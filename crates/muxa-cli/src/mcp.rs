@@ -1152,6 +1152,7 @@ async fn call_tool(
                 task: args.get("task").and_then(Value::as_str).map(str::to_string),
                 generation: None,
                 direction,
+                account: config.account_route(agent.label()),
             };
             let is_rmux = endpoint
                 .as_ref()
@@ -3386,6 +3387,7 @@ async fn spawn_peer(
             config.mcp.guide.direction.as_str(),
         ))
         .expect("MCP guide direction has the same closed value set"),
+        account: config.account_route(program.label()),
     };
     // Arm the daemon transition subscription before creating the pane. A
     // Started hook can register very quickly; subscribing first ensures the

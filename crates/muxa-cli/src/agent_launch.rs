@@ -55,8 +55,7 @@ impl AgentProgram {
 
     #[cfg(test)]
     fn launch_argv(self, options: &[String], prompt: Option<&str>) -> Vec<String> {
-        let launch = self.native_launch(options, prompt);
-        std::iter::once(launch.command).chain(launch.args).collect()
+        self.native_launch(options, prompt).argv()
     }
 
     #[cfg(test)]
@@ -115,6 +114,42 @@ impl AgentProgram {
 struct NativeLaunch {
     command: String,
     args: Vec<String>,
+}
+
+impl NativeLaunch {
+    /// This launch, run on the account `routed` chose. A launch routing
+    /// skipped or never asked for runs as built.
+    fn on_account(
+        self,
+        routed: Option<&std::result::Result<muxa::account_route::RoutedLaunch, String>>,
+    ) -> Self {
+        match routed {
+            Some(Ok(routed)) => {
+                let mut argv = routed.argv(self.args).into_iter();
+                Self {
+                    command: argv.next().expect("aas argv has a program"),
+                    args: argv.collect(),
+                }
+            }
+            _ => self,
+        }
+    }
+
+    fn argv(self) -> Vec<String> {
+        std::iter::once(self.command).chain(self.args).collect()
+    }
+}
+
+/// Settle `[agent.<program>].account` for one launch, before anything is
+/// created. A skipped route is reported, not fatal: the agent still starts.
+fn route_account(
+    route: Option<&muxa::account_route::AccountRoute>,
+) -> Option<std::result::Result<muxa::account_route::RoutedLaunch, String>> {
+    let outcome = muxa::account_route::decide(route?);
+    if let Err(reason) = &outcome {
+        eprintln!("muxa: starting without an aas account: {reason}");
+    }
+    Some(outcome)
 }
 
 /// Execution host selection for the user-facing agent launcher.
@@ -362,6 +397,9 @@ pub struct StartRequest {
     /// room — or, with no daemon on the default socket at all, failed and
     /// rolled the whole launch back.
     pub socket: PathBuf,
+    /// `[agent.<program>].account`: which `aas` account the agent starts
+    /// on. `None` runs the bare provider CLI.
+    pub account: Option<muxa::account_route::AccountRoute>,
 }
 
 /// The caller's own `--option`/`options` list, or `None` when they named
@@ -399,6 +437,7 @@ impl StartRequest {
             generation: None,
             direction: args.direction.unwrap_or(SplitDirection::Right),
             socket: socket.to_path_buf(),
+            account: cfg.account_route(args.agent.label()),
         }
     }
 }
@@ -428,6 +467,8 @@ pub struct StartResult {
     pub alias: Option<String>,
     pub cwd: PathBuf,
     pub prompt_supplied: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<muxa::account_route::AccountDecision>,
 }
 
 /// Stable `muxa agent start --json` envelope across execution hosts.
@@ -454,6 +495,7 @@ struct AgentStartOutput {
     alias: Option<String>,
     cwd: PathBuf,
     prompt_supplied: bool,
+    account: Option<muxa::account_route::AccountDecision>,
 }
 
 impl AgentStartOutput {
@@ -476,6 +518,7 @@ impl AgentStartOutput {
             alias: result.alias.clone(),
             cwd: result.cwd.clone(),
             prompt_supplied: result.prompt_supplied,
+            account: result.account.clone(),
         }
     }
 }
@@ -509,8 +552,9 @@ fn run_tmux(args: StartArgs, socket: &Path, cfg: &muxa::config::Config) -> Resul
         );
     } else {
         println!(
-            "started {} in {} {} (cwd {})",
+            "started {}{} in {} {} (cwd {})",
             result.agent.label(),
+            account_suffix(result.account.as_ref()),
             match result.placement {
                 Placement::Pane => "pane",
                 Placement::Window => "window pane",
@@ -547,7 +591,11 @@ async fn run_native(
     // tmux one does: which surface a session lands on says nothing about
     // which model it should run.
     let options = cfg.launch_options(args.agent.label(), explicit_options(&args.options));
-    let launch = args.agent.native_launch(&options, prompt);
+    let routed = route_account(cfg.account_route(args.agent.label()).as_ref());
+    let launch = args
+        .agent
+        .native_launch(&options, prompt)
+        .on_account(routed.as_ref());
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
     let session = client
         .spawn_session(muxa::SpawnSession {
@@ -582,13 +630,15 @@ async fn run_native(
         alias: None,
         cwd,
         prompt_supplied: prompt.is_some(),
+        account: routed.as_ref().map(muxa::account_route::report),
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
     } else {
         println!(
-            "started {} in native session {} (cwd {})\nattach with: muxa proc attach {}",
+            "started {}{} in native session {} (cwd {})\nattach with: muxa proc attach {}",
             result.agent.label(),
+            account_suffix(result.account.as_ref()),
             result
                 .session
                 .as_deref()
@@ -654,6 +704,7 @@ pub fn run_work_start(
         alias: args.alias,
         generation: None,
         direction: args.direction,
+        account: cfg.account_route(args.agent.label()),
     })?;
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -702,6 +753,9 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     if request.creator.is_none() {
         request.creator = crate::spawn_provenance::resolve_creator(&request.socket);
     }
+    // Before prepare_launch: it can create sessions and windows, and a slow
+    // or failed `aas` must not leave them behind.
+    let routed = route_account(request.account.as_ref());
     let PreparedLaunch {
         cwd,
         workspace,
@@ -717,15 +771,13 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // Replace tmux's command shell, so the pane's foreground command and PID
     // describe the CLI even before it emits a hook. rmux on Windows hands the
     // line to PowerShell, which has no `exec`; there the program just runs.
-    let command = muxa::shell::Dialect::native().exec_line(&{
-        let launch =
-            request
-                .agent
-                .permission_launch(&request.options, prompt, request.bypass_permissions);
-        std::iter::once(launch.command)
-            .chain(launch.args)
-            .collect::<Vec<_>>()
-    });
+    let command = muxa::shell::Dialect::native().exec_line(
+        &request
+            .agent
+            .permission_launch(&request.options, prompt, request.bypass_permissions)
+            .on_account(routed.as_ref())
+            .argv(),
+    );
     let args = tmux_args(&request, &cwd, &command)?;
     let output = crate::mux_control::ambient_command_with_args(&args)?
         .output()
@@ -850,7 +902,15 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         alias,
         cwd,
         prompt_supplied: prompt.is_some(),
+        account: routed.as_ref().map(muxa::account_route::report),
     })
+}
+
+/// ` on <account>` for a routed launch's one-line report.
+fn account_suffix(decision: Option<&muxa::account_route::AccountDecision>) -> String {
+    decision
+        .and_then(|decision| decision.account.as_deref())
+        .map_or_else(String::new, |account| format!(" on {account}"))
 }
 
 fn register_worker_purpose(request: &StartRequest, pane: &str) -> Result<()> {
@@ -1363,7 +1423,36 @@ mod tests {
             alias: None,
             generation: None,
             direction: SplitDirection::Right,
+            account: None,
         }
+    }
+
+    #[test]
+    fn a_routed_launch_runs_the_finished_argv_through_aas() {
+        let build = || {
+            AgentProgram::Codex.permission_launch(&["--no-daemon".into()], Some("it's\nfine"), true)
+        };
+        let routed = Ok(muxa::account_route::RoutedLaunch {
+            aas: "/opt/aas".into(),
+            account: "ok@codex".into(),
+        });
+        assert_eq!(
+            build().on_account(Some(&routed)).argv(),
+            [
+                "/opt/aas",
+                "e",
+                "ok@codex",
+                "--yolo",
+                "--no-daemon",
+                "it's\nfine"
+            ]
+        );
+        let bare = ["codex", "--yolo", "--no-daemon", "it's\nfine"];
+        assert_eq!(build().on_account(None).argv(), bare);
+        assert_eq!(
+            build().on_account(Some(&Err("no quota".into()))).argv(),
+            bare
+        );
     }
 
     #[test]
@@ -1476,6 +1565,7 @@ mod tests {
             alias: None,
             cwd: PathBuf::from("/repo"),
             prompt_supplied: true,
+            account: None,
         };
         let native = AgentStartOutput {
             host: LaunchHost::Native,

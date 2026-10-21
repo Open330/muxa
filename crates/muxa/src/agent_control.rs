@@ -135,6 +135,10 @@ pub struct AgentStartResult {
     pub cwd: PathBuf,
     #[serde(default)]
     pub prompt_supplied: bool,
+    /// The `aas` account routing decision, when the provider's config asked
+    /// for one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<crate::account_route::AccountDecision>,
     /// Fleet host alias that ran the launch; `None` for the daemon's own
     /// host. Filled in by the daemon, not the CLI.
     #[serde(default, skip_serializing_if = "Option::is_none")]

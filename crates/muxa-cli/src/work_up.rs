@@ -174,6 +174,8 @@ pub(crate) struct Resolved {
     /// daemon is unreachable, which degrades to the old pane-only view
     /// rather than failing the launch.
     states: HashMap<String, AgentState>,
+    /// `[agent.<program>].account` for each provider that sets one.
+    accounts: Vec<muxa::account_route::AccountRoute>,
 }
 
 pub async fn run(
@@ -441,6 +443,7 @@ pub(crate) async fn apply_durable(
 #[allow(clippy::too_many_lines)] // claim, launch, and durable report form one reconciliation pass
 pub(crate) async fn reconcile_run(
     client: &muxa::ipc::Client,
+    config: &Config,
     identity: &WorkIdentity,
     generation: u64,
 ) -> Result<Vec<LaunchedAgent>> {
@@ -497,6 +500,7 @@ pub(crate) async fn reconcile_run(
                         alias: Some(claim.agent.alias.clone()),
                         generation: Some(claim.generation),
                         direction,
+                        account: config.account_route(program.label()),
                     })
                     .with_context(|| format!("launch pipeline agent {:?}", claim.agent.alias))
                     .map(|result| {
@@ -548,7 +552,11 @@ pub(crate) async fn reconcile_run(
     Ok(launched)
 }
 
-pub async fn run_reconcile(args: ReconcileArgs, client: &muxa::ipc::Client) -> Result<()> {
+pub async fn run_reconcile(
+    args: ReconcileArgs,
+    client: &muxa::ipc::Client,
+    config: &Config,
+) -> Result<()> {
     let runs = client
         .pipeline_runs()
         .await
@@ -568,7 +576,7 @@ pub async fn run_reconcile(args: ReconcileArgs, client: &muxa::ipc::Client) -> R
     let mut failure_count = 0;
     let mut first_error = None;
     for run in selected {
-        if let Err(error) = reconcile_run(client, &run.identity, run.generation).await {
+        if let Err(error) = reconcile_run(client, config, &run.identity, run.generation).await {
             tracing::warn!(
                 work = %run.identity.key(),
                 generation = run.generation,
@@ -752,7 +760,15 @@ pub(crate) async fn resolve(
         desired,
         durable_run,
         states,
+        accounts: account_routes(config),
     })
+}
+
+fn account_routes(config: &Config) -> Vec<muxa::account_route::AccountRoute> {
+    muxa::account_route::PROVIDERS
+        .iter()
+        .filter_map(|program| config.account_route(program))
+        .collect()
 }
 
 /// Whether the caller named a directory, as opposed to happening to stand
@@ -1278,6 +1294,11 @@ fn launch(
         alias: Some(agent.alias.clone()),
         generation: Some(generation),
         direction,
+        account: resolved
+            .accounts
+            .iter()
+            .find(|route| route.provider == agent.program)
+            .cloned(),
     })
     .with_context(|| format!("launch pipeline agent {:?}", agent.alias))?;
     Ok(LaunchedAgent {
@@ -1564,6 +1585,7 @@ mod reconcile_tests {
                 work: None,
             },
             &muxa::ipc::Client::new(socket),
+            &Config::default(),
         )
         .await;
         tokio::time::timeout(Duration::from_secs(3), server)

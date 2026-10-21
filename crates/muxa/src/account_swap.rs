@@ -30,6 +30,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_QUIET: Duration = Duration::from_millis(1500);
 /// Time for the shell to redraw its prompt after the agent exits.
 const SHELL_SETTLE: Duration = Duration::from_millis(700);
+/// How long `aas candidates` gets before a swap gives up on it.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `[swap]` in `config.toml`: defaults shared by `muxa swap` and the
 /// `swap_account` automation action.
@@ -626,48 +628,102 @@ pub(crate) fn find_launch(
 
 /// Query `aas candidates --json` for one provider.
 pub fn query_candidates(aas: &str, provider: &str) -> Result<Vec<Candidate>, String> {
-    let program = resolve_aas(aas);
-    let output = std::process::Command::new(&program)
-        .args(["candidates", "--json", "--provider", provider])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("could not run `{program} candidates`: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`{program} candidates` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    parse_candidates(&String::from_utf8_lossy(&output.stdout))
+    let program = find_aas(aas).unwrap_or_else(|| aas.to_owned());
+    query_candidates_within(&program, provider, QUERY_TIMEOUT)
 }
 
-/// A bare program name, looked up on `PATH` and then where `aas` is
-/// usually installed — a launchd-started daemon has a minimal `PATH`.
-fn resolve_aas(configured: &str) -> String {
+/// [`query_candidates`] against an already resolved `program`, killed and
+/// reaped once `timeout` passes so a hung `aas` cannot hold a caller.
+pub fn query_candidates_within(
+    program: &str,
+    provider: &str,
+    timeout: Duration,
+) -> Result<Vec<Candidate>, String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new(program)
+        .args(["candidates", "--json", "--provider", provider])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run `{program} candidates`: {error}"))?;
+    // Drained on their own threads so a full pipe cannot stall the child;
+    // killing it on timeout closes the write ends and ends them.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "`{program} candidates` did not answer within {}s",
+                    timeout.as_secs()
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("`{program} candidates` failed: {error}"));
+            }
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!(
+            "`{program} candidates` failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
+    }
+    parse_candidates(&String::from_utf8_lossy(&stdout))
+}
+
+/// Where the configured `aas` is: a path as given, a bare name looked up
+/// on `PATH` and then where `aas` is usually installed — a
+/// launchd-started daemon has a minimal `PATH`. `None` when none exists.
+#[must_use]
+pub fn find_aas(configured: &str) -> Option<String> {
     if configured.contains(['/', '\\']) {
-        return configured.to_owned();
+        return std::path::Path::new(configured)
+            .is_file()
+            .then(|| configured.to_owned());
     }
     if cfg!(windows) {
         // `aas.exe` / `aas.cmd`: PATH lookup has to try the extensions.
-        return crate::shell::find_program(configured)
-            .map_or_else(|| configured.to_owned(), |path| path.display().to_string());
-    }
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(configured).is_file()));
-    if on_path {
-        return configured.to_owned();
+        return crate::shell::find_program(configured).map(|path| path.display().to_string());
     }
     let home = std::env::var("HOME").unwrap_or_default();
-    [
-        "/opt/homebrew/bin".to_owned(),
-        "/usr/local/bin".to_owned(),
-        format!("{home}/.cargo/bin"),
-        format!("{home}/.local/bin"),
-    ]
-    .into_iter()
-    .map(|dir| format!("{dir}/{configured}"))
-    .find(|path| std::path::Path::new(path).is_file())
-    .unwrap_or_else(|| configured.to_owned())
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            [
+                "/opt/homebrew/bin".to_owned(),
+                "/usr/local/bin".to_owned(),
+                format!("{home}/.cargo/bin"),
+                format!("{home}/.local/bin"),
+            ]
+            .map(std::path::PathBuf::from),
+        )
+        .map(|dir| dir.join(configured))
+        .find(|path| path.is_file())
+        .map(|path| path.display().to_string())
 }
 
 /// Plan and carry out `request` over `agents`. Blocking: it signals

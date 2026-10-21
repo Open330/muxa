@@ -222,13 +222,34 @@ impl Config {
         if let Some(explicit) = over {
             return explicit.to_vec();
         }
-        if let Some(configured) = self.agent.get(program) {
-            return configured.options.clone();
+        if let Some(configured) = self
+            .agent
+            .get(program)
+            .and_then(|agent| agent.options.as_ref())
+        {
+            return configured.clone();
         }
         if self.mcp.guide.agent.as_deref() == Some(program) {
             return self.mcp.guide.options.clone();
         }
         Vec::new()
+    }
+
+    /// The `aas` account routing for a new `program` agent, when
+    /// `[agent.<program>].account` asks for it.
+    #[must_use]
+    pub fn account_route(&self, program: &str) -> Option<crate::account_route::AccountRoute> {
+        if !crate::account_route::PROVIDERS.contains(&program) {
+            return None;
+        }
+        let choice = crate::account_route::SpawnAccount::parse(
+            self.agent.get(program)?.account.as_deref()?,
+        )?;
+        Some(crate::account_route::AccountRoute {
+            provider: program.to_owned(),
+            choice,
+            aas: self.swap.aas.clone(),
+        })
     }
 
     /// Unknown top-level entries that are not sections. A feature always
@@ -675,8 +696,16 @@ pub struct WorktreeConfig {
 pub struct AgentLaunchConfig {
     /// Arguments inserted after muxa's built-in launch profile
     /// (`--yolo` / `--dangerously-skip-permissions` / …) and before the
-    /// initial prompt — where `--model <id>` goes.
-    pub options: Vec<String>,
+    /// initial prompt — where `--model <id>` goes. Absent (as opposed to
+    /// `[]`) inherits `[mcp.guide].options`, so a table that only sets
+    /// `account` changes nothing about the arguments.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    /// The `aas` account new agents start on (`claude` / `codex` only):
+    /// `auto` for the best-ranked one with quota left, or an account name.
+    /// Unset leaves the choice to the `aas` shim's active account.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
 }
 
 /// One `[pipeline.<name>]` entry — the set of agents a work window should
@@ -1662,9 +1691,28 @@ fn validate_agents(
                 "unknown agent {program:?}; expected claude, codex, gemini, agy, or opencode"
             )));
         }
+        if launch.account.is_some() && !crate::account_route::PROVIDERS.contains(&program.as_str())
+        {
+            return Err(ConfigError::InvalidAgent {
+                path: format!("agent.{program}.account"),
+                message: "account routing goes through aas, which runs only claude and codex"
+                    .into(),
+            });
+        }
+        if launch
+            .account
+            .as_deref()
+            .is_some_and(|account| account.trim().is_empty() || account.contains('\0'))
+        {
+            return Err(ConfigError::InvalidAgent {
+                path: format!("agent.{program}.account"),
+                message: "expected \"auto\" or an aas account name".into(),
+            });
+        }
         if let Some((index, _)) = launch
             .options
             .iter()
+            .flatten()
             .enumerate()
             .find(|(_, option)| option.contains('\0'))
         {
@@ -2513,6 +2561,47 @@ options = ["--model", "gpt-5-codex"]
 
         let good: Config = toml::from_str("[agent.claude]\noptions = []\n").unwrap();
         assert!(good.validate().is_ok());
+    }
+
+    #[test]
+    fn an_account_only_table_still_inherits_the_guide_options() {
+        let cfg: Config = toml::from_str(
+            "[mcp.guide]\nagent = \"codex\"\noptions = [\"legacy\"]\n\
+             [agent.codex]\naccount = \"auto\"\n\
+             [swap]\naas = \"/opt/aas\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        assert_eq!(cfg.launch_options("codex", None), ["legacy"]);
+        assert_eq!(
+            cfg.account_route("codex"),
+            Some(crate::account_route::AccountRoute {
+                provider: "codex".into(),
+                choice: crate::account_route::SpawnAccount::Auto,
+                aas: "/opt/aas".into(),
+            })
+        );
+        assert_eq!(cfg.account_route("claude"), None);
+    }
+
+    #[test]
+    fn account_routing_is_only_for_aas_providers_and_never_blank() {
+        for bad in [
+            "[agent.gemini]\naccount = \"auto\"\n",
+            "[agent.claude]\naccount = \" \"\n",
+        ] {
+            let cfg: Config = toml::from_str(bad).unwrap();
+            assert!(
+                matches!(cfg.validate(), Err(ConfigError::InvalidAgent { ref path, .. }) if path.ends_with(".account")),
+                "{bad}"
+            );
+        }
+        let named: Config = toml::from_str("[agent.claude]\naccount = \"jelly@claude\"\n").unwrap();
+        named.validate().unwrap();
+        assert_eq!(
+            named.account_route("claude").unwrap().choice,
+            crate::account_route::SpawnAccount::Named("jelly@claude".into())
+        );
     }
 
     #[test]

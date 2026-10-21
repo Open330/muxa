@@ -159,6 +159,26 @@ options = ['--model', 'claude-sonnet-5']
 `muxa work up --dry-run` prints the resolved list for every pane, so what it
 shows is what the launch will use.
 
+### Starting on an `aas` account
+
+```toml
+[agent.claude]
+account = "auto"          # or a pinned account: "jelly@claude"
+```
+
+With [`aas`](ACCOUNT_SWAP.md) managing several accounts, a bare `claude` lands
+on whichever account `aas active` names, even while that one is capped.
+`account` makes every launch path above start `aas e <account> …` instead.
+`auto` takes the best-ranked eligible account from `aas candidates` (it never
+changes `aas active`); a name pins one. `claude` and `codex` only.
+
+`aas` stays optional: it is run, never linked, and only when `account` is set.
+When it is missing, takes longer than 5 seconds, or has no account with quota
+left, the agent starts bare as before, which may still be the capped account.
+The reason goes to stderr and to the `account` field of `muxa agent start
+--json`. The binary is `[swap].aas`. An agent already capped mid-run is
+[`muxa swap`](ACCOUNT_SWAP.md)'s job.
+
 ### Advanced launch options form
 
 In Muxa.app, **Settings → Advanced** has a segmented **Launch options / Raw

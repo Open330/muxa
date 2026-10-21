@@ -122,6 +122,25 @@ options = ['--model', 'claude-sonnet-5']
 
 `muxa work up --dry-run`은 pane별로 최종 인자를 출력하므로, 보이는 그대로 실행됩니다.
 
+### `aas` 계정으로 시작하기
+
+```toml
+[agent.claude]
+account = "auto"          # 또는 고정 계정: "jelly@claude"
+```
+
+[`aas`](ACCOUNT_SWAP.md)로 여러 계정을 쓰면, 맨 `claude`는 `aas active` 계정으로
+뜹니다. 그 계정이 한도에 걸려 있어도 마찬가지입니다. `account`를 설정하면 위의 모든
+실행 경로가 `aas e <account> …`로 시작합니다. `auto`는 `aas candidates`에서 순위가
+가장 높은 eligible 계정을 고르고(`aas active`는 바꾸지 않음), 이름을 쓰면 그 계정으로
+고정합니다. `claude`, `codex`만 지원합니다.
+
+`aas`는 선택 사항입니다. 링크하지 않고 실행만 하며, `account`가 있을 때만 호출합니다.
+`aas`가 없거나, 5초 안에 답하지 않거나, 한도가 남은 계정이 없으면 예전처럼 맨 CLI로
+시작합니다(한도에 걸린 active 계정일 수 있음). 이유는 stderr와 `muxa agent start
+--json`의 `account` 필드에 남습니다. 바이너리는 `[swap].aas`를 씁니다. 실행 중에 한도에
+걸린 에이전트는 [`muxa swap`](ACCOUNT_SWAP.md)이 처리합니다.
+
 ## Ask
 
 ```toml
