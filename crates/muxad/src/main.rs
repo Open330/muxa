@@ -1773,10 +1773,11 @@ async fn wake_idle_collaboration_peers_with_inflight(
 ) {
     let requests = collaboration.pending_unnotified().await;
     let replies = collaboration.pending_reply_unnotified().await;
-    if requests.is_empty() && replies.is_empty() {
+    let agents = store.snapshot().await;
+    let stranded = stranded_requests(collaboration, &agents).await;
+    if requests.is_empty() && replies.is_empty() && stranded.is_empty() {
         return;
     }
-    let agents = store.snapshot().await;
     let listed_backends = backends.to_vec();
     let discovery_agents = agents.clone();
     let (panes, mut participants) = tokio::task::spawn_blocking(move || {
@@ -1794,12 +1795,16 @@ async fn wake_idle_collaboration_peers_with_inflight(
         .enrich_launch_purposes(&mut participants, &panes)
         .await;
 
+    // Follow vanished recipients for every undelivered request, quiet ones
+    // included; a readdressed request comes back through the next pass.
+    for request in &stranded {
+        follow_vanished_recipient(collaboration, request, &participants, &agents, &panes).await;
+    }
+
     for request in requests {
         let Some(recipient) =
             ready_collaboration_recipient(&participants, &agents, &panes, &request)
         else {
-            follow_vanished_recipient(collaboration, &request, &participants, &agents, &panes)
-                .await;
             continue;
         };
         let recipient = &recipient;
@@ -1859,6 +1864,28 @@ async fn wake_idle_collaboration_peers_with_inflight(
         store,
     )
     .await;
+}
+
+/// Undelivered requests (quiet ones included) whose pinned session is no
+/// longer registered at its pane. Checked against the registry first so a
+/// lingering quiet notice to a present agent costs no pane scan.
+async fn stranded_requests(
+    collaboration: &CollaborationStore,
+    agents: &[muxa::state::Agent],
+) -> Vec<CollaborationRequest> {
+    collaboration
+        .undelivered_requests()
+        .await
+        .into_iter()
+        .filter(|request| {
+            !muxa::collaboration::is_pending_session(&request.to.agent_session_id)
+                && !agents.iter().any(|agent| {
+                    agent.session_id == request.to.agent_session_id
+                        && agent.state != muxa::AgentState::Stopped
+                        && agent.pane.as_deref() == Some(request.to.pane.as_str())
+                })
+        })
+        .collect()
 }
 
 /// Readdress an undelivered request whose pinned recipient is gone: to the
@@ -3826,6 +3853,28 @@ mod tests {
             .await
             .unwrap();
 
+        // A quiet notice to the same slot wakes nobody but must follow too.
+        let notice = mailbox
+            .create(
+                coordinator.clone(),
+                old.clone(),
+                NewRequest {
+                    kind: RequestKind::Notice,
+                    body: "fyi".into(),
+                    expects_reply: false,
+                    notify: Some(false),
+                    recipient_slot: Some(muxa::collaboration::RecipientSlot::of(
+                        &old,
+                        &panes,
+                        Some("reviewer"),
+                        None,
+                    )),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+
         // The reviewer pane goes away and a new reviewer session starts in a
         // new pane of the same work window.
         store.forget_agent("old-reviewer").await;
@@ -3856,6 +3905,11 @@ mod tests {
         let stored = mailbox.get_for(&coordinator, &request.id).await.unwrap();
         assert_eq!(stored.to.agent_session_id, "new-reviewer");
         assert_eq!(stored.rebound_from, ["old-reviewer"]);
+        let notice = mailbox.get_for(&coordinator, &notice.id).await.unwrap();
+        assert_eq!(
+            notice.to.agent_session_id, "new-reviewer",
+            "quiet notice stranded"
+        );
     }
 
     async fn deliver_quiet_progress_burst(

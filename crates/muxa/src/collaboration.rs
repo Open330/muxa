@@ -168,15 +168,13 @@ fn dispatch_matches(
     // A request that followed its slot is matched by that slot: a retry
     // resolves the slot afresh and may reach the successor. Two different
     // slots are different requests even when they reach the same session.
-    let slot_consistent = match (&existing.to_slot, &input.recipient_slot) {
-        (Some(existing), Some(retry)) => existing == retry,
-        _ => true,
+    let same_slot = match (&existing.to_slot, &input.recipient_slot) {
+        (Some(existing), Some(retry)) => Some(existing.same_slot(retry)),
+        _ => None,
     };
     existing.from.same_endpoint(from)
-        && slot_consistent
-        && (existing.to.same_endpoint(to)
-            || addresses(&existing.to, to)
-            || existing.to_slot.is_some() && existing.to_slot == input.recipient_slot)
+        && same_slot != Some(false)
+        && (existing.to.same_endpoint(to) || addresses(&existing.to, to) || same_slot == Some(true))
         && existing.kind == input.kind
         && existing.body == body
         && existing.expects_reply == input.expects_reply
@@ -1127,10 +1125,21 @@ impl RecipientSlot {
     }
 
     /// Whether `participant` holds this slot now.
+    ///
+    /// Always on the slot's own server: work ids are only unique per
+    /// server. Within it, the durable work identity when the slot has one
+    /// (a recreated window keeps it), else the exact window. Roles come from
+    /// the participant, which is already seeded from the launch mark and
+    /// overridden by any registered identity.
     pub fn held_by(&self, participant: &Participant, panes: &[PaneInfo]) -> bool {
-        let pane = pane_of(participant, panes);
+        if participant.console
+            || participant.room.host != self.room.host
+            || participant.room.socket != self.room.socket
+        {
+            return false;
+        }
         let in_work = match (self.workspace_id.as_deref(), self.work_id.as_deref()) {
-            (Some(workspace), Some(work)) => pane.is_some_and(|pane| {
+            (Some(workspace), Some(work)) => pane_of(participant, panes).is_some_and(|pane| {
                 pane.workspace_id.as_deref() == Some(workspace)
                     && pane.work_id.as_deref() == Some(work)
             }),
@@ -1141,9 +1150,6 @@ impl RecipientSlot {
                 .roles
                 .iter()
                 .any(|held| held.eq_ignore_ascii_case(role))
-                || pane
-                    .and_then(|pane| pane.agent_role.as_deref())
-                    .is_some_and(|held| held.eq_ignore_ascii_case(role))
         });
         let alias = self.alias.as_deref().is_none_or(|alias| {
             participant
@@ -1151,15 +1157,41 @@ impl RecipientSlot {
                 .as_deref()
                 .is_some_and(|held| held.eq_ignore_ascii_case(alias))
         });
-        in_work && role && alias && !participant.console
+        in_work && role && alias
+    }
+
+    /// Whether two slots name the same logical recipient: same server, same
+    /// durable work (or the same window when there is none), same role and
+    /// alias. The window id alone may differ after a work's window is
+    /// recreated.
+    pub fn same_slot(&self, other: &Self) -> bool {
+        let text_eq = |left: Option<&str>, right: Option<&str>| match (left, right) {
+            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+            (None, None) => true,
+            _ => false,
+        };
+        let durable = |slot: &Self| slot.workspace_id.is_some() && slot.work_id.is_some();
+        let same_work = if durable(self) && durable(other) {
+            self.workspace_id == other.workspace_id && self.work_id == other.work_id
+        } else {
+            self.room == other.room
+        };
+        self.room.host == other.room.host
+            && self.room.socket == other.room.socket
+            && same_work
+            && text_eq(self.role.as_deref(), other.role.as_deref())
+            && text_eq(self.alias.as_deref(), other.alias.as_deref())
     }
 }
 
+/// The pane scan row for `participant`. Matched on its socket too, because
+/// pane ids repeat across servers; only a participant with no known socket
+/// falls back to the pane id alone.
 fn pane_of<'p>(participant: &Participant, panes: &'p [PaneInfo]) -> Option<&'p PaneInfo> {
-    panes
-        .iter()
-        .find(|pane| pane.pane_id == participant.pane && pane.socket == participant.socket)
-        .or_else(|| panes.iter().find(|pane| pane.pane_id == participant.pane))
+    panes.iter().find(|pane| {
+        pane.pane_id == participant.pane
+            && (participant.socket.is_none() || pane.socket == participant.socket)
+    })
 }
 
 /// Parse `workspace/work/role`, `workspace/work/role@alias` or
@@ -3468,6 +3500,27 @@ impl CollaborationStore {
             .await
             .values()
             .filter(|request| request.needs_human_response() && request.notified_at.is_none())
+            .cloned()
+            .collect()
+    }
+
+    /// Requests that have not reached their recipient in any way yet:
+    /// queued, unclaimed, not notified and with no direct wake in progress.
+    /// Includes quiet ones that never wake anybody, which still need to
+    /// follow a recipient that moved or was replaced.
+    pub async fn undelivered_requests(&self) -> Vec<CollaborationRequest> {
+        let _transaction = self.transaction_lock.lock().await;
+        self.requests
+            .read()
+            .await
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::Queued
+                    && request.claimed_at.is_none()
+                    && request.notified_at.is_none()
+                    && request.wake_delivery.is_none()
+                    && !request.to.console
+            })
             .cloned()
             .collect()
     }

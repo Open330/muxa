@@ -2220,6 +2220,46 @@ fn peer_worker_route(
     Ok((selection, worker_program))
 }
 
+/// Whether `target` names a collaboration slot (`@alias`, `alias:`,
+/// `role:`, or a `workspace/work/role` path) rather than a pane, a provider
+/// (`@codex`) or the reserved `@peer` routing words.
+fn names_a_slot(target: &str) -> bool {
+    let target = target.trim();
+    if target.starts_with("role:") || muxa::collaboration::parse_slot_path(target).is_some() {
+        return true;
+    }
+    let Some(alias) = target
+        .strip_prefix('@')
+        .or_else(|| target.strip_prefix("alias:"))
+    else {
+        return false;
+    };
+    !matches!(alias, "peer" | "muxa-peer")
+        && crate::agent_launch::AgentProgram::parse(alias).is_err()
+}
+
+/// Send a peer call by its logical target when it named a slot, falling
+/// back to the locally selected pane if the daemon cannot resolve the slot
+/// on its own (for example a role two peers share).
+async fn send_peer_call(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    target: &str,
+    logical: bool,
+    pane_selector: Option<&str>,
+    request: &NewRequest,
+) -> Result<muxa::collaboration::CollaborationRequest, muxa::ipc::RuntimeError> {
+    if logical {
+        match client.collaboration_send(origin, target, request).await {
+            Ok(sent) => return Ok(sent),
+            Err(error) if pane_selector.is_none() => return Err(error),
+            Err(_) => {}
+        }
+    }
+    let selector = pane_selector.unwrap_or(target);
+    client.collaboration_send(origin, selector, request).await
+}
+
 /// One high-level colleague call behind the conversational `@peer` protocol.
 /// The model still owns understanding the user's sentence; muxa owns every
 /// deterministic and security-sensitive step after that: prompt expansion,
@@ -2265,13 +2305,20 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     };
     let target = args.get("target").and_then(Value::as_str).unwrap_or("auto");
     let target = review_provider_target(target, kind, room.current.agent_kind);
-    let (mut selection, worker_program) = match peer_worker_route(&room, target, args) {
-        Ok(route) => route,
-        Err(error) => return error_result(&error),
+    // A `workspace/work/role` path names a slot the daemon resolves across
+    // windows; there is no local peer to select or worker to spawn for it.
+    let path_target = muxa::collaboration::parse_slot_path(target).is_some();
+    let (mut selection, worker_program) = if path_target {
+        (None, None)
+    } else {
+        match peer_worker_route(&room, target, args) {
+            Ok(route) => route,
+            Err(error) => return error_result(&error),
+        }
     };
     let mut spawned = None;
 
-    if selection.is_none() {
+    if selection.is_none() && !path_target {
         let spawn_target = if let Some(program) = worker_program {
             program.label()
         } else {
@@ -2310,11 +2357,27 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         }
     }
 
-    let selection = selection.expect("missing selection handled above");
-    let selector = format!("pane:{}", selection.pane);
-    let sent = match client
-        .collaboration_send(&origin, &selector, &request)
-        .await
+    let (selected_peer, selection_reason, pane_selector) = match selection {
+        Some(selection) => (
+            selection.peer,
+            selection.reason,
+            Some(format!("pane:{}", selection.pane)),
+        ),
+        None => (None, format!("logical slot {target}"), None),
+    };
+    // Send a named slot (path, `@alias`, `role:`) as itself so the daemon
+    // records it and the request can follow a replaced holder. A provider or
+    // worker substitution was a local choice, so it is sent by pane.
+    let logical = path_target || (worker_program.is_none() && names_a_slot(target));
+    let sent = match send_peer_call(
+        client,
+        &origin,
+        target,
+        logical,
+        pane_selector.as_deref(),
+        &request,
+    )
+    .await
     {
         Ok(request) => request,
         Err(error) => return error_result(&format!("call_peer send failed: {error}")),
@@ -2322,8 +2385,8 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     let peer_pending = muxa::collaboration::is_pending_session(&sent.to.agent_session_id);
     let mut common = json!({
         "sent": true,
-        "selected_peer": selection.peer.clone().unwrap_or_else(|| sent.to.clone()),
-        "selection_reason": selection.reason,
+        "selected_peer": selected_peer.unwrap_or_else(|| sent.to.clone()),
+        "selection_reason": selection_reason,
         "expanded_skill": expanded_skill,
         "spawned": spawned,
         "request_id": sent.id,
@@ -2348,7 +2411,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
              that pane reports idle, which needs muxa to see an agent process there. Wait on \
              request_id {} with muxa_wait_reply — never watch the pane with capture-pane or \
              sleep. If the reply times out, check `muxa status` for a row on the pane.",
-            selection.pane, sent.id
+            sent.to.pane, sent.id
         ));
     }
     if !args.get("wait").and_then(Value::as_bool).unwrap_or(true) {
@@ -2382,7 +2445,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
             payload["next_step"] = json!(format!(
                 "the request remains durable for {}; call muxa_wait_reply with request_id {} to keep \
                  waiting, or muxa_peer_report later. Do not poll the pane.",
-                selection.pane, sent.id
+                sent.to.pane, sent.id
             ));
             json_result(&payload)
         }
@@ -4735,6 +4798,123 @@ mod tests {
         let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
         wait_for_socket(sock).await;
         (Client::new(sock.to_path_buf()), sends, tx, handle)
+    }
+
+    /// `muxa_call_peer` sends a named slot as itself, so the daemon records
+    /// it and the request can follow a replaced holder: a
+    /// `workspace/work/role` path (which local peer selection does not
+    /// know) and a `role:` target alike.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one isolated transport lifecycle, including origin env
+    async fn call_peer_sends_named_slots_as_slots() {
+        const PROBE: &str = "MUXA_CALL_PEER_SLOT_PROBE";
+        if std::env::var_os(PROBE).is_none() {
+            let result = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "mcp::tests::call_peer_sends_named_slots_as_slots",
+                    "--nocapture",
+                ])
+                .env(PROBE, "1")
+                .env_remove("MUXA_HOST")
+                .env_remove("MUXA_HOSTS")
+                .env_remove("RMUX")
+                .env_remove("RMUX_PANE")
+                .env_remove("CMUX_SOCKET_PATH")
+                .env_remove("HERDR_PANE")
+                .env("TMUX", "/tmp/muxa-slot-test/default,0,0")
+                .env("TMUX_PANE", "%1")
+                .env("CODEX_THREAD_ID", "slot-sender")
+                .output()
+                .unwrap();
+            assert!(
+                result.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&result.stdout),
+                String::from_utf8_lossy(&result.stderr)
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("slot.sock");
+        let origin = current_collaboration_origin().unwrap();
+        let store = Store::shared();
+        for (pane, session) in [("%1", "slot-sender"), ("%2", "slot-reviewer")] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: muxa::event::AgentId {
+                        kind: AgentKind::Codex,
+                        session_id: session.into(),
+                        surface: None,
+                        pane: Some(pane.into()),
+                        tmux_socket: origin.socket.clone(),
+                        cwd: Some("/repo".into()),
+                    },
+                    at: time::OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+        let panes = [("%1", "0"), ("%2", "1")]
+            .into_iter()
+            .map(|(pane, index)| {
+                let mut pane = registration_pane(pane, index);
+                pane.socket.clone_from(&origin.socket);
+                if pane.pane_id == "%2" {
+                    pane.workspace_id = Some("ws".into());
+                    pane.work_id = Some("W1".into());
+                    pane.agent_role = Some("reviewer".into());
+                }
+                pane
+            })
+            .collect();
+        let backend: SharedBackend = Arc::new(RegistrationBackend { panes });
+        let mailbox = muxa::collaboration::CollaborationStore::in_memory(
+            muxa::collaboration::CollaborationOptions::default(),
+        );
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let room = client.collaboration_context(&origin).await.unwrap();
+        mailbox
+            .set_purpose(&room.peers[0], muxa::collaboration::LaunchPurpose::Worker)
+            .await
+            .unwrap();
+        let tool = |target: &str| {
+            json!({"jsonrpc":"2.0", "id":1,"method":"tools/call",
+            "params":{"name":"muxa_call_peer","arguments":{
+                "target": target, "intent": "question", "body": "status?", "wait": false
+            },"_meta":{"threadId":"slot-sender"}}})
+        };
+        for (target, role) in [
+            ("ws/W1/reviewer", "reviewer"),
+            ("role:reviewer", "reviewer"),
+        ] {
+            let response = dispatch(&client, &tool(target)).await.unwrap();
+            assert!(
+                response["result"].get("isError").is_none(),
+                "{target}: {response}"
+            );
+            let sent: Value =
+                serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                    .unwrap();
+            let id = sent["request_id"].as_str().unwrap();
+            let stored = mailbox.get_for(&room.current, id).await.unwrap();
+            assert_eq!(stored.to.agent_session_id, "slot-reviewer", "{target}");
+            assert_eq!(
+                stored
+                    .to_slot
+                    .as_ref()
+                    .and_then(|slot| slot.role.as_deref()),
+                Some(role),
+                "{target} was not sent as a slot"
+            );
+        }
+        let _ = shutdown.send(());
+        daemon.await.unwrap();
     }
 
     #[tokio::test]

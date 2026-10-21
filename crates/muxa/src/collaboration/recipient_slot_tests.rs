@@ -387,3 +387,94 @@ async fn a_dispatch_retry_after_rebinding_matches_by_slot() {
         Err(CollaborationError::DispatchConflict(_))
     ));
 }
+
+fn on_server(mut participant: Participant, socket: &str) -> Participant {
+    participant.socket = Some(socket.into());
+    participant.room.socket = Some(socket.into());
+    participant
+}
+
+/// Work ids are per server. A worker with the same work on another rmux
+/// server never holds the slot, and its pane metadata is never borrowed.
+#[test]
+fn a_slot_is_held_only_on_its_own_server() {
+    let Scenario { mut panes, request } = scenario(true);
+    let mut elsewhere = pane("rmux:%600", "@163", Some("S1"), Some("reviewer"));
+    elsewhere.socket = Some("/tmp/rmux-other".into());
+    panes.push(elsewhere.clone());
+    let other_server = on_server(
+        agent(&elsewhere, "foreign-reviewer", WORKER),
+        "/tmp/rmux-other",
+    );
+    assert!(successor_for(&request, std::slice::from_ref(&other_server), &[], &panes).is_none());
+
+    // Same pane id on the slot's server but no scan row for that socket:
+    // the other server's row must not stand in for it.
+    let mut local = agent(&elsewhere, "local-reviewer", WORKER);
+    local.socket = Some("default".into());
+    assert!(!request.to_slot.as_ref().unwrap().held_by(&local, &panes));
+}
+
+/// A registered identity replaces the launch mark: an agent re-roled from
+/// reviewer to implementer no longer answers to `…/reviewer`.
+#[test]
+fn a_stale_launch_role_does_not_hold_a_slot() {
+    let sender_pane = pane("rmux:%4", "@4", None, None);
+    let sender = agent(&sender_pane, "coordinator", LaunchPurpose::Primary);
+    let marked = pane("rmux:%7", "@9", Some("CAL-8111"), Some("reviewer"));
+    let mut reroled = agent(&marked, "s", WORKER);
+    reroled.roles = vec!["implementer".into()];
+    let panes = vec![sender_pane, marked];
+    assert!(matches!(
+        resolve_slot_path(
+            &sender,
+            "callabo/CAL-8111/reviewer",
+            &[reroled.clone()],
+            &panes
+        ),
+        Some(Err(CollaborationError::UnknownTarget(_)))
+    ));
+    assert!(
+        resolve_slot_path(&sender, "callabo/CAL-8111/implementer", &[reroled], &panes)
+            .unwrap()
+            .is_ok()
+    );
+}
+
+/// After a work's window is recreated the slot carries a new window id;
+/// a retry is still the same request, matched by durable work identity.
+#[tokio::test]
+async fn a_dispatch_retry_survives_a_recreated_work_window() {
+    let store = CollaborationStore::in_memory(CollaborationOptions::default());
+    let sender_pane = pane("rmux:%4", "@4", None, None);
+    let old_pane = pane("rmux:%414", "@163", Some("S1"), Some("reviewer"));
+    let new_pane = pane("rmux:%600", "@200", Some("S1"), Some("reviewer"));
+    let sender = agent(&sender_pane, "coordinator", LaunchPurpose::Primary);
+    let old = agent(&old_pane, "old-reviewer", WORKER);
+    let fresh = agent(&new_pane, "new-reviewer", WORKER);
+    let input = |slot_of: &Participant, slot_pane: &PaneInfo| NewRequest {
+        dispatch_id: Some("7a6b3a9e-2f61-4f0e-9a51-6f7c2f6a8d10".into()),
+        body: "review S1".into(),
+        recipient_slot: Some(RecipientSlot::of(
+            slot_of,
+            std::slice::from_ref(slot_pane),
+            Some("reviewer"),
+            None,
+        )),
+        ..NewRequest::default()
+    };
+    let sent = store
+        .create(sender.clone(), old.clone(), input(&old, &old_pane))
+        .await
+        .unwrap();
+    store
+        .rebind_recipient(&sent.id, &old, fresh.clone())
+        .await
+        .unwrap()
+        .unwrap();
+    let retried = store
+        .create(sender, fresh.clone(), input(&fresh, &new_pane))
+        .await
+        .unwrap();
+    assert_eq!(retried.id, sent.id);
+}
