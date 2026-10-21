@@ -14,11 +14,19 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 자동·provider·role 선택은 `worker`만 대상으로 합니다. 사전에 에이전트 생성이
 허용된 `spawn_if_missing=true` 경로로 만든 peer는 worker입니다. 일반 start와
 Work pipeline은 기본적으로 primary이며 별도 worker pool을 만들지 않습니다.
+peer 요청에 답하는 것이 역할인 pipeline 에이전트(구현자·리뷰어 등)에는
+`purpose = "worker"`를 지정합니다.
 
 전용 worker는 `muxa start --agent claude --purpose worker`로 실행하거나 해당 세션에서
 `muxa identity purpose worker`로 지정합니다. `primary`로 다시 변경할 수 있습니다.
 목적은 정확한 provider 세션에 저장하며 pane, role, alias나 새 세션으로 상속하지
 않습니다. 새 worker의 첫 세션만 실제 CLI 프로세스에 한 번 결합합니다.
+
+운영자 터미널(에이전트 pane이 아닌 곳)에서는 `muxa identity purpose worker --session ID`로
+살아 있는 특정 에이전트 세션을 지정할 수 있습니다. purpose 도입 전에 띄운 worker의
+요청이 대기열에 묶여 있을 때 씁니다. 호출 프로세스가 에이전트 pane 안에 있으면 거부하므로,
+에이전트는 자기 purpose만 바꿀 수 있습니다. 승격된 세션의 대기 요청은 다시 보내지 않아도
+다음 idle 때 전달됩니다.
 
 pane·alias로 primary를 직접 지정한 요청도 대기합니다. 작업을 받아도 될 때
 `muxa msg accept REQUEST --json` 또는 `muxa_inbox(request_id=REQUEST)`로 하나만

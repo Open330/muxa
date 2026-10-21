@@ -140,6 +140,7 @@ mod tests {
                 options: Vec::new(),
                 direction: None,
                 after: Vec::new(),
+                purpose: muxa::collaboration::LaunchPurpose::Primary,
             }],
             cwd: PathBuf::from("/tmp"),
             window_id: None,

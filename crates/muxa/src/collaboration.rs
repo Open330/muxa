@@ -6,7 +6,7 @@
 
 mod purpose;
 use purpose::{load_purposes, PurposeGrant};
-pub use purpose::{LaunchPurpose, HUMAN_PRIORITY_CAPABILITY};
+pub use purpose::{LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PURPOSE_PROMOTE_CAPABILITY};
 
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
@@ -7951,6 +7951,8 @@ mod tests {
 
 #[cfg(test)]
 mod database_tests;
+#[cfg(test)]
+mod purpose_promote_tests;
 mod recovery;
 #[cfg(test)]
 mod reply_wake_tests;

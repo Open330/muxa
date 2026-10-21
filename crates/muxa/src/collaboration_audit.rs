@@ -37,6 +37,7 @@ pub enum CollaborationAuditOperation {
     Peek,
     Wait,
     Cancel,
+    PromotePurpose,
     WithdrawReplyWakes,
 }
 

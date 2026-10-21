@@ -253,12 +253,14 @@ prompt  = 'You own the approach. Write the plan first; do not edit code.'
 alias   = 'impl'
 program = 'codex'
 role    = 'implementer'
+purpose = 'worker'
 prompt  = 'You own the implementation. Follow the planner.'
 
 [[pipeline.triad.agent]]
 alias   = 'review'
 program = 'claude'
 role    = 'reviewer'
+purpose = 'worker'
 prompt  = 'You own review. Critique the implementer; do not edit.'
 ```
 
@@ -271,7 +273,10 @@ them.
 The pipeline's `prompt` is context every agent needs, stated once; each
 agent's own `prompt` is appended to it. `role` is recorded on the pane too,
 so peers can address an agent as `role:reviewer` through the collaboration
-layer.
+layer. `purpose = 'worker'` lets an agent take peer requests on its own;
+without it the pane launches `primary`, protected like a human session, and
+requests sent to it wait until someone accepts them (see
+[Human task priority](COLLABORATION.md#human-task-priority)).
 
 `layout` is applied only after every pane exists — splitting a window
 repeatedly halves whichever pane happened to be active, so geometry is worth

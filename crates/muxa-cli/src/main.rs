@@ -917,8 +917,15 @@ enum WorkspaceCmd {
 #[derive(Debug, Subcommand)]
 enum IdentityCmd {
     /// Set this exact session to primary (protected) or worker.
+    ///
+    /// With `--session`, the operator sets exact live agent sessions
+    /// instead, for example muxa-launched workers that predate purposes.
+    /// Refused when run from inside an agent's pane.
     Purpose {
         purpose: muxa::collaboration::LaunchPurpose,
+        /// Agent session id to set (operator only). Repeatable.
+        #[arg(long = "session", value_name = "SESSION_ID")]
+        sessions: Vec<String>,
     },
     /// Show this agent's current identity and room peers.
     Show {
@@ -1900,9 +1907,15 @@ async fn cmd_peers(client: &Client, json: bool) -> Result<()> {
 }
 
 async fn cmd_identity(client: &Client, action: IdentityCmd) -> Result<()> {
+    // Operator promotion names its targets; it has no origin of its own.
+    if let IdentityCmd::Purpose { purpose, sessions } = &action {
+        if !sessions.is_empty() {
+            return cmd_promote_purpose(client, sessions, *purpose).await;
+        }
+    }
     let origin = collaboration_origin(client).await?;
     let (room, json) = match action {
-        IdentityCmd::Purpose { purpose } => {
+        IdentityCmd::Purpose { purpose, .. } => {
             require_capability(
                 client,
                 muxa::collaboration::HUMAN_PRIORITY_CAPABILITY,
@@ -2062,6 +2075,30 @@ fn participant_matches_window(participant: &Participant, wanted: &str) -> bool {
         .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
         || participant.room.window_id.eq_ignore_ascii_case(wanted)
         || participant_location(participant).eq_ignore_ascii_case(wanted)
+}
+
+async fn cmd_promote_purpose(
+    client: &Client,
+    sessions: &[String],
+    purpose: muxa::collaboration::LaunchPurpose,
+) -> Result<()> {
+    require_capability(
+        client,
+        muxa::collaboration::PURPOSE_PROMOTE_CAPABILITY,
+        "identity purpose --session",
+    )
+    .await?;
+    client
+        .collaboration_promote_purpose(sessions, purpose)
+        .await?;
+    let label = serde_json::to_value(purpose)?;
+    for session in sessions {
+        println!(
+            "purpose: {}  {session}",
+            label.as_str().unwrap_or("primary")
+        );
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_lines)] // explicit message subcommand dispatch keeps output compatibility visible

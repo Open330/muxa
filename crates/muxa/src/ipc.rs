@@ -596,6 +596,13 @@ enum RequestBody {
         origin: CollaborationOrigin,
         purpose: collaboration::LaunchPurpose,
     },
+    /// Operator act: set the purpose of exact live agent sessions. Refused
+    /// when the caller process runs inside an agent's pane, so an agent can
+    /// change only its own purpose (through `CollaborationPurpose`).
+    CollaborationPromotePurpose {
+        session_ids: Vec<String>,
+        purpose: collaboration::LaunchPurpose,
+    },
     CollaborationWorkerLaunch {
         pane: String,
         socket: Option<String>,
@@ -818,6 +825,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_update",
     "collaboration_peer_recovery",
     collaboration::HUMAN_ACTIONS_CAPABILITY,
+    collaboration::PURPOSE_PROMOTE_CAPABILITY,
     collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
     "pipeline_runs_v1",
     "pipeline_subscribe",
@@ -2726,6 +2734,57 @@ async fn collaboration_participants(
     }
 }
 
+/// The live sessions an operator promotion names, or why it is refused.
+///
+/// The caller must be provably outside every agent pane: its process is
+/// traced to a pane by credentials, not by what it claims. Each id must name
+/// exactly one live agent session; a missing or ambiguous one refuses the
+/// whole operation.
+fn promote_purpose_targets(
+    topology: &CollaborationTopology,
+    actor: &CollaborationConnectionActor,
+    session_ids: &[String],
+) -> Result<Vec<collaboration::Participant>, String> {
+    if actor.caller_pid.is_none() {
+        return Err("cannot verify the caller process; run this from an operator terminal".into());
+    }
+    if let Some(pane) = actor.observed_pane.as_deref() {
+        let same_pane =
+            |candidate: &str| candidate == pane || candidate.rsplit(':').next() == Some(pane);
+        let agent_pane = topology
+            .participants
+            .iter()
+            .any(|participant| same_pane(&participant.pane))
+            || topology.agents.iter().any(|agent| {
+                agent.state != crate::AgentState::Stopped
+                    && agent.pane.as_deref().is_some_and(same_pane)
+            });
+        if agent_pane {
+            return Err(format!(
+                "refused: this command runs inside agent pane {pane}; an agent may change only its own purpose (`muxa identity purpose`)"
+            ));
+        }
+    }
+    if session_ids.is_empty() {
+        return Err("name at least one agent session id".into());
+    }
+    session_ids
+        .iter()
+        .map(|id| {
+            let matches: Vec<_> = topology
+                .participants
+                .iter()
+                .filter(|participant| participant.agent_session_id == *id && !participant.console)
+                .collect();
+            match matches.as_slice() {
+                [participant] => Ok((*participant).clone()),
+                [] => Err(format!("no live agent session {id}")),
+                _ => Err(format!("agent session {id} is ambiguous across panes")),
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 struct CollaborationConnectionActor {
     client_kind: CollaborationClientKind,
@@ -4354,6 +4413,48 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     }
+                }
+                RequestBody::CollaborationPromotePurpose {
+                    session_ids,
+                    purpose,
+                } => {
+                    kind = "collaboration_promote_purpose";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration, None).await;
+                    let origin = CollaborationOrigin {
+                        pane: collaboration_actor
+                            .observed_pane
+                            .clone()
+                            .unwrap_or_default(),
+                        socket: None,
+                        console: true,
+                        agent_session_id: None,
+                    };
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::PromotePurpose,
+                        origin,
+                    );
+                    audit_context.request_id = session_ids.first().cloned();
+                    let response = match promote_purpose_targets(
+                        &topology,
+                        &collaboration_actor,
+                        &session_ids,
+                    ) {
+                        Ok(targets) => match collaboration.set_purposes(&targets, purpose).await {
+                            Ok(()) => Response::ok(),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error),
+                    };
+                    record_collaboration_audit(
+                        &collaboration_audit,
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    )
+                    .await;
+                    response
                 }
                 RequestBody::CollaborationWorkerLaunch {
                     pane,
@@ -6392,6 +6493,18 @@ impl Client {
         serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Operator: set the purpose of exact live agent sessions.
+    pub async fn collaboration_promote_purpose(
+        &self,
+        session_ids: &[String],
+        purpose: collaboration::LaunchPurpose,
+    ) -> Result<(), RuntimeError> {
+        self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,
+            "kind":"collaboration_promote_purpose", "session_ids":session_ids, "purpose":purpose}))
+            .await?;
+        Ok(())
+    }
+
     pub async fn collaboration_purpose(
         &self,
         origin: &CollaborationOrigin,
@@ -7163,6 +7276,93 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn promote_topology(panes: &[(&str, &str)]) -> CollaborationTopology {
+        CollaborationTopology {
+            participants: panes
+                .iter()
+                .map(|(pane, session)| collaboration::Participant {
+                    agent_kind: crate::event::AgentKind::Codex,
+                    agent_session_id: (*session).into(),
+                    pane: (*pane).into(),
+                    socket: Some("default".into()),
+                    room: collaboration::RoomId {
+                        host: "rmux".into(),
+                        socket: Some("default".into()),
+                        window_id: "@1".into(),
+                    },
+                    tmux_session_id: None,
+                    tmux_session_name: None,
+                    window_name: None,
+                    state: crate::AgentState::Idle,
+                    cwd: None,
+                    alias: None,
+                    roles: Vec::new(),
+                    console: false,
+                    launch_purpose: collaboration::LaunchPurpose::Primary,
+                })
+                .collect(),
+            panes: Vec::new(),
+            agents: Vec::new(),
+        }
+    }
+
+    fn promote_actor(
+        pid: Option<u32>,
+        observed_pane: Option<&str>,
+    ) -> CollaborationConnectionActor {
+        CollaborationConnectionActor {
+            client_kind: CollaborationClientKind::Cli,
+            caller_pid: pid,
+            caller_uid: None,
+            caller_gid: None,
+            executable: None,
+            observed_pane: observed_pane.map(str::to_string),
+            pane_evidence: None,
+            pane_observed: true,
+        }
+    }
+
+    /// Operator promotion is only for the operator: a caller whose process
+    /// sits in an agent's pane is refused, whatever it claims, and every
+    /// named session must resolve to exactly one live agent.
+    #[test]
+    fn purpose_promotion_requires_an_operator_caller_and_exact_sessions() {
+        let topology = promote_topology(&[
+            ("rmux:%5", "worker"),
+            ("rmux:%6", "twin"),
+            ("rmux:%7", "twin"),
+        ]);
+        let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+
+        let from_agent = promote_actor(Some(42), Some("%5"));
+        assert!(
+            promote_purpose_targets(&topology, &from_agent, &ids(&["worker"]))
+                .unwrap_err()
+                .contains("agent pane")
+        );
+        assert!(
+            promote_purpose_targets(&topology, &promote_actor(None, None), &ids(&["worker"]))
+                .is_err()
+        );
+
+        let operator = promote_actor(Some(42), Some("%9"));
+        let targets = promote_purpose_targets(&topology, &operator, &ids(&["worker"])).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].pane, "rmux:%5");
+        assert!(promote_purpose_targets(
+            &topology,
+            &promote_actor(Some(42), None),
+            &ids(&["worker"])
+        )
+        .is_ok());
+        for bad in [ids(&["worker", "missing"]), ids(&["twin"]), ids(&[])] {
+            assert!(
+                promote_purpose_targets(&topology, &operator, &bad).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
     use crate::event::{AgentEvent, AgentId, AgentKind, AgentState};
     use crate::state::Store;
     use std::collections::HashMap;
@@ -8481,6 +8681,7 @@ mod tests {
             options: Vec::new(),
             direction: None,
             after,
+            purpose: crate::collaboration::LaunchPurpose::Primary,
         };
         let identity = WorkIdentity::new("ws", "WORK-1");
         let client = Client::new(sock.clone());

@@ -90,6 +90,7 @@ async fn pipeline_reads(count: usize) {
                     options: Vec::new(),
                     direction: None,
                     after: Vec::new(),
+                    purpose: muxa::collaboration::LaunchPurpose::Primary,
                 }],
                 cwd: "/tmp".into(),
                 window_id: None,

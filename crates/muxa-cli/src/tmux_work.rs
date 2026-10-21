@@ -2139,6 +2139,7 @@ mod work_list_view_tests {
                     options: Vec::new(),
                     direction: None,
                     after: Vec::new(),
+                    purpose: muxa::collaboration::LaunchPurpose::Primary,
                 })
                 .collect(),
             cwd: PathBuf::from("/repo"),
@@ -2200,6 +2201,7 @@ mod work_list_view_tests {
                 options: Vec::new(),
                 direction: None,
                 after,
+                purpose: muxa::collaboration::LaunchPurpose::Primary,
             })
             .collect();
         let state = |alias: &str, status, completion_generation| PipelineAliasState {

@@ -608,6 +608,14 @@ pub struct DesiredAgent {
     /// Aliases that must report done before this one may start.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub after: Vec<String>,
+    /// Purpose the pane launches with. Absent on the wire means primary.
+    #[serde(default, skip_serializing_if = "is_primary")]
+    pub purpose: crate::collaboration::LaunchPurpose,
+}
+
+#[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
+fn is_primary(purpose: &crate::collaboration::LaunchPurpose) -> bool {
+    *purpose == crate::collaboration::LaunchPurpose::Primary
 }
 
 /// Render a pipeline into the panes it asks for.
@@ -727,6 +735,7 @@ fn render_agent(
         prompt,
         options: agent.options.clone(),
         direction: agent.direction.clone(),
+        purpose: agent.purpose.unwrap_or_default(),
         after: agent
             .after
             .iter()
@@ -1218,6 +1227,40 @@ role = 'reviewer'
         );
     }
 
+    /// A pipeline declares which panes are peer workers; everything else
+    /// launches protected, as before the field existed.
+    #[test]
+    fn pipeline_agents_carry_their_declared_purpose() {
+        use crate::collaboration::LaunchPurpose;
+        let config: Config = toml::from_str(
+            r"
+[[pipeline.p.agent]]
+alias = 'implementer'
+program = 'codex'
+purpose = 'worker'
+
+[[pipeline.p.agent]]
+alias = 'lead'
+program = 'claude'
+",
+        )
+        .unwrap();
+        let agents = desired_agents("p", &config.pipeline["p"], &Vars::new()).unwrap();
+        assert_eq!(agents[0].purpose, LaunchPurpose::Worker);
+        assert_eq!(agents[1].purpose, LaunchPurpose::Primary);
+
+        // A Run recorded before the field existed reads back as primary,
+        // and a primary agent keeps the old wire shape.
+        let wire = serde_json::to_value(&agents[1]).unwrap();
+        assert!(wire.get("purpose").is_none());
+        let old: DesiredAgent = serde_json::from_value(wire).unwrap();
+        assert_eq!(old.purpose, LaunchPurpose::Primary);
+        assert!(toml::from_str::<Config>(
+            "[[pipeline.p.agent]]\nalias = 'a'\nprogram = 'codex'\npurpose = 'boss'\n"
+        )
+        .is_err());
+    }
+
     #[test]
     fn a_template_that_places_the_request_is_not_double_fed() {
         let config: Config = toml::from_str(
@@ -1303,6 +1346,7 @@ program = 'claude'
                 options: Vec::new(),
                 direction: None,
                 after: Vec::new(),
+                purpose: crate::collaboration::LaunchPurpose::Primary,
             })
             .collect()
     }
@@ -1342,6 +1386,7 @@ program = 'claude'
             options: Vec::new(),
             direction: None,
             after: after.iter().map(|a| (*a).to_string()).collect(),
+            purpose: crate::collaboration::LaunchPurpose::Primary,
         }
     }
 

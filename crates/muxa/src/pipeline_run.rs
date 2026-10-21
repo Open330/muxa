@@ -999,6 +999,7 @@ mod tests {
             options: Vec::new(),
             direction: None,
             after: after.iter().map(|value| (*value).to_string()).collect(),
+            purpose: crate::collaboration::LaunchPurpose::Primary,
         }
     }
 
