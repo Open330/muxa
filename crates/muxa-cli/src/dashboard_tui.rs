@@ -2934,6 +2934,7 @@ async fn collaboration_send(
         links: Vec::new(),
         air_artifacts: Vec::new(),
         withdraw_reply_wakes: Vec::new(),
+        recipient_slot: None,
     };
     match client.collaboration_send(&origin, &target, &request).await {
         Ok(request) => ActionOutcome::Ok(format!(
@@ -5336,6 +5337,8 @@ mod tests {
             reply_wake: None,
             reply: None,
             withdrew_reply_wakes: Vec::new(),
+            rebound_from: Vec::new(),
+            to_slot: None,
         }
     }
 

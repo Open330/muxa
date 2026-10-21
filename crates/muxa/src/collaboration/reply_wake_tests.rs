@@ -522,6 +522,8 @@ fn legacy_request(pair: &Pair) -> CollaborationRequest {
         reply_read_at: None,
         reply_wake: None,
         reply: None,
+        rebound_from: Vec::new(),
+        to_slot: None,
     }
 }
 

@@ -170,6 +170,15 @@ argument로 발신 pane을 임의 지정하지 않습니다.
   같은 room 안에서만 찾으며, 다른 서버에 같은 pane ID가 있으면 모호한 대상으로 거부합니다.
 - 요청은 pane뿐 아니라 현재 agent session에도 고정됩니다. pane을 새 agent가
   재사용해도 이전 요청을 받지 않습니다.
+- pane이 아니라 "이 작업의 이 역할"에게 보내려면 경로를 씁니다:
+  `workspace/work/role`, `workspace/work/role@alias`, `workspace/work/@alias`
+  (예: `muxa msg send callabo/CAL-8111/implementer "진행 상황?"`). 살아 있는 agent
+  하나와 정확히 일치해야 하며 pane 대상과 같은 scope 규칙을 따릅니다.
+- 경로·`@alias`·`role:`로 보낸 요청은 슬롯을 기억합니다. 아직 전달되기 전(미수신, 알림
+  전)이라면 같은 세션이 다른 pane으로 옮겼을 때 그 세션을, 원래 세션이 사라졌을 때는
+  그 슬롯의 살아 있는 worker 하나를 따라갑니다. 이미 전달된 요청은 옮기지 않고, 후보가
+  여럿이면 고르지 않으며, 보호된 primary로는 보내지 않습니다. pane 대상은 같은 세션의
+  pane 이동만 따라갑니다.
 
 확인:
 

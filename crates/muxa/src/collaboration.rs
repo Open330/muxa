@@ -165,8 +165,16 @@ fn dispatch_matches(
     input: &NewRequest,
     body: &str,
 ) -> bool {
+    // A request that followed its slot is matched by that slot: a retry
+    // resolves the slot afresh and may reach the successor. Two different
+    // slots are different requests even when they reach the same session.
+    let same_slot = match (&existing.to_slot, &input.recipient_slot) {
+        (Some(existing), Some(retry)) => Some(existing.same_slot(retry)),
+        _ => None,
+    };
     existing.from.same_endpoint(from)
-        && (existing.to.same_endpoint(to) || addresses(&existing.to, to))
+        && same_slot != Some(false)
+        && (existing.to.same_endpoint(to) || addresses(&existing.to, to) || same_slot == Some(true))
         && existing.kind == input.kind
         && existing.body == body
         && existing.expects_reply == input.expects_reply
@@ -865,6 +873,15 @@ pub struct CollaborationRequest {
         with = "time::serde::rfc3339::option"
     )]
     pub reply_read_at: Option<OffsetDateTime>,
+    /// The logical slot the sender addressed (`@alias`, `role:`, or a
+    /// `workspace/work/role` path), next to the session it resolved to.
+    /// Absent for pane targets, which pin one session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_slot: Option<RecipientSlot>,
+    /// Sessions this request was addressed to before it followed its
+    /// recipient (a moved session, or a successor in its slot), oldest first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rebound_from: Vec<String>,
     /// Whether the sender is still owed a wake for the terminal reply. Rows
     /// written before this field existed derive it from the two timestamps
     /// above on load.
@@ -1036,6 +1053,10 @@ pub struct NewRequest {
     /// the earlier work and its reply are untouched.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub withdraw_reply_wakes: Vec<String>,
+    /// Set by the daemon when the target was a logical slot; never read
+    /// from a client.
+    #[serde(skip)]
+    pub recipient_slot: Option<RecipientSlot>,
 }
 
 impl Default for NewRequest {
@@ -1061,7 +1082,220 @@ impl Default for NewRequest {
             links: Vec::new(),
             air_artifacts: Vec::new(),
             withdraw_reply_wakes: Vec::new(),
+            recipient_slot: None,
         }
+    }
+}
+
+/// A logical recipient: whoever holds `role` and/or `alias` in one work
+/// window. A request addressed this way may follow the slot to a successor
+/// session while it is still undelivered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecipientSlot {
+    /// The window the slot lives in.
+    pub room: RoomId,
+    /// Durable work identity of that window, when muxa manages it. Preferred
+    /// over `room`, whose window id does not survive a server restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+impl RecipientSlot {
+    /// The slot `recipient` occupies for a role or alias selector.
+    pub fn of(
+        recipient: &Participant,
+        panes: &[PaneInfo],
+        role: Option<&str>,
+        alias: Option<&str>,
+    ) -> Self {
+        let pane = pane_of(recipient, panes);
+        Self {
+            room: recipient.room.clone(),
+            workspace_id: pane.and_then(|pane| pane.workspace_id.clone()),
+            work_id: pane.and_then(|pane| pane.work_id.clone()),
+            role: role.map(str::to_string),
+            alias: alias.map(str::to_string),
+        }
+    }
+
+    /// Whether `participant` holds this slot now.
+    ///
+    /// Always on the slot's own server: work ids are only unique per
+    /// server. Within it, the durable work identity when the slot has one
+    /// (a recreated window keeps it), else the exact window. Roles come from
+    /// the participant, which is already seeded from the launch mark and
+    /// overridden by any registered identity.
+    pub fn held_by(&self, participant: &Participant, panes: &[PaneInfo]) -> bool {
+        if participant.console
+            || participant.room.host != self.room.host
+            || participant.room.socket != self.room.socket
+        {
+            return false;
+        }
+        let in_work = match (self.workspace_id.as_deref(), self.work_id.as_deref()) {
+            (Some(workspace), Some(work)) => pane_of(participant, panes).is_some_and(|pane| {
+                pane.workspace_id.as_deref() == Some(workspace)
+                    && pane.work_id.as_deref() == Some(work)
+            }),
+            _ => participant.room == self.room,
+        };
+        let role = self.role.as_deref().is_none_or(|role| {
+            participant
+                .roles
+                .iter()
+                .any(|held| held.eq_ignore_ascii_case(role))
+        });
+        let alias = self.alias.as_deref().is_none_or(|alias| {
+            participant
+                .alias
+                .as_deref()
+                .is_some_and(|held| held.eq_ignore_ascii_case(alias))
+        });
+        in_work && role && alias
+    }
+
+    /// Whether two slots name the same logical recipient: same server, same
+    /// durable work (or the same window when there is none), same role and
+    /// alias. The window id alone may differ after a work's window is
+    /// recreated.
+    pub fn same_slot(&self, other: &Self) -> bool {
+        let text_eq = |left: Option<&str>, right: Option<&str>| match (left, right) {
+            (Some(left), Some(right)) => left.eq_ignore_ascii_case(right),
+            (None, None) => true,
+            _ => false,
+        };
+        let durable = |slot: &Self| slot.workspace_id.is_some() && slot.work_id.is_some();
+        let same_work = if durable(self) && durable(other) {
+            self.workspace_id == other.workspace_id && self.work_id == other.work_id
+        } else {
+            self.room == other.room
+        };
+        self.room.host == other.room.host
+            && self.room.socket == other.room.socket
+            && same_work
+            && text_eq(self.role.as_deref(), other.role.as_deref())
+            && text_eq(self.alias.as_deref(), other.alias.as_deref())
+    }
+}
+
+/// The pane scan row for `participant`. Matched on its socket too, because
+/// pane ids repeat across servers; only a participant with no known socket
+/// falls back to the pane id alone.
+fn pane_of<'p>(participant: &Participant, panes: &'p [PaneInfo]) -> Option<&'p PaneInfo> {
+    panes.iter().find(|pane| {
+        pane.pane_id == participant.pane
+            && (participant.socket.is_none() || pane.socket == participant.socket)
+    })
+}
+
+/// Parse `workspace/work/role`, `workspace/work/role@alias` or
+/// `workspace/work/@alias`. Anything else is not a slot path.
+pub fn parse_slot_path(selector: &str) -> Option<(String, String, Option<String>, Option<String>)> {
+    if crate::backend::pane_id_host_kind(selector).is_some() || selector.starts_with("pane:") {
+        return None;
+    }
+    let mut parts = selector.split('/');
+    let (workspace, work, holder) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || workspace.is_empty() || work.is_empty() || holder.is_empty() {
+        return None;
+    }
+    let (role, alias) = match holder.split_once('@') {
+        Some((role, alias)) => (role, Some(alias)),
+        None => (holder, None),
+    };
+    let role = (!role.is_empty()).then(|| role.to_string());
+    let alias = alias.filter(|alias| !alias.is_empty()).map(str::to_string);
+    if role.is_none() && alias.is_none() {
+        return None;
+    }
+    Some((workspace.to_string(), work.to_string(), role, alias))
+}
+
+/// Resolve a `workspace/work/role[@alias]` path to the one live agent that
+/// holds it, with the slot to record on the request.
+///
+/// # Errors
+/// Unknown when no live agent holds the slot, ambiguous when several do.
+pub fn resolve_slot_path(
+    sender: &Participant,
+    selector: &str,
+    participants: &[Participant],
+    panes: &[PaneInfo],
+) -> Option<Result<(Participant, RecipientSlot), CollaborationError>> {
+    let (workspace, work, role, alias) = parse_slot_path(selector)?;
+    let probe = RecipientSlot {
+        room: sender.room.clone(),
+        workspace_id: Some(workspace),
+        work_id: Some(work),
+        role,
+        alias,
+    };
+    let matches: Vec<_> = participants
+        .iter()
+        .filter(|candidate| !candidate.same_endpoint(sender) && probe.held_by(candidate, panes))
+        .collect();
+    Some(match matches.as_slice() {
+        [recipient] => {
+            let mut slot = probe.clone();
+            slot.room = recipient.room.clone();
+            Ok(((*recipient).clone(), slot))
+        }
+        [] => Err(CollaborationError::UnknownTarget(selector.to_string())),
+        _ => Err(CollaborationError::AmbiguousTarget(selector.to_string())),
+    })
+}
+
+/// Where an undelivered request should go now that its pinned recipient is
+/// gone, if anywhere.
+///
+/// Follows the same session when it moved to another pane (a restore, a
+/// relocation): that is the same recipient. Otherwise, for a slot-addressed
+/// request only, the one live worker now holding the slot. Never when the
+/// pinned session still has a live registry row (it may only be momentarily
+/// out of the pane scan), and never to a choice between several.
+pub fn successor_for(
+    request: &CollaborationRequest,
+    participants: &[Participant],
+    agents: &[Agent],
+    panes: &[PaneInfo],
+) -> Option<Participant> {
+    let pinned = &request.to;
+    if pinned.console
+        || is_pending_session(&pinned.agent_session_id)
+        || participants.iter().any(|p| p.same_endpoint(pinned))
+    {
+        return None;
+    }
+    let moved: Vec<_> = participants
+        .iter()
+        .filter(|p| !p.console && p.same_session(pinned))
+        .collect();
+    if let [moved] = moved.as_slice() {
+        return Some((*moved).clone());
+    }
+    if !moved.is_empty()
+        || agents.iter().any(|agent| {
+            agent.session_id == pinned.agent_session_id && agent.state != AgentState::Stopped
+        })
+    {
+        return None;
+    }
+    let slot = request.to_slot.as_ref()?;
+    let holders: Vec<_> = participants
+        .iter()
+        .filter(|p| {
+            !p.same_endpoint(&request.from) && p.accepts_peer_work() && slot.held_by(p, panes)
+        })
+        .collect();
+    match holders.as_slice() {
+        [successor] => Some((*successor).clone()),
+        _ => None,
     }
 }
 
@@ -2507,6 +2741,8 @@ impl CollaborationStore {
             links: input.links,
             air_artifacts: input.air_artifacts,
             withdrew_reply_wakes: withdrawals,
+            to_slot: input.recipient_slot,
+            rebound_from: Vec::new(),
             status: RequestStatus::Queued,
             created_at: now,
             claimed_at: None,
@@ -3266,6 +3502,69 @@ impl CollaborationStore {
             .filter(|request| request.needs_human_response() && request.notified_at.is_none())
             .cloned()
             .collect()
+    }
+
+    /// Requests that have not reached their recipient in any way yet:
+    /// queued, unclaimed, not notified and with no direct wake in progress.
+    /// Includes quiet ones that never wake anybody, which still need to
+    /// follow a recipient that moved or was replaced.
+    pub async fn undelivered_requests(&self) -> Vec<CollaborationRequest> {
+        let _transaction = self.transaction_lock.lock().await;
+        self.requests
+            .read()
+            .await
+            .values()
+            .filter(|request| {
+                request.status == RequestStatus::Queued
+                    && request.claimed_at.is_none()
+                    && request.notified_at.is_none()
+                    && request.wake_delivery.is_none()
+                    && !request.to.console
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Readdress an undelivered request from the recipient it was pinned to
+    /// (`from`) to `to`, as chosen by [`successor_for`].
+    ///
+    /// Only before any delivery evidence: still queued, never claimed,
+    /// notified or part-way through a direct wake, and still pinned to
+    /// `from` (a concurrent change wins). Returns the updated request, or
+    /// `None` when it no longer qualifies. The sender, contract, ids and
+    /// thread are untouched; the old session is kept in `rebound_from`.
+    pub async fn rebind_recipient(
+        &self,
+        request_id: &str,
+        from: &Participant,
+        to: Participant,
+    ) -> Result<Option<CollaborationRequest>, CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let previous = self.requests.read().await.clone();
+        let rebound = {
+            let mut requests = self.requests.write().await;
+            let Some(request) = requests.get_mut(request_id) else {
+                return Ok(None);
+            };
+            if request.status != RequestStatus::Queued
+                || request.claimed_at.is_some()
+                || request.notified_at.is_some()
+                || request.wake_delivery.is_some()
+                || !request.to.same_endpoint(from)
+                || to.console
+            {
+                return Ok(None);
+            }
+            let old = std::mem::replace(&mut request.to, to);
+            request.rebound_from.push(old.agent_session_id);
+            request.clone()
+        };
+        if let Err(error) = self.persist_requests(std::slice::from_ref(&rebound)) {
+            *self.requests.write().await = previous;
+            return Err(error);
+        }
+        self.publish_change();
+        Ok(Some(rebound))
     }
 
     /// Replies still owed a wake to their sender, oldest reply first.
@@ -8071,6 +8370,8 @@ mod tests {
 mod database_tests;
 #[cfg(test)]
 mod purpose_promote_tests;
+#[cfg(test)]
+mod recipient_slot_tests;
 mod recovery;
 #[cfg(test)]
 mod reply_wake_tests;

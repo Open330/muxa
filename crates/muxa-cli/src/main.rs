@@ -514,7 +514,8 @@ enum MsgCmd {
         #[arg(long)]
         json: bool,
     },
-    /// Send to `peer`, `%N`, `@alias`, or `role:<role>`.
+    /// Send to `peer`, `%N`, `@alias`, `role:<role>`, or a
+    /// `workspace/work/role[@alias]` path.
     Send {
         target: String,
         body: String,
@@ -2225,6 +2226,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         artifacts,
                         links,
                         withdraw_reply_wakes: withdraw,
+                        recipient_slot: None,
                     },
                 )
                 .await?;
@@ -5808,6 +5810,8 @@ mod tests {
             reply_wake: None,
             reply: None,
             withdrew_reply_wakes: Vec::new(),
+            rebound_from: Vec::new(),
+            to_slot: None,
         }
     }
 
