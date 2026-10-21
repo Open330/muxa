@@ -161,6 +161,18 @@ pub struct SaveStats {
 }
 
 async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<SaveStats> {
+    let payload = StateFile {
+        v: STATE_SCHEMA_VERSION,
+        saved_at: OffsetDateTime::now_utc(),
+        agents: agents.to_vec(),
+    };
+    let bytes = serde_json::to_vec(&payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    write_atomically(path, &bytes).await
+}
+
+/// Durably replace `path` with `bytes`: temp file, fsync, rename, fsync dir.
+async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<SaveStats> {
     let started = Instant::now();
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
@@ -175,14 +187,6 @@ async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<SaveStats> {
         .unwrap_or("state.json");
     let tmp = parent.join(format!(".{}.{}.tmp", basename, std::process::id()));
 
-    let payload = StateFile {
-        v: STATE_SCHEMA_VERSION,
-        saved_at: OffsetDateTime::now_utc(),
-        agents: agents.to_vec(),
-    };
-    let bytes = serde_json::to_vec(&payload)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
     {
         let mut opts = OpenOptions::new();
         opts.create(true).truncate(true).write(true);
@@ -193,7 +197,7 @@ async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<SaveStats> {
         #[cfg(unix)]
         opts.mode(STATE_FILE_MODE);
         let mut f = opts.open(&tmp).await?;
-        f.write_all(&bytes).await?;
+        f.write_all(bytes).await?;
         // fsync the body before the rename — we want the file's contents
         // durable before any crash window opens between rename and the
         // next write. The cost is a single fsync per debounce window
@@ -230,6 +234,60 @@ pub struct SnapshotterOptions {
     /// Coalescing window applied between a `dirty` wakeup and the actual
     /// disk write.
     pub debounce: Duration,
+    /// Longest a change confined to `last_activity_at` waits before it is
+    /// written. Activity stamps move on nearly every hook event and only
+    /// order and age agents after a restart, so they ride along with the
+    /// next material change or are flushed on this slower cadence.
+    pub activity_interval: Duration,
+}
+
+/// Default for [`SnapshotterOptions::activity_interval`].
+pub const DEFAULT_ACTIVITY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What the writer last put on disk, to decide whether a new snapshot is
+/// worth writing.
+#[derive(Default)]
+struct Written {
+    /// Serialized agents exactly as last written.
+    agents: Vec<u8>,
+    /// The same agents with every `last_activity_at` blanked.
+    material: Vec<u8>,
+}
+
+/// What a fresh snapshot needs, compared with the last write.
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    /// Byte-identical agents: nothing to write.
+    None,
+    /// Only activity stamps moved: may wait for the slow cadence.
+    ActivityOnly,
+    /// Anything else: write now.
+    Material,
+}
+
+fn serialize_agents(agents: &[Agent]) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
+    let to_bytes = |agents: &[Agent]| {
+        serde_json::to_vec(agents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+    };
+    let exact = to_bytes(agents)?;
+    let mut blanked = agents.to_vec();
+    for agent in &mut blanked {
+        agent.last_activity_at = OffsetDateTime::UNIX_EPOCH;
+    }
+    Ok((exact, to_bytes(&blanked)?))
+}
+
+impl Written {
+    fn classify(&self, exact: &[u8], material: &[u8]) -> Change {
+        if self.agents == exact {
+            Change::None
+        } else if self.material == material {
+            Change::ActivityOnly
+        } else {
+            Change::Material
+        }
+    }
 }
 
 /// Event-driven snapshot writer. Wakes on [`Store`](crate::state::Store)
@@ -247,6 +305,9 @@ pub struct Snapshotter {
     /// file) can construct a `Snapshotter` without weaving a `Metrics`
     /// through; the daemon always wires one in via [`Self::with_metrics`].
     metrics: Option<Metrics>,
+    written: Written,
+    /// When pending activity-only changes must be written by.
+    activity_due: Option<tokio::time::Instant>,
 }
 
 impl Snapshotter {
@@ -256,6 +317,8 @@ impl Snapshotter {
             dirty,
             opts,
             metrics: None,
+            written: Written::default(),
+            activity_due: None,
         }
     }
 
@@ -282,8 +345,9 @@ impl Snapshotter {
     /// wakeup thanks to `Notify`'s saturating-to-1 semantics, so a
     /// tool-heavy turn that fires four events in 1 ms produces exactly
     /// one disk write.
-    pub async fn run(self, mut shutdown: broadcast::Receiver<()>) {
+    pub async fn run(mut self, mut shutdown: broadcast::Receiver<()>) {
         loop {
+            let activity_due = self.activity_due;
             tokio::select! {
                 () = self.dirty.notified() => {
                     // Coalesce a burst of adjacent signals before
@@ -296,19 +360,25 @@ impl Snapshotter {
                         () = tokio::time::sleep(self.opts.debounce) => false,
                         _ = shutdown.recv() => true,
                     };
-                    self.flush().await;
+                    self.flush(early_shutdown).await;
                     if early_shutdown {
                         debug!("snapshotter shutting down");
                         return;
                     }
                 }
+                () = async {
+                    match activity_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.flush(true).await;
+                }
                 _ = shutdown.recv() => {
-                    // Shutdown with no pending dirty — still flush so the
-                    // file on disk matches the registry the daemon is
-                    // about to drop. Cheap when nothing changed (rewrites
-                    // the same bytes) and worth it for the consistency
-                    // guarantee on a clean restart.
-                    self.flush().await;
+                    // Shutdown with no pending dirty: flush anything held
+                    // back so the file on disk matches the registry the
+                    // daemon is about to drop.
+                    self.flush(true).await;
                     debug!("snapshotter shutting down");
                     return;
                 }
@@ -316,13 +386,40 @@ impl Snapshotter {
         }
     }
 
-    /// Snapshot the registry and write it through `save`. Errors are
-    /// logged but never propagated — a write failure shouldn't take down
+    /// Snapshot the registry and write it if it differs from the last
+    /// write. A change confined to activity stamps is held back until
+    /// `activity_interval` after it was first seen, unless `force`. Errors
+    /// are logged but never propagated: a write failure shouldn't take down
     /// the daemon, and the next dirty signal will retry naturally.
-    async fn flush(&self) {
+    async fn flush(&mut self, force: bool) {
         let agents = self.store.snapshot().await;
+        let (exact, material) = match serialize_agents(&agents) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!(error = %e, "state snapshot serialization failed");
+                return;
+            }
+        };
+        match self.written.classify(&exact, &material) {
+            Change::None => {
+                self.activity_due = None;
+                return;
+            }
+            Change::ActivityOnly if !force => {
+                self.activity_due.get_or_insert_with(|| {
+                    tokio::time::Instant::now() + self.opts.activity_interval
+                });
+                return;
+            }
+            Change::ActivityOnly | Change::Material => {}
+        }
         match save(&self.opts.path, &agents).await {
             Ok(stats) => {
+                self.written = Written {
+                    agents: exact,
+                    material,
+                };
+                self.activity_due = None;
                 if let Some(m) = &self.metrics {
                     m.record_snapshot_write(stats.elapsed);
                 }
@@ -494,6 +591,7 @@ mod tests {
                 // Long enough that all three apply() calls land before
                 // the writer wakes — that's the burst we want to coalesce.
                 debounce: Duration::from_millis(80),
+                activity_interval: DEFAULT_ACTIVITY_INTERVAL,
             },
         );
         let task = tokio::spawn(snapshotter.run(rx));
@@ -548,6 +646,7 @@ mod tests {
                 // Unrealistically long debounce so the only way the file
                 // appears is via the shutdown final-flush branch.
                 debounce: Duration::from_secs(60),
+                activity_interval: DEFAULT_ACTIVITY_INTERVAL,
             },
         );
         let task = tokio::spawn(snapshotter.run(rx));
@@ -582,5 +681,118 @@ mod tests {
         let after = store_b.snapshot().await;
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].session_id, "a");
+    }
+
+    fn tool_event(sid: &str, at: OffsetDateTime) -> AgentEvent {
+        AgentEvent::ToolStarted {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::ClaudeCode,
+                session_id: sid.into(),
+                surface: None,
+                pane: Some("%1".into()),
+                cwd: None,
+            },
+            tool: "Bash".into(),
+            subagent: None,
+            at,
+        }
+    }
+
+    fn writes(metrics: &Metrics) -> u64 {
+        metrics.snapshot().snapshot_writes_total
+    }
+
+    async fn wait_for(metrics: &Metrics, count: u64) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while writes(metrics) < count {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected {count} writes, saw {}", writes(metrics)));
+    }
+
+    async fn on_disk_activity(path: &Path, sid: &str) -> OffsetDateTime {
+        let parsed: StateFile =
+            serde_json::from_slice(&tokio::fs::read(path).await.unwrap()).unwrap();
+        parsed
+            .agents
+            .into_iter()
+            .find(|agent| agent.session_id == sid)
+            .unwrap()
+            .last_activity_at
+    }
+
+    /// Most dirty signals in a busy registry change nothing, or only move an
+    /// agent's activity stamp. Neither may cost a full fsync'd rewrite each
+    /// time: unchanged snapshots are skipped, activity-only ones wait for
+    /// the slow cadence, and a material change still goes out at once,
+    /// carrying the latest activity with it.
+    #[tokio::test]
+    async fn snapshotter_skips_unchanged_and_defers_activity_only_writes() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("state.json");
+        let store = Store::shared();
+        let metrics = Metrics::new();
+        let (tx, rx) = broadcast::channel::<()>(1);
+        let activity_interval = Duration::from_millis(400);
+        let task = tokio::spawn(
+            Snapshotter::new(
+                store.clone(),
+                store.dirty(),
+                SnapshotterOptions {
+                    path: path.clone(),
+                    debounce: Duration::from_millis(10),
+                    activity_interval,
+                },
+            )
+            .with_metrics(metrics.clone())
+            .run(rx),
+        );
+
+        let t = datetime!(2026-04-28 00:00 UTC);
+        store.apply(&started_event("a", "%1", t)).await;
+        store.apply(&tool_event("a", t)).await;
+        wait_for(&metrics, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let settled = writes(&metrics);
+
+        // A dirty signal with nothing changed writes nothing.
+        store.dirty().notify_one();
+        tokio::time::sleep(activity_interval + Duration::from_millis(100)).await;
+        assert_eq!(writes(&metrics), settled, "unchanged snapshot rewritten");
+
+        // Activity-only: held back, then flushed once on the slow cadence.
+        let later = t + time::Duration::seconds(5);
+        store.apply(&tool_event("a", later)).await;
+        let before = on_disk_activity(&path, "a").await;
+        assert_ne!(before, later, "precondition: the event only moved activity");
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(
+            writes(&metrics),
+            settled,
+            "activity-only change written early"
+        );
+        wait_for(&metrics, settled + 1).await;
+        assert_eq!(on_disk_activity(&path, "a").await, later);
+
+        // Pending activity rides along with a material change, at once.
+        let latest = t + time::Duration::seconds(9);
+        store.apply(&tool_event("a", latest)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        store.apply(&started_event("b", "%2", latest)).await;
+        wait_for(&metrics, settled + 2).await;
+        assert_eq!(on_disk_activity(&path, "a").await, latest);
+        tokio::time::sleep(activity_interval + Duration::from_millis(100)).await;
+        assert_eq!(writes(&metrics), settled + 2, "no leftover activity flush");
+
+        // Shutdown flushes a held-back activity change.
+        let last = t + time::Duration::seconds(12);
+        store.apply(&tool_event("a", last)).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(()).unwrap();
+        task.await.unwrap();
+        assert_eq!(on_disk_activity(&path, "a").await, last);
     }
 }
