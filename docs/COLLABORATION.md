@@ -14,7 +14,9 @@ and terminal replies to the primary's own outgoing requests still work.
 Automatic, provider and role selection choose only `worker` sessions. Peers
 created with `spawn_if_missing=true` are workers; that flag requires existing
 user authorization to launch an agent. General `start` and Work pipelines remain
-primary unless explicitly configured. There is no automatic worker pool.
+primary unless explicitly configured: give a pipeline agent `purpose = "worker"`
+when its job is to answer peers (for example an implementer or reviewer).
+There is no automatic worker pool.
 
 Use `muxa start --agent claude --purpose worker` to launch a worker, or
 `muxa identity purpose worker` inside an existing dedicated worker session.
@@ -22,6 +24,15 @@ Use `muxa start --agent claude --purpose worker` to launch a worker, or
 for the exact provider session; a new session does not inherit it from a pane,
 role or alias. A launched worker's first session binds once to its actual CLI
 process; restarting or reusing the pane does not grant worker purpose.
+
+From an operator terminal (not an agent's pane), `muxa identity purpose worker
+--session ID` sets exact live agent sessions, for example workers launched
+before purposes existed whose requests now sit queued. A call made from inside
+an agent's pane is refused, which keeps an agent from promoting other sessions
+by accident. This is a guard for the trusted same-user setup muxa assumes, not
+operator authentication: the pane is inferred from the caller's environment and
+process tree. Queued requests to a promoted session are delivered on its next
+idle turn, without being re-sent.
 
 Explicit pane/alias targets can address a primary, but their requests remain
 queued. Accept one deliberately with `muxa msg accept REQUEST --json` or

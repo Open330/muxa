@@ -93,6 +93,7 @@ impl From<PipelineSpec> for PipelineConfig {
                     options: agent.options,
                     direction: agent.direction,
                     after: agent.after,
+                    purpose: None,
                 })
                 .collect(),
         }

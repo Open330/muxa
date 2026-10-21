@@ -6,7 +6,10 @@
 
 mod purpose;
 use purpose::{load_purposes, PurposeGrant};
-pub use purpose::{LaunchPurpose, HUMAN_PRIORITY_CAPABILITY};
+pub use purpose::{
+    LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PIPELINE_PURPOSE_CAPABILITY,
+    PURPOSE_PROMOTE_CAPABILITY,
+};
 
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
@@ -1384,7 +1387,11 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
              value TEXT NOT NULL
          );",
     )?;
-    connection.pragma_update(None, "user_version", COLLABORATION_DATABASE_SCHEMA_VERSION)?;
+    // Every persist opens the database. Writing an unchanged user_version
+    // would still be a committed, fsync'd write transaction each time.
+    if version != COLLABORATION_DATABASE_SCHEMA_VERSION {
+        connection.pragma_update(None, "user_version", COLLABORATION_DATABASE_SCHEMA_VERSION)?;
+    }
     secure_database_files(path)?;
     Ok(connection)
 }
@@ -7945,6 +7952,10 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod database_tests;
+#[cfg(test)]
+mod purpose_promote_tests;
 mod recovery;
 #[cfg(test)]
 mod reply_wake_tests;

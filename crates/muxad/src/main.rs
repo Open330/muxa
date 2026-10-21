@@ -2998,6 +2998,7 @@ fn spawn_snapshotter_task(
     let opts = SnapshotterOptions {
         path: path.clone(),
         debounce: std::time::Duration::from_millis(cfg.state.debounce_ms),
+        activity_interval: muxa::snapshot::DEFAULT_ACTIVITY_INTERVAL,
     };
     let snapshotter =
         Snapshotter::new(store.clone(), store.dirty(), opts).with_metrics(store.metrics());

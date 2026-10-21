@@ -166,6 +166,7 @@ fn agent(alias: &str, program: &str, role: &str, task: &str, prompt: &str) -> Pi
         options: Vec::new(),
         direction: None,
         after: Vec::new(),
+        purpose: None,
     }
 }
 

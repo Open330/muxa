@@ -726,6 +726,11 @@ pub struct PipelineAgentConfig {
     /// Split direction when this pane joins an existing window: `right`
     /// (default) or `down`.
     pub direction: Option<String>,
+    /// `worker` launches this pane as a dedicated peer worker that accepts
+    /// automatic peer requests; `primary` (the default) keeps it protected
+    /// like a human session. Set `worker` for agents whose job is to answer
+    /// peers, such as a pipeline's implementer and reviewer.
+    pub purpose: Option<crate::collaboration::LaunchPurpose>,
     /// Aliases in this pipeline that must report finishing before this
     /// agent is launched at all.
     ///

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Requests to muxa-launched workers no longer sit queued forever as
+  `deferred: protected_primary`. Pipeline agents can declare
+  `purpose = "worker"`, and the operator can promote exact existing sessions
+  from a non-agent terminal with `muxa identity purpose worker --session ID`.
+  Queued requests are delivered on the session's next idle turn. `work up`
+  refuses worker agents on a daemon too old to keep their purpose.
+- The daemon no longer rewrites `state.json` (about 110KB) on every hook
+  event. An unchanged registry is not written, a change confined to
+  activity timestamps is batched for up to 30 seconds, and every other change
+  is still written immediately. On a busy host this removes about 80% of the
+  writes. Mailbox changes also stop committing an extra SQLite write to
+  re-stamp the schema version each time.
 - Old peer replies no longer keep coming back. A reply the sender already
   read with `wait` is no longer announced afterwards, and replies that piled
   up while the sender was busy arrive as one wake (up to five, oldest first)
