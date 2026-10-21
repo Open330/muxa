@@ -2239,8 +2239,8 @@ fn names_a_slot(target: &str) -> bool {
 }
 
 /// Send a peer call by its logical target when it named a slot, falling
-/// back to the locally selected pane if the daemon cannot resolve the slot
-/// on its own (for example a role two peers share).
+/// back to the locally selected pane only when the daemon refused the slot
+/// outright (for example a role two peers share).
 async fn send_peer_call(
     client: &Client,
     origin: &CollaborationOrigin,
@@ -2252,8 +2252,11 @@ async fn send_peer_call(
     if logical {
         match client.collaboration_send(origin, target, request).await {
             Ok(sent) => return Ok(sent),
-            Err(error) if pane_selector.is_none() => return Err(error),
-            Err(_) => {}
+            // Only an explicit refusal proves nothing was stored. After a
+            // lost or garbled response the request may exist, and a second
+            // send would duplicate the work.
+            Err(muxa::ipc::RuntimeError::Daemon(_)) if pane_selector.is_some() => {}
+            Err(error) => return Err(error),
         }
     }
     let selector = pane_selector.unwrap_or(target);
@@ -2308,6 +2311,15 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     // A `workspace/work/role` path names a slot the daemon resolves across
     // windows; there is no local peer to select or worker to spawn for it.
     let path_target = muxa::collaboration::parse_slot_path(target).is_some();
+    let context_bound = args
+        .get("context_bound")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if context_bound && path_target {
+        return error_result(
+            "context_bound needs the exact session that holds the conversation; name its pane or @alias, not a workspace/work/role path",
+        );
+    }
     let (mut selection, worker_program) = if path_target {
         (None, None)
     } else {
@@ -2367,8 +2379,10 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     };
     // Send a named slot (path, `@alias`, `role:`) as itself so the daemon
     // records it and the request can follow a replaced holder. A provider or
-    // worker substitution was a local choice, so it is sent by pane.
-    let logical = path_target || (worker_program.is_none() && names_a_slot(target));
+    // worker substitution was a local choice, so it is sent by pane, and a
+    // context-bound call must stay with the exact session it selected.
+    let logical =
+        !context_bound && (path_target || (worker_program.is_none() && names_a_slot(target)));
     let sent = match send_peer_call(
         client,
         &origin,
@@ -4800,6 +4814,102 @@ mod tests {
         (Client::new(sock.to_path_buf()), sends, tx, handle)
     }
 
+    /// A daemon that answers each `collaboration_send` per `script`, keyed
+    /// by the request's target, and records every target it was sent.
+    /// `None` drops the connection without an answer, like a lost ACK.
+    fn scripted_send_daemon(
+        script: &'static [(&'static str, Option<&'static str>)],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        Arc<std::sync::Mutex<Vec<String>>>,
+    ) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("scripted.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    if request["kind"] != "collaboration_send" {
+                        let _ = writer.write_all(b"{\"ok\":true}\n").await;
+                        continue;
+                    }
+                    let target = request["target"].as_str().unwrap().to_string();
+                    record.lock().unwrap().push(target.clone());
+                    let answer = script
+                        .iter()
+                        .find(|(name, _)| *name == target)
+                        .and_then(|(_, answer)| *answer);
+                    match answer {
+                        Some(body) => {
+                            let _ = writer.write_all(format!("{body}\n").as_bytes()).await;
+                        }
+                        None => break,
+                    }
+                }
+            }
+        });
+        (dir, socket, seen)
+    }
+
+    /// The pane fallback runs only after the daemon refused the slot, which
+    /// proves nothing was stored. After a lost response the request may
+    /// exist, so sending again by pane could duplicate the work.
+    #[tokio::test]
+    async fn a_slot_send_falls_back_only_after_an_explicit_refusal() {
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: None,
+            console: false,
+            agent_session_id: None,
+        };
+        let request = NewRequest {
+            body: "status?".into(),
+            ..NewRequest::default()
+        };
+
+        let (_lost_dir, lost, seen) = scripted_send_daemon(&[("role:reviewer", None)]);
+        let result = send_peer_call(
+            &Client::new(lost),
+            &origin,
+            "role:reviewer",
+            true,
+            Some("pane:%2"),
+            &request,
+        )
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["role:reviewer"],
+            "resent after a lost response"
+        );
+
+        let (_refused_dir, refused, seen) = scripted_send_daemon(&[
+            (
+                "role:reviewer",
+                Some(r#"{"ok":false,"error":"target \"role:reviewer\" is ambiguous"}"#),
+            ),
+            ("pane:%2", Some(r#"{"ok":false,"error":"stop here"}"#)),
+        ]);
+        let _ = send_peer_call(
+            &Client::new(refused),
+            &origin,
+            "role:reviewer",
+            true,
+            Some("pane:%2"),
+            &request,
+        )
+        .await;
+        assert_eq!(*seen.lock().unwrap(), ["role:reviewer", "pane:%2"]);
+    }
+
     /// `muxa_call_peer` sends a named slot as itself, so the daemon records
     /// it and the request can follow a replaced holder: a
     /// `workspace/work/role` path (which local peer selection does not
@@ -4913,6 +5023,30 @@ mod tests {
                 "{target} was not sent as a slot"
             );
         }
+        // A context-bound call stays with the exact session it selected,
+        // and a path cannot name one.
+        let bound = |target: &str| {
+            json!({"jsonrpc":"2.0", "id":1,"method":"tools/call",
+            "params":{"name":"muxa_call_peer","arguments":{
+                "target": target, "intent": "question", "body": "continue our thread",
+                "wait": false, "context_bound": true
+            },"_meta":{"threadId":"slot-sender"}}})
+        };
+        let response = dispatch(&client, &bound("role:reviewer")).await.unwrap();
+        assert!(response["result"].get("isError").is_none(), "{response}");
+        let sent: Value =
+            serde_json::from_str(response["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        let stored = mailbox
+            .get_for(&room.current, sent["request_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            stored.to_slot.is_none(),
+            "a context-bound call became movable"
+        );
+        let response = dispatch(&client, &bound("ws/W1/reviewer")).await.unwrap();
+        assert_eq!(response["result"]["isError"], true, "{response}");
         let _ = shutdown.send(());
         daemon.await.unwrap();
     }
