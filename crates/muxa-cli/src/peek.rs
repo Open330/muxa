@@ -59,6 +59,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::attend;
 use crate::watch::agent_kind_short;
 
+#[cfg(test)]
+mod layout_tests;
 mod relations;
 
 /// Budget for the one snapshot round-trip. The overlay is a
@@ -1923,7 +1925,7 @@ mod tests {
         }
     }
 
-    fn linked_layout(vertical: bool) -> Vec<PeekCell> {
+    pub(super) fn linked_layout(vertical: bool) -> Vec<PeekCell> {
         use muxa::collaboration::{
             CollaborationEndpoint, CollaborationLink, LaunchPurpose, RequestKind, RequestStatus,
         };
