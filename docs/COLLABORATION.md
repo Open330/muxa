@@ -44,8 +44,11 @@ and account settings are not cloned from the primary.
 
 
 `prefix + q` (`muxa peek`) displays registered roles and primary/worker purpose,
-plus up to three actual incoming/outgoing requests per card with their delivery
-or reply status. It reads one bounded metadata snapshot per refresh without
+plus up to three actual incoming/outgoing requests with their delivery or reply
+status in a separate `Links` panel below each prompt/response card. Cards show
+full pane addresses such as `rmux:%37`; connecting arrows follow the actual pane
+layout without crossing text cards. Arrows to replaced/hidden sessions and paths
+that cannot fit are omitted. It reads one bounded metadata snapshot per refresh without
 request bodies or claiming/acknowledging messages. Roles alone do not imply a link.
 
 Codex workers use `--no-daemon` and bind only from their own pane-bearing hooks;

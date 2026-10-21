@@ -59,6 +59,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::attend;
 use crate::watch::agent_kind_short;
 
+mod relations;
+
 /// Budget for the one snapshot round-trip. The overlay is a
 /// press-and-glance affair, so a wedged daemon must degrade to "boxes
 /// with no agent detail" fast rather than leaving the user staring at a
@@ -105,6 +107,7 @@ pub(crate) struct PeekCollaboration {
     roles: Vec<String>,
     purpose: Option<muxa::collaboration::LaunchPurpose>,
     links: Vec<String>,
+    connections: Vec<muxa::collaboration::CollaborationLink>,
 }
 
 /// One pane's worth of overlay: where to draw, and what to say.
@@ -759,9 +762,10 @@ fn apply_collaboration(
             } else {
                 format!("{:?}", link.status).to_ascii_lowercase()
             };
+            cell.collaboration.connections.push(link.clone());
             cell.collaboration.links.push(format!(
                 "{} {} · {:?} · {}",
-                if outbound { "→" } else { "←" },
+                if outbound { "to" } else { "from" },
                 label,
                 link.kind,
                 state
@@ -980,6 +984,7 @@ fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool, p
             );
         }
     }
+    relations::draw(f, cells, placement, zoomed);
     if area.height > 0 {
         // Land on the row tmux's status line occupies — the one row of the
         // client that never belongs to a pane. Guessing wrong here paints
@@ -1054,13 +1059,10 @@ fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect, is_latest_prompt: boo
         );
         return;
     }
-    let header = header_spans(cell, rect.width.saturating_sub(2));
     // The box covers only what it needs, so the pane's content stays
     // readable below it.
-    let rect = Rect {
-        height: box_height(cell, rect),
-        ..rect
-    };
+    let rect = info_rect(cell, rect);
+    let header = header_spans(cell, rect.width.saturating_sub(2));
     // Wipe the backdrop out from under the box: the dim capture showing
     // through the box's own interior reads as corruption, not as depth.
     f.render_widget(Clear, rect);
@@ -1117,7 +1119,7 @@ fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect, is_latest_prompt: boo
 
     // Reserve the bottom row for the meta strip once there's a row to
     // spare above it; below that, body text is the better use of space.
-    let (body, meta) = if inner.height >= 3 {
+    let (body, meta) = if inner.height >= 3 && meta_line(cell, inner.width).is_some() {
         (
             Rect {
                 height: inner.height - 1,
@@ -1188,6 +1190,31 @@ pub(crate) fn box_height(cell: &PeekCell, rect: Rect) -> u16 {
     (needed + 2).clamp(MIN_BORDERED_HEIGHT, ceiling)
 }
 
+/// Leave a routing lane beside cards that have a separate collaboration panel.
+fn info_rect(cell: &PeekCell, mut pane: Rect) -> Rect {
+    if pane.height < MIN_BORDERED_HEIGHT || pane.width < 4 {
+        return Rect {
+            height: pane.height.min(1),
+            ..pane
+        };
+    }
+    if cell.collaboration.purpose.is_some() && pane.width >= 12 {
+        pane.x += 1;
+        pane.width -= 2;
+    }
+    Rect {
+        height: box_height(cell, pane),
+        ..pane
+    }
+}
+
+fn pane_address(cell: &PeekCell) -> &str {
+    cell.agent
+        .as_ref()
+        .and_then(|agent| agent.pane.as_deref())
+        .unwrap_or(&cell.geo.pane_id)
+}
+
 /// Whether the header and the age stamp can share the top border without
 /// colliding. Both are drawn on the same row from opposite ends, and
 /// ratatui will happily overlap them; the two corners plus a gap between
@@ -1214,8 +1241,9 @@ fn spans_width(spans: &[Span<'static>]) -> usize {
 /// - the **pane id** is the same address spelled the way tmux spells it:
 ///   always correct, never memorable.
 ///
-/// So a narrow box gives up the pane id before the handle, and the kind
-/// name before either. Everything except the bare kind is width-gated
+/// A narrow box keeps the complete pane address before the handle or kind.
+/// When the address itself cannot fit, it is omitted in full. Everything
+/// except the bare kind is width-gated
 /// rather than left to ratatui's title clipping, because a clipped
 /// `%1242` or `@claude2` is still a well-formed address — it just points
 /// somewhere else, and would be copied without a second thought. Clipping
@@ -1228,13 +1256,13 @@ fn header_spans(cell: &PeekCell, width: u16) -> Vec<Span<'static>> {
         )
     });
     let pane_id = Span::styled(
-        format!(" {}", cell.geo.pane_id),
+        format!(" {}", pane_address(cell)),
         Style::default().fg(Color::DarkGray),
     );
 
     let mut narrowest = Vec::new();
-    for identity in identity_spans(cell) {
-        for with_pane_id in [true, false] {
+    for with_pane_id in [true, false] {
+        for identity in identity_spans(cell) {
             let mut spans = badge_spans(cell);
             spans.extend(identity.iter().cloned());
             if with_pane_id {
@@ -1246,6 +1274,14 @@ fn header_spans(cell: &PeekCell, width: u16) -> Vec<Span<'static>> {
                 return spans;
             }
             narrowest = spans;
+        }
+        if with_pane_id {
+            let mut address = badge_spans(cell);
+            address.push(pane_id.clone());
+            address.push(Span::raw(" "));
+            if spans_width(&address) <= width as usize {
+                return address;
+            }
         }
     }
     narrowest
@@ -1336,18 +1372,6 @@ pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'stati
         return Text::default();
     };
     let mut lines: Vec<Line> = Vec::new();
-    for relation in collaboration_lines(cell).iter().take(3) {
-        push_tier(
-            &mut lines,
-            &mut budget,
-            relation,
-            "",
-            1,
-            Style::default().fg(Color::Yellow),
-            width,
-        );
-    }
-
     if let Some(summary) = summary_source(agent) {
         // A tall pane can afford a second line of summary; a short one
         // must leave room for the prompt.
@@ -1595,7 +1619,12 @@ pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
                 if collaboration_lines(cell).is_empty() {
                     summary
                 } else {
-                    format!("{} | {}", collaboration_lines(cell).join(" | "), summary)
+                    format!(
+                        "{}\n  Links · {}\n    {}",
+                        summary,
+                        pane_address(cell),
+                        collaboration_lines(cell).join("\n    ")
+                    )
                 }
             )
         })
@@ -1839,8 +1868,8 @@ mod tests {
         let rendered = plain_lines(&cells).join("\n");
         assert!(rendered.contains("implementer · worker"));
         assert!(rendered.contains("reviewer · worker"));
-        assert!(rendered.contains("→ critic"));
-        assert!(rendered.contains("← builder"));
+        assert!(rendered.contains("to critic"));
+        assert!(rendered.contains("from builder"));
         assert!(rendered.contains("reply received / blocked"));
         assert_eq!(cells[0].collaboration.purpose, Some(LaunchPurpose::Worker));
         cells[1].agent.as_mut().unwrap().session_id = "replacement".into();
@@ -1855,7 +1884,7 @@ mod tests {
     }
 
     #[test]
-    fn collaboration_overlay_renders_roles_and_links_within_small_viewports() {
+    fn prompt_card_excludes_collaboration_and_keeps_small_viewports_bounded() {
         let cell = PeekCell {
             geo: geo("0", 0, 0, 80, 24, true),
             agent: Some(agent("%0", AgentState::Idle)),
@@ -1866,6 +1895,7 @@ mod tests {
                 roles: vec!["reviewer".into()],
                 purpose: Some(muxa::collaboration::LaunchPurpose::Worker),
                 links: vec!["← implementer · Review · claimed".into()],
+                ..PeekCollaboration::default()
             },
         };
         let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
@@ -1879,8 +1909,8 @@ mod tests {
             .iter()
             .map(ratatui::buffer::Cell::symbol)
             .collect::<String>();
-        assert!(rendered.contains("reviewer · worker"));
-        assert!(rendered.contains("← implementer · Review · claimed"));
+        assert!(!rendered.contains("reviewer · worker"));
+        assert!(!rendered.contains("← implementer · Review · claimed"));
         for width in [0, 1, 4, 12, 80] {
             for height in [0, 1, 2, 3, 12] {
                 let body = body_text(&cell, width, height);
@@ -1891,6 +1921,228 @@ mod tests {
                     .all(|line| line.width() <= usize::from(width)));
             }
         }
+    }
+
+    fn linked_layout(vertical: bool) -> Vec<PeekCell> {
+        use muxa::collaboration::{
+            CollaborationEndpoint, CollaborationLink, LaunchPurpose, RequestKind, RequestStatus,
+        };
+        let mut from = agent("rmux:%37", AgentState::Working);
+        from.last_prompt = Some("Implement the authentication change".into());
+        from.last_response = Some("Implementation ready for review".into());
+        let mut to = agent("rmux:%42", AgentState::Working);
+        to.last_prompt = Some("Review the authentication change".into());
+        to.last_response = Some("Checking behavior and regression risks".into());
+        let endpoint = |a: &Agent, alias: &str| CollaborationEndpoint {
+            agent_session_id: a.session_id.clone(),
+            pane: a.pane.clone().unwrap(),
+            socket: a.tmux_socket.clone(),
+            label: format!("{}@{}", alias, a.pane.as_ref().unwrap()),
+        };
+        let link = CollaborationLink {
+            request_id: "req-layout".into(),
+            from: endpoint(&from, "builder"),
+            to: endpoint(&to, "reviewer"),
+            kind: RequestKind::Review,
+            status: RequestStatus::Claimed,
+            reply_received: false,
+        };
+        [from, to]
+            .into_iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                let (left, top, width, height) = if vertical {
+                    (0, if i == 0 { 0 } else { 21 }, 60, 20)
+                } else {
+                    (if i == 0 { 0 } else { 45 }, 0, 44, 24)
+                };
+                PeekCell {
+                    geo: PaneGeometry {
+                        pane_id: if i == 0 { "%37" } else { "%42" }.into(),
+                        alias: Some(if i == 0 { "builder" } else { "reviewer" }.into()),
+                        ..geo(&i.to_string(), left, top, width, height, i == 0)
+                    },
+                    agent: Some(agent),
+                    extra: 0,
+                    last_prompt_at: None,
+                    capture: Vec::new(),
+                    collaboration: PeekCollaboration {
+                        roles: vec![if i == 0 { "implementer" } else { "reviewer" }.into()],
+                        purpose: Some(LaunchPurpose::Worker),
+                        links: vec![format!(
+                            "{} {} · Review · claimed",
+                            if i == 0 { "to" } else { "from" },
+                            if i == 0 {
+                                "reviewer@rmux:%42"
+                            } else {
+                                "builder@rmux:%37"
+                            }
+                        )],
+                        connections: vec![link.clone()],
+                    },
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collaboration_is_below_prompts_and_connects_actual_pane_positions() {
+        for vertical in [false, true] {
+            let cells = linked_layout(vertical);
+            let (width, height) = if vertical { (60, 42) } else { (90, 25) };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+                .unwrap();
+            let rendered = screen(&terminal);
+            assert!(rendered.contains("Links · rmux:%37"), "{rendered}");
+            assert!(rendered.contains("Links · rmux:%42"), "{rendered}");
+            assert!(rendered.contains("implementer · worker"), "{rendered}");
+            assert!(rendered.contains("reviewer · worker"), "{rendered}");
+            let rows: Vec<_> = rendered.lines().collect();
+            let response = rows
+                .iter()
+                .position(|row| row.contains("Implementation ready"))
+                .unwrap();
+            let relations = rows
+                .iter()
+                .position(|row| row.contains("Links · rmux:%37"))
+                .unwrap();
+            assert!(relations > response + 1, "{rendered}");
+            let arrows: Vec<_> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| {
+                    cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol())
+                })
+                .collect();
+            assert!(!arrows.is_empty(), "no spatial arrows: {rendered}");
+            for (offset, _) in arrows {
+                let point = ratatui::layout::Position::new(
+                    u16::try_from(offset % usize::from(width)).unwrap(),
+                    u16::try_from(offset / usize::from(width)).unwrap(),
+                );
+                for cell in &cells {
+                    let rect = cell_rect(&cell.geo, 0, Rect::new(0, 0, width, height)).unwrap();
+                    assert!(
+                        !info_rect(cell, rect).contains(point),
+                        "arrow inside prompt card"
+                    );
+                }
+            }
+            if let Ok(directory) = std::env::var("MUXA_PEEK_LAYOUT_PREVIEW") {
+                std::fs::create_dir_all(&directory).unwrap();
+                let preview:Vec<_>=terminal.backend().buffer().content().iter().map(|cell|
+                    serde_json::json!({"symbol":cell.symbol(),"fg":format!("{:?}",cell.fg),"bg":format!("{:?}",cell.bg)})).collect();
+                std::fs::write(
+                    std::path::Path::new(&directory).join(if vertical {
+                        "vertical.json"
+                    } else {
+                        "horizontal.json"
+                    }),
+                    serde_json::to_vec(
+                        &serde_json::json!({"width":width,"height":height,"cells":preview}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    std::path::Path::new(&directory).join(if vertical {
+                        "vertical.txt"
+                    } else {
+                        "horizontal.txt"
+                    }),
+                    rendered,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_links_skip_hidden_or_replaced_sessions_and_keep_prompts_intact() {
+        let mut cells = linked_layout(false);
+        cells[1].agent.as_mut().unwrap().session_id = "replacement".into();
+        let mut terminal = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        assert!(!terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol())));
+        let mut cells = linked_layout(false);
+        cells[0].geo.width = 90;
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), true, ""))
+            .unwrap();
+        assert!(!screen(&terminal).contains("Links · rmux:%42"));
+        assert!(!terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol())));
+    }
+
+    #[test]
+    fn replies_have_two_spatial_arrowheads_and_metadata_stays_separate_in_plain_output() {
+        let mut cells = linked_layout(false);
+        for cell in &mut cells {
+            for link in &mut cell.collaboration.connections {
+                link.reply_received = true;
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let arrows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol()))
+            .count();
+        assert_eq!(arrows, 2, "{}", screen(&terminal));
+        let plain = plain_lines(&cells).join("\n");
+        assert!(plain.contains("\n  Links · rmux:%37\n    implementer · worker"));
+        assert!(!plain.lines().next().unwrap().contains("worker"));
+    }
+
+    #[test]
+    fn a_middle_pane_keeps_its_incoming_arrow_when_it_also_sends_work() {
+        let mut cells = linked_layout(true);
+        let mut third = cells[1].clone();
+        third.geo.top = 42;
+        third.geo.pane_id = "%53".into();
+        third.agent.as_mut().unwrap().pane = Some("rmux:%53".into());
+        third.agent.as_mut().unwrap().session_id = "third-session".into();
+        let mut link = cells[0].collaboration.connections[0].clone();
+        link.request_id = "req-chain".into();
+        link.from = link.to.clone();
+        link.to.pane = "rmux:%53".into();
+        link.to.agent_session_id = "third-session".into();
+        third.collaboration.connections = vec![link.clone()];
+        cells[1].collaboration.connections.push(link);
+        cells.push(third);
+        let mut terminal = Terminal::new(TestBackend::new(60, 64)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let arrows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol()))
+            .count();
+        assert_eq!(arrows, 2, "{}", screen(&terminal));
     }
 
     #[test]
@@ -2779,15 +3031,15 @@ mod tests {
     }
 
     #[test]
-    fn a_narrow_header_gives_up_the_pane_id_before_the_handle() {
-        // Both address the pane; only one of them is memorable.
+    fn a_narrow_header_keeps_the_pane_id_before_the_handle() {
+        // Keep the full address visible even when the alias must yield.
         let cell = &build_cells(
             vec![named("0", "%1242", "reviewer", 20, 10)],
             &[agent("%1242", AgentState::Working)],
         )[0];
         let header = line_text(&Line::from(header_spans(cell, 20)));
-        assert!(header.contains("@reviewer"), "{header:?}");
-        assert!(!header.contains('%'), "{header:?}");
+        assert!(header.contains("%1242"), "{header:?}");
+        assert!(!header.contains("@reviewer"), "{header:?}");
     }
 
     #[test]
@@ -2801,7 +3053,10 @@ mod tests {
         let wide = line_text(&Line::from(header_spans(cell, 40)));
         let narrow = line_text(&Line::from(header_spans(cell, 12)));
         assert!(wide.contains("%1242"), "{wide:?}");
-        assert!(!narrow.contains('%'), "no partial id survives: {narrow:?}");
+        assert!(
+            !narrow.contains('%') || narrow.contains("%1242"),
+            "no partial id survives: {narrow:?}"
+        );
         assert!(narrow.contains(" 3 "), "the digit survives: {narrow:?}");
     }
 

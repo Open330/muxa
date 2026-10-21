@@ -15,6 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `prefix + q` keeps collaboration roles and request state in a separate panel
+  below prompts/responses. Spatial arrows connect visible pane panels without
+  covering their text, and full pane addresses such as `rmux:%37` remain visible.
 - High-level peer calls reuse workers and create a missing worker using configured
   provider permissions by default, without adding bypass flags. Naming a protected
   primary sends generic work to a same-provider worker; `context_bound=true`
