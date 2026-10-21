@@ -293,6 +293,7 @@ pub(crate) async fn apply_durable(
     }
     invalidate.sort();
     invalidate.dedup();
+    require_pipeline_purpose_support(client, &resolved.desired).await?;
     let identity = WorkIdentity::new(resolved.workspace.clone(), resolved.work.clone());
     let registration = PipelineRunRegistration {
         identity: identity.clone(),
@@ -1423,6 +1424,75 @@ mod reconcile_tests {
     use muxa::pipeline_run::PipelineRunStore;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+    fn agent_with(purpose: muxa::collaboration::LaunchPurpose) -> DesiredAgent {
+        DesiredAgent {
+            alias: "impl".into(),
+            program: "codex".into(),
+            role: None,
+            task: None,
+            prompt: None,
+            options: Vec::new(),
+            direction: None,
+            after: Vec::new(),
+            purpose,
+        }
+    }
+
+    /// A daemon that answers `hello` with the given capabilities.
+    fn hello_daemon(capabilities: &'static [&'static str]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("muxa.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "protocol": muxa::event::PROTOCOL_VERSION,
+                        "min_protocol": 1,
+                        "max_protocol": muxa::event::PROTOCOL_VERSION,
+                        "capabilities": capabilities,
+                    });
+                    let mut bytes = serde_json::to_vec(&response).unwrap();
+                    bytes.push(b'\n');
+                    if writer.write_all(&bytes).await.is_err() {
+                        break;
+                    }
+                    line.clear();
+                }
+            }
+        });
+        (dir, socket)
+    }
+
+    /// A daemon from before pipeline purposes would drop `worker` and hand
+    /// back primary claims. Refuse to register worker agents with it, and
+    /// leave all-primary pipelines alone.
+    #[tokio::test]
+    async fn worker_pipelines_need_a_daemon_that_keeps_their_purpose() {
+        use muxa::collaboration::{LaunchPurpose, PIPELINE_PURPOSE_CAPABILITY};
+        let (_old_dir, old) = hello_daemon(&["collaboration_human_priority_v1"]);
+        let old = muxa::ipc::Client::new(old);
+        let error = require_pipeline_purpose_support(&old, &[agent_with(LaunchPurpose::Worker)])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("purpose"), "{error}");
+        require_pipeline_purpose_support(&old, &[agent_with(LaunchPurpose::Primary)])
+            .await
+            .unwrap();
+
+        let (_new_dir, new) = hello_daemon(&[PIPELINE_PURPOSE_CAPABILITY]);
+        require_pipeline_purpose_support(
+            &muxa::ipc::Client::new(new),
+            &[agent_with(LaunchPurpose::Worker)],
+        )
+        .await
+        .unwrap();
+    }
+
     async fn run_pass(first_claim_fails: bool) -> Result<()> {
         let store = PipelineRunStore::in_memory();
         for work in ["first", "second"] {
@@ -1725,6 +1795,30 @@ fn print_result(result: &UpResult) {
     } else if result.plan.converged() && result.launched.is_empty() {
         println!("\nalready converged: every pipeline agent has a pane.");
     }
+}
+
+/// Refuse to register worker agents with a daemon that would drop their
+/// purpose. It would hand back primary claims and launch protected panes
+/// without saying so.
+async fn require_pipeline_purpose_support(
+    client: &muxa::ipc::Client,
+    desired: &[DesiredAgent],
+) -> Result<()> {
+    if !desired
+        .iter()
+        .any(|agent| agent.purpose == muxa::collaboration::LaunchPurpose::Worker)
+    {
+        return Ok(());
+    }
+    let hello = client.hello(std::time::Duration::from_secs(2)).await?;
+    anyhow::ensure!(
+        hello
+            .capabilities
+            .iter()
+            .any(|tag| tag == muxa::collaboration::PIPELINE_PURPOSE_CAPABILITY),
+        "the running muxad does not keep pipeline `purpose = \"worker\"`; upgrade it (muxa daemon restart after installing) before `work up`"
+    );
+    Ok(())
 }
 
 #[cfg(test)]

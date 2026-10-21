@@ -6,7 +6,10 @@
 
 mod purpose;
 use purpose::{load_purposes, PurposeGrant};
-pub use purpose::{LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PURPOSE_PROMOTE_CAPABILITY};
+pub use purpose::{
+    LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PIPELINE_PURPOSE_CAPABILITY,
+    PURPOSE_PROMOTE_CAPABILITY,
+};
 
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;

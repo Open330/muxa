@@ -597,8 +597,10 @@ enum RequestBody {
         purpose: collaboration::LaunchPurpose,
     },
     /// Operator act: set the purpose of exact live agent sessions. Refused
-    /// when the caller process runs inside an agent's pane, so an agent can
-    /// change only its own purpose (through `CollaborationPurpose`).
+    /// when the caller process appears to run inside an agent's pane: a
+    /// guard against accidental promotion in a trusted same-user setup, not
+    /// authentication. An agent sets its own purpose with
+    /// `CollaborationPurpose`.
     CollaborationPromotePurpose {
         session_ids: Vec<String>,
         purpose: collaboration::LaunchPurpose,
@@ -826,6 +828,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_peer_recovery",
     collaboration::HUMAN_ACTIONS_CAPABILITY,
     collaboration::PURPOSE_PROMOTE_CAPABILITY,
+    collaboration::PIPELINE_PURPOSE_CAPABILITY,
     collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
     "pipeline_runs_v1",
     "pipeline_subscribe",
@@ -2734,30 +2737,115 @@ async fn collaboration_participants(
     }
 }
 
+/// The pane a caller process runs in, qualified by its server: the backend
+/// pane id and that pane's socket. `TMUX_PANE` alone is ambiguous when two
+/// servers both have a `%5`, so the process's `TMUX` socket picks the server;
+/// failing that, the pane is found by process ancestry within each backend.
+///
+/// Both come from the caller's own environment and process tree, so this is
+/// best-effort attribution for a trusted same-user setup, not authentication.
+fn observed_process_endpoint(
+    pid: u32,
+    backends: &[SharedBackend],
+) -> Option<(String, Option<String>)> {
+    if let Some((pane, socket)) = process_environment_tmux(pid) {
+        let matches =
+            |info: &crate::tmux::PaneInfo| match (socket.as_deref(), info.socket.as_deref()) {
+                (Some(wanted), Some(actual)) => {
+                    crate::backend::pane_endpoints_match(Some(&info.pane_id), wanted, actual)
+                }
+                _ => true,
+            };
+        if let Some(info) = backends
+            .iter()
+            .filter_map(|backend| backend.resolve_pane(&pane))
+            .find(|info| matches(info))
+        {
+            return Some((info.pane_id, info.socket));
+        }
+    }
+    backends.iter().find_map(|backend| {
+        let pane_pids = backend.pane_pid_map();
+        let candidates = pane_pids
+            .keys()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        let pane_pid = if candidates.contains(&pid) {
+            pid
+        } else {
+            crate::adapters::proc_ancestry::ancestor_in_set(
+                pid,
+                &candidates,
+                crate::adapters::proc_ancestry::parent_pid,
+            )?
+        };
+        let info = backend.resolve_pane(pane_pids.get(&pane_pid)?)?;
+        Some((info.pane_id, info.socket))
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn process_environment_tmux(pid: u32) -> Option<(String, Option<String>)> {
+    let environment = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let entries: Vec<&str> = environment
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .collect();
+    let pane = entries
+        .iter()
+        .find_map(|entry| entry.strip_prefix("TMUX_PANE="))
+        .filter(|pane| pane.starts_with('%'))?;
+    let socket = entries
+        .iter()
+        .find_map(|entry| entry.strip_prefix("TMUX="))
+        .and_then(|value| value.split(',').next())
+        .filter(|socket| !socket.is_empty())
+        .map(str::to_string);
+    Some((pane.to_string(), socket))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_environment_tmux(_pid: u32) -> Option<(String, Option<String>)> {
+    None
+}
+
 /// The live sessions an operator promotion names, or why it is refused.
 ///
-/// The caller must be provably outside every agent pane: its process is
-/// traced to a pane by credentials, not by what it claims. Each id must name
-/// exactly one live agent session; a missing or ambiguous one refuses the
-/// whole operation.
+/// Refused when the caller's pane (on its own server) hosts an agent: this
+/// keeps an agent from promoting other sessions by accident through the
+/// operator path. It is a guard for a trusted same-user setup, not operator
+/// authentication. Each id must name exactly one live agent session; a
+/// missing or ambiguous one refuses the whole operation.
 fn promote_purpose_targets(
     topology: &CollaborationTopology,
-    actor: &CollaborationConnectionActor,
+    caller_pid: Option<u32>,
+    caller: Option<&(String, Option<String>)>,
     session_ids: &[String],
 ) -> Result<Vec<collaboration::Participant>, String> {
-    if actor.caller_pid.is_none() {
-        return Err("cannot verify the caller process; run this from an operator terminal".into());
+    if caller_pid.is_none() {
+        return Err(
+            "cannot identify the caller process; run this from an operator terminal".into(),
+        );
     }
-    if let Some(pane) = actor.observed_pane.as_deref() {
-        let same_pane =
-            |candidate: &str| candidate == pane || candidate.rsplit(':').next() == Some(pane);
+    if let Some((pane, socket)) = caller {
+        let same_endpoint = |candidate_pane: &str, candidate_socket: Option<&str>| {
+            candidate_pane == pane
+                && match (socket.as_deref(), candidate_socket) {
+                    (Some(left), Some(right)) => {
+                        crate::backend::pane_endpoints_match(Some(pane), left, right)
+                    }
+                    _ => true,
+                }
+        };
         let agent_pane = topology
             .participants
             .iter()
-            .any(|participant| same_pane(&participant.pane))
+            .any(|participant| same_endpoint(&participant.pane, participant.socket.as_deref()))
             || topology.agents.iter().any(|agent| {
                 agent.state != crate::AgentState::Stopped
-                    && agent.pane.as_deref().is_some_and(same_pane)
+                    && agent.pane.as_deref().is_some_and(|candidate| {
+                        same_endpoint(candidate, agent.tmux_socket.as_deref())
+                    })
             });
         if agent_pane {
             return Err(format!(
@@ -4420,6 +4508,18 @@ async fn handle(
                 } => {
                     kind = "collaboration_promote_purpose";
                     collaboration_actor.observe_pane(&backends).await;
+                    let caller = match collaboration_actor.caller_pid {
+                        Some(pid) => {
+                            let observed = backends.clone();
+                            tokio::task::spawn_blocking(move || {
+                                observed_process_endpoint(pid, &observed)
+                            })
+                            .await
+                            .ok()
+                            .flatten()
+                        }
+                        None => None,
+                    };
                     let topology =
                         collaboration_participants(&store, &backends, &collaboration, None).await;
                     let origin = CollaborationOrigin {
@@ -4435,10 +4535,12 @@ async fn handle(
                         CollaborationAuditOperation::PromotePurpose,
                         origin,
                     );
-                    audit_context.request_id = session_ids.first().cloned();
+                    audit_context.target_sessions.clone_from(&session_ids);
+                    audit_context.purpose = Some(purpose);
                     let response = match promote_purpose_targets(
                         &topology,
-                        &collaboration_actor,
+                        collaboration_actor.caller_pid,
+                        caller.as_ref(),
                         &session_ids,
                     ) {
                         Ok(targets) => match collaboration.set_purposes(&targets, purpose).await {
@@ -7307,25 +7409,13 @@ mod tests {
         }
     }
 
-    fn promote_actor(
-        pid: Option<u32>,
-        observed_pane: Option<&str>,
-    ) -> CollaborationConnectionActor {
-        CollaborationConnectionActor {
-            client_kind: CollaborationClientKind::Cli,
-            caller_pid: pid,
-            caller_uid: None,
-            caller_gid: None,
-            executable: None,
-            observed_pane: observed_pane.map(str::to_string),
-            pane_evidence: None,
-            pane_observed: true,
-        }
+    fn endpoint(pane: &str, socket: &str) -> (String, Option<String>) {
+        (pane.to_string(), Some(socket.to_string()))
     }
 
-    /// Operator promotion is only for the operator: a caller whose process
-    /// sits in an agent's pane is refused, whatever it claims, and every
-    /// named session must resolve to exactly one live agent.
+    /// Operator promotion is only for the operator: a caller whose own pane
+    /// hosts an agent is refused, and every named session must resolve to
+    /// exactly one live agent.
     #[test]
     fn purpose_promotion_requires_an_operator_caller_and_exact_sessions() {
         let topology = promote_topology(&[
@@ -7334,34 +7424,40 @@ mod tests {
             ("rmux:%7", "twin"),
         ]);
         let ids = |ids: &[&str]| ids.iter().map(|id| (*id).to_string()).collect::<Vec<_>>();
+        let pid = Some(42);
 
-        let from_agent = promote_actor(Some(42), Some("%5"));
+        let from_agent = endpoint("rmux:%5", "default");
         assert!(
-            promote_purpose_targets(&topology, &from_agent, &ids(&["worker"]))
+            promote_purpose_targets(&topology, pid, Some(&from_agent), &ids(&["worker"]))
                 .unwrap_err()
                 .contains("agent pane")
         );
-        assert!(
-            promote_purpose_targets(&topology, &promote_actor(None, None), &ids(&["worker"]))
-                .is_err()
-        );
+        assert!(promote_purpose_targets(&topology, None, None, &ids(&["worker"])).is_err());
 
-        let operator = promote_actor(Some(42), Some("%9"));
-        let targets = promote_purpose_targets(&topology, &operator, &ids(&["worker"])).unwrap();
+        let operator = endpoint("rmux:%9", "default");
+        let targets =
+            promote_purpose_targets(&topology, pid, Some(&operator), &ids(&["worker"])).unwrap();
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].pane, "rmux:%5");
-        assert!(promote_purpose_targets(
-            &topology,
-            &promote_actor(Some(42), None),
-            &ids(&["worker"])
-        )
-        .is_ok());
+        assert!(promote_purpose_targets(&topology, pid, None, &ids(&["worker"])).is_ok());
         for bad in [ids(&["worker", "missing"]), ids(&["twin"]), ids(&[])] {
             assert!(
-                promote_purpose_targets(&topology, &operator, &bad).is_err(),
+                promote_purpose_targets(&topology, pid, Some(&operator), &bad).is_err(),
                 "{bad:?}"
             );
         }
+    }
+
+    /// Pane ids are per server. An operator in `%5` on one server is not in
+    /// the agent's `%5` on another.
+    #[test]
+    fn purpose_promotion_compares_the_callers_pane_on_its_own_server() {
+        let topology = promote_topology(&[("rmux:%5", "worker")]);
+        let ids = vec!["worker".to_string()];
+        let other_server = endpoint("rmux:%5", "/tmp/rmux-1044/other");
+        assert!(promote_purpose_targets(&topology, Some(42), Some(&other_server), &ids).is_ok());
+        let same_server = endpoint("rmux:%5", "default");
+        assert!(promote_purpose_targets(&topology, Some(42), Some(&same_server), &ids).is_err());
     }
     use crate::event::{AgentEvent, AgentId, AgentKind, AgentState};
     use crate::state::Store;

@@ -161,6 +161,7 @@ pub struct SaveStats {
 }
 
 async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<SaveStats> {
+    let started = Instant::now();
     let payload = StateFile {
         v: STATE_SCHEMA_VERSION,
         saved_at: OffsetDateTime::now_utc(),
@@ -168,7 +169,10 @@ async fn save(path: &Path, agents: &[Agent]) -> std::io::Result<SaveStats> {
     };
     let bytes = serde_json::to_vec(&payload)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    write_atomically(path, &bytes).await
+    let mut stats = write_atomically(path, &bytes).await?;
+    // Report serialization plus the durable write, as before the split.
+    stats.elapsed = started.elapsed();
+    Ok(stats)
 }
 
 /// Durably replace `path` with `bytes`: temp file, fsync, rename, fsync dir.
@@ -404,6 +408,9 @@ impl Snapshotter {
         let (exact, material) = match serialize_agents(&agents) {
             Ok(bytes) => bytes,
             Err(e) => {
+                // Same backoff as a failed write: a due deadline must not
+                // turn into a loop of failing serializations.
+                self.activity_due = Some(tokio::time::Instant::now() + self.opts.activity_interval);
                 warn!(error = %e, "state snapshot serialization failed");
                 return;
             }

@@ -14,6 +14,11 @@ pub const HUMAN_PRIORITY_CAPABILITY: &str = "collaboration_human_priority_v1";
 /// sessions it names, from a terminal that is not itself an agent pane.
 pub const PURPOSE_PROMOTE_CAPABILITY: &str = "collaboration_purpose_promote_v1";
 
+/// `hello` capability: the daemon keeps a pipeline agent's `purpose` when a
+/// Run is registered. An older daemon drops the field and hands back primary
+/// claims, so a client must not register worker agents without it.
+pub const PIPELINE_PURPOSE_CAPABILITY: &str = "pipeline_purpose_v1";
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum LaunchPurpose {

@@ -920,7 +920,8 @@ enum IdentityCmd {
     ///
     /// With `--session`, the operator sets exact live agent sessions
     /// instead, for example muxa-launched workers that predate purposes.
-    /// Refused when run from inside an agent's pane.
+    /// Refused when run from inside an agent's pane (a guard against
+    /// accidental promotion, not authentication).
     Purpose {
         purpose: muxa::collaboration::LaunchPurpose,
         /// Agent session id to set (operator only). Repeatable.

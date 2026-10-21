@@ -73,6 +73,12 @@ pub struct CollaborationAuditEntry {
     pub message_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_count: Option<usize>,
+    /// Exact agent sessions an operator purpose change named, granted or not.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_sessions: Vec<String>,
+    /// The purpose an operator purpose change asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub purpose: Option<crate::collaboration::LaunchPurpose>,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -88,6 +94,8 @@ pub struct CollaborationAuditContext {
     pub scope: Option<MailboxScope>,
     pub status: Option<RequestStatus>,
     pub message_bytes: Option<usize>,
+    pub target_sessions: Vec<String>,
+    pub purpose: Option<crate::collaboration::LaunchPurpose>,
 }
 
 impl CollaborationAuditContext {
@@ -104,6 +112,8 @@ impl CollaborationAuditContext {
             scope: None,
             status: None,
             message_bytes: None,
+            target_sessions: Vec::new(),
+            purpose: None,
         }
     }
 
@@ -132,6 +142,8 @@ impl CollaborationAuditContext {
             status: self.status,
             message_bytes: self.message_bytes,
             result_count,
+            target_sessions: self.target_sessions,
+            purpose: self.purpose,
             ok: error.is_none(),
             error: error.map(str::to_string),
         }

@@ -27,10 +27,12 @@ process; restarting or reusing the pane does not grant worker purpose.
 
 From an operator terminal (not an agent's pane), `muxa identity purpose worker
 --session ID` sets exact live agent sessions, for example workers launched
-before purposes existed whose requests now sit queued. The caller's process is
-traced to its pane; a call from inside an agent pane is refused, so an agent
-can change only its own purpose. Queued requests to a promoted session are
-delivered on its next idle turn, without being re-sent.
+before purposes existed whose requests now sit queued. A call made from inside
+an agent's pane is refused, which keeps an agent from promoting other sessions
+by accident. This is a guard for the trusted same-user setup muxa assumes, not
+operator authentication: the pane is inferred from the caller's environment and
+process tree. Queued requests to a promoted session are delivered on its next
+idle turn, without being re-sent.
 
 Explicit pane/alias targets can address a primary, but their requests remain
 queued. Accept one deliberately with `muxa msg accept REQUEST --json` or
