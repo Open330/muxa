@@ -218,14 +218,12 @@ prompt  = '너는 기획을 맡는다. 접근안을 먼저 쓰고 코드는 고�
 alias   = 'impl'
 program = 'codex'
 role    = 'implementer'
-purpose = 'worker'
 prompt  = '너는 구현을 맡는다. 기획을 따르고 범위를 바꾸려면 먼저 물어라.'
 
 [[pipeline.triad.agent]]
 alias   = 'review'
 program = 'claude'
 role    = 'reviewer'
-purpose = 'worker'
 prompt  = '너는 리뷰를 맡는다. 구현을 비판하되 직접 고치지 마라.'
 ```
 
@@ -236,10 +234,9 @@ prompt  = '너는 리뷰를 맡는다. 구현을 비판하되 직접 고치지 �
 
 pipeline의 `prompt`는 모든 agent에게 필요한 context를 한 번만 적는 자리이고,
 각 agent의 `prompt`가 그 뒤에 붙습니다. `role`도 pane에 기록되므로 collaboration
-레이어에서 `role:reviewer`로 지목할 수 있습니다. `purpose = 'worker'`를 주면 그
-agent가 peer 요청을 직접 받습니다. 없으면 사람 세션처럼 보호되는 `primary`로 뜨고,
-그 pane에 보낸 요청은 누군가 받아 줄 때까지 대기합니다
-([사람 작업 우선](COLLABORATION.ko.md)).
+레이어에서 `role:reviewer`로 지목할 수 있습니다. `role`이 있는 agent는 worker로 떠서
+peer 요청을 직접 받습니다. `purpose = 'primary'`를 주면 사람 세션처럼 보호되고, 그 pane에
+보낸 요청은 누군가 받아 줄 때까지 대기합니다([사람 작업 우선](COLLABORATION.ko.md)).
 
 `layout`은 모든 pane이 생긴 다음에만 적용됩니다. window를 반복해서 split하면
 그때그때 active pane이 반으로 쪼개지므로, 도중에 세 번 고치는 것보다 끝에 한 번

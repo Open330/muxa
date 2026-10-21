@@ -735,7 +735,13 @@ fn render_agent(
         prompt,
         options: agent.options.clone(),
         direction: agent.direction.clone(),
-        purpose: agent.purpose.unwrap_or_default(),
+        // An agent given a role is there to work with its peers, so it
+        // accepts their requests unless the pipeline says otherwise.
+        purpose: agent.purpose.unwrap_or(if agent.role.is_some() {
+            crate::collaboration::LaunchPurpose::Worker
+        } else {
+            crate::collaboration::LaunchPurpose::Primary
+        }),
         after: agent
             .after
             .iter()
@@ -1227,8 +1233,8 @@ role = 'reviewer'
         );
     }
 
-    /// A pipeline declares which panes are peer workers; everything else
-    /// launches protected, as before the field existed.
+    /// Agents with a role are peer workers by default; an explicit
+    /// `purpose` wins either way, and a role-less agent stays protected.
     #[test]
     fn pipeline_agents_carry_their_declared_purpose() {
         use crate::collaboration::LaunchPurpose;
@@ -1237,17 +1243,30 @@ role = 'reviewer'
 [[pipeline.p.agent]]
 alias = 'implementer'
 program = 'codex'
-purpose = 'worker'
+role = 'implementer'
 
 [[pipeline.p.agent]]
 alias = 'lead'
 program = 'claude'
+
+[[pipeline.p.agent]]
+alias = 'pinned'
+program = 'claude'
+role = 'reviewer'
+purpose = 'primary'
+
+[[pipeline.p.agent]]
+alias = 'helper'
+program = 'codex'
+purpose = 'worker'
 ",
         )
         .unwrap();
         let agents = desired_agents("p", &config.pipeline["p"], &Vars::new()).unwrap();
         assert_eq!(agents[0].purpose, LaunchPurpose::Worker);
         assert_eq!(agents[1].purpose, LaunchPurpose::Primary);
+        assert_eq!(agents[2].purpose, LaunchPurpose::Primary);
+        assert_eq!(agents[3].purpose, LaunchPurpose::Worker);
 
         // A Run recorded before the field existed reads back as primary,
         // and a primary agent keeps the old wire shape.
