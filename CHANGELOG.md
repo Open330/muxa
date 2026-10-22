@@ -7,7 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2] - 2026-10-22
+
 ### Added
+
+- `muxa graph` explores session/window/pane hierarchies and collaboration
+  requests/replies in an interactive terminal graph, including over SSH.
+- Agent launches can select an aas account with available quota, with bounded
+  account queries and provider-checked account pins.
 
 - Sidebar navigation: `prefix + e` toggle, watch transition with `s` or a header
   click, current window/pane markers, and live sharing of watch's saved sort order.
@@ -32,6 +39,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Address a role in a work instead of a pane:
   `muxa msg send callabo/CAL-8111/implementer …` (also `…/role@alias` and
   `…/@alias`, and on `muxa_send_message`/`muxa_call_peer`).
+
+- `prefix + q` / `muxa peek` shows registered roles, primary/worker purpose,
+  incoming/outgoing request links and reported reply state. It uses a bounded
+  metadata snapshot without reading bodies or consuming messages.
+- `muxa msg withdraw REQ…`, `muxa msg send --withdraw REQ`, the
+  `muxa_withdraw_reply_wake` MCP tool and `withdraw_reply_wakes` on
+  `muxa_send_message`/`muxa_call_peer` let an agent say it gave up on or
+  replaced its own request. The late reply stays readable and unread but no
+  longer wakes it; the recipient's work is untouched. Human decisions and
+  peer recovery are excluded, and Fleet sends reject withdrawals.
 
 ### Fixed
 
@@ -75,18 +92,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of one per idle turn. Each entry says how long ago a stale request
   was made. Whether a wake is sent is now decided by the mailbox at delivery
   time, so a read or withdrawal in the meantime always wins.
-
-### Added
-
-- `prefix + q` / `muxa peek` shows registered roles, primary/worker purpose,
-  incoming/outgoing request links and reported reply state. It uses a bounded
-  metadata snapshot without reading bodies or consuming messages.
-- `muxa msg withdraw REQ…`, `muxa msg send --withdraw REQ`, the
-  `muxa_withdraw_reply_wake` MCP tool and `withdraw_reply_wakes` on
-  `muxa_send_message`/`muxa_call_peer` let an agent say it gave up on or
-  replaced its own request. The late reply stays readable and unread but no
-  longer wakes it; the recipient's work is untouched. Human decisions and
-  peer recovery are excluded, and Fleet sends reject withdrawals.
 
 ## [0.9.1] - 2026-10-19
 
@@ -4436,7 +4441,9 @@ and opt-in desktop notifications. 92 tests green.
 - Hook ingest is best-effort — adapter or daemon hiccups never block
   the agent CLI's actual command from running.
 
-[Unreleased]: https://github.com/Open330/muxa/compare/v0.9.0...HEAD
+[Unreleased]: https://github.com/Open330/muxa/compare/v0.9.2...HEAD
+[0.9.2]: https://github.com/Open330/muxa/compare/v0.9.1...v0.9.2
+[0.9.1]: https://github.com/Open330/muxa/compare/v0.9.0...v0.9.1
 [0.9.0]: https://github.com/Open330/muxa/compare/v0.8.58...v0.9.0
 [0.8.58]: https://github.com/Open330/muxa/compare/v0.8.57...v0.8.58
 [0.8.57]: https://github.com/Open330/muxa/compare/v0.8.56...v0.8.57
