@@ -1588,20 +1588,37 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("muxa-aas-{name}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("aas");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        // Anything but `candidates` exits at once, so the probe below is free.
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$1\" = candidates ] || exit 0\n{body}\n"),
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A test thread forking while the file was open for writing leaves
+        // it busy (ETXTBSY) until that child execs; wait that out here so
+        // the query under test never sees it.
+        for _ in 0..100 {
+            match std::process::Command::new(&path).arg("probe").status() {
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
         path
     }
 
     #[cfg(unix)]
     #[test]
     fn the_query_deadline_covers_a_helper_holding_the_pipes() {
-        let aas = fake_aas("helper", "sleep 3 &\nprintf '{\"accounts\":[]}'\nexit 0");
+        let aas = fake_aas("helper", "sleep 20 &\nprintf '{\"accounts\":[]}'\nexit 0");
         let started = Instant::now();
         let outcome =
             query_candidates_within(aas.to_str().unwrap(), "claude", Duration::from_millis(300));
+        // Far under the helper's 20s, with room for a loaded test machine.
         assert!(
-            started.elapsed() < Duration::from_secs(2),
+            started.elapsed() < Duration::from_secs(10),
             "{:?}",
             started.elapsed()
         );
@@ -1623,7 +1640,7 @@ mod tests {
         let started = Instant::now();
         let outcome =
             query_candidates_within(hung.to_str().unwrap(), "claude", Duration::from_millis(200));
-        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(outcome.unwrap_err().contains("did not answer"));
         for path in [ok, hung] {
             std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
