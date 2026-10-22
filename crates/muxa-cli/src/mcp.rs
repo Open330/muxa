@@ -3332,6 +3332,18 @@ fn launch_options(
     Ok(options)
 }
 
+/// The role a peer spawned for `target` takes: the one it names, or the
+/// call's intent.
+fn spawned_peer_role<'a>(target: &'a str, args: &Value) -> &'a str {
+    target.strip_prefix("role:").unwrap_or_else(|| {
+        if args.get("intent").and_then(Value::as_str) == Some("task") {
+            "implementer"
+        } else {
+            "reviewer"
+        }
+    })
+}
+
 async fn spawn_peer(
     client: &Client,
     origin: &CollaborationOrigin,
@@ -3365,18 +3377,7 @@ async fn spawn_peer(
         name: None,
         workspace: None,
         work: None,
-        role: Some(
-            target
-                .strip_prefix("role:")
-                .unwrap_or_else(|| {
-                    if args.get("intent").and_then(Value::as_str) == Some("task") {
-                        "implementer"
-                    } else {
-                        "reviewer"
-                    }
-                })
-                .into(),
-        ),
+        role: Some(spawned_peer_role(target, args).into()),
         task: Some("muxa peer call".into()),
         // A peer spawned for one call is not a pipeline pane, so it stays
         // unaliased and `muxa work up` reports it as unclaimed rather than
