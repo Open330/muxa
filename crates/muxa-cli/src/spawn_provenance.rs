@@ -114,6 +114,7 @@ mod tests {
             launch_id: uuid::Uuid::new_v4().to_string(),
             created_at: "2026-10-22".into(),
             creator: CollaborationEndpoint {
+                location: None,
                 agent_session_id: "original-session".into(),
                 pane: "rmux:%37".into(),
                 socket: Some("/tmp/server-a".into()),

@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Peek `from`/`to` rows show the remote window, plus the session when different,
+  while omitting shared location components. Endpoint snapshots retain location.
+
 - `prefix + q` gives pane addresses stable server-aware colors across card titles,
   creation history and message peers, while retaining relationship line colors.
 

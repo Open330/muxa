@@ -746,26 +746,23 @@ fn apply_collaboration(
                 continue;
             }
             let other = if outbound { &link.to } else { &link.from };
-            let label = overview
-                .participants
-                .iter()
-                .find(|peer| {
-                    peer.agent_session_id == other.agent_session_id && peer.socket == other.socket
-                })
-                .map_or_else(
-                    || {
-                        if overview.participants.iter().any(|peer| {
-                            peer.pane == other.pane
-                                && peer.socket == other.socket
-                                && peer.agent_session_id != other.agent_session_id
-                        }) {
-                            format!("{} [previous session]", other.label)
-                        } else {
-                            other.label.clone()
-                        }
-                    },
-                    muxa::collaboration::Participant::label,
-                );
+            let live_peer = overview.participants.iter().find(|peer| {
+                peer.agent_session_id == other.agent_session_id && peer.socket == other.socket
+            });
+            let label = live_peer.map_or_else(
+                || {
+                    if overview.participants.iter().any(|peer| {
+                        peer.pane == other.pane
+                            && peer.socket == other.socket
+                            && peer.agent_session_id != other.agent_session_id
+                    }) {
+                        format!("{} [previous session]", other.label)
+                    } else {
+                        other.label.clone()
+                    }
+                },
+                muxa::collaboration::Participant::label,
+            );
             let state = if link.reply_received {
                 format!("reply received / {:?}", link.status).to_ascii_lowercase()
             } else if link.status == RequestStatus::Completed {
@@ -775,9 +772,10 @@ fn apply_collaboration(
             };
             cell.collaboration.connections.push(link.clone());
             cell.collaboration.links.push(format!(
-                "{} {} · {:?} · {}",
+                "{} {}{} · {:?} · {}",
                 if outbound { "to" } else { "from" },
                 label,
+                connection_location(participant, other, live_peer),
                 link.kind,
                 state
             ));
@@ -786,6 +784,50 @@ fn apply_collaboration(
             }
         }
     }
+}
+
+/// Add only the location components that differ from this card's pane.
+fn connection_location(
+    current: &muxa::collaboration::Participant,
+    other: &muxa::collaboration::CollaborationEndpoint,
+    live: Option<&muxa::collaboration::Participant>,
+) -> String {
+    let endpoint = live.map(muxa::collaboration::CollaborationEndpoint::from);
+    let other = endpoint.as_ref().unwrap_or(other);
+    let Some(location) = &other.location else {
+        return String::new();
+    };
+    let same_server = muxa::backend::pane_id_host_kind(&current.pane)
+        == muxa::backend::pane_id_host_kind(&other.pane)
+        && match (current.socket.as_deref(), other.socket.as_deref()) {
+            (Some(a), Some(b)) => muxa::backend::pane_endpoints_match(Some(&current.pane), a, b),
+            (None, None) => true,
+            _ => false,
+        };
+    let same_session = same_server
+        && match (&current.tmux_session_id, &location.session_id) {
+            (Some(a), Some(b)) => a == b,
+            _ => {
+                matches!((&current.tmux_session_name, &location.session_name), (Some(a), Some(b)) if a == b)
+            }
+        };
+    let session = location
+        .session_name
+        .as_deref()
+        .or(location.session_id.as_deref());
+    let window = location
+        .window_name
+        .as_deref()
+        .unwrap_or(&location.window_id);
+    if !same_session {
+        if let Some(session) = session {
+            return format!(" [{session}/{window}]");
+        }
+    }
+    if !same_server || current.room.window_id != location.window_id {
+        return format!(" [{window}]");
+    }
+    String::new()
 }
 
 fn collaboration_lines(cell: &PeekCell) -> Vec<String> {
@@ -1840,6 +1882,60 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     #[test]
+    fn peer_locations_omit_shared_components_and_keep_remote_snapshot_names() {
+        use muxa::collaboration::{CollaborationEndpoint, Participant};
+        let current: Participant = serde_json::from_value(serde_json::json!({
+            "agent_kind":"codex", "agent_session_id":"one", "pane":"rmux:%47",
+            "socket":"/tmp/server", "state":"idle",
+            "tmux_session_id":"$1", "tmux_session_name":"muxa", "window_name":"main",
+            "room":{"host":"rmux", "socket":"/tmp/server", "window_id":"@1"}
+        }))
+        .unwrap();
+        let mut other = current.clone();
+        other.agent_session_id = "two".into();
+        other.pane = "rmux:%559".into();
+        assert_eq!(connection_location(&current, &(&other).into(), None), "");
+        // Renamed labels do not turn the same stable session/window into a
+        // different location.
+        other.tmux_session_name = Some("renamed".into());
+        other.window_name = Some("renamed-window".into());
+        assert_eq!(connection_location(&current, &(&other).into(), None), "");
+        other.room.window_id = "@2".into();
+        other.window_name = Some("review".into());
+        let remote = CollaborationEndpoint::from(&other);
+        assert_eq!(connection_location(&current, &remote, None), " [review]");
+        other.tmux_session_id = Some("$2".into());
+        other.tmux_session_name = Some("other-session".into());
+        assert_eq!(
+            connection_location(&current, &(&other).into(), None),
+            " [other-session/review]"
+        );
+        // Prefer a live identity's current location over an older snapshot.
+        assert_eq!(
+            connection_location(&current, &remote, Some(&other)),
+            " [other-session/review]"
+        );
+        other.tmux_session_id = Some("$1".into());
+        other.tmux_session_name = Some("muxa".into());
+        other.socket = Some("/tmp/another-server".into());
+        assert_eq!(
+            connection_location(&current, &(&other).into(), None),
+            " [muxa/review]"
+        );
+        other.tmux_session_name = None;
+        other.window_name = None;
+        assert_eq!(
+            connection_location(&current, &(&other).into(), None),
+            " [$1/@2]"
+        );
+        let legacy: CollaborationEndpoint = serde_json::from_value(serde_json::json!({
+            "agent_session_id":"old", "pane":"rmux:%5", "socket":"/tmp/server", "label":"old"
+        }))
+        .unwrap();
+        assert_eq!(connection_location(&current, &legacy, None), "");
+    }
+
+    #[test]
     fn collaboration_cards_show_real_links_and_reject_recycled_sessions() {
         use muxa::collaboration::{
             CollaborationEndpoint, CollaborationLink, CollaborationOverview, LaunchPurpose,
@@ -1891,6 +1987,22 @@ mod tests {
         assert!(rendered.contains("from builder"));
         assert!(rendered.contains("reply received / blocked"));
         assert_eq!(cells[0].collaboration.purpose, Some(LaunchPurpose::Worker));
+        let mut remote_overview = overview.clone();
+        remote_overview.participants.truncate(1);
+        remote_overview.links[0]
+            .to
+            .location
+            .as_mut()
+            .unwrap()
+            .window_id = "@9".into();
+        remote_overview.links[0]
+            .to
+            .location
+            .as_mut()
+            .unwrap()
+            .window_name = Some("remote-review".into());
+        apply_collaboration(&mut cells, &remote_overview);
+        assert!(cells[0].collaboration.links[0].contains(" [remote-review]"));
         cells[1].agent.as_mut().unwrap().session_id = "replacement".into();
         overview.participants[1].agent_session_id = "replacement".into();
         apply_collaboration(&mut cells, &overview);
@@ -1953,6 +2065,7 @@ mod tests {
         to.last_prompt = Some("Review the authentication change".into());
         to.last_response = Some("Checking behavior and regression risks".into());
         let endpoint = |a: &Agent, alias: &str| CollaborationEndpoint {
+            location: None,
             agent_session_id: a.session_id.clone(),
             pane: a.pane.clone().unwrap(),
             socket: a.tmux_socket.clone(),

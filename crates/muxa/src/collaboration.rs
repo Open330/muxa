@@ -5,7 +5,9 @@
 //! pane never inherits stale work.
 
 mod overview;
-pub use overview::{CollaborationEndpoint, CollaborationLink, CollaborationOverview};
+pub use overview::{
+    CollaborationEndpoint, CollaborationLink, CollaborationLocation, CollaborationOverview,
+};
 mod purpose;
 use purpose::{load_purposes, PurposeGrant};
 pub use purpose::{

@@ -5,12 +5,27 @@ use super::{
 };
 use serde::{Deserialize, Serialize};
 
+/// Multiplexer location, kept with endpoints even when the peer is outside
+/// the visible window or no longer running. Older snapshots omit it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationLocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_name: Option<String>,
+    pub window_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_name: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationEndpoint {
     pub agent_session_id: String,
     pub pane: String,
     pub socket: Option<String>,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<CollaborationLocation>,
 }
 impl From<&Participant> for CollaborationEndpoint {
     fn from(value: &Participant) -> Self {
@@ -19,6 +34,12 @@ impl From<&Participant> for CollaborationEndpoint {
             pane: value.pane.clone(),
             socket: value.socket.clone(),
             label: value.label(),
+            location: Some(CollaborationLocation {
+                session_id: value.tmux_session_id.clone(),
+                session_name: value.tmux_session_name.clone(),
+                window_id: value.room.window_id.clone(),
+                window_name: value.window_name.clone(),
+            }),
         }
     }
 }

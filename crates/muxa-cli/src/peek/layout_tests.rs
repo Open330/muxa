@@ -87,6 +87,7 @@ fn cells_for(rects: &[Rect]) -> Vec<PeekCell> {
     let endpoint = |cell: &PeekCell| {
         let agent = cell.agent.as_ref().unwrap();
         CollaborationEndpoint {
+            location: None,
             agent_session_id: agent.session_id.clone(),
             pane: agent.pane.clone().unwrap(),
             socket: agent.tmux_socket.clone(),

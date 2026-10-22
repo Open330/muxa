@@ -64,6 +64,11 @@ colors, and plain output remains uncolored.
 The Links box itself is the connection node, centered within its pane with
 horizontal padding. It moves below the prompt when needed to avoid overlap;
 arrows attach to the box border instead of a floating point.
+Peer `from`/`to` rows omit shared session/window names. Another window in the
+same session adds `[window]`; another session adds `[session/window]`. Names
+fall back to stable IDs when unavailable; old endpoints without location stay
+unannotated.
+
 
 
 
