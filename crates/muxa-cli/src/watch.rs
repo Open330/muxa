@@ -20,6 +20,8 @@
 //! Terminal lifecycle is managed by a RAII `TerminalGuard` so raw mode and
 //! the alternate screen are always restored — even on panic.
 
+pub(crate) mod sidebar;
+
 use std::cmp::Ordering;
 use std::future::Future;
 use std::io::{self, Stdout, Write};

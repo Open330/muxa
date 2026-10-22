@@ -106,6 +106,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | --- | --- |
 | `muxa status-line` | One-line tmux `status-right` summary for the active pane. |
 | `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its handle (`@claude`) and tmux pane id, its agent's state, summary, and latest prompt/response; a separate Links panel below shows roles, primary/worker purpose and request/reply state, with full pane IDs and connecting arrows following the real pane layout — including how long ago you last prompted it and which pane was prompted most recently; press a digit to jump, or `|` for a scrollable reader (`Tab` toggles terminal history). |
+| `muxa sidebar show` | Persistent left/right agent explorer, with matching pane colors and sidebar-aware focus zoom. [Usage](docs/SIDEBAR.md). |
 | `muxa watch` | Main TUI for agents, prompts, live previews, hierarchy-aware mailbox history, and table/sequence collaboration. |
 | `muxa dashboard` | Work-first TUI console; `P` prompts and `A` aborts every live agent in the selected Work. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |

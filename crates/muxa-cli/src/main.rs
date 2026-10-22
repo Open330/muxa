@@ -31,6 +31,7 @@ mod pane_identity;
 mod peek;
 mod relay;
 mod reload;
+mod sidebar;
 mod spawn_provenance;
 mod stale_agents;
 mod start;
@@ -262,6 +263,8 @@ enum Cmd {
     /// Designed to be bound to `prefix + q` via a borderless fullscreen
     /// `display-popup` (see `muxa init --only tmux-peek`).
     Peek(peek::Args),
+    /// Persistent left/right agent tree, with sidebar-aware focus zoom.
+    Sidebar(sidebar::Args),
     /// Fullscreen nested session/window/pane topology of tracked agents.
     Watch {
         /// Open watch in a popup on the current tmux or rmux server.
@@ -1582,6 +1585,7 @@ async fn main() -> Result<()> {
             RegistryCmd::Panes => cmd_panes(),
         },
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
+        Cmd::Sidebar(args) => sidebar::run(&client, &cfg, args).await,
         Cmd::Watch {
             popup: _,
             fleet,

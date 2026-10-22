@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa sidebar show/toggle/hide`: a persistent left/right native agent explorer,
+  automatic sidebars in visited windows, and reversible focus zoom that keeps
+  the explorer visible without moving or restarting work panes.
+
 - Watch pane IDs use the same server-aware colors as peek across tree rows,
   inspector rosters, capture titles, preview headers and collaboration routes.
 

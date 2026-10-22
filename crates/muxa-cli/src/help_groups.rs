@@ -19,6 +19,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
             "dashboard",
             "attend",
             "peek",
+            "sidebar",
             "recap",
         ],
     ),
