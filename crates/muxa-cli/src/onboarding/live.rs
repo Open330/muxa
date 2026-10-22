@@ -1407,6 +1407,12 @@ impl Sandbox {
             (&fleet.codex, "codex"),
         ] {
             self.muxa_as(pane, &["identity", "set", "--alias", alias])?;
+            // A tracked session is a protected primary by default, and a
+            // primary's bulk `msg inbox` claims nothing an agent sent it. The
+            // tour's sessions trade requests both ways (the learner asks
+            // @claude, @codex asks @you), so each opts into peer work the way
+            // a worker would; a real human session stays primary.
+            self.muxa_as(pane, &["identity", "purpose", "worker"])?;
         }
         Ok(())
     }
@@ -1631,8 +1637,8 @@ const STEPS: &[Step] = &[
     Step {
         achieved_en: "✓ you read claude's reply — and codex has asked you something of its own",
         achieved_ko: "✓ claude의 답장을 봤습니다 — 그리고 codex가 당신에게 물어왔습니다",
-        title_en: "`inbox` claims the requests addressed to you. Agents use muxa too.",
-        title_ko: "`inbox`는 당신 앞으로 온 요청을 가져옵니다. agent도 muxa를 씁니다.",
+        title_en: "`inbox` claims requests to worker sessions; a primary uses `msg accept ID`.",
+        title_ko: "worker는 `inbox`로, primary는 `msg accept ID`로 요청을 수락합니다.",
         cue_en: "run:   muxa msg inbox",
         cue_ko: "입력:   muxa msg inbox",
         detect: Detect::ClaimedInbox,
