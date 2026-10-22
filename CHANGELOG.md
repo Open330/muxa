@@ -22,8 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- `prefix + q` anchors connections at pane centers, using the nearest free row
-  on the centerline when prompt or relationship text occupies the center.
+- `prefix + q` centers padded Links boxes within panes and attaches arrows to
+  their borders. Boxes move below prompts when needed, without floating nodes.
 
 - `prefix + q` keeps collaboration roles and request state in a separate panel
   below prompts/responses. Spatial arrows connect visible pane panels without

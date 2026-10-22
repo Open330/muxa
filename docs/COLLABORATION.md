@@ -61,8 +61,9 @@ prompt bodies. The overlay never scans that archive.
 Pane addresses use stable server-and-pane colors in card titles, creation history
 and peer rows. Only addresses are colored; relationship lines retain their type
 colors, and plain output remains uncolored.
-Connection nodes sit on each pane's horizontal centerline, as close as possible
-to its geometric center without covering prompt or relationship text.
+The Links box itself is the connection node, centered within its pane with
+horizontal padding. It moves below the prompt when needed to avoid overlap;
+arrows attach to the box border instead of a floating point.
 
 
 

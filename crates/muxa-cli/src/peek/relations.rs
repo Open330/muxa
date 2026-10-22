@@ -5,7 +5,7 @@ use muxa::collaboration::CollaborationEndpoint;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Clear, Paragraph};
+use ratatui::widgets::{Block, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 use super::{
@@ -23,16 +23,36 @@ fn panel(cell: &PeekCell, pane: Rect, bottom: u16) -> Option<Rect> {
         return None;
     }
     let prompt = info_rect(cell, pane);
-    let y = prompt.bottom().saturating_add(1);
-    let available = pane.bottom().min(bottom).saturating_sub(y);
+    let minimum_y = prompt.bottom().saturating_add(1);
+    let end = pane.bottom().min(bottom);
+    let available = end.saturating_sub(minimum_y);
     if available < 3 {
         return None;
     }
-    let rows = u16::try_from(collaboration_lines(cell).len()).unwrap_or(4);
+    let lines = collaboration_lines(cell);
+    let rows = u16::try_from(lines.len()).unwrap_or(4);
+    let height = available.min(rows + 2);
+    // Size to the actual text, with one cell of inner padding and at least
+    // a little room on both sides. The box itself is the visible graph node.
+    let title_width = display_width(&format!(" Links · {} ", pane_address(cell))) + 2;
+    let text_width = lines
+        .iter()
+        .map(|line| display_width(line))
+        .max()
+        .unwrap_or(0)
+        + 4;
+    let margin = if pane.width >= 20 { 2 } else { 1 };
+    let width = u16::try_from(title_width.max(text_width).max(16))
+        .unwrap_or(u16::MAX)
+        .min(pane.width.saturating_sub(margin * 2));
+    let centered_y = pane
+        .y
+        .saturating_add(pane.height.saturating_sub(height) / 2);
     Some(Rect {
-        y,
-        height: available.min(rows + 2),
-        ..prompt
+        x: pane.x + (pane.width - width) / 2,
+        y: centered_y.clamp(minimum_y, end - height),
+        width,
+        height,
     })
 }
 
@@ -66,6 +86,7 @@ pub(super) fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoom
             " Links ".into()
         };
         let block = Block::bordered()
+            .padding(Padding::horizontal(1))
             .title(identity::address_line(
                 title,
                 pane_address(cell),
@@ -176,16 +197,27 @@ fn edges(cells: &[PeekCell], panels: &[Panel]) -> BTreeMap<(usize, usize), (bool
     edges
 }
 
-/// Keep the connection node on the pane's horizontal centerline. Prefer its
-/// geometric center, then the nearest free row, without covering any text.
-fn node_position(pane: Rect, area: Rect, blocked: &[bool]) -> Option<Position> {
-    let visible = pane.intersection(area);
-    let x = pane.x.checked_add(pane.width / 2)?;
-    let center_y = pane.y.checked_add(pane.height / 2)?;
-    (visible.y..visible.bottom())
-        .map(|y| Position::new(x, y))
-        .filter(|point| offset(area, *point).is_some_and(|index| !blocked[index]))
-        .min_by_key(|point| point.y.abs_diff(center_y))
+/// The centered Links box is the node. Attach at side midpoints rather
+/// than leaving a separate floating dot or overwriting the box's title.
+fn ports(from: Rect, to: Rect) -> (Position, Position) {
+    let a = Position::new(from.x + from.width / 2, from.y + from.height / 2);
+    let b = Position::new(to.x + to.width / 2, to.y + to.height / 2);
+    if a.x.abs_diff(b.x) >= a.y.abs_diff(b.y) && a.x <= b.x {
+        (
+            Position::new(from.right() - 1, a.y),
+            Position::new(to.x, b.y),
+        )
+    } else if a.x.abs_diff(b.x) >= a.y.abs_diff(b.y) {
+        (
+            Position::new(from.x, a.y),
+            Position::new(to.right() - 1, b.y),
+        )
+    } else {
+        (
+            Position::new(from.right() - 1, a.y),
+            Position::new(to.right() - 1, b.y),
+        )
+    }
 }
 
 fn offset(area: Rect, p: Position) -> Option<usize> {
@@ -363,20 +395,6 @@ fn draw_links(
             }
         }
     }
-    let nodes: Vec<_> = panels
-        .iter()
-        .map(|panel| {
-            let pane = cell_rect(&cells[panel.index].geo, placement.origin_y, f.area())?;
-            node_position(pane, area, &blocked)
-        })
-        .collect();
-    // Routes may end on their own nodes, but must not pass through a third
-    // pane's node and imply a relationship that does not exist.
-    for node in nodes.iter().flatten() {
-        if let Some(index) = offset(area, *node) {
-            blocked[index] = true;
-        }
-    }
     // Creation is pane history; only show edges touching the active pane and
     // only while the original creator session is still visible on its server.
     // Message strokes are painted afterwards and take precedence at crossings.
@@ -387,18 +405,13 @@ fn draw_links(
         let Some(parent) = endpoint_panel(cells, panels, &spawn.creator) else {
             continue;
         };
-        let Some(child_panel) = panels.iter().position(|panel| panel.index == child.index) else {
-            continue;
-        };
-        let (Some(start), Some(end)) = (nodes[parent], nodes[child_panel]) else {
-            continue;
-        };
         let parent = &panels[parent];
         if parent.index == child.index
             || !(cells[parent.index].geo.active || cells[child.index].geo.active)
         {
             continue;
         }
+        let (start, end) = ports(parent.rect, child.rect);
         let Some(path) = route(area, &blocked, start, end) else {
             continue;
         };
@@ -420,9 +433,7 @@ fn draw_links(
     let mut strokes = BTreeMap::new();
     let mut heads = BTreeMap::new();
     for ((from, to), (forward, backward)) in edges(cells, panels).into_iter().take(8) {
-        let (Some(start), Some(end)) = (nodes[from], nodes[to]) else {
-            continue;
-        };
+        let (start, end) = ports(panels[from].rect, panels[to].rect);
         let Some(path) = route(area, &blocked, start, end) else {
             continue;
         };
@@ -516,25 +527,26 @@ mod tests {
     }
 
     #[test]
-    fn nodes_prefer_pane_centers_and_move_only_vertically_to_avoid_text() {
-        let area = Rect::new(0, 0, 120, 48);
-        let pane = Rect::new(60, 0, 60, 48);
-        let mut blocked = vec![false; 120 * 48];
+    fn links_boxes_are_centered_padded_and_connections_touch_their_borders() {
+        let cells = crate::peek::tests::linked_layout(false);
+        let pane = Rect::new(0, 0, 120, 48);
+        let box_rect = panel(&cells[0], pane, 48).unwrap();
+        assert!(box_rect.x >= pane.x + 2);
+        assert!(box_rect.right() <= pane.right() - 2);
+        assert!(box_rect.x.abs_diff(pane.right() - box_rect.right()) <= 1);
+        assert!((box_rect.y * 2 + box_rect.height).abs_diff(pane.height) <= 1);
+        let other = Rect::new(121, box_rect.y, box_rect.width, box_rect.height);
+        let (start, end) = ports(box_rect, other);
         assert_eq!(
-            node_position(pane, area, &blocked),
-            Some(Position::new(90, 24))
+            start,
+            Position::new(box_rect.right() - 1, box_rect.y + box_rect.height / 2)
         );
-        for y in 22..27 {
-            blocked[offset(area, Position::new(90, y)).unwrap()] = true;
+        assert_eq!(end, Position::new(other.x, other.y + other.height / 2));
+        // Crowded panes move the box below the prompt, keeping a blank row.
+        let crowded = Rect::new(0, 0, 44, 15);
+        if let Some(rect) = panel(&cells[0], crowded, 15) {
+            assert!(rect.y > info_rect(&cells[0], crowded).bottom());
+            assert!(rect.bottom() <= 15);
         }
-        assert_eq!(
-            node_position(pane, area, &blocked),
-            Some(Position::new(90, 21))
-        );
-        for y in 0..48 {
-            blocked[offset(area, Position::new(90, y)).unwrap()] = true;
-        }
-        assert_eq!(node_position(pane, area, &blocked), None);
-        assert_eq!(node_position(pane, Rect::new(0, 0, 1, 1), &blocked), None);
     }
 }
