@@ -427,6 +427,11 @@ bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
 bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 ```
 
+`prefix+e` toggles the persistent [agent sidebar](SIDEBAR.md). Its sort order
+shares `[watch].sort`, including changes saved in watch. `prefix+s` expands
+over the sidebar and closes back into it; `s` or a header click inside the
+sidebar opens watch at the selected/last work pane.
+
 `prefix+s` is the normal watch and collaboration entry point. `prefix+D` is an
 optional shortcut to the richer Dashboard.
 

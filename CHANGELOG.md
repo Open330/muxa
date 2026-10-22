@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Sidebar navigation: `prefix + e` toggle, watch transition with `s` or a header
+  click, current window/pane markers, and live sharing of watch's saved sort order.
+
 - `muxa sidebar show/toggle/hide`: a persistent left/right native agent explorer,
   automatic sidebars in visited windows, and reversible focus zoom that keeps
   the explorer visible without moving or restarting work panes.

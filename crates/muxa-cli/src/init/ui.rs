@@ -210,7 +210,7 @@ pub fn final_summary(
         body.push("Token also stored in your config.toml.".into());
     }
     body.push(
-        "Use `prefix+s` for local watch, `prefix+S` for Fleet, and `prefix+D` for the dashboard."
+        "Use `prefix+s` for local watch, `prefix+S` for Fleet, `prefix+e` for the sidebar, and `prefix+D` for the dashboard."
             .into(),
     );
     body.push("Learn the workflow and shortcuts with `muxa onboard`.".into());

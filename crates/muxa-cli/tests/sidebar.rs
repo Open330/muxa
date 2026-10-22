@@ -133,6 +133,7 @@ fn live_sidebar_keeps_agents_in_place_across_docking_focus_and_native_zoom() {
         (&"0".into(), &"36".into(), &"45".into())
     );
     let sidebar_id = sidebar[0].clone();
+    check_navigation(&server, &window, &second, &sidebar_id);
     server.mux(&["set-option", "-w", "-t", &window, "@muxa_sidebar_pane", ""]);
     server.cli("show", &window, &[]);
     assert_eq!(server.panes(&window).len(), 4);
@@ -163,6 +164,12 @@ fn live_sidebar_keeps_agents_in_place_across_docking_focus_and_native_zoom() {
             .iter()
             .any(|row| row.get(5).is_some_and(|mark| mark == "1"))
     });
+    server.cli("hide", &window, &[]);
+    server.cli("toggle", &window, &[]);
+    let restored = server.panes(&window);
+    assert!(restored
+        .iter()
+        .any(|row| row[5] == "1" && row[3] == "30" && row[2] != "0"));
     server.cli("hide", &window, &[]);
     let after: BTreeMap<_, _> = server
         .panes(&window)
@@ -237,4 +244,41 @@ fn check_native_zoom(server: &Server, window: &str, first: &str, layout: &str) {
     });
     server.cli("zoom", window, &[]);
     assert_eq!(server.layout(window), layout);
+}
+
+fn check_navigation(server: &Server, window: &str, pane: &str, sidebar: &str) {
+    assert!(server
+        .mux(&["list-keys", "-T", "prefix"])
+        .contains("sidebar toggle"));
+    server.mux(&["select-pane", "-t", pane]);
+    let last = || {
+        server.mux(&[
+            "show-options",
+            "-w",
+            "-qv",
+            "-t",
+            window,
+            "@muxa_sidebar_last_pane",
+        ])
+    };
+    eventually(|| last() == pane);
+    server.mux(&["select-pane", "-t", sidebar]);
+    assert_eq!(
+        last(),
+        pane,
+        "focusing the explorer must retain the work pane marker"
+    );
+    server.mux(&[
+        "bind-key",
+        "-T",
+        "prefix",
+        "e",
+        "display-message",
+        "keep-sidebar-toggle",
+    ]);
+    server.cli("show", window, &[]);
+    assert!(server
+        .mux(&["list-keys", "-T", "prefix"])
+        .contains("keep-sidebar-toggle"));
+    server.mux(&["select-pane", "-t", pane]);
 }

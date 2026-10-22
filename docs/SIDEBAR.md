@@ -16,8 +16,21 @@ Width defaults to 36 columns (24–80). At least 20 columns must remain for work
 Existing content panes and their nested split structure are retained. Repeating
 show does not create duplicates; changing side/width replaces only the sidebar.
 
+`prefix + e` toggles the explorer and remembers its side/width. An existing
+custom `e` binding is preserved when enabling the sidebar. `muxa init` also
+installs this shortcut with the watch bindings.
+
+`prefix + s` opens the normal full watch over the tree; closing watch reveals
+the same sidebar. Press `s` in the sidebar or click its header for the same
+transition, starting watch at the selected/last work pane. This uses the existing
+popup and reserves rmux's status row, without rebuilding the agent tree pane.
+
 Use arrows or `hjkl` to navigate, Enter or a mouse click to focus a pane, and `r`
-to refresh. The explorer stays running when focus moves. Cross-session selection
+to refresh. Click session/window rows to collapse/expand them; the wheel scrolls.
+`◆` marks the current session/window and `▶` the active work pane, independently
+of the `>` navigation cursor. Focusing the sidebar retains the last work pane
+marker. The sort order comes from `[watch].sort`; changes saved in watch are
+picked up within one second without restarting the sidebar. The explorer stays running when focus moves. Cross-session selection
 requires exactly one client focused on the sidebar; it carries the sidebar into
 the selected session without switching an unrelated client. Plain `z`/`q` in the
 explorer show hints; use the commands above to hide it.
@@ -47,7 +60,7 @@ the saved layout. If panes were created/closed during focus, keep the user's
 current pane set/layout instead of recreating or deleting anything.
 
 Hooks occupy index 9105 of `after-select-window`, `after-new-window`,
-`client-session-changed`, and `after-resize-pane`. They are guarded by sidebar
+`client-session-changed`, `after-select-pane`, and `after-resize-pane`. They are guarded by sidebar
 policy/zoom state and do not run a sidebar CLI in disabled sessions. The ordinary
 zoom binding still behaves normally in windows without a sidebar.
 

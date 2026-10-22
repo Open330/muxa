@@ -4,6 +4,7 @@ use super::{
     watch_theme, App, RefreshOutcome, Spinner, TerminalGuard, TopologyNodeKey, TopologyNodeRef,
     WatchConfig, WatchLayout, WatchTreeExpansion, WatchView,
 };
+use crate::sidebar::UiLaunch;
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEventKind};
 use muxa::ipc::Client;
@@ -17,16 +18,127 @@ use ratatui::{
 };
 use std::{
     io,
-    path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 use tokio::sync::mpsc;
 
 struct SidebarContext {
     endpoint: BackendEndpoint,
     own: String,
-    daemon: PathBuf,
+    launch: UiLaunch,
+}
+
+#[derive(Default)]
+struct Active {
+    session: String,
+    window: String,
+    pane: String,
+}
+impl Active {
+    fn read(context: &SidebarContext) -> Option<Self> {
+        let control = crate::mux_control::Control::Endpoint(context.endpoint.clone());
+        let source = context.own.strip_prefix("rmux:").unwrap_or(&context.own);
+        let row = control
+            .output(&[
+                "display-message",
+                "-p",
+                "-t",
+                source,
+                "#{session_id}\t#{window_id}\t#{@muxa_sidebar_last_pane}",
+            ])
+            .ok()?;
+        let mut fields = row.trim_end().split('\t');
+        Some(Self {
+            session: fields.next()?.into(),
+            window: fields.next()?.into(),
+            pane: fields.next().unwrap_or_default().into(),
+        })
+    }
+    fn marker(&self, key: &TopologyNodeKey) -> &'static str {
+        match key {
+            TopologyNodeKey::Pane(pane)
+                if pane.window.session.session_id == self.session
+                    && pane.window.window_id == self.window
+                    && pane.pane_id.strip_prefix("rmux:").unwrap_or(&pane.pane_id) == self.pane =>
+            {
+                "▶ "
+            }
+            TopologyNodeKey::Window(window)
+                if window.session.session_id == self.session && window.window_id == self.window =>
+            {
+                "◆ "
+            }
+            TopologyNodeKey::Session(session) if session.session_id == self.session => "◆ ",
+            _ => "  ",
+        }
+    }
+}
+
+fn sync_sort(app: &mut App, launch: &UiLaunch, modified: &mut Option<(SystemTime, u64)>) {
+    let Some(path) = &launch.config else {
+        return;
+    };
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    let Ok(time) = metadata.modified() else {
+        return;
+    };
+    let stamp = (time, metadata.len());
+    if *modified == Some(stamp) {
+        return;
+    }
+    if let Ok(config) = muxa::config::Config::load(path) {
+        *modified = Some(stamp);
+        if app.watch_cfg.sort != config.watch.sort {
+            let selected = app.selection_identity_for_rebuild();
+            app.watch_cfg.sort = config.watch.sort;
+            app.resort_rows_restoring_selection(selected);
+        }
+    }
+}
+
+fn toggle_branch(app: &mut App, key: &TopologyNodeKey) {
+    if !app.expanded_nodes.remove(key) {
+        app.expanded_nodes.insert(key.clone());
+    }
+    app.pin_filtered_tree_selection();
+}
+
+fn open_watch(context: &SidebarContext, app: &App) -> Result<()> {
+    let control = crate::mux_control::Control::Endpoint(context.endpoint.clone());
+    let source = context.own.strip_prefix("rmux:").unwrap_or(&context.own);
+    let client = crate::sidebar::focused_client(&control, source)?;
+    let selected = match app.selected_node_key() {
+        Some(TopologyNodeKey::Pane(pane)) => pane.pane_id.clone(),
+        _ => crate::sidebar::watch_source(&control, source).unwrap_or_else(|| source.into()),
+    };
+    let mut words = context.launch.words()?;
+    words.extend([
+        "watch".into(),
+        "--caller-client".into(),
+        client.clone(),
+        "--caller-pane".into(),
+        selected,
+    ]);
+    let command = muxa::shell::Dialect::native().command_line(&words);
+    control.run(&[
+        "display-popup",
+        "-c",
+        &client,
+        "-B",
+        "-E",
+        "-w",
+        "100%",
+        "-h",
+        "99%",
+        "-x",
+        "0",
+        "-y",
+        "0",
+        &command,
+    ])
 }
 
 fn on_server(agent: &Agent, endpoint: &BackendEndpoint) -> bool {
@@ -65,7 +177,7 @@ fn filter(
         .then_some(RefreshOutcome::SingleAgent(agent)),
     }
 }
-fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState) {
+fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState, active: &Active) {
     let area = frame.area();
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
     let targets = app.tree_targets();
@@ -77,7 +189,12 @@ fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState) 
         .iter()
         .filter_map(|target| {
             let node = app.topology.find(&target.key)?;
-            let mut spans = Vec::new();
+            let mut spans = vec![Span::styled(
+                active.marker(&target.key),
+                theme
+                    .dim_style()
+                    .add_modifier(ratatui::style::Modifier::BOLD),
+            )];
             if let TopologyNodeRef::Pane(pane) = node {
                 let (glyph, style) = pane.agent.as_ref().map_or_else(
                     || ("○", theme.dim_style()),
@@ -99,7 +216,7 @@ fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState) 
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Muxa agents ")
+                .title(" Muxa agents · s watch ")
                 .border_style(theme.border_style()),
         )
         .highlight_style(theme.selected_style())
@@ -111,7 +228,7 @@ fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState) 
     frame.render_stateful_widget(list, body, state);
     if area.height > 0 {
         let footer = if message.is_empty() {
-            "↑↓ tree · Enter focus · z zoom"
+            "s watch · Enter focus · ▶ active"
         } else {
             message
         };
@@ -137,6 +254,7 @@ pub(crate) async fn run(
     config: &muxa::config::Config,
     endpoint: BackendEndpoint,
     own: String,
+    launch: UiLaunch,
 ) -> Result<()> {
     let terminal = setup_terminal()?;
     let mut guard = TerminalGuard::new(terminal);
@@ -177,13 +295,16 @@ pub(crate) async fn run(
     let context = SidebarContext {
         endpoint: endpoint.clone(),
         own: own.clone(),
-        daemon: client.socket().to_path_buf(),
+        launch,
     };
     let mut message = String::new();
     let mut list_state = ListState::default();
     let _background = Abort(background);
     let mut dirty = true;
     let mut last_draw = Instant::now();
+    let mut last_sync: Option<Instant> = None;
+    let mut modified = None;
+    let mut active = Active::default();
     loop {
         while let Ok(outcome) = out_rx.try_recv() {
             if let Some(outcome) = filter(outcome, &endpoint, &own) {
@@ -191,10 +312,18 @@ pub(crate) async fn run(
                 dirty = true;
             }
         }
+        if last_sync.is_none_or(|last| last.elapsed() >= Duration::from_secs(1)) {
+            if let Some(current) = Active::read(&context) {
+                active = current;
+            }
+            sync_sort(&mut app, &context.launch, &mut modified);
+            last_sync = Some(Instant::now());
+            dirty = true;
+        }
         if dirty || last_draw.elapsed() >= Duration::from_secs(1) {
             guard
                 .terminal_mut()
-                .draw(|frame| draw(frame, &mut app, &message, &mut list_state))?;
+                .draw(|frame| draw(frame, &mut app, &message, &mut list_state, &active))?;
             last_draw = Instant::now();
             dirty = false;
         }
@@ -235,6 +364,13 @@ fn input(
             crossterm::event::MouseEventKind::ScrollUp => app.move_up(),
             crossterm::event::MouseEventKind::ScrollDown => app.move_down(),
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                if mouse.row == 0 =>
+            {
+                *message = open_watch(context, app)
+                    .err()
+                    .map_or_else(String::new, |error| error.to_string());
+            }
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
                 if mouse.row > 0 && mouse.row < pane_height.saturating_sub(2) =>
             {
                 let index = list_state.offset() + usize::from(mouse.row - 1);
@@ -245,12 +381,12 @@ fn input(
                             &context.endpoint,
                             pane,
                             &context.own,
-                            &context.daemon,
+                            &context.launch,
                         )
                         .err()
                         .map_or_else(String::new, |error| error.to_string());
                     } else {
-                        app.expand_or_enter_tree_child();
+                        toggle_branch(app, &target.key);
                     }
                 }
             }
@@ -261,6 +397,11 @@ fn input(
             KeyCode::Down | KeyCode::Char('j') => app.move_down(),
             KeyCode::Left | KeyCode::Char('h') => app.collapse_or_select_tree_parent(),
             KeyCode::Right | KeyCode::Char('l') => app.expand_or_enter_tree_child(),
+            KeyCode::Char('s') => {
+                *message = open_watch(context, app)
+                    .err()
+                    .map_or_else(String::new, |error| error.to_string());
+            }
             KeyCode::Char('r') => {
                 let _ = wake_tx.try_send(());
             }
@@ -270,12 +411,12 @@ fn input(
                         &context.endpoint,
                         &pane,
                         &context.own,
-                        &context.daemon,
+                        &context.launch,
                     )
                     .err()
                     .map_or_else(String::new, |error| error.to_string());
-                } else {
-                    app.expand_or_enter_tree_child();
+                } else if let Some(key) = app.selected_node_key() {
+                    toggle_branch(app, &key);
                 }
             }
             KeyCode::Esc => {
@@ -296,6 +437,55 @@ fn input(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn current_window_and_pane_are_independent_of_the_tree_cursor() {
+        let session = muxa::SessionKey {
+            endpoint: BackendEndpoint {
+                host: HostKind::Rmux,
+                socket: "/tmp/server".into(),
+            },
+            session_id: "$1".into(),
+        };
+        let window = muxa::WindowKey {
+            session: session.clone(),
+            window_id: "@2".into(),
+        };
+        let pane = muxa::PaneKey {
+            window: window.clone(),
+            pane_id: "rmux:%35".into(),
+        };
+        let active = Active {
+            session: "$1".into(),
+            window: "@2".into(),
+            pane: "%35".into(),
+        };
+        assert_eq!(active.marker(&TopologyNodeKey::Session(session)), "◆ ");
+        assert_eq!(active.marker(&TopologyNodeKey::Window(window)), "◆ ");
+        assert_eq!(active.marker(&TopologyNodeKey::Pane(pane.clone())), "▶ ");
+        let mut other = pane;
+        other.window.window_id = "@3".into();
+        assert_eq!(active.marker(&TopologyNodeKey::Pane(other)), "  ");
+    }
+    #[test]
+    fn watch_saved_sort_updates_the_running_sidebar_and_survives_bad_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[watch]\nsort=['name']\n").unwrap();
+        let launch = UiLaunch {
+            daemon: directory.path().join("socket"),
+            config: Some(path.clone()),
+        };
+        let mut app = App::with_config(WatchConfig::default());
+        let mut stamp = None;
+        sync_sort(&mut app, &launch, &mut stamp);
+        assert_eq!(app.watch_cfg.sort, vec![muxa::config::WatchSortKey::Name]);
+        crate::watch::persist_watch_sort(&path, &[muxa::config::WatchSortKey::PaneId]).unwrap();
+        sync_sort(&mut app, &launch, &mut stamp);
+        assert_eq!(app.watch_cfg.sort, vec![muxa::config::WatchSortKey::PaneId]);
+        std::fs::write(&path, "[watch] invalid").unwrap();
+        sync_sort(&mut app, &launch, &mut stamp);
+        assert_eq!(app.watch_cfg.sort, vec![muxa::config::WatchSortKey::PaneId]);
+    }
     #[test]
     fn compact_tree_does_not_list_its_own_infrastructure_pane() {
         let endpoint = BackendEndpoint {

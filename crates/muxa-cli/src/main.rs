@@ -1469,10 +1469,11 @@ async fn main() -> Result<()> {
     if let Cmd::Watch {
         popup: true,
         caller_client,
+        caller_pane,
         ..
     } = &cmd
     {
-        return mux_control::watch_popup(caller_client.as_deref());
+        return mux_control::watch_popup(caller_client.as_deref(), caller_pane.as_deref());
     }
     if matches!(cmd, Cmd::Start) && !start::interactive() {
         start::print_help();
@@ -1585,7 +1586,7 @@ async fn main() -> Result<()> {
             RegistryCmd::Panes => cmd_panes(),
         },
         Cmd::Peek(peek_args) => peek::run(&client, peek_args).await,
-        Cmd::Sidebar(args) => sidebar::run(&client, &cfg, args).await,
+        Cmd::Sidebar(args) => sidebar::run(&client, &cfg, args, config_path.as_deref()).await,
         Cmd::Watch {
             popup: _,
             fleet,

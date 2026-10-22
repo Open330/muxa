@@ -118,7 +118,7 @@ impl Component {
     pub fn label(self) -> &'static str {
         match self {
             Component::TmuxPopup => {
-                "tmux: prefix+s watch + prefix+S Fleet + prefix+M move + prefix+D dashboard"
+                "tmux: prefix+s watch + prefix+S Fleet + prefix+e sidebar + prefix+M move + prefix+D dashboard"
             }
             Component::TmuxStatusLine => "tmux: per-pane agent glyphs in status-right",
             Component::TmuxPeek => "tmux: prefix+Q overlays each pane with its agent",

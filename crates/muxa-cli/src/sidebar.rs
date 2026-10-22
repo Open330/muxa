@@ -6,9 +6,11 @@ use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use muxa::{BackendEndpoint, HostKind};
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
+use std::path::{Path, PathBuf};
 
 mod layout;
 const POLICY: &str = "@muxa_sidebar_config";
+const SAVED_POLICY: &str = "@muxa_sidebar_saved_config";
 const PANE: &str = "@muxa_sidebar_pane";
 const MARK: &str = "@muxa_sidebar";
 const ZOOM: &str = "@muxa_sidebar_focus";
@@ -65,6 +67,24 @@ struct Policy {
 struct Focus {
     layout: String,
     panes: Vec<String>,
+}
+#[derive(Clone)]
+pub(crate) struct UiLaunch {
+    pub(crate) daemon: PathBuf,
+    pub(crate) config: Option<PathBuf>,
+}
+impl UiLaunch {
+    pub(crate) fn words(&self) -> Result<Vec<String>> {
+        let mut words = vec![
+            std::env::current_exe()?.to_string_lossy().into_owned(),
+            "--socket".into(),
+            self.daemon.to_string_lossy().into_owned(),
+        ];
+        if let Some(config) = &self.config {
+            words.extend(["--config".into(), config.to_string_lossy().into_owned()]);
+        }
+        Ok(words)
+    }
 }
 struct Location {
     session: String,
@@ -215,7 +235,12 @@ pub async fn run(
     client: &muxa::ipc::Client,
     config: &muxa::config::Config,
     args: Args,
+    config_path: Option<&Path>,
 ) -> Result<()> {
+    let launch = UiLaunch {
+        daemon: client.socket().to_path_buf(),
+        config: config_path.map(Path::to_path_buf),
+    };
     let endpoint = endpoint(&args)?;
     if matches!(args.action, Some(Action::Run)) {
         let pane = args
@@ -223,7 +248,7 @@ pub async fn run(
             .or_else(|| muxa::default_backend().current_pane())
             .context("sidebar could not identify its own pane")?;
         let pane = canonical(&endpoint, &pane);
-        return crate::watch::sidebar::run(client, config, endpoint, pane).await;
+        return crate::watch::sidebar::run(client, config, endpoint, pane, launch).await;
     }
     let control = Control::Endpoint(endpoint.clone());
     let target = args
@@ -242,28 +267,28 @@ pub async fn run(
                 side: args.side,
                 width: args.width,
             },
-            client.socket(),
+            &launch,
         )?,
         Action::Toggle => {
             if policy(&control, &location.session)?.is_some() {
                 hide(&control, &location)?;
             } else {
-                show(
-                    &control,
-                    &endpoint,
-                    &location,
+                let saved = option(&control, "", &location.session, SAVED_POLICY)?;
+                let preferences = if saved.is_empty() {
                     Policy {
                         side: args.side,
                         width: args.width,
-                    },
-                    client.socket(),
-                )?;
+                    }
+                } else {
+                    serde_json::from_str(&saved).context("invalid saved sidebar policy")?
+                };
+                show(&control, &endpoint, &location, preferences, &launch)?;
             }
         }
         Action::Hide => hide(&control, &location)?,
         Action::Ensure => {
             if let Some(policy) = policy(&control, &location.session)? {
-                ensure_pane(&control, &endpoint, &location, &policy, client.socket())?;
+                ensure_pane(&control, &endpoint, &location, &policy, &launch)?;
             }
         }
         Action::Zoom => zoom(&control, &location)?,
@@ -280,7 +305,7 @@ fn show(
     endpoint: &BackendEndpoint,
     location: &Location,
     policy: Policy,
-    daemon: &std::path::Path,
+    launch: &UiLaunch,
 ) -> Result<()> {
     // Validate before enabling hooks or changing session preferences.
     ensure!(
@@ -303,7 +328,7 @@ fn show(
         }
     }
     let current = Location::read(control, &location.window)?;
-    ensure_pane(control, endpoint, &current, &policy, daemon)?;
+    ensure_pane(control, endpoint, &current, &policy, launch)?;
     set(
         control,
         "",
@@ -311,8 +336,13 @@ fn show(
         POLICY,
         &serde_json::to_string(&policy)?,
     )?;
-    install_bindings(control, endpoint, daemon)?;
-    println!("Sidebar enabled; use muxa sidebar zoom (stock prefix + z is integrated)");
+    install_bindings(control, endpoint, launch)?;
+    if option(control, "-w", &location.window, PANE)? != location.pane
+        && pane_ids(control, &location.window)?.contains(&location.pane)
+    {
+        set(control, "-w", &location.window, LAST, &location.pane)?;
+    }
+    println!("Sidebar enabled; prefix + e toggles, prefix + s opens watch, prefix + z focuses (custom bindings preserved)");
     Ok(())
 }
 fn ensure_pane(
@@ -320,7 +350,7 @@ fn ensure_pane(
     endpoint: &BackendEndpoint,
     location: &Location,
     policy: &Policy,
-    daemon: &std::path::Path,
+    launch: &UiLaunch,
 ) -> Result<()> {
     if let Some(pane) = owned_pane(control, &location.window)? {
         if option(control, "-w", &location.window, PANE)? != pane {
@@ -339,17 +369,15 @@ fn ensure_pane(
         control.run(&["resize-pane", "-Z", "-t", &location.pane])?;
     }
     // Detached split preserves the human's active pane and its subtree.
-    let words = vec![
-        std::env::current_exe()?.to_string_lossy().into_owned(),
-        "--socket".into(),
-        daemon.to_string_lossy().into_owned(),
+    let mut words = launch.words()?;
+    words.extend([
         "sidebar".into(),
         "run".into(),
         "--host".into(),
         endpoint.host.to_string(),
         "--mux-socket".into(),
         endpoint.socket.clone(),
-    ];
+    ]);
     let shell = muxa::shell::Dialect::native();
     let command = shell.exec_line(&words);
     let mut split = vec![
@@ -463,6 +491,10 @@ fn zoom(control: &Control, location: &Location) -> Result<()> {
     control.run(&["select-pane", "-t", &selected])
 }
 fn hide(control: &Control, location: &Location) -> Result<()> {
+    let preferences = option(control, "", &location.session, POLICY)?;
+    if !preferences.is_empty() {
+        set(control, "", &location.session, SAVED_POLICY, &preferences)?;
+    }
     set(control, "", &location.session, POLICY, "")?;
     // Only this session's marked sidebar panes are eligible for removal.
     let windows = control.output(&[
@@ -501,13 +533,11 @@ fn hide(control: &Control, location: &Location) -> Result<()> {
 fn install_bindings(
     control: &Control,
     endpoint: &BackendEndpoint,
-    daemon: &std::path::Path,
+    launch: &UiLaunch,
 ) -> Result<()> {
     let shell = muxa::shell::Dialect::native();
-    let words = vec![
-        std::env::current_exe()?.to_string_lossy().into_owned(),
-        "--socket".into(),
-        daemon.to_string_lossy().into_owned(),
+    let mut words = launch.words()?;
+    words.extend([
         "sidebar".into(),
         "ensure".into(),
         "--host".into(),
@@ -516,7 +546,7 @@ fn install_bindings(
         endpoint.socket.clone(),
         "--window".into(),
         "#{window_id}".into(),
-    ];
+    ]);
     let command = shell.command_line(&words);
     let guarded = format!("run-shell -b {}", shell.quote(&command));
     let hook = format!("if-shell -F '#{{{POLICY}}}' {}", shell.quote(&guarded));
@@ -527,6 +557,11 @@ fn install_bindings(
     ] {
         control.run(&["set-hook", "-g", name, &hook])?;
     }
+    let focus_hook = format!(
+        "if-shell -F '#{{&&:#{{{POLICY}}},#{{!=:#{{{MARK}}},1}}}}' \"set-option -w {LAST} '#{{pane_id}}'\""
+    );
+    control.run(&["set-hook", "-g", "after-select-pane[9105]", &focus_hook])?;
+    install_toggle(control, endpoint, launch)?;
     let zoom_hook = format!(
         "if-shell -F '#{{&&:#{{window_zoomed_flag}},#{{{PANE}}}}}' {}",
         shell.quote(&guarded)
@@ -548,10 +583,8 @@ fn install_bindings(
         );
         return Ok(());
     }
-    let words = vec![
-        std::env::current_exe()?.to_string_lossy().into_owned(),
-        "--socket".into(),
-        daemon.to_string_lossy().into_owned(),
+    let mut words = launch.words()?;
+    words.extend([
         "sidebar".into(),
         "zoom".into(),
         "--host".into(),
@@ -560,7 +593,7 @@ fn install_bindings(
         endpoint.socket.clone(),
         "--pane".into(),
         "#{pane_id}".into(),
-    ];
+    ]);
     let command = shell.command_line(&words);
     // Outside an enabled window, preserve tmux's native zoom behaviour.
     control.run(&[
@@ -581,7 +614,7 @@ pub(crate) fn select(
     endpoint: &BackendEndpoint,
     pane: &muxa::PaneKey,
     source: &str,
-    daemon: &std::path::Path,
+    launch: &UiLaunch,
 ) -> Result<()> {
     ensure!(
         pane.window.session.endpoint.host == endpoint.host
@@ -605,25 +638,13 @@ pub(crate) fn select(
     let client = if origin.session == destination.session {
         None
     } else {
-        let clients = control.output(&["list-clients", "-F", "#{client_name}\t#{pane_id}"])?;
-        let clients: Vec<_> = clients
-            .lines()
-            .filter_map(|line| {
-                let (name, active) = line.split_once('\t')?;
-                (active == native(source)).then(|| name.to_string())
-            })
-            .collect();
-        ensure!(
-            clients.len() == 1,
-            "cross-session navigation needs one client focused on this sidebar"
-        );
-        Some(clients[0].clone())
+        Some(focused_client(&control, source)?)
     };
     // Carry the explorer into a destination workspace only after an explicit
     // user selection, without stealing another client's session/window.
     if client.is_some() && policy(&control, &destination.session)?.is_none() {
         if let Some(preferences) = policy(&control, &origin.session)? {
-            ensure_pane(&control, endpoint, &destination, &preferences, daemon)?;
+            ensure_pane(&control, endpoint, &destination, &preferences, launch)?;
             set(
                 &control,
                 "",
@@ -643,4 +664,66 @@ pub(crate) fn select(
     }
     set(&control, "-w", &pane.window.window_id, LAST, id)?;
     control.run(&["select-pane", "-t", id])
+}
+
+fn install_toggle(control: &Control, endpoint: &BackendEndpoint, launch: &UiLaunch) -> Result<()> {
+    let bindings = control.output(&["list-keys", "-T", "prefix"])?;
+    let existing = bindings.lines().find(|line| {
+        line.split_whitespace()
+            .collect::<Vec<_>>()
+            .windows(3)
+            .any(|words| words == ["-T", "prefix", "e"])
+    });
+    if existing.is_some_and(|binding| !binding.contains("sidebar toggle")) {
+        eprintln!("Custom prefix + e preserved; use muxa sidebar toggle");
+        return Ok(());
+    }
+    let mut words = launch.words()?;
+    words.extend([
+        "sidebar".into(),
+        "toggle".into(),
+        "--host".into(),
+        endpoint.host.to_string(),
+        "--mux-socket".into(),
+        endpoint.socket.clone(),
+        "--pane".into(),
+        "#{pane_id}".into(),
+    ]);
+    let command = muxa::shell::Dialect::native().command_line(&words);
+    control.run(&["bind-key", "-T", "prefix", "e", "run-shell", "-b", &command])
+}
+
+/// A popup opened from the explorer should select its last work pane.
+pub(crate) fn watch_source(control: &Control, source: &str) -> Option<String> {
+    if option(control, "-p", native(source), MARK).ok()?.as_str() != "1" {
+        return None;
+    }
+    let pane = option(control, "-w", native(source), LAST).ok()?;
+    (!pane.is_empty()).then_some(pane)
+}
+
+/// rmux does not expose `pane_id` in list-clients; resolve the active session
+/// pane separately and refuse to switch an ambiguous group of clients.
+pub(crate) fn focused_client(control: &Control, source: &str) -> Result<String> {
+    let source = native(source);
+    let session = control.output(&["display-message", "-p", "-t", source, "#{session_id}"])?;
+    let target = format!("{}:", session.trim());
+    let active = control.output(&["display-message", "-p", "-t", &target, "#{pane_id}"])?;
+    ensure!(
+        active.trim() == source,
+        "focus this sidebar before navigating"
+    );
+    let clients = control.output(&["list-clients", "-F", "#{client_name}\t#{session_id}"])?;
+    let clients: Vec<_> = clients
+        .lines()
+        .filter_map(|line| {
+            let (name, id) = line.split_once('\t')?;
+            (id == session.trim()).then_some(name)
+        })
+        .collect();
+    ensure!(
+        clients.len() == 1,
+        "navigation needs one client focused on this sidebar; use prefix + s"
+    );
+    Ok(clients[0].into())
 }
