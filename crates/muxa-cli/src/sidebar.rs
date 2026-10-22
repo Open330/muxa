@@ -558,7 +558,7 @@ fn install_bindings(
         control.run(&["set-hook", "-g", name, &hook])?;
     }
     let focus_hook = format!(
-        "if-shell -F '#{{&&:#{{{POLICY}}},#{{!=:#{{{MARK}}},1}}}}' \"set-option -w {LAST} '#{{pane_id}}'\""
+        "if-shell -F '#{{&&:#{{{POLICY}}},#{{!=:#{{{MARK}}},1}}}}' \"set-option -wF {LAST} '#{{pane_id}}'\""
     );
     control.run(&["set-hook", "-g", "after-select-pane[9105]", &focus_hook])?;
     install_toggle(control, endpoint, launch)?;

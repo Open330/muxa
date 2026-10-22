@@ -34,25 +34,65 @@ struct Active {
     session: String,
     window: String,
     pane: String,
+    session_name: String,
+    window_name: String,
+    in_sidebar: bool,
+    rmux: bool,
 }
 impl Active {
     fn read(context: &SidebarContext) -> Option<Self> {
         let control = crate::mux_control::Control::Endpoint(context.endpoint.clone());
         let source = context.own.strip_prefix("rmux:").unwrap_or(&context.own);
-        let row = control
-            .output(&[
-                "display-message",
-                "-p",
-                "-t",
-                source,
-                "#{session_id}\t#{window_id}\t#{@muxa_sidebar_last_pane}",
-            ])
-            .ok()?;
-        let mut fields = row.trim_end().split('\t');
-        Some(Self {
-            session: fields.next()?.into(),
-            window: fields.next()?.into(),
-            pane: fields.next().unwrap_or_default().into(),
+        let raw = control.output(&["list-panes", "-s", "-t", source, "-F",
+            "#{session_id}\t#{session_name}\t#{window_id}\t#{window_name}\t#{window_active}\t#{pane_id}\t#{pane_active}\t#{@muxa_sidebar}\t#{@muxa_sidebar_last_pane}"]).ok()?;
+        let mut current = Self::parse(&raw)?;
+        current.rmux = context.endpoint.host == HostKind::Rmux;
+        if !current.in_sidebar {
+            // Mouse/keyboard focus paths may bypass hooks in rmux. Repair the
+            // remembered work pane from native state, never from the tree cursor.
+            let prior = raw.lines().find_map(|line| {
+                let columns: Vec<_> = line.split('\t').collect();
+                (columns.get(2) == Some(&current.window.as_str()))
+                    .then(|| columns.get(8).copied())
+                    .flatten()
+            });
+            if prior != Some(current.pane.as_str()) {
+                let _ = control.run(&[
+                    "set-option",
+                    "-w",
+                    "-t",
+                    &current.window,
+                    "@muxa_sidebar_last_pane",
+                    &current.pane,
+                ]);
+            }
+        }
+        Some(current)
+    }
+    fn parse(raw: &str) -> Option<Self> {
+        raw.lines().find_map(|line| {
+            let columns: Vec<_> = line.split('\t').collect();
+            if columns.len() < 9 || columns[4] != "1" || columns[6] != "1" {
+                return None;
+            }
+            let in_sidebar = columns[7] == "1";
+            let pane = if in_sidebar { columns[8] } else { columns[5] };
+            Some(Self {
+                session: columns[0].into(),
+                session_name: columns[1].into(),
+                window: columns[2].into(),
+                window_name: columns[3].into(),
+                pane: if pane
+                    .strip_prefix('%')
+                    .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+                {
+                    pane.into()
+                } else {
+                    String::new()
+                },
+                in_sidebar,
+                rmux: false,
+            })
         })
     }
     fn marker(&self, key: &TopologyNodeKey) -> &'static str {
@@ -177,6 +217,56 @@ fn filter(
         .then_some(RefreshOutcome::SingleAgent(agent)),
     }
 }
+fn tree_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x.saturating_add(1),
+        area.y.saturating_add(5),
+        area.width.saturating_sub(2),
+        area.height.saturating_sub(7),
+    )
+}
+
+fn context_lines(active: &Active, theme: super::WatchThemeSpec, width: u16) -> Vec<Line<'static>> {
+    let pane = if active.pane.is_empty() {
+        "—".into()
+    } else if active.rmux {
+        format!("rmux:{}", active.pane)
+    } else {
+        active.pane.clone()
+    };
+    vec![
+        Line::from(vec![
+            Span::styled("Session ", theme.dim_style()),
+            Span::styled(
+                format!("{} {}", active.session, active.session_name),
+                theme.accent_badge(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Window  ", theme.dim_style()),
+            Span::styled(
+                format!("{} {}", active.window, active.window_name),
+                theme.accent_badge(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                if active.in_sidebar {
+                    "Last    "
+                } else {
+                    "Pane    "
+                },
+                theme.dim_style(),
+            ),
+            Span::styled(pane, theme.accent_badge()),
+        ]),
+        Line::from(Span::styled(
+            "─".repeat(usize::from(width)),
+            theme.dim_style(),
+        )),
+    ]
+}
+
 fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState, active: &Active) {
     let area = frame.area();
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
@@ -191,9 +281,11 @@ fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState, 
             let node = app.topology.find(&target.key)?;
             let mut spans = vec![Span::styled(
                 active.marker(&target.key),
-                theme
-                    .dim_style()
-                    .add_modifier(ratatui::style::Modifier::BOLD),
+                if active.marker(&target.key).trim().is_empty() {
+                    theme.dim_style()
+                } else {
+                    theme.accent_badge()
+                },
             )];
             if let TopologyNodeRef::Pane(pane) = node {
                 let (glyph, style) = pane.agent.as_ref().map_or_else(
@@ -208,24 +300,40 @@ fn draw(frame: &mut Frame, app: &mut App, message: &str, state: &mut ListState, 
                     .into_iter()
                     .flat_map(|line| line.spans),
             );
-            Some(ListItem::new(Line::from(spans)))
+            let item = ListItem::new(Line::from(spans));
+            Some(if active.marker(&target.key).trim().is_empty() {
+                item
+            } else {
+                item.style(
+                    theme
+                        .dim_style()
+                        .add_modifier(ratatui::style::Modifier::BOLD),
+                )
+            })
         })
         .collect();
     state.select(app.table_state.selected());
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Muxa agents · s watch ")
-                .border_style(theme.border_style()),
-        )
-        .highlight_style(theme.selected_style())
-        .highlight_symbol("> ");
     let body = Rect {
         height: area.height.saturating_sub(1),
         ..area
     };
-    frame.render_stateful_widget(list, body, state);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Muxa agents · s watch ")
+        .border_style(theme.border_style());
+    let inner = block.inner(body);
+    frame.render_widget(block, body);
+    frame.render_widget(
+        Paragraph::new(context_lines(active, theme, inner.width)),
+        Rect {
+            height: inner.height.min(4),
+            ..inner
+        },
+    );
+    let list = List::new(items)
+        .highlight_style(theme.selected_style())
+        .highlight_symbol("> ");
+    frame.render_stateful_widget(list, tree_area(area), state);
     if area.height > 0 {
         let footer = if message.is_empty() {
             "s watch · Enter focus · ▶ active"
@@ -344,7 +452,10 @@ pub(crate) async fn run(
                 &list_state,
                 &mut message,
                 &wake_tx,
-                guard.terminal_mut().size()?.height,
+                {
+                    let size = guard.terminal_mut().size()?;
+                    Rect::new(0, 0, size.width, size.height)
+                },
             );
         }
     }
@@ -357,7 +468,7 @@ fn input(
     list_state: &ListState,
     message: &mut String,
     wake_tx: &mpsc::Sender<()>,
-    pane_height: u16,
+    area: Rect,
 ) {
     match event {
         Event::Mouse(mouse) => match mouse.kind {
@@ -371,9 +482,9 @@ fn input(
                     .map_or_else(String::new, |error| error.to_string());
             }
             crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                if mouse.row > 0 && mouse.row < pane_height.saturating_sub(2) =>
+                if tree_area(area).contains((mouse.column, mouse.row).into()) =>
             {
-                let index = list_state.offset() + usize::from(mouse.row - 1);
+                let index = list_state.offset() + usize::from(mouse.row - tree_area(area).y);
                 if let Some(target) = app.tree_targets().get(index) {
                     app.table_state.select(Some(index));
                     if let TopologyNodeKey::Pane(pane) = &target.key {
@@ -438,6 +549,46 @@ fn input(
 mod tests {
     use super::*;
     #[test]
+    fn focus_uses_native_flags_even_when_the_remembered_pane_is_a_literal_format() {
+        let raw = "$1\tproject\t@1\told\t0\t%1\t1\t\t%1\n$1\tproject\t@2\tworking\t1\t%9\t0\t1\t#{pane_id}\n$1\tproject\t@2\tworking\t1\t%35\t1\t\t#{pane_id}\n";
+        let active = Active::parse(raw).unwrap();
+        assert_eq!((&*active.window, &*active.pane), ("@2", "%35"));
+        assert_eq!(active.window_name, "working");
+        assert!(!active.in_sidebar);
+        let focused_tree = Active::parse("$1\tproject\t@2\tworking\t1\t%9\t1\t1\t%35").unwrap();
+        assert!(focused_tree.in_sidebar);
+        assert_eq!(focused_tree.pane, "%35");
+    }
+    #[test]
+    fn fixed_context_is_visible_without_any_tracked_agents() {
+        let backend = ratatui::backend::TestBackend::new(36, 14);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        let mut app = App::with_config(WatchConfig::default());
+        let active = Active {
+            session: "$1".into(),
+            session_name: "muxa".into(),
+            window: "@2".into(),
+            window_name: "main".into(),
+            pane: "%35".into(),
+            rmux: true,
+            ..Active::default()
+        };
+        terminal
+            .draw(|frame| draw(frame, &mut app, "", &mut ListState::default(), &active))
+            .unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        for label in ["Session $1 muxa", "Window  @2 main", "Pane    rmux:%35"] {
+            assert!(screen.contains(label), "{screen}");
+        }
+        assert_eq!(tree_area(Rect::new(0, 0, 36, 14)).y, 5);
+    }
+    #[test]
     fn current_window_and_pane_are_independent_of_the_tree_cursor() {
         let session = muxa::SessionKey {
             endpoint: BackendEndpoint {
@@ -458,6 +609,7 @@ mod tests {
             session: "$1".into(),
             window: "@2".into(),
             pane: "%35".into(),
+            ..Active::default()
         };
         assert_eq!(active.marker(&TopologyNodeKey::Session(session)), "◆ ");
         assert_eq!(active.marker(&TopologyNodeKey::Window(window)), "◆ ");

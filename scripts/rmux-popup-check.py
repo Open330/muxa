@@ -67,6 +67,26 @@ with tempfile.TemporaryDirectory(prefix='muxa-popup-check-') as tmp:
                        env=env, check=True, capture_output=True, timeout=10)
         sidebar = run('show-options', '-wqv', '-t', '@0', '@muxa_sidebar_pane')
         run('set-option', '-g', 'mouse', 'on')
+        # Focus polling must recover without hooks (native mouse paths may
+        # bypass them) and must never trust a literal format as a pane id.
+        work = next(pane for pane in run('list-panes', '-t', '@0', '-F', '#{pane_id}').splitlines() if pane != sidebar)
+        run('set-hook', '-gu', 'after-select-pane[9105]')
+        run('set-option', '-w', '-t', '@0', '@muxa_sidebar_last_pane', '#{pane_id}')
+        run('select-pane', '-t', work)
+        collect(1.3)
+        screen = run('capture-pane', '-p', '-t', sidebar)
+        assert 'Pane    rmux:' + work in screen, screen
+        run('select-pane', '-t', sidebar)
+        collect(1.3)
+        assert 'Last    rmux:' + work in run('capture-pane', '-p', '-t', sidebar)
+        new_window = run('new-window', '-d', '-n', 'focus-other', '-P', '-F', '#{window_id}', '/bin/sh')
+        run('select-window', '-t', new_window)
+        collect(1.3)
+        screen = run('capture-pane', '-p', '-t', sidebar)
+        assert 'Window  ' + new_window + ' focus-other' in screen, screen
+        run('select-window', '-t', '@0')
+        collect(.3)
+        print('focus: native pane/window changes update fixed context without hooks', flush=True)
         for key in (b's', b'S'):
             run('select-pane', '-t', sidebar)
             collect(.2)

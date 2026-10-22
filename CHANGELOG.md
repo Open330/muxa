@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Sidebar focus now follows native active-window/pane flags, with a fixed context
+  header. Watch's live layout excludes sidebar terminals and reclaims their space.
+
 - `prefix + q` centers padded Links boxes within panes and attaches arrows to
   their borders. Boxes move below prompts when needed, without floating nodes.
 

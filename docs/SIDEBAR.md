@@ -27,8 +27,10 @@ popup and reserves rmux's status row, without rebuilding the agent tree pane.
 
 Use arrows or `hjkl` to navigate, Enter or a mouse click to focus a pane, and `r`
 to refresh. Click session/window rows to collapse/expand them; the wheel scrolls.
-`◆` marks the current session/window and `▶` the active work pane, independently
-of the `>` navigation cursor. Focusing the sidebar retains the last work pane
+A fixed header shows the current session, window and work pane, including their
+native IDs. `◆` marks the current session/window and `▶` the active work pane,
+independently of the `>` navigation cursor. Native focus flags are sampled every
+second, so keyboard and mouse focus changes work even when hooks are skipped. Focusing the sidebar retains the last work pane
 marker. The sort order comes from `[watch].sort`; changes saved in watch are
 picked up within one second without restarting the sidebar. The explorer stays running when focus moves. Cross-session selection
 requires exactly one client focused on the sidebar; it carries the sidebar into
@@ -76,3 +78,6 @@ Real-host regression tests create only shell panes on a private rmux socket:
 ```sh
 cargo test -p muxa-cli --test sidebar -- --ignored
 ```
+
+Watch’s live layout excludes the marked sidebar before capturing terminals and
+uses the reclaimed width for work panes; its own navigation tree stays visible.

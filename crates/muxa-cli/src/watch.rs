@@ -3357,26 +3357,38 @@ pub struct CapturedWindow {
     pub fetched_at: std::time::Instant,
 }
 
+/// The explorer already exists in watch's navigation tree. Omit its terminal
+/// before capture, and rebase the work panes so it leaves no empty side strip.
+fn content_window_geometry(raw: &str) -> (Vec<PaneGeometry>, bool) {
+    let content = raw
+        .lines()
+        .filter(|line| line.split('\t').nth(11) != Some("1"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let (mut panes, zoomed) = muxa::tmux::layout::parse_pane_geometry_lines(&content);
+    let left = panes.iter().map(|pane| pane.left).min().unwrap_or(0);
+    let top = panes.iter().map(|pane| pane.top).min().unwrap_or(0);
+    for pane in &mut panes {
+        pane.left -= left;
+        pane.top -= top;
+    }
+    (panes, zoomed)
+}
+
 fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
     use ansi_to_tui::IntoText;
 
     let socket = key.session.endpoint.socket.clone();
-    let (geometries, zoomed) = if key.session.endpoint.host == muxa::HostKind::Rmux {
-        crate::mux_control::capture(
-            &key.session.endpoint,
-            &[
-                "list-panes",
-                "-t",
-                &key.window_id,
-                "-F",
-                muxa::tmux::layout::PANE_GEOMETRY_FMT,
-            ],
-        )
-        .map(|raw| muxa::tmux::layout::parse_pane_geometry_lines(&raw))
-        .unwrap_or_default()
-    } else {
-        muxa::tmux::layout::window_panes_on(Some(&socket), &key.window_id)
-    };
+    let format = format!(
+        "{}\t#{{@muxa_sidebar}}",
+        muxa::tmux::layout::PANE_GEOMETRY_FMT
+    );
+    let (geometries, zoomed) = crate::mux_control::capture(
+        &key.session.endpoint,
+        &["list-panes", "-t", &key.window_id, "-F", &format],
+    )
+    .map(|raw| content_window_geometry(&raw))
+    .unwrap_or_default();
     let backend = crate::backend_for_kind(key.session.endpoint.host);
 
     // A slow or wedged pane must not make N panes cost N timeout windows.
@@ -20403,6 +20415,31 @@ mod tests {
         assert!(screen.contains("edit auth"));
     }
 
+    #[test]
+    fn live_layout_omits_only_marked_sidebars_and_reclaims_their_width() {
+        let row = |id, left, width, command, mark| {
+            format!("{id}\t0\t{left}\t0\t{width}\t40\t0\t0\t{command}\t\t\t{mark}")
+        };
+        for side in ["left", "right"] {
+            let offset = if side == "left" { 37 } else { 0 };
+            let raw = [
+                row("%9", if side == "left" { 0 } else { 104 }, 36, "muxa", "1"),
+                row("%1", offset, 50, "codex", ""),
+                row("%2", offset + 51, 52, "muxa", ""),
+            ]
+            .join("\n");
+            let (panes, zoomed) = content_window_geometry(&raw);
+            assert!(!zoomed);
+            assert_eq!(
+                panes
+                    .iter()
+                    .map(|pane| pane.pane_id.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["%1", "%2"]
+            );
+            assert_eq!((panes[0].left, panes[1].left + panes[1].width), (0, 103));
+        }
+    }
     #[test]
     fn session_inspector_fills_available_height_then_summarizes_hidden_nodes() {
         let panes = (0..12)
