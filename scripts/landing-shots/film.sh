@@ -83,7 +83,7 @@ tm set-option -g status-interval 1
 tm set-option -g status-right-length 140
 tm set-option -g status-right "#(muxa status-line --needs-attention) #(muxa status-line --pane #{pane_id}) | #[fg=white]%H:%M"
 tm set-option -g pane-active-border-style "fg=green"
-tm bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek"
+tm bind-key q run-shell -b "muxa peek --popup --caller-client '#{client_name}' --caller-session '#{session_id}' --caller-window '#{window_id}'"
 cat > "$WORK/bashrc" <<'RC'
 PS1='\[\e[32m\]~/acme\[\e[0m\] $ '
 unset PROMPT_COMMAND

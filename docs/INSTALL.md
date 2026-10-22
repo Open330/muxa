@@ -314,3 +314,17 @@ usage-limit recovery, input-wait notices, persistent-error notices and selected 
 individual rules with `muxa automation enable <name>`; existing same-name rules
 are preserved. Binary-only upgrades add missing rules when muxad next starts.
 See [Automation](AUTOMATION.md).
+
+### Peek in linked view sessions
+
+`prefix + q` launches `muxa peek --popup` with the pressing client's session and
+window IDs. A linked window's panes may retain their original session environment;
+peek must not use that environment to decide which screen to draw on or where to
+jump. The popup launcher pins the client, and pane jumps retain the same view.
+After upgrading, `muxa init --component tmux-peek --yes` updates an older binding.
+
+The isolated regression uses only shell panes on a private rmux socket:
+
+```sh
+python3 scripts/rmux-peek-view-check.py
+```

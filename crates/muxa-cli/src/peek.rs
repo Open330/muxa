@@ -95,6 +95,15 @@ const MIN_BORDERED_HEIGHT: u16 = 3;
 
 #[derive(Debug, Clone, clap::Args)]
 pub(crate) struct Args {
+    /// Open the overlay on the client that invoked the key binding.
+    #[arg(long, conflicts_with = "plain")]
+    pub(crate) popup: bool,
+    #[arg(long, hide = true)]
+    pub(crate) caller_client: Option<String>,
+    #[arg(long, hide = true, requires = "caller_window")]
+    caller_session: Option<String>,
+    #[arg(long, hide = true, requires = "caller_session")]
+    caller_window: Option<String>,
     /// Print the overlay's per-pane lines as plain text and exit, instead
     /// of drawing the TUI. Intended for `muxa doctor`-style debugging from
     /// a normal shell, where there's no popup to draw into.
@@ -103,6 +112,26 @@ pub(crate) struct Args {
     /// Open the active pane in a fullscreen, scrollable reader.
     #[arg(long)]
     expanded: bool,
+}
+
+impl Args {
+    fn target(&self) -> Result<WindowTarget> {
+        match (&self.caller_session, &self.caller_window) {
+            (None, None) => Ok(WindowTarget::resolve()),
+            (Some(session), Some(window)) if native_id(session, '$') && native_id(window, '@') => {
+                Ok(WindowTarget {
+                    session: Some(session.clone()),
+                    window: Some(window.clone()),
+                })
+            }
+            _ => anyhow::bail!("peek needs valid caller session ($N) and window (@N) IDs"),
+        }
+    }
+}
+fn native_id(value: &str, prefix: char) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -143,7 +172,7 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // Pin the window before anything else: every later query is scoped to
     // it, so a keystroke in another terminal can't reroute the overlay
     // onto a different session mid-read.
-    let target = WindowTarget::resolve();
+    let target = args.target()?;
     // Before any work: is there a viewer a popup could be drawn on? When
     // there isn't, peek reports in text rather than painting a full-client
     // overlay into a pane-sized hole (or into a popup nobody renders).
@@ -200,10 +229,11 @@ pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
     // repaints the window underneath, and doing it while we still own the
     // alternate screen leaves the user looking at our leftovers.
     if let Outcome::Jump(pane_id) = outcome? {
-        crate::mux_control::ambient_command()
-            .args(["select-pane", "-t", &pane_id])
-            .status()
-            .ok();
+        let pane_target = match (&target.session, &target.window) {
+            (Some(session), Some(window)) => format!("{session}:{window}.{pane_id}"),
+            _ => pane_id,
+        };
+        crate::mux_control::Control::Ambient.run(&["select-pane", "-t", &pane_target])?;
     }
     Ok(())
 }
@@ -2460,6 +2490,27 @@ mod tests {
             last_activity_at: now,
             state_entered_at: now,
         }
+    }
+
+    #[test]
+    fn caller_view_session_and_window_override_inherited_popup_context() {
+        let mut args = Args {
+            popup: false,
+            caller_client: Some("/dev/pts/1".into()),
+            caller_session: Some("$192".into()),
+            caller_window: Some("@11".into()),
+            plain: false,
+            expanded: false,
+        };
+        assert_eq!(
+            args.target().unwrap(),
+            WindowTarget {
+                session: Some("$192".into()),
+                window: Some("@11".into())
+            }
+        );
+        args.caller_session = Some("#{session_id}".into());
+        assert!(args.target().is_err());
     }
 
     fn screen(terminal: &Terminal<TestBackend>) -> String {

@@ -52,8 +52,9 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard""#;
 pub const PEEK_BODY: &str = r#"# prefix + q: display-panes, plus each pane's agent state, summary, and
 # latest prompt/response over its live content. A pane's digit jumps to it.
 # Inside peek: | opens a scrollable reader; Tab switches to terminal history.
+# Pin the pressing client/view/window before popup env can inherit a stale base session.
 # Replaces tmux's stock display-panes; `muxa init --uninstall` puts it back.
-bind-key q display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa peek""#;
+bind-key q run-shell -b "muxa peek --popup --caller-client '#{client_name}' --caller-session '#{session_id}' --caller-window '#{window_id}'""#;
 
 /// The body that goes inside the `tmux-auto-view` marker block.
 ///
@@ -285,13 +286,18 @@ mod tests {
     fn peek_round_trip() {
         let (after, o1) = upsert("", Component::TmuxPeek);
         assert_eq!(o1, Outcome::Inserted);
-        assert!(after.contains("bind-key q display-popup"));
+        assert!(after.contains("bind-key q run-shell -b"));
         assert!(after.contains("muxa peek"));
-        // The overlay repaints pane rectangles at their own coordinates,
-        // so any border or inset would slide every box off its pane.
-        assert!(after.contains("-B"));
-        assert!(after.contains("-w 100% -h 100%"));
-        assert!(after.contains("-x 0 -y 0"));
+        // Resolve the pressing client's linked view before entering the popup;
+        // pane environments may still name the detached original session.
+        for argument in [
+            "--popup",
+            "--caller-client",
+            "--caller-session",
+            "--caller-window",
+        ] {
+            assert!(after.contains(argument));
+        }
 
         let (after2, o2) = upsert(&after, Component::TmuxPeek);
         assert_eq!(o2, Outcome::Unchanged);
@@ -332,7 +338,7 @@ mod tests {
         // so it claims the reflex key outright rather than making the user
         // reach for Shift to get the better version.
         let (after, _) = upsert("", Component::TmuxPeek);
-        assert!(after.contains("bind-key q display-popup"));
+        assert!(after.contains("bind-key q run-shell -b"));
         assert!(
             !after.contains("bind-key Q "),
             "peek should not hide behind a shifted key: {after}"

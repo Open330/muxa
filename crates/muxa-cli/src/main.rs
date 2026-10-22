@@ -1469,6 +1469,11 @@ async fn main() -> Result<()> {
     {
         return agent_move::run_window(move_args.clone(), args.socket.clone()).await;
     }
+    if let Cmd::Peek(peek_args) = &cmd {
+        if peek_args.popup {
+            return mux_control::peek_popup(peek_args.caller_client.as_deref());
+        }
+    }
     if let Cmd::Watch {
         popup: true,
         caller_client,

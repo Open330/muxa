@@ -136,17 +136,31 @@ pub fn watch_popup(client: Option<&str>, source: Option<&str>) -> anyhow::Result
     if let Some(pane) = work_pane {
         words.extend(["--caller-pane".into(), pane.into()]);
     }
-    let shell_command = popup_shell_command(&words)?;
+    full_popup(&words, client, "99%")
+}
+
+pub fn peek_popup(client: Option<&str>) -> anyhow::Result<()> {
+    let mut words = vec![std::env::current_exe()?.into_os_string()];
+    words.extend(std::env::args_os().skip(1).filter(|arg| arg != "--popup"));
+    full_popup(&words, client, "100%")
+}
+
+fn full_popup(
+    words: &[std::ffi::OsString],
+    client: Option<&str>,
+    height: &str,
+) -> anyhow::Result<()> {
+    let shell_command = popup_shell_command(words)?;
     let mut command = ambient_command();
     command.arg("display-popup");
     if let Some(client) = client.filter(|c| !c.is_empty() && !c.contains("#{")) {
         command.args(["-c", client]);
     }
     let status = command
-        .args(["-B", "-E", "-w", "100%", "-h", "99%", "-x", "0", "-y", "0"])
+        .args(["-B", "-E", "-w", "100%", "-h", height, "-x", "0", "-y", "0"])
         .arg(shell_command)
         .status()?;
-    anyhow::ensure!(status.success(), "could not open watch popup: {status}");
+    anyhow::ensure!(status.success(), "could not open Muxa popup: {status}");
     Ok(())
 }
 

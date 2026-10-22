@@ -35,6 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Peek pins its invoking client, view session and window before opening a popup,
+  and keeps pane jumps in that view instead of inheriting a detached base session.
+
 - Sidebar focus now follows native active-window/pane flags, with a fixed context
   header. Watch's live layout excludes sidebar terminals and reclaims their space.
 
