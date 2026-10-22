@@ -33,6 +33,7 @@
 //! an **unstable wire format** — the values may bump on any minor release
 //! when the underlying schema changes.
 
+pub mod account_route;
 pub mod account_swap;
 pub mod activity;
 pub mod adapters;

@@ -89,6 +89,13 @@ hourly cap, and a fire-time re-check that the agent is still capped. A new
 account that is also capped is a new episode, so the next swap excludes it;
 `max_per_hour` bounds how many times one pane can be moved.
 
+## New agents
+
+`muxa swap` moves agents that are already running. To keep new ones off a
+capped account in the first place, set `[agent.<program>].account = "auto"`
+(see [Configuration](CONFIGURATION.md#starting-on-an-aas-account)): every muxa
+launch then starts `aas e <best eligible account> …` instead of the bare CLI.
+
 ## Limits
 
 - The agent must run under a shell in its pane. A pane started *with* the

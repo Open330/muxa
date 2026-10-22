@@ -30,6 +30,8 @@ const READY_TIMEOUT: Duration = Duration::from_secs(30);
 const READY_QUIET: Duration = Duration::from_millis(1500);
 /// Time for the shell to redraw its prompt after the agent exits.
 const SHELL_SETTLE: Duration = Duration::from_millis(700);
+/// How long `aas candidates` gets before a swap gives up on it.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `[swap]` in `config.toml`: defaults shared by `muxa swap` and the
 /// `swap_account` automation action.
@@ -626,48 +628,113 @@ pub(crate) fn find_launch(
 
 /// Query `aas candidates --json` for one provider.
 pub fn query_candidates(aas: &str, provider: &str) -> Result<Vec<Candidate>, String> {
-    let program = resolve_aas(aas);
-    let output = std::process::Command::new(&program)
-        .args(["candidates", "--json", "--provider", provider])
-        .stdin(std::process::Stdio::null())
-        .output()
-        .map_err(|error| format!("could not run `{program} candidates`: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "`{program} candidates` failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    parse_candidates(&String::from_utf8_lossy(&output.stdout))
+    let program = find_aas(aas).unwrap_or_else(|| aas.to_owned());
+    query_candidates_within(&program, provider, QUERY_TIMEOUT)
 }
 
-/// A bare program name, looked up on `PATH` and then where `aas` is
-/// usually installed — a launchd-started daemon has a minimal `PATH`.
-fn resolve_aas(configured: &str) -> String {
-    if configured.contains(['/', '\\']) {
-        return configured.to_owned();
+/// [`query_candidates`] against an already resolved `program`, given up on
+/// once `timeout` passes so a hung `aas` cannot hold a caller. The deadline
+/// covers reading its output too: a helper it left behind can hold the
+/// pipes open after `aas` itself exits.
+pub fn query_candidates_within(
+    program: &str,
+    provider: &str,
+    timeout: Duration,
+) -> Result<Vec<Candidate>, String> {
+    use std::io::Read;
+    let deadline = Instant::now() + timeout;
+    let late = || {
+        format!(
+            "`{program} candidates` did not answer within {}s",
+            timeout.as_secs()
+        )
+    };
+    let mut child = std::process::Command::new(program)
+        .args(["candidates", "--json", "--provider", provider])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("could not run `{program} candidates`: {error}"))?;
+    // Drained on their own threads so a full pipe cannot stall the child.
+    // A reader still blocked at the deadline is abandoned, not joined.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
+            }
+            let _ = sender.send(buf);
+        });
+        receiver
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as _));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as _));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            outcome => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(match outcome {
+                    Err(error) => format!("`{program} candidates` failed: {error}"),
+                    _ => late(),
+                });
+            }
+        }
+    };
+    let collect = |receiver: std::sync::mpsc::Receiver<Vec<u8>>| {
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|_| late())
+    };
+    let stdout = collect(stdout)?;
+    let stderr = collect(stderr)?;
+    if !status.success() {
+        return Err(format!(
+            "`{program} candidates` failed: {}",
+            String::from_utf8_lossy(&stderr).trim()
+        ));
     }
-    if cfg!(windows) {
+    parse_candidates(&String::from_utf8_lossy(&stdout))
+}
+
+/// Where the configured `aas` is: a path as given, a bare name looked up
+/// on `PATH` and then where `aas` is usually installed — a
+/// launchd-started daemon has a minimal `PATH`. Always absolute, because a
+/// launch runs it from another directory. `None` when none exists.
+#[must_use]
+pub fn find_aas(configured: &str) -> Option<String> {
+    let found = if configured.contains(['/', '\\']) {
+        Some(std::path::PathBuf::from(configured)).filter(|path| path.is_file())
+    } else if cfg!(windows) {
         // `aas.exe` / `aas.cmd`: PATH lookup has to try the extensions.
-        return crate::shell::find_program(configured)
-            .map_or_else(|| configured.to_owned(), |path| path.display().to_string());
-    }
-    let on_path = std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(configured).is_file()));
-    if on_path {
-        return configured.to_owned();
-    }
-    let home = std::env::var("HOME").unwrap_or_default();
-    [
-        "/opt/homebrew/bin".to_owned(),
-        "/usr/local/bin".to_owned(),
-        format!("{home}/.cargo/bin"),
-        format!("{home}/.local/bin"),
-    ]
-    .into_iter()
-    .map(|dir| format!("{dir}/{configured}"))
-    .find(|path| std::path::Path::new(path).is_file())
-    .unwrap_or_else(|| configured.to_owned())
+        crate::shell::find_program(configured)
+    } else {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::env::var_os("PATH")
+            .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .chain(
+                [
+                    "/opt/homebrew/bin".to_owned(),
+                    "/usr/local/bin".to_owned(),
+                    format!("{home}/.cargo/bin"),
+                    format!("{home}/.local/bin"),
+                ]
+                .map(std::path::PathBuf::from),
+            )
+            .map(|dir| dir.join(configured))
+            .find(|path| path.is_file())
+    }?;
+    std::path::absolute(found)
+        .ok()
+        .map(|path| path.display().to_string())
 }
 
 /// Plan and carry out `request` over `agents`. Blocking: it signals
@@ -1513,5 +1580,96 @@ mod tests {
             AccountChoice::parse("jelly@claude"),
             AccountChoice::Named("jelly@claude".into())
         );
+    }
+
+    #[cfg(unix)]
+    fn fake_aas(name: &str, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("muxa-aas-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("aas");
+        // Anything but `candidates` exits at once, so the probe below is free.
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\n[ \"$1\" = candidates ] || exit 0\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // A test thread forking while the file was open for writing leaves
+        // it busy (ETXTBSY) until that child execs; wait that out here so
+        // the query under test never sees it.
+        for _ in 0..100 {
+            match std::process::Command::new(&path).arg("probe").status() {
+                Err(error) if error.raw_os_error() == Some(26) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => break,
+            }
+        }
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_query_deadline_covers_a_helper_holding_the_pipes() {
+        let aas = fake_aas("helper", "sleep 20 &\nprintf '{\"accounts\":[]}'\nexit 0");
+        let started = Instant::now();
+        let outcome =
+            query_candidates_within(aas.to_str().unwrap(), "claude", Duration::from_millis(300));
+        // Far under the helper's 20s, with room for a loaded test machine.
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(outcome.unwrap_err().contains("did not answer"));
+        std::fs::remove_dir_all(aas.parent().unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_query_reads_a_prompt_answer_and_kills_a_hung_one() {
+        let ok = fake_aas(
+            "ok",
+            "printf '{\"accounts\":[{\"name\":\"a@claude\",\"provider\":\"claude\",\"eligible\":true}]}'",
+        );
+        let list = query_candidates_within(ok.to_str().unwrap(), "claude", Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(list[0].name, "a@claude");
+        let hung = fake_aas("hung", "exec sleep 30");
+        let started = Instant::now();
+        let outcome =
+            query_candidates_within(hung.to_str().unwrap(), "claude", Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(outcome.unwrap_err().contains("did not answer"));
+        for path in [ok, hung] {
+            std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_aas_answers_with_an_absolute_path() {
+        let aas = fake_aas("relative", "true");
+        let dir = aas.parent().unwrap().to_owned();
+        // A relative configured path, resolved against this process's cwd.
+        let cwd = std::env::current_dir().unwrap();
+        let relative = pathdiff(&aas, &cwd);
+        let found = find_aas(&relative).unwrap();
+        assert!(std::path::Path::new(&found).is_absolute(), "{found}");
+        assert!(std::path::Path::new(&found).is_file(), "{found}");
+        assert_eq!(find_aas(&format!("{}/missing", dir.display())), None);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// `target` relative to `base`, through enough `..` to reach the root.
+    #[cfg(unix)]
+    fn pathdiff(target: &std::path::Path, base: &std::path::Path) -> String {
+        let ups = base.components().count().saturating_sub(1);
+        format!(
+            "{}{}",
+            "../".repeat(ups),
+            target.display().to_string().trim_start_matches('/')
+        )
     }
 }

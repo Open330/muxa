@@ -1008,7 +1008,11 @@ fn take_window_name_buffer(buffer: &str) -> Result<String> {
 /// when an agent has finished and when it is between thoughts, and a pane
 /// stays open either way. So the agent says so, and muxa records the claim
 /// rather than inferring one.
-pub async fn run_work_done(args: WorkDoneArgs, client: &muxa::ipc::Client) -> Result<()> {
+pub async fn run_work_done(
+    args: WorkDoneArgs,
+    client: &muxa::ipc::Client,
+    config: &muxa::config::Config,
+) -> Result<()> {
     let pane = args
         .pane
         .clone()
@@ -1055,7 +1059,7 @@ pub async fn run_work_done(args: WorkDoneArgs, client: &muxa::ipc::Client) -> Re
     // Completion is the event that drives reconciliation; callers never need
     // to remember a second `work up`. The daemon also subscribes to this same
     // durable revision as a crash/restart safety net.
-    crate::work_up::reconcile_run(client, &identity, run.generation).await?;
+    crate::work_up::reconcile_run(client, config, &identity, run.generation).await?;
     let done = run
         .aliases
         .values()

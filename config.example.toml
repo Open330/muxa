@@ -93,6 +93,12 @@
 # options = ["--model", "claude-opus-5"]
 # [agent.codex]
 # options = ["--model", "gpt-5-codex", "--search"]
+#
+# `account` (claude / codex) starts new agents through `aas e <account>`:
+# "auto" = best-ranked aas account with quota left, or a pinned name.
+# Unset, or aas missing / nothing eligible -> the bare CLI, as before.
+# [agent.claude]
+# account = "auto"
 
 # Durable request/reply collaboration between top-level agents in the same
 # tmux window. Opt-in: idle_only delivery types only at a hook-authoritative

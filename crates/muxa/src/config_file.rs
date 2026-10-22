@@ -92,7 +92,10 @@ fn launch_settings(text: &str) -> Result<LaunchSettings, ConfigFileError> {
         .into_iter()
         .map(|program| LaunchProvider {
             program: program.to_owned(),
-            options: config.agent.get(program).map(|entry| entry.options.clone()),
+            options: config
+                .agent
+                .get(program)
+                .and_then(|entry| entry.options.clone()),
             effective_options: config.launch_options(program, None),
         })
         .collect();
@@ -208,11 +211,15 @@ pub fn write_launch(
                     continue;
                 }
                 let agents = launch_table(document.as_table_mut(), "agent")?;
-                if options.is_none() {
+                if options.is_none() && !agents.contains_key(program) {
+                    continue;
+                }
+                let provider = launch_table(agents, program)?;
+                set_launch_options(provider, options.as_deref());
+                // Inheriting drops only `options`: the provider's other
+                // settings (`account`) are not the form's to remove.
+                if provider.is_empty() {
                     agents.remove(program);
-                } else {
-                    let provider = launch_table(agents, program)?;
-                    set_launch_options(provider, options.as_deref());
                 }
             }
             LaunchEdit::Pipeline {
@@ -589,6 +596,35 @@ options = ["--model", "other"]
         assert_eq!(inherited.launch.pipelines[0].options, None);
         assert_eq!(inherited.launch.pipelines[0].effective_options, ["legacy"]);
         assert_eq!(inherited.launch.legacy_guide.options, ["legacy"]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn inheriting_options_keeps_the_providers_account() {
+        let dir = temp_dir("launch-account");
+        let path = dir.join("config.toml");
+        let source = "[agent.claude]\noptions = ['--model', 'x']\naccount = 'auto'\n";
+        std::fs::write(&path, source).unwrap();
+        let saved = write_launch(
+            &path,
+            source,
+            &[LaunchEdit::Provider {
+                program: "claude".into(),
+                options: None,
+            }],
+        )
+        .unwrap();
+        assert!(
+            saved.config.text.contains("account = 'auto'"),
+            "{}",
+            saved.config.text
+        );
+        assert!(
+            !saved.config.text.contains("--model"),
+            "{}",
+            saved.config.text
+        );
+        assert_eq!(saved.launch.providers[0].options, None);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
