@@ -14,6 +14,7 @@ mod doctor;
 mod doctor_report;
 mod fleet_cli;
 mod fleet_watch;
+mod graph;
 mod help_groups;
 mod init;
 mod interactive_child;
@@ -237,6 +238,8 @@ enum Cmd {
     Timeline(timeline::Args),
     /// Work-board TUI for tracking Work, Runs, external issues, and agents.
     Dashboard(dashboard_tui::Args),
+    /// Explore session/window/pane message connections in an interactive terminal graph.
+    Graph(graph::Args),
     /// Former name of `muxa stats activity`.
     #[command(hide = true)]
     Activity(activity_query::ActivityInvocation),
@@ -1572,6 +1575,7 @@ async fn main() -> Result<()> {
         Cmd::Report(report) => stats::run_report(&client, &cfg, &report.window, report.args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
         Cmd::Dashboard(dashboard_args) => cmd_dashboard(&client, &cfg, dashboard_args).await,
+        Cmd::Graph(args) => graph::run(&cfg, args).await,
         Cmd::Activity(activity) => activity_query::run(&cfg, &activity.window, activity.args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
         Cmd::Panes => cmd_panes(),

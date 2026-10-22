@@ -2064,6 +2064,66 @@ fn query_database(
     query: &CollaborationQuery,
 ) -> Result<CollaborationPage, CollaborationError> {
     let connection = open_database(path)?;
+    query_connection(
+        &connection,
+        caller,
+        mailbox,
+        scope,
+        query,
+        0,
+        MAX_QUERY_LIMIT,
+    )
+}
+
+/// Read the persisted mailbox without creating, migrating, pruning or mutating
+/// it. Used by the standalone CLI viewer, including with an older daemon whose
+/// unbounded IPC list can exceed the transport's message size limit.
+pub fn read_history_page(
+    path: &Path,
+    offset: usize,
+    limit: usize,
+) -> Result<CollaborationPage, CollaborationError> {
+    let database = collaboration_database_path(path);
+    if !database.exists() {
+        return Ok(CollaborationPage {
+            requests: Vec::new(),
+            total: 0,
+            has_more: false,
+            next_cursor: None,
+        });
+    }
+    let connection =
+        Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    connection.busy_timeout(Duration::from_secs(2))?;
+    let caller = Participant::console(RoomId {
+        host: CONSOLE_PANE.into(),
+        socket: None,
+        window_id: CONSOLE_PANE.into(),
+    });
+    query_connection(
+        &connection,
+        &caller,
+        RequestMailbox::All,
+        MailboxScope::All,
+        &CollaborationQuery {
+            limit: Some(limit),
+            ..Default::default()
+        },
+        offset,
+        5000,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn query_connection(
+    connection: &Connection,
+    caller: &Participant,
+    mailbox: RequestMailbox,
+    scope: MailboxScope,
+    query: &CollaborationQuery,
+    offset: usize,
+    max_limit: usize,
+) -> Result<CollaborationPage, CollaborationError> {
     let mut clauses = Vec::new();
     let mut values = Vec::new();
     if let Some(clause) = request_access_clause(caller, mailbox, scope, &mut values) {
@@ -2083,7 +2143,7 @@ fn query_database(
             values.push(Value::Text(value.clone()));
         }
     }
-    append_session_query_filters(&connection, query, &mut clauses, &mut values)?;
+    append_session_query_filters(connection, query, &mut clauses, &mut values)?;
     if let Some(kind) = query.kind {
         clauses.push("kind = ?".to_string());
         values.push(Value::Text(request_kind_name(kind).to_string()));
@@ -2129,11 +2189,12 @@ fn query_database(
     let limit = query
         .limit
         .unwrap_or(DEFAULT_QUERY_LIMIT)
-        .clamp(1, MAX_QUERY_LIMIT);
+        .clamp(1, max_limit);
     page_values.push(Value::Integer(i64::try_from(limit + 1).unwrap_or(i64::MAX)));
+    page_values.push(Value::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
     let mut statement = connection.prepare(&format!(
         "SELECT payload FROM collaboration_requests{page_where_sql}
-         ORDER BY created_at_ns DESC, id DESC LIMIT ?"
+         ORDER BY created_at_ns DESC, id DESC LIMIT ? OFFSET ?"
     ))?;
     let rows = statement.query_map(params_from_iter(page_values.iter()), |row| {
         row.get::<_, String>(0)
@@ -8144,6 +8205,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second_page.requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn readonly_history_pages_preserve_database_and_follow_new_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration.json");
+        assert_eq!(read_history_page(&path, 0, 10).unwrap().total, 0);
+        assert!(!collaboration_database_path(&path).exists());
+        let store = CollaborationStore::load(CollaborationOptions {
+            path: Some(path.clone()),
+            ..CollaborationOptions::default()
+        })
+        .await
+        .unwrap();
+        for body in ["first", "second", "third"] {
+            store
+                .create(
+                    participant("%1", "sender"),
+                    participant("%2", "recipient"),
+                    NewRequest {
+                        body: body.into(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let db = collaboration_database_path(&path);
+        let before = std::fs::read(&db).unwrap();
+        let page = read_history_page(&path, 0, 2).unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.requests.len(), 2);
+        assert!(page.has_more);
+        let older = read_history_page(&path, 2, 2).unwrap();
+        assert_eq!(older.requests.len(), 1);
+        assert!(!older.has_more);
+        assert!(page.requests.iter().all(|r| r.id != older.requests[0].id));
+        assert_eq!(std::fs::read(&db).unwrap(), before);
+        store
+            .create(
+                participant("%1", "sender"),
+                participant("%2", "recipient"),
+                NewRequest {
+                    body: "newest".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let refreshed = read_history_page(&path, 0, 1).unwrap();
+        assert_eq!(refreshed.total, 4);
+        assert_eq!(refreshed.requests[0].body, "newest");
     }
 
     #[tokio::test]

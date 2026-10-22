@@ -318,6 +318,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa status [--flat\|--json]` | 추적 중인 agent를 session / window / pane 트리로 보여 줌(`--flat`: agent당 한 줄), 또는 desktop integration용 versioned JSON snapshot. |
 | `muxa watch [--view session\|window\|pane]` | workspace → work → agent live TUI picker/dashboard. |
 | `muxa dashboard [--since today]` | Run capture와 agent별/Work 일괄 prompt·abort, ACT/WACT total을 보여주는 Work-card TUI. |
+| `muxa graph` | [터미널 인터랙티브 그래프](docs/GRAPH.ko.md)에서 session/window/pane 연결·협업 메시지 탐색. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
 | `muxa peek [--plain] [--expanded]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. 오버레이는 tmux popup이므로 이를 그릴 수 없는 환경 — client를 붙이지 않는 프런트엔드(cmux), control mode 클라이언트(`tmux -CC` — amux, iTerm2) — 에서는 텍스트 리포트로 대체하고 이유를 stderr에 알림. |
