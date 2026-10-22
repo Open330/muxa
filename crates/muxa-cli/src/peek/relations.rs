@@ -337,6 +337,41 @@ fn draw_links(
             }
         }
     }
+    // Creation is pane history; only show edges touching the active pane and
+    // only while the original creator session is still visible on its server.
+    // Message strokes are painted afterwards and take precedence at crossings.
+    for child in panels {
+        let Some(spawn) = &cells[child.index].geo.spawn else {
+            continue;
+        };
+        let Some(parent) = endpoint_panel(cells, panels, &spawn.creator) else {
+            continue;
+        };
+        let parent = &panels[parent];
+        if parent.index == child.index
+            || !(cells[parent.index].geo.active || cells[child.index].geo.active)
+        {
+            continue;
+        }
+        let (start, end) = ports(parent.rect, child.rect);
+        let Some(path) = route(area, &blocked, start, end) else {
+            continue;
+        };
+        for (i, point) in path.iter().enumerate() {
+            let glyph = if i + 1 == path.len() && i > 0 {
+                arrow(path[i - 1], *point)
+            } else if i == 0 {
+                "◇"
+            } else if path[i - 1].x == point.x {
+                "┆"
+            } else {
+                "┄"
+            };
+            if let Some(cell) = f.buffer_mut().cell_mut((point.x, point.y)) {
+                cell.set_symbol(glyph).set_fg(Color::DarkGray);
+            }
+        }
+    }
     let mut strokes = BTreeMap::new();
     let mut heads = BTreeMap::new();
     for ((from, to), (forward, backward)) in edges(cells, panels).into_iter().take(8) {

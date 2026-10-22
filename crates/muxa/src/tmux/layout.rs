@@ -52,7 +52,7 @@ fn tmux_command() -> std::process::Command {
 
 /// `tmux -F` columns behind [`current_window_panes`]. Tab-separated,
 /// parsed by [`parse_pane_geometry_lines`].
-pub const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_zoomed_flag}\t#{pane_current_command}\t#{@muxa_agent_alias}";
+pub const PANE_GEOMETRY_FMT: &str = "#{pane_id}\t#{pane_index}\t#{pane_left}\t#{pane_top}\t#{pane_width}\t#{pane_height}\t#{pane_active}\t#{window_zoomed_flag}\t#{pane_current_command}\t#{@muxa_agent_alias}\t#{@muxa_spawn}";
 
 /// `tmux -F` columns behind [`current_window_frame`].
 const FRAME_FMT: &str =
@@ -69,6 +69,17 @@ const CLIENT_SURFACE_FMT: &str = "#{client_control_mode}\t#{client_name}\t#{sess
 
 /// `tmux -F` column behind [`server_config_files`].
 const CONFIG_FILES_FMT: &str = "#{config_files}";
+
+/// Immutable pane creation provenance, independent of requests and current roles.
+/// The child is a pane lifetime; the creator is an exact agent session.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpawnProvenance {
+    pub launch_id: String,
+    pub created_at: String,
+    pub creator: crate::collaboration::CollaborationEndpoint,
+    pub child_pane: String,
+    pub child_socket: Option<String>,
+}
 
 /// Where one pane sits on screen, plus the little bit of identity the
 /// overlay needs to label it when no agent is attached.
@@ -96,6 +107,8 @@ pub struct PaneGeometry {
     /// as the durable label rather than as the last word on where a peer
     /// call lands.
     pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawn: Option<SpawnProvenance>,
 }
 
 /// Client/window dimensions needed to place window-relative pane
@@ -169,6 +182,7 @@ pub fn parse_pane_geometry_lines(stdout: &str) -> (Vec<PaneGeometry>, bool) {
             height,
             active: is_flag_set(cols[6]),
             command: cols.get(8).map(|s| (*s).to_string()).unwrap_or_default(),
+            spawn: cols.get(10).and_then(|raw| serde_json::from_str(raw).ok()),
             alias: cols
                 .get(9)
                 .map(|s| s.trim())
@@ -550,6 +564,26 @@ mod tests {
     use super::*;
 
     const TWO_PANE: &str = "%0\t0\t0\t0\t120\t19\t0\t0\tzsh\n%1\t1\t0\t20\t120\t19\t1\t0\tclaude\n";
+
+    #[test]
+    fn creation_metadata_is_optional_and_malformed_metadata_does_not_hide_panes() {
+        let prefix = "%52\t1\t0\t0\t80\t24\t1\t0\tcodex\tworker";
+        let record = serde_json::json!({
+            "launch_id":"launch-1", "created_at":"2026-10-22",
+            "creator":{"agent_session_id":"creator-1", "pane":"rmux:%37",
+                "socket":"/tmp/one", "label":"builder"},
+            "child_pane":"rmux:%52", "child_socket":"/tmp/two"
+        });
+        let (panes, _) = parse_pane_geometry_lines(&format!("{prefix}\t{record}"));
+        let spawn = panes[0].spawn.as_ref().unwrap();
+        assert_eq!(spawn.creator.agent_session_id, "creator-1");
+        assert_eq!(spawn.child_socket.as_deref(), Some("/tmp/two"));
+        for raw in [prefix.to_string(), format!("{prefix}\tbroken-json")] {
+            let (panes, _) = parse_pane_geometry_lines(&raw);
+            assert_eq!(panes.len(), 1);
+            assert!(panes[0].spawn.is_none());
+        }
+    }
 
     #[test]
     fn parses_vertical_split() {

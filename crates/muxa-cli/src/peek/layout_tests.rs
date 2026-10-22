@@ -101,6 +101,15 @@ fn cells_for(rects: &[Rect]) -> Vec<PeekCell> {
         link.to = endpoints[(i + 1) % endpoints.len()].clone();
         link.reply_received = i % 2 == 0;
         cell.collaboration.connections.push(link);
+        if i > 0 {
+            cell.geo.spawn = Some(muxa::tmux::layout::SpawnProvenance {
+                launch_id: format!("launch-{i}"),
+                created_at: "2026-10-22".into(),
+                creator: endpoints[0].clone(),
+                child_pane: endpoints[i].pane.clone(),
+                child_socket: endpoints[i].socket.clone(),
+            });
+        }
     }
     cells
 }
@@ -214,4 +223,49 @@ fn mixed_layouts_hide_connections_to_covered_panes_when_zoomed() {
             );
         }
     }
+}
+
+#[test]
+fn spawn_edges_are_distinct_and_require_the_original_creator_session() {
+    let mut cells = cells_for(&[Rect::new(0, 0, 59, 23), Rect::new(60, 0, 60, 23)]);
+    for cell in &mut cells {
+        cell.collaboration.connections.clear();
+        cell.collaboration.links.clear();
+    }
+    // Verify prompt pixels across the same frame with creation edges only.
+    assert_eq!(
+        verify_frame(&cells, (120, 48), Placement::default(), false),
+        0
+    );
+    let render = |cells: &[PeekCell], zoomed| {
+        let mut terminal = Terminal::new(TestBackend::new(120, 48)).unwrap();
+        terminal
+            .draw(|f| draw(f, cells, Placement::default(), zoomed, ""))
+            .unwrap();
+        terminal.backend().buffer().clone()
+    };
+    let dashed = |buffer: &ratatui::buffer::Buffer| {
+        buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == Color::DarkGray && ["┆", "┄", "◇"].contains(&cell.symbol()))
+            .count()
+    };
+    let buffer = render(&cells, false);
+    assert!(dashed(&buffer) > 0);
+    let text: String = buffer
+        .content()
+        .iter()
+        .map(ratatui::buffer::Cell::symbol)
+        .collect();
+    assert!(text.contains("Pane spawned by rmux:%1000"));
+    assert_eq!(dashed(&render(&cells, true)), 0);
+    cells[0].geo.active = false;
+    assert_eq!(dashed(&render(&cells, false)), 0);
+    cells[0].geo.active = true;
+    cells[0].agent.as_mut().unwrap().session_id = "replacement".into();
+    assert_eq!(dashed(&render(&cells, false)), 0);
+    cells[0].agent.as_mut().unwrap().session_id = "layout-session-0".into();
+    cells[0].agent.as_mut().unwrap().tmux_socket = Some("/tmp/other-server".into());
+    assert_eq!(dashed(&render(&cells, false)), 0);
 }

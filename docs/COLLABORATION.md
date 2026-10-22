@@ -50,6 +50,15 @@ full pane addresses such as `rmux:%37`; connecting arrows follow the actual pane
 layout without crossing text cards. Arrows to replaced/hidden sessions and paths
 that cannot fit are omitted. It reads one bounded metadata snapshot per refresh without
 request bodies or claiming/acknowledging messages. Roles alone do not imply a link.
+Creation history appears separately as `Pane spawned by rmux:%37`. Gray dashed
+creation edges touch only the active pane and require the exact creator session
+and server; message edges remain cyan. Creation describes the pane's origin,
+not its current task owner. `primary` is a human-priority purpose, not a manager
+role. Existing panes are not assigned guessed creators. New launches with a
+verified agent caller retain provenance in pane metadata across daemon restarts
+and archive it under the data directory's `muxa/spawns/<launch-id>.json`, without
+prompt bodies. The overlay never scans that archive.
+
 
 Codex workers use `--no-daemon` and bind only from their own pane-bearing hooks;
 shared-server threads cannot take their launch grants.

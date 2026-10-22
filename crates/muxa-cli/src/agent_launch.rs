@@ -334,6 +334,7 @@ pub struct WorkStartArgs {
 
 #[derive(Debug, Clone)]
 pub struct StartRequest {
+    pub creator: Option<muxa::collaboration::CollaborationEndpoint>,
     pub bypass_permissions: bool,
     pub purpose: muxa::collaboration::LaunchPurpose,
     pub agent: AgentProgram,
@@ -380,6 +381,7 @@ impl StartRequest {
     /// pipeline or an MCP call does.
     pub fn from_args(args: &StartArgs, socket: &Path, cfg: &muxa::config::Config) -> Self {
         Self {
+            creator: None,
             bypass_permissions: true,
             purpose: args.purpose,
             agent: args.agent,
@@ -634,6 +636,7 @@ pub fn run_work_start(
 ) -> Result<()> {
     let json = args.json;
     let result = start(StartRequest {
+        creator: None,
         bypass_permissions: true,
         purpose: muxa::collaboration::LaunchPurpose::Primary,
         socket: socket.to_path_buf(),
@@ -695,6 +698,9 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
                 .any(|cap| cap == muxa::collaboration::HUMAN_PRIORITY_CAPABILITY)),
             "worker launch requires an upgraded muxad with human-priority support"
         );
+    }
+    if request.creator.is_none() {
+        request.creator = crate::spawn_provenance::resolve_creator(&request.socket);
     }
     let PreparedLaunch {
         cwd,
@@ -819,6 +825,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             return Err(error).context("register worker launch purpose");
         }
     }
+    crate::spawn_provenance::record(&request, &pane);
     // Minting belongs to the agent's session-start hook, which reaches the
     // room's arbiter. Doing it here too would allocate from a namespace this
     // process cannot see all of — the bug the arbiter exists to close — so an
@@ -1338,6 +1345,7 @@ mod tests {
 
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {
         StartRequest {
+            creator: None,
             bypass_permissions: true,
             purpose: muxa::collaboration::LaunchPurpose::Primary,
             socket: muxa::paths::default_socket(),

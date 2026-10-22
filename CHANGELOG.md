@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `prefix + q` separates pane creation history (`Pane spawned by`) from message
+  connections. Active-pane creation edges use gray dashed lines and exact creator
+  sessions; Muxa launches archive body-free provenance under `muxa/spawns`.
+
 - Address a role in a work instead of a pane:
   `muxa msg send callabo/CAL-8111/implementer …` (also `…/role@alias` and
   `…/@alias`, and on `muxa_send_message`/`muxa_call_peer`).

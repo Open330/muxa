@@ -30,6 +30,7 @@ mod owner_only;
 mod peek;
 mod relay;
 mod reload;
+mod spawn_provenance;
 mod stale_agents;
 mod start;
 mod stats;

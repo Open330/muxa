@@ -1108,7 +1108,17 @@ async fn call_tool(
                 Ok(purpose) => purpose,
                 Err(error) => return Ok(error_result(&error)),
             };
+            let creator = match resolve_collaboration_origin(client).await {
+                Ok(origin) => client
+                    .collaboration_context(&origin)
+                    .await
+                    .ok()
+                    .filter(|room| !room.current.console)
+                    .map(|room| (&room.current).into()),
+                Err(_) => None,
+            };
             let request = crate::agent_launch::StartRequest {
+                creator,
                 bypass_permissions: true,
                 purpose,
                 socket: client.socket().to_path_buf(),
@@ -3341,6 +3351,7 @@ async fn spawn_peer(
         .strip_prefix("rmux:")
         .unwrap_or(&room.current.pane);
     let request = crate::agent_launch::StartRequest {
+        creator: Some((&room.current).into()),
         bypass_permissions: config.collaboration.worker_bypass_permissions,
         purpose: muxa::collaboration::LaunchPurpose::Worker,
         socket: client.socket().to_path_buf(),
@@ -3560,7 +3571,7 @@ fn caller_session_hint(params: Option<&Value>) -> Option<String> {
 
 /// Whether this process inherited its pane env from a shared Codex
 /// app-server. Ancestry is fixed for the life of the process, so walk once.
-fn pane_env_is_borrowed() -> bool {
+pub(crate) fn pane_env_is_borrowed() -> bool {
     static SHARED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SHARED.get_or_init(|| {
         muxa::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id())

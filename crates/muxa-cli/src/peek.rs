@@ -796,6 +796,12 @@ fn collaboration_lines(cell: &PeekCell) -> Vec<String> {
             }
         ));
     }
+    if let Some(spawn) = &cell.geo.spawn {
+        lines.push(format!(
+            "Pane spawned by {} · {}",
+            spawn.creator.pane, spawn.creator.label
+        ));
+    }
     lines.extend(cell.collaboration.links.iter().cloned());
     lines
 }
@@ -2276,6 +2282,7 @@ mod tests {
             active,
             command: "zsh".into(),
             alias: None,
+            spawn: None,
         }
     }
 
