@@ -1638,7 +1638,7 @@ const STEPS: &[Step] = &[
         achieved_en: "✓ you read claude's reply — and codex has asked you something of its own",
         achieved_ko: "✓ claude의 답장을 봤습니다 — 그리고 codex가 당신에게 물어왔습니다",
         title_en: "`inbox` claims requests to worker sessions; a primary uses `msg accept ID`.",
-        title_ko: "`inbox`는 worker에게 온 요청을 가져옵니다. primary는 `msg accept ID`로 수락.",
+        title_ko: "worker는 `inbox`로, primary는 `msg accept ID`로 요청을 수락합니다.",
         cue_en: "run:   muxa msg inbox",
         cue_ko: "입력:   muxa msg inbox",
         detect: Detect::ClaimedInbox,
