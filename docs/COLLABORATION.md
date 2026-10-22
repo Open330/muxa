@@ -58,6 +58,13 @@ role. Existing panes are not assigned guessed creators. New launches with a
 verified agent caller retain provenance in pane metadata across daemon restarts
 and archive it under the data directory's `muxa/spawns/<launch-id>.json`, without
 prompt bodies. The overlay never scans that archive.
+Pane addresses use stable server-and-pane colors in card titles, creation history
+and peer rows. Only addresses are colored; relationship lines retain their type
+colors, and plain output remains uncolored.
+Connection nodes sit on each pane's horizontal centerline, as close as possible
+to its geometric center without covering prompt or relationship text.
+
+
 
 
 Codex workers use `--no-daemon` and bind only from their own pane-bearing hooks;

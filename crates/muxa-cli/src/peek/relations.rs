@@ -9,7 +9,8 @@ use ratatui::widgets::{Block, Clear, Paragraph};
 use ratatui::Frame;
 
 use super::{
-    cell_rect, collaboration_lines, display_width, info_rect, pane_address, PeekCell, Placement,
+    cell_rect, collaboration_lines, display_width, identity, info_rect, pane_address, PeekCell,
+    Placement,
 };
 
 struct Panel {
@@ -65,15 +66,20 @@ pub(super) fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoom
             " Links ".into()
         };
         let block = Block::bordered()
-            .title(title)
+            .title(identity::address_line(
+                title,
+                pane_address(cell),
+                cell.agent
+                    .as_ref()
+                    .and_then(|agent| agent.tmux_socket.as_deref()),
+            ))
             .border_style(Style::default().fg(Color::Yellow));
         let inner = block.inner(panel.rect);
         f.render_widget(Clear, panel.rect);
         f.render_widget(block, panel.rect);
-        let lines: Vec<_> = collaboration_lines(cell)
+        let lines: Vec<_> = styled_lines(cell)
             .into_iter()
             .take(usize::from(inner.height))
-            .map(Line::raw)
             .collect();
         f.render_widget(
             Paragraph::new(lines).style(Style::default().fg(Color::Yellow)),
@@ -81,6 +87,38 @@ pub(super) fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoom
         );
     }
     draw_links(f, cells, &panels, canvas, placement, zoomed);
+}
+
+fn styled_lines(cell: &PeekCell) -> Vec<Line<'static>> {
+    let mut lines = collaboration_lines(cell).into_iter();
+    let mut styled = Vec::new();
+    if cell.collaboration.purpose.is_some() {
+        styled.extend(lines.next().map(Line::raw));
+    }
+    if let Some(spawn) = &cell.geo.spawn {
+        styled.extend(lines.next().map(|text| {
+            identity::address_line(text, &spawn.creator.pane, spawn.creator.socket.as_deref())
+        }));
+    }
+    for (index, text) in lines.enumerate() {
+        let endpoint = cell.collaboration.connections.get(index).map(|link| {
+            if cell.agent.as_ref().is_some_and(|agent| {
+                agent.session_id == link.from.agent_session_id
+                    && agent.tmux_socket == link.from.socket
+            }) {
+                &link.to
+            } else {
+                &link.from
+            }
+        });
+        styled.push(match endpoint {
+            Some(endpoint) => {
+                identity::address_line(text, &endpoint.pane, endpoint.socket.as_deref())
+            }
+            None => Line::raw(text),
+        });
+    }
+    styled
 }
 
 fn matches(cell: &PeekCell, endpoint: &CollaborationEndpoint) -> bool {
@@ -138,28 +176,16 @@ fn edges(cells: &[PeekCell], panels: &[Panel]) -> BTreeMap<(usize, usize), (bool
     edges
 }
 
-/// Cards keep a one-column margin, so even vertical stacks have a clear route.
-fn ports(from: Rect, to: Rect) -> (Position, Position) {
-    let a = Position::new(from.x + from.width / 2, from.y + from.height / 2);
-    let b = Position::new(to.x + to.width / 2, to.y + to.height / 2);
-    if a.x.abs_diff(b.x) >= a.y.abs_diff(b.y) {
-        if a.x <= b.x {
-            (
-                Position::new(from.right() - 1, a.y),
-                Position::new(to.x, b.y),
-            )
-        } else {
-            (
-                Position::new(from.x, a.y),
-                Position::new(to.right() - 1, b.y),
-            )
-        }
-    } else {
-        (
-            Position::new(from.right() - 1, a.y),
-            Position::new(to.right() - 1, b.y),
-        )
-    }
+/// Keep the connection node on the pane's horizontal centerline. Prefer its
+/// geometric center, then the nearest free row, without covering any text.
+fn node_position(pane: Rect, area: Rect, blocked: &[bool]) -> Option<Position> {
+    let visible = pane.intersection(area);
+    let x = pane.x.checked_add(pane.width / 2)?;
+    let center_y = pane.y.checked_add(pane.height / 2)?;
+    (visible.y..visible.bottom())
+        .map(|y| Position::new(x, y))
+        .filter(|point| offset(area, *point).is_some_and(|index| !blocked[index]))
+        .min_by_key(|point| point.y.abs_diff(center_y))
 }
 
 fn offset(area: Rect, p: Position) -> Option<usize> {
@@ -337,6 +363,20 @@ fn draw_links(
             }
         }
     }
+    let nodes: Vec<_> = panels
+        .iter()
+        .map(|panel| {
+            let pane = cell_rect(&cells[panel.index].geo, placement.origin_y, f.area())?;
+            node_position(pane, area, &blocked)
+        })
+        .collect();
+    // Routes may end on their own nodes, but must not pass through a third
+    // pane's node and imply a relationship that does not exist.
+    for node in nodes.iter().flatten() {
+        if let Some(index) = offset(area, *node) {
+            blocked[index] = true;
+        }
+    }
     // Creation is pane history; only show edges touching the active pane and
     // only while the original creator session is still visible on its server.
     // Message strokes are painted afterwards and take precedence at crossings.
@@ -347,13 +387,18 @@ fn draw_links(
         let Some(parent) = endpoint_panel(cells, panels, &spawn.creator) else {
             continue;
         };
+        let Some(child_panel) = panels.iter().position(|panel| panel.index == child.index) else {
+            continue;
+        };
+        let (Some(start), Some(end)) = (nodes[parent], nodes[child_panel]) else {
+            continue;
+        };
         let parent = &panels[parent];
         if parent.index == child.index
             || !(cells[parent.index].geo.active || cells[child.index].geo.active)
         {
             continue;
         }
-        let (start, end) = ports(parent.rect, child.rect);
         let Some(path) = route(area, &blocked, start, end) else {
             continue;
         };
@@ -375,7 +420,9 @@ fn draw_links(
     let mut strokes = BTreeMap::new();
     let mut heads = BTreeMap::new();
     for ((from, to), (forward, backward)) in edges(cells, panels).into_iter().take(8) {
-        let (start, end) = ports(panels[from].rect, panels[to].rect);
+        let (Some(start), Some(end)) = (nodes[from], nodes[to]) else {
+            continue;
+        };
         let Some(path) = route(area, &blocked, start, end) else {
             continue;
         };
@@ -395,6 +442,48 @@ fn draw_links(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_color_matches_headers_spawn_history_and_both_message_directions() {
+        let mut cells = crate::peek::tests::linked_layout(false);
+        let creator = cells[0].collaboration.connections[0].from.clone();
+        let child = cells[0].collaboration.connections[0].to.clone();
+        cells[1].geo.spawn = Some(muxa::tmux::layout::SpawnProvenance {
+            launch_id: "test-colors".into(),
+            created_at: "2026-10-22".into(),
+            creator: creator.clone(),
+            child_pane: child.pane.clone(),
+            child_socket: child.socket.clone(),
+        });
+        for cell in &cells {
+            let address = pane_address(cell);
+            let header = crate::peek::header_spans(cell, 120);
+            let id = header
+                .iter()
+                .find(|span| span.content.trim() == address)
+                .unwrap();
+            assert_eq!(id.style.fg, Some(identity::cell_color(cell)));
+        }
+        // Parent outbound row names the child; child history and inbound row
+        // name the parent. Every occurrence must use the endpoint's own color.
+        for (cell, endpoint, expected_count) in [(&cells[0], &child, 1), (&cells[1], &creator, 3)] {
+            let count = styled_lines(cell)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .filter(|span| span.content == endpoint.pane)
+                .inspect(|span| {
+                    assert_eq!(
+                        span.style.fg,
+                        Some(identity::pane_color(
+                            &endpoint.pane,
+                            endpoint.socket.as_deref()
+                        ))
+                    );
+                })
+                .count();
+            assert_eq!(count, expected_count);
+        }
+    }
 
     #[test]
     fn routing_avoids_every_card_cell_and_fails_closed_without_a_path() {
@@ -427,17 +516,25 @@ mod tests {
     }
 
     #[test]
-    fn side_by_side_ports_face_each_other_and_vertical_ports_keep_titles_clear() {
-        let left = Rect::new(1, 6, 40, 4);
-        let right = Rect::new(46, 6, 40, 4);
-        let (start, end) = ports(left, right);
-        assert_eq!(start, Position::new(left.right() - 1, 8));
-        assert_eq!(end, Position::new(right.x, 8));
-        let below = Rect::new(1, 27, 40, 4);
-        let (start, end) = ports(left, below);
-        assert_eq!(start.x, end.x);
-        assert!(end.y > start.y);
-        assert_ne!(start.y, left.y);
-        assert_ne!(end.y, below.y);
+    fn nodes_prefer_pane_centers_and_move_only_vertically_to_avoid_text() {
+        let area = Rect::new(0, 0, 120, 48);
+        let pane = Rect::new(60, 0, 60, 48);
+        let mut blocked = vec![false; 120 * 48];
+        assert_eq!(
+            node_position(pane, area, &blocked),
+            Some(Position::new(90, 24))
+        );
+        for y in 22..27 {
+            blocked[offset(area, Position::new(90, y)).unwrap()] = true;
+        }
+        assert_eq!(
+            node_position(pane, area, &blocked),
+            Some(Position::new(90, 21))
+        );
+        for y in 0..48 {
+            blocked[offset(area, Position::new(90, y)).unwrap()] = true;
+        }
+        assert_eq!(node_position(pane, area, &blocked), None);
+        assert_eq!(node_position(pane, Rect::new(0, 0, 1, 1), &blocked), None);
     }
 }

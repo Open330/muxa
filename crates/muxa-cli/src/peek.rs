@@ -59,6 +59,7 @@ use unicode_width::UnicodeWidthChar;
 use crate::attend;
 use crate::watch::agent_kind_short;
 
+mod identity;
 #[cfg(test)]
 mod layout_tests;
 mod relations;
@@ -336,9 +337,17 @@ impl Detail {
         } else {
             "Saved agent text"
         };
-        let block = Block::bordered().title(format!(
-            " {} {} · {source} ",
-            self.cell.geo.pane_index, self.cell.geo.pane_id
+        let block = Block::bordered().title(identity::address_line(
+            format!(
+                " {} {} · {source} ",
+                self.cell.geo.pane_index,
+                pane_address(&self.cell)
+            ),
+            pane_address(&self.cell),
+            self.cell
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.tmux_socket.as_deref()),
         ));
         let inner = block.inner(area);
         frame.render_widget(Clear, area);
@@ -1265,7 +1274,9 @@ fn header_spans(cell: &PeekCell, width: u16) -> Vec<Span<'static>> {
     });
     let pane_id = Span::styled(
         format!(" {}", pane_address(cell)),
-        Style::default().fg(Color::DarkGray),
+        Style::default()
+            .fg(identity::cell_color(cell))
+            .add_modifier(Modifier::BOLD),
     );
 
     let mut narrowest = Vec::new();

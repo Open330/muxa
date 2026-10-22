@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `prefix + q` gives pane addresses stable server-aware colors across card titles,
+  creation history and message peers, while retaining relationship line colors.
+
 - `prefix + q` separates pane creation history (`Pane spawned by`) from message
   connections. Active-pane creation edges use gray dashed lines and exact creator
   sessions; Muxa launches archive body-free provenance under `muxa/spawns`.
@@ -18,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `…/@alias`, and on `muxa_send_message`/`muxa_call_peer`).
 
 ### Fixed
+
+- `prefix + q` anchors connections at pane centers, using the nearest free row
+  on the centerline when prompt or relationship text occupies the center.
 
 - `prefix + q` keeps collaboration roles and request state in a separate panel
   below prompts/responses. Spatial arrows connect visible pane panels without
