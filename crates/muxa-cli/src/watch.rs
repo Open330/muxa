@@ -517,7 +517,12 @@ impl WatchColumn {
                             .add_modifier(Modifier::DIM | Modifier::ITALIC),
                     ))
                 } else {
-                    label.into()
+                    crate::pane_identity::address_line(
+                        label,
+                        a.pane.as_deref().unwrap_or(""),
+                        a.tmux_socket.as_deref(),
+                    )
+                    .into()
                 }
             }
             Self::Kind => a.kind.to_string().into(),
@@ -14756,11 +14761,19 @@ fn build_preview_lines_for<'a>(
             )
         },
     );
+    let pane_socket = pane_key
+        .map(|key| key.window.session.endpoint.socket.as_str())
+        .or_else(|| agent.and_then(|agent| agent.tmux_socket.as_deref()));
     if let Some(agent) = agent {
         // Header line — pane label + kind + state, all on one row.
         out.push(Line::from(vec![
             Span::styled("pane: ", Style::default().add_modifier(Modifier::DIM)),
-            Span::styled(pane_label, Style::default().add_modifier(Modifier::BOLD)),
+            // The route label may be a location rather than a raw pane ID.
+            // Only address occurrences receive identity colors.
+            Span::styled(
+                pane_label.clone(),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
             Span::raw("    "),
             Span::styled("kind: ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw(agent.kind.to_string()),
@@ -14768,6 +14781,13 @@ fn build_preview_lines_for<'a>(
             Span::styled("state: ", Style::default().add_modifier(Modifier::DIM)),
             Span::raw(agent.state.to_string()),
         ]));
+        if let Some(header) = out.pop() {
+            out.push(crate::pane_identity::highlight_line(
+                header,
+                pane_id,
+                pane_socket,
+            ));
+        }
         out.push(Line::from(""));
 
         push_section(&mut out, "Last prompt", agent.last_prompt.as_deref());
@@ -15438,11 +15458,15 @@ fn inspector_pane_roster_line_with_prefix(
             " {:<5} {:<8} {} · {}",
             pane.key.pane_id, pane.current_command, pane.title, pane.cwd
         );
-        return Line::from(vec![
-            Span::styled(prefix, theme.dim_style()),
-            Span::styled("○", theme.dim_style()),
-            Span::styled(truncate_chars(&body, body_width), theme.dim_style()),
-        ]);
+        return crate::pane_identity::highlight_line(
+            Line::from(vec![
+                Span::styled(prefix, theme.dim_style()),
+                Span::styled("○", theme.dim_style()),
+                Span::styled(truncate_chars(&body, body_width), theme.dim_style()),
+            ]),
+            &pane.key.pane_id,
+            Some(&pane.key.window.session.endpoint.socket),
+        );
     };
 
     let (glyph, style) = state_marker(agent.state, theme, spin);
@@ -15473,11 +15497,15 @@ fn inspector_pane_roster_line_with_prefix(
             summary
         )
     };
-    Line::from(vec![
-        Span::styled(prefix, theme.dim_style()),
-        Span::styled(glyph.to_string(), style),
-        Span::raw(truncate_chars(&body, body_width)),
-    ])
+    crate::pane_identity::highlight_line(
+        Line::from(vec![
+            Span::styled(prefix, theme.dim_style()),
+            Span::styled(glyph.to_string(), style),
+            Span::raw(truncate_chars(&body, body_width)),
+        ]),
+        &pane.key.pane_id,
+        Some(&pane.key.window.session.endpoint.socket),
+    )
 }
 
 fn extend_inspector_roster(
@@ -15599,11 +15627,12 @@ fn render_window_mosaic_cell(
         Span::styled(glyph.to_string(), state_style),
         Span::styled(
             format!(" {}", captured.geometry.pane_id),
-            if captured.geometry.active {
-                theme.accent_badge()
-            } else {
-                Style::default()
-            },
+            Style::default()
+                .fg(crate::pane_identity::pane_color(
+                    &captured.geometry.pane_id,
+                    Some(&window.key.session.endpoint.socket),
+                ))
+                .add_modifier(Modifier::BOLD),
         ),
     ];
     if rect.width >= 18 {
@@ -16129,11 +16158,20 @@ fn render_topology_inspector(
         }
     };
     lines.insert(0, topology_inspector_status_line(node, app, theme));
+    let title = match node {
+        TopologyNodeRef::Pane(pane) => crate::pane_identity::address_line(
+            title,
+            &pane.key.pane_id,
+            Some(&pane.key.window.session.endpoint.socket),
+        ),
+        _ => Line::raw(title),
+    }
+    .style(theme.accent_badge());
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style())
         .border_type(theme.border_type)
-        .title(Span::styled(title, theme.accent_badge()));
+        .title(title);
     f.render_widget(Paragraph::new(lines).block(block), area);
     if let TopologyNodeRef::Window(window) = node {
         if let (Some(capture), Some(mosaic_area)) = (
@@ -16557,7 +16595,16 @@ fn tree_node_label(
             }
         }
     };
-    if target.depth == 0 {
+    if let TopologyNodeRef::Pane(pane) = node {
+        spans.extend(
+            crate::pane_identity::address_line(
+                label,
+                &pane.key.pane_id,
+                Some(&pane.key.window.session.endpoint.socket),
+            )
+            .spans,
+        );
+    } else if target.depth == 0 {
         spans.push(Span::styled(
             label,
             Style::default().add_modifier(Modifier::BOLD),
@@ -18939,6 +18986,60 @@ mod tests {
         });
         app.set_data(agents, panes);
         app
+    }
+
+    #[test]
+    fn watch_tree_and_inspector_use_the_shared_pane_color_without_recoloring_state() {
+        let socket = "/tmp/rmux-test/default";
+        let panes = vec![fake_topology_pane(
+            socket, "$1", "muxa", "@1", "main", 0, "rmux:%35", 0,
+        )];
+        let agents = vec![topology_agent(
+            "color-test",
+            "rmux:%35",
+            socket,
+            AgentState::Working,
+            "review",
+            1,
+        )];
+        let app = topology_watch(WatchView::Pane, agents, panes);
+        let target = app
+            .tree_targets()
+            .into_iter()
+            .find(|target| matches!(target.key, TopologyNodeKey::Pane(_)))
+            .unwrap();
+        let node = app.topology.find(&target.key).unwrap();
+        let TopologyNodeRef::Pane(pane) = node else {
+            unreachable!()
+        };
+        let theme = watch_theme(WatchTheme::default());
+        let color = crate::pane_identity::pane_color("rmux:%35", Some(socket));
+        let label = tree_node_label(&target, node, false, theme);
+        let id = label
+            .lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content == "rmux:%35")
+            .unwrap();
+        assert_eq!(id.style.fg, Some(color));
+        let spin = Spinner {
+            frame: 0,
+            enabled: false,
+        };
+        let roster = inspector_pane_roster_line(pane, 100, OffsetDateTime::now_utc(), theme, spin);
+        let id = roster
+            .spans
+            .iter()
+            .find(|span| span.content == "rmux:%35")
+            .unwrap();
+        assert_eq!(id.style.fg, Some(color));
+        let (glyph, state) = state_marker(AgentState::Working, theme, spin);
+        let status = roster
+            .spans
+            .iter()
+            .find(|span| span.content == glyph)
+            .unwrap();
+        assert_eq!(status.style, state);
     }
 
     #[test]

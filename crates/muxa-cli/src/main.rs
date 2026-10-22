@@ -27,6 +27,7 @@ mod mux_control;
 mod onboarding;
 mod orchestration;
 mod owner_only;
+mod pane_identity;
 mod peek;
 mod relay;
 mod reload;

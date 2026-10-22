@@ -307,6 +307,28 @@ fn participant_lifeline(participant: &Participant) -> String {
     }
 }
 
+fn route_line(
+    request: &CollaborationRequest,
+    from: String,
+    arrow: &str,
+    to: String,
+) -> Line<'static> {
+    // Color each endpoint separately: identical pane IDs on different servers
+    // must not be recolored together by a global string replacement.
+    let mut spans = crate::pane_identity::address_line(
+        from,
+        &request.from.pane,
+        request.from.socket.as_deref(),
+    )
+    .spans;
+    spans.push(Span::raw(arrow.to_string()));
+    spans.extend(
+        crate::pane_identity::address_line(to, &request.to.pane, request.to.socket.as_deref())
+            .spans,
+    );
+    Line::from(spans)
+}
+
 fn participant_lifeline_key(participant: &Participant) -> String {
     if participant.console {
         return "console".into();
@@ -443,12 +465,11 @@ pub(crate) fn row<'a>(
             Cell::from(""),
         ]),
         CollabRow::Request(request) => {
-            let route = format!(
-                "{} [{}] → {} [{}]",
-                request.from.label(),
-                location(&request.from),
-                request.to.label(),
-                location(&request.to),
+            let route = route_line(
+                request,
+                format!("{} [{}]", request.from.label(), location(&request.from)),
+                " → ",
+                format!("{} [{}]", request.to.label(), location(&request.to)),
             );
             let cells = vec![
                 Cell::from(age(now, request.created_at)),
@@ -525,10 +546,11 @@ pub(crate) fn sequence_row<'a>(
         ],
         SequenceRow::Request(request) => vec![
             Cell::from(clock(request.created_at)),
-            Cell::from(format!(
-                "{} ●──────▶ {}",
+            Cell::from(route_line(
+                request,
                 participant_lifeline(&request.from),
-                participant_lifeline(&request.to)
+                " ●──────▶ ",
+                participant_lifeline(&request.to),
             )),
             Cell::from(kind_label(request)),
             Cell::from(format!("now {}", status_label(request.status))),
@@ -538,10 +560,11 @@ pub(crate) fn sequence_row<'a>(
             let reply = request.reply.as_ref().expect("reply sequence row");
             vec![
                 Cell::from(clock(reply.at)),
-                Cell::from(format!(
-                    "{} ◀──────● {}",
+                Cell::from(route_line(
+                    request,
                     participant_lifeline(&request.from),
-                    participant_lifeline(&request.to)
+                    " ◀──────● ",
+                    participant_lifeline(&request.to),
                 )),
                 Cell::from("reply"),
                 Cell::from(status_label(reply.status)),

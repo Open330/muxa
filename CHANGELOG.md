@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Watch pane IDs use the same server-aware colors as peek across tree rows,
+  inspector rosters, capture titles, preview headers and collaboration routes.
+
 - Peek `from`/`to` rows show the remote window, plus the session when different,
   while omitting shared location components. Endpoint snapshots retain location.
 
