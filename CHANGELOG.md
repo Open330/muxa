@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Peek qualifies pane geometry queries with the caller's session and window,
+  so `prefix + q` stays open when an older rmux server reports a linked window
+  ID as ambiguous across sessions.
+
 ## [0.9.2] - 2026-10-22
 
 ### Added

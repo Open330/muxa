@@ -271,7 +271,14 @@ pub fn current_window_panes(target: &WindowTarget) -> (Vec<PaneGeometry>, bool) 
     let mut cmd = tmux_command();
     cmd.args(["list-panes", "-F", PANE_GEOMETRY_FMT]);
     if let Some(window) = &target.window {
-        cmd.args(["-t", window]);
+        // A linked window can appear in several sessions. Older rmux servers
+        // reject its bare @id as ambiguous, even though the caller is pinned.
+        // Keep the session in the actual query as well as in the popup args.
+        let qualified = target
+            .session
+            .as_ref()
+            .map_or_else(|| window.clone(), |session| format!("{session}:{window}"));
+        cmd.args(["-t", &qualified]);
     }
     let Ok(out) = command_output_with_timeout(
         cmd,

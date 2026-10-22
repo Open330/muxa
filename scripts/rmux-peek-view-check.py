@@ -85,6 +85,9 @@ with tempfile.TemporaryDirectory(prefix='muxa-peek-view-') as directory:
                                text=True, check=True, timeout=10).stdout
         assert len(plain.strip().splitlines()) == 2, plain
         run('new-session', '-d', '-s', 'unrelated', '/bin/sh')
+        # A second independent session may link the same window (sidebar/view
+        # navigation does this). Older rmux servers reject the bare @id here.
+        run('link-window', '-s', 'original:' + main, '-t', 'unrelated:1')
         other_client, other_fd = attach('unrelated')
         other_session = run('display-message', '-p', '-t', 'unrelated', '#{session_id}')
         fixed = shlex.join(stale + ['peek', '--popup', '--caller-client', '#{client_name}',
