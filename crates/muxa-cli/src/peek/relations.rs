@@ -18,6 +18,14 @@ struct Panel {
     rect: Rect,
 }
 
+fn horizontal_padding(width: u16) -> u16 {
+    if width >= 24 {
+        2
+    } else {
+        1
+    }
+}
+
 fn panel(cell: &PeekCell, pane: Rect, bottom: u16) -> Option<Rect> {
     if cell.agent.is_none() || cell.collaboration.purpose.is_none() || pane.width < 12 {
         return None;
@@ -32,7 +40,7 @@ fn panel(cell: &PeekCell, pane: Rect, bottom: u16) -> Option<Rect> {
     let lines = collaboration_lines(cell);
     let rows = u16::try_from(lines.len()).unwrap_or(4);
     let height = available.min(rows + 2);
-    // Size to the actual text, with one cell of inner padding and at least
+    // Size to the actual text, with two cells of inner padding and at least
     // a little room on both sides. The box itself is the visible graph node.
     let title_width = display_width(&format!(" Links · {} ", pane_address(cell))) + 2;
     let text_width = lines
@@ -40,7 +48,8 @@ fn panel(cell: &PeekCell, pane: Rect, bottom: u16) -> Option<Rect> {
         .map(|line| display_width(line))
         .max()
         .unwrap_or(0)
-        + 4;
+        + 2
+        + 2 * usize::from(horizontal_padding(pane.width.saturating_sub(4)));
     let margin = if pane.width >= 20 { 2 } else { 1 };
     let width = u16::try_from(title_width.max(text_width).max(16))
         .unwrap_or(u16::MAX)
@@ -86,7 +95,7 @@ pub(super) fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoom
             " Links ".into()
         };
         let block = Block::bordered()
-            .padding(Padding::horizontal(1))
+            .padding(Padding::horizontal(horizontal_padding(panel.rect.width)))
             .title(identity::address_line(
                 title,
                 pane_address(cell),
