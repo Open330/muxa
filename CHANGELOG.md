@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa fleet sync --from HOST --to HOSTS` previews automation rule changes
+  across Fleet hosts; `--apply` backs up, conditionally saves, and reloads
+  changed hosts. Target-only rules, pauses, and unrelated settings remain local.
+
 ### Changed
 
 - Global Ask publishes bounded Codex/Claude assistant progress through the

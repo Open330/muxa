@@ -331,3 +331,27 @@ request를 keystroke로 조용히 낮추지 않고 upgrade 안내를 표시합�
 
 전체 설정은 [CONFIGURATION.ko.md](CONFIGURATION.ko.md), 같은 물리 node 안에서 여러
 backend를 관측하는 기능은 [MULTI_HOST.md](MULTI_HOST.md)를 참고하세요.
+
+## automation 설정 비교와 전파
+
+```sh
+muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --diff
+muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --apply
+```
+
+기본은 미리보기이며 `--diff`로 명시할 수도 있습니다. 초기 범위는
+`--section automation`입니다. 규칙 이름이 같으면 원본 설정으로 갱신하고,
+대상 기기에만 있는 규칙은 보존합니다. 원본의 엔진 활성화 설정은 복사하지만
+일시 정지와 실행 기록·횟수는 기기별로 유지합니다. SSH·인증 및 다른 설정은
+전파하지 않으며 diff에도 표시하지 않습니다. `local`과 `localhost`는 현재
+기기의 데몬입니다.
+
+모든 대상은 Fleet에 등록되고 활성화되어야 합니다. 비교는 observe에서도
+가능하지만 적용에는 control 모드가 필요합니다. 변경되는 원격 대상의 CLI도
+`fleet sync` 지원 버전이어야 합니다. 저장 전 전체 대상을 먼저 읽고 검증하며,
+기기별 비공개 백업을 만든 뒤 동시 편집 여부를 확인하고 데몬 재시작까지
+검증합니다. 동일한 설정은 쓰거나 재시작하지 않습니다.
+
+각 기기는 독립적으로 적용됩니다. 중간 실패 시 앞서 성공한 기기는 유지되므로
+다시 diff를 확인하세요. SSH 시간 초과가 적용 도중 발생했다면 저장 여부가
+불확실하므로 해당 기기의 상태를 먼저 확인해야 합니다.

@@ -138,6 +138,10 @@ pub(crate) struct FleetArgs {
 
 #[derive(Debug, Subcommand)]
 enum FleetCommand {
+    /// Compare or apply selected settings across registered Fleet hosts.
+    Sync(crate::fleet_sync::Args),
+    #[command(hide = true)]
+    SyncReceive,
     /// Manage local/SSH host inventory and Kubernetes-style metadata.
     Host(HostArgs),
     /// Print the aggregated host/session/window/pane state.
@@ -399,6 +403,8 @@ pub(crate) async fn run_fleet(
     config_path: Option<&Path>,
 ) -> Result<()> {
     match args.command {
+        FleetCommand::Sync(args) => crate::fleet_sync::run(args, client, cfg).await,
+        FleetCommand::SyncReceive => crate::fleet_sync::receive(client).await,
         FleetCommand::Host(host) => Box::pin(run_host(host, client, cfg, config_path)).await,
         FleetCommand::Status { table } => {
             let selector = parse_selector(table.selector.as_deref())?;

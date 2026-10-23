@@ -13,6 +13,7 @@ mod dashboard_tui;
 mod doctor;
 mod doctor_report;
 mod fleet_cli;
+mod fleet_sync;
 mod fleet_watch;
 mod graph;
 mod help_groups;
