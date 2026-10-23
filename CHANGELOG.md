@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Global Ask publishes bounded Codex/Claude assistant progress through the
+  existing revision stream, without exposing tool payloads or reasoning or
+  treating progress as completion. CLI waits use notifications where available.
+- Fresh Ask conversations receive compact preparation guidance to avoid broad
+  tool catalogs and repeated instruction reads while preserving project rules.
+
 ### Fixed
 
 - Peek qualifies pane geometry queries with the caller's session and window,

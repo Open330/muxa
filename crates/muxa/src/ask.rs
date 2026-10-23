@@ -5,16 +5,15 @@
 //! `claude`/`codex` TUI alive and typing into it is the obvious shape, and
 //! it does not work: a TUI gives no machine-readable "the answer ends
 //! here", so reading a reply back means screen-scraping a moving target.
-//! Print mode (`claude -p --output-format json`, `codex exec --json`,
+//! Print mode (`claude -p --output-format stream-json`, `codex exec --json`,
 //! `gemini -p --output-format json`) answers with structured output and an
 //! exit code — completion is a fact, not a guess.
 //!
-//! **And it is not slower.** The CLIs resume a prior conversation by id,
-//! so the second question onward reuses the cached system context the
-//! first one paid for, which is the efficiency a parked session was meant
-//! to buy. The thread continues until the user resets it, and the entries
-//! outlive the daemon because they live in the same durable-JSON shape the
-//! collaboration mailbox uses.
+//! **Resumable turns.** The CLIs resume a prior conversation by id rather
+//! than rediscovering it from scratch. This does not bound model/tool latency;
+//! user-facing messages are published while a turn is running. The thread
+//! continues until the user resets it, and entries outlive the daemon in
+//! the same durable-JSON shape the collaboration mailbox uses.
 //!
 //! **API providers** (`anthropic`, `openai`) have no server-side thread to
 //! resume, so muxa replays the conversation's prior turns from its own
@@ -48,6 +47,10 @@ use time::OffsetDateTime;
 use tokio::sync::{watch, Mutex, RwLock};
 
 use crate::config::{AskPermissionMode, AskProviderConfig, Config, DEFAULT_ASK_TIMEOUT_SECS};
+
+mod cli_stream;
+
+const FIRST_TURN_GUIDANCE: &str = "Global Ask: keep preparation proportional to the request. Answer simple questions directly. For work, locate the relevant project and follow its instructions and any explicitly requested skill. Read only the necessary instruction sections, once per conversation; reuse what you have already learned. Discover exact tools when needed instead of printing broad tool catalogs. Keep tool output bounded and summarize progress briefly. Preserve the user's scope, permissions, and explicit instructions.\n\n";
 
 /// How many entries the store keeps. Old answers are worth re-reading;
 /// unbounded growth is not.
@@ -870,6 +873,14 @@ impl AskStore {
         let id = entry.id.clone();
         let mut prompt = prompt.to_string();
         if resume.is_none()
+            && matches!(
+                engine,
+                AskEngine::Claude | AskEngine::Codex | AskEngine::Gemini
+            )
+        {
+            prompt.insert_str(0, FIRST_TURN_GUIDANCE);
+        }
+        if resume.is_none()
             && self
                 .opts
                 .config_path
@@ -882,24 +893,45 @@ impl AskStore {
         tokio::spawn(async move {
             let api_key =
                 resolve_api_key(&provider, credential_key, |name| std::env::var(name).ok());
-            let outcome = engine
-                .run(Turn {
-                    prompt: &prompt,
-                    resume: resume.as_deref(),
-                    history: &history,
-                    cwd: &store.opts.cwd,
-                    permission_mode: store.opts.permission_mode,
-                    additional_dirs: &store.opts.additional_dirs,
-                    timeout: Duration::from_secs(store.opts.timeout_secs.max(5)),
-                    model: provider.model(),
-                    executable: provider.executable(),
-                    api_key: api_key.as_deref(),
-                    workspace: store.opts.socket.as_deref().map(|socket| Workspace {
-                        socket,
-                        config: store.opts.config_path.as_deref(),
-                    }),
-                })
-                .await;
+            let (progress, mut updates) = watch::channel(String::new());
+            let turn = Turn {
+                prompt: &prompt,
+                resume: resume.as_deref(),
+                history: &history,
+                cwd: &store.opts.cwd,
+                permission_mode: store.opts.permission_mode,
+                additional_dirs: &store.opts.additional_dirs,
+                timeout: Duration::from_secs(store.opts.timeout_secs.max(5)),
+                model: provider.model(),
+                executable: provider.executable(),
+                api_key: api_key.as_deref(),
+                workspace: store.opts.socket.as_deref().map(|socket| Workspace {
+                    socket,
+                    config: store.opts.config_path.as_deref(),
+                }),
+            };
+            let execution = engine.run_observed(turn, Some(progress));
+            tokio::pin!(execution);
+            let mut tick = tokio::time::interval(Duration::from_millis(250));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let outcome = loop {
+                tokio::select! {
+                    result = &mut execution => break result,
+                    _ = tick.tick() => {
+                        if updates.has_changed().unwrap_or(false) {
+                            let text = updates.borrow_and_update().clone();
+                            let mut entries = store.entries.write().await;
+                            if let Some(entry) = entries.iter_mut().find(|entry| entry.id == id) {
+                                entry.answer = text;
+                            }
+                            drop(entries);
+                            // Transient progress uses the existing revision stream; durable
+                            // snapshots are still written only at turn boundaries.
+                            store.publish_change();
+                        }
+                    }
+                }
+            };
             store.finish(&id, outcome).await;
         });
 
@@ -1921,21 +1953,40 @@ impl AskEngine {
     }
 
     async fn run(self, turn: Turn<'_>) -> Result<AskAnswer, String> {
+        self.run_observed(turn, None).await
+    }
+
+    async fn run_observed(
+        self,
+        turn: Turn<'_>,
+        progress: Option<watch::Sender<String>>,
+    ) -> Result<AskAnswer, String> {
         match self {
-            Self::Claude | Self::Codex | Self::Gemini => self.run_cli(&turn).await,
+            Self::Claude | Self::Codex | Self::Gemini => self.run_cli(&turn, progress).await,
             Self::Anthropic | Self::OpenAi => self.call_api(self.api_url(), &turn).await,
             Self::Apple => run_apple(&turn).await,
         }
     }
 
-    async fn run_cli(self, turn: &Turn<'_>) -> Result<AskAnswer, String> {
-        let (default_bin, args) = self.argv(
+    async fn run_cli(
+        self,
+        turn: &Turn<'_>,
+        progress: Option<watch::Sender<String>>,
+    ) -> Result<AskAnswer, String> {
+        let (default_bin, mut args) = self.argv(
             turn.prompt,
             turn.resume,
             turn.permission_mode,
             turn.additional_dirs,
             turn.model,
         );
+        let streaming = progress.is_some() && matches!(self, Self::Codex | Self::Claude);
+        if streaming && self == Self::Claude {
+            if let Some(format) = args.iter().position(|arg| arg == "--output-format") {
+                args[format + 1] = "stream-json".into();
+            }
+            args.insert(0, "--verbose".into());
+        }
         // An instance may point at its own copy of the CLI — a second
         // `claude` under a different login, say. Only the program changes;
         // the argv and the parser stay the engine's.
@@ -1958,6 +2009,9 @@ impl AskEngine {
         // Lets the user's own CLI hooks (prompt rewriters, coaches, loggers)
         // recognise a headless muxa turn and stay out of the answer.
         cmd.env(ASK_ENV_MARKER, "1");
+        if streaming {
+            return cli_stream::run(cmd, self, bin, turn.timeout, progress).await;
+        }
         let output = tokio::time::timeout(turn.timeout, cmd.output())
             .await
             .map_err(|_| timeout_message(bin, turn.timeout))?
@@ -2583,14 +2637,18 @@ fn parse_codex_jsonl(stdout: &str) -> Result<AskAnswer, String> {
                 session_id = find_str(&value, key);
             }
         }
-        // Codex has moved this field around across versions; take the last
-        // message-shaped payload rather than pinning one event name.
-        for key in ["last_agent_message", "agent_message", "message", "text"] {
-            if let Some(found) = find_str(&value, key) {
-                if !found.trim().is_empty() {
-                    text = Some(found);
-                }
-            }
+        // Accept assistant messages, never a tool's text or reasoning. Keep
+        // the legacy item/payload/message envelope for older CLI versions.
+        let found = if value["type"] == "item.completed" && value["item"]["type"] == "agent_message"
+        {
+            value["item"]["text"].as_str().map(str::to_owned)
+        } else if value["type"] == "item" {
+            value["payload"]["message"].as_str().map(str::to_owned)
+        } else {
+            value["last_agent_message"].as_str().map(str::to_owned)
+        };
+        if let Some(found) = found.filter(|text| !text.trim().is_empty()) {
+            text = Some(found);
         }
     }
     let text = text.ok_or("codex produced no agent message")?;

@@ -13126,12 +13126,14 @@ fn render_ask_reader(f: &mut Frame, area: Rect, app: &mut App) {
     );
     lines.push(Line::from(""));
     let body = match entry.status {
-        muxa::ask::AskStatus::Running => "…waiting for the agent".to_string(),
+        muxa::ask::AskStatus::Running if entry.answer.is_empty() => {
+            "…waiting for the agent".to_string()
+        }
         muxa::ask::AskStatus::Failed => entry
             .error
             .clone()
             .unwrap_or_else(|| "failed with no detail".into()),
-        muxa::ask::AskStatus::Answered => entry.answer.clone(),
+        muxa::ask::AskStatus::Running | muxa::ask::AskStatus::Answered => entry.answer.clone(),
     };
     // The detail pane paints an answer green to mark it as the reply; a
     // whole page of green is a wall to read. The status badge in the title
@@ -13200,12 +13202,14 @@ fn ask_detail_lines(
             .map(Line::from),
     );
     let body = match entry.status {
-        muxa::ask::AskStatus::Running => "…waiting for the agent".to_string(),
+        muxa::ask::AskStatus::Running if entry.answer.is_empty() => {
+            "…waiting for the agent".to_string()
+        }
         muxa::ask::AskStatus::Failed => entry
             .error
             .clone()
             .unwrap_or_else(|| "failed with no detail".into()),
-        muxa::ask::AskStatus::Answered => entry.answer.clone(),
+        muxa::ask::AskStatus::Running | muxa::ask::AskStatus::Answered => entry.answer.clone(),
     };
     let style = match entry.status {
         muxa::ask::AskStatus::Failed => Style::default().fg(Color::Red),

@@ -1389,23 +1389,57 @@ async fn cmd_ask(client: &Client, prompt: String, options: AskOptions) -> Result
         return Ok(());
     }
 
+    wait_for_ask(client, &pending.id, json, timeout_secs).await
+}
+
+async fn wait_for_ask(client: &Client, id: &str, json: bool, timeout_secs: u64) -> Result<()> {
     let deadline =
         tokio::time::Instant::now() + Duration::from_secs(timeout_secs.clamp(1, 24 * 60 * 60));
+    // Subscribe before reading the snapshot, so a finishing turn cannot fall
+    // between our read and wait. Older/remote daemons retain bounded polling.
+    let mut updates = client.ask_subscribe().await.ok();
+    let mut shown = String::new();
     loop {
         let entry = client
             .ask_list()
             .await?
             .into_iter()
-            .find(|entry| entry.id == pending.id)
+            .find(|entry| entry.id == id)
             .context("the queued Ask disappeared from durable history")?;
         match entry.status {
             muxa::ask::AskStatus::Running => {
+                if !json && std::io::stderr().is_terminal() && entry.answer != shown {
+                    let added = entry
+                        .answer
+                        .strip_prefix(&shown)
+                        .unwrap_or(&entry.answer)
+                        .trim();
+                    if !added.is_empty() {
+                        eprintln!("{added}");
+                    }
+                    shown.clone_from(&entry.answer);
+                }
                 anyhow::ensure!(
                     tokio::time::Instant::now() < deadline,
                     "timed out waiting for {}; the Ask remains queued in muxad history",
                     entry.id
                 );
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                if let Some(stream) = updates.as_mut() {
+                    let refresh =
+                        deadline.min(tokio::time::Instant::now() + Duration::from_secs(30));
+                    if matches!(
+                        tokio::time::timeout_at(refresh, stream.recv()).await,
+                        Ok(Ok(None) | Err(_))
+                    ) {
+                        updates = None;
+                    }
+                } else {
+                    tokio::time::sleep(
+                        Duration::from_secs(1)
+                            .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    )
+                    .await;
+                }
             }
             muxa::ask::AskStatus::Answered => {
                 if json {

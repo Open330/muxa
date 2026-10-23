@@ -227,6 +227,19 @@ TOML or update the daemon if it is unavailable.
 
 ## Ask
 
+Codex and Claude turns publish user-facing messages while they run. Watch and
+the macOS app show these as provisional output; only process exit and the final
+provider result settle the turn. Tool payloads and reasoning are excluded.
+The CLI waits on change notifications (with polling for older/remote daemons),
+prints progress only to an interactive stderr, and keeps stdout/`--json` final-only.
+Progress is bounded and coalesced, without a disk write per message. Other
+providers retain their final-response behavior.
+
+New CLI conversations receive a short preparation guide: read relevant project
+instructions and requested skills once, discover tools narrowly, and bound tool
+output. This preserves the provider's configured tools and permissions. Set
+`cwd` to the usual project when appropriate to avoid searching from `$HOME`.
+
 ```toml
 [ask]
 enabled = true
