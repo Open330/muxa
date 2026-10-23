@@ -349,3 +349,31 @@ retention, authority and compatibility contracts.
 
 See [Fleet Work dispatch](FLEET_ORCHESTRATION.md) for coordinator routing,
 selector-based placement, configurable workspace paths, and durable dispatch.
+
+## Preview and synchronize automation settings
+
+```sh
+muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --diff
+muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --apply
+```
+
+`local` and `localhost` mean the controller's daemon. The default is a preview;
+`--diff` makes that intent explicit. Only automation is supported initially
+(`--section automation`). Rules are merged by name, source names replace matching
+rules, and target-only rules remain. The source engine's enabled switch is copied;
+each target's pause stays local. Execution history, firing counters, Fleet SSH
+settings, credentials, and other config sections are never synchronized. The diff
+shows only changed rules and the engine switch, without unrelated configuration.
+
+All targets must be registered and enabled. Preview reads work in observe mode;
+apply requires control mode. Changed remote targets need a CLI version with
+`fleet sync` support; reads use the existing `config show --json` endpoint. SSH
+uses the configured binary and optional daemon socket, trusted host keys, and
+noninteractive authentication. No SSH configuration is created automatically.
+
+Apply reads and validates all targets first, then writes each independently. It
+backs up the previous config with private permissions, rejects a concurrent edit,
+and verifies daemon restart before reporting success. If a later host fails,
+already-applied hosts stay applied; inspect the error and preview again. An SSH
+timeout during apply has an uncertain outcome, so inspect that target before
+retrying. Running sync again with identical settings makes no writes or restarts.
