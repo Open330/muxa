@@ -2746,15 +2746,20 @@ async fn collaboration_participants(
     backends: &[SharedBackend],
     collaboration: &CollaborationStore,
     origin_session: Option<&str>,
+    scanned: Option<Vec<PaneInfo>>,
 ) -> CollaborationTopology {
     let mut agents = store.snapshot().await;
     let listed = backends.to_vec();
     let discovery_agents = agents.clone();
     let (panes, mut participants) = tokio::task::spawn_blocking(move || {
-        let panes = listed
-            .iter()
-            .flat_map(|backend| backend.list_panes())
-            .collect::<Vec<_>>();
+        // Reuse the inventory this request already took for caller
+        // provenance; only a request that observed nothing scans here.
+        let panes = scanned.unwrap_or_else(|| {
+            listed
+                .iter()
+                .flat_map(|backend| backend.list_panes())
+                .collect::<Vec<_>>()
+        });
         let participants = collaboration::participants_from(&discovery_agents, &panes);
         (panes, participants)
     })
@@ -2822,6 +2827,10 @@ struct CollaborationConnectionActor {
     observed_pane: Option<String>,
     pane_evidence: Option<CollaborationPaneEvidence>,
     pane_observed: bool,
+    /// The pane inventory the current request took while observing the
+    /// caller, handed to participant discovery so one request scans once.
+    /// Cleared before every request; never reused across requests.
+    request_panes: Option<Vec<PaneInfo>>,
 }
 
 impl CollaborationConnectionActor {
@@ -2834,15 +2843,24 @@ impl CollaborationConnectionActor {
             return;
         };
         let pane_backends = backends.to_vec();
-        let observed =
-            tokio::task::spawn_blocking(move || observed_process_pane(pid, &pane_backends))
-                .await
-                .ok()
-                .flatten();
+        let Ok((observed, panes)) = tokio::task::spawn_blocking(move || {
+            let scan = RequestPaneScan::take(&pane_backends);
+            let observed = observed_process_pane(pid, &pane_backends, &scan);
+            (observed, scan.into_panes())
+        })
+        .await
+        else {
+            return;
+        };
+        self.request_panes = Some(panes);
         if let Some((pane, evidence)) = observed {
             self.observed_pane = Some(pane);
             self.pane_evidence = Some(evidence);
         }
+    }
+
+    fn take_request_panes(&mut self) -> Option<Vec<PaneInfo>> {
+        self.request_panes.take()
     }
 
     fn provenance(&self, origin: &CollaborationOrigin) -> CollaborationProvenance {
@@ -2881,25 +2899,100 @@ fn observe_collaboration_actor(stream: &Stream) -> CollaborationConnectionActor 
         observed_pane: None,
         pane_evidence: None,
         pane_observed: false,
+        request_panes: None,
+    }
+}
+
+/// One request's pane inventory, per backend in `backends` order. Taken
+/// fresh for every request that observes its caller; it is the same
+/// inventory participant discovery would otherwise list again.
+struct RequestPaneScan {
+    per_backend: Vec<Vec<PaneInfo>>,
+}
+
+impl RequestPaneScan {
+    fn take(backends: &[SharedBackend]) -> Self {
+        Self {
+            per_backend: backends
+                .iter()
+                .map(|backend| backend.list_panes())
+                .collect(),
+        }
+    }
+
+    fn into_panes(self) -> Vec<PaneInfo> {
+        self.per_backend.into_iter().flatten().collect()
+    }
+
+    /// [`PaneBackend::resolve_pane`] answered from the scan for hosts whose
+    /// resolver is itself a lookup in that inventory (tmux exact id, rmux
+    /// namespaced id). Other hosts keep their native resolver.
+    fn resolves(&self, backends: &[SharedBackend], pane: &str) -> bool {
+        backends
+            .iter()
+            .zip(&self.per_backend)
+            .any(|(backend, panes)| match backend.kind() {
+                HostKind::Tmux => panes.iter().any(|listed| listed.pane_id == pane),
+                HostKind::Rmux => {
+                    let namespaced = if pane.starts_with(crate::backend::rmux::PANE_ID_PREFIX) {
+                        pane.to_string()
+                    } else {
+                        format!("{}{pane}", crate::backend::rmux::PANE_ID_PREFIX)
+                    };
+                    panes.iter().any(|listed| listed.pane_id == namespaced)
+                }
+                HostKind::Cmux | HostKind::Zellij | HostKind::Herdr => {
+                    backend.resolve_pane(pane).is_some()
+                }
+            })
+    }
+
+    /// [`PaneBackend::pane_pid_map`] derived from the scan for hosts whose map
+    /// is their pane inventory keyed by shell pid; cmux keeps its own (empty)
+    /// map because its single-surface listing is not pid evidence.
+    fn pid_map(&self, backends: &[SharedBackend]) -> std::collections::HashMap<u32, String> {
+        backends
+            .iter()
+            .zip(&self.per_backend)
+            .flat_map(|(backend, panes)| match backend.kind() {
+                HostKind::Cmux => backend.pane_pid_map().into_iter().collect::<Vec<_>>(),
+                HostKind::Tmux | HostKind::Rmux | HostKind::Zellij | HostKind::Herdr => panes
+                    .iter()
+                    .filter(|pane| pane.pane_pid != 0)
+                    .map(|pane| (pane.pane_pid, pane.pane_id.clone()))
+                    .collect(),
+            })
+            .collect()
     }
 }
 
 fn observed_process_pane(
     pid: u32,
     backends: &[SharedBackend],
+    scan: &RequestPaneScan,
 ) -> Option<(String, CollaborationPaneEvidence)> {
-    if let Some(pane) = process_environment_pane(pid) {
-        if backends
-            .iter()
-            .any(|backend| backend.resolve_pane(&pane).is_some())
-        {
+    observed_pane_in_scan(
+        process_environment_pane(pid),
+        pid,
+        backends,
+        scan,
+        crate::adapters::proc_ancestry::parent_pid,
+    )
+}
+
+fn observed_pane_in_scan(
+    environment_pane: Option<String>,
+    pid: u32,
+    backends: &[SharedBackend],
+    scan: &RequestPaneScan,
+    parent_pid: impl Fn(u32) -> Option<u32>,
+) -> Option<(String, CollaborationPaneEvidence)> {
+    if let Some(pane) = environment_pane {
+        if scan.resolves(backends, &pane) {
             return Some((pane, CollaborationPaneEvidence::ProcessEnvironment));
         }
     }
-    let pane_pids = backends
-        .iter()
-        .flat_map(|backend| backend.pane_pid_map())
-        .collect::<std::collections::HashMap<_, _>>();
+    let pane_pids = scan.pid_map(backends);
     if pane_pids.is_empty() {
         return None;
     }
@@ -2910,11 +3003,7 @@ fn observed_process_pane(
         .keys()
         .copied()
         .collect::<std::collections::HashSet<_>>();
-    let pane_pid = crate::adapters::proc_ancestry::ancestor_in_set(
-        pid,
-        &candidates,
-        crate::adapters::proc_ancestry::parent_pid,
-    )?;
+    let pane_pid = crate::adapters::proc_ancestry::ancestor_in_set(pid, &candidates, parent_pid)?;
     pane_pids
         .get(&pane_pid)
         .cloned()
@@ -3158,6 +3247,7 @@ async fn handle(
 
     loop {
         line.clear();
+        collaboration_actor.request_panes = None;
         // Bound the wait for the *next* request line. A client that connects
         // and then neither sends a complete request nor closes its half would
         // otherwise park this handler — and pin its fd — forever. A live
@@ -3922,6 +4012,7 @@ async fn handle(
                             &backends,
                             &collaboration,
                             origin.agent_session_id.as_deref(),
+                            collaboration_actor.take_request_panes(),
                         )
                         .await;
                         match topology.resolve_origin(&origin) {
@@ -3955,8 +4046,14 @@ async fn handle(
                     request,
                 } => {
                     kind = "collaboration_issue_handle";
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration, None).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
                     match topology.room_of(&pane, socket.as_deref()) {
                         Some(room) => match collaboration
                             .issue_handle(&room, &pane, &topology.participants, request)
@@ -3987,6 +4084,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4354,6 +4452,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let result = topology.resolve_origin(&origin).and_then(|sender| {
@@ -4406,6 +4505,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4438,6 +4538,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     match topology.resolve_origin(&origin) {
@@ -4454,8 +4555,14 @@ async fn handle(
                 } => {
                     kind = "collaboration_promote_purpose";
                     collaboration_actor.observe_pane(&backends).await;
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration, None).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
                     let origin = CollaborationOrigin {
                         pane: collaboration_actor
                             .observed_pane
@@ -4494,8 +4601,14 @@ async fn handle(
                     launch_id,
                 } => {
                     kind = "collaboration_worker_launch";
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration, None).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
                     let candidates: Vec<_> = topology
                         .panes
                         .iter()
@@ -4517,6 +4630,7 @@ async fn handle(
                                         &backends,
                                         &collaboration,
                                         None,
+                                        collaboration_actor.take_request_panes(),
                                     )
                                     .await;
                                     Response::ok()
@@ -4550,8 +4664,14 @@ async fn handle(
                 }
                 RequestBody::CollaborationOverview { origin } => {
                     kind = "collaboration_overview";
-                    let topology =
-                        collaboration_participants(&store, &backends, &collaboration, None).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
                     match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration
                             .overview_for(&current, &topology.participants)
@@ -4588,6 +4708,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4627,6 +4748,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4670,6 +4792,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4711,6 +4834,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4742,6 +4866,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4777,6 +4902,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4832,6 +4958,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -4868,6 +4995,7 @@ async fn handle(
                         &backends,
                         &collaboration,
                         origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
@@ -7576,6 +7704,248 @@ mod tests {
         }
     }
 
+    /// Counts every inventory/resolve/pid-map call so tests can prove how
+    /// many scans one collaboration request performs.
+    struct CountingPaneBackend {
+        kind: HostKind,
+        panes: Vec<PaneInfo>,
+        native_pid_map: HashMap<u32, String>,
+        lists: std::sync::atomic::AtomicUsize,
+        resolves: std::sync::atomic::AtomicUsize,
+        pid_maps: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CountingPaneBackend {
+        fn new(kind: HostKind, panes: Vec<PaneInfo>) -> Arc<Self> {
+            Arc::new(Self {
+                kind,
+                panes,
+                native_pid_map: HashMap::new(),
+                lists: 0.into(),
+                resolves: 0.into(),
+                pid_maps: 0.into(),
+            })
+        }
+
+        fn counts(&self) -> (usize, usize, usize) {
+            use std::sync::atomic::Ordering::SeqCst;
+            (
+                self.lists.load(SeqCst),
+                self.resolves.load(SeqCst),
+                self.pid_maps.load(SeqCst),
+            )
+        }
+    }
+
+    impl PaneBackend for CountingPaneBackend {
+        fn kind(&self) -> HostKind {
+            self.kind
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.panes.clone()
+        }
+
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.resolves
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            self.pid_maps
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.native_pid_map.clone()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
+
+    fn pid_pane(pane_id: &str, shell_pid: u32) -> PaneInfo {
+        PaneInfo {
+            pane_pid: shell_pid,
+            ..collaboration_test_pane(pane_id, "0")
+        }
+    }
+
+    fn scan_of(backends: &[SharedBackend]) -> RequestPaneScan {
+        RequestPaneScan::take(backends)
+    }
+
+    #[tokio::test]
+    async fn collaboration_context_and_list_scan_panes_once_per_request() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("single-scan.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "caller", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "peer", AgentKind::ClaudeCode).await;
+        let counting = CountingPaneBackend::new(
+            HostKind::Tmux,
+            vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        );
+        let backend: SharedBackend = counting.clone();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(CollaborationStore::in_memory(
+                CollaborationOptions::default(),
+            ));
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+
+        let context = client.collaboration_context(&origin).await.unwrap();
+        assert!(!context.peers.is_empty());
+        let (lists, resolves, pid_maps) = counting.counts();
+        assert_eq!(
+            lists, 1,
+            "context: provenance and participants share one scan"
+        );
+        assert_eq!(
+            (resolves, pid_maps),
+            (0, 0),
+            "tmux evidence comes from the scan"
+        );
+
+        client
+            .collaboration_list(&origin, RequestMailbox::Incoming)
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.counts().0,
+            2,
+            "list: one fresh scan for its own request"
+        );
+
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[test]
+    fn scanned_caller_evidence_matches_native_resolution_and_rejects_stale_panes() {
+        let tmux: SharedBackend =
+            CountingPaneBackend::new(HostKind::Tmux, vec![pid_pane("%3", 300)]);
+        let backends = vec![tmux];
+        let scan = scan_of(&backends);
+        let no_parent = |_| None;
+
+        assert_eq!(
+            observed_pane_in_scan(Some("%3".into()), 1, &backends, &scan, no_parent),
+            Some(("%3".into(), CollaborationPaneEvidence::ProcessEnvironment))
+        );
+        // A stale TMUX_PANE that no longer exists is not evidence, and an
+        // unrelated process gains no pane.
+        assert_eq!(
+            observed_pane_in_scan(Some("%9".into()), 1, &backends, &scan, no_parent),
+            None
+        );
+        // A stale environment falls through to the live pid inventory, which
+        // names the pane the caller actually descends from now.
+        let parent = |pid| (pid == 7).then_some(300);
+        assert_eq!(
+            observed_pane_in_scan(Some("%9".into()), 7, &backends, &scan, parent),
+            Some(("%3".into(), CollaborationPaneEvidence::ProcessAncestry))
+        );
+        assert_eq!(
+            observed_pane_in_scan(None, 300, &backends, &scan, no_parent),
+            Some(("%3".into(), CollaborationPaneEvidence::ProcessAncestry))
+        );
+    }
+
+    #[test]
+    fn scanned_evidence_keeps_backend_specific_resolution() {
+        // rmux lists namespaced ids; a bare TMUX_PANE resolves through them.
+        let rmux: SharedBackend =
+            CountingPaneBackend::new(HostKind::Rmux, vec![pid_pane("rmux:%5", 0)]);
+        let rmux_backends = vec![rmux];
+        let scan = scan_of(&rmux_backends);
+        assert_eq!(
+            observed_pane_in_scan(Some("%5".into()), 1, &rmux_backends, &scan, |_| None),
+            Some(("%5".into(), CollaborationPaneEvidence::ProcessEnvironment))
+        );
+        // tmux ids are exact: the same bare id does not match a namespaced one.
+        let tmux: SharedBackend =
+            CountingPaneBackend::new(HostKind::Tmux, vec![pid_pane("rmux:%5", 0)]);
+        let tmux_backends = vec![tmux];
+        let scan = scan_of(&tmux_backends);
+        assert_eq!(
+            observed_pane_in_scan(Some("%5".into()), 1, &tmux_backends, &scan, |_| None),
+            None
+        );
+
+        // cmux keeps its native resolver and its own (empty) pid map: a listed
+        // surface with a pid is not ancestry evidence.
+        let cmux = CountingPaneBackend::new(HostKind::Cmux, vec![pid_pane("cmux:s1", 400)]);
+        let cmux_backends: Vec<SharedBackend> = vec![cmux.clone()];
+        let scan = scan_of(&cmux_backends);
+        assert_eq!(
+            observed_pane_in_scan(Some("cmux:s1".into()), 400, &cmux_backends, &scan, |_| None),
+            Some((
+                "cmux:s1".into(),
+                CollaborationPaneEvidence::ProcessEnvironment
+            ))
+        );
+        assert_eq!(
+            observed_pane_in_scan(None, 400, &cmux_backends, &scan, |_| None),
+            None
+        );
+        assert_eq!(
+            cmux.counts(),
+            (1, 1, 1),
+            "one scan; native resolve and pid map"
+        );
+    }
+
+    #[tokio::test]
+    async fn observed_scan_is_handed_off_once() {
+        let backend: SharedBackend =
+            CountingPaneBackend::new(HostKind::Tmux, vec![pid_pane("%3", 300)]);
+        let mut actor = CollaborationConnectionActor {
+            client_kind: CollaborationClientKind::Cli,
+            caller_pid: Some(std::process::id()),
+            caller_uid: None,
+            caller_gid: None,
+            executable: None,
+            observed_pane: None,
+            pane_evidence: None,
+            pane_observed: false,
+            request_panes: None,
+        };
+        actor.observe_pane(std::slice::from_ref(&backend)).await;
+        assert_eq!(actor.take_request_panes().map(|panes| panes.len()), Some(1));
+        assert!(actor.take_request_panes().is_none());
+        // A connection observes its caller once; later requests scan afresh.
+        actor.observe_pane(&[backend]).await;
+        assert!(actor.take_request_panes().is_none());
+    }
+
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
@@ -7725,6 +8095,7 @@ mod tests {
             observed_pane: Some("%9".into()),
             pane_evidence: Some(CollaborationPaneEvidence::ProcessEnvironment),
             pane_observed: true,
+            request_panes: None,
         };
         let provenance = actor.provenance(&CollaborationOrigin {
             pane: "%1".into(),

@@ -17,7 +17,7 @@ pub struct McpReloadArgs {
     /// Codex profile to refresh. Defaults to explicit `CODEX_HOME`; otherwise pass this flag.
     #[arg(long, conflicts_with = "all")]
     codex_home: Option<PathBuf>,
-    /// Refresh every discovered stale shared Codex profile; report other owners needing manual reconnect.
+    /// Discover stale owners, refresh shared Codex profiles, and explain standalone clients needing reconnect.
     #[arg(long)]
     all: bool,
     /// Print the selected scope without sending a reload request.
@@ -122,7 +122,9 @@ fn plan(args: &McpReloadArgs, stale: &crate::stale_agents::StaleReport) -> Resul
             }
         }
         for owner in stale.panes.keys() {
-            manual.push(format!("{owner}: reconnect MCP in its agent client"));
+            manual.push(if stale.standalone_codex.contains(owner) {
+                format!("{owner}: standalone Codex CLI, not an app-server connection; reconnect MCP in that client, or restart/resume it when idle")
+            } else { format!("{owner}: reconnect MCP in its agent client") });
         }
         if stale.other > 0 {
             manual.push(format!(
@@ -245,18 +247,26 @@ pub async fn run(args: McpReloadArgs) -> Result<()> {
         }
     }
     if !args.dry_run {
-        let failed = report
-            .hosts
-            .iter()
-            .filter(|host| !matches!(host.state, "queued" | "reloaded"))
-            .count();
-        if failed > 0 || !report.manual_reconnect.is_empty() {
-            bail!("{failed} host request(s) were not acknowledged; {} owner(s) need manual reconnect; inspect the per-profile result", report.manual_reconnect.len());
-        }
+        require_acknowledged(&report)?;
     }
     if !args.dry_run && pending_refresh(&report) {
         // A queued API acknowledgement does not mean old tool connections were replaced.
         std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn require_acknowledged(report: &Report) -> Result<()> {
+    let failed = report
+        .hosts
+        .iter()
+        .filter(|host| !matches!(host.state, "queued" | "reloaded"))
+        .count();
+    if failed > 0 {
+        bail!("{failed} host request(s) were not acknowledged; {} owner(s) need manual reconnect; inspect the per-profile result", report.manual_reconnect.len());
+    }
+    if !report.manual_reconnect.is_empty() {
+        bail!("{} MCP owner(s) are outside the app-server reload API; see manual_reconnect for the owning client and recovery", report.manual_reconnect.len());
     }
     Ok(())
 }
@@ -603,6 +613,8 @@ mod tests {
             .insert((2, Some("/profiles/a".into())), 2);
         stale.shared_codex.insert((3, None), 1);
         stale.panes.insert("claude@%9".into(), 1);
+        stale.panes.insert("codex@%10".into(), 1);
+        stale.standalone_codex.insert("codex@%10".into());
         let single = plan(&args(), &stale).unwrap();
         assert_eq!(
             single.hosts[0].codex_home,
@@ -620,7 +632,10 @@ mod tests {
         .unwrap();
         assert_eq!(all.hosts.len(), 1);
         assert_eq!(all.hosts[0].codex_home, PathBuf::from("/profiles/a"));
-        assert_eq!(all.manual_reconnect.len(), 2);
+        assert_eq!(all.manual_reconnect.len(), 3);
+        assert!(all.manual_reconnect.iter().any(|message| message
+            .contains("standalone Codex CLI")
+            && message.contains("when idle")));
         assert!(all.scope.contains("registered Muxa connections"));
     }
 

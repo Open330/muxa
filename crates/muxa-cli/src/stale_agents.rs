@@ -10,7 +10,7 @@
 //! This scan lists those processes by who owns them, so `muxa upgrade` and
 //! `muxa doctor` can identify the owner that must refresh MCP.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -35,6 +35,8 @@ pub struct StaleReport {
     pub shared_codex: BTreeMap<(u32, Option<String>), usize>,
     /// Pane-hosted agents: pane label → number of stale servers.
     pub panes: BTreeMap<String, usize>,
+    /// Pane owners known to be standalone Codex CLI, not a shared app-server.
+    pub standalone_codex: BTreeSet<String>,
     /// Stale servers whose owner could not be placed.
     pub other: usize,
 }
@@ -97,6 +99,9 @@ impl StaleReport {
                  that launched it and reconnect MCP there.",
                 self.other
             );
+        }
+        if !self.standalone_codex.is_empty() {
+            out.push_str("\nStandalone Codex CLI owners are not controlled by the shared app-server reload API. Reconnect in that client, or restart and resume it when idle.");
         }
         out.push_str("\nNever kill a `muxa mcp` to refresh it: the agent will not respawn it.");
         Some(out)
@@ -167,12 +172,16 @@ fn classify(
         }
         let mut cur = proc.parent_pid;
         let mut placed = false;
+        let mut standalone_codex = false;
         for _ in 0..32 {
             if let Some(pane) = pane_of_pid.get(&cur) {
                 let label = format!(
                     "{} ({}:{}.{})",
                     pane.pane_id, pane.session, pane.window_index, pane.pane_index
                 );
+                if standalone_codex {
+                    report.standalone_codex.insert(label.clone());
+                }
                 *report.panes.entry(label).or_default() += 1;
                 placed = true;
                 break;
@@ -188,6 +197,8 @@ fn classify(
                 placed = true;
                 break;
             }
+            standalone_codex |=
+                matches!(codex_subcommand(&parent.args), Some("" | "resume" | "exec"));
             if parent.parent_pid <= 1 || parent.parent_pid == cur {
                 break;
             }
@@ -383,5 +394,31 @@ mod tests {
         assert!(text.contains("reconnect MCP in each agent client"));
         assert!(!text.contains("every pane at once"));
         assert!(StaleReport::default().guidance().is_none());
+    }
+
+    #[test]
+    fn standalone_codex_is_not_mistaken_for_its_profiles_shared_server() {
+        let procs = [
+            proc(200, 1, 9000, "zsh"),
+            proc(201, 200, 9000, "/bin/codex resume session"),
+            proc(202, 201, 9000, "muxa mcp"),
+            proc(300, 1, 9000, "/bin/codex app-server --managed-daemon"),
+            proc(301, 300, 9000, "muxa mcp"),
+        ];
+        let report = classify(
+            &procs,
+            Duration::from_secs(60),
+            &[pane("rmux:%439", 200)],
+            |_| Some("/profiles/shared".into()),
+        );
+        assert_eq!(
+            report
+                .shared_codex
+                .get(&(300, Some("/profiles/shared".into()))),
+            Some(&1)
+        );
+        assert!(report.standalone_codex.contains("rmux:%439 (callabo:4.1)"));
+        assert_eq!(report.total(), 2);
+        assert!(report.guidance().unwrap().contains("when idle"));
     }
 }

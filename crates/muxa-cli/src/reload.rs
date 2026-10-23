@@ -149,7 +149,7 @@ pub struct ReloadArgs {
 
 #[derive(Debug, clap::Subcommand)]
 enum ReloadTarget {
-    /// Refresh existing Codex MCP connections; does not restart the app-server or panes
+    /// Refresh shared Codex app-server MCP connections; standalone clients need their own reconnect
     Mcp(crate::mcp_reload::McpReloadArgs),
     /// Snapshot, restart the multiplexer, and restore the workspace (same as bare reload)
     Mux(MultiplexerReloadArgs),

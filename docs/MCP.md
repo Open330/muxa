@@ -25,8 +25,13 @@ muxa init --component agent-instructions,agent-skills,agent-mcp
 This installs canonical guidance beside muxa config, links the personal skill,
 and merges each detected host's user MCP registration, including Codex `env_vars`.
 See [Global agent integration](AGENT_INTEGRATION.md) for updates and removal.
-Use `muxa reload mcp` for Codex MCP connections; the host queues the refresh.
-Other clients and global instructions may require an agent restart. The manual setup below remains available.
+Use `muxa reload mcp` for Codex shared app-server MCP connections; the host
+queues the refresh. `--all` discovers stale owners and distinguishes standalone
+Codex CLI processes from the shared app-server. A standalone `codex resume`
+does not belong to that app-server's loaded connections, even when both use the
+same profile. Reconnect in the owning client, or restart/resume it when idle.
+The reload command leaves its running work and stdio MCP child intact.
+Other clients and global instructions may also require an agent restart. The manual setup below remains available.
 
 Start the daemon (`muxad`) first — the MCP server **refuses to start** when
 the socket is unreachable, with a clear error, so an agent never talks to a

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Collaboration requests reuse their fresh pane observation for caller evidence
+  and participant discovery, avoiding a second inventory scan without adding a
+  cross-request authorization cache.
 - Ask waits fetch only their turn, and watch scopes history refreshes to the
   selected conversation. Optional wire filters retain older-client behavior.
 - Codex polling shares one parsed tail and reuses settled, unchanged files;
@@ -40,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `reload mcp --all` explains standalone Codex CLI owners that are outside the
+  shared app-server API instead of only giving a generic manual-reconnect hint.
 - Bounded Ask progress no longer reprints the retained 32 KiB tail when it rolls.
   Watch subscribes to Ask changes independently of agent hook activity.
 
