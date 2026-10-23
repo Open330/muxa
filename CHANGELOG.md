@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Fleet automation sync creates missing configuration directories, recovers
+  incomplete reloads on retry, and serializes concurrent applies. Config
+  documents report absolute paths so backups stay beside the daemon's file.
+
 ### Added
 
 - `muxa fleet sync --from HOST --to HOSTS` previews automation rule changes

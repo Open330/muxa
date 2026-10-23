@@ -197,6 +197,65 @@ fn diff(before: &str, after: &str) -> Result<String> {
     Ok(sanitize_terminal_text(&lines))
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Pending {
+    before: String,
+    after: String,
+    backup: std::path::PathBuf,
+}
+
+fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
+    path.with_extension("toml.fleet-sync-pending.json")
+}
+
+fn private_options() -> std::fs::OpenOptions {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options
+}
+
+fn write_pending(path: &std::path::Path, pending: &Pending) -> Result<()> {
+    if path.exists() {
+        bail!(
+            "an unfinished sync journal already exists: {}",
+            path.display()
+        );
+    }
+    let temp = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+    let result = (|| -> Result<()> {
+        let mut file = private_options().create_new(true).open(&temp)?;
+        file.write_all(&serde_json::to_vec(pending)?)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn ensure_parent(path: &std::path::Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!("daemon returned a relative config path; upgrade muxad or start it with an absolute --config path");
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    Ok(())
+}
+
 async fn persist(
     client: &Client,
     transfer: &Transfer,
@@ -212,40 +271,117 @@ async fn persist(
     let backup = current
         .path
         .with_extension(format!("toml.fleet-sync-{}.bak", uuid::Uuid::new_v4()));
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    let mut file = options.open(&backup)?;
+    ensure_parent(&current.path)?;
+    let mut file = private_options().create_new(true).open(&backup)?;
     file.write_all(current.text.as_bytes())?;
     file.sync_all()?;
+    let pending = Pending {
+        before: current.text.clone(),
+        after: next.clone(),
+        backup: backup.clone(),
+    };
+    write_pending(&pending_path(&current.path), &pending)?;
+    // Keep the journal on IPC failure: the write may have landed despite a
+    // lost response. A retry resolves it under the same per-config file lock.
     client.config_write(&next, Some(&current.text)).await?;
     Ok(Some((backup, next)))
 }
 
 async fn apply(client: &Client, transfer: &Transfer) -> Result<String> {
-    let Some((backup, next)) = persist(client, transfer).await? else {
-        return Ok("unchanged".into());
-    };
-    // Reuse lifecycle's generation check; acceptance alone is not success.
-    crate::daemon::run(
-        crate::daemon::Action::Restart,
-        client,
-        client.socket(),
-        None,
-    )
+    apply_with_reload(client, transfer, || async {
+        crate::daemon::run(
+            crate::daemon::Action::Restart,
+            client,
+            client.socket(),
+            None,
+        )
+        .await
+    })
     .await
-    .context("config saved and backed up, but daemon restart failed")?;
-    let confirmed = client.config_read().await?;
-    if confirmed.text != next {
+}
+
+async fn finish_pending<F, Fut>(
+    client: &Client,
+    path: &std::path::Path,
+    pending: &Pending,
+    reload: &F,
+) -> Result<()>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    reload().await.with_context(|| {
+        format!(
+            "config saved but reload incomplete; retry --apply; backup {}",
+            pending.backup.display()
+        )
+    })?;
+    if client.config_read().await?.text != pending.after {
         bail!(
             "config changed during reload; inspect target and backup {}",
-            backup.display()
+            pending.backup.display()
         );
     }
+    std::fs::remove_file(pending_path(path))?;
+    Ok(())
+}
+
+async fn apply_with_reload<F, Fut>(
+    client: &Client,
+    transfer: &Transfer,
+    reload: F,
+) -> Result<String>
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let initial = client.config_read().await?;
+    if merge(&initial.text, &transfer.automation)? == initial.text
+        && !pending_path(&initial.path).exists()
+    {
+        return Ok("unchanged".into());
+    }
+    ensure_parent(&initial.path)?;
+    let lock = private_options()
+        .read(true)
+        .create(true)
+        .truncate(false)
+        .open(initial.path.with_extension("toml.fleet-sync.lock"))?;
+    lock.try_lock()
+        .context("another Fleet sync is applying this config")?;
+    let current = client.config_read().await?;
+    let journal = pending_path(&current.path);
+    let mut recovered = false;
+    if journal.exists() {
+        let pending: Pending = serde_json::from_slice(&std::fs::read(&journal)?)?;
+        if current.text == pending.after {
+            finish_pending(client, &current.path, &pending, &reload).await?;
+            recovered = true;
+        } else if current.text == pending.before {
+            // Previous process stopped before the conditional write landed.
+            std::fs::remove_file(&journal)?;
+        } else {
+            bail!(
+                "unfinished sync conflicts with a later config edit; inspect {} and backup {}",
+                journal.display(),
+                pending.backup.display()
+            );
+        }
+    }
+    let Some((backup, next)) = persist(client, transfer).await? else {
+        return Ok(if recovered {
+            "recovered unfinished reload"
+        } else {
+            "unchanged"
+        }
+        .into());
+    };
+    let pending = Pending {
+        before: current.text,
+        after: next,
+        backup: backup.clone(),
+    };
+    finish_pending(client, &current.path, &pending, &reload).await?;
     Ok(format!("applied; backup {}", backup.display()))
 }
 
@@ -282,6 +418,9 @@ pub(crate) async fn run(args: Args, client: &Client, cfg: &Config) -> Result<()>
         let current = read(target, client, cfg)
             .await
             .with_context(|| format!("reading {target}"))?;
+        if args.apply && !current.path.is_absolute() {
+            bail!("{target}: daemon returned a relative config path; upgrade muxad or start it with an absolute --config path");
+        }
         let next = merge(&current.text, &config.automation)?;
         println!("--- {target}/automation\n+++ {}/automation", args.source);
         if next == current.text {
@@ -296,8 +435,15 @@ pub(crate) async fn run(args: Args, client: &Client, cfg: &Config) -> Result<()>
         return Ok(());
     }
     // Fail before mutating any host when an old remote CLI cannot apply.
-    for (target, current, next) in &plans {
-        if current.text != *next && !local(target) {
+    for (target, current, _next) in &plans {
+        let transfer = Transfer {
+            expected_text: current.text.clone(),
+            automation: config.automation.clone(),
+        };
+        if serde_json::to_vec(&transfer)?.len() > LIMIT {
+            bail!("{target}: sync payload exceeds limit; no hosts have been applied");
+        }
+        if !local(target) {
             remote(
                 host(cfg, target, true)?,
                 &["fleet", "sync-receive", "--help"],
@@ -307,10 +453,7 @@ pub(crate) async fn run(args: Args, client: &Client, cfg: &Config) -> Result<()>
             .with_context(|| format!("{target} needs a CLI with Fleet sync support"))?;
         }
     }
-    for (target, current, next) in plans {
-        if current.text == next {
-            continue;
-        }
+    for (target, current, _next) in plans {
         let transfer = Transfer {
             expected_text: current.text,
             automation: config.automation.clone(),
@@ -406,6 +549,37 @@ mod persistence_tests {
         task.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn first_sync_creates_a_missing_config_directory_and_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("fresh-sync.sock");
+        let path = dir.path().join("not-created-yet/muxa/config.toml");
+        let server = muxa::ipc::Server::new(socket.clone(), muxa::Store::shared())
+            .with_config_path(Some(path.clone()));
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        let client = Client::new(socket);
+        for _ in 0..100 {
+            if client.config_read().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let transfer = Transfer {
+            expected_text: String::new(),
+            automation: AutomationConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let result = persist(&client, &transfer).await;
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+        let (backup, next) = result.unwrap().unwrap();
+        assert_eq!(std::fs::read_to_string(backup).unwrap(), "");
+        assert_eq!(std::fs::read_to_string(path).unwrap(), next);
+    }
+
     #[test]
     fn observe_targets_are_readable_but_cannot_be_written() {
         let mut config = Config::default();
@@ -423,5 +597,97 @@ mod persistence_tests {
         assert!(host(&config, "missing", false).is_err());
         config.fleet.hosts.get_mut("dev").unwrap().enabled = false;
         assert!(host(&config, "dev", false).is_err());
+    }
+}
+
+#[cfg(test)]
+mod reload_recovery_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn retry_recovers_a_failed_reload_even_when_config_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let socket = dir.path().join("recovery.sock");
+        let before = "[automation]\nenabled = true\n";
+        std::fs::write(&path, before).unwrap();
+        let server = muxa::ipc::Server::new(socket.clone(), muxa::Store::shared())
+            .with_config_path(Some(path.clone()));
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        let client = Client::new(socket);
+        for _ in 0..100 {
+            if client.config_read().await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let mut transfer = Transfer {
+            expected_text: before.into(),
+            automation: AutomationConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        };
+        let failed = apply_with_reload(&client, &transfer, || async {
+            bail!("fixture reload failed")
+        })
+        .await;
+        assert!(failed
+            .unwrap_err()
+            .to_string()
+            .contains("reload incomplete"));
+        assert!(pending_path(&path).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(pending_path(&path))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        transfer.expected_text = std::fs::read_to_string(&path).unwrap();
+        let calls = std::cell::Cell::new(0);
+        let result = apply_with_reload(&client, &transfer, || async {
+            calls.set(calls.get() + 1);
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "recovered unfinished reload");
+        assert_eq!(calls.get(), 1);
+        assert!(!pending_path(&path).exists());
+        let count = std::fs::read_dir(dir.path()).unwrap().count();
+        assert_eq!(
+            apply_with_reload(&client, &transfer, || async {
+                panic!("unchanged config must not reload")
+            })
+            .await
+            .unwrap(),
+            "unchanged"
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), count);
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn apply_lock_excludes_another_process_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sync.lock");
+        let first = private_options()
+            .read(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        let second = private_options().read(true).open(&path).unwrap();
+        first.try_lock().unwrap();
+        assert!(second.try_lock().is_err());
+        drop(first);
+        second.try_lock().unwrap();
     }
 }

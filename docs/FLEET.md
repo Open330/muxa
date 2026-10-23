@@ -366,7 +366,7 @@ settings, credentials, and other config sections are never synchronized. The dif
 shows only changed rules and the engine switch, without unrelated configuration.
 
 All targets must be registered and enabled. Preview reads work in observe mode;
-apply requires control mode. Changed remote targets need a CLI version with
+apply requires control mode. All remote targets of `--apply` need a CLI version with
 `fleet sync` support; reads use the existing `config show --json` endpoint. SSH
 uses the configured binary and optional daemon socket, trusted host keys, and
 noninteractive authentication. No SSH configuration is created automatically.
@@ -376,4 +376,11 @@ backs up the previous config with private permissions, rejects a concurrent edit
 and verifies daemon restart before reporting success. If a later host fails,
 already-applied hosts stay applied; inspect the error and preview again. An SSH
 timeout during apply has an uncertain outcome, so inspect that target before
-retrying. Running sync again with identical settings makes no writes or restarts.
+retrying. Running sync again with identical settings makes no writes or restarts unless
+a previous sync saved its config but did not finish reloading. That incomplete
+reload is recorded privately beside the config and recovered by the next
+`--apply`, even when the file already matches. Concurrent applies on one config
+are excluded by a file lock. A later unrelated config edit causes a recovery
+conflict instead of being overwritten. Daemons must report absolute config
+paths; upgrade an older daemon started with a relative `--config` path, or
+restart it with an absolute path.

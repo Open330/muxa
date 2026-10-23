@@ -328,6 +328,10 @@ impl std::error::Error for ConfigFileError {}
 /// Reads the configuration file. A missing file is not an error: the daemon
 /// runs on defaults, and the editor should offer to create one.
 pub fn read(path: &Path) -> Result<ConfigDocument, ConfigFileError> {
+    // Config documents cross IPC: callers may have another working directory.
+    let absolute = std::path::absolute(path)
+        .map_err(|error| ConfigFileError::Io(format!("resolving config path: {error}")))?;
+    let path = absolute.as_path();
     match std::fs::read_to_string(path) {
         Ok(text) => Ok(ConfigDocument {
             path: path.to_path_buf(),
@@ -451,6 +455,13 @@ fn atomic_write(path: &Path, text: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ipc_document_paths_are_absolute_even_for_missing_relative_configs() {
+        let document = read(Path::new("missing-relative-sync-config.toml")).unwrap();
+        assert!(document.path.is_absolute());
+        assert!(document.path.ends_with("missing-relative-sync-config.toml"));
+    }
 
     #[test]
     fn launch_reads_presence_and_replacement_precedence() {
