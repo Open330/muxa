@@ -219,7 +219,19 @@ fn is_muxa_mcp(args: &str) -> bool {
 fn codex_subcommand(args: &str) -> Option<&str> {
     let mut words = args.split_whitespace();
     let program = words.next()?;
-    (muxa::shell::program_name(program) == "codex").then(|| words.next().unwrap_or(""))
+    (muxa::shell::program_name(program) == "codex").then(|| {
+        words
+            .find(|word| {
+                !matches!(
+                    *word,
+                    "--yolo"
+                        | "--no-daemon"
+                        | "--dangerously-bypass-approvals-and-sandbox"
+                        | "--no-alt-screen"
+                )
+            })
+            .unwrap_or("")
+    })
 }
 
 /// One pass over the process table: pid, parent pid, age, command line.
@@ -310,9 +322,23 @@ fn parse_etime(value: &str) -> Option<Duration> {
 /// readable from `/proc`; elsewhere the default home is implied.
 fn codex_home_of(pid: u32) -> Option<String> {
     let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    raw.split(|b| *b == 0)
-        .filter_map(|kv| std::str::from_utf8(kv).ok())
-        .find_map(|kv| kv.strip_prefix("CODEX_HOME=").map(str::to_owned))
+    codex_home_from_environment(&raw)
+}
+
+fn codex_home_from_environment(raw: &[u8]) -> Option<String> {
+    let value = |key: &str| {
+        raw.split(|byte| *byte == 0)
+            .filter_map(|entry| std::str::from_utf8(entry).ok())
+            .find_map(|entry| entry.strip_prefix(key).filter(|value| !value.is_empty()))
+    };
+    value("CODEX_HOME=").map(str::to_owned).or_else(|| {
+        value("HOME=").map(|home| {
+            Path::new(home)
+                .join(".codex")
+                .to_string_lossy()
+                .into_owned()
+        })
+    })
 }
 
 #[cfg(test)]
@@ -400,7 +426,12 @@ mod tests {
     fn standalone_codex_is_not_mistaken_for_its_profiles_shared_server() {
         let procs = [
             proc(200, 1, 9000, "zsh"),
-            proc(201, 200, 9000, "/bin/codex resume session"),
+            proc(
+                201,
+                200,
+                9000,
+                "/bin/codex --yolo --no-daemon resume session",
+            ),
             proc(202, 201, 9000, "muxa mcp"),
             proc(300, 1, 9000, "/bin/codex app-server --managed-daemon"),
             proc(301, 300, 9000, "muxa mcp"),
@@ -420,5 +451,17 @@ mod tests {
         assert!(report.standalone_codex.contains("rmux:%439 (callabo:4.1)"));
         assert_eq!(report.total(), 2);
         assert!(report.guidance().unwrap().contains("when idle"));
+    }
+    #[test]
+    fn codex_profile_uses_owners_default_home_when_unset() {
+        assert_eq!(
+            codex_home_from_environment(b"HOME=/owner\0"),
+            Some("/owner/.codex".into())
+        );
+        assert_eq!(
+            codex_home_from_environment(b"HOME=/owner\0CODEX_HOME=/profile\0"),
+            Some("/profile".into())
+        );
+        assert_eq!(codex_home_from_environment(b"OTHER=value\0"), None);
     }
 }
