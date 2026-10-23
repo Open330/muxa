@@ -402,6 +402,21 @@ parent buttons open related history across rooms, and message links reopen an
 exact retained request even outside the default period. Copy-link strips all
 other URL parameters; copy-conversation is available to authenticated operators.
 
+## Fleet hosts
+
+When `[fleet] enabled = true` and `[fleet.hosts]` lists SSH hosts, the
+dashboard shows a **Fleet** panel above the session tree: one card per host
+(this node first) with its connection state, muxa version, relay latency,
+agent and pane counts, and how many agents need you (waiting on input or a
+choice, or in error). A host that is offline shows the relay's error.
+Selecting an online host lists its agents: state, kind, session and pane,
+task, and last activity, with the ones that need you first.
+
+The panel reads `GET /api/fleet` every five seconds while it is open, and
+stays hidden when the daemon has no fleet or only this node. It follows the
+same read policy as `/api/agents`; it is read-only, and
+`POST /api/fleet/{host}/command` is not wired to it.
+
 ## Sessions, windows and panes
 
 muxa tracks every agent by where it runs: a tmux (or rmux) **session**, a

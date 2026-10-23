@@ -17,6 +17,7 @@ import {
   withTopologyHash,
 } from "./topology-model.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
+import { fleetTotals, renderFleet } from "./fleet-view.mjs";
 import {
   buildRailEntries,
   findRailEntry,
@@ -3638,6 +3639,9 @@ function initCollapseControls() {
       if (panelId === "collaboration-panel" && !next) {
         fetchCollaboration().catch(() => {});
       }
+      if (panelId === "fleet-panel" && !next) {
+        fetchFleet().catch(() => {});
+      }
     });
   });
 }
@@ -4798,6 +4802,7 @@ async function main() {
   initDataTabs();
   initSessionControls();
   initCollaborationControls();
+  initFleetControls();
   initDynamicEventDelegation();
   initPaneDrawer();
   initTopology();
@@ -4846,6 +4851,8 @@ async function main() {
   setTimeout(pollTerminals, TERMINALS_REFETCH_INTERVAL_MS);
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
   setTimeout(pollCollaboration, COLLABORATION_REFETCH_INTERVAL_MS);
+  fetchFleet().catch(() => {});
+  setTimeout(pollFleet, FLEET_REFETCH_INTERVAL_MS);
 
   const linkedMessage = new URLSearchParams(window.location.hash.slice(1)).get("message");
   if (linkedMessage) await openCollaborationHistory({ message: linkedMessage });
@@ -4899,6 +4906,65 @@ async function pollTimeline() {
   if (store.access.signInRequired) return; // landing page: nothing to poll
   if (!document.hidden) await fetchTimeline().catch(() => {});
   setTimeout(pollTimeline, TIMELINE_REFETCH_INTERVAL_MS);
+}
+
+// ── Fleet ───────────────────────────────────────────────────────────
+
+const FLEET_REFETCH_INTERVAL_MS = 5000;
+const FLEET_HOST_KEY = "muxa.dashboard.fleetHost";
+const fleetState = { hosts: null, selected: null, disabled: false };
+try { fleetState.selected = localStorage.getItem(FLEET_HOST_KEY); } catch (_) { /* storage blocked */ }
+
+// Not jsonFetch: a daemon without `[fleet] enabled` answers 503, which only
+// hides this panel instead of marking the whole dashboard disconnected.
+async function fetchFleet() {
+  const resp = await fetch("/api/fleet", { credentials: "same-origin", headers: authHeaders() });
+  if (resp.status === 401) {
+    await showLanding();
+    return;
+  }
+  const panel = document.getElementById("fleet-panel");
+  if (resp.status === 503) {
+    fleetState.disabled = true;
+    panel.hidden = true;
+    return;
+  }
+  if (!resp.ok) return;
+  const data = await resp.json();
+  fleetState.hosts = Array.isArray(data.hosts) ? data.hosts : [];
+  // Only worth a panel when there is more than this node.
+  panel.hidden = !fleetState.hosts.some((host) => !host.local);
+  renderFleetPanel();
+}
+
+function renderFleetPanel() {
+  if (!fleetState.hosts) return;
+  const totals = fleetTotals(fleetState.hosts);
+  document.getElementById("fleet-meta").textContent =
+    `${totals.online}/${totals.hosts} online · ${totals.agents} agents${totals.attention ? ` · ${totals.attention} need you` : ""}`;
+  setStableHTML(document.getElementById("fleet-content"),
+    renderFleet(fleetState.hosts, { selected: fleetState.selected, esc, relTime }));
+}
+
+function initFleetControls() {
+  document.getElementById("fleet-content")?.addEventListener("click", (event) => {
+    const card = event.target.closest("[data-fleet-host]");
+    if (!card) return;
+    const alias = card.getAttribute("data-fleet-host");
+    fleetState.selected = fleetState.selected === alias ? null : alias;
+    try {
+      if (fleetState.selected) localStorage.setItem(FLEET_HOST_KEY, fleetState.selected);
+      else localStorage.removeItem(FLEET_HOST_KEY);
+    } catch (_) { /* storage blocked */ }
+    renderFleetPanel();
+  });
+}
+
+async function pollFleet() {
+  if (store.access.signInRequired || fleetState.disabled) return;
+  const collapsed = document.getElementById("fleet-panel")?.classList.contains("collapsed");
+  if (!document.hidden && !collapsed) await fetchFleet().catch(() => {});
+  setTimeout(pollFleet, FLEET_REFETCH_INTERVAL_MS);
 }
 
 async function pollCollaboration() {
