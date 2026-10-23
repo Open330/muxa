@@ -3,6 +3,7 @@
 mod activity_query;
 mod agent_launch;
 mod agent_move;
+mod ask_progress;
 mod attend;
 mod automation;
 mod collab_screen;
@@ -1402,7 +1403,7 @@ async fn wait_for_ask(client: &Client, id: &str, json: bool, timeout_secs: u64) 
     let mut shown = String::new();
     loop {
         let entry = client
-            .ask_list()
+            .ask_list_filtered(Some(id), None)
             .await?
             .into_iter()
             .find(|entry| entry.id == id)
@@ -1410,11 +1411,7 @@ async fn wait_for_ask(client: &Client, id: &str, json: bool, timeout_secs: u64) 
         match entry.status {
             muxa::ask::AskStatus::Running => {
                 if !json && std::io::stderr().is_terminal() && entry.answer != shown {
-                    let added = entry
-                        .answer
-                        .strip_prefix(&shown)
-                        .unwrap_or(&entry.answer)
-                        .trim();
+                    let added = ask_progress::delta(&shown, &entry.answer).trim();
                     if !added.is_empty() {
                         eprintln!("{added}");
                     }

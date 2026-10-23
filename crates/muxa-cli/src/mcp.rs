@@ -66,10 +66,7 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
 const MCP_SERVER_INSTRUCTIONS: &str =
-    "Muxa routes durable agent messages. Read muxa_collaboration_guide \
-    once for identity and protocol. Discover tools by exact name/suffix, never shared descriptions. \
-    Read instructions before choosing discovery calls; retain resolved handles/schemas. Delivery and reply receipt do not prove work success; \
-    reported_status is the recipient's declaration. Use mailbox tools, not terminal scraping.";
+    "Read muxa_collaboration_guide once. Delivery is not task success; reported_status is peer-declared.";
 
 /// How often `muxa_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -5623,7 +5620,7 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(init["result"]["capabilities"]["tools"].is_object());
         let instructions = init["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.len() < 400, "instructions: {instructions}");
+        assert!(instructions.len() < 140, "instructions: {instructions}");
         assert!(instructions.contains("muxa_collaboration_guide"));
         assert!(instructions.contains("reported_status"));
 

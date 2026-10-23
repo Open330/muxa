@@ -232,6 +232,10 @@ the macOS app show these as provisional output; only process exit and the final
 provider result settle the turn. Tool payloads and reasoning are excluded.
 The CLI waits on change notifications (with polling for older/remote daemons),
 prints progress only to an interactive stderr, and keeps stdout/`--json` final-only.
+CLI waits fetch just their own turn; watch subscribes to Ask changes separately
+from agent hooks and fetches the selected conversation. Legacy clients may still
+request full history. The macOS app retains its full history projection for
+cross-conversation activity badges.
 Progress is bounded and coalesced, without a disk write per message. Other
 providers retain their final-response behavior.
 

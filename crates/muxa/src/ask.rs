@@ -462,6 +462,25 @@ impl AskStore {
         self.entries.read().await.clone()
     }
 
+    pub async fn list_filtered(
+        &self,
+        id: Option<&str>,
+        conversation: Option<&str>,
+    ) -> Vec<AskEntry> {
+        self.entries
+            .read()
+            .await
+            .iter()
+            .filter(|entry| {
+                id.is_none_or(|id| entry.id == id)
+                    && conversation.is_none_or(|conversation| {
+                        entry.conversation_id.as_deref() == Some(conversation)
+                    })
+            })
+            .cloned()
+            .collect()
+    }
+
     pub async fn list_conversations(&self) -> Vec<AskConversation> {
         let mut conversations = self.conversations.read().await.clone();
         conversations.sort_by_key(|conversation| std::cmp::Reverse(conversation.updated_at));

@@ -441,7 +441,12 @@ enum RequestBody {
     /// grant at startup. This lets native clients present setup before a
     /// typed question fails with a configuration error.
     AskStatus {},
-    AskList {},
+    AskList {
+        #[serde(default)]
+        id: Option<String>,
+        #[serde(default)]
+        conversation_id: Option<String>,
+    },
     /// List durable conversations and identify the selected one for the
     /// current provider.
     AskConversationList {},
@@ -4045,9 +4050,15 @@ async fn handle(
                     kind = "ask_status";
                     Response::with_ask_status(ask.enabled())
                 }
-                RequestBody::AskList {} => {
+                RequestBody::AskList {
+                    id,
+                    conversation_id,
+                } => {
                     kind = "ask_list";
-                    Response::with_ask_entries(ask.list().await)
+                    Response::with_ask_entries(
+                        ask.list_filtered(id.as_deref(), conversation_id.as_deref())
+                            .await,
+                    )
                 }
                 RequestBody::AskConversationList {} => {
                     kind = "ask_conversation_list";
@@ -6168,9 +6179,29 @@ impl Client {
     }
 
     pub async fn ask_list(&self) -> Result<Vec<AskEntry>, RuntimeError> {
-        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_list" });
+        self.ask_list_filtered(None, None).await
+    }
+
+    pub async fn ask_list_filtered(
+        &self,
+        id: Option<&str>,
+        conversation_id: Option<&str>,
+    ) -> Result<Vec<AskEntry>, RuntimeError> {
+        let req = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "ask_list", "id": id, "conversation_id": conversation_id });
         let resp = self.call_checked(&req).await?;
-        serde_json::from_value(resp["ask_entries"].clone()).map_err(RuntimeError::Json)
+        let entries: Vec<AskEntry> =
+            serde_json::from_value(resp["ask_entries"].clone()).map_err(RuntimeError::Json)?;
+        // Older controllers ignore optional filters. Keep client semantics
+        // identical while those installations fall back to a full response.
+        Ok(entries
+            .into_iter()
+            .filter(|entry| {
+                id.is_none_or(|id| entry.id == id)
+                    && conversation_id.is_none_or(|conversation| {
+                        entry.conversation_id.as_deref() == Some(conversation)
+                    })
+            })
+            .collect())
     }
 
     pub async fn ask_conversation_list(

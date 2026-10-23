@@ -21,6 +21,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ask waits fetch only their turn, and watch scopes history refreshes to the
+  selected conversation. Optional wire filters retain older-client behavior.
+- Codex polling shares one parsed tail and reuses settled, unchanged files;
+  hook timestamps, quota recovery, rotation and truncation still invalidate or
+  reconcile against current state. Recently written files bypass reuse.
+- Screen detection gives idle hook-owned Codex panes a settling capture and
+  bounded fallback instead of capturing every tick. Known rmux locations avoid
+  extra inventory scans, with fresh resolution if a pane moved.
+- MCP initialization points to the collaboration guide with a compact contract,
+  reducing instructions repeated by MCP hosts across tool descriptions.
+
 - Global Ask publishes bounded Codex/Claude assistant progress through the
   existing revision stream, without exposing tool payloads or reasoning or
   treating progress as completion. CLI waits use notifications where available.
@@ -28,6 +39,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tool catalogs and repeated instruction reads while preserving project rules.
 
 ### Fixed
+
+- Bounded Ask progress no longer reprints the retained 32 KiB tail when it rolls.
+  Watch subscribes to Ask changes independently of agent hook activity.
 
 - Peek qualifies pane geometry queries with the caller's session and window,
   so `prefix + q` stays open when an older rmux server reports a linked window

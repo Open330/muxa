@@ -196,7 +196,23 @@ impl RmuxBackend {
         let command = scoped
             .control_command(&["capture-pane", "-ep", "-t", strip_prefix(pane_id)])
             .ok()?;
-        successful_stdout(command)
+        if let Some(output) = successful_stdout(command) {
+            return Some(output);
+        }
+        // The pane may have moved since its observation. Only this read-only
+        // operation retries with a freshly resolved identity; mutations never
+        // enter this path or get replayed.
+        let target = strip_prefix(pane_id);
+        let (scope, pane) = target.rsplit_once('.')?;
+        let (session, window) = scope.split_once(':')?;
+        if qualified_pane_target(session, window, pane).as_deref() != Some(target) {
+            return None;
+        }
+        successful_stdout(
+            scoped
+                .control_command(&["capture-pane", "-ep", "-t", pane])
+                .ok()?,
+        )
     }
 
     fn paste_text_on(&self, endpoint: Option<&str>, pane_id: &str, text: &str) -> bool {
@@ -386,6 +402,20 @@ fn namespace_pane_id(pane_id: &str) -> String {
 
 fn strip_prefix(pane_id: &str) -> &str {
     pane_id.strip_prefix(PANE_ID_PREFIX).unwrap_or(pane_id)
+}
+
+/// Reuse identities from an authoritative pane observation, avoiding a second
+/// whole-server inventory for a read-only capture. Unknown/legacy ids retain
+/// the normal resolver and its old-rmux compatibility behavior.
+pub fn qualified_pane_target(session: &str, window: &str, pane: &str) -> Option<String> {
+    let pane = strip_prefix(pane);
+    for (value, prefix) in [(session, '$'), (window, '@'), (pane, '%')] {
+        let id = value.strip_prefix(prefix)?;
+        if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+    }
+    Some(format!("{session}:{window}.{pane}"))
 }
 
 fn parse_pane_observation(stdout: &str, endpoint: Option<&str>) -> PaneObservation {
@@ -686,6 +716,31 @@ mod tests {
         let command = backend.command(None);
         let args: Vec<_> = command.get_args().collect();
         assert_eq!(args, ["-S", "/tmp/rmux.sock"]);
+    }
+
+    #[test]
+    fn observed_identity_qualifies_capture_without_resolving_again() {
+        let target = qualified_pane_target("$3", "@7", "rmux:%9").unwrap();
+        let command = RmuxBackend::with_endpoint("/tmp/absent.sock")
+            .control_command(&["capture-pane", "-ep", "-t", &target])
+            .unwrap();
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-S",
+                "/tmp/absent.sock",
+                "capture-pane",
+                "-ep",
+                "-t",
+                "$3:@7.%9"
+            ]
+        );
+        assert!(qualified_pane_target("", "@7", "%9").is_none());
+        assert!(qualified_pane_target("$3", "@7", "%9junk").is_none());
     }
 
     #[test]

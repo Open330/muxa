@@ -25,7 +25,7 @@
 //! could plug in a multi-server tmux scanner, a screen/zellij adapter, or
 //! a remote-host probe — all without touching `Reconciler` or `Store`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -156,6 +156,9 @@ pub struct Reconciler<L: LivenessSource> {
     /// `Some`, read lifecycle and quota evidence even when hooks are missing.
     /// `None` (default) disables the poll.
     codex_sessions_root: Option<PathBuf>,
+    /// Last parsed tail per live codex session, reused while the rollout file
+    /// is unchanged. Pruned to the polled set every pass.
+    codex_rollouts: Arc<std::sync::Mutex<codex_rollout::RolloutCache>>,
     native_sessions: Option<crate::session::SharedSessionBackend>,
     /// When each observed host last answered well enough to protect its rows
     /// from the cross-host age-out. Seeded with construction time, so a host
@@ -193,6 +196,7 @@ impl<L: LivenessSource> Reconciler<L> {
             stuck_waiting_timeout: Duration::ZERO,
             paneless_stale_timeout: Duration::ZERO,
             codex_sessions_root: None,
+            codex_rollouts: Arc::default(),
             native_sessions: None,
             last_protected: std::sync::Mutex::new(
                 kinds
@@ -300,12 +304,22 @@ impl<L: LivenessSource> Reconciler<L> {
                 last_activity_at: a.last_activity_at,
             })
             .collect();
+        let cache = Arc::clone(&self.codex_rollouts);
         if targets.is_empty() {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .retain(|_| false);
             return;
         }
 
         let root = root.to_path_buf();
         let readings = tokio::task::spawn_blocking(move || {
+            let mut cache = cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let live: HashSet<String> = targets.iter().map(|t| t.id.session_id.clone()).collect();
+            cache.retain(|session_id| live.contains(session_id));
             targets
                 .into_iter()
                 .filter_map(|t| {
@@ -315,8 +329,12 @@ impl<L: LivenessSource> Reconciler<L> {
                         now,
                         ROLLOUT_LOOKBACK_DAYS,
                     )?;
-                    let rl = codex_rollout::latest_rate_limits(&path);
-                    let status = codex_rollout::latest_status(&path);
+                    // One parse per changed file serves quota, lifecycle and
+                    // recovery; an unchanged file reuses the previous reading
+                    // and is still judged against the current row below.
+                    let reading = cache.read(&t.id.session_id, &path)?;
+                    let rl = reading.rate_limits;
+                    let status = reading.status;
                     // Also repair old inferred caps stamped after a successful
                     // final response by earlier muxa versions.
                     let recovery_response = (t.state == AgentState::Error
@@ -325,7 +343,7 @@ impl<L: LivenessSource> Reconciler<L> {
                             Some(RateLimitSource::CodexRollout | RateLimitSource::Statusline)
                         )
                         && rl.as_ref().is_some_and(|reading| reading.reached.is_none()))
-                    .then(|| codex_rollout::latest_final_response(&path))
+                    .then_some(reading.final_response)
                     .flatten();
                     Some((t, rl, status, recovery_response))
                 })
@@ -1584,6 +1602,10 @@ mod tests {
             r#"{{"timestamp":"2026-06-12T06:26:08.491Z","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{primary_pct},"window_minutes":300,"resets_at":1781262859}},"secondary":{{"used_percent":46.0,"window_minutes":10080,"resets_at":1781745469}},"rate_limit_reached_type":{reached}}}}}}}"#
         );
         std::fs::write(&path, format!("{line}\n")).unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(2))
+            .unwrap();
     }
 
     /// A reached cap in the rollout flips the codex row to `Error` with a
@@ -1822,6 +1844,106 @@ mod tests {
             store.by_session("completed-recovery").await.unwrap().state,
             AgentState::Idle
         );
+    }
+
+    /// An unchanged rollout is parsed once, yet each poll still judges the
+    /// cached reading against the row as it is now: a cap inferred after the
+    /// file went quiet is repaired from the cached final response.
+    #[tokio::test]
+    async fn reconcile_codex_rollout_reuses_unchanged_reading_against_current_row() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let started = codex_started("cached", "%8", now - time::Duration::minutes(5));
+        store.apply(&started).await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "cached", 100.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "cached", now, 0).unwrap();
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}", serde_json::json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Done"}})).unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        let parses = || reconciler.codex_rollouts.lock().unwrap().parses();
+
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(2))
+            .unwrap();
+
+        reconciler.reconcile_once().await;
+        assert_eq!(parses(), 1);
+        let row = store.by_session("cached").await.unwrap();
+        assert_eq!(row.rate_limit_5h_pct, Some(100.0));
+        assert_ne!(row.state, AgentState::Error);
+
+        let capped_at = OffsetDateTime::now_utc();
+        store
+            .apply(&AgentEvent::RateLimited {
+                id: started.id().clone(),
+                scope: RateLimitScope::FiveHour,
+                source: RateLimitSource::CodexRollout,
+                resets_at: None,
+                message: None,
+                at: capped_at,
+            })
+            .await;
+        reconciler.reconcile_once().await;
+        assert_eq!(parses(), 1, "unchanged rollout must not be re-parsed");
+        let row = store.by_session("cached").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle);
+        assert_eq!(row.last_response.as_deref(), Some("Done"));
+        assert_eq!(row.last_activity_at, capped_at);
+    }
+
+    /// Appended telemetry invalidates the cached reading, and a session that
+    /// leaves the polled set is dropped from the cache.
+    #[tokio::test]
+    async fn reconcile_codex_rollout_cache_invalidates_on_append_and_prunes_stopped_rows() {
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let started = codex_started("appended", "%8", now - time::Duration::minutes(5));
+        store.apply(&started).await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "appended", 20.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "appended", now, 0).unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+
+        reconciler.reconcile_once().await;
+        reconciler.reconcile_once().await;
+        assert_eq!(reconciler.codex_rollouts.lock().unwrap().parses(), 1);
+        writeln!(std::fs::OpenOptions::new().append(true).open(&path).unwrap(),
+            "{}", serde_json::json!({"timestamp":"2026-06-12T06:30:00Z","type":"event_msg","payload":{"type":"token_count","rate_limits":{"primary":{"used_percent":64.0,"window_minutes":300}}}})).unwrap();
+        reconciler.reconcile_once().await;
+        assert_eq!(reconciler.codex_rollouts.lock().unwrap().parses(), 2);
+        assert_eq!(
+            store
+                .by_session("appended")
+                .await
+                .unwrap()
+                .rate_limit_5h_pct,
+            Some(64.0)
+        );
+
+        store
+            .apply(&AgentEvent::SessionEnded {
+                id: started.id().clone(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        reconciler.reconcile_once().await;
+        assert!(reconciler.codex_rollouts.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

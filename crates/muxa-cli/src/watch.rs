@@ -3375,6 +3375,19 @@ fn content_window_geometry(raw: &str) -> (Vec<PaneGeometry>, bool) {
     (panes, zoomed)
 }
 
+fn pane_capture_target(key: &PaneKey) -> String {
+    if key.window.session.endpoint.host == muxa::HostKind::Rmux {
+        muxa::backend::rmux::qualified_pane_target(
+            &key.window.session.session_id,
+            &key.window.window_id,
+            &key.pane_id,
+        )
+        .unwrap_or_else(|| key.pane_id.clone())
+    } else {
+        key.pane_id.clone()
+    }
+}
+
 fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
     use ansi_to_tui::IntoText;
 
@@ -3385,7 +3398,13 @@ fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
     );
     let (geometries, zoomed) = crate::mux_control::capture(
         &key.session.endpoint,
-        &["list-panes", "-t", &key.window_id, "-F", &format],
+        &[
+            "list-panes",
+            "-t",
+            &format!("{}:{}", key.session.session_id, key.window_id),
+            "-F",
+            &format,
+        ],
     )
     .map(|raw| content_window_geometry(&raw))
     .unwrap_or_default();
@@ -3407,10 +3426,13 @@ fn capture_tmux_window(key: WindowKey) -> CapturedWindow {
                     let backend = backend.clone();
                     let socket = socket.clone();
                     let geometry = geometry.clone();
+                    let capture_target = pane_capture_target(&PaneKey {
+                        window: key.clone(),
+                        pane_id: geometry.pane_id.clone(),
+                    });
                     scope.spawn(move || {
-                        let pane_id = geometry.pane_id.clone();
                         let text = backend
-                            .capture_pane_on(Some(&socket), &pane_id)
+                            .capture_pane_on(Some(&socket), &capture_target)
                             .filter(|raw| !raw.is_empty())
                             .and_then(|raw| raw.as_bytes().into_text().ok());
                         CapturedWindowPane { geometry, text }
@@ -7745,6 +7767,7 @@ pub async fn run(
     // block or fail.
     let _ = wake_tx.try_send(());
 
+    let mut ask_updates = ask_revision_updates(client.clone());
     let mut jump_target: Option<WatchOpenTarget> = None;
 
     // Repaint only when something actually changed (`needs_render`) or the
@@ -8415,6 +8438,7 @@ pub async fn run(
                             None,
                             muxa::backend::pane_id_host_kind(&preview.pane_id)
                                 .unwrap_or(muxa::HostKind::Tmux),
+                            preview.pane_id.clone(),
                         )
                     },
                     |key| {
@@ -8422,6 +8446,7 @@ pub async fn run(
                             key.pane_id.clone(),
                             Some(key.window.session.endpoint.socket.clone()),
                             key.window.session.endpoint.host,
+                            pane_capture_target(key),
                         )
                     },
                 )
@@ -8436,17 +8461,18 @@ pub async fn run(
                             pane.key.pane_id.clone(),
                             Some(pane.key.window.session.endpoint.socket.clone()),
                             pane.key.window.session.endpoint.host,
+                            pane_capture_target(&pane.key),
                         )
                     })
                 } else {
                     app.selected_pane().map(|pane_id| {
                         let host = muxa::backend::pane_id_host_kind(&pane_id)
                             .unwrap_or(muxa::HostKind::Tmux);
-                        (pane_id, None, host)
+                        (pane_id.clone(), None, host, pane_id)
                     })
                 }
             });
-        if let Some((capture_pane, capture_socket, capture_host)) = capture_target {
+        if let Some((capture_pane, capture_socket, capture_host, command_target)) = capture_target {
             // Resolve the capturing backend by the pane id's namespace so a
             // herdr row captures via herdr even when tmux is the primary
             // host (and vice versa). Cheap to build per capture (bounded to
@@ -8459,7 +8485,7 @@ pub async fn run(
                         || c.fetched_at.elapsed() >= Duration::from_millis(500)
                 });
                 if stale {
-                    let pane_id = capture_pane.clone();
+                    let pane_id = command_target;
                     let socket = capture_socket.clone();
                     let captured = tokio::task::spawn_blocking(move || {
                         cap_backend.capture_pane_on(socket.as_deref(), &pane_id)
@@ -8530,6 +8556,10 @@ pub async fn run(
             apply_outcome(&mut app, outcome);
             received_outcome = true;
         }
+        let ask_changed = ask_updates.has_changed().unwrap_or(false);
+        if ask_changed {
+            ask_updates.borrow_and_update();
+        }
         if received_outcome {
             app.refresh_pending = false;
             needs_render = true;
@@ -8537,9 +8567,12 @@ pub async fn run(
             // Piggyback on the refresh the table already does, and only
             // while the panel is open — nobody needs ask polling to run
             // behind a screen that is not showing it.
-            if app.ask_panel.open && app.ask_entries.iter().any(is_ask_running) {
-                refresh_ask_entries(client, &mut app).await;
-            }
+        }
+        if app.ask_panel.open
+            && (ask_changed || (received_outcome && app.ask_entries.iter().any(is_ask_running)))
+        {
+            refresh_ask_entries(client, &mut app).await;
+            needs_render = true;
         }
 
         if app.collaboration_mailbox.open
@@ -9173,18 +9206,18 @@ fn is_ask_running(entry: &muxa::ask::AskEntry) -> bool {
 }
 
 async fn refresh_ask_entries(client: &Client, app: &mut App) {
-    let (agent, entries, conversations) = tokio::join!(
-        client.ask_agent(None),
-        client.ask_list(),
-        client.ask_conversation_list()
-    );
-    if let Ok(agent) = agent {
-        app.ask_agent = agent;
-    }
+    let conversations = client.ask_conversation_list().await;
     if let Ok((listed, active)) = conversations {
         app.ask_conversations = listed;
         app.active_ask_conversation_id = active.map(|conversation| conversation.id);
         app.ask_conversations_available = true;
+    }
+    let (agent, entries) = tokio::join!(
+        client.ask_agent(None),
+        client.ask_list_filtered(None, app.active_ask_conversation_id.as_deref())
+    );
+    if let Ok(agent) = agent {
+        app.ask_agent = agent;
     }
     match entries {
         Ok(entries) => {
@@ -9196,6 +9229,27 @@ async fn refresh_ask_entries(client: &Client, app: &mut App) {
             app.set_hint(format!("ask history unavailable: {error}"), HintLevel::Err);
         }
     }
+}
+
+/// A separate invalidation stream: Ask turns need not produce agent hooks.
+/// Dropping the receiver closes this task even on an early UI error.
+fn ask_revision_updates(client: Client) -> tokio::sync::watch::Receiver<u64> {
+    let (sender, receiver) = tokio::sync::watch::channel(0);
+    tokio::spawn(async move {
+        let Ok(mut stream) = client.ask_subscribe().await else {
+            return;
+        };
+        loop {
+            tokio::select! {
+                update = stream.recv() => match update {
+                    Ok(Some(revision)) => { sender.send_replace(revision.wrapping_add(1)); }
+                    _ => return,
+                },
+                () = sender.closed() => return,
+            }
+        }
+    });
+    receiver
 }
 
 /// Who the cursor means, for both `m` and `Space`.
@@ -25489,6 +25543,43 @@ sort = ["state"]
         // Dropping the wake sender ends the task cleanly.
         drop(wake_tx);
         task.await.expect("refresh_task joins on shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ask_progress_notifies_watch_without_an_agent_transition() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("ask-subscribe.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = stream.into_split();
+            let mut reader = BufReader::new(reader);
+            for kind in ["hello", "ask_subscribe"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                    kind
+                );
+                writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+            }
+            writer.write_all(b"{\"revision\":7}\n").await.unwrap();
+            let mut line = String::new();
+            assert_eq!(reader.read_line(&mut line).await.unwrap(), 0);
+        });
+        let mut updates = ask_revision_updates(Client::new(socket));
+        tokio::time::timeout(Duration::from_secs(2), updates.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*updates.borrow_and_update(), 8);
+        drop(updates);
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     /// On the periodic tick (no wake), the fetcher still runs and an

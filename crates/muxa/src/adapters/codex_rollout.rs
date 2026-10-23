@@ -129,8 +129,19 @@ fn window(w: Option<RawWindow>) -> Option<Window> {
 /// Parse a single rollout line into a [`RateLimits`] snapshot, or `None`
 /// when the line isn't a rate-limit-bearing record. Walking callers keep
 /// the most recent `Some(...)`.
+#[cfg(test)]
 fn parse_line(line: &str) -> Option<RateLimits> {
-    let rec: Record = serde_json::from_str(line.trim()).ok()?;
+    parse_rate_limits(&serde_json::from_str(line.trim()).ok()?)
+}
+
+/// [`parse_line`] over an already-parsed record, so one tail pass can feed
+/// every reader from a single `serde_json` parse per line.
+fn parse_rate_limits(record: &serde_json::Value) -> Option<RateLimits> {
+    // Most lines carry no telemetry; skip the typed decode for them.
+    if record["payload"]["rate_limits"].is_null() {
+        return None;
+    }
+    let rec = Record::deserialize(record).ok()?;
     let raw = rec.payload?.rate_limits?;
 
     // Newer Codex can put the weekly window in `primary` with no
@@ -183,21 +194,7 @@ fn window_scope(window: Option<&RawWindow>, fallback: RateLimitScope) -> RateLim
 /// record in the tail window, malformed lines) — same silent-failure
 /// contract as the Claude transcript parser.
 pub fn latest_rate_limits(path: &Path) -> Option<RateLimits> {
-    let mut f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    let start = len.saturating_sub(TAIL_BYTES);
-    f.seek(SeekFrom::Start(start)).ok()?;
-
-    let reader = BufReader::new(f);
-    let mut latest: Option<RateLimits> = None;
-    // A mid-file seek almost always lands inside a line; that fragment
-    // fails to parse and is silently skipped, same as the transcript reader.
-    for line in reader.lines().map_while(Result::ok) {
-        if let Some(rl) = parse_line(&line) {
-            latest = Some(rl);
-        }
-    }
-    latest
+    read_tail(path)?.rate_limits
 }
 
 /// Latest lifecycle evidence persisted by Codex, independent of quota telemetry.
@@ -222,19 +219,83 @@ pub enum StatusEvent {
 /// Read actual event timestamps so unchanged files cannot manufacture recent
 /// activity or continually reorder the watch list. Partial JSON is skipped.
 pub fn latest_status(path: &Path) -> Option<Status> {
-    let mut file = File::open(path).ok()?;
-    let start = file.metadata().ok()?.len().saturating_sub(TAIL_BYTES);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut latest = None;
-    let mut response = None;
+    read_tail(path)?.status
+}
+
+/// Read a final assistant response from the current turn only. Commentary,
+/// tool output, and a previous turn's answer must not turn a response-less
+/// Stop (for example at a permission prompt) into a successful completion.
+pub fn latest_final_response(path: &Path) -> Option<String> {
+    read_tail(path)?.final_response
+}
+
+/// Everything the reconciler consumes from one rollout tail. Built in a
+/// single pass so a poll reads and parses each line once instead of once
+/// per signal.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Reading {
+    /// See [`latest_rate_limits`].
+    pub rate_limits: Option<RateLimits>,
+    /// See [`latest_status`].
+    pub status: Option<Status>,
+    /// See [`latest_final_response`].
+    pub final_response: Option<String>,
+}
+
+/// Read and fold the tail of `path`. `None` only when the file cannot be
+/// opened or sought; an empty or unparsable tail is an empty [`Reading`].
+pub fn read_tail(path: &Path) -> Option<Reading> {
+    let file = File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    read_tail_from(file, len)
+}
+
+fn read_tail_from(mut file: File, len: u64) -> Option<Reading> {
+    file.seek(SeekFrom::Start(len.saturating_sub(TAIL_BYTES)))
+        .ok()?;
+    let mut fold = TailFold::default();
+    // A mid-file seek almost always lands inside a line; that fragment
+    // fails to parse and is silently skipped.
     for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(record) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) {
+            fold.observe(&value);
+        }
+    }
+    Some(fold.finish())
+}
+
+#[derive(Default)]
+struct TailFold {
+    rate_limits: Option<RateLimits>,
+    status: Option<Status>,
+    /// The current turn's final answer as seen by the status walk, used to
+    /// fill a `task_complete` that carries no `last_agent_message`.
+    status_response: Option<String>,
+    final_response: Option<String>,
+}
+
+impl TailFold {
+    fn observe(&mut self, record: &serde_json::Value) {
+        if let Some(rl) = parse_rate_limits(record) {
+            self.rate_limits = Some(rl);
+        }
+        self.observe_final_response(record);
+        self.observe_status(record);
+    }
+
+    fn finish(self) -> Reading {
+        Reading {
+            rate_limits: self.rate_limits,
+            status: self.status,
+            final_response: self.final_response,
+        }
+    }
+
+    fn observe_status(&mut self, record: &serde_json::Value) {
         let payload = &record["payload"];
         let event = match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("event_msg"), Some("task_started" | "user_message")) => {
-                response = None;
+                self.status_response = None;
                 StatusEvent::Working
             }
             (Some("event_msg"), Some("task_complete")) => {
@@ -253,7 +314,7 @@ pub fn latest_status(path: &Path) -> Option<Status> {
                         .as_str()
                         .filter(|text| !text.trim().is_empty())
                         .map(|text| super::hook::truncate(text.to_owned(), 4_000))
-                        .or_else(|| response.clone());
+                        .or_else(|| self.status_response.clone());
                     StatusEvent::Stopped {
                         response: final_response,
                         interrupted: false,
@@ -261,31 +322,22 @@ pub fn latest_status(path: &Path) -> Option<Status> {
                 }
             }
             (Some("event_msg"), Some("turn_aborted")) => {
-                response = None;
+                self.status_response = None;
                 StatusEvent::Stopped {
                     response: None,
                     interrupted: true,
                 }
             }
             (Some("response_item"), Some("message")) if payload["role"] == "user" => {
-                response = None;
+                self.status_response = None;
                 StatusEvent::Working
             }
             (Some("response_item"), Some("message")) if payload["role"] == "assistant" => {
                 if matches!(payload["phase"].as_str(), Some("final" | "final_answer")) {
-                    let text = payload["content"].as_array().map(|parts| {
-                        parts
-                            .iter()
-                            .filter(|part| part["type"] == "output_text")
-                            .filter_map(|part| part["text"].as_str())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    });
-                    response = text
-                        .filter(|text| !text.trim().is_empty())
-                        .map(|text| super::hook::truncate(text, 4_000));
+                    self.status_response =
+                        final_answer_text(payload).map(|text| super::hook::truncate(text, 4_000));
                     StatusEvent::Stopped {
-                        response: response.clone(),
+                        response: self.status_response.clone(),
                         interrupted: false,
                     }
                 } else {
@@ -302,71 +354,181 @@ pub fn latest_status(path: &Path) -> Option<Status> {
                     | "custom_tool_call_output",
                 ),
             ) => StatusEvent::Working,
-            _ => continue,
+            _ => return,
         };
         let Some(at) = record["timestamp"].as_str().and_then(|value| {
             OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339).ok()
         }) else {
-            continue;
+            return;
         };
-        if latest
+        if self
+            .status
             .as_ref()
             .is_none_or(|previous: &Status| at >= previous.at)
         {
-            latest = Some(Status { at, event });
+            self.status = Some(Status { at, event });
         }
     }
-    latest
-}
 
-/// Read a final assistant response from the current turn only. Commentary,
-/// tool output, and a previous turn's answer must not turn a response-less
-/// Stop (for example at a permission prompt) into a successful completion.
-pub fn latest_final_response(path: &Path) -> Option<String> {
-    let mut file = File::open(path).ok()?;
-    let start = file.metadata().ok()?.len().saturating_sub(TAIL_BYTES);
-    file.seek(SeekFrom::Start(start)).ok()?;
-    let mut latest = None;
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
+    fn observe_final_response(&mut self, value: &serde_json::Value) {
         let payload = &value["payload"];
         match (value["type"].as_str(), payload["type"].as_str()) {
             (Some("event_msg"), Some("task_started" | "user_message" | "turn_aborted")) => {
-                latest = None;
+                self.final_response = None;
             }
-            (Some("response_item"), Some("message")) if payload["role"] == "user" => latest = None,
+            (Some("response_item"), Some("message")) if payload["role"] == "user" => {
+                self.final_response = None;
+            }
             (Some("response_item"), Some("message"))
                 if payload["role"] == "assistant"
                     && matches!(payload["phase"].as_str(), Some("final" | "final_answer")) =>
             {
-                let text = payload["content"].as_array().map(|parts| {
-                    parts
-                        .iter()
-                        .filter(|part| part["type"] == "output_text")
-                        .filter_map(|part| part["text"].as_str())
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                });
-                latest = text.filter(|text| !text.trim().is_empty());
+                self.final_response = final_answer_text(payload);
             }
             (Some("event_msg"), Some("task_complete")) => {
                 if payload.get("error").is_some_and(|error| !error.is_null()) {
-                    latest = None;
-                    continue;
-                }
-                if let Some(text) = payload["last_agent_message"]
+                    self.final_response = None;
+                } else if let Some(text) = payload["last_agent_message"]
                     .as_str()
                     .filter(|text| !text.trim().is_empty())
                 {
-                    latest = Some(text.to_owned());
+                    self.final_response = Some(text.to_owned());
                 }
             }
             _ => {}
         }
     }
-    latest
+}
+
+/// Joined `output_text` parts of an assistant message, `None` when blank.
+fn final_answer_text(payload: &serde_json::Value) -> Option<String> {
+    payload["content"]
+        .as_array()
+        .map(|parts| {
+            parts
+                .iter()
+                .filter(|part| part["type"] == "output_text")
+                .filter_map(|part| part["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// Identity of a rollout file's content as far as a tail read can tell.
+/// Codex only appends, so an unchanged length, mtime and inode means the
+/// tail parses to the same [`Reading`]. Truncation, rotation, and
+/// same-path replacement each change at least one field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Fingerprint {
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+}
+
+impl Fingerprint {
+    fn settled(self) -> bool {
+        // A truncate/rewrite can keep the same length and land within the
+        // filesystem's timestamp quantum. Never reuse a just-written file;
+        // ordinary idle rollouts still avoid all tail reads after one second.
+        self.modified
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= std::time::Duration::from_secs(1))
+    }
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            dev: metadata.dev(),
+            #[cfg(unix)]
+            ino: metadata.ino(),
+        }
+    }
+}
+
+struct CachedReading {
+    path: PathBuf,
+    fingerprint: Fingerprint,
+    reading: Reading,
+}
+
+/// Last [`Reading`] per live session, reused while its rollout file is
+/// unchanged. The cache holds no state beyond the parsed tail: callers still
+/// compare the reading against the store on every poll, so a hook that lands
+/// while the file is idle is judged exactly as it was without the cache.
+/// Bounded by [`RolloutCache::retain`], which the poller calls with the live
+/// session set each pass.
+#[derive(Default)]
+pub struct RolloutCache {
+    entries: std::collections::HashMap<String, CachedReading>,
+    #[cfg(test)]
+    parses: usize,
+}
+
+impl RolloutCache {
+    /// The reading for `session_id`'s rollout at `path`, parsing the tail
+    /// only when the file's identity changed since the last call. A missing
+    /// or unreadable file drops the entry and returns `None`.
+    pub fn read(&mut self, session_id: &str, path: &Path) -> Option<Reading> {
+        let opened = File::open(path).ok().and_then(|file| {
+            let fingerprint = Fingerprint::of(&file.metadata().ok()?);
+            Some((file, fingerprint))
+        });
+        let Some((file, fingerprint)) = opened else {
+            self.entries.remove(session_id);
+            return None;
+        };
+        if let Some(cached) = self.entries.get(session_id) {
+            if cached.path == path && cached.fingerprint == fingerprint && fingerprint.settled() {
+                return Some(cached.reading.clone());
+            }
+        }
+        #[cfg(test)]
+        {
+            self.parses += 1;
+        }
+        let Some(reading) = read_tail_from(file, fingerprint.len) else {
+            self.entries.remove(session_id);
+            return None;
+        };
+        self.entries.insert(
+            session_id.to_owned(),
+            CachedReading {
+                path: path.to_path_buf(),
+                fingerprint,
+                reading: reading.clone(),
+            },
+        );
+        Some(reading)
+    }
+
+    /// Forget sessions that are no longer polled.
+    pub fn retain(&mut self, mut live: impl FnMut(&str) -> bool) {
+        self.entries.retain(|session_id, _| live(session_id));
+    }
+
+    /// Number of cached sessions.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether no session is cached.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parses(&self) -> usize {
+        self.parses
+    }
 }
 
 /// Locate the rollout JSONL for `session_id` by scanning the
@@ -630,6 +792,8 @@ mod tests {
         for l in lines {
             writeln!(f, "{l}").unwrap();
         }
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(2))
+            .unwrap();
         path
     }
 
@@ -871,5 +1035,159 @@ mod tests {
         let now = datetime!(2026-06-12 15:30:00 UTC);
         let (root, _day) = dated_root(now);
         assert!(session_rate_limits(root.path(), "ghost", now, 1).is_none());
+    }
+
+    fn final_answer_line(text: &str) -> String {
+        serde_json::json!({"timestamp":"2026-06-12T06:27:00Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":text}]}}).to_string()
+    }
+
+    #[test]
+    fn one_tail_pass_feeds_quota_lifecycle_and_final_response() {
+        let dir = tempdir().unwrap();
+        let path = write_rollout(
+            dir.path(),
+            "fold",
+            &[
+                rate_limit_line(42.0, 46.0, "null"),
+                final_answer_line("Done"),
+            ],
+        );
+        let reading = read_tail(&path).unwrap();
+        assert_eq!(reading.rate_limits, latest_rate_limits(&path));
+        assert_eq!(
+            reading.rate_limits.unwrap().five_hour.unwrap().used_percent,
+            42.0
+        );
+        assert_eq!(reading.final_response.as_deref(), Some("Done"));
+        assert_eq!(
+            reading.status.map(|status| status.event),
+            Some(StatusEvent::Stopped {
+                response: Some("Done".into()),
+                interrupted: false,
+            })
+        );
+        assert!(read_tail(&dir.path().join("missing.jsonl")).is_none());
+    }
+
+    #[test]
+    fn cache_reuses_unchanged_tail_and_reparses_after_append() {
+        let dir = tempdir().unwrap();
+        let path = write_rollout(dir.path(), "s", &[rate_limit_line(10.0, 46.0, "null")]);
+        let mut cache = RolloutCache::default();
+        let first = cache.read("s", &path).unwrap();
+        assert_eq!(cache.read("s", &path).unwrap(), first);
+        assert_eq!(cache.parses(), 1);
+
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "{}", final_answer_line("Done")).unwrap();
+        let appended = cache.read("s", &path).unwrap();
+        assert_eq!(cache.parses(), 2);
+        assert_eq!(appended.final_response.as_deref(), Some("Done"));
+        assert_eq!(appended.rate_limits, first.rate_limits);
+    }
+
+    #[test]
+    fn cache_rechecks_fresh_same_sized_rewrites_with_equal_mtime() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("fresh.jsonl");
+        let first = rate_limit_line(10.0, 46.0, "null");
+        let next = rate_limit_line(20.0, 46.0, "null");
+        assert_eq!(first.len(), next.len());
+        std::fs::write(&path, &first).unwrap();
+        let stamp = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let mut cache = RolloutCache::default();
+        cache.read("fresh", &path).unwrap();
+        std::fs::write(&path, &next).unwrap();
+        File::open(&path).unwrap().set_modified(stamp).unwrap();
+        let reading = cache.read("fresh", &path).unwrap();
+        assert_eq!(
+            reading.rate_limits.unwrap().five_hour.unwrap().used_percent,
+            20.0
+        );
+        assert_eq!(cache.parses(), 2);
+    }
+
+    #[test]
+    fn cache_invalidates_on_truncation_and_same_path_replacement() {
+        let dir = tempdir().unwrap();
+        let path = write_rollout(
+            dir.path(),
+            "s",
+            &[
+                rate_limit_line(10.0, 46.0, "null"),
+                final_answer_line("Old"),
+            ],
+        );
+        let mut cache = RolloutCache::default();
+        assert_eq!(
+            cache.read("s", &path).unwrap().final_response.as_deref(),
+            Some("Old")
+        );
+
+        // Truncate and rewrite in place: shorter file, same inode.
+        write_rollout(dir.path(), "s", &[rate_limit_line(30.0, 46.0, "null")]);
+        let truncated = cache.read("s", &path).unwrap();
+        assert_eq!(truncated.final_response, None);
+        assert_eq!(
+            truncated
+                .rate_limits
+                .unwrap()
+                .five_hour
+                .unwrap()
+                .used_percent,
+            30.0
+        );
+
+        // Replace through rename with a same-length file: only the inode moves.
+        let replacement = dir.path().join("replacement");
+        std::fs::write(
+            &replacement,
+            format!("{}\n", rate_limit_line(70.0, 46.0, "null")),
+        )
+        .unwrap();
+        let original = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&replacement).unwrap().len(),
+            original.len()
+        );
+        File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_modified(original.modified().unwrap())
+            .unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        let replaced = cache.read("s", &path).unwrap();
+        assert_eq!(
+            replaced
+                .rate_limits
+                .unwrap()
+                .five_hour
+                .unwrap()
+                .used_percent,
+            70.0
+        );
+        assert_eq!(cache.parses(), 3);
+    }
+
+    #[test]
+    fn cache_drops_missing_files_and_prunes_to_live_sessions() {
+        let dir = tempdir().unwrap();
+        let a = write_rollout(dir.path(), "a", &[rate_limit_line(10.0, 46.0, "null")]);
+        let b = write_rollout(dir.path(), "b", &[rate_limit_line(20.0, 46.0, "null")]);
+        let mut cache = RolloutCache::default();
+        cache.read("a", &a).unwrap();
+        cache.read("b", &b).unwrap();
+        assert_eq!(cache.len(), 2);
+
+        std::fs::remove_file(&a).unwrap();
+        assert!(cache.read("a", &a).is_none());
+        assert_eq!(cache.len(), 1);
+
+        cache.retain(|session_id| session_id != "b");
+        assert!(cache.is_empty());
     }
 }

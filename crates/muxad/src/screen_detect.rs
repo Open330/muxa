@@ -38,7 +38,7 @@
 //! `MissedTickBehavior::Skip`, and each tick is fully awaited before the next).
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use muxa::screen::{AgentManifest, ManifestSet, ScreenState};
 use muxa::state::SYNTHETIC_SESSION_PREFIX;
@@ -161,6 +161,28 @@ struct ScreenDetector {
     /// being a candidate (its foreground command changed away from the agent),
     /// its synthetic row is stopped so it doesn't freeze.
     tracked: HashSet<String>,
+    recap_probes: HashMap<(String, Option<String>), RecapProbe>,
+}
+
+struct RecapProbe {
+    session: String,
+    state: AgentState,
+    activity: OffsetDateTime,
+    captured: Instant,
+    settle: bool,
+}
+impl RecapProbe {
+    fn changed(&self, owner: &muxa::Agent) -> bool {
+        self.session != owner.session_id
+            || self.state != owner.state
+            || self.activity != owner.last_activity_at
+    }
+    fn due(&self, owner: &muxa::Agent, now: Instant) -> bool {
+        owner.state == AgentState::Working
+            || self.changed(owner)
+            || self.settle
+            || now.duration_since(self.captured) >= Duration::from_secs(30)
+    }
 }
 
 impl ScreenDetector {
@@ -188,6 +210,11 @@ impl ScreenDetector {
     /// hook doesn't own.
     async fn run_tick(&mut self) -> usize {
         let candidates = self.gather_candidates().await;
+        self.recap_probes.retain(|(id, socket), _| {
+            candidates
+                .iter()
+                .any(|(_, pane, _)| &pane.pane_id == id && &pane.socket == socket)
+        });
         let current: HashSet<String> = candidates
             .iter()
             .map(|(_, p, _)| p.pane_id.clone())
@@ -342,27 +369,25 @@ impl ScreenDetector {
             }
         }
 
+        let probe_key = (pane_id.clone(), pane.socket.clone());
+        if let Some(owner) = codex_owner.as_ref().filter(|_| hook_owned) {
+            if self
+                .recap_probes
+                .get(&probe_key)
+                .is_some_and(|probe| !probe.due(owner, Instant::now()))
+            {
+                return false;
+            }
+        }
+
         let Some(raw) = self.capture(backend_idx, pane).await else {
             return false;
         };
+        if let Some(owner) = codex_owner.as_ref().filter(|_| hook_owned) {
+            self.record_recap_probe(probe_key, owner);
+        }
         let recap_changed = if let Some(owner) = codex_owner {
-            match muxa::adapters::codex::conversation_recap_from_capture(&raw) {
-                Some(recap) => {
-                    let changed = self
-                        .store
-                        .update_recap_if_changed(&owner.session_id, recap)
-                        .await;
-                    if changed {
-                        tracing::debug!(
-                            pane = %pane_id,
-                            session_id = %owner.session_id,
-                            "screen detection observed Codex conversation recap",
-                        );
-                    }
-                    changed
-                }
-                None => false,
-            }
+            self.observe_recap(&owner, &raw).await
         } else {
             false
         };
@@ -443,10 +468,50 @@ impl ScreenDetector {
                 || synthetic_row_shows(occupants, state))
     }
 
+    fn record_recap_probe(&mut self, key: (String, Option<String>), owner: &muxa::Agent) {
+        let settle = self
+            .recap_probes
+            .get(&key)
+            .is_none_or(|probe| probe.changed(owner));
+        self.recap_probes.insert(
+            key,
+            RecapProbe {
+                session: owner.session_id.clone(),
+                state: owner.state,
+                activity: owner.last_activity_at,
+                captured: Instant::now(),
+                settle,
+            },
+        );
+    }
+
+    async fn observe_recap(&self, owner: &muxa::Agent, raw: &str) -> bool {
+        let Some(recap) = muxa::adapters::codex::conversation_recap_from_capture(raw) else {
+            return false;
+        };
+        let changed = self
+            .store
+            .update_recap_if_changed(&owner.session_id, recap)
+            .await;
+        if changed {
+            tracing::debug!(session_id = %owner.session_id, "screen detection observed Codex conversation recap");
+        }
+        changed
+    }
+
     /// Capture one pane on the given backend, off the async runtime.
     async fn capture(&self, backend_idx: usize, pane: &PaneInfo) -> Option<String> {
         let backend = self.backends[backend_idx].clone();
-        let pane_id = pane.pane_id.clone();
+        let pane_id = if backend.kind() == HostKind::Rmux {
+            muxa::backend::rmux::qualified_pane_target(
+                &pane.session_id,
+                &pane.window_id,
+                &pane.pane_id,
+            )
+            .unwrap_or_else(|| pane.pane_id.clone())
+        } else {
+            pane.pane_id.clone()
+        };
         let socket = pane.socket.clone();
         spawn_blocking(move || backend.capture_pane_on(socket.as_deref(), &pane_id))
             .await
@@ -494,6 +559,7 @@ pub fn spawn_screen_detect_task(
         interval,
         last_state: HashMap::new(),
         tracked: HashSet::new(),
+        recap_probes: HashMap::new(),
     };
     Some(tokio::spawn(detector.run(shutdown_tx.subscribe())))
 }
@@ -616,6 +682,7 @@ mod tests {
             interval: Duration::from_secs(3),
             last_state: HashMap::new(),
             tracked: HashSet::new(),
+            recap_probes: HashMap::new(),
         }
     }
 
@@ -914,8 +981,19 @@ mod tests {
         );
         assert_eq!(
             det.run_tick().await,
+            0,
+            "an unchanged idle owner does not trigger another capture"
+        );
+        for _ in 0..10 {
+            assert_eq!(det.run_tick().await, 0);
+        }
+        for probe in det.recap_probes.values_mut() {
+            probe.captured -= Duration::from_secs(31);
+        }
+        assert_eq!(
+            det.run_tick().await,
             1,
-            "a later recap replaces the old one"
+            "bounded fallback finds a recap rendered without a hook"
         );
         assert_eq!(
             store
