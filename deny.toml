@@ -19,6 +19,18 @@ ignore = [
     # the OIDC dependency: https://rustsec.org/advisories/RUSTSEC-2023-0071.html
     "RUSTSEC-2023-0071",
 
+    # openidconnect 4.0.1 -> p256/p384 0.13 -> elliptic-curve 0.13 ->
+    # crypto-bigint 0.5.5. Reviewed 2026-10-25: RUSTSEC-2026-0387 is timing
+    # variability in constant-time operations on SECRET integers. Muxa uses
+    # p256/p384 only through openidconnect's IdTokenVerifier, verifying ES256/
+    # ES384 ID-token signatures against the issuer's public JWKS; it never
+    # holds an EC private key or signs with ECDSA (test tokens are Ed25519).
+    # The fix is crypto-bigint >= 0.7.6, which needs the p256 0.14 line;
+    # openidconnect 4.0.1 (latest) still requires p256 ^0.13. Drop this entry
+    # once openidconnect moves to elliptic-curve 0.14, and reassess before
+    # adding ECDSA signing: https://rustsec.org/advisories/RUSTSEC-2026-0387
+    "RUSTSEC-2026-0387",
+
     # notify-rust 4.17.0 -> zbus 5 -> these standalone crates. Reviewed
     # 2026-10-19: the 2026-10-17 advisories announce their merge into zbus 6,
     # not a vulnerability; there are no patched standalone versions. Keep
