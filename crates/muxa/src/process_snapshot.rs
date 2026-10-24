@@ -56,6 +56,10 @@ impl ProcessTable {
         self.by_pid.get(&pid)
     }
 
+    pub(crate) fn processes(&self) -> impl Iterator<Item = &ProcessInfo> {
+        self.by_pid.values()
+    }
+
     pub(crate) fn descendants(
         &self,
         root: u32,
