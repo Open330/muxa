@@ -980,10 +980,7 @@ fn execute(
     }
     let started = Instant::now();
     let relaunched = loop {
-        let processes = crate::process_tree::read_descendants(target.pane_pid);
-        if processes.iter().any(|p| {
-            is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str())
-        }) {
+        if resumed_agent_running(target) {
             break true;
         }
         if started.elapsed() >= LAUNCH_TIMEOUT {
@@ -994,12 +991,44 @@ fn execute(
     if !relaunched {
         return Err("typed the relaunch, but the agent never appeared in the pane".into());
     }
-    let Some(text) = follow_up else {
-        return Ok(String::new());
-    };
-    if !wait_until_drawn(target) {
-        return Ok("resumed; screen never settled, follow-up not sent".into());
+    // A running process is not a resumed conversation: the TUI can be up and
+    // showing that another app owns the conversation, or a startup error.
+    // Every swap, with or without a follow-up, waits for a usable screen.
+    let readiness = wait_for_resume(
+        || target.backend.capture_pane_on(socket, &target.pane),
+        || resumed_agent_running(target),
+        READY_TIMEOUT,
+        READY_QUIET,
+        Duration::from_millis(250),
+    );
+    match readiness {
+        Resume::Ready => {}
+        Resume::Blocked(reason) => {
+            let owners = if target.kind == AgentKind::Codex {
+                codex_writer_owners(target.pane_pid)
+            } else {
+                String::new()
+            };
+            return Err(format!(
+                "relaunched, but {reason}{owners}; nothing was sent to the pane"
+            ));
+        }
+        Resume::Exited => {
+            return Err(
+                "relaunched, but the agent exited before its conversation was ready".into(),
+            );
+        }
+        Resume::Unsettled => {
+            return Err(format!(
+                "relaunched, but the conversation did not become ready within {}s; \
+                 nothing was sent to the pane",
+                READY_TIMEOUT.as_secs()
+            ));
+        }
     }
+    let Some(text) = follow_up else {
+        return Ok("resumed".into());
+    };
     let sent = target
         .backend
         .send_prompt_text_on(socket, &target.pane, text)
@@ -1103,31 +1132,352 @@ fn is_shell(command: &str) -> bool {
     crate::shell::is_shell_program(command)
 }
 
-/// Wait for the resumed TUI to stop redrawing, so the follow-up lands in
-/// its input box rather than in its startup.
-fn wait_until_drawn(target: &Target) -> bool {
+/// Is the relaunched agent, on this conversation, still running in the pane?
+fn resumed_agent_running(target: &Target) -> bool {
+    crate::process_tree::read_descendants(target.pane_pid)
+        .iter()
+        .any(|p| is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str()))
+}
+
+/// What a resumed pane turned out to be.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Resume {
+    /// Settled on a screen with no ownership or startup error, agent alive.
+    Ready,
+    /// Settled on an ownership or startup-error screen.
+    Blocked(String),
+    /// The agent process went away before the screen was usable.
+    Exited,
+    /// Never settled within the timeout.
+    Unsettled,
+}
+
+/// Wait for the resumed TUI to stop redrawing, then accept it only if the
+/// agent is still running and the screen is not an ownership or startup
+/// error. A stable screen alone proves nothing: "This conversation is open
+/// in another app" is stable too (Open330/muxa#275).
+fn wait_for_resume(
+    mut capture: impl FnMut() -> Option<String>,
+    mut alive: impl FnMut() -> bool,
+    timeout: Duration,
+    quiet: Duration,
+    tick: Duration,
+) -> Resume {
     let started = Instant::now();
     let mut last = String::new();
     let mut quiet_since = Instant::now();
-    while started.elapsed() < READY_TIMEOUT {
-        let screen = target
-            .backend
-            .capture_pane_on(target.socket.as_deref(), &target.pane)
-            .unwrap_or_default();
+    loop {
+        let screen = capture().unwrap_or_default();
         if screen != last {
             last = screen;
             quiet_since = Instant::now();
-        } else if !last.trim().is_empty() && quiet_since.elapsed() >= READY_QUIET {
-            return true;
+        } else if !last.trim().is_empty() && quiet_since.elapsed() >= quiet {
+            if let Some(reason) = blocked_screen(&last) {
+                return Resume::Blocked(reason.to_owned());
+            }
+            return if alive() {
+                Resume::Ready
+            } else {
+                Resume::Exited
+            };
         }
-        std::thread::sleep(Duration::from_millis(250));
+        if started.elapsed() >= timeout {
+            // A blocker can sit on a screen that keeps redrawing (a clock,
+            // a spinner): report it rather than a bare timeout.
+            if let Some(reason) = blocked_screen(&last) {
+                return Resume::Blocked(reason.to_owned());
+            }
+            return if alive() {
+                Resume::Unsettled
+            } else {
+                Resume::Exited
+            };
+        }
+        std::thread::sleep(tick);
     }
-    false
+}
+
+/// How many non-blank lines at the bottom of the screen a startup banner or
+/// error can occupy. Only these are read, so a resumed conversation's own
+/// history (which may quote the same words) cannot trip the check.
+const BLOCKER_TAIL_LINES: usize = 8;
+
+/// Line openings that mean the resumed agent cannot take input, with the
+/// note shown to the operator. Matched case-insensitively at the start of a
+/// line, after any leading box-drawing, bullet or `error:` decoration.
+const BLOCKERS: &[(&str, &str)] = &[
+    (
+        "this conversation is open in another app",
+        "another app still owns this conversation (\"This conversation is open in another app\")",
+    ),
+    (
+        "conversation is open in another",
+        "another app still owns this conversation",
+    ),
+    (
+        "no conversation found",
+        "the agent could not find the conversation to resume",
+    ),
+    (
+        "no session found",
+        "the agent could not find the session to resume",
+    ),
+    (
+        "session not found",
+        "the agent could not find the session to resume",
+    ),
+    (
+        "failed to resume",
+        "the agent failed to resume the conversation",
+    ),
+    (
+        "unable to resume",
+        "the agent failed to resume the conversation",
+    ),
+    (
+        "too many open files",
+        "the agent hit the open-file limit while starting",
+    ),
+    (
+        "unexpected argument",
+        "the agent rejected the relaunch arguments",
+    ),
+    (
+        "command not found",
+        "the relaunch command was not found in the pane's shell",
+    ),
+];
+
+/// The reason a settled screen cannot take input, if it shows one.
+fn blocked_screen(screen: &str) -> Option<&'static str> {
+    let lines: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    let tail = &lines[lines.len().saturating_sub(BLOCKER_TAIL_LINES)..];
+    tail.iter().find_map(|line| {
+        let text = line.trim_start_matches(|c: char| {
+            c.is_whitespace()
+                || matches!(
+                    c,
+                    '│' | '┃'
+                        | '║'
+                        | '╭'
+                        | '╰'
+                        | '■'
+                        | '▌'
+                        | '⚠'
+                        | '✗'
+                        | '×'
+                        | '•'
+                        | '›'
+                        | '>'
+                        | '!'
+                        | '-'
+                        | '*'
+                )
+        });
+        // Work on the lowercased copy only: its byte offsets need not match
+        // the original's once non-ASCII text is lowercased.
+        let mut text = text.to_lowercase();
+        // `zsh: command not found: aas` — the shell names itself first.
+        for prefixes in [
+            &["zsh:", "bash:", "sh:", "fish:"][..],
+            &["error:", "warning:", "fatal:", "error"][..],
+        ] {
+            if let Some(rest) = prefixes.iter().find_map(|p| text.strip_prefix(p)) {
+                text = rest.trim_start().to_owned();
+            }
+        }
+        BLOCKERS
+            .iter()
+            .find(|(opening, _)| text.starts_with(opening))
+            .map(|(_, reason)| *reason)
+    })
+}
+
+/// Codex app-servers outside this pane, which can keep writer ownership of a
+/// conversation after the pane's own agent exits. Named, never stopped: one
+/// shared server serves unrelated agents.
+fn codex_writer_owners(pane_pid: u32) -> String {
+    let processes = all_processes();
+    let in_pane: std::collections::HashSet<u32> = crate::process_tree::read_descendants(pane_pid)
+        .iter()
+        .map(|p| p.pid)
+        .collect();
+    let owners = outside_codex_servers(processes.iter(), pane_pid, &in_pane);
+    if owners.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " — Codex app-server(s) outside the pane that may hold it: {}; \
+             close the other client or restart that server when it is safe",
+            owners.join(", ")
+        )
+    }
+}
+
+/// Every process's pid and command line. Linux reads `/proc` (there is no
+/// whole-table snapshot there); elsewhere the shared process table.
+#[cfg(target_os = "linux")]
+fn all_processes() -> Vec<ProcessInfo> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let raw = std::fs::read(entry.path().join("cmdline")).ok()?;
+            let cmdline = String::from_utf8_lossy(&raw)
+                .split('\0')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(ProcessInfo {
+                pid,
+                parent_pid: 0,
+                depth: 0,
+                comm: String::new(),
+                cmdline,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn all_processes() -> Vec<ProcessInfo> {
+    crate::process_snapshot::read_current_process_table()
+        .processes()
+        .cloned()
+        .collect()
+}
+
+fn outside_codex_servers<'a>(
+    processes: impl Iterator<Item = &'a ProcessInfo>,
+    pane_pid: u32,
+    in_pane: &std::collections::HashSet<u32>,
+) -> Vec<String> {
+    let mut owners: Vec<(u32, String)> = processes
+        .filter(|p| p.pid != pane_pid && !in_pane.contains(&p.pid))
+        .filter(|p| {
+            let mut words = p.cmdline.split_whitespace();
+            words.any(|w| w.rsplit('/').next() == Some("codex"))
+                && p.cmdline.split_whitespace().any(|w| w == "app-server")
+        })
+        .map(|p| (p.pid, format!("pid {}", p.pid)))
+        .collect();
+    owners.sort();
+    owners.into_iter().map(|(_, label)| label).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- Open330/muxa#275: a running, settled TUI is not a resumed one ----
+
+    const OWNED_ELSEWHERE: &str =
+        "\n\n  ■ This conversation is open in another app.\n    Close it there to continue here.\n";
+    const RESUMED: &str = "› Plan rate limiting\n\n• Edited src/limit.ts\n\n› Ask Codex to do anything\n  ⏎ send   ⌃J newline\n";
+
+    fn quick(screens: Vec<&'static str>, alive: bool) -> Resume {
+        let mut screens = screens.into_iter().map(str::to_owned);
+        let mut last = String::new();
+        wait_for_resume(
+            || {
+                if let Some(next) = screens.next() {
+                    last = next;
+                }
+                Some(last.clone())
+            },
+            || alive,
+            Duration::from_millis(300),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        )
+    }
+
+    #[test]
+    fn a_stable_ownership_banner_is_blocked_not_ready() {
+        assert!(
+            matches!(quick(vec![OWNED_ELSEWHERE], true), Resume::Blocked(r) if r.contains("another app"))
+        );
+    }
+
+    #[test]
+    fn startup_errors_are_blocked() {
+        for screen in [
+            "Error: No conversation found with session ID 019a\n$ ",
+            "error: unexpected argument '--resume' found\n",
+            "⚠ Too many open files (os error 24)\n",
+            "zsh: command not found: aas\n$ ",
+        ] {
+            assert!(blocked_screen(screen).is_some(), "{screen:?}");
+        }
+    }
+
+    #[test]
+    fn a_settled_resumed_conversation_with_a_live_agent_is_ready() {
+        assert_eq!(quick(vec!["", "loading", RESUMED], true), Resume::Ready);
+    }
+
+    #[test]
+    fn a_settled_screen_whose_agent_exited_is_not_ready() {
+        assert_eq!(quick(vec![RESUMED], false), Resume::Exited);
+    }
+
+    #[test]
+    fn history_that_quotes_a_blocker_does_not_trip_the_check() {
+        let mut screen = String::from(
+            "› why did the swap fail?\n• It said: This conversation is open in another app.\n",
+        );
+        screen.push_str(&"• more history\n".repeat(BLOCKER_TAIL_LINES));
+        screen.push_str(RESUMED);
+        assert_eq!(blocked_screen(&screen), None);
+        // Mid-line mentions are not banners either.
+        assert_eq!(
+            blocked_screen("• the log said no conversation found yesterday\n› Ask Codex\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_screen_that_never_settles_is_unsettled_unless_it_shows_a_blocker() {
+        fn spinning(prefix: &'static str) -> Resume {
+            let mut tick = 0u32;
+            wait_for_resume(
+                || {
+                    tick += 1;
+                    Some(format!("{prefix}spinner {tick}\n"))
+                },
+                || true,
+                Duration::from_millis(60),
+                Duration::from_millis(40),
+                Duration::from_millis(5),
+            )
+        }
+        assert_eq!(spinning(""), Resume::Unsettled);
+        assert!(matches!(spinning(OWNED_ELSEWHERE), Resume::Blocked(_)));
+    }
+
+    #[test]
+    fn a_detached_codex_server_outside_the_pane_is_named_and_the_panes_own_is_not() {
+        let processes = [
+            proc(10, 1, 0, "-zsh"),
+            proc(11, 10, 1, "node /opt/homebrew/bin/codex resume 019a"),
+            proc(12, 11, 2, "/opt/homebrew/bin/codex app-server"),
+            proc(
+                40,
+                1,
+                0,
+                "/opt/homebrew/bin/codex app-server --managed-daemon",
+            ),
+            proc(41, 1, 0, "/usr/bin/vim app-server.md"),
+        ];
+        let in_pane: std::collections::HashSet<u32> = [11, 12].into_iter().collect();
+        assert_eq!(
+            outside_codex_servers(processes.iter(), 10, &in_pane),
+            vec!["pid 40".to_owned()]
+        );
+    }
     use crate::event::RateLimitScope;
 
     fn agent(pane: &str, sid: &str, kind: AgentKind, state: AgentState) -> Agent {
