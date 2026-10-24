@@ -1297,12 +1297,12 @@ fn blocked_screen(screen: &str) -> Option<&'static str> {
 /// conversation after the pane's own agent exits. Named, never stopped: one
 /// shared server serves unrelated agents.
 fn codex_writer_owners(pane_pid: u32) -> String {
-    let table = crate::process_snapshot::read_current_process_table();
+    let processes = all_processes();
     let in_pane: std::collections::HashSet<u32> = crate::process_tree::read_descendants(pane_pid)
         .iter()
         .map(|p| p.pid)
         .collect();
-    let owners = outside_codex_servers(table.processes(), pane_pid, &in_pane);
+    let owners = outside_codex_servers(processes.iter(), pane_pid, &in_pane);
     if owners.is_empty() {
         String::new()
     } else {
@@ -1312,6 +1312,42 @@ fn codex_writer_owners(pane_pid: u32) -> String {
             owners.join(", ")
         )
     }
+}
+
+/// Every process's pid and command line. Linux reads `/proc` (there is no
+/// whole-table snapshot there); elsewhere the shared process table.
+#[cfg(target_os = "linux")]
+fn all_processes() -> Vec<ProcessInfo> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid: u32 = entry.file_name().to_str()?.parse().ok()?;
+            let raw = std::fs::read(entry.path().join("cmdline")).ok()?;
+            let cmdline = String::from_utf8_lossy(&raw)
+                .split('\0')
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ");
+            Some(ProcessInfo {
+                pid,
+                parent_pid: 0,
+                depth: 0,
+                comm: String::new(),
+                cmdline,
+            })
+        })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn all_processes() -> Vec<ProcessInfo> {
+    crate::process_snapshot::read_current_process_table()
+        .processes()
+        .cloned()
+        .collect()
 }
 
 fn outside_codex_servers<'a>(
