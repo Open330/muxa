@@ -144,9 +144,18 @@ launch then starts `aas e <best eligible account> …` instead of the bare CLI.
 
 ## Limits
 
-- The agent must run under a shell in its pane. A pane started *with* the
-  agent (`new-window 'aas e …'`) would close when the agent stops, so it is
-  skipped.
+- A pane started *with* the agent (`new-window 'aas e …'`, `exec claude …`)
+  has no shell to type a relaunch into. On tmux and rmux it is kept open
+  past the exit (`remain-on-exit`) and respawned in place with the relaunch,
+  keeping its pane id; other multiplexers skip it.
+- An agent that did something in the last 20 seconds counts as mid-turn even
+  when its state reads idle (a long tool call shows no transition), so it is
+  skipped without `--force`. A capped agent is exempt: its last activity is
+  the cap.
+- What was half-typed into the agent's prompt is typed back after the
+  resume (after the follow-up, so the two are not sent as one prompt).
+- After the follow-up, muxa waits up to 20 seconds for the agent to show a
+  turn in progress and says in the report whether it did.
 - muxa needs the provider session id. A hook-fed row has it; a
   screen-detected row is resumed only when the agent's own command line names
   it (`--resume <id>` / `resume <id>`).

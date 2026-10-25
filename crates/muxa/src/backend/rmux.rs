@@ -310,6 +310,42 @@ impl PaneBackend for RmuxBackend {
         self.send_text_on(None, pane_id, text)
     }
 
+    fn set_remain_on_exit_on(&self, endpoint: Option<&str>, pane_id: &str, on: bool) -> bool {
+        let scoped = Self {
+            endpoint: endpoint
+                .map(str::to_string)
+                .or_else(|| self.endpoint.clone()),
+        };
+        // Off means unset, as on tmux.
+        let pane = strip_prefix(pane_id);
+        let args: &[&str] = if on {
+            &["set-option", "-p", "-t", pane, "remain-on-exit", "on"]
+        } else {
+            &["set-option", "-p", "-u", "-t", pane, "remain-on-exit"]
+        };
+        scoped.run_control(args).is_ok()
+    }
+
+    fn respawn_pane_on(
+        &self,
+        endpoint: Option<&str>,
+        pane_id: &str,
+        cwd: &str,
+        command: &str,
+    ) -> bool {
+        let scoped = Self {
+            endpoint: endpoint
+                .map(str::to_string)
+                .or_else(|| self.endpoint.clone()),
+        };
+        let mut args = vec!["respawn-pane", "-k"];
+        if !cwd.is_empty() {
+            args.extend(["-c", cwd]);
+        }
+        args.extend(["-t", strip_prefix(pane_id), command]);
+        scoped.run_control(&args).is_ok()
+    }
+
     fn send_text_on(&self, endpoint: Option<&str>, pane_id: &str, text: &str) -> bool {
         if text.contains('\n') || text.ends_with(';') {
             return self.paste_text_on(endpoint, pane_id, text);

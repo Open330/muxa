@@ -247,6 +247,25 @@ pub fn select<'a>(
     agents: &'a [Agent],
     request: &SwapRequest,
 ) -> (Vec<&'a Agent>, Vec<SwapOutcome>) {
+    select_at(agents, request, time::OffsetDateTime::now_utc())
+}
+
+/// How recently an agent must have done something to count as mid-turn
+/// even when its state says otherwise: a long tool call shows no
+/// transition, and stopping it would cut the turn off.
+const RECENT_ACTIVITY: time::Duration = time::Duration::seconds(20);
+
+/// Mid-turn by its activity: something happened within
+/// [`RECENT_ACTIVITY`]. A capped agent's last activity is the cap itself.
+fn recently_active(agent: &Agent, now: time::OffsetDateTime) -> bool {
+    !is_rate_limited(agent) && now - agent.last_activity_at < RECENT_ACTIVITY
+}
+
+fn select_at<'a>(
+    agents: &'a [Agent],
+    request: &SwapRequest,
+    now: time::OffsetDateTime,
+) -> (Vec<&'a Agent>, Vec<SwapOutcome>) {
     let mut chosen = Vec::new();
     let mut skipped = Vec::new();
     for agent in agents {
@@ -267,6 +286,10 @@ pub fn select<'a>(
             skipped.push(skip("not in a multiplexer pane"));
         } else if is_busy(agent) && !request.force {
             skipped.push(skip("mid-turn; pass --force to stop it anyway"));
+        } else if recently_active(agent, now) && !request.force {
+            skipped.push(skip(
+                "active in the last 20s (likely mid-turn); pass --force to stop it anyway",
+            ));
         } else {
             chosen.push(agent);
         }
@@ -370,12 +393,9 @@ enum Landed {
 
 /// The configured account the relaunched agent in `target`'s pane runs on.
 fn resumed_account(target: &Target, resolved: &crate::accounts::ResolvedAccounts) -> Landed {
-    let Some(agent) = crate::process_tree::read_descendants(target.pane_pid)
-        .into_iter()
-        .find(|p| {
-            is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str())
-        })
-    else {
+    let Some(agent) = pane_processes(target.pane_pid.get()).into_iter().find(|p| {
+        is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str())
+    }) else {
         return Landed::On(None);
     };
     let environ = crate::accounts::process_environ(agent.pid);
@@ -737,11 +757,20 @@ pub(crate) fn find_launch(
         .min_by_key(|p| p.depth)?;
     let by_pid = |pid: u32| processes.iter().find(|p| p.pid == pid);
     let mut chain = vec![agent];
-    let mut parent = agent.parent_pid;
-    while parent != pane_pid {
-        let process = by_pid(parent)?;
-        chain.push(process);
-        parent = process.parent_pid;
+    // A pane started as `exec claude …` has the agent as its own root.
+    if agent.pid != pane_pid {
+        let mut parent = agent.parent_pid;
+        while parent != pane_pid {
+            let process = by_pid(parent)?;
+            chain.push(process);
+            parent = process.parent_pid;
+        }
+        // A pane started as `aas e …` has the wrapper as its root.
+        if let Some(root) =
+            by_pid(pane_pid).filter(|root| LaunchLine::from_aas(&root.cmdline).is_some())
+        {
+            chain.push(root);
+        }
     }
     let top = *chain.last()?;
     let wrapper = chain
@@ -1059,8 +1088,12 @@ fn swap_one(
         }
     };
     outcome.command = Some(command.clone());
-    let follow_up =
-        request.continue_for(is_rate_limited(agent) || agent.state == AgentState::Working);
+    // The swap cuts a turn in progress off, so it gets the follow-up like a
+    // capped one.
+    // Recent activity only keeps an agent out of a non-forced swap; an idle
+    // agent that just finished a turn has nothing to continue.
+    let mid_turn = agent.state == AgentState::Working;
+    let follow_up = request.continue_for(is_rate_limited(agent) || mid_turn);
     if request.dry_run {
         outcome.status = SwapStatus::Planned;
         if let Some(text) = follow_up {
@@ -1072,10 +1105,21 @@ fn swap_one(
         backend: backend.clone(),
         socket: agent.tmux_socket.clone(),
         pane: pane.pane_id.clone(),
-        pane_pid: pane.pane_pid,
+        pane_pid: std::cell::Cell::new(pane.pane_pid),
+        direct: !shell_above(
+            &pane_processes(pane.pane_pid),
+            launch.agent_pid,
+            pane.pane_pid,
+        )
+        .unwrap_or(true),
+        cwd: agent
+            .cwd
+            .clone()
+            .filter(|cwd| !cwd.is_empty())
+            .unwrap_or_else(|| pane.current_path.clone()),
         kind: agent.kind,
         session_id: session_id.clone(),
-        busy: agent.state == AgentState::Working,
+        busy: mid_turn,
     };
     // The relaunch must land on the account it was meant for, checked before
     // any follow-up starts work on the wrong one.
@@ -1161,13 +1205,20 @@ fn locate(
     if pane.pane_pid == 0 {
         return Err("the pane's process id is unknown".into());
     }
-    let processes = crate::process_tree::read_descendants(pane.pane_pid);
+    let processes = pane_processes(pane.pane_pid);
     let launch = find_launch(&processes, pane.pane_pid, agent.kind)
         .ok_or_else(|| format!("no running {} process in the pane", agent.kind))?;
     // A pane started *with* the agent (`new-window 'aas e …'`) has no shell
-    // behind it: stopping the agent would close the pane.
-    let root = process_command(pane.pane_pid).unwrap_or_default();
-    if !is_shell(&root) {
+    // behind it: it is kept open past the exit and respawned in place, which
+    // only the tmux-family backends can do.
+    let direct = !shell_above(&processes, launch.agent_pid, pane.pane_pid)
+        .ok_or_else(|| "could not read the pane's root process".to_owned())?;
+    if direct
+        && !matches!(
+            host,
+            crate::backend::HostKind::Tmux | crate::backend::HostKind::Rmux
+        )
+    {
         return Err("the pane runs the agent directly, with no shell to relaunch into".into());
     }
     Ok((launch, pane, backend.clone()))
@@ -1177,7 +1228,13 @@ struct Target {
     backend: SharedBackend,
     socket: Option<String>,
     pane: String,
-    pane_pid: u32,
+    /// The pane's root process; a respawn replaces it.
+    pane_pid: std::cell::Cell<u32>,
+    /// The pane runs the agent directly, with no shell to type into: it is
+    /// respawned in place instead.
+    direct: bool,
+    /// Where a respawned agent starts.
+    cwd: String,
     kind: AgentKind,
     session_id: String,
     /// Mid-turn when the swap began (`--force`).
@@ -1195,16 +1252,22 @@ fn execute(
 ) -> Result<String, Refusal> {
     let socket = target.socket.as_deref();
     let mut answered: Vec<&'static str> = Vec::new();
-    if target.kind == AgentKind::ClaudeCode {
-        exit_claude(target, launch, follow_up, &mut answered)?;
+    // Clearing the prompt to quit loses what was half-typed there; it is
+    // typed back once the agent is up again (or stays, if it is kept).
+    let draft = target
+        .backend
+        .capture_pane_on(socket, &target.pane)
+        .and_then(|screen| composer_draft(&screen, target.kind));
+    stop_agent(target, launch, follow_up, draft.as_deref(), &mut answered)?;
+    if target.direct {
+        relaunch_in_place(target, command)?;
     } else {
-        stop(launch)?;
-    }
-    std::thread::sleep(SHELL_SETTLE);
-    if !target.backend.send_text_on(socket, &target.pane, command)
-        || !target.backend.send_text_on(socket, &target.pane, "\r")
-    {
-        return Err("could not type the relaunch command into the pane".into());
+        std::thread::sleep(SHELL_SETTLE);
+        if !target.backend.send_text_on(socket, &target.pane, command)
+            || !target.backend.send_text_on(socket, &target.pane, "\r")
+        {
+            return Err("could not type the relaunch command into the pane".into());
+        }
     }
     let started = Instant::now();
     let relaunched = loop {
@@ -1217,7 +1280,19 @@ fn execute(
         std::thread::sleep(Duration::from_millis(300));
     };
     if !relaunched {
-        return Err("typed the relaunch, but the agent never appeared in the pane".into());
+        return Err(if target.direct {
+            "respawned the pane, but the agent never appeared; the pane is kept open so its \
+             output can be read"
+        } else {
+            "typed the relaunch, but the agent never appeared in the pane"
+        }
+        .into());
+    }
+    if target.direct {
+        // Running again: the pane may close with its agent as before.
+        target
+            .backend
+            .set_remain_on_exit_on(socket, &target.pane, false);
     }
     // A running process is not a resumed conversation: the TUI can be up and
     // showing that another app owns the conversation, or a startup error.
@@ -1235,7 +1310,7 @@ fn execute(
         Resume::Ready => {}
         Resume::Blocked(reason) => {
             let owners = if target.kind == AgentKind::Codex {
-                codex_writer_owners(target.pane_pid)
+                codex_writer_owners(target.pane_pid.get())
             } else {
                 String::new()
             };
@@ -1259,19 +1334,212 @@ fn execute(
     }
     let checked = verify(target)
         .map_err(|why| format!("relaunched, but {why}; nothing was sent to the pane"))?;
+    Ok(follow_through(
+        target,
+        follow_up,
+        draft.as_deref(),
+        &answered,
+        &checked,
+    ))
+}
+
+/// After a usable resume: send the follow-up, see whether a turn started,
+/// and type back the half-typed prompt. The note for the report.
+fn follow_through(
+    target: &Target,
+    follow_up: Option<&str>,
+    draft: Option<&str>,
+    answered: &[&'static str],
+    checked: &str,
+) -> String {
+    let socket = target.socket.as_deref();
     let answers = if answered.is_empty() {
-        checked
+        checked.to_owned()
     } else {
         format!(" ({}){checked}", answered.join(", "))
     };
-    let Some(text) = follow_up else {
-        return Ok(format!("resumed{answers}"));
+    // The draft goes back after the follow-up: typed first, the two would
+    // be submitted as one prompt.
+    let restore = |note: String| match draft {
+        Some(text)
+            if target
+                .backend
+                .send_prompt_text_on(socket, &target.pane, text) =>
+        {
+            format!("{note}; restored the half-typed prompt")
+        }
+        _ => note,
     };
-    Ok(if send_follow_up(target, text) {
-        format!("sent {text:?}{answers}")
+    let Some(text) = follow_up else {
+        return restore(format!("resumed{answers}"));
+    };
+    if !send_follow_up(target, text) {
+        return restore(format!("resumed{answers}; follow-up could not be typed"));
+    }
+    let started = wait_until(Duration::from_secs(20), || {
+        target
+            .backend
+            .capture_pane_on(socket, &target.pane)
+            .is_some_and(|screen| turn_running(&screen))
+    });
+    restore(if started {
+        format!("sent {text:?}, and the agent picked the turn back up{answers}")
     } else {
-        format!("resumed{answers}; follow-up could not be typed")
+        format!("sent {text:?}{answers}, but no turn started within 20s")
     })
+}
+
+/// Poll `ready` until it holds or `timeout` passes.
+fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let started = Instant::now();
+    loop {
+        if ready() {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(400));
+    }
+}
+
+/// Does the bottom of `screen` show a turn in progress? Both TUIs print an
+/// interrupt hint while working; Claude's spinner line also counts up
+/// (`✻ Thinking… (12s · ↓ 300 tokens)`).
+fn turn_running(screen: &str) -> bool {
+    let tail = screen_tail(screen, 12);
+    tail.contains("esc to interrupt")
+        || tail.lines().any(|line| {
+            // Claude's spinner: `… (12s ·`, `… (1m 3s ·`.
+            line.split_once("… (").is_some_and(|(_, rest)| {
+                let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                digits > 0 && matches!(rest[digits..].chars().next(), Some('s' | 'm'))
+            })
+        })
+}
+
+/// Placeholder text an empty Codex composer shows.
+const CODEX_PLACEHOLDERS: &[&str] = &[
+    "Ask Codex to do anything",
+    "Find and fix a bug",
+    "Explain this codebase",
+    "Summarize recent commits",
+    "Improve documentation",
+    "Write tests",
+    "Implement {feature}",
+    "Run /review",
+    "Use /skills",
+];
+
+/// What was half-typed into the agent's prompt, if anything. Claude's prompt
+/// sits between the last two horizontal rules, after `❯`; Codex's is the
+/// last `› ` line that is not its placeholder or a menu row.
+fn composer_draft(screen: &str, kind: AgentKind) -> Option<String> {
+    let lines: Vec<&str> = screen.lines().collect();
+    let text = match kind {
+        AgentKind::ClaudeCode => {
+            let rules: Vec<usize> = lines
+                .iter()
+                .enumerate()
+                .filter(|(_, line)| {
+                    let line = line.trim();
+                    line.chars().count() >= 5 && line.chars().all(|c| c == '─')
+                })
+                .map(|(i, _)| i)
+                .collect();
+            let [.., top, bottom] = rules[..] else {
+                return None;
+            };
+            lines[top + 1..bottom]
+                .iter()
+                .map(|line| line.trim())
+                .collect::<Vec<_>>()
+                .join(" ")
+                .trim_start_matches('❯')
+                .trim()
+                .to_owned()
+        }
+        AgentKind::Codex => {
+            let line = lines.iter().rev().find(|line| line.starts_with("› "))?;
+            let text = line["› ".len()..].trim().to_owned();
+            // A menu row (`› 1. Trust and continue`) sits above key hints.
+            let menu_row = open_question(screen).is_some()
+                && text
+                    .split_once(". ")
+                    .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+            if menu_row || CODEX_PLACEHOLDERS.contains(&text.as_str()) {
+                return None;
+            }
+            text
+        }
+        _ => return None,
+    };
+    (!text.is_empty()).then_some(text)
+}
+
+/// Stop the agent in `target`'s pane, keeping a direct pane open past the
+/// exit so it can be respawned. A refusal undoes that.
+fn stop_agent(
+    target: &Target,
+    launch: &PaneLaunch,
+    follow_up: Option<&str>,
+    draft: Option<&str>,
+    answered: &mut Vec<&'static str>,
+) -> Result<(), Refusal> {
+    let socket = target.socket.as_deref();
+    if target.direct
+        && !target
+            .backend
+            .set_remain_on_exit_on(socket, &target.pane, true)
+    {
+        return Err(
+            "the pane runs the agent directly and cannot be kept open to relaunch it".into(),
+        );
+    }
+    let stopped = if target.kind == AgentKind::ClaudeCode {
+        exit_claude(target, launch, follow_up, draft, answered)
+    } else {
+        stop(launch).map_err(Refusal::from)
+    };
+    if stopped.is_err() && target.direct {
+        target
+            .backend
+            .set_remain_on_exit_on(socket, &target.pane, false);
+    }
+    stopped
+}
+
+/// Respawn a pane that ran its agent directly with `command`, keeping the
+/// pane id, then follow the pane's new root process.
+fn relaunch_in_place(target: &Target, command: &str) -> Result<(), Refusal> {
+    let socket = target.socket.as_deref();
+    // The pane had no shell; run the relaunch through the user's login
+    // shell, which has the `PATH` the typed line would have had.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    let line =
+        crate::shell::Dialect::native().command_line(&[shell, "-lic".into(), command.to_owned()]);
+    if !target
+        .backend
+        .respawn_pane_on(socket, &target.pane, &target.cwd, &line)
+    {
+        return Err(
+            "the agent stopped, but its pane could not be respawned with the relaunch; \
+             it is kept open"
+                .into(),
+        );
+    }
+    // `%5` exists on every server: match the pane's own.
+    for _ in 0..10 {
+        if let Some(pane) = target.backend.list_panes().into_iter().find(|pane| {
+            pane.pane_id == target.pane
+                && socket.is_none_or(|socket| pane.socket.as_deref().is_none_or(|s| s == socket))
+        }) {
+            target.pane_pid.set(pane.pane_pid);
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    Err("respawned the pane, but could not find it again to follow the relaunch".into())
 }
 
 /// Type `text` and submit it.
@@ -1319,6 +1587,7 @@ fn exit_claude(
     target: &Target,
     launch: &PaneLaunch,
     follow_up: Option<&str>,
+    draft: Option<&str>,
     answered: &mut Vec<&'static str>,
 ) -> Result<(), Refusal> {
     let socket = target.socket.as_deref();
@@ -1331,6 +1600,12 @@ fn exit_claude(
         if let Some(text) = follow_up.filter(|_| target.busy) {
             std::thread::sleep(Duration::from_millis(800));
             send_follow_up(target, text);
+        }
+        if let Some(text) = draft {
+            std::thread::sleep(Duration::from_millis(300));
+            target
+                .backend
+                .send_prompt_text_on(socket, &target.pane, text);
         }
         Err(Refusal::Kept(note.to_owned()))
     };
@@ -1474,13 +1749,76 @@ fn process_command(pid: u32) -> Option<String> {
     (output.status.success() && !line.is_empty()).then_some(line)
 }
 
+/// Is `command` an interactive shell, one with a prompt a relaunch can be
+/// typed at? `sh script` and `sh -c '…'` run a command and have none; any
+/// other option (`--norc`, `-o vi`, `-NoLogo`) leaves a shell interactive.
 fn is_shell(command: &str) -> bool {
-    crate::shell::is_shell_program(command)
+    let mut words = command.split_whitespace();
+    if !crate::shell::is_shell_program(words.next().unwrap_or_default()) {
+        return false;
+    }
+    !words.any(|word| {
+        let short_c = word.starts_with('-')
+            && !word.starts_with("--")
+            && word[1..].chars().all(|c| c.is_ascii_alphabetic())
+            && word.contains('c');
+        // A script: a path, not an option value like `vi` in `-o vi`.
+        let script = !word.starts_with('-')
+            && (word.contains('/')
+                || std::path::Path::new(word)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("sh")));
+        short_c || script
+    })
+}
+
+/// Is there an interactive shell between the agent and its pane's root
+/// (the root included), one a relaunch can be typed into? `None` when the
+/// root could not be read. A pane can start a wrapper that starts the shell
+/// (`reattach-to-user-namespace -l zsh`), so the root alone does not tell.
+fn shell_above(processes: &[ProcessInfo], agent_pid: u32, pane_pid: u32) -> Option<bool> {
+    let by_pid = |pid: u32| processes.iter().find(|p| p.pid == pid);
+    let root = by_pid(pane_pid)?;
+    if agent_pid == pane_pid {
+        return Some(false);
+    }
+    let mut pid = by_pid(agent_pid)?.parent_pid;
+    while pid != pane_pid {
+        let process = by_pid(pid)?;
+        if is_shell(&process.cmdline) {
+            return Some(true);
+        }
+        pid = process.parent_pid;
+    }
+    Some(is_shell(&root.cmdline))
+}
+
+/// Every process in a pane: its root, then the root's descendants. The root
+/// is the agent itself in a pane started as `exec claude …`.
+fn pane_processes(pane_pid: u32) -> Vec<ProcessInfo> {
+    let mut processes = crate::process_tree::read_descendants(pane_pid);
+    if let Some(cmdline) = process_command(pane_pid) {
+        processes.insert(
+            0,
+            ProcessInfo {
+                pid: pane_pid,
+                parent_pid: 0,
+                depth: 0,
+                comm: cmdline
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+                cmdline,
+            },
+        );
+    }
+    processes
 }
 
 /// Is the relaunched agent, on this conversation, still running in the pane?
 fn resumed_agent_running(target: &Target) -> bool {
-    crate::process_tree::read_descendants(target.pane_pid)
+    pane_processes(target.pane_pid.get())
         .iter()
         .any(|p| is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str()))
 }
@@ -2556,6 +2894,119 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    // ---- panes that run the agent directly, drafts, resumed turns ----
+
+    #[test]
+    fn only_a_shell_waiting_at_its_prompt_counts_as_one() {
+        for shell in [
+            "-zsh",
+            "/bin/zsh",
+            "bash -l",
+            "zsh -i",
+            "/opt/homebrew/bin/fish",
+            "bash --norc",
+            "zsh -o vi",
+            "pwsh -NoLogo",
+        ] {
+            assert!(is_shell(shell), "{shell}");
+        }
+        for not_one in [
+            "sh /tmp/bin/aas e x@claude",
+            "zsh -lic 'claude; exec zsh'",
+            "sh -c claude",
+            "claude",
+        ] {
+            assert!(!is_shell(not_one), "{not_one}");
+        }
+    }
+
+    #[test]
+    fn a_shell_behind_a_wrapper_still_takes_the_relaunch() {
+        // tmux's default-command on macOS: the root is not the shell.
+        let processes = [
+            proc(10, 0, 0, "reattach-to-user-namespace -l /bin/zsh"),
+            proc(11, 10, 1, "/bin/zsh"),
+            proc(12, 11, 2, "claude --resume x"),
+        ];
+        assert_eq!(shell_above(&processes, 12, 10), Some(true));
+        let direct = [
+            proc(20, 0, 0, "/bin/sh /tmp/bin/aas e x@claude"),
+            proc(21, 20, 1, "/bin/sh /tmp/bin/claude"),
+        ];
+        assert_eq!(shell_above(&direct, 21, 20), Some(false));
+        // An unreadable root is never taken as "no shell".
+        assert_eq!(shell_above(&processes[1..], 12, 10), None);
+    }
+
+    #[test]
+    fn an_agent_that_is_its_panes_root_process_is_found() {
+        let processes = [proc(
+            10,
+            0,
+            0,
+            "claude --dangerously-skip-permissions --resume 5a95b526-0439-4938-adb8-a24055198731",
+        )];
+        let launch = find_launch(&processes, 10, AgentKind::ClaudeCode).unwrap();
+        assert_eq!((launch.agent_pid, launch.top_pid), (10, 10));
+        assert_eq!(
+            launch.resumed_id.as_deref(),
+            Some("5a95b526-0439-4938-adb8-a24055198731")
+        );
+    }
+
+    #[test]
+    fn recent_activity_counts_as_mid_turn_unless_forced_or_capped() {
+        let now = time::OffsetDateTime::now_utc();
+        let mut quiet = agent("%1", "s1", AgentKind::ClaudeCode, AgentState::Idle);
+        quiet.last_activity_at = now - time::Duration::seconds(5);
+        let mut capped = limited("%2", "s2");
+        capped.last_activity_at = now;
+        let agents = [quiet, capped];
+        let mut req = request(SwapScope::All);
+        let (chosen, skipped) = select_at(&agents, &req, now);
+        assert_eq!(chosen.len(), 1, "the capped one goes");
+        assert!(
+            skipped[0].note.contains("active in the last 20s"),
+            "{skipped:?}"
+        );
+        req.force = true;
+        assert_eq!(select_at(&agents, &req, now).0.len(), 2);
+    }
+
+    #[test]
+    fn a_half_typed_prompt_is_read_back_for_both_agents() {
+        let claude = "⏺ Done.\n────────\n❯ fix the login\n  redirect too\n────────\n  ⏵⏵ bypass permissions on\n";
+        assert_eq!(
+            composer_draft(claude, AgentKind::ClaudeCode).as_deref(),
+            Some("fix the login redirect too")
+        );
+        let empty = "⏺ Done.\n────────\n❯ \n────────\n  ⏵⏵ bypass permissions on\n";
+        assert_eq!(composer_draft(empty, AgentKind::ClaudeCode), None);
+        let codex = "• Edited x\n› write a test for the parser\n  GPT-6.1-Sol medium · ~/p\n";
+        assert_eq!(
+            composer_draft(codex, AgentKind::Codex).as_deref(),
+            Some("write a test for the parser")
+        );
+        for idle in [
+            "› Ask Codex to do anything\n",
+            "› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit\n",
+        ] {
+            assert_eq!(composer_draft(idle, AgentKind::Codex), None, "{idle}");
+        }
+    }
+
+    #[test]
+    fn a_resumed_turn_is_recognised_on_either_tui() {
+        assert!(turn_running("✻ Thinking… (12s · ↓ 300 tokens)\n────\n❯ \n"));
+        assert!(turn_running(
+            "• Working (5s • esc to interrupt)\n› Ask Codex to do anything\n"
+        ));
+        assert!(!turn_running(
+            "✻ Cooked for 1m 2s · done 4:45 PM\n────\n❯ \n"
+        ));
+        assert!(!turn_running(RESUMED));
+    }
+
     // ---- configured accounts: no aas involved ----
 
     fn account(name: &str, key: &str, value: &str) -> crate::accounts::AccountProfile {
@@ -2638,7 +3089,7 @@ mod tests {
                 r#"trap '' INT
 echo "FAKE CLAUDE on $CLAUDE_CONFIG_DIR $*"
 echo '⏵⏵ bypass permissions on'
-while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; done
+while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; echo '✻ Working… (1s · esc to interrupt)'; done
 "#
             ),
             0o755,
@@ -2707,7 +3158,104 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; d
             )),
             "{screen}"
         );
-        assert!(screen.trim_end().ends_with("GOT continue"), "{screen}");
+        assert!(screen.contains("GOT continue"), "{screen}");
+        assert!(
+            outcome.note.contains("picked the turn back up"),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "drives a private tmux server; run with --ignored"]
+    fn swaps_a_live_pane_that_runs_its_agent_directly() {
+        use std::process::Command;
+        let _live = live_tmux();
+        let dir = std::env::temp_dir().join(format!("muxa-swap-direct-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let script = |name: &str, body: &str| {
+            crate::test_support::write_executable(
+                &bin.join(name),
+                format!("#!/bin/sh\n{body}\n"),
+                0o755,
+            );
+        };
+        script(
+            "aas",
+            r#"trap '' INT; shift 2; "$(dirname "$0")/claude" "$@""#,
+        );
+        script(
+            "claude",
+            r#"trap '' INT
+echo "FAKE CLAUDE $*"
+echo '⏵⏵ bypass permissions on'
+while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; echo '✻ Working… (1s · esc to interrupt)'; done"#,
+        );
+        let socket = dir.join("tmux.sock");
+        let socket = socket.to_str().unwrap();
+        let tmux = |args: &[&str]| {
+            let out = Command::new(crate::tmux::tmux_binary())
+                .arg("-S")
+                .arg(socket)
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        // The pane *is* the agent: no shell behind it to type a relaunch into.
+        let launch = format!(
+            "{} e e-ed@claude --dangerously-skip-permissions fix it",
+            bin.join("aas").display()
+        );
+        tmux(&[
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "160",
+            "-y",
+            "40",
+            &launch,
+        ]);
+        std::env::set_var("MUXA_TMUX_SOCKET", socket);
+        let pane = tmux(&["display-message", "-p", "#{pane_id}"]);
+        std::thread::sleep(Duration::from_secs(1));
+
+        let sid = "0c5a1d2e-0000-4000-8000-0000000d17ec";
+        let mut capped = limited(&pane, sid);
+        capped.tmux_socket = None;
+        let mut request = request(SwapScope::Targets(vec![pane.clone()]));
+        request.to = AccountChoice::Named("jelly@claude".into());
+        let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
+        let outcomes = run(
+            &request,
+            &[capped],
+            &[backend],
+            &SwapConfig::default(),
+            &crate::accounts::AccountsConfig::default(),
+        );
+        let screen = tmux(&["capture-pane", "-p", "-t", &pane]);
+        let still_there = tmux(&[
+            "display-message",
+            "-p",
+            "-t",
+            &pane,
+            "#{pane_id} #{pane_dead}",
+        ]);
+        tmux(&["kill-server"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let outcome = &outcomes[0];
+        assert_eq!(outcome.status, SwapStatus::Swapped, "{outcome:?}\n{screen}");
+        assert_eq!(still_there, format!("{pane} 0"), "same pane, alive");
+        assert!(
+            screen.contains(&format!(
+                "FAKE CLAUDE --dangerously-skip-permissions --resume {sid}"
+            )),
+            "{screen}"
+        );
+        assert!(screen.contains("GOT continue"), "{screen}");
     }
 
     #[test]
@@ -2743,7 +3291,7 @@ case "$*" in *--resume*)
   case "$answer" in *'[B'*) echo TRUSTED ;; *) echo REFUSED; exit 1 ;; esac ;;
 esac
 echo '⏵⏵ bypass permissions on'
-while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; done"#,
+while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; echo '✻ Working… (1s · esc to interrupt)'; done"#,
         );
         let socket = dir.join("tmux.sock");
         let socket = socket.to_str().unwrap();
@@ -2797,7 +3345,11 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; d
         assert_eq!(outcome.status, SwapStatus::Swapped, "{outcome:?}\n{screen}");
         assert!(screen.contains("TRUSTED"), "{screen}");
         assert!(outcome.note.contains("trusted the folder"), "{outcome:?}");
-        assert!(screen.trim_end().ends_with("GOT continue"), "{screen}");
+        assert!(screen.contains("GOT continue"), "{screen}");
+        assert!(
+            outcome.note.contains("picked the turn back up"),
+            "{outcome:?}"
+        );
         assert_eq!(outcome.from.as_deref(), Some("e-ed@claude"));
         let command = outcome.command.as_deref().unwrap_or_default();
         assert!(!command.starts_with("/bin/sh"), "{command}");
