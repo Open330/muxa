@@ -208,6 +208,13 @@
 # path        = "/home/$USER/.local/share/muxa/state.json"
 # debounce_ms = 200                  # coalesce window between dirty signal and write
 
+# `muxa config export` / `diff` / `apply`: share portable settings between
+# hosts. This table is this host's own choice and is never exported.
+# See docs/CONFIGURATION.md#sharing-settings-between-hosts.
+# [config_sync]
+# categories = ["pipeline", "skills", "automation"]   # default: all
+# ignore     = ["pipeline.solo", "ticket"]
+
 # Moving agents onto another `aas` account (`muxa swap`, and the
 # `swap_account` automation action). See docs/ACCOUNT_SWAP.md.
 [swap]

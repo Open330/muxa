@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa config export` / `diff` / `apply` share portable settings between
+  hosts through any transport. Machine-specific settings never travel and are
+  refused in a bundle; apply is three-way against the last-applied base, so
+  local edits survive and changes on both sides are reported as conflicts.
+  `diff` exits 0/1/2 like `kubectl diff`. `[config_sync]` lets a host choose
+  its categories and ignore items.
+
 ### Changed
 
 - CLI and MCP message lists query filtered, paged history in the daemon.

@@ -57,6 +57,47 @@ enum ConfigCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Write this host's portable settings as a bundle another host can
+    /// apply. Machine-specific settings (dashboard, paths, accounts) and
+    /// anything in `[config_sync] ignore` are left out.
+    Export {
+        /// Bundle file to write; standard output when omitted or `-`.
+        #[arg(short, long, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Category to include; repeatable. Defaults to `[config_sync]
+        /// categories`, or all: pipeline, skills, automation, agent, watch,
+        /// collaboration, ticket.
+        #[arg(long = "category", value_name = "NAME")]
+        categories: Vec<String>,
+    },
+    /// Preview what applying a bundle would change, writing nothing. Exits
+    /// 0 when there is nothing to change, 1 when there is, 2 on an error
+    /// or a conflict.
+    Diff {
+        /// Bundle file; `-` reads standard input.
+        bundle: PathBuf,
+        #[arg(long, value_enum)]
+        prefer: Option<crate::config_sync_cmd::PreferArg>,
+        #[arg(long)]
+        switch_source: bool,
+    },
+    /// Apply a bundle three-way: an item changes only where this host still
+    /// has what it last applied, local edits survive, and an item changed on
+    /// both sides is a conflict. Backs up the file and writes through muxad.
+    Apply {
+        /// Bundle file; `-` reads standard input (then `--yes` is required).
+        bundle: PathBuf,
+        /// Apply without asking.
+        #[arg(short, long)]
+        yes: bool,
+        /// Settle every conflict one way instead of stopping.
+        #[arg(long, value_enum)]
+        prefer: Option<crate::config_sync_cmd::PreferArg>,
+        /// Accept a bundle from a different source than the last apply;
+        /// its items are treated as a first sync.
+        #[arg(long)]
+        switch_source: bool,
+    },
 }
 
 pub(crate) async fn run(args: Args, socket: PathBuf) -> Result<()> {
@@ -137,6 +178,25 @@ pub(crate) async fn run(args: Args, socket: PathBuf) -> Result<()> {
                     bail!(message);
                 }
             }
+        }
+        ConfigCommand::Export { output, categories } => {
+            crate::config_sync_cmd::export(&client, output.as_deref(), &categories).await?;
+        }
+        ConfigCommand::Diff {
+            bundle,
+            prefer,
+            switch_source,
+        } => {
+            let code = crate::config_sync_cmd::diff(&client, &bundle, prefer, switch_source).await;
+            std::process::exit(code);
+        }
+        ConfigCommand::Apply {
+            bundle,
+            yes,
+            prefer,
+            switch_source,
+        } => {
+            crate::config_sync_cmd::apply(&client, &bundle, yes, prefer, switch_source).await?;
         }
     }
     Ok(())

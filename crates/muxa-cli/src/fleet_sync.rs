@@ -205,11 +205,26 @@ struct Pending {
     backup: std::path::PathBuf,
 }
 
-fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_extension("toml.fleet-sync-pending.json")
 }
 
-fn private_options() -> std::fs::OpenOptions {
+/// The one lock every sync writer of a config file takes, so Fleet sync and
+/// `muxa config apply` never interleave their journals.
+pub(crate) fn lock_config(path: &std::path::Path) -> Result<std::fs::File> {
+    let lock = private_options()
+        .read(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("toml.fleet-sync.lock"))?;
+    lock.try_lock()
+        .context("another sync is applying this config")?;
+    Ok(lock)
+}
+
+/// Open options for a file only this user may read: backups and journals
+/// hold the whole private config.
+pub(crate) fn private_options() -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
     options.write(true);
     #[cfg(unix)]
@@ -220,7 +235,8 @@ fn private_options() -> std::fs::OpenOptions {
     options
 }
 
-fn write_pending(path: &std::path::Path, pending: &Pending) -> Result<()> {
+/// Durably create a journal at `path`, refusing to replace an unfinished one.
+pub(crate) fn write_journal<T: Serialize>(path: &std::path::Path, pending: &T) -> Result<()> {
     if path.exists() {
         bail!(
             "an unfinished sync journal already exists: {}",
@@ -246,7 +262,7 @@ fn write_pending(path: &std::path::Path, pending: &Pending) -> Result<()> {
     result
 }
 
-fn ensure_parent(path: &std::path::Path) -> Result<()> {
+pub(crate) fn ensure_parent(path: &std::path::Path) -> Result<()> {
     if !path.is_absolute() {
         bail!("daemon returned a relative config path; upgrade muxad or start it with an absolute --config path");
     }
@@ -280,7 +296,7 @@ async fn persist(
         after: next.clone(),
         backup: backup.clone(),
     };
-    write_pending(&pending_path(&current.path), &pending)?;
+    write_journal(&pending_path(&current.path), &pending)?;
     // Keep the journal on IPC failure: the write may have landed despite a
     // lost response. A retry resolves it under the same per-config file lock.
     client.config_write(&next, Some(&current.text)).await?;
@@ -342,13 +358,14 @@ where
         return Ok("unchanged".into());
     }
     ensure_parent(&initial.path)?;
-    let lock = private_options()
-        .read(true)
-        .create(true)
-        .truncate(false)
-        .open(initial.path.with_extension("toml.fleet-sync.lock"))?;
-    lock.try_lock()
-        .context("another Fleet sync is applying this config")?;
+    let _lock = lock_config(&initial.path)?;
+    let other = crate::config_sync_cmd::journal_path(&initial.path);
+    if other.exists() {
+        bail!(
+            "an unfinished `muxa config apply` holds this config; rerun it to recover ({})",
+            other.display()
+        );
+    }
     let current = client.config_read().await?;
     let journal = pending_path(&current.path);
     let mut recovered = false;

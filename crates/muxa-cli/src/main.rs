@@ -9,6 +9,7 @@ mod automation;
 mod collab_screen;
 mod collaboration_output;
 mod config_cmd;
+mod config_sync_cmd;
 mod daemon;
 mod dashboard_tui;
 mod doctor;

@@ -497,6 +497,58 @@ Codex rollout 조회는 전체 `interval_secs` 보정 주기와 별개로 2초�
 `paneless_stale_timeout_secs`는 pane·surface·pid가 모두 없는 레지스트리 행을
 기본 24시간 후 stopped로 전환하며, `0`이면 이 정리를 끕니다.
 
+## 호스트 간 설정 공유
+
+```sh
+muxa config export -o muxa-settings.toml      # 설정을 마친 호스트에서
+muxa config diff  muxa-settings.toml          # 다른 호스트에서 미리보기
+muxa config apply muxa-settings.toml          # 그다음 적용
+```
+
+번들은 평범한 TOML 파일이라 dotfiles를 옮기는 방식(git, `scp`, gist) 그대로
+옮기면 됩니다. 에디터·dotfile 동기화 도구와 같은 방식으로 동작합니다.
+
+- **공유 가능한 설정만 옮깁니다.** 카테고리는 `pipeline`, `skills`
+  (`[message.skills]`), `automation`(`enabled`와 이름별 규칙), `agent`
+  (`[agent.<program>].options`), `watch`, `collaboration`, `ticket`
+  (`[ticket.source.<name>]` 포함)입니다. 한 기계에 묶인 설정은 내보내지 않고,
+  번들에 들어 있으면 거부합니다: `[dashboard]`, `[ask]`, `[fleet]`,
+  `[[route]]`(경로가 로컬), `collaboration.path`, `ticket.cwd` /
+  `additional_dirs`, `[watch]`의 composer 상태, `automation.paused_until`,
+  `[agent.<program>].account`. 계정을 바꾸는 자동화 규칙(`swap_account`)은 그
+  호스트의 도구에 의존하므로 통째로 남기고, export가 그 사실을 알려 줍니다.
+- **apply는 3-way입니다.** 호스트마다 출처별로 마지막에 적용한 내용을
+  기억합니다(`$XDG_DATA_HOME/muxa/config-sync/`). 로컬 값이 그 base와 같을
+  때만 바뀝니다. upstream이 그대로면 로컬 수정은 유지되고, upstream에서 지운
+  항목은 동기화가 넣은 것만 지우며, 양쪽에서 바뀐 항목은 충돌입니다. 충돌이
+  있으면 직접 정리하거나, 해당 항목을 ignore하거나, `--prefer local|incoming`을
+  고를 때까지 적용하지 않습니다. 한 출처에서 처음 적용할 때는 추가·교체만 하고
+  지우지 않습니다.
+- **먼저 미리보기.** `diff`는 아무것도 쓰지 않고 `kubectl diff`처럼 종료합니다:
+  `0` 변경 없음, `1` 변경 있음, `2` 오류나 충돌. 바뀐 항목만 보여 주고 주변
+  설정은 보여 주지 않습니다.
+- **안전한 쓰기.** `apply`는 계획된 항목만 고쳐서 다른 곳의 주석과 배치를
+  그대로 둡니다. 파일을 백업하고, muxad를 거쳐 씁니다(검증하며, 그사이 파일이
+  바뀌었으면 거부). Fleet sync와 같은 lock·복구를 씁니다. 적용 후 muxad를
+  재시작해야 반영됩니다.
+
+번들은 어느 호스트에서 왔는지 기억합니다. 다른 출처의 번들은
+`--switch-source`가 있어야 적용되고, 그 뒤로는 첫 동기화로 취급합니다.
+
+어떤 설정에 참여할지는 호스트가 정하며, 이 설정은 내보내지 않습니다.
+
+```toml
+[config_sync]
+categories = ["pipeline", "skills", "automation"]   # 기본값: 전부
+ignore = ["pipeline.solo", "automation.rule.confirm-selected-yes", "ticket"]
+```
+
+자유 텍스트는 쓰인 그대로 옮겨집니다. pipeline prompt, skill, ticket prompt,
+provider option에는 경로나 비밀값이 들어 있을 수 있으니, 번들을 공개하기 전에
+읽어 보거나 남길 항목을 `ignore`하세요. 에이전트 연동(hook, MCP, skill)은
+번들에 들어가지 않습니다. 호스트마다 `muxa init`을 실행하되, 쓰는 provider 홈마다
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME`을 지정하세요.
+
 ## Fleet
 
 ```toml
