@@ -75,6 +75,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   original deadline. A connection closed without any answer is reported as
   "muxad closed the connection before answering" rather than
   `json error: EOF while parsing a value`.
+- `muxa doctor` checks the provider home the session runs under: an active
+  `CLAUDE_CONFIG_DIR` or `CODEX_HOME` whose config lacks the muxa MCP server
+  is reported with the command that installs it, instead of passing because
+  the ownership manifest only re-checks files init wrote.
+- Agent integration writes to `.claude.json` take Claude Code's own
+  `.claude.json.lock` and keep a compact file compact, so a one-entry edit no
+  longer rewrites the whole file or races a running session.
 - Fleet automation sync creates missing configuration directories, recovers
   incomplete reloads on retry, and serializes concurrent applies. Config
   documents report absolute paths so backups stay beside the daemon's file.

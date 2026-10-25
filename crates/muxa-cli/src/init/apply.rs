@@ -257,6 +257,10 @@ fn apply_edit(
         _ => None,
     };
     let path = resolved.as_deref().unwrap_or(path);
+    // Claude Code rewrites `.claude.json` from many processes under its own
+    // lock; take the same lock so a running session cannot interleave with
+    // this check-and-write.
+    let _owner_lock = OwnerLock::acquire(path)?;
     let current = match fs::read_to_string(path) {
         Ok(text) => Some(text),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -287,6 +291,72 @@ fn apply_edit(
     atomic_write(path, after)?;
     report.edited.push(path.to_path_buf());
     Ok(())
+}
+
+/// The lock another program keeps around a file muxa edits.
+///
+/// Claude Code guards `.claude.json` with `proper-lockfile`: a directory
+/// `<file>.lock` created with `mkdir` (atomic) and refreshed while held,
+/// stale once its mtime is ten seconds old. Following that protocol is how
+/// a cooperating writer avoids a lost update; files without a known owner
+/// protocol take no lock.
+struct OwnerLock(Option<PathBuf>);
+
+impl OwnerLock {
+    const STALE: std::time::Duration = std::time::Duration::from_secs(10);
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    fn acquire(path: &Path) -> Result<Self> {
+        Self::acquire_within(path, Self::WAIT)
+    }
+
+    fn acquire_within(path: &Path, wait: std::time::Duration) -> Result<Self> {
+        if path.file_name().and_then(|n| n.to_str()) != Some(".claude.json") {
+            return Ok(Self(None));
+        }
+        // No directory yet means no other writer can hold the file.
+        if !path.parent().is_some_and(Path::is_dir) {
+            return Ok(Self(None));
+        }
+        let lock = path.with_file_name(".claude.json.lock");
+        let deadline = std::time::Instant::now() + wait;
+        loop {
+            match fs::create_dir(&lock) {
+                Ok(()) => return Ok(Self(Some(lock))),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let stale = fs::metadata(&lock)
+                        .and_then(|m| m.modified())
+                        .ok()
+                        .and_then(|t| t.elapsed().ok())
+                        .is_some_and(|age| age > Self::STALE);
+                    if stale {
+                        // The protocol's own recovery: a holder that stopped
+                        // refreshing for the stale period is gone.
+                        let _ = fs::remove_dir(&lock);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        anyhow::bail!(
+                            "{} is locked by another writer (Claude Code); try again",
+                            path.display()
+                        );
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("locking {}", path.display()));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for OwnerLock {
+    fn drop(&mut self) {
+        if let Some(lock) = &self.0 {
+            let _ = fs::remove_dir(lock);
+        }
+    }
 }
 
 fn apply_delete(path: &Path, dry_run: bool, report: &mut ApplyReport) -> Result<()> {
@@ -668,6 +738,39 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[test]
+    fn claude_config_writes_follow_claude_codes_lock_protocol() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(".claude.json");
+        let lock = dir.path().join(".claude.json.lock");
+        {
+            let _held = OwnerLock::acquire(&config).unwrap();
+            assert!(lock.is_dir());
+            // A second writer waits, then gives up while the lock is fresh.
+            let started = std::time::Instant::now();
+            assert!(
+                OwnerLock::acquire_within(&config, std::time::Duration::from_millis(300)).is_err()
+            );
+            assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        }
+        assert!(!lock.exists(), "released on drop");
+
+        // A holder that stopped refreshing past the stale period is gone.
+        fs::create_dir(&lock).unwrap();
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        fs::File::open(&lock)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        drop(OwnerLock::acquire_within(&config, std::time::Duration::from_millis(300)).unwrap());
+        assert!(!lock.exists());
+
+        // Other files have no owner protocol and take no lock.
+        let other = dir.path().join("config.toml");
+        let _none = OwnerLock::acquire(&other).unwrap();
+        assert!(!dir.path().join("config.toml.lock").exists());
+    }
+
     #[test]
     fn backup_inherits_original_mode() {
         use std::os::unix::fs::PermissionsExt;
