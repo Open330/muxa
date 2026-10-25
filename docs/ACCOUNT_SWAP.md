@@ -1,10 +1,44 @@
 # Account swap
 
-When one account's usage cap is spent, the conversation is still fine. With
-`aas` (Agent Account Switcher) profiles sharing `projects/` (Claude)
-and `sessions/` (Codex), the same provider session id resumes under any
-account. `muxa swap` moves agents onto another `aas` account and resumes each
-one in its own pane.
+When one account's usage cap is spent, the conversation is still fine. As
+long as the accounts share `projects/` (Claude) and `sessions/` (Codex), the
+same provider session id resumes under any account. `muxa swap` moves agents
+onto another account and resumes each one in its own pane.
+
+Accounts come from one of two places, per provider:
+
+- **`[[accounts.<provider>]]` in `config.toml`** (no external tool). Each
+  account is a name and the environment that selects it. muxa launches with
+  that environment and recognises a running agent's account from its own
+  environment, however it was started.
+- **`aas`** (Agent Account Switcher), used for a provider with no
+  `[[accounts]]` entries: candidates from `aas candidates --json`, launches
+  through `aas e <account>`.
+
+```toml
+[[accounts.claude]]
+name = "work"
+env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
+
+[[accounts.claude]]
+name = "personal"
+env_file = "~/.secrets/claude-personal.env"   # CLAUDE_CODE_OAUTH_TOKEN=…
+
+[[accounts.codex]]
+name = "work"
+env = { CODEX_HOME = "~/.codex-work" }
+```
+
+`env_file` is sourced by a small `sh` wrapper at launch, so a token never
+appears on the typed command line or in shell history; it is read again only
+to recognise the account. `auto` tries accounts in the listed order and skips
+one an agent here was capped on. `[accounts]` is host-local: config sync
+never copies it.
+
+Once a provider lists accounts, its swaps use only those: an `aas` name is
+not one of them, and `--bare` no longer applies, since an agent started bare
+is relaunched with the account's environment like any other. An `env_file`
+must be an absolute or `~/` path.
 
 ```console
 $ muxa swap --dry-run

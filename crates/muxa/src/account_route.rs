@@ -53,8 +53,12 @@ pub struct AccountRoute {
     /// `claude` or `codex`.
     pub provider: String,
     pub choice: SpawnAccount,
-    /// The configured `aas` binary (`[swap].aas`).
+    /// The configured `aas` binary (`[swap].aas`), used when the provider
+    /// lists no [`Self::profiles`].
     pub aas: String,
+    /// The provider's `[[accounts.<provider>]]`, in `auto` order. When
+    /// present, routing needs no external tool.
+    pub profiles: Vec<crate::accounts::AccountProfile>,
 }
 
 /// What routing decided, reported with the launch result.
@@ -67,26 +71,55 @@ pub struct AccountDecision {
     pub skipped: Option<String>,
 }
 
-/// A decided launch: run `aas e <account>` in place of the provider CLI.
+/// A decided launch: the words that start the provider CLI on `account`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutedLaunch {
-    /// The `aas` executable, as an absolute path where one was found: the
-    /// pane's shell need not have the same `PATH` as this process.
-    pub aas: String,
     pub account: String,
+    /// `aas e <account>` (with `aas` as an absolute path where one was
+    /// found: the pane's shell need not have this process's `PATH`), or a
+    /// configured account's `env K=V … <provider>`. Either way it ends where
+    /// the provider's own arguments begin.
+    pub launcher: Vec<String>,
 }
 
 impl RoutedLaunch {
-    /// The argv that starts `provider_args` on this account. `aas e` picks
-    /// the provider CLI from the account, so the provider's own name is not
-    /// repeated.
+    /// The argv that starts `provider_args` on this account.
     #[must_use]
     pub fn argv(&self, provider_args: impl IntoIterator<Item = String>) -> Vec<String> {
-        [self.aas.clone(), "e".into(), self.account.clone()]
-            .into_iter()
-            .chain(provider_args)
-            .collect()
+        self.launcher.iter().cloned().chain(provider_args).collect()
     }
+
+    /// Through `aas`, which picks the provider CLI from the account.
+    #[must_use]
+    pub fn via_aas(aas: String, account: String) -> Self {
+        Self {
+            launcher: vec![aas, "e".into(), account.clone()],
+            account,
+        }
+    }
+}
+
+/// A configured account, by name or the first one for `auto`. There is no
+/// quota to rank by at launch; a swap moves the agent on when it is capped.
+fn from_profiles(route: &AccountRoute) -> Result<RoutedLaunch, String> {
+    let provider = route.provider.as_str();
+    if cfg!(windows) {
+        return Err("configured accounts launch through `env`/`sh`, which this shell lacks".into());
+    }
+    let profile = match &route.choice {
+        SpawnAccount::Named(name) => crate::accounts::find_profile(&route.profiles, provider, name)
+            .ok_or_else(|| {
+                format!("no {provider} account named {name} in [[accounts.{provider}]]")
+            })?,
+        SpawnAccount::Auto => route
+            .profiles
+            .first()
+            .ok_or_else(|| format!("[[accounts.{provider}]] lists no account"))?,
+    };
+    Ok(RoutedLaunch {
+        account: profile.name.clone(),
+        launcher: profile.launch_prefix(provider),
+    })
 }
 
 /// The first eligible `provider` account, in `aas`'s own ranking.
@@ -137,13 +170,16 @@ fn decide_with(
     route: &AccountRoute,
     query: impl FnOnce(&str, &str) -> Result<Vec<Candidate>, String>,
 ) -> Result<RoutedLaunch, String> {
+    if !route.profiles.is_empty() {
+        return from_profiles(route);
+    }
     let aas = find_aas(&route.aas).ok_or_else(|| format!("`{}` not found", route.aas))?;
     let candidates = query(&aas, &route.provider)?;
     let account = match &route.choice {
         SpawnAccount::Named(name) => pinned(&candidates, name, &route.provider)?,
         SpawnAccount::Auto => choose(&candidates, &route.provider)?,
     };
-    Ok(RoutedLaunch { aas, account })
+    Ok(RoutedLaunch::via_aas(aas, account))
 }
 
 /// [`decide`], folded into what the launch result reports.
@@ -187,6 +223,7 @@ mod tests {
             choice,
             // Any file that exists stands in for the binary.
             aas: std::env::current_exe().unwrap().display().to_string(),
+            profiles: Vec::new(),
         }
     }
 
@@ -237,7 +274,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(routed.account, "ok@claude");
-        assert_eq!(routed.aas, route.aas);
+        assert_eq!(routed.launcher, [route.aas.as_str(), "e", "ok@claude"]);
     }
 
     #[test]
@@ -282,13 +319,40 @@ mod tests {
 
     #[test]
     fn argv_runs_the_provider_args_through_aas_unchanged() {
-        let routed = RoutedLaunch {
-            aas: "/opt/aas".into(),
-            account: "ok@codex".into(),
-        };
+        let routed = RoutedLaunch::via_aas("/opt/aas".into(), "ok@codex".into());
         assert_eq!(
             routed.argv(["--yolo".into(), "say \"hi\"\nthere".into()]),
             ["/opt/aas", "e", "ok@codex", "--yolo", "say \"hi\"\nthere"]
         );
+    }
+
+    fn profile(name: &str) -> crate::accounts::AccountProfile {
+        crate::accounts::AccountProfile {
+            name: name.into(),
+            env: [("CLAUDE_CONFIG_DIR".to_owned(), format!("/p/{name}"))].into(),
+            env_file: None,
+        }
+    }
+
+    #[test]
+    fn configured_accounts_route_without_aas() {
+        let mut route = route(SpawnAccount::Auto);
+        route.aas = "/nonexistent/aas".into();
+        route.profiles = vec![profile("work"), profile("home")];
+        let never = |_: &str, _: &str| -> Result<Vec<Candidate>, String> {
+            panic!("aas must not be queried")
+        };
+        let auto = decide_with(&route, never).unwrap();
+        assert_eq!(auto.account, "work");
+        assert_eq!(
+            auto.argv(["--resume".into()]),
+            ["env", "CLAUDE_CONFIG_DIR=/p/work", "claude", "--resume"]
+        );
+        route.choice = SpawnAccount::Named("home@claude".into());
+        assert_eq!(decide_with(&route, never).unwrap().account, "home");
+        route.choice = SpawnAccount::Named("nope".into());
+        assert!(decide_with(&route, never)
+            .unwrap_err()
+            .contains("no claude account named nope"));
     }
 }

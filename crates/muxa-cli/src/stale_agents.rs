@@ -302,38 +302,11 @@ fn parse_etime(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(days * 86_400 + seconds))
 }
 
-/// The server's `CODEX_HOME`, which names the daemon to restart.
-#[cfg(target_os = "linux")]
+/// The server's `CODEX_HOME`, which names the daemon to restart. Read from
+/// its environment whole: on macOS `ps eww` would cut a profile under
+/// `~/Library/Application Support/…` at the space.
 fn codex_home_of(pid: u32) -> Option<String> {
-    let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
-    codex_home_from_environment(&raw)
-}
-
-/// The server's `CODEX_HOME`, which names the daemon to restart. There is
-/// no `/proc` here, and `ps eww` joins the environment with spaces, so a
-/// profile under `~/Library/Application Support/…` would be cut at the
-/// space; sysinfo returns each entry whole (macOS `KERN_PROCARGS2`).
-#[cfg(not(target_os = "linux"))]
-fn codex_home_of(pid: u32) -> Option<String> {
-    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let pid = Pid::from_u32(pid);
-    let mut system = System::new();
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[pid]),
-        true,
-        // macOS parses argv and the environment from one KERN_PROCARGS2
-        // read; sysinfo fills `environ` only when `cmd` is refreshed too.
-        ProcessRefreshKind::nothing()
-            .with_cmd(UpdateKind::Always)
-            .with_environ(UpdateKind::Always),
-    );
-    let raw: Vec<u8> = system
-        .process(pid)?
-        .environ()
-        .iter()
-        .flat_map(|entry| entry.as_encoded_bytes().iter().copied().chain([0]))
-        .collect();
-    codex_home_from_environment(&raw)
+    codex_home_from_environment(&muxa::accounts::process_environ_raw(pid)?)
 }
 
 fn codex_home_from_environment(raw: &[u8]) -> Option<String> {

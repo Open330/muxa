@@ -147,7 +147,7 @@ fn route_account(
 ) -> Option<std::result::Result<muxa::account_route::RoutedLaunch, String>> {
     let outcome = muxa::account_route::decide(route?);
     if let Err(reason) = &outcome {
-        eprintln!("muxa: starting without an aas account: {reason}");
+        eprintln!("muxa: starting without an account: {reason}");
     }
     Some(outcome)
 }
@@ -1432,10 +1432,10 @@ mod tests {
         let build = || {
             AgentProgram::Codex.permission_launch(&["--no-daemon".into()], Some("it's\nfine"), true)
         };
-        let routed = Ok(muxa::account_route::RoutedLaunch {
-            aas: "/opt/aas".into(),
-            account: "ok@codex".into(),
-        });
+        let routed = Ok(muxa::account_route::RoutedLaunch::via_aas(
+            "/opt/aas".into(),
+            "ok@codex".into(),
+        ));
         assert_eq!(
             build().on_account(Some(&routed)).argv(),
             [

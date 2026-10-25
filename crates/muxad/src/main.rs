@@ -359,6 +359,7 @@ async fn main() -> Result<()> {
         store.clone(),
         backends.clone(),
         cfg.swap.clone(),
+        cfg.accounts.clone(),
         &shutdown_tx,
     );
 
@@ -866,6 +867,7 @@ fn spawn_automation_task(
     store: muxa::SharedStore,
     backends: Vec<muxa::SharedBackend>,
     swap: muxa::account_swap::SwapConfig,
+    accounts: muxa::accounts::AccountsConfig,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -877,6 +879,7 @@ fn spawn_automation_task(
         let mut engine = AutomationEngine::new(automation, store, backends);
         engine.ask = Some(ask);
         engine.swap = swap;
+        engine.accounts = accounts;
         engine.rescan().await;
         let mut reconcile =
             tokio::time::interval(std::time::Duration::from_secs(AUTOMATION_RECONCILE_SECONDS));
@@ -942,6 +945,9 @@ struct AutomationEngine {
     judgments: tokio::task::JoinSet<JudgedFiring>,
     /// `[swap]` defaults for the `swap_account` action.
     swap: muxa::account_swap::SwapConfig,
+    /// `[accounts]`, which the `swap_account` action moves agents between
+    /// when a provider lists them.
+    accounts: muxa::accounts::AccountsConfig,
 }
 
 struct JudgedFiring {
@@ -971,6 +977,7 @@ impl AutomationEngine {
             ask: None,
             judgments: tokio::task::JoinSet::new(),
             swap: muxa::account_swap::SwapConfig::default(),
+            accounts: muxa::accounts::AccountsConfig::default(),
         }
     }
 
@@ -1440,8 +1447,15 @@ impl AutomationEngine {
         }
         let backends = self.backends.clone();
         let config = self.swap.clone();
+        let accounts = self.accounts.clone();
         let outcomes = tokio::task::spawn_blocking(move || {
-            account_swap::run(&request, std::slice::from_ref(&agent), &backends, &config)
+            account_swap::run(
+                &request,
+                std::slice::from_ref(&agent),
+                &backends,
+                &config,
+                &accounts,
+            )
         })
         .await
         .unwrap_or_default();

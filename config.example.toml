@@ -94,11 +94,20 @@
 # [agent.codex]
 # options = ["--model", "gpt-5-codex", "--search"]
 #
-# `account` (claude / codex) starts new agents through `aas e <account>`:
-# "auto" = best-ranked aas account with quota left, or a pinned name.
-# Unset, or aas missing / nothing eligible -> the bare CLI, as before.
+# `account` (claude / codex) starts new agents on an account: one of
+# [[accounts.<provider>]] below when any are listed, else through
+# `aas e <account>` ("auto" = best-ranked aas account with quota left).
+# Unset, or nothing usable -> the bare CLI, as before.
 # [agent.claude]
 # account = "auto"
+#
+# Accounts without aas: the environment that selects each one. Host-local.
+# [[accounts.claude]]
+# name = "work"
+# env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
+# [[accounts.claude]]
+# name = "personal"
+# env_file = "~/.secrets/claude-personal.env"   # CLAUDE_CODE_OAUTH_TOKEN=...
 
 # Durable request/reply collaboration between top-level agents in the same
 # tmux window. Opt-in: idle_only delivery types only at a hook-authoritative

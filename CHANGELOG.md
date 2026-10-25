@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `[[accounts.claude]]` / `[[accounts.codex]]` list accounts by the
+  environment that selects them (`env`, or an `env_file` for tokens).
+  `muxa swap`, the `swap_account` action and `[agent.*].account` launches use
+  them with no external tool, read a running agent's account from its own
+  environment (so bare and hand-started agents are recognised), and check
+  that a swapped agent landed on the account it was sent to. Providers with
+  no entries keep using `aas`.
+
 ### Fixed
 
 - `muxa swap` no longer types its follow-up into a startup dialog. Claude's
