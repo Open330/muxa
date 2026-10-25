@@ -30,6 +30,10 @@ use tokio::io::AsyncWriteExt;
 use crate::fleet::{drain_bounded, HostAccessMode, LOCAL_HOST_ALIAS};
 
 pub const WORK_UP_TIMEOUT: Duration = Duration::from_secs(600);
+/// A swap stops, relaunches and waits on one agent after another, up to
+/// about a minute and a half each; killing it midway would leave an agent
+/// stopped with nothing resumed.
+pub const SWAP_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const MAX_WORK_UP_INPUT_BYTES: usize = 64 * 1024;
 const MAX_WORK_UP_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
 
@@ -309,12 +313,19 @@ impl WorkCommandLimits {
         max_output_bytes: MAX_WORK_UP_OUTPUT_BYTES,
     };
 
+    /// Budget for `swap`.
+    pub const SWAP: Self = Self {
+        timeout: SWAP_TIMEOUT,
+        max_output_bytes: MAX_WORK_UP_OUTPUT_BYTES,
+    };
+
     /// The budget a validated argv is entitled to.
     #[must_use]
     pub fn for_args(args: &[String]) -> Self {
-        // A swap stops, relaunches and waits on one agent after another.
+        if is_swap(args) {
+            return Self::SWAP;
+        }
         if is_work_up(args)
-            || is_swap(args)
             || args
                 .get(1)
                 .is_some_and(|s| matches!(s.as_str(), "dispatch" | "dispatch-execute"))
@@ -369,8 +380,9 @@ const SWAP_SWITCHES: &[&str] = &[
     "--dry-run",
 ];
 
-/// `muxa swap` options a remote run may pass, each as one `--flag=value`.
-const SWAP_VALUE_FLAGS: &[&str] = &["--provider", "--to", "--bare", "--continue"];
+/// `muxa swap` options a remote run may pass, each as one non-empty
+/// `--flag=value`. Only `--exclude` may repeat.
+const SWAP_VALUE_FLAGS: &[&str] = &["--provider", "--to", "--bare", "--continue", "--exclude"];
 
 /// Check a `swap` argv: JSON output, only the allowlisted flags, and plain
 /// targets (`%5`, `rmux:%5`, session ids). The daemon-owned `--socket` /
@@ -383,11 +395,19 @@ pub fn validate_swap_argv(args: &[String]) -> Result<(), String> {
     if !rest.iter().any(|arg| arg == "--json") {
         return Err("`swap` over Fleet must pass --json".into());
     }
+    let mut seen: Vec<&str> = Vec::new();
     for arg in rest {
         let switch = SWAP_SWITCHES.contains(&arg.as_str());
+        let flag = arg.split_once('=').map(|(flag, _)| flag);
         let valued = arg
             .split_once('=')
-            .is_some_and(|(flag, _)| SWAP_VALUE_FLAGS.contains(&flag));
+            .is_some_and(|(flag, value)| SWAP_VALUE_FLAGS.contains(&flag) && !value.is_empty());
+        if let Some(name) = flag.filter(|_| valued).or(switch.then_some(arg.as_str())) {
+            if name != "--exclude" && seen.contains(&name) {
+                return Err(format!("`swap` got {name} twice"));
+            }
+            seen.push(name);
+        }
         let target = !arg.starts_with('-')
             && (1..=200).contains(&arg.len())
             && arg
@@ -423,27 +443,19 @@ pub fn validate_work_command(
     stdin: Option<&str>,
     surface: WorkCommandSurface,
 ) -> Result<(), WorkCommandError> {
+    let input_bytes = args.iter().map(String::len).sum::<usize>() + optional_len(stdin);
+    if input_bytes > MAX_WORK_COMMAND_INPUT_BYTES {
+        return Err(WorkCommandError::Invalid(format!(
+            "request exceeds {MAX_WORK_COMMAND_INPUT_BYTES} bytes"
+        )));
+    }
     // WS-B: new agent — a remote `agent_start` travels as this frame too.
     // The IPC surface has its own `agent_start` kind and keeps refusing it.
     if surface == WorkCommandSurface::Relay && crate::agent_control::is_agent_start(args) {
-        crate::agent_control::validate_relay_argv(args).map_err(WorkCommandError::Invalid)?;
-        let input_bytes = args.iter().map(String::len).sum::<usize>() + optional_len(stdin);
-        if input_bytes > MAX_WORK_COMMAND_INPUT_BYTES {
-            return Err(WorkCommandError::Invalid(format!(
-                "request exceeds {MAX_WORK_COMMAND_INPUT_BYTES} bytes"
-            )));
-        }
-        return Ok(());
+        return crate::agent_control::validate_relay_argv(args).map_err(WorkCommandError::Invalid);
     }
     if is_swap(args) {
-        validate_swap_argv(args).map_err(WorkCommandError::Invalid)?;
-        let input_bytes = args.iter().map(String::len).sum::<usize>() + optional_len(stdin);
-        if input_bytes > MAX_WORK_COMMAND_INPUT_BYTES {
-            return Err(WorkCommandError::Invalid(format!(
-                "request exceeds {MAX_WORK_COMMAND_INPUT_BYTES} bytes"
-            )));
-        }
-        return Ok(());
+        return validate_swap_argv(args).map_err(WorkCommandError::Invalid);
     }
     let [command, subcommand, rest @ ..] = args else {
         return Err(WorkCommandError::Invalid(
@@ -472,12 +484,6 @@ pub fn validate_work_command(
             "`{flag}` is chosen by the daemon and cannot be passed"
         )));
     }
-    let input_bytes = args.iter().map(String::len).sum::<usize>() + optional_len(stdin);
-    if input_bytes > MAX_WORK_COMMAND_INPUT_BYTES {
-        return Err(WorkCommandError::Invalid(format!(
-            "request exceeds {MAX_WORK_COMMAND_INPUT_BYTES} bytes"
-        )));
-    }
     Ok(())
 }
 
@@ -491,7 +497,10 @@ pub fn authorize_work_command(
     if mode == HostAccessMode::Control {
         return Ok(());
     }
-    let read_only = !is_work_up(args)
+    // Only a `work …` argv has read-only subcommands; in `swap options`,
+    // `options` is a pane name.
+    let read_only = args.first().is_some_and(|command| command == "work")
+        && !is_work_up(args)
         && args.get(1).is_some_and(|subcommand| {
             WORK_COMMAND_READ_ONLY_SUBCOMMANDS.contains(&subcommand.as_str())
         });
@@ -758,21 +767,34 @@ mod tests {
         for surface in [WorkCommandSurface::Relay, WorkCommandSurface::Ipc] {
             validate_work_command(&ok, None, surface).unwrap();
         }
-        assert_eq!(WorkCommandLimits::for_args(&ok), WorkCommandLimits::WORK_UP);
+        assert_eq!(WorkCommandLimits::for_args(&ok), WorkCommandLimits::SWAP);
         for bad in [
             argv(&["swap", "--all"]),
             argv(&["swap", "--json", "--socket=/tmp/x"]),
             argv(&["swap", "--json", "--config=/etc/x"]),
             argv(&["swap", "--json", "--host=other"]),
             argv(&["swap", "--json", "%5;rm -rf ~"]),
+            argv(&["swap", "--json", "--to="]),
+            argv(&["swap", "--json", "--to=a", "--to=b"]),
+            argv(&["swap", "--json", "--force", "--force"]),
         ] {
             assert!(
                 validate_work_command(&bad, None, WorkCommandSurface::Relay).is_err(),
                 "{bad:?}"
             );
         }
-        // Moving agents is a mutation: observe-only hosts refuse it.
+        // Moving agents is a mutation: observe-only hosts refuse it, also when
+        // a target happens to be named like a read-only `work` subcommand.
         assert!(authorize_work_command("dev", HostAccessMode::Observe, &ok).is_err());
+        let sneaky = argv(&["swap", "options", "--force", "--json"]);
+        validate_work_command(&sneaky, None, WorkCommandSurface::Relay).unwrap();
+        assert!(authorize_work_command("dev", HostAccessMode::Observe, &sneaky).is_err());
+        validate_work_command(
+            &argv(&["swap", "--json", "--exclude=%1", "--exclude=%2"]),
+            None,
+            WorkCommandSurface::Relay,
+        )
+        .unwrap();
         authorize_work_command("dev", HostAccessMode::Control, &ok).unwrap();
     }
 

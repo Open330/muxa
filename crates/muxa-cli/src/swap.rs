@@ -78,6 +78,9 @@ pub struct Args {
     /// alias) instead of here: its daemon, its agents, its config.
     #[arg(long, value_name = "ALIAS")]
     host: Option<String>,
+    /// Leave this pane alone whatever the scope (repeatable).
+    #[arg(long, value_name = "PANE")]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -126,6 +129,7 @@ fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
         request.continue_when = ContinueWhen::Always;
     }
     request.dry_run = args.dry_run;
+    request.exclude.clone_from(&args.exclude);
     request
 }
 
@@ -135,7 +139,7 @@ pub(crate) async fn run(
     config: &SwapConfig,
     accounts: &muxa::accounts::AccountsConfig,
 ) -> Result<()> {
-    if let Some(host) = args.host.as_deref().filter(|host| *host != "local") {
+    if let Some(host) = muxa::work_control::remote_host_alias(args.host.as_deref()) {
         return run_remote(client, &args, host).await;
     }
     let request = request(&args, config);
@@ -200,8 +204,34 @@ fn remote_argv(args: &Args) -> Vec<String> {
     if let Some(text) = &args.continue_text {
         words.push(format!("--continue={text}"));
     }
+    words.extend(args.exclude.iter().map(|pane| format!("--exclude={pane}")));
     words.push("--json".to_owned());
     words
+}
+
+#[derive(clap::Parser)]
+#[command(name = "swap")]
+struct SwapCli {
+    #[command(flatten)]
+    args: Args,
+}
+
+/// The canonical `swap … --json` argv for `words` (a `muxa swap` command
+/// line without the program name), checked by the same parser the CLI uses
+/// so conflicting options fail here, before any process is spawned.
+pub(crate) fn checked_argv(words: &[String]) -> std::result::Result<Vec<String>, String> {
+    use clap::Parser as _;
+    let cli =
+        SwapCli::try_parse_from(std::iter::once("swap".to_owned()).chain(words.iter().cloned()))
+            .map_err(|error| {
+                error
+                    .to_string()
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned()
+            })?;
+    Ok(remote_argv(&cli.args))
 }
 
 /// `muxa swap --host`: the host's own `muxa swap` does the work, through
@@ -302,6 +332,17 @@ mod tests {
             ]
         );
         muxa::work_control::validate_swap_argv(&argv).unwrap();
+    }
+
+    #[test]
+    fn conflicting_options_fail_before_anything_is_sent() {
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert!(checked_argv(&words(&["%5", "--all"])).is_err());
+        assert!(checked_argv(&words(&["--to", "x", "--spread"])).is_err());
+        assert_eq!(
+            checked_argv(&words(&["--all", "--exclude", "%9"])).unwrap(),
+            ["swap", "--all", "--to=auto", "--exclude=%9", "--json"]
+        );
     }
 
     #[test]

@@ -135,6 +135,8 @@ pub struct SwapRequest {
     pub continue_when: ContinueWhen,
     /// Plan only: report what would happen, touch nothing.
     pub dry_run: bool,
+    /// Panes left alone whatever the scope: the caller's own, for one.
+    pub exclude: Vec<String>,
 }
 
 impl SwapRequest {
@@ -150,6 +152,7 @@ impl SwapRequest {
             continue_text: Some(config.continue_text.clone()).filter(|t| !t.trim().is_empty()),
             continue_when: config.continue_when,
             dry_run: false,
+            exclude: Vec::new(),
         }
     }
 
@@ -277,6 +280,14 @@ fn select_at<'a>(
             SwapScope::All => provider_name(agent.kind).is_some(),
         };
         if !in_scope || request.provider.is_some_and(|kind| kind != agent.kind) {
+            continue;
+        }
+        if agent
+            .pane
+            .as_deref()
+            .is_some_and(|pane| request.exclude.iter().any(|excluded| excluded == pane))
+        {
+            skipped.push(SwapOutcome::new(agent, SwapStatus::Skipped, "excluded"));
             continue;
         }
         let skip = |note: &str| SwapOutcome::new(agent, SwapStatus::Skipped, note);
@@ -2952,6 +2963,17 @@ mod tests {
             launch.resumed_id.as_deref(),
             Some("5a95b526-0439-4938-adb8-a24055198731")
         );
+    }
+
+    #[test]
+    fn excluded_panes_are_left_alone_whatever_the_scope() {
+        let agents = [limited("%1", "s1"), limited("%2", "s2")];
+        let mut req = request(SwapScope::Limited);
+        req.exclude = vec!["%1".into()];
+        let (chosen, skipped) = select(&agents, &req);
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].pane.as_deref(), Some("%2"));
+        assert_eq!(skipped[0].note, "excluded");
     }
 
     #[test]

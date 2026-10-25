@@ -670,7 +670,10 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "all": { "type": "boolean", "description": "Every Claude/Codex agent, not only capped ones." },
                     "provider": { "type": "string", "enum": ["claude", "codex"] },
                     "to": { "type": "string", "description": "Account name, or auto (default)." },
+                    "spread": { "type": "boolean", "description": "Round-robin agents over every account with quota left." },
                     "force": { "type": "boolean", "description": "Also stop agents that are mid-turn." },
+                    "continue": { "type": "string", "description": "Follow-up prompt for every swapped agent." },
+                    "no_continue": { "type": "boolean", "description": "Send no follow-up prompt." },
                     "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." }
                 },
                 "additionalProperties": false
@@ -4772,45 +4775,71 @@ fn error_result(message: &str) -> Value {
 }
 
 /// `muxa_swap_account`: `muxa swap --json` through the daemon's work
-/// command transport, here or on a Fleet host.
+/// command transport, here or on a Fleet host. The caller's own pane is
+/// never swapped from under its tool call.
 async fn swap_account(client: &Client, args: &Value) -> Value {
     let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
-    let mut words = vec!["swap".to_owned()];
-    if let Some(targets) = args.get("targets").and_then(Value::as_array) {
-        words.extend(targets.iter().filter_map(Value::as_str).map(str::to_owned));
-    }
+    let text = |name: &str| args.get(name).and_then(Value::as_str);
+    let host = muxa::work_control::remote_host_alias(text("host"));
+    let mut words: Vec<String> = args
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
     for (name, switch) in [
         ("all", "--all"),
+        ("spread", "--spread"),
         ("force", "--force"),
+        ("no_continue", "--no-continue"),
         ("dry_run", "--dry-run"),
     ] {
         if flag(name) {
             words.push(switch.to_owned());
         }
     }
-    if let Some(provider) = args.get("provider").and_then(Value::as_str) {
-        words.push(format!("--provider={provider}"));
+    for (name, option) in [
+        ("provider", "--provider"),
+        ("to", "--to"),
+        ("continue", "--continue"),
+    ] {
+        if let Some(value) = text(name) {
+            words.extend([option.to_owned(), value.to_owned()]);
+        }
     }
-    if let Some(to) = args.get("to").and_then(Value::as_str) {
-        words.push(format!("--to={to}"));
+    if host.is_none() {
+        if let Some(pane) = muxa::default_backend()
+            .current_pane()
+            .or_else(current_process_host_pane)
+        {
+            words.extend(["--exclude".to_owned(), pane]);
+        }
     }
-    words.push("--json".to_owned());
-    let host = args
-        .get("host")
-        .and_then(Value::as_str)
-        .filter(|host| !host.is_empty() && *host != "local");
-    match client.work_command(host, &words, None).await {
-        Ok(output) => match serde_json::from_str::<Value>(&output.stdout) {
-            Ok(outcomes) => {
-                json_result(&json!({ "host": host.unwrap_or("local"), "outcomes": outcomes }))
-            }
-            Err(_) => error_result(&format!(
-                "swap failed (exit {}): {}",
-                output.exit_code,
-                output.stderr.trim()
-            )),
-        },
-        Err(error) => error_result(&format!("swap failed: {error}")),
+    let command_line = match crate::swap::checked_argv(&words) {
+        Ok(command_line) => command_line,
+        Err(error) => return error_result(&format!("swap: {error}")),
+    };
+    let output = match client.work_command(host, &command_line, None).await {
+        Ok(output) => output,
+        Err(error) => return error_result(&format!("swap failed: {error}")),
+    };
+    let Ok(outcomes) = serde_json::from_str::<Value>(&output.stdout) else {
+        return error_result(&format!(
+            "swap failed (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        ));
+    };
+    let report = json!({ "host": host.unwrap_or("local"), "outcomes": outcomes });
+    let failed = outcomes
+        .as_array()
+        .is_some_and(|all| all.iter().any(|o| o["status"] == "failed"));
+    if failed || output.exit_code != 0 {
+        error_result(&format!("some agents could not be swapped: {report}"))
+    } else {
+        json_result(&report)
     }
 }
 #[cfg(test)]
