@@ -7259,6 +7259,12 @@ impl Client {
                     reached = true;
                     RuntimeError::Disconnected
                 }
+                // A connection the daemon closed while stopping can also
+                // fail on the write, before any read sees the end.
+                Err(error) if error.is_client_disconnect() => {
+                    reached = true;
+                    error
+                }
                 // While a restart is under way the socket can briefly be
                 // absent; a daemon that was never reached is simply down.
                 Err(error @ RuntimeError::NotConnected(_)) if reached => error,
@@ -10645,6 +10651,41 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, RuntimeError::NotConnected(_)), "{error}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wait_retries_when_the_daemon_closes_right_after_hello() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("closing-after-hello.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let closing = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                // Answer hello, then stop without reading the request: the
+                // client's write of the wait itself is what fails.
+                let _ = writer.write_all(b"{\"ok\":true}\n").await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = Client::new(socket)
+            .collaboration_wait(&pane_origin("%1"), "req", 2)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "gave up after {:?} on {error}",
+            started.elapsed()
+        );
+        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        closing.abort();
     }
 
     #[cfg(unix)]
