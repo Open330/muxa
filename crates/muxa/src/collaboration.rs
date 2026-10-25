@@ -1387,6 +1387,9 @@ impl CollaborationRequest {
 /// exclusive. Room matching is exact across host, socket and tmux window id.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollaborationQuery {
+    /// Optional stored-payload budget per page, with at least one whole record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
     /// CLI calendar ranges use an exclusive upper bound; existing queries remain inclusive.
     #[serde(default)]
     pub until_exclusive: bool,
@@ -2212,6 +2215,32 @@ fn append_window_query_filter(
     }
 }
 
+fn collect_query_rows(
+    rows: impl Iterator<Item = rusqlite::Result<String>>,
+    query: &CollaborationQuery,
+    limit: usize,
+) -> Result<(Vec<CollaborationRequest>, bool), CollaborationError> {
+    let mut requests: Vec<CollaborationRequest> = Vec::new();
+    let mut used = 0_usize;
+    let mut byte_limited = false;
+    for row in rows {
+        let payload = row?;
+        if !requests.is_empty()
+            && query
+                .byte_budget()
+                .is_some_and(|budget| used.saturating_add(payload.len()) > budget)
+        {
+            byte_limited = true;
+            break;
+        }
+        used = used.saturating_add(payload.len());
+        requests.push(serde_json::from_str(&payload)?);
+    }
+    let has_more = byte_limited || requests.len() > limit;
+    requests.truncate(limit);
+    Ok((requests, has_more))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn query_connection(
     connection: &Connection,
@@ -2298,12 +2327,7 @@ fn query_connection(
     let rows = statement.query_map(params_from_iter(page_values.iter()), |row| {
         row.get::<_, String>(0)
     })?;
-    let mut requests: Vec<CollaborationRequest> = Vec::new();
-    for row in rows {
-        requests.push(serde_json::from_str(&row?)?);
-    }
-    let has_more = requests.len() > limit;
-    requests.truncate(limit);
+    let (requests, has_more) = collect_query_rows(rows, query, limit)?;
     let next_cursor = if has_more {
         requests.last().map(|last| CollaborationCursor {
             created_at: last.created_at,
@@ -2371,6 +2395,11 @@ fn endpoint_matches_window(participant: &Participant, wanted: &str) -> bool {
 }
 
 impl CollaborationQuery {
+    pub fn byte_budget(&self) -> Option<usize> {
+        self.max_bytes
+            .map(|bytes| bytes.clamp(64 * 1024, 4 * 1024 * 1024))
+    }
+
     /// Compatibility selection when an older daemon returns the unbounded mailbox.
     pub fn page(&self, requests: &[CollaborationRequest], offset: usize) -> CollaborationPage {
         select_query_page(requests.iter(), self, offset)
@@ -2395,13 +2424,20 @@ fn select_query_page<'a>(
         .limit
         .unwrap_or(DEFAULT_QUERY_LIMIT)
         .clamp(1, MAX_QUERY_LIMIT);
-    let has_more = matched.len().saturating_sub(offset) > limit;
-    let requests: Vec<_> = matched
-        .into_iter()
-        .skip(offset)
-        .take(limit)
-        .cloned()
-        .collect();
+    let available = matched.len().saturating_sub(offset);
+    let mut requests = Vec::new();
+    let mut used = 0_usize;
+    for request in matched.into_iter().skip(offset).take(limit) {
+        if let Some(budget) = query.byte_budget() {
+            let size = serde_json::to_vec(request).map_or(usize::MAX, |bytes| bytes.len());
+            if !requests.is_empty() && used.saturating_add(size) > budget {
+                break;
+            }
+            used = used.saturating_add(size);
+        }
+        requests.push(request.clone());
+    }
+    let has_more = available > requests.len();
     let next_cursor = has_more.then(|| {
         let last = requests.last().expect("nonempty page");
         CollaborationCursor {
@@ -4958,6 +4994,69 @@ mod tests {
             );
         }
         created
+    }
+
+    #[tokio::test]
+    async fn byte_bounded_pages_keep_complete_records_and_cursors_in_memory_and_sqlite() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("budget.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                CollaborationStore::in_memory(CollaborationOptions::default())
+            };
+            let sender = participant("%1", "sender");
+            let recipient = participant("%2", "recipient");
+            for _ in 0..20 {
+                store
+                    .create(
+                        sender.clone(),
+                        recipient.clone(),
+                        NewRequest {
+                            body: "x".repeat(8192),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            let mut query = CollaborationQuery {
+                limit: Some(500),
+                max_bytes: Some(64 * 1024),
+                ..Default::default()
+            };
+            let mut ids = std::collections::HashSet::new();
+            loop {
+                let page = store
+                    .query_for(&sender, RequestMailbox::All, MailboxScope::Caller, &query)
+                    .await
+                    .unwrap();
+                assert_eq!(page.total, 20);
+                assert!(!page.requests.is_empty());
+                assert!(page.requests.len() < 20);
+                let bytes: usize = page
+                    .requests
+                    .iter()
+                    .map(|request| serde_json::to_vec(request).unwrap().len())
+                    .sum();
+                assert!(bytes <= 64 * 1024);
+                for request in page.requests {
+                    assert_eq!(request.body.len(), 8192);
+                    assert!(ids.insert(request.id), "cursor must not duplicate a record");
+                }
+                if !page.has_more {
+                    break;
+                }
+                assert!(page.next_cursor.is_some());
+                query.cursor = page.next_cursor;
+            }
+            assert_eq!(ids.len(), 20, "byte limits must not skip history");
+        }
     }
 
     #[tokio::test]

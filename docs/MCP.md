@@ -584,6 +584,11 @@ methods) for the underlying `send_prompt` / `capture` / `subscribe` IPC.
 
 ### Checking collaboration cost locally
 
+Full-body history queries can opt into `max_bytes`, a stored-payload budget
+clamped to 64 KiB–4 MiB. A page always contains at least one whole record; its
+continuation cursor prevents skipped history when the budget ends a page early.
+Watch keeps conservative full-body pages until budget support is acknowledged.
+
 Watch subscribes to durable mailbox revisions and reuses unchanged history.
 Disconnected/older servers fall back to reconciled reads. It uses 256-character
 previews in bounded pages without dropping historical

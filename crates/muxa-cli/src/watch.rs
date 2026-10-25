@@ -8735,7 +8735,8 @@ async fn read_watch_history(
         muxa::collaboration::CollaborationReadView::Preview
     };
     let mut query = muxa::collaboration::CollaborationQuery {
-        limit: Some(if full { 8 } else { 100 }),
+        limit: Some(if full { 8 } else { 500 }),
+        max_bytes: full.then_some(4 * 1024 * 1024),
         ..Default::default()
     };
     let mut requests = Vec::new();
@@ -8757,6 +8758,9 @@ async fn read_watch_history(
                 view.apply(request);
             }
             return Ok(legacy);
+        }
+        if full && result.byte_budget_supported {
+            query.limit = Some(500);
         }
         let page = result.page;
         requests.extend(page.requests);
@@ -28572,7 +28576,7 @@ sort = ["state"]
             &socket,
             vec![
                 (
-                    json!({"/view":"preview","/query/limit":100}),
+                    json!({"/view":"preview","/query/limit":500}),
                     page(&preview),
                 ),
                 (json!({"/view":"preview"}), page(&preview)),
@@ -28755,7 +28759,7 @@ sort = ["state"]
         use serde_json::json;
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join("legacy-watch-history.sock");
-        let records: Vec<_> = (0..101)
+        let records: Vec<_> = (0..501)
             .map(|index| {
                 let mut request = collab_request("%2");
                 request.id = format!("row-{index}");
@@ -28778,9 +28782,56 @@ sort = ["state"]
         let rows = read_watch_history(&Client::new(socket), &origin, false)
             .await
             .unwrap();
-        assert_eq!(rows.len(), 101);
-        assert_eq!(rows.last().unwrap().id, "row-100");
+        assert_eq!(rows.len(), 501);
+        assert_eq!(rows.last().unwrap().id, "row-500");
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_history_widens_pages_only_after_budget_acknowledgement() {
+        use serde_json::json;
+        for acknowledged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("page-budget.sock");
+            let first = collab_request("%2");
+            let mut second = first.clone();
+            second.id = "second".into();
+            let cursor = muxa::collaboration::CollaborationCursor {
+                created_at: first.created_at,
+                id: first.id.clone(),
+            };
+            let mut response = json!({"ok":true,"collaboration_scope":"all","collaboration_page":{"requests":[first],"total":2,"has_more":true,"next_cursor":cursor}});
+            if acknowledged {
+                response["collaboration_byte_budget"] = json!(4 * 1024 * 1024);
+            }
+            let next_limit = if acknowledged { 500 } else { 8 };
+            let server = crate::collaboration_output::mock_collaboration_responses(
+                &socket,
+                vec![
+                    (
+                        json!({"/query/limit":8,"/query/max_bytes":4*1024*1024}),
+                        response,
+                    ),
+                    (
+                        json!({"/query/limit":next_limit}),
+                        json!({"ok":true,"collaboration_scope":"all","collaboration_page":{"requests":[second],"total":2,"has_more":false}}),
+                    ),
+                ],
+            );
+            let origin = CollaborationOrigin {
+                pane: "%1".into(),
+                socket: Some("default".into()),
+                console: true,
+                agent_session_id: None,
+            };
+            let rows = read_watch_history(&Client::new(socket), &origin, true)
+                .await
+                .unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[1].body, COLLAB_FIXTURE_BODY);
+            server.await.unwrap();
+        }
     }
 
     #[test]

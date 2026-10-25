@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Watch loads preview history in 500-row pages. Full-body history widens its
+  conservative page size only after the daemon acknowledges a payload budget,
+  reducing round trips while retaining whole records and continuation cursors.
+
 ### Fixed
 
 - Mac app Work commands run independently per host instead of blocking terminal

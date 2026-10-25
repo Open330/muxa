@@ -927,6 +927,8 @@ pub struct Response {
     pub collaboration_scope: Option<MailboxScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_page: Option<collaboration::CollaborationPage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_byte_budget: Option<usize>,
     /// Present only when the daemon can restart itself. It increments across
     /// each re-exec so a client can distinguish the replacement image from
     /// the old daemon still finishing an in-flight response.
@@ -1059,6 +1061,7 @@ impl Response {
             version: None,
             collaboration_scope: None,
             collaboration_page: None,
+            collaboration_byte_budget: None,
             generation: None,
             sessions: None,
             session: None,
@@ -4775,6 +4778,9 @@ async fn handle(
                                     }
                                     let mut response = Response::ok();
                                     response.collaboration_scope = Some(scope);
+                                    response.collaboration_byte_budget = query
+                                        .as_ref()
+                                        .and_then(collaboration::CollaborationQuery::byte_budget);
                                     response.collaboration_page = Some(page);
                                     response
                                 }
@@ -5428,6 +5434,7 @@ pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
 /// consumer can select locally instead of downloading the same mailbox again.
 #[derive(Debug)]
 pub struct CollaborationQueryResult {
+    pub byte_budget_supported: bool,
     pub page: collaboration::CollaborationPage,
     pub scope: MailboxScope,
     pub legacy_requests: Option<Vec<CollaborationRequest>>,
@@ -7013,6 +7020,7 @@ impl Client {
             view.apply(request);
         }
         Ok(CollaborationQueryResult {
+            byte_budget_supported: response["collaboration_byte_budget"].as_u64().is_some(),
             page,
             scope: actual_scope,
             legacy_requests,
@@ -8375,6 +8383,25 @@ mod tests {
             1,
             "auto scope uses one authorized list request"
         );
+        let budget_query = collaboration::CollaborationQuery {
+            max_bytes: Some(64 * 1024),
+            ..query.clone()
+        };
+        let bounded = client
+            .collaboration_query_result(
+                &origin,
+                RequestMailbox::All,
+                MailboxScope::Caller,
+                &budget_query,
+                0,
+                View::Full,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(bounded.byte_budget_supported);
+        assert_eq!(bounded.page.requests.len(), 1);
+
         let terminal = CollaborationOrigin {
             pane: "%9".into(),
             ..origin.clone()
