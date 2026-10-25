@@ -2288,7 +2288,12 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         } => {
             require_capability(client, "collaboration_update", "msg update").await?;
             let request = client
-                .collaboration_update(&origin, &request_id, &body)
+                .collaboration_update_view(
+                    &origin,
+                    &request_id,
+                    &body,
+                    muxa::collaboration::CollaborationReadView::Metadata,
+                )
                 .await?;
             if json {
                 println!(
@@ -2366,13 +2371,18 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         } => {
             let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
-                .collaboration_reply(
+                .collaboration_reply_view(
                     &origin,
                     &request_id,
                     collaboration_reply_status(&status)?,
                     &body,
                     &artifacts,
                     &air_artifacts,
+                    if json {
+                        muxa::collaboration::CollaborationReadView::Full
+                    } else {
+                        muxa::collaboration::CollaborationReadView::Metadata
+                    },
                 )
                 .await?;
             print_collaboration_receipt(&request, json)?;
@@ -2487,6 +2497,19 @@ async fn cmd_msg_list(
     full: bool,
     json: bool,
 ) -> Result<()> {
+    if request_id.is_none() && scope == "auto" {
+        return cmd_msg_list_page(
+            client,
+            origin,
+            collaboration_mailbox(mailbox)?,
+            MailboxScope::Caller,
+            filters,
+            full,
+            json,
+            true,
+        )
+        .await;
+    }
     let scope = if scope == "auto" {
         match client.collaboration_context(origin).await {
             Ok(_) => MailboxScope::Caller,
@@ -2506,9 +2529,27 @@ async fn cmd_msg_list(
     let mailbox = collaboration_mailbox(mailbox)?;
     let requests = if let Some(id) = request_id {
         let request = if after_update.is_some() {
-            client.collaboration_peek(&listing_origin, id).await?
+            client
+                .collaboration_peek_view(
+                    &listing_origin,
+                    id,
+                    muxa::collaboration::CollaborationReadView::Progress {
+                        after_update: after_update.unwrap_or(0),
+                    },
+                )
+                .await?
         } else {
-            client.collaboration_get(&listing_origin, id).await?
+            client
+                .collaboration_get_view(
+                    &listing_origin,
+                    id,
+                    if full {
+                        muxa::collaboration::CollaborationReadView::Full
+                    } else {
+                        muxa::collaboration::CollaborationReadView::Metadata
+                    },
+                )
+                .await?
         };
         if matches!(scope, MailboxScope::Room) {
             let room = client
@@ -2536,8 +2577,17 @@ async fn cmd_msg_list(
         }
         vec![request]
     } else {
-        return cmd_msg_list_page(client, &listing_origin, mailbox, scope, filters, full, json)
-            .await;
+        return cmd_msg_list_page(
+            client,
+            &listing_origin,
+            mailbox,
+            scope,
+            filters,
+            full,
+            json,
+            false,
+        )
+        .await;
     };
     let total = requests
         .iter()
@@ -2550,14 +2600,16 @@ async fn cmd_msg_list(
     print_collaboration_messages(&requests, json, full, origin, scope)
 }
 
+#[allow(clippy::too_many_arguments)] // Existing display flags plus server-side auto scope.
 async fn cmd_msg_list_page(
     client: &Client,
     origin: &CollaborationOrigin,
     mailbox: RequestMailbox,
-    scope: MailboxScope,
+    mut scope: MailboxScope,
     filters: &CollaborationListFilters,
     full: bool,
     json: bool,
+    mut auto_scope: bool,
 ) -> Result<()> {
     let mut query = muxa::collaboration::CollaborationQuery {
         since: filters.range.as_ref().and_then(|range| range.since_at),
@@ -2580,9 +2632,38 @@ async fn cmd_msg_list_page(
     let mut total = None;
     loop {
         query.limit = Some(wanted.saturating_sub(requests.len()).min(500));
-        let page = client
-            .collaboration_query(origin, mailbox, scope, &query, offset, !full)
+        let view = if full {
+            muxa::collaboration::CollaborationReadView::Full
+        } else {
+            muxa::collaboration::CollaborationReadView::Metadata
+        };
+        let listing_origin = if auto_scope {
+            origin.clone()
+        } else {
+            CollaborationOrigin {
+                console: !matches!(scope, MailboxScope::Caller),
+                ..origin.clone()
+            }
+        };
+        let result = client
+            .collaboration_query_result(
+                &listing_origin,
+                mailbox,
+                scope,
+                &query,
+                offset,
+                view,
+                auto_scope,
+            )
             .await?;
+        scope = result.scope;
+        auto_scope = false;
+        if let Some(legacy) = result.legacy_requests {
+            total = Some(result.page.total);
+            requests = filters.apply(legacy);
+            break;
+        }
+        let page = result.page;
         total.get_or_insert(page.total);
         let done = !page.has_more || page.requests.is_empty();
         requests.extend(page.requests);
@@ -2644,7 +2725,16 @@ async fn cmd_msg_wait(
     output: Option<&Path>,
 ) -> Result<()> {
     let request = client
-        .collaboration_wait(origin, request_id, timeout_secs)
+        .collaboration_wait_view(
+            origin,
+            request_id,
+            timeout_secs,
+            if full {
+                muxa::collaboration::CollaborationReadView::Full
+            } else {
+                muxa::collaboration::CollaborationReadView::Outcome
+            },
+        )
         .await?;
     if !request.status.is_terminal() && body {
         eprintln!("wait deadline reached for {request_id}; no final reply received");

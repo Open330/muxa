@@ -26,6 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Watch subscribes to mailbox revisions, reads bounded preview pages only when
+  history changes, reuses them for console-sent history, and
+  loads only selected conversation details. Full-body search keeps its complete
+  matching behavior and refreshes only records whose summaries changed.
+- Peer reports select the newest matching reply from metadata pages before an
+  exact read. CLI default list scope resolves inside the authorized list call.
+- Opt-in read views omit repeated task/reply bodies from outcome, progress and
+  mutation responses. Existing full reads and legacy JSON receipts remain intact.
+
+### Changed
+
 - CLI and MCP message lists query filtered, paged history in the daemon.
   Default lists omit task, reply and update bodies from IPC; full and exact
   reads retain their contracts. Older daemons use the same local query rules.

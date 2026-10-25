@@ -155,6 +155,42 @@ pub(crate) fn fixture() -> CollaborationRequest {
     .unwrap()
 }
 
+#[cfg(all(test, unix))]
+pub(crate) fn mock_collaboration_responses(
+    socket: &std::path::Path,
+    responses: Vec<(Value, Value)>,
+) -> tokio::task::JoinHandle<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    let listener = tokio::net::UnixListener::bind(socket).unwrap();
+    tokio::spawn(async move {
+        for (expected, response) in responses {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            reader.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["kind"],
+                "hello"
+            );
+            write.write_all(b"{\"ok\":true}\n").await.unwrap();
+            line.clear();
+            reader.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            for (path, value) in expected.as_object().unwrap() {
+                assert_eq!(
+                    request.pointer(path).unwrap_or(&Value::Null),
+                    value,
+                    "request field {path}"
+                );
+            }
+            let mut bytes = serde_json::to_vec(&response).unwrap();
+            bytes.push(b'\n');
+            write.write_all(&bytes).await.unwrap();
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

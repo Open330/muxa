@@ -635,6 +635,10 @@ enum RequestBody {
         offset: usize,
         #[serde(default)]
         metadata_only: bool,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
+        #[serde(default)]
+        auto_scope: bool,
     },
     CollaborationReply {
         origin: CollaborationOrigin,
@@ -646,20 +650,28 @@ enum RequestBody {
         artifacts: Vec<String>,
         #[serde(default)]
         air_artifacts: Vec<AirArtifactReference>,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
     },
     CollaborationGet {
         origin: CollaborationOrigin,
         request_id: String,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
     },
     /// Exact non-acknowledging read for instructions and incremental progress.
     CollaborationPeek {
         origin: CollaborationOrigin,
         request_id: String,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
     },
     CollaborationUpdate {
         origin: CollaborationOrigin,
         request_id: String,
         body: String,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
     },
     /// Block on the mailbox's durable revision signal until this exact
     /// participant-visible request becomes terminal, or return its latest
@@ -669,6 +681,8 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_id: String,
         timeout_secs: u64,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
     },
     CollaborationCancel {
         origin: CollaborationOrigin,
@@ -3268,6 +3282,7 @@ async fn handle(
         line.clear();
         collaboration_actor.request_panes = None;
         let mut pending_audit = None;
+        let mut response_view = collaboration::CollaborationReadView::Full;
         // Bound the wait for the *next* request line. A client that connects
         // and then neither sends a complete request nor closes its half would
         // otherwise park this handler — and pin its fd — forever. A live
@@ -3383,7 +3398,7 @@ async fn handle(
                 }
             }
         }
-        let resp = match serde_json::from_str::<Request>(trimmed) {
+        let mut resp = match serde_json::from_str::<Request>(trimmed) {
             // Strict-match only applies in the legacy regime, and only
             // for non-`hello` kinds. Once the client has sent `hello`,
             // the negotiated version governs and per-message `protocol`
@@ -4694,12 +4709,14 @@ async fn handle(
                     }
                 }
                 RequestBody::CollaborationList {
-                    origin,
+                    mut origin,
                     mailbox,
-                    scope,
+                    mut scope,
                     query,
                     offset,
                     metadata_only,
+                    view,
+                    auto_scope,
                 } => {
                     kind = "collaboration_list";
                     collaboration_actor.observe_pane(&backends).await;
@@ -4720,7 +4737,22 @@ async fn handle(
                         collaboration_actor.take_request_panes(),
                     )
                     .await;
-                    let response = match topology.resolve_origin(&origin) {
+                    let mut current = topology.resolve_origin(&origin);
+                    if auto_scope
+                        && matches!(scope, MailboxScope::Caller)
+                        && origin.agent_session_id.is_none()
+                        && matches!(
+                            current,
+                            Err(collaboration::CollaborationError::UnknownOrigin(_))
+                        )
+                    {
+                        origin.console = true;
+                        scope = MailboxScope::Room;
+                        current = topology.resolve_origin(&origin);
+                    }
+                    audit_context.represented_origin = origin.clone();
+                    audit_context.scope = (!matches!(scope, MailboxScope::Caller)).then_some(scope);
+                    let response = match current {
                         Ok(current) if query.is_some() => {
                             match collaboration
                                 .query_for_offset(
@@ -4733,10 +4765,13 @@ async fn handle(
                                 .await
                             {
                                 Ok(mut page) => {
-                                    if metadata_only {
-                                        for request in &mut page.requests {
-                                            request.omit_list_bodies();
-                                        }
+                                    let view = if metadata_only {
+                                        collaboration::CollaborationReadView::Metadata
+                                    } else {
+                                        view
+                                    };
+                                    for request in &mut page.requests {
+                                        view.apply(request);
                                     }
                                     let mut response = Response::ok();
                                     response.collaboration_scope = Some(scope);
@@ -4766,7 +4801,9 @@ async fn handle(
                     origin,
                     request_id,
                     body,
+                    view,
                 } => {
+                    response_view = view;
                     kind = "collaboration_update";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(
@@ -4807,7 +4844,9 @@ async fn handle(
                     body,
                     artifacts,
                     air_artifacts,
+                    view,
                 } => {
+                    response_view = view;
                     kind = "collaboration_reply";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(
@@ -4849,7 +4888,12 @@ async fn handle(
                     ));
                     response
                 }
-                RequestBody::CollaborationGet { origin, request_id } => {
+                RequestBody::CollaborationGet {
+                    origin,
+                    request_id,
+                    view,
+                } => {
+                    response_view = view;
                     kind = "collaboration_get";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(
@@ -4879,7 +4923,12 @@ async fn handle(
                     ));
                     response
                 }
-                RequestBody::CollaborationPeek { origin, request_id } => {
+                RequestBody::CollaborationPeek {
+                    origin,
+                    request_id,
+                    view,
+                } => {
+                    response_view = view;
                     kind = "collaboration_peek";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(
@@ -4913,7 +4962,9 @@ async fn handle(
                     origin,
                     request_id,
                     timeout_secs,
+                    view,
                 } => {
+                    response_view = view;
                     kind = "collaboration_wait";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(
@@ -5226,6 +5277,9 @@ async fn handle(
             }
         };
 
+        if let Some(request) = &mut resp.collaboration_request {
+            response_view.apply(request);
+        }
         let bytes = encode_line(&resp, negotiated.unwrap_or(PROTOCOL_VERSION))?;
         if let Some(mut entry) = pending_audit {
             entry.response_bytes = Some(bytes.len());
@@ -5368,6 +5422,15 @@ pub fn blocking_reserve_handle(
 
 pub fn harden_permissions(socket_path: &Path) -> std::io::Result<()> {
     transport::harden_permissions(socket_path)
+}
+
+/// One list transport result. Legacy rows are exposed only so a multi-page
+/// consumer can select locally instead of downloading the same mailbox again.
+#[derive(Debug)]
+pub struct CollaborationQueryResult {
+    pub page: collaboration::CollaborationPage,
+    pub scope: MailboxScope,
+    pub legacy_requests: Option<Vec<CollaborationRequest>>,
 }
 
 /// Client-side helper. Single-shot request/response.
@@ -5916,9 +5979,25 @@ impl Client {
         request_id: &str,
         body: &str,
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_update_view(
+            origin,
+            request_id,
+            body,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+    }
+
+    pub async fn collaboration_update_view(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        body: &str,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let response = self
             .call_checked(&serde_json::json!({
-                "protocol": PROTOCOL_VERSION, "kind": "collaboration_update",
+                "protocol": PROTOCOL_VERSION, "view": view, "kind": "collaboration_update",
                 "origin": origin, "request_id": request_id, "body": body,
             }))
             .await?;
@@ -6813,28 +6892,131 @@ impl Client {
         offset: usize,
         metadata_only: bool,
     ) -> Result<collaboration::CollaborationPage, RuntimeError> {
-        let response = self
-            .call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,
-            "kind":"collaboration_list","origin":origin,"mailbox":mailbox,"scope":scope,
-            "query":query,"offset":offset,"metadata_only":metadata_only}))
-            .await?;
-        if !matches!(scope, MailboxScope::Caller) && response["collaboration_scope"].is_null() {
+        self.collaboration_query_view(
+            origin,
+            mailbox,
+            scope,
+            query,
+            offset,
+            if metadata_only {
+                collaboration::CollaborationReadView::Metadata
+            } else {
+                collaboration::CollaborationReadView::Full
+            },
+        )
+        .await
+    }
+
+    pub async fn collaboration_query_view(
+        &self,
+        origin: &CollaborationOrigin,
+        mailbox: RequestMailbox,
+        scope: MailboxScope,
+        query: &collaboration::CollaborationQuery,
+        offset: usize,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<collaboration::CollaborationPage, RuntimeError> {
+        self.collaboration_query_result(origin, mailbox, scope, query, offset, view, false)
+            .await
+            .map(|result| result.page)
+    }
+
+    pub async fn collaboration_query_auto(
+        &self,
+        origin: &CollaborationOrigin,
+        mailbox: RequestMailbox,
+        query: &collaboration::CollaborationQuery,
+        offset: usize,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<(collaboration::CollaborationPage, MailboxScope), RuntimeError> {
+        self.collaboration_query_result(
+            origin,
+            mailbox,
+            MailboxScope::Caller,
+            query,
+            offset,
+            view,
+            true,
+        )
+        .await
+        .map(|result| (result.page, result.scope))
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing list controls plus opt-in projection and scope resolution.
+    pub async fn collaboration_query_result(
+        &self,
+        origin: &CollaborationOrigin,
+        mailbox: RequestMailbox,
+        scope: MailboxScope,
+        query: &collaboration::CollaborationQuery,
+        offset: usize,
+        view: collaboration::CollaborationReadView,
+        auto_scope: bool,
+    ) -> Result<CollaborationQueryResult, RuntimeError> {
+        let make_request = |origin: &CollaborationOrigin, scope, auto_scope| {
+            serde_json::json!({"protocol":PROTOCOL_VERSION,
+            "kind":"collaboration_list","origin":origin,"mailbox":mailbox,"scope":scope,"query":query,"offset":offset,
+            "metadata_only":view == collaboration::CollaborationReadView::Metadata, "view":view,"auto_scope":auto_scope})
+        };
+        let (response, requested_scope) = match self
+            .call_checked(&make_request(origin, scope, auto_scope))
+            .await
+        {
+            Ok(response) => (response, scope),
+            Err(RuntimeError::Daemon(error))
+                if auto_scope
+                    && origin.agent_session_id.is_none()
+                    && error.starts_with(
+                        "collaboration origin is not a hook-correlated tracked pane agent:",
+                    ) =>
+            {
+                let console = CollaborationOrigin {
+                    console: true,
+                    ..origin.clone()
+                };
+                (
+                    self.call_checked(&make_request(&console, MailboxScope::Room, false))
+                        .await?,
+                    MailboxScope::Room,
+                )
+            }
+            Err(error) => return Err(error),
+        };
+        if !matches!(requested_scope, MailboxScope::Caller)
+            && response["collaboration_scope"].is_null()
+        {
             return Err(RuntimeError::Daemon("this muxad predates scoped collaboration listing; restart the daemon (`muxa daemon restart`)".into()));
         }
-        if !response["collaboration_page"].is_null() {
-            return serde_json::from_value(response["collaboration_page"].clone())
-                .map_err(RuntimeError::Json);
+        let actual_scope = response
+            .get("collaboration_scope")
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(RuntimeError::Json)?
+            .unwrap_or(requested_scope);
+        let legacy_requests: Option<Vec<CollaborationRequest>> =
+            if response["collaboration_page"].is_null() {
+                Some(
+                    serde_json::from_value(response["collaboration_requests"].clone())
+                        .map_err(RuntimeError::Json)?,
+                )
+            } else {
+                None
+            };
+        let mut page = if let Some(requests) = &legacy_requests {
+            query.page(requests, offset)
+        } else {
+            serde_json::from_value(response["collaboration_page"].clone())
+                .map_err(RuntimeError::Json)?
+        };
+        for request in &mut page.requests {
+            view.apply(request);
         }
-        let requests: Vec<CollaborationRequest> =
-            serde_json::from_value(response["collaboration_requests"].clone())
-                .map_err(RuntimeError::Json)?;
-        let mut page = query.page(&requests, offset);
-        if metadata_only {
-            for request in &mut page.requests {
-                request.omit_list_bodies();
-            }
-        }
-        Ok(page)
+        Ok(CollaborationQueryResult {
+            page,
+            scope: actual_scope,
+            legacy_requests,
+        })
     }
 
     pub async fn collaboration_reply(
@@ -6846,8 +7028,31 @@ impl Client {
         artifacts: &[String],
         air_artifacts: &[AirArtifactReference],
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_reply_view(
+            origin,
+            request_id,
+            status,
+            body,
+            artifacts,
+            air_artifacts,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // Existing reply contract plus opt-in response view.
+    pub async fn collaboration_reply_view(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        status: RequestStatus,
+        body: &str,
+        artifacts: &[String],
+        air_artifacts: &[AirArtifactReference],
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
+            "protocol": PROTOCOL_VERSION, "view": view,
             "kind": "collaboration_reply",
             "origin": origin,
             "request_id": request_id,
@@ -6857,7 +7062,10 @@ impl Client {
             "air_artifacts": air_artifacts,
         });
         let resp = self.call_checked(&req).await?;
-        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+        let mut request = serde_json::from_value(resp["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)?;
+        view.apply(&mut request);
+        Ok(request)
     }
 
     pub async fn collaboration_get(
@@ -6865,14 +7073,31 @@ impl Client {
         origin: &CollaborationOrigin,
         request_id: &str,
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_get_view(
+            origin,
+            request_id,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+    }
+
+    pub async fn collaboration_get_view(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
+            "protocol": PROTOCOL_VERSION, "view": view,
             "kind": "collaboration_get",
             "origin": origin,
             "request_id": request_id,
         });
         let resp = self.call_checked(&req).await?;
-        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+        let mut request = serde_json::from_value(resp["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)?;
+        view.apply(&mut request);
+        Ok(request)
     }
 
     /// Read without marking the reply read; older daemons reject this operation.
@@ -6881,14 +7106,31 @@ impl Client {
         origin: &CollaborationOrigin,
         request_id: &str,
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_peek_view(
+            origin,
+            request_id,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+    }
+
+    pub async fn collaboration_peek_view(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
+            "protocol": PROTOCOL_VERSION, "view": view,
             "kind": "collaboration_peek",
             "origin": origin,
             "request_id": request_id,
         });
         let resp = self.call_checked(&req).await?;
-        serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
+        let mut request = serde_json::from_value(resp["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)?;
+        view.apply(&mut request);
+        Ok(request)
     }
 
     /// Wait for a request to become terminal through muxad's collaboration
@@ -6900,11 +7142,27 @@ impl Client {
         request_id: &str,
         timeout_secs: u64,
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_wait_view(
+            origin,
+            request_id,
+            timeout_secs,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+    }
+
+    pub async fn collaboration_wait_view(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        timeout_secs: u64,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let timeout_secs = timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS);
         let legacy_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
-            "kind": "collaboration_wait",
+            "kind": "collaboration_wait", "view":view,
             "origin": origin,
             "request_id": request_id,
             "timeout_secs": timeout_secs,
@@ -6914,8 +7172,10 @@ impl Client {
         let deadline = Duration::from_secs(timeout_secs).saturating_add(CLIENT_CALL_TIMEOUT);
         let resp = self.call_with_timeout(&req, deadline).await?;
         if resp["ok"].as_bool().unwrap_or(false) {
-            return serde_json::from_value(resp["collaboration_request"].clone())
-                .map_err(RuntimeError::Json);
+            let mut request = serde_json::from_value(resp["collaboration_request"].clone())
+                .map_err(RuntimeError::Json)?;
+            view.apply(&mut request);
+            return Ok(request);
         }
         let error = resp["error"]
             .as_str()
@@ -6925,9 +7185,11 @@ impl Client {
                 request_id,
                 "daemon lacks collaboration_wait; using bounded client-side compatibility wait"
             );
-            return self
+            let mut request = self
                 .collaboration_wait_legacy(origin, request_id, legacy_deadline)
-                .await;
+                .await?;
+            view.apply(&mut request);
+            return Ok(request);
         }
         Err(RuntimeError::Json(serde::de::Error::custom(
             error.to_string(),
@@ -8062,6 +8324,148 @@ mod tests {
         shutdown.send(()).unwrap();
         serving.await.unwrap();
         assert_legacy_list_query_fallback(legacy, &origin, &query).await;
+    }
+
+    #[tokio::test]
+    async fn auto_scope_and_read_views_keep_authority_and_unread_semantics() {
+        use collaboration::CollaborationReadView as View;
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("views.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let counting = CountingPaneBackend::new(
+            HostKind::Tmux,
+            vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+                collaboration_test_pane("%9", "2"),
+            ],
+        );
+        let backend: SharedBackend = counting.clone();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+        let room = client.collaboration_context(&origin).await.unwrap();
+        let ids = create_private_list_history(&mailbox, &room.current, &room.peers[0]).await;
+        let query = collaboration::CollaborationQuery {
+            limit: Some(1),
+            ..Default::default()
+        };
+        let before = counting.counts().0;
+        let (page, scope) = client
+            .collaboration_query_auto(&origin, RequestMailbox::All, &query, 0, View::Metadata)
+            .await
+            .unwrap();
+        assert_eq!(scope, MailboxScope::Caller);
+        assert_eq!(page.total, 3);
+        assert_eq!(
+            counting.counts().0 - before,
+            1,
+            "auto scope uses one authorized list request"
+        );
+        let terminal = CollaborationOrigin {
+            pane: "%9".into(),
+            ..origin.clone()
+        };
+        let (_, scope) = client
+            .collaboration_query_auto(&terminal, RequestMailbox::All, &query, 0, View::Metadata)
+            .await
+            .unwrap();
+        assert_eq!(scope, MailboxScope::Room);
+        let pinned = CollaborationOrigin {
+            agent_session_id: Some("missing".into()),
+            ..terminal
+        };
+        assert!(client
+            .collaboration_query_auto(&pinned, RequestMailbox::All, &query, 0, View::Metadata)
+            .await
+            .is_err());
+        assert!(client
+            .collaboration_query_view(
+                &origin,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &query,
+                0,
+                View::Metadata
+            )
+            .await
+            .is_err());
+        assert_read_views(&client, &origin, &mailbox, &room.current, &ids).await;
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    async fn assert_read_views(
+        client: &Client,
+        origin: &CollaborationOrigin,
+        mailbox: &CollaborationStore,
+        sender: &Participant,
+        ids: &[String],
+    ) {
+        use collaboration::CollaborationReadView as View;
+        for view in [
+            View::Metadata,
+            View::Preview,
+            View::Outcome,
+            View::Progress { after_update: 1 },
+        ] {
+            let request = client
+                .collaboration_peek_view(origin, &ids[0], view)
+                .await
+                .unwrap();
+            assert_eq!(request.status, RequestStatus::Completed);
+            assert_eq!(request.updates.last().unwrap().sequence, 1);
+            if view == View::Preview {
+                assert_eq!(request.body.chars().count(), 256);
+            } else {
+                assert!(request.body.is_empty());
+            }
+            if view == View::Outcome {
+                assert!(request
+                    .reply
+                    .as_ref()
+                    .unwrap()
+                    .body
+                    .contains("PRIVATE REPLY"));
+            }
+            if matches!(view, View::Progress { .. }) {
+                assert!(request.updates[0].body.is_empty());
+            }
+        }
+        assert_eq!(mailbox.unread_reply_count(sender).await, 3);
+        let progress = client
+            .collaboration_peek_view(origin, &ids[0], View::Progress { after_update: 0 })
+            .await
+            .unwrap();
+        assert_eq!(progress.updates[0].body, "PRIVATE UPDATE");
+        let full = client.collaboration_peek(origin, &ids[0]).await.unwrap();
+        assert!(full.body.contains("PRIVATE TASK"));
+        assert_eq!(full.updates[0].body, "PRIVATE UPDATE");
+        client
+            .collaboration_get_view(origin, &ids[0], View::Outcome)
+            .await
+            .unwrap();
+        assert_eq!(mailbox.unread_reply_count(sender).await, 2);
+        let reply = client
+            .collaboration_wait_view(origin, &ids[1], 1, View::Outcome)
+            .await
+            .unwrap();
+        assert!(reply.body.is_empty());
+        assert!(reply.reply.as_ref().unwrap().body.contains("PRIVATE REPLY"));
+        assert_eq!(mailbox.unread_reply_count(sender).await, 1);
     }
 
     async fn create_private_list_history(

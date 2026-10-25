@@ -2558,6 +2558,17 @@ fn persist_watch_collab_layout(
     std::fs::write(path, doc.to_string()).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
+#[derive(Debug, Default)]
+struct WatchHistoryCache {
+    changes: Option<tokio::sync::watch::Receiver<Option<u64>>>,
+    revision: Option<u64>,
+    previews: Vec<CollaborationRequest>,
+    /// Full history is needed only while the operator explicitly searches bodies.
+    search_full: Option<Vec<CollaborationRequest>>,
+    detail: Option<CollaborationRequest>,
+    detail_failure: Option<(String, std::time::Instant)>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct WatchCollaboration {
     human: Vec<CollaborationRequest>,
@@ -3183,6 +3194,7 @@ pub(crate) struct App {
     /// interpreted.
     pub confirm: Option<ConfirmPopup>,
     collaboration: WatchCollaboration,
+    collaboration_history: WatchHistoryCache,
     /// `[collaboration] scope` from config: `host` lets the composer target
     /// the tracked agent under the cursor in any window; `window` keeps the
     /// classic same-room contract.
@@ -3533,6 +3545,7 @@ impl App {
             window_capture_target: None,
             confirm: None,
             collaboration: WatchCollaboration::default(),
+            collaboration_history: WatchHistoryCache::default(),
             collaboration_scope: muxa::config::CollaborationScope::default(),
             inspector_split,
             collaboration_mailbox: CollaborationMailboxState::default(),
@@ -7711,6 +7724,7 @@ pub async fn run(
         .draw(|f| render(f, &mut app))
         .map_err(anyhow::Error::from)?;
     refresh_watch_collaboration(client, &mut app).await;
+    sync_collab_screen_from_cache(&mut app);
     // After the first paint, so a stale daemon delays nothing the user sees,
     // and before the loop, so the bar is up on the very first frame that has
     // data on it.
@@ -7797,6 +7811,14 @@ pub async fn run(
             IDLE_REDRAW_INTERVAL
         };
         if needs_render || last_render.elapsed() >= redraw_interval {
+            if matches!(app.watch_cfg.screen, WatchScreen::Collab)
+                && !app.search_query.is_empty()
+                && app.collaboration_history.search_full.is_none()
+                && app.collab.unavailable.is_none()
+            {
+                refresh_fleet_collaboration(client, &mut app).await;
+            }
+            refresh_selected_collaboration_detail(client, &mut app).await;
             guard
                 .terminal_mut()
                 .draw(|f| render(f, &mut app))
@@ -7882,8 +7904,9 @@ pub async fn run(
                 }
                 Action::Refresh => {
                     request_refresh(&mut app, &wake_tx);
+                    app.collaboration_history.revision = None;
                     refresh_watch_collaboration(client, &mut app).await;
-                    refresh_fleet_collaboration(client, &mut app).await;
+                    sync_collab_screen_from_cache(&mut app);
                 }
                 Action::RestartDaemon => {
                     match restart_daemon_from_watch(client).await {
@@ -8575,10 +8598,19 @@ pub async fn run(
             needs_render = true;
         }
 
-        if app.collaboration_mailbox.open
-            && last_mailbox_refresh.elapsed() >= Duration::from_secs(2)
+        let mailbox_changed = app
+            .collaboration_history
+            .changes
+            .as_ref()
+            .is_some_and(|changes| changes.has_changed().unwrap_or(false))
+            && app.collaboration.unavailable.is_none();
+        if (app.collaboration_mailbox.open || matches!(app.watch_cfg.screen, WatchScreen::Collab))
+            && (last_mailbox_refresh.elapsed() >= Duration::from_secs(2)
+                || (mailbox_changed
+                    && last_mailbox_refresh.elapsed() >= Duration::from_millis(200)))
         {
             refresh_watch_collaboration(client, &mut app).await;
+            sync_collab_screen_from_cache(&mut app);
             last_mailbox_refresh = std::time::Instant::now();
             needs_render = true;
         }
@@ -8692,6 +8724,255 @@ fn friendly_watch_collaboration_error(error: &str) -> String {
 /// pane agent, and the operator sitting in front of `muxa watch` is exactly
 /// the caller that is entitled to it. Skipped whenever the screen is not on
 /// show, so a topology-only session never pays for it.
+async fn read_watch_history(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    full: bool,
+) -> Result<Vec<CollaborationRequest>, String> {
+    let view = if full {
+        muxa::collaboration::CollaborationReadView::Full
+    } else {
+        muxa::collaboration::CollaborationReadView::Preview
+    };
+    let mut query = muxa::collaboration::CollaborationQuery {
+        limit: Some(if full { 8 } else { 100 }),
+        ..Default::default()
+    };
+    let mut requests = Vec::new();
+    loop {
+        let result = client
+            .collaboration_query_result(
+                origin,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &query,
+                0,
+                view,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(mut legacy) = result.legacy_requests {
+            for request in &mut legacy {
+                view.apply(request);
+            }
+            return Ok(legacy);
+        }
+        let page = result.page;
+        requests.extend(page.requests);
+        if !page.has_more {
+            return Ok(requests);
+        }
+        query.cursor = Some(
+            page.next_cursor
+                .ok_or("history page omitted its continuation cursor")?,
+        );
+    }
+}
+
+async fn reconcile_search_history(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    previews: &[CollaborationRequest],
+    previous: &[CollaborationRequest],
+) -> Result<Vec<CollaborationRequest>, String> {
+    use futures_util::{StreamExt, TryStreamExt};
+    let by_id: HashMap<_, _> = previous
+        .iter()
+        .map(|request| (request.id.as_str(), request))
+        .collect();
+    futures_util::stream::iter(previews)
+        .map(|summary| {
+            let by_id = &by_id;
+            async move {
+                if let Some(full) = by_id.get(summary.id.as_str()) {
+                    let mut projected = (*full).clone();
+                    muxa::collaboration::CollaborationReadView::Preview.apply(&mut projected);
+                    if &projected == summary {
+                        return Ok((*full).clone());
+                    }
+                }
+                client
+                    .collaboration_peek(origin, &summary.id)
+                    .await
+                    .map_err(|error| error.to_string())
+            }
+        })
+        .buffered(4)
+        .try_collect()
+        .await
+}
+
+fn collaboration_revision_updates(client: Client) -> tokio::sync::watch::Receiver<Option<u64>> {
+    let (sender, receiver) = tokio::sync::watch::channel(None);
+    tokio::spawn(async move {
+        let Ok(mut stream) = client.collaboration_subscribe().await else {
+            return;
+        };
+        sender.send_replace(Some(0));
+        let mut epoch = 0_u64;
+        loop {
+            tokio::select! {
+                update = stream.recv() => match update {
+                    Ok(Some(_)) => { epoch = epoch.wrapping_add(1); sender.send_replace(Some(epoch)); }
+                    _ => return,
+                },
+                () = sender.closed() => return,
+            }
+        }
+    });
+    receiver
+}
+
+async fn watch_history(
+    client: &Client,
+    app: &mut App,
+    origin: &CollaborationOrigin,
+) -> Result<Vec<CollaborationRequest>, String> {
+    if app
+        .collaboration_history
+        .changes
+        .as_ref()
+        .is_none_or(|changes| changes.has_changed().is_err())
+    {
+        app.collaboration_history.changes = Some(collaboration_revision_updates(client.clone()));
+        app.collaboration_history.revision = None;
+    }
+    // Read the revision before the snapshot. A racing update remains dirty.
+    let revision = app
+        .collaboration_history
+        .changes
+        .as_mut()
+        .and_then(|changes| *changes.borrow_and_update());
+    let previews = if revision.is_some() && revision == app.collaboration_history.revision {
+        app.collaboration_history.previews.clone()
+    } else {
+        read_watch_history(client, origin, false).await?
+    };
+    let changed = previews != app.collaboration_history.previews;
+    let searching =
+        !app.search_query.is_empty() && matches!(app.watch_cfg.screen, WatchScreen::Collab);
+    if searching {
+        if changed || app.collaboration_history.search_full.is_none() {
+            let full = if let Some(previous) = app.collaboration_history.search_full.as_deref() {
+                reconcile_search_history(client, origin, &previews, previous).await?
+            } else {
+                read_watch_history(client, origin, true).await?
+            };
+            app.collaboration_history.search_full = Some(full);
+        }
+        app.collaboration_history.previews = previews;
+        app.collaboration_history.revision = revision;
+        return Ok(app
+            .collaboration_history
+            .search_full
+            .clone()
+            .unwrap_or_default());
+    }
+    if changed {
+        app.collaboration_history.search_full = None;
+    }
+    app.collaboration_history.previews = previews;
+    app.collaboration_history.revision = revision;
+    Ok(app.collaboration_history.previews.clone())
+}
+
+fn detail_matches(summary: &CollaborationRequest, full: &CollaborationRequest) -> bool {
+    summary.id == full.id
+        && summary.status == full.status
+        && summary.from == full.from
+        && summary.to == full.to
+        && summary.reply.as_ref().map(|reply| reply.at) == full.reply.as_ref().map(|reply| reply.at)
+        && summary.updates.last().map(|update| update.sequence)
+            == full.updates.last().map(|update| update.sequence)
+}
+
+fn detail_for<'a>(app: &'a App, request: &'a CollaborationRequest) -> &'a CollaborationRequest {
+    app.collaboration_history
+        .detail
+        .as_ref()
+        .filter(|full| detail_matches(request, full))
+        .unwrap_or(request)
+}
+
+async fn refresh_selected_collaboration_detail(client: &Client, app: &mut App) {
+    let request = if app.collaboration_mailbox.open {
+        collaboration_requests(app).get(app.collaboration_mailbox.selected)
+    } else if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
+        app.collab.selected_request(&app.search_query)
+    } else {
+        None
+    };
+    let Some(request) = request else {
+        return;
+    };
+    if app
+        .collaboration_history
+        .detail
+        .as_ref()
+        .is_some_and(|full| detail_matches(request, full))
+    {
+        return;
+    }
+    if let Some(full) = app
+        .collaboration_history
+        .search_full
+        .as_ref()
+        .and_then(|history| history.iter().find(|full| detail_matches(request, full)))
+    {
+        app.collaboration_history.detail = Some(full.clone());
+        return;
+    }
+    let id = request.id.clone();
+    if app
+        .collaboration_history
+        .detail_failure
+        .as_ref()
+        .is_some_and(|(failed, at)| *failed == id && at.elapsed() < Duration::from_secs(2))
+    {
+        return;
+    }
+    let Some(origin) = app.collaboration.origin.clone() else {
+        return;
+    };
+    let origin = CollaborationOrigin {
+        console: true,
+        ..origin
+    };
+    match client.collaboration_peek(&origin, &id).await {
+        Ok(full) => {
+            app.collaboration_history.detail = Some(full);
+            app.collaboration_history.detail_failure = None;
+        }
+        Err(error) => {
+            app.collaboration_history.detail_failure = Some((id, std::time::Instant::now()));
+            app.set_hint(
+                format!("conversation detail unavailable: {error}"),
+                HintLevel::Err,
+            );
+        }
+    }
+}
+
+fn sync_collab_screen_from_cache(app: &mut App) {
+    if !matches!(app.watch_cfg.screen, WatchScreen::Collab) {
+        return;
+    }
+    if let Some(error) = &app.collaboration.unavailable {
+        app.collab.fail(error.clone());
+        return;
+    }
+    let history = if app.search_query.is_empty() {
+        app.collaboration_history.previews.clone()
+    } else {
+        app.collaboration_history
+            .search_full
+            .clone()
+            .unwrap_or_default()
+    };
+    app.collab.set_requests(history);
+}
+
 async fn refresh_fleet_collaboration(client: &Client, app: &mut App) {
     if !matches!(app.watch_cfg.screen, WatchScreen::Collab) {
         return;
@@ -8704,14 +8985,9 @@ async fn refresh_fleet_collaboration(client: &Client, app: &mut App) {
         console: true,
         ..origin
     };
-    match client
-        .collaboration_list_scoped(&origin, RequestMailbox::All, MailboxScope::All)
-        .await
-    {
+    match watch_history(client, app, &origin).await {
         Ok(requests) => app.collab.set_requests(requests),
-        Err(error) => app
-            .collab
-            .fail(friendly_watch_collaboration_error(&error.to_string())),
+        Err(error) => app.collab.fail(friendly_watch_collaboration_error(&error)),
     }
 }
 
@@ -8744,10 +9020,7 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
         console: true,
         ..origin.clone()
     };
-    let (history, console_sent) = tokio::join!(
-        client.collaboration_list_scoped(&history_origin, RequestMailbox::All, MailboxScope::All,),
-        client.collaboration_list(&origin, RequestMailbox::Sent),
-    );
+    let history = watch_history(client, app, &history_origin).await;
     match history {
         Ok(requests) => {
             let aggregate = history_scope
@@ -8765,7 +9038,11 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
                 // Pane mode keeps the established two-owner contract:
                 // incoming belongs to the selected recipient, while Sent is
                 // this watch console's dispatch log across targets.
-                console_sent.unwrap_or_default()
+                requests
+                    .iter()
+                    .filter(|request| request.from.same_session(&room.current))
+                    .cloned()
+                    .collect()
             };
             let inbox = match &history_scope {
                 Some(MailboxHistoryScope::Pane(anchor)) => Some(anchor.clone()),
@@ -9645,7 +9922,9 @@ fn collaboration_requests(app: &App) -> &[CollaborationRequest] {
 }
 
 fn selected_collaboration_request(app: &App) -> Option<&CollaborationRequest> {
-    collaboration_requests(app).get(app.collaboration_mailbox.selected)
+    collaboration_requests(app)
+        .get(app.collaboration_mailbox.selected)
+        .map(|request| detail_for(app, request))
 }
 
 fn clamp_collaboration_mailbox(app: &mut App) {
@@ -14628,6 +14907,7 @@ fn render_collab_detail(f: &mut Frame, area: Rect, app: &App, theme: WatchThemeS
     let Some(request) = app.collab.selected_request(&filter) else {
         return;
     };
+    let request = detail_for(app, request);
     let now = OffsetDateTime::now_utc();
     let mut lines = vec![
         Line::from(vec![
@@ -28265,6 +28545,242 @@ sort = ["state"]
         app.collab.set_requests(vec![collab_request(to_pane)]);
         app.apply_screen(WatchScreen::Collab);
         app
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watch_previews_keep_full_search_and_fetch_details_only_on_change() {
+        use muxa::collaboration::CollaborationReadView as View;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("watch-history.sock");
+        let mut full = collab_request("%2");
+        full.body = format!("{}needle_tail", "body ".repeat(1000));
+        let mut preview = full.clone();
+        View::Preview.apply(&mut preview);
+        let page = |request: &CollaborationRequest| json!({"ok":true,"collaboration_scope":"all", "collaboration_page":{"requests":[request],"total":1,"has_more":false}});
+        let mut changed = full.clone();
+        changed
+            .updates
+            .push(muxa::collaboration::CollaborationUpdate {
+                sequence: 1,
+                author: full.from.clone(),
+                body: "new progress".into(),
+                at: full.created_at,
+            });
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![
+                (
+                    json!({"/view":"preview","/query/limit":100}),
+                    page(&preview),
+                ),
+                (json!({"/view":"preview"}), page(&preview)),
+                (json!({"/view":"full","/query/limit":8}), page(&full)),
+                (json!({"/view":"preview"}), page(&preview)),
+                (
+                    json!({"/kind":"collaboration_peek"}),
+                    json!({"ok":true,"collaboration_request":full}),
+                ),
+                (
+                    json!({"/kind":"collaboration_peek"}),
+                    json!({"ok":true,"collaboration_request":changed}),
+                ),
+            ],
+        );
+        let client = Client::new(socket);
+        let mut app = collab_app("%2");
+        let (_mailbox_sender, mailbox_rx) = tokio::sync::watch::channel(None);
+        app.collaboration_history.changes = Some(mailbox_rx);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        };
+        app.collaboration.origin = Some(origin.clone());
+        let rows = watch_history(&client, &mut app, &origin).await.unwrap();
+        assert_eq!(rows[0].body.chars().count(), 256);
+        app.search_query = "needle_tail".into();
+        let searched = watch_history(&client, &mut app, &origin).await.unwrap();
+        assert!(searched[0].body.contains("needle_tail"));
+        let cached = watch_history(&client, &mut app, &origin).await.unwrap();
+        assert!(
+            cached[0].body.contains("needle_tail"),
+            "unchanged summaries reuse full search content"
+        );
+        app.search_query.clear();
+        app.collaboration_history.search_full = None;
+        app.collab.set_requests(rows);
+        refresh_selected_collaboration_detail(&client, &mut app).await;
+        refresh_selected_collaboration_detail(&client, &mut app).await;
+        assert!(app
+            .collaboration_history
+            .detail
+            .as_ref()
+            .unwrap()
+            .body
+            .contains("needle_tail"));
+        let mut summary = changed.clone();
+        View::Preview.apply(&mut summary);
+        app.collab.set_requests(vec![summary]);
+        refresh_selected_collaboration_detail(&client, &mut app).await;
+        assert_eq!(
+            app.collaboration_history.detail.as_ref().unwrap().updates[0].body,
+            "new progress"
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn full_body_search_refreshes_only_changed_requests() {
+        use muxa::collaboration::CollaborationReadView as View;
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("changed-search.sock");
+        let first = collab_request("%2");
+        let mut second = first.clone();
+        second.id = "unchanged".into();
+        let mut changed = first.clone();
+        changed
+            .updates
+            .push(muxa::collaboration::CollaborationUpdate {
+                sequence: 1,
+                author: first.from.clone(),
+                body: "new update".into(),
+                at: first.created_at,
+            });
+        let mut previews = vec![changed.clone(), second.clone()];
+        for request in &mut previews {
+            View::Preview.apply(request);
+        }
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![(
+                json!({"/kind":"collaboration_peek","/request_id":first.id}),
+                json!({"ok":true,"collaboration_request":changed}),
+            )],
+        );
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        };
+        let full =
+            reconcile_search_history(&Client::new(socket), &origin, &previews, &[first, second])
+                .await
+                .unwrap();
+        assert_eq!(full.len(), 2);
+        assert_eq!(full[0].updates[0].body, "new update");
+        assert_eq!(full[1].body, COLLAB_FIXTURE_BODY);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unchanged_mailbox_revision_does_not_reload_history() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("revision-history.sock");
+        let request = collab_request("%2");
+        let response = json!({"ok":true,"collaboration_scope":"all","collaboration_page":{"requests":[request],"total":1,"has_more":false}});
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![
+                (json!({"/view":"preview"}), response.clone()),
+                (json!({"/view":"preview"}), response),
+            ],
+        );
+        let client = Client::new(socket);
+        let mut app = collab_app("%2");
+        let (sender, changes) = tokio::sync::watch::channel(Some(7));
+        app.collaboration_history.changes = Some(changes);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        };
+        let first = watch_history(&client, &mut app, &origin).await.unwrap();
+        let idle = watch_history(&client, &mut app, &origin).await.unwrap();
+        assert_eq!(first, idle, "no additional RPC for an unchanged revision");
+        sender.send_replace(Some(8));
+        let updated = watch_history(&client, &mut app, &origin).await.unwrap();
+        assert_eq!(first, updated);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mailbox_subscription_ack_establishes_idle_baseline_without_a_revision_event() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("idle-subscription.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut write) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            let mut line = String::new();
+            for kind in ["hello", "collaboration_subscribe"] {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                    kind
+                );
+                write.write_all(b"{\"ok\":true}\n").await.unwrap();
+            }
+            assert_eq!(
+                reader.read_line(&mut line).await.unwrap(),
+                0,
+                "dropping watch must close its subscription"
+            );
+        });
+        let mut changes = collaboration_revision_updates(Client::new(socket));
+        tokio::time::timeout(Duration::from_secs(2), changes.changed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(*changes.borrow_and_update(), Some(0));
+        drop(changes);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn legacy_watch_history_is_received_once_not_once_per_page() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy-watch-history.sock");
+        let records: Vec<_> = (0..101)
+            .map(|index| {
+                let mut request = collab_request("%2");
+                request.id = format!("row-{index}");
+                request
+            })
+            .collect();
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![(
+                json!({"/kind":"collaboration_list"}),
+                json!({"ok":true,"collaboration_scope":"all","collaboration_requests":records}),
+            )],
+        );
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        };
+        let rows = read_watch_history(&Client::new(socket), &origin, false)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 101);
+        assert_eq!(rows.last().unwrap().id, "row-100");
+        server.await.unwrap();
     }
 
     #[test]

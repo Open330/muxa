@@ -584,6 +584,20 @@ methods) for the underlying `send_prompt` / `capture` / `subscribe` IPC.
 
 ### Checking collaboration cost locally
 
+Watch subscribes to durable mailbox revisions and reuses unchanged history.
+Disconnected/older servers fall back to reconciled reads. It uses 256-character
+previews in bounded pages without dropping historical
+rows or aggregate counts. Conversation selection loads full details with a
+non-acknowledging read. Full-body searches load complete content on demand,
+then reuse unchanged records. Existing watch processes must be reopened after
+installing an updated CLI; MCP reload refreshes supported agent connections.
+
+Optional IPC read views (`metadata`, `preview`, `outcome`, `progress`) retain
+normal authorization and read/peek semantics. Full execution contracts remain
+the wire default. Progress preserves sequence metadata while omitting already
+seen update text; outcome reads retain the complete final reply. Original
+messages are never modified by a transport view.
+
 CLI and MCP message lists use server-side filters and pagination. Default
 list IPC responses omit task/reply bodies, paths, artifacts and update text;
 reply status and the latest update sequence remain available. `--full` and

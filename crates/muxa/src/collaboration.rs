@@ -496,7 +496,7 @@ impl Participant {
     /// Durable mailbox ownership follows a registered session across pane/window
     /// moves on the same host and control socket. Pending recipients remain
     /// pinned to their endpoint until a real session adopts them.
-    fn same_session(&self, other: &Self) -> bool {
+    pub fn same_session(&self, other: &Self) -> bool {
         if self.console
             || other.console
             || self.agent_session_id.is_empty()
@@ -1307,6 +1307,59 @@ pub struct CollaborationCursor {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub id: String,
+}
+
+/// Opt-in transport views. Full execution contracts remain the default.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationReadView {
+    #[default]
+    Full,
+    Metadata,
+    Preview,
+    Outcome,
+    Progress {
+        after_update: u64,
+    },
+}
+
+impl CollaborationReadView {
+    pub fn apply(self, request: &mut CollaborationRequest) {
+        match self {
+            Self::Full => {}
+            Self::Metadata => request.omit_list_bodies(),
+            Self::Preview => {
+                let body = request.body.chars().take(256).collect();
+                let reply = request
+                    .reply
+                    .as_ref()
+                    .map(|reply| reply.body.chars().take(256).collect::<String>());
+                request.omit_list_bodies();
+                request.body = body;
+                if let (Some(reply), Some(body)) = (&mut request.reply, reply) {
+                    reply.body = body;
+                }
+            }
+            Self::Outcome => {
+                let reply = request.reply.take();
+                request.omit_list_bodies();
+                request.reply = reply;
+            }
+            Self::Progress { after_update } => {
+                let updates = std::mem::take(&mut request.updates)
+                    .into_iter()
+                    .map(|mut update| {
+                        if update.sequence <= after_update {
+                            update.body.clear();
+                        }
+                        update
+                    })
+                    .collect();
+                request.omit_list_bodies();
+                request.updates = updates;
+            }
+        }
+    }
 }
 
 impl CollaborationRequest {

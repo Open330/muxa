@@ -1694,9 +1694,32 @@ async fn call_tool(
                 let request = if args.get("after_update").is_some()
                     && args.get("full").and_then(Value::as_bool) != Some(true)
                 {
-                    client.collaboration_peek(&origin, id).await
+                    client
+                        .collaboration_peek_view(
+                            &origin,
+                            id,
+                            muxa::collaboration::CollaborationReadView::Progress {
+                                after_update: args
+                                    .get("after_update")
+                                    .and_then(Value::as_u64)
+                                    .unwrap_or(0),
+                            },
+                        )
+                        .await
                 } else {
-                    client.collaboration_get(&origin, id).await
+                    client
+                        .collaboration_get_view(
+                            &origin,
+                            id,
+                            if args.get("full").and_then(Value::as_bool) == Some(true)
+                                || args.get("include_body").and_then(Value::as_bool) == Some(true)
+                            {
+                                muxa::collaboration::CollaborationReadView::Full
+                            } else {
+                                muxa::collaboration::CollaborationReadView::Outcome
+                            },
+                        )
+                        .await
                 };
                 return Ok(match request {
                     Ok(request) => json_result(&message_view(&request, &args)),
@@ -1784,7 +1807,15 @@ async fn call_tool(
                 Err(error) => return Ok(error_result(&error)),
             };
             Ok(
-                match client.collaboration_update(&origin, request_id, body).await {
+                match client
+                    .collaboration_update_view(
+                        &origin,
+                        request_id,
+                        body,
+                        muxa::collaboration::CollaborationReadView::Metadata,
+                    )
+                    .await
+                {
                     Ok(request) => {
                         json_result(&crate::collaboration_output::mutation_receipt(&request))
                     }
@@ -1814,13 +1845,14 @@ async fn call_tool(
             };
             Ok(
                 match client
-                    .collaboration_reply(
+                    .collaboration_reply_view(
                         &origin,
                         request_id,
                         status,
                         body,
                         &artifacts,
                         &air_artifacts,
+                        muxa::collaboration::CollaborationReadView::Metadata,
                     )
                     .await
                 {
@@ -2275,8 +2307,16 @@ async fn peer_report(client: &Client, args: &Value) -> Value {
         Ok(origin) => origin,
         Err(error) => return error_result(&error),
     };
+    let view = if args.get("full").and_then(Value::as_bool).unwrap_or(false) {
+        muxa::collaboration::CollaborationReadView::Full
+    } else {
+        muxa::collaboration::CollaborationReadView::Outcome
+    };
     if let Some(request_id) = args.get("request_id").and_then(Value::as_str) {
-        return match client.collaboration_get(&origin, request_id).await {
+        return match client
+            .collaboration_get_view(&origin, request_id, view)
+            .await
+        {
             Ok(request) if request.reply.is_some() => json_result(&json!({
                 "selection_reason": "explicit request_id",
                 if args.get("full").and_then(Value::as_bool).unwrap_or(false) { "request" } else { "result" }: report_view(&request, args),
@@ -2289,30 +2329,74 @@ async fn peer_report(client: &Client, args: &Value) -> Value {
     }
 
     let target = args.get("target").and_then(Value::as_str).unwrap_or("peer");
-    let requests = match client
-        .collaboration_list(&origin, RequestMailbox::Sent)
-        .await
-    {
-        Ok(requests) => requests,
+    let selected = match newest_peer_report(client, &origin, target).await {
+        Ok(request) => request,
         Err(error) => return error_result(&format!("peer_report list failed: {error}")),
     };
-    let selected = requests
-        .into_iter()
-        .filter(|request| {
-            request.reply.is_some() && peer_report_target_matches(&request.to, target)
-        })
-        .max_by_key(|request| request.created_at);
     let Some(selected) = selected else {
         return error_result(&format!(
             "no received Muxa peer report matches {target:?}; use muxa_call_peer only if the user wants a new request"
         ));
     };
-    match client.collaboration_get(&origin, &selected.id).await {
+    match client
+        .collaboration_get_view(&origin, &selected.id, view)
+        .await
+    {
         Ok(request) => json_result(&json!({
             "selection_reason": format!("newest received report matching {target:?}"),
             if args.get("full").and_then(Value::as_bool).unwrap_or(false) { "request" } else { "result" }: report_view(&request, args),
         })),
         Err(error) => error_result(&format!("peer_report failed: {error}")),
+    }
+}
+
+async fn newest_peer_report(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    target: &str,
+) -> Result<Option<CollaborationRequest>, String> {
+    let mut query = muxa::collaboration::CollaborationQuery {
+        limit: Some(20),
+        ..Default::default()
+    };
+    loop {
+        let result = client
+            .collaboration_query_result(
+                origin,
+                RequestMailbox::Sent,
+                muxa::collaboration::MailboxScope::Caller,
+                &query,
+                0,
+                muxa::collaboration::CollaborationReadView::Metadata,
+                false,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        if let Some(legacy) = result.legacy_requests {
+            let selected = legacy
+                .into_iter()
+                .filter(|request| {
+                    request.reply.is_some() && peer_report_target_matches(&request.to, target)
+                })
+                .max_by_key(|request| request.created_at);
+            return Ok(selected.map(|mut request| {
+                request.omit_list_bodies();
+                request
+            }));
+        }
+        let page = result.page;
+        if let Some(request) = page.requests.into_iter().find(|request| {
+            request.reply.is_some() && peer_report_target_matches(&request.to, target)
+        }) {
+            return Ok(Some(request));
+        }
+        if !page.has_more {
+            return Ok(None);
+        }
+        query.cursor = Some(
+            page.next_cursor
+                .ok_or("report page omitted its continuation cursor")?,
+        );
     }
 }
 
@@ -3698,7 +3782,12 @@ async fn await_collaboration_reply(
     timeout_secs: u64,
 ) -> std::result::Result<Option<CollaborationRequest>, String> {
     let request = client
-        .collaboration_wait(origin, request_id, timeout_secs)
+        .collaboration_wait_view(
+            origin,
+            request_id,
+            timeout_secs,
+            muxa::collaboration::CollaborationReadView::Outcome,
+        )
         .await
         .map_err(|error| error.to_string())?;
     Ok((request.status.is_terminal() || request.peer_interrupted()).then_some(request))
@@ -4058,7 +4147,16 @@ async fn wait_for_reply(client: &Client, args: &Value) -> Value {
         Err(error) => return error_result(&error),
     };
     match client
-        .collaboration_wait(&origin, request_id, timeout_secs)
+        .collaboration_wait_view(
+            &origin,
+            request_id,
+            timeout_secs,
+            if args.get("full").and_then(Value::as_bool) == Some(true) {
+                muxa::collaboration::CollaborationReadView::Full
+            } else {
+                muxa::collaboration::CollaborationReadView::Outcome
+            },
+        )
         .await
     {
         Ok(request) if request.status.is_terminal() || request.peer_interrupted() => {
@@ -6513,6 +6611,60 @@ mod tests {
         assert!(has_pane_readiness_signal(AgentProgram::Gemini));
         assert!(has_pane_readiness_signal(AgentProgram::Antigravity));
         assert!(!has_pane_readiness_signal(AgentProgram::Opencode));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn newest_report_scans_metadata_pages_without_full_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("reports.sock");
+        let mut newer = crate::collaboration_output::fixture();
+        newer.status = RequestStatus::Completed;
+        newer.reply = Some(muxa::collaboration::CollaborationReply {
+            status: RequestStatus::Completed,
+            body: "review result".into(),
+            artifacts: vec![],
+            air_artifacts: vec![],
+            at: newer.created_at,
+        });
+        newer.id = "newer".into();
+        newer.to.alias = Some("other".into());
+        let mut older = newer.clone();
+        older.id = "older".into();
+        older.to.alias = Some("reviewer".into());
+        muxa::collaboration::CollaborationReadView::Metadata.apply(&mut newer);
+        muxa::collaboration::CollaborationReadView::Metadata.apply(&mut older);
+        let cursor = muxa::collaboration::CollaborationCursor {
+            created_at: newer.created_at,
+            id: newer.id.clone(),
+        };
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![
+                (
+                    json!({"/kind":"collaboration_list","/metadata_only":true,"/query/limit":20,"/query/cursor":null}),
+                    json!({"ok":true,"collaboration_scope":"caller","collaboration_page":{"requests":[newer],"total":2,"has_more":true,"next_cursor":cursor}}),
+                ),
+                (
+                    json!({"/kind":"collaboration_list","/metadata_only":true,"/query/cursor/id":"newer"}),
+                    json!({"ok":true,"collaboration_scope":"caller","collaboration_page":{"requests":[older],"total":2,"has_more":false}}),
+                ),
+            ],
+        );
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: None,
+            console: false,
+            agent_session_id: None,
+        };
+        let found = newest_peer_report(&Client::new(socket), &origin, "@reviewer")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, "older");
+        assert!(found.body.is_empty());
+        assert!(found.reply.is_some());
+        server.await.unwrap();
     }
 
     #[test]
