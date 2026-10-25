@@ -1187,6 +1187,14 @@ pub struct ReconcilerConfig {
     /// and preserve the historical "orphan rows persist" behaviour.
     #[serde(default = "default_paneless_stale_secs")]
     pub paneless_stale_timeout_secs: u64,
+
+    /// Most live orphan rows (no pane, surface or pid) kept at once; the
+    /// least recently active beyond it are marked `Stopped` and removed a
+    /// few minutes later. Bounds what a script running agent CLIs headlessly
+    /// can pile up within `paneless_stale_timeout_secs`. Default `256`;
+    /// `0` disables the cap.
+    #[serde(default = "default_paneless_max_live_rows")]
+    pub paneless_max_live_rows: usize,
 }
 
 impl Default for ReconcilerConfig {
@@ -1198,6 +1206,7 @@ impl Default for ReconcilerConfig {
             stuck_waiting_timeout_secs: 0,
             codex_rollout_enabled: true,
             paneless_stale_timeout_secs: default_paneless_stale_secs(),
+            paneless_max_live_rows: default_paneless_max_live_rows(),
         }
     }
 }
@@ -1295,6 +1304,11 @@ fn default_screen_detect_interval_secs() -> u64 {
 fn default_paneless_stale_secs() -> u64 {
     // 24 hours — see `ReconcilerConfig::paneless_stale_timeout_secs`.
     86_400
+}
+
+fn default_paneless_max_live_rows() -> usize {
+    // See `ReconcilerConfig::paneless_max_live_rows`.
+    256
 }
 
 fn default_discovery_interval_secs() -> u64 {

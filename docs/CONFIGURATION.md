@@ -610,6 +610,7 @@ stuck_working_timeout_secs = 0
 stuck_waiting_timeout_secs = 0
 codex_rollout_enabled = true
 paneless_stale_timeout_secs = 86400
+paneless_max_live_rows = 256
 ```
 
 The reconciler keeps stale states from staying misleading forever. Timeout
@@ -622,7 +623,11 @@ Codex rollout polling runs every two seconds independently of the full
 and recovers running/completed turns and actual errors. Used percentages and
 credit balances alone do not change state. Set `codex_rollout_enabled = false`
 to disable it. `paneless_stale_timeout_secs` stops fully orphaned registry rows
-after 24 hours by default; `0` disables that cleanup.
+after 24 hours by default; `0` disables that cleanup. `paneless_max_live_rows`
+keeps at most that many live orphan rows at once (the least recently active
+beyond it are stopped), so a script running agent CLIs headlessly cannot pile
+thousands up within that day; stopped orphan rows are removed after five
+minutes. `0` disables the cap.
 
 ## Fleet
 
