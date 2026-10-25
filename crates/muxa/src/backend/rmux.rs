@@ -316,17 +316,14 @@ impl PaneBackend for RmuxBackend {
                 .map(str::to_string)
                 .or_else(|| self.endpoint.clone()),
         };
-        let value = if on { "on" } else { "off" };
-        scoped
-            .run_control(&[
-                "set-option",
-                "-p",
-                "-t",
-                strip_prefix(pane_id),
-                "remain-on-exit",
-                value,
-            ])
-            .is_ok()
+        // Off means unset, as on tmux.
+        let pane = strip_prefix(pane_id);
+        let args: &[&str] = if on {
+            &["set-option", "-p", "-t", pane, "remain-on-exit", "on"]
+        } else {
+            &["set-option", "-p", "-u", "-t", pane, "remain-on-exit"]
+        };
+        scoped.run_control(args).is_ok()
     }
 
     fn respawn_pane_on(
@@ -341,17 +338,12 @@ impl PaneBackend for RmuxBackend {
                 .map(str::to_string)
                 .or_else(|| self.endpoint.clone()),
         };
-        scoped
-            .run_control(&[
-                "respawn-pane",
-                "-k",
-                "-c",
-                cwd,
-                "-t",
-                strip_prefix(pane_id),
-                command,
-            ])
-            .is_ok()
+        let mut args = vec!["respawn-pane", "-k"];
+        if !cwd.is_empty() {
+            args.extend(["-c", cwd]);
+        }
+        args.extend(["-t", strip_prefix(pane_id), command]);
+        scoped.run_control(&args).is_ok()
     }
 
     fn send_text_on(&self, endpoint: Option<&str>, pane_id: &str, text: &str) -> bool {

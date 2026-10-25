@@ -87,12 +87,14 @@ impl PaneBackend for TmuxBackend {
     }
 
     fn set_remain_on_exit_on(&self, socket: Option<&str>, pane_id: &str, on: bool) -> bool {
-        let value = if on { "on" } else { "off" };
-        tmux::run_control_on(
-            socket,
-            &["set-option", "-p", "-t", pane_id, "remain-on-exit", value],
-        )
-        .is_ok()
+        // Off means unset: the pane goes back to the window or global
+        // setting instead of a pane-local override.
+        let args: &[&str] = if on {
+            &["set-option", "-p", "-t", pane_id, "remain-on-exit", "on"]
+        } else {
+            &["set-option", "-p", "-u", "-t", pane_id, "remain-on-exit"]
+        };
+        tmux::run_control_on(socket, args).is_ok()
     }
 
     fn respawn_pane_on(
@@ -102,11 +104,12 @@ impl PaneBackend for TmuxBackend {
         cwd: &str,
         command: &str,
     ) -> bool {
-        tmux::run_control_on(
-            socket,
-            &["respawn-pane", "-k", "-c", cwd, "-t", pane_id, command],
-        )
-        .is_ok()
+        let mut args = vec!["respawn-pane", "-k"];
+        if !cwd.is_empty() {
+            args.extend(["-c", cwd]);
+        }
+        args.extend(["-t", pane_id, command]);
+        tmux::run_control_on(socket, &args).is_ok()
     }
 
     fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {

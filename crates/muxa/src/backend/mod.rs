@@ -562,7 +562,8 @@ pub trait PaneBackend: Send + Sync + 'static {
         BackendCaps::default()
     }
 
-    /// Keep `pane_id` open (dead) after its process exits, or stop doing so.
+    /// Keep `pane_id` open (dead) after its process exits, or drop that
+    /// pane-level setting again (back to the window's or the global one).
     /// `false` when the backend has no such option; a pane that runs its
     /// agent directly then cannot be relaunched in place.
     fn set_remain_on_exit_on(&self, _socket: Option<&str>, _pane_id: &str, _on: bool) -> bool {
