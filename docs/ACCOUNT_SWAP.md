@@ -115,6 +115,18 @@ aas = "aas"              # the aas binary; the daemon also looks in /opt/homebre
 cut off: by a usage cap, or by the swap itself when `--force` stopped them
 mid-turn. An idle agent moved with `--all` is only resumed.
 
+## On a Fleet host
+
+`muxa swap --host <alias>` runs the same swap on a control-mode
+`[fleet.hosts]` host: that host's daemon, agents and `[accounts]`, through
+the Fleet work-command transport, with the report printed here. Agents use
+the same thing through the `muxa_swap_account` MCP tool (`host` omitted for
+this host). The host's own `muxa` must be new enough to know `swap`.
+
+```console
+$ muxa swap --host rtzr --to work --dry-run
+```
+
 ## Automatic swap
 
 The same swap is an automation action. This rule moves any capped agent to the

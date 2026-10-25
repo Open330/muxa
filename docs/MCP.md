@@ -195,6 +195,7 @@ it:
 | `muxa_guide` | — | Return the user's configured surface, agent, option, direction, and free-form orchestration preferences. |
 | `muxa_start_agent` | `agent?`, `options?`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. `agent` is optional only when configured in `[mcp.guide]`. |
 | `muxa_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
+| `muxa_swap_account` | `host?`, `targets?`, `all?`, `provider?`, `to?`, `force?`, `dry_run?` | Move Claude/Codex agents onto another account and resume them in place, here or on a control-mode Fleet host (`muxa swap`; see [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md)). |
 | `muxa_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
 | `muxa_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `muxa_capture_pane` | `pane` | Capture the visible contents of a pane. |

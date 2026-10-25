@@ -312,7 +312,9 @@ impl WorkCommandLimits {
     /// The budget a validated argv is entitled to.
     #[must_use]
     pub fn for_args(args: &[String]) -> Self {
+        // A swap stops, relaunches and waits on one agent after another.
         if is_work_up(args)
+            || is_swap(args)
             || args
                 .get(1)
                 .is_some_and(|s| matches!(s.as_str(), "dispatch" | "dispatch-execute"))
@@ -350,6 +352,55 @@ pub enum WorkCommandError {
     Failed(String),
 }
 
+/// `swap …`: `muxa swap` run on a Fleet host for the controller.
+#[must_use]
+pub fn is_swap(args: &[String]) -> bool {
+    args.first().is_some_and(|command| command == "swap")
+}
+
+/// `muxa swap` switches a remote run may pass.
+const SWAP_SWITCHES: &[&str] = &[
+    "--json",
+    "--all",
+    "--limited",
+    "--spread",
+    "--force",
+    "--no-continue",
+    "--dry-run",
+];
+
+/// `muxa swap` options a remote run may pass, each as one `--flag=value`.
+const SWAP_VALUE_FLAGS: &[&str] = &["--provider", "--to", "--bare", "--continue"];
+
+/// Check a `swap` argv: JSON output, only the allowlisted flags, and plain
+/// targets (`%5`, `rmux:%5`, session ids). The daemon-owned `--socket` /
+/// `--config` and a nested `--host` fall outside the allowlist.
+pub fn validate_swap_argv(args: &[String]) -> Result<(), String> {
+    if !is_swap(args) {
+        return Err("expected `swap …`".into());
+    }
+    let rest = &args[1..];
+    if !rest.iter().any(|arg| arg == "--json") {
+        return Err("`swap` over Fleet must pass --json".into());
+    }
+    for arg in rest {
+        let switch = SWAP_SWITCHES.contains(&arg.as_str());
+        let valued = arg
+            .split_once('=')
+            .is_some_and(|(flag, _)| SWAP_VALUE_FLAGS.contains(&flag));
+        let target = !arg.starts_with('-')
+            && (1..=200).contains(&arg.len())
+            && arg
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || ":%._@-".contains(c));
+        if !(switch || valued || target) {
+            let shown: String = arg.chars().take(40).collect();
+            return Err(format!("`swap` does not accept {shown:?} here"));
+        }
+    }
+    Ok(())
+}
+
 fn is_work_up(args: &[String]) -> bool {
     args.first().is_some_and(|command| command == "work")
         && args.get(1).is_some_and(|subcommand| subcommand == "up")
@@ -376,6 +427,16 @@ pub fn validate_work_command(
     // The IPC surface has its own `agent_start` kind and keeps refusing it.
     if surface == WorkCommandSurface::Relay && crate::agent_control::is_agent_start(args) {
         crate::agent_control::validate_relay_argv(args).map_err(WorkCommandError::Invalid)?;
+        let input_bytes = args.iter().map(String::len).sum::<usize>() + optional_len(stdin);
+        if input_bytes > MAX_WORK_COMMAND_INPUT_BYTES {
+            return Err(WorkCommandError::Invalid(format!(
+                "request exceeds {MAX_WORK_COMMAND_INPUT_BYTES} bytes"
+            )));
+        }
+        return Ok(());
+    }
+    if is_swap(args) {
+        validate_swap_argv(args).map_err(WorkCommandError::Invalid)?;
         let input_bytes = args.iter().map(String::len).sum::<usize>() + optional_len(stdin);
         if input_bytes > MAX_WORK_COMMAND_INPUT_BYTES {
             return Err(WorkCommandError::Invalid(format!(
@@ -680,6 +741,39 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|part| (*part).to_string()).collect()
+    }
+
+    #[test]
+    fn a_swap_crosses_fleet_with_json_allowlisted_flags_and_plain_targets() {
+        let ok = argv(&[
+            "swap",
+            "rmux:%14",
+            "%5",
+            "--all",
+            "--force",
+            "--to=work@claude",
+            "--continue=keep going",
+            "--json",
+        ]);
+        for surface in [WorkCommandSurface::Relay, WorkCommandSurface::Ipc] {
+            validate_work_command(&ok, None, surface).unwrap();
+        }
+        assert_eq!(WorkCommandLimits::for_args(&ok), WorkCommandLimits::WORK_UP);
+        for bad in [
+            argv(&["swap", "--all"]),
+            argv(&["swap", "--json", "--socket=/tmp/x"]),
+            argv(&["swap", "--json", "--config=/etc/x"]),
+            argv(&["swap", "--json", "--host=other"]),
+            argv(&["swap", "--json", "%5;rm -rf ~"]),
+        ] {
+            assert!(
+                validate_work_command(&bad, None, WorkCommandSurface::Relay).is_err(),
+                "{bad:?}"
+            );
+        }
+        // Moving agents is a mutation: observe-only hosts refuse it.
+        assert!(authorize_work_command("dev", HostAccessMode::Observe, &ok).is_err());
+        authorize_work_command("dev", HostAccessMode::Control, &ok).unwrap();
     }
 
     #[tokio::test]

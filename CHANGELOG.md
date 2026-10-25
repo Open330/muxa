@@ -9,6 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa swap --host <alias>` swaps agents on a control-mode Fleet host
+  through the work-command transport, and the `muxa_swap_account` MCP tool
+  does the same for agents, here or on a host.
 - `muxa swap` relaunches agents in panes that run them directly
   (`exec claude …`, `aas e …` as the pane command) by keeping the pane open
   past the exit and respawning it in place on tmux and rmux, instead of

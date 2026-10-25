@@ -27,7 +27,8 @@ use std::fmt::Write as _;
   muxa swap %5 --to jelly@claude
   muxa swap --all --spread      move every idle agent, spread across accounts
   muxa swap --all --force --provider codex
-  muxa swap --dry-run           show the plan, touch nothing")]
+  muxa swap --dry-run           show the plan, touch nothing
+  muxa swap --host rtzr --to work@claude   swap on a Fleet host")]
 #[allow(clippy::struct_excessive_bools)] // independent CLI switches
 pub struct Args {
     /// Panes (`%5`, `herdr:p9`) or provider session ids to swap.
@@ -73,6 +74,10 @@ pub struct Args {
     dry_run: bool,
     #[arg(long)]
     json: bool,
+    /// Run the swap on this Fleet host (a control-mode `[fleet.hosts]`
+    /// alias) instead of here: its daemon, its agents, its config.
+    #[arg(long, value_name = "ALIAS")]
+    host: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -130,6 +135,9 @@ pub(crate) async fn run(
     config: &SwapConfig,
     accounts: &muxa::accounts::AccountsConfig,
 ) -> Result<()> {
+    if let Some(host) = args.host.as_deref().filter(|host| *host != "local") {
+        return run_remote(client, &args, host).await;
+    }
     let request = request(&args, config);
     let agents = client.snapshot().await.context("listing agents")?;
     let backends = muxa::backend::active_backends();
@@ -147,6 +155,76 @@ pub(crate) async fn run(
     }
     if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
         bail!("some agents could not be swapped");
+    }
+    Ok(())
+}
+
+/// The same swap as a `muxa swap … --json` argv for a Fleet host, every
+/// value as one `--flag=value` word as the relay's allowlist expects.
+fn remote_argv(args: &Args) -> Vec<String> {
+    let mut words = vec!["swap".to_owned()];
+    words.extend(args.targets.iter().cloned());
+    for (on, flag) in [
+        (args.all, "--all"),
+        (args.limited, "--limited"),
+        (args.spread, "--spread"),
+        (args.force, "--force"),
+        (args.no_continue, "--no-continue"),
+        (args.dry_run, "--dry-run"),
+    ] {
+        if on {
+            words.push(flag.to_owned());
+        }
+    }
+    if let Some(provider) = args.provider {
+        words.push(format!(
+            "--provider={}",
+            match provider {
+                Provider::Claude => "claude",
+                Provider::Codex => "codex",
+            }
+        ));
+    }
+    if !args.spread {
+        words.push(format!("--to={}", args.to));
+    }
+    if let Some(bare) = args.bare {
+        words.push(format!(
+            "--bare={}",
+            match bare {
+                Bare::Skip => "skip",
+                Bare::Wrap => "wrap",
+            }
+        ));
+    }
+    if let Some(text) = &args.continue_text {
+        words.push(format!("--continue={text}"));
+    }
+    words.push("--json".to_owned());
+    words
+}
+
+/// `muxa swap --host`: the host's own `muxa swap` does the work, through
+/// the Fleet transport, and its report is printed here.
+async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
+    let output = client
+        .work_command(Some(host), &remote_argv(args), None)
+        .await
+        .with_context(|| format!("running the swap on {host}"))?;
+    let Ok(outcomes) = serde_json::from_str::<Vec<SwapOutcome>>(&output.stdout) else {
+        bail!(
+            "{host}: swap failed (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        );
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&outcomes)?);
+    } else {
+        print!("{}", render(&outcomes));
+    }
+    if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
+        bail!("some agents on {host} could not be swapped");
     }
     Ok(())
 }
@@ -193,6 +271,37 @@ mod tests {
     fn parse(argv: &[&str]) -> SwapRequest {
         let cli = Cli::parse_from(std::iter::once("swap").chain(argv.iter().copied()));
         request(&cli.args, &SwapConfig::default())
+    }
+
+    #[test]
+    fn host_runs_the_same_swap_there_as_one_word_per_value() {
+        let cli = Cli::parse_from([
+            "swap",
+            "%5",
+            "--force",
+            "--provider",
+            "claude",
+            "--to",
+            "work@claude",
+            "--continue",
+            "keep going",
+            "--host",
+            "rtzr",
+        ]);
+        let argv = remote_argv(&cli.args);
+        assert_eq!(
+            argv,
+            [
+                "swap",
+                "%5",
+                "--force",
+                "--provider=claude",
+                "--to=work@claude",
+                "--continue=keep going",
+                "--json"
+            ]
+        );
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
     }
 
     #[test]

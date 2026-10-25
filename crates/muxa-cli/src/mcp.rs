@@ -656,6 +656,27 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_swap_account",
+            "description": "Move Claude/Codex agents onto another account and resume each conversation in its own pane: \
+                stop the agent, relaunch it on the account with the same session, answer startup dialogs, and send a \
+                follow-up so a cut-off turn carries on. Default targets are agents stopped by a usage cap. Accounts come \
+                from [[accounts.<provider>]] on that host, or aas. Run on this host or a control-mode Fleet host. \
+                Use dry_run=true to see the plan first. CLI equivalent: `muxa swap`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string", "description": "Fleet host alias. Omit (or \"local\") for this host." },
+                    "targets": { "type": "array", "items": { "type": "string" }, "description": "Panes (%5, rmux:%5) or provider session ids. Omit for every capped agent." },
+                    "all": { "type": "boolean", "description": "Every Claude/Codex agent, not only capped ones." },
+                    "provider": { "type": "string", "enum": ["claude", "codex"] },
+                    "to": { "type": "string", "description": "Account name, or auto (default)." },
+                    "force": { "type": "boolean", "description": "Also stop agents that are mid-turn." },
+                    "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
             "name": "muxa_manage_tmux",
             "description": "Manage Muxa's tmux bindings: session=Workspace, window=current Run, \
                 and pane=agent session. List/show managed Workspaces and Work, interrupt an agent turn, \
@@ -1569,6 +1590,7 @@ async fn call_tool(
         }
         "muxa_call_peer" => Ok(call_peer(client, &args, config).await),
         "muxa_start_work" => Ok(start_work(client, &args, config).await),
+        "muxa_swap_account" => Ok(swap_account(client, &args).await),
         "muxa_peer_report" => Ok(peer_report(client, &args).await),
         "muxa_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
@@ -4749,6 +4771,48 @@ fn error_result(message: &str) -> Value {
     })
 }
 
+/// `muxa_swap_account`: `muxa swap --json` through the daemon's work
+/// command transport, here or on a Fleet host.
+async fn swap_account(client: &Client, args: &Value) -> Value {
+    let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+    let mut words = vec!["swap".to_owned()];
+    if let Some(targets) = args.get("targets").and_then(Value::as_array) {
+        words.extend(targets.iter().filter_map(Value::as_str).map(str::to_owned));
+    }
+    for (name, switch) in [
+        ("all", "--all"),
+        ("force", "--force"),
+        ("dry_run", "--dry-run"),
+    ] {
+        if flag(name) {
+            words.push(switch.to_owned());
+        }
+    }
+    if let Some(provider) = args.get("provider").and_then(Value::as_str) {
+        words.push(format!("--provider={provider}"));
+    }
+    if let Some(to) = args.get("to").and_then(Value::as_str) {
+        words.push(format!("--to={to}"));
+    }
+    words.push("--json".to_owned());
+    let host = args
+        .get("host")
+        .and_then(Value::as_str)
+        .filter(|host| !host.is_empty() && *host != "local");
+    match client.work_command(host, &words, None).await {
+        Ok(output) => match serde_json::from_str::<Value>(&output.stdout) {
+            Ok(outcomes) => {
+                json_result(&json!({ "host": host.unwrap_or("local"), "outcomes": outcomes }))
+            }
+            Err(_) => error_result(&format!(
+                "swap failed (exit {}): {}",
+                output.exit_code,
+                output.stderr.trim()
+            )),
+        },
+        Err(error) => error_result(&format!("swap failed: {error}")),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5897,6 +5961,7 @@ mod tests {
                 "muxa_guide",
                 "muxa_start_agent",
                 "muxa_start_work",
+                "muxa_swap_account",
                 "muxa_manage_tmux",
                 "muxa_send_prompt",
                 "muxa_capture_pane",
