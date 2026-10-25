@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa swap` no longer types its follow-up into a startup dialog. Claude's
+  folder-trust prompt on a fresh account (where Enter means "No, exit"), its
+  auto-mode tour, and Codex's folder trust, "Working directory · resume",
+  "Resume goal" and "open in another app" are answered the way the agent was
+  already running; any other dialog stops the swap with a note.
+- `muxa swap` quits Claude with `/exit` instead of a signal, keeping background
+  work and worktrees through the exit dialogs. A session that owns scheduled
+  tasks stays on its account. Agents stopped mid-turn by `--force` now get the
+  follow-up prompt under `continue_when = "limited"`.
+- `muxa swap --to auto` treats a bare agent as running on the active account,
+  so it is moved to another account rather than onto the one it already uses.
+
+### Fixed
+
 - Mac Fleet snapshots index panes once per host instead of scanning all panes
   for every agent. Socket ambiguity and host isolation retain their prior
   behavior while avoiding quadratic matching work on large workspaces.
