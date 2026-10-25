@@ -6059,3 +6059,65 @@ func slowFleetSnapshotDoesNotBlockTerminalInput() async throws {
     probe.release.signal()
     _ = try await snapshot.value
 }
+
+private final class QueuedCancellationProbe: @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var count = 0
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return count }
+    func waitUntilStarted() -> Bool { entered.wait(timeout: .now() + 2) == .success }
+    func request(path: String, payload: Data) throws -> Data {
+        lock.lock(); count += 1; let index = count; lock.unlock()
+        if index == 1 {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 3)
+        }
+        return payload
+    }
+}
+
+@Test
+func cancelledQueuedIPCRequestsNeverExecuteOrDelayFreshRequests() async throws {
+    let probe = QueuedCancellationProbe()
+    let transport = SerializedIPCTransport(handler: probe.request)
+    let first = Task { try await transport.request(path: "fixture", payload: Data([1])) }
+    defer { probe.release.signal() }
+    #expect(await Task.detached { probe.waitUntilStarted() }.value)
+    let stale = (0..<50).map { _ in Task { try await transport.request(path: "fixture", payload: Data([2])) } }
+    // Let the tasks reach their transport continuations before cancelling.
+    for _ in 0..<100 { await Task.yield() }
+    for task in stale { task.cancel() }
+    for task in stale {
+        do { _ = try await task.value; Issue.record("Cancelled request unexpectedly succeeded") }
+        catch is CancellationError { }
+    }
+    probe.release.signal()
+    _ = try await first.value
+    #expect(try await transport.request(path: "fixture", payload: Data([3])) == Data([3]))
+    #expect(probe.calls == 2, "Only the already-running and fresh requests may execute")
+}
+
+@Test @MainActor
+func panePreviewWakesImmediatelyWhenApplicationBecomesActive() async throws {
+    let probe = IPCProbe()
+    let client = MuxaIPCClient(socketPath: "/tmp/isolated-preview-wake.sock", request: probe.request)
+    try await client.hello()
+    let snapshot = try await client.executionSnapshot()
+    let pane = try #require(snapshot.watchHosts.first?.sessions.first?.windows.first?.panes.first)
+    let model = PaneCaptureModel(client: client, target: MuxaPaneTarget(host: pane.host, pane: pane.pane))
+    model.setApplicationActive(false)
+    let polling = Task { await model.run() }
+    defer { polling.cancel() }
+    try await Task.sleep(for: .milliseconds(30))
+    #expect(!probe.didRequest("fleet_command"))
+    let began = ContinuousClock.now
+    model.setApplicationActive(true)
+    while !model.screenText.contains("echo"), began.duration(to: .now) < .seconds(1) {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(model.screenText.contains("echo"), "Resume must not wait for the five-second idle backoff")
+    #expect(model.columns > 0)
+    polling.cancel()
+    await polling.value
+}

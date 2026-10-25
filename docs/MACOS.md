@@ -655,3 +655,8 @@ can report the same release version. The app's embedded `muxa` and `muxad` must
 also be refreshed when installing a newer main build. CLI-only commands do not
 automatically gain a native UI; Advanced settings exposes the daemon's complete
 configuration, while dedicated forms remain limited to their supported sections.
+
+Queued IPC work that is cancelled before it starts never reaches muxad. Cancelling
+an in-flight operation does not undo an already-sent command. Live pane preview
+ANSI parsing runs off the main actor and rejects superseded renders; inactive
+previews wake immediately on reactivation instead of waiting for the idle timer.

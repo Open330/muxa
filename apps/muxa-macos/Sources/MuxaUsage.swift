@@ -10,7 +10,38 @@ import SwiftUI
 /// RFC 3339 timestamps as muxad writes them. The daemon's `time` crate emits
 /// up to nine fractional digits, which `ISO8601DateFormatter` refuses, so the
 /// fraction is cut to milliseconds before parsing.
+/// Date formatters are expensive ICU objects. Usage projections repeatedly
+/// inspect the same agent timestamps, so share immutable formatter options
+/// and bound cached successes/failures instead of allocating per comparison.
+private final class UsageTimestampParser: @unchecked Sendable {
+    private final class Value {
+        let date: Date?
+        init(_ date: Date?) { self.date = date }
+    }
+    private let lock = NSLock()
+    private let fractional = ISO8601DateFormatter()
+    private let whole = ISO8601DateFormatter()
+    private let cache = NSCache<NSString, Value>()
+
+    init() {
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        whole.formatOptions = [.withInternetDateTime]
+        cache.countLimit = 4096
+    }
+
+    func parse(_ text: String) -> Date? {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = text as NSString
+        if let value = cache.object(forKey: key) { return value.date }
+        let date = fractional.date(from: text) ?? whole.date(from: text)
+        if text.utf8.count <= 128 { cache.setObject(Value(date), forKey: key) }
+        return date
+    }
+}
+
 enum MuxaUsageTimestamp {
+    private static let parser = UsageTimestampParser()
     static func parse(_ text: String?) -> Date? {
         guard var text = text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else {
             return nil
@@ -21,11 +52,7 @@ enum MuxaUsageTimestamp {
                 text.replaceSubrange(digits.startIndex..<digits.endIndex, with: digits.prefix(3))
             }
         }
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = formatter.date(from: text) { return date }
-        formatter.formatOptions = [.withInternetDateTime]
-        return formatter.date(from: text)
+        return parser.parse(text)
     }
 }
 

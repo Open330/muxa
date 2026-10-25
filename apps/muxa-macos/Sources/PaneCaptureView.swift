@@ -7,7 +7,7 @@ struct MuxaPaneTarget: Hashable, Sendable {
 }
 
 @MainActor
-private final class PaneCaptureModel: ObservableObject {
+final class PaneCaptureModel: ObservableObject {
     /// The screen rendered with the pane's SGR colors and attributes.
     @Published private(set) var screenContent = AttributedString(PaneCaptureModel.openingPlaceholder)
     /// Plain text of `screenContent`, for the copy action.
@@ -23,7 +23,7 @@ private final class PaneCaptureModel: ObservableObject {
 
     /// What the last capture returned. Change detection compares this, not
     /// the rendered `AttributedString`.
-    private enum CaptureSource: Equatable {
+    private enum CaptureSource: Equatable, Sendable {
         case placeholder
         case raw(Data)
         case plain(String)
@@ -36,6 +36,8 @@ private final class PaneCaptureModel: ObservableObject {
     private var isApplicationActive = NSApp.isActive
     private var hasLoaded = false
     private var source = CaptureSource.placeholder
+    private var wakeableSleep: Task<Void, Error>?
+    private var renderGeneration: UInt64 = 0
     private var colorScheme = ColorScheme.dark
 
     init(client: MuxaIPCClient, target: MuxaPaneTarget) {
@@ -44,14 +46,15 @@ private final class PaneCaptureModel: ObservableObject {
     }
 
     func run() async {
+        defer {
+            renderGeneration &+= 1
+            wakeableSleep?.cancel()
+            wakeableSleep = nil
+        }
         var unchangedReads = 0
         while !Task.isCancelled {
             guard isVisible, isApplicationActive else {
-                do {
-                    try await Task.sleep(for: .seconds(5))
-                } catch {
-                    return
-                }
+                await waitForRefresh(.seconds(5))
                 continue
             }
             let changed = await refresh()
@@ -62,20 +65,31 @@ private final class PaneCaptureModel: ObservableObject {
             case 3...5: .seconds(3)
             default: .seconds(5)
             }
-            do {
-                try await Task.sleep(for: interval)
-            } catch {
-                return
-            }
+            await waitForRefresh(interval)
         }
     }
 
+    private func waitForRefresh(_ interval: Duration) async {
+        let sleep = Task { try await Task.sleep(for: interval) }
+        wakeableSleep = sleep
+        await withTaskCancellationHandler {
+            try? await sleep.value
+        } onCancel: {
+            sleep.cancel()
+        }
+        wakeableSleep = nil
+    }
+
     func setVisible(_ visible: Bool) {
+        guard isVisible != visible else { return }
         isVisible = visible
+        if visible { wakeableSleep?.cancel() }
     }
 
     func setApplicationActive(_ active: Bool) {
+        guard isApplicationActive != active else { return }
         isApplicationActive = active
+        if active { wakeableSleep?.cancel() }
     }
 
     /// Re-renders the last capture with the palette for `scheme` when it
@@ -83,20 +97,30 @@ private final class PaneCaptureModel: ObservableObject {
     func setColorScheme(_ scheme: ColorScheme) {
         guard scheme != colorScheme else { return }
         colorScheme = scheme
-        render()
+        Task { await render() }
     }
 
-    private func render() {
-        let formatter = TerminalCaptureFormatter(palette: .palette(for: colorScheme))
-        let content: AttributedString = switch source {
-        case .placeholder: AttributedString(PaneCaptureModel.openingPlaceholder)
-        case .raw(let bytes): formatter.render(bytes: bytes)
-        case .plain(let text): formatter.render(text: text)
-        case .unavailable: AttributedString(Self.unavailablePlaceholder)
-        }
-        let trimmed = TerminalCaptureFormatter.trimmingTrailingBlankLines(content)
-        screenText = String(trimmed.characters)
-        columns = TerminalPreviewFont.columns(in: screenText)
+    private func render() async {
+        renderGeneration &+= 1
+        let generation = renderGeneration
+        let source = source, palette = TerminalCapturePalette.palette(for: colorScheme)
+        let opening = Self.openingPlaceholder, unavailable = Self.unavailablePlaceholder
+        let result = await Task.detached(priority: .userInitiated) {
+            let formatter = TerminalCaptureFormatter(palette: palette)
+            let content: AttributedString = switch source {
+            case .placeholder: AttributedString(opening)
+            case .raw(let bytes): formatter.render(bytes: bytes)
+            case .plain(let text): formatter.render(text: text)
+            case .unavailable: AttributedString(unavailable)
+            }
+            let trimmed = TerminalCaptureFormatter.trimmingTrailingBlankLines(content)
+            let text = String(trimmed.characters)
+            return (trimmed, text, TerminalPreviewFont.columns(in: text))
+        }.value
+        guard generation == renderGeneration, !Task.isCancelled else { return }
+        let (trimmed, text, width) = result
+        screenText = text
+        columns = width
         screenContent = trimmed
     }
 
@@ -109,6 +133,7 @@ private final class PaneCaptureModel: ObservableObject {
         }
         do {
             let capture = try await client.captureFleetPane(host: target.host, pane: target.pane)
+            try Task.checkCancellation()
             let nextSource: CaptureSource = if let bytes = capture.rawBytes {
                 .raw(bytes)
             } else if let text = capture.screenText {
@@ -119,7 +144,7 @@ private final class PaneCaptureModel: ObservableObject {
             let changed = nextSource != source
             if changed {
                 source = nextSource
-                render()
+                await render()
             }
             if errorMessage != nil { errorMessage = nil }
             return changed
