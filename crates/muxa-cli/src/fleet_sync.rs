@@ -749,6 +749,15 @@ mod reload_recovery_tests {
         first.try_lock().unwrap();
         assert!(second.try_lock().is_err());
         drop(first);
-        second.try_lock().unwrap();
+        // A process another test spawns at this moment can hold a copy of
+        // `first` until it execs, keeping the flock alive briefly.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while second.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the lock stayed held after its only owner dropped it"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 }
