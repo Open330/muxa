@@ -5990,3 +5990,72 @@ struct MuxaHumanAttentionInboxTests {
         #expect(model.operatorMessages.isEmpty)
     }
 }
+
+/// Deterministic head-of-line regression: a slow remote Work command must
+/// stay blocked while a snapshot and terminal input both complete.
+private final class SlowWorkTransportProbe: @unchecked Sendable {
+    let entered = DispatchSemaphore(value: 0)
+    let release = DispatchSemaphore(value: 0)
+    private let base = IPCProbe()
+    let blockSnapshot: Bool
+
+    init(blockSnapshot: Bool = false) { self.blockSnapshot = blockSnapshot }
+    func waitUntilStarted() -> Bool { entered.wait(timeout: .now() + 2) == .success }
+
+    func request(path: String, payload: Data) throws -> Data {
+        let object = try JSONSerialization.jsonObject(with: payload) as? [String: Any]
+        if blockSnapshot, object?["kind"] as? String == "fleet_snapshot" {
+            entered.signal()
+            _ = release.wait(timeout: .now() + 3)
+        }
+        if object?["kind"] as? String == "hello" {
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true, "min_protocol": 1, "max_protocol": 6,
+                "capabilities": ["session_bytes_v1", "session_attachment_identity_v1", "work_control_v1", "work_command_v1", "fleet_v1"],
+            ])
+        }
+        if object?["kind"] as? String == "work_command" {
+            if object?["host"] as? String == "slow" {
+                entered.signal()
+                _ = release.wait(timeout: .now() + 3)
+            }
+            return try JSONSerialization.data(withJSONObject: ["ok": true, "work_command": ["exit_code": 0, "stdout": "{}", "stderr": ""]])
+        }
+        return try base.request(path: path, payload: payload)
+    }
+}
+
+@Test
+func slowWorkCommandDoesNotBlockInputSnapshotsOrAnotherHost() async throws {
+    let probe = SlowWorkTransportProbe()
+    let client = MuxaIPCClient(socketPath: "/tmp/isolated-latency-test.sock", request: probe.request)
+    try await client.hello()
+    let slow = Task { try await client.workCommand(host: "slow", arguments: ["work", "options"]) }
+    defer { probe.release.signal() }
+    let started = await Task.detached { probe.waitUntilStarted() }.value
+    #expect(started)
+    let began = ContinuousClock.now
+    async let snapshot = client.executionSnapshot()
+    async let input: Void = client.writeSession(id: "test-session", bytes: Data("x".utf8))
+    async let otherHost = client.workCommand(host: "fast", arguments: ["work", "options"])
+    _ = try await (snapshot, input, otherHost)
+    #expect(began.duration(to: .now) < .seconds(1), "UI operations must finish before the slow command is released")
+    probe.release.signal()
+    _ = try await slow.value
+}
+
+@Test
+func slowFleetSnapshotDoesNotBlockTerminalInput() async throws {
+    let probe = SlowWorkTransportProbe(blockSnapshot: true)
+    let client = MuxaIPCClient(socketPath: "/tmp/isolated-snapshot-latency.sock", request: probe.request)
+    try await client.hello()
+    let snapshot = Task { try await client.executionSnapshot() }
+    defer { probe.release.signal() }
+    let started = await Task.detached { probe.waitUntilStarted() }.value
+    #expect(started)
+    let began = ContinuousClock.now
+    try await client.writeSession(id: "test-session", bytes: Data("x".utf8))
+    #expect(began.duration(to: .now) < .seconds(1))
+    probe.release.signal()
+    _ = try await snapshot.value
+}

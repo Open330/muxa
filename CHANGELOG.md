@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Mac app Work commands run independently per host instead of blocking terminal
+  input and background refreshes on the control IPC queue. Snapshot and state
+  reads have separate bounded transports; workspace projections compute off the
+  main actor and reject stale results. Unchanged connection status no longer
+  triggers another UI update. Runtime settings display installed build metadata.
+
 ### Added
 
 - `muxa config export` / `diff` / `apply` share portable settings between

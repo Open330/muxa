@@ -1045,6 +1045,11 @@ actor MuxaIPCClient {
     let socketPath: String
     private(set) var capabilities: Set<String> = []
     private let transport: SerializedIPCTransport
+    // Slow command execution and background snapshots must never queue in
+    // front of terminal input, resize, attachment, or prompt delivery.
+    private let snapshotTransport: SerializedIPCTransport
+    private let stateTransport: SerializedIPCTransport
+    private var workTransports: [String: SerializedIPCTransport] = [:]
     private let timedRequestHandler: MuxaIPCTimedRequestHandler
     private var terminalReadTransports: [String: SerializedIPCTransport] = [:]
     private let fleetReadTransports: [SerializedIPCTransport]
@@ -1053,6 +1058,8 @@ actor MuxaIPCClient {
     init(socketPath: String = MuxaIPCClient.defaultSocketPath()) {
         self.socketPath = socketPath
         timedRequestHandler = UnixSocket.request
+        snapshotTransport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-snapshot", timedHandler: UnixSocket.request)
+        stateTransport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-state", timedHandler: UnixSocket.request)
         transport = SerializedIPCTransport(
             label: "dev.muxa.mac.ipc-control",
             timedHandler: UnixSocket.request
@@ -1069,6 +1076,8 @@ actor MuxaIPCClient {
     init(socketPath: String, request: @escaping MuxaIPCRequestHandler) {
         self.socketPath = socketPath
         timedRequestHandler = { path, payload, _ in try request(path, payload) }
+        snapshotTransport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-snapshot-test", handler: request)
+        stateTransport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-state-test", handler: request)
         transport = SerializedIPCTransport(label: "dev.muxa.mac.ipc-control-test", handler: request)
         fleetReadTransports = (0..<4).map { index in
             SerializedIPCTransport(
@@ -1178,7 +1187,7 @@ actor MuxaIPCClient {
         ]
         if let host, !host.isEmpty { request["host"] = host }
         if let stdin { request["stdin"] = stdin }
-        let response = try await call(request, timeout: 40)
+        let response = try await call(request, using: workTransport(for: host ?? "local"), timeout: 40)
         guard let output = response.workCommand else {
             throw MuxaIPCError.missingField("work_command")
         }
@@ -1858,6 +1867,23 @@ actor MuxaIPCClient {
         return fleetReadTransports[abs(hash % fleetReadTransports.count)]
     }
 
+    private func workTransport(for host: String) -> SerializedIPCTransport {
+        if let existing = workTransports[host] { return existing }
+        let created = SerializedIPCTransport(label: "dev.muxa.mac.ipc-work-\(host)", timedHandler: timedRequestHandler)
+        workTransports[host] = created
+        return created
+    }
+
+    private func defaultTransport(for object: [String: Any]) -> SerializedIPCTransport {
+        switch object["kind"] as? String {
+        case "fleet_snapshot", "snapshot": return snapshotTransport
+        case "list_sessions", "pipeline_runs", "ask_list", "ask_conversations", "ask_status":
+            return stateTransport
+        case "ask_agent" where object["agent"] == nil: return stateTransport
+        default: return transport
+        }
+    }
+
     private func terminalReadTransport(for sessionID: String) -> SerializedIPCTransport {
         if let existing = terminalReadTransports[sessionID] { return existing }
         let hash = sessionID.utf8.reduce(0) { (partial: Int, byte: UInt8) in
@@ -1877,7 +1903,7 @@ actor MuxaIPCClient {
         timeout: TimeInterval = 3
     ) async throws -> MuxaIPCResponse {
         let request = try JSONSerialization.data(withJSONObject: object)
-        let data = try await (requestTransport ?? transport).request(
+        let data = try await (requestTransport ?? defaultTransport(for: object)).request(
             path: socketPath,
             payload: request,
             timeout: timeout
