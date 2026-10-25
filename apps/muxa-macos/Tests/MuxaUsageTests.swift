@@ -374,3 +374,20 @@ private let weekly: TimeInterval = 3 * 86_400
     #expect(firstReadableLine("- `cargo test` passed") == "cargo test passed")
     #expect(firstReadableLine("   ") == "")
 }
+
+@Test
+func usageTimestampCacheIsSafeAcrossConcurrentProjections() async {
+    await withTaskGroup(of: Bool.self) { group in
+        for _ in 0..<32 {
+            group.addTask {
+                for _ in 0..<200 {
+                    guard MuxaUsageTimestamp.parse("2026-09-21T14:13:20.250123456Z") == now.addingTimeInterval(0.25),
+                          MuxaUsageTimestamp.parse("2026-09-21T23:13:20+09:00") == now,
+                          MuxaUsageTimestamp.parse("invalid-timestamp") == nil else { return false }
+                }
+                return true
+            }
+        }
+        for await passed in group { #expect(passed) }
+    }
+}

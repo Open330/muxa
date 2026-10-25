@@ -985,6 +985,52 @@ typealias MuxaIPCTimedRequestHandler = @Sendable (
     TimeInterval
 ) throws -> Data
 
+/// Owns exactly one continuation across cancellation/queue-start races.
+private final class QueuedIPCRequest: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Data, Error>?
+    private var cancelled = false
+    private var started = false
+
+    func install(_ value: CheckedContinuation<Data, Error>) -> Bool {
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            value.resume(throwing: CancellationError())
+            return false
+        }
+        continuation = value
+        lock.unlock()
+        return true
+    }
+
+    func begin() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !cancelled else { return false }
+        started = true
+        return true
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        // A command already sent cannot be undone by cancelling its waiter.
+        let pending = started ? nil : continuation
+        if !started { continuation = nil }
+        lock.unlock()
+        pending?.resume(throwing: CancellationError())
+    }
+
+    func finish(_ result: Result<Data, Error>) {
+        lock.lock()
+        let pending = continuation
+        continuation = nil
+        lock.unlock()
+        pending?.resume(with: result)
+    }
+}
+
 /// Runs the blocking Unix-socket exchange on one serial queue.
 ///
 /// Actor methods are reentrant while awaiting detached work. The previous
@@ -1016,15 +1062,21 @@ final class SerializedIPCTransport: @unchecked Sendable {
     ) async throws -> Data {
         try Task.checkCancellation()
         let handler = self.handler
-        return try await withCheckedThrowingContinuation { continuation in
-            queue.async {
-                do {
-                    continuation.resume(returning: try handler(path, payload, timeout))
-                } catch {
-                    continuation.resume(throwing: error)
+        let pending = QueuedIPCRequest()
+        let response = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                guard pending.install(continuation) else { return }
+                queue.async {
+                    guard pending.begin() else { return }
+                    pending.finish(Result { try handler(path, payload, timeout) })
                 }
             }
+        } onCancel: {
+            pending.cancel()
         }
+        // Preserve acknowledgements for work already started: attachment
+        // cleanup must know whether the attach actually took effect.
+        return response
     }
 }
 

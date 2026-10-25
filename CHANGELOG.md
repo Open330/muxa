@@ -15,6 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Mac usage displays reuse RFC 3339 formatters and bound their parse cache,
+  avoiding repeated ICU setup on every agent comparison and UI update.
+- Mac IPC skips cancelled requests still waiting in a transport queue. Live pane
+  previews parse terminal styling off the main actor and wake promptly when
+  their view or app becomes active, rather than waiting for idle backoff.
+
+### Fixed
+
 - Mac app Work commands run independently per host instead of blocking terminal
   input and background refreshes on the control IPC queue. Snapshot and state
   reads have separate bounded transports; workspace projections compute off the
