@@ -490,6 +490,20 @@ impl Default for Store {
     }
 }
 
+/// How long a `Stopped` orphan row (no pane, surface or pid) is kept before
+/// the GC removes it; see `Store::gc`.
+pub const ORPHAN_STOPPED_TTL: time::Duration = time::Duration::minutes(5);
+
+/// A row no liveness path owns: no pane, no surface, no pid, not a task.
+/// Headless runs (a script driving an agent CLI without a terminal) and
+/// detached remote sessions produce these.
+fn is_orphan(agent: &Agent) -> bool {
+    agent.kind != AgentKind::Task
+        && agent.pane.is_none()
+        && agent.surface.is_none()
+        && agent.pid.is_none()
+}
+
 impl Store {
     /// Build a store wired to a specific [`PromptHistory`]. Daemon uses
     /// this to plug in a disk-backed instance; tests use the default
@@ -1526,13 +1540,21 @@ impl Store {
     }
 
     /// Remove agents that ended more than `max_age` ago. Caller decides
-    /// cadence; daemon runs this on a timer.
+    /// cadence; daemon runs this on a timer. Stopped orphan rows (no pane,
+    /// surface or pid) go after `ORPHAN_STOPPED_TTL` at most: no view shows
+    /// them, and a flood of headless runs would otherwise keep an hour of
+    /// them in memory, the snapshot and every full IPC reply.
     pub async fn gc(&self, max_age: time::Duration) -> usize {
-        let cutoff = OffsetDateTime::now_utc() - max_age;
+        let now = OffsetDateTime::now_utc();
+        let cutoff = now - max_age;
+        let orphan_cutoff = now - max_age.min(ORPHAN_STOPPED_TTL);
         let removed = {
             let mut agents = self.agents.write().await;
             let before = agents.len();
-            agents.retain(|_, a| a.state != AgentState::Stopped || a.last_activity_at >= cutoff);
+            agents.retain(|_, a| {
+                a.state != AgentState::Stopped
+                    || a.last_activity_at >= if is_orphan(a) { orphan_cutoff } else { cutoff }
+            });
             before - agents.len()
         };
         if removed > 0 {
@@ -1884,6 +1906,49 @@ impl Store {
             self.dirty.notify_one();
             self.changes.send_replace(());
         }
+        flipped
+    }
+
+    /// Keep at most `max` live orphan rows (no pane, surface or pid): the
+    /// most recently active stay, the rest flip to `Stopped` for the GC.
+    /// The idle timeout above spares a person's quiet remote session for a
+    /// day; this bounds what a script launching agent CLIs headlessly can
+    /// pile up meanwhile (thousands an hour pushed full IPC replies past
+    /// their size limit). `max == 0` disables it. Returns the number flipped.
+    pub async fn cap_live_orphans(&self, max: usize) -> usize {
+        if max == 0 {
+            return 0;
+        }
+        let mut agents = self.agents.write().await;
+        let mut live: Vec<(OffsetDateTime, String)> = agents
+            .iter()
+            .filter(|(_, a)| is_orphan(a) && a.state != AgentState::Stopped)
+            .map(|(key, a)| (a.last_activity_at, key.clone()))
+            .collect();
+        if live.len() <= max {
+            return 0;
+        }
+        live.sort_by(|a, b| b.0.cmp(&a.0));
+        let now = OffsetDateTime::now_utc();
+        let mut flipped = 0_usize;
+        for (_, key) in live.into_iter().skip(max) {
+            let Some(agent) = agents.get_mut(&key) else {
+                continue;
+            };
+            let prev = agent.state;
+            agent.state = AgentState::Stopped;
+            agent.state_entered_at = now;
+            agent.last_activity_at = now;
+            flipped += 1;
+            let _ = self.transitions.send(Transition {
+                from: prev,
+                to: agent.state,
+                agent: Arc::new(agent.clone()),
+            });
+        }
+        drop(agents);
+        self.dirty.notify_one();
+        self.changes.send_replace(());
         flipped
     }
 
@@ -2945,6 +3010,78 @@ mod tests {
         );
         // Idempotent: a second pass flips nothing new.
         assert_eq!(store.reap_dead_pids().await, 0);
+    }
+
+    #[tokio::test]
+    async fn live_orphans_are_capped_newest_first_and_owned_rows_are_spared() {
+        let store = Store::shared();
+        let base = OffsetDateTime::now_utc() - Duration::from_secs(600);
+        let started = |sid: &str, pane: Option<&str>, secs: u64| AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: None,
+                kind: AgentKind::ClaudeCode,
+                session_id: sid.into(),
+                surface: None,
+                pane: pane.map(Into::into),
+                cwd: None,
+            },
+            at: base + Duration::from_secs(secs),
+        };
+        for (i, sid) in ["h1", "h2", "h3", "h4", "h5"].iter().enumerate() {
+            store.apply(&started(sid, None, i as u64 * 10)).await;
+        }
+        store.apply(&started("paned-old", Some("%1"), 0)).await;
+
+        assert_eq!(store.cap_live_orphans(0).await, 0, "0 disables the cap");
+        assert_eq!(store.cap_live_orphans(2).await, 3);
+        for sid in ["h1", "h2", "h3"] {
+            assert_eq!(
+                store.by_session(sid).await.unwrap().state,
+                AgentState::Stopped,
+                "{sid}"
+            );
+        }
+        for sid in ["h4", "h5", "paned-old"] {
+            assert_ne!(
+                store.by_session(sid).await.unwrap().state,
+                AgentState::Stopped,
+                "{sid}"
+            );
+        }
+        assert_eq!(store.cap_live_orphans(2).await, 0, "idempotent");
+    }
+
+    #[tokio::test]
+    async fn stopped_orphans_are_collected_sooner_than_owned_stopped_rows() {
+        let store = Store::shared();
+        let at = OffsetDateTime::now_utc();
+        for (sid, pane) in [("orphan", None), ("paned", Some("%1".to_owned()))] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        tmux_socket: None,
+                        kind: AgentKind::Codex,
+                        session_id: sid.into(),
+                        surface: None,
+                        pane,
+                        cwd: None,
+                    },
+                    at,
+                })
+                .await;
+        }
+        // Both stopped ten minutes ago: past the orphan TTL, inside the
+        // regular one.
+        {
+            let mut agents = store.agents.write().await;
+            for agent in agents.values_mut() {
+                agent.state = AgentState::Stopped;
+                agent.last_activity_at = at - time::Duration::minutes(10);
+            }
+        }
+        assert_eq!(store.gc(time::Duration::minutes(60)).await, 1);
+        assert!(store.by_session("orphan").await.is_none());
+        assert!(store.by_session("paned").await.is_some());
     }
 
     #[tokio::test]

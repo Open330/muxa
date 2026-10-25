@@ -152,6 +152,8 @@ pub struct Reconciler<L: LivenessSource> {
     /// codex rows from detached `app-server`/remote sessions that no other
     /// converge path governs.
     paneless_stale_timeout: Duration,
+    /// Most live orphan rows kept; older ones flip to `Stopped`. `0` = off.
+    paneless_max_live: usize,
     /// Root of codex's session-rollout tree (`~/.codex/sessions`). When
     /// `Some`, read lifecycle and quota evidence even when hooks are missing.
     /// `None` (default) disables the poll.
@@ -195,6 +197,7 @@ impl<L: LivenessSource> Reconciler<L> {
             stuck_working_timeout: Duration::ZERO,
             stuck_waiting_timeout: Duration::ZERO,
             paneless_stale_timeout: Duration::ZERO,
+            paneless_max_live: 0,
             codex_sessions_root: None,
             codex_rollouts: Arc::default(),
             native_sessions: None,
@@ -244,6 +247,12 @@ impl<L: LivenessSource> Reconciler<L> {
     /// pid) — flips them to `Stopped` after `t` of inactivity so the GC
     /// removes them. `Duration::ZERO` (the default) keeps the sweep off.
     #[must_use]
+    /// Bound live orphan rows (see `Store::cap_live_orphans`).
+    pub fn with_paneless_max_live(mut self, max: usize) -> Self {
+        self.paneless_max_live = max;
+        self
+    }
+
     pub fn with_paneless_stale_timeout(mut self, t: Duration) -> Self {
         self.paneless_stale_timeout = t;
         self
@@ -712,6 +721,14 @@ impl<L: LivenessSource> Reconciler<L> {
             tracing::info!(
                 stale_paneless,
                 "orphan-row sweep flipped {stale_paneless} paneless agent(s) to Stopped",
+            );
+        }
+        let capped = self.store.cap_live_orphans(self.paneless_max_live).await;
+        if capped > 0 {
+            tracing::info!(
+                capped,
+                max = self.paneless_max_live,
+                "orphan-row cap flipped {capped} older paneless agent(s) to Stopped",
             );
         }
         // Age out rows whose pane belongs to a host that neither answered with
