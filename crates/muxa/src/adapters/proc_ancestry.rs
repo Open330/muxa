@@ -164,15 +164,50 @@ where
     false
 }
 
+/// Codex global options that take their value as the next argument.
+const CODEX_VALUE_OPTIONS: &[&str] = &[
+    "-c",
+    "--config",
+    "--enable",
+    "--disable",
+    "-i",
+    "--image",
+    "-m",
+    "--model",
+    "--local-provider",
+    "-p",
+    "--profile",
+    "-s",
+    "--sandbox",
+    "-a",
+    "--ask-for-approval",
+    "-C",
+    "--cd",
+    "--add-dir",
+];
+
 /// For a `codex …` command line (NUL- or space-separated), the first argument
-/// after the program, or `""` when there is none. `None` when the program is
-/// not `codex`.
-fn codex_subcommand(command_line: &str) -> Option<&str> {
+/// after the program and its global options, or `""` when there is none.
+/// `None` when the program is not `codex`.
+///
+/// Options come before the subcommand, so `codex -c key=value app-server`
+/// is an app-server, not a `-c` command.
+pub fn codex_subcommand(command_line: &str) -> Option<&str> {
     let mut args = command_line
         .split(|c: char| c == '\0' || c.is_whitespace())
         .filter(|arg| !arg.is_empty());
     let program = args.next()?;
-    (program.rsplit('/').next() == Some("codex")).then(|| args.next().unwrap_or(""))
+    (crate::shell::program_name(program) == "codex").then(|| {
+        while let Some(arg) = args.next() {
+            if !arg.starts_with('-') {
+                return arg;
+            }
+            if CODEX_VALUE_OPTIONS.contains(&arg) {
+                args.next();
+            }
+        }
+        ""
+    })
 }
 
 #[cfg(test)]
@@ -350,5 +385,23 @@ TracerPid:\t0
         assert_eq!(codex_subcommand("muxa app-server"), None);
         assert_eq!(codex_subcommand("/x/codex-code-mode-host app-server"), None);
         assert_eq!(codex_subcommand(""), None);
+    }
+
+    #[test]
+    fn codex_subcommand_skips_global_options() {
+        assert_eq!(
+            codex_subcommand("codex -c features.code_mode_host=true app-server --listen unix://"),
+            Some("app-server")
+        );
+        assert_eq!(
+            codex_subcommand("codex\0--profile\0work\0--yolo\0resume\0id"),
+            Some("resume")
+        );
+        assert_eq!(
+            codex_subcommand("codex --config=a=b app-server"),
+            Some("app-server")
+        );
+        assert_eq!(codex_subcommand("codex --yolo --no-alt-screen"), Some(""));
+        assert_eq!(codex_subcommand("codex -m gpt-5 -c x=y"), Some(""));
     }
 }
