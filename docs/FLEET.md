@@ -357,6 +357,10 @@ muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --diff
 muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --apply
 ```
 
+To share more than automation, or between hosts that are not in a Fleet, use
+[`muxa config export` / `apply`](CONFIGURATION.md#sharing-settings-between-hosts),
+which carries every portable category through a file.
+
 `local` and `localhost` mean the controller's daemon. The default is a preview;
 `--diff` makes that intent explicit. Only automation is supported initially
 (`--section automation`). Rules are merged by name, source names replace matching

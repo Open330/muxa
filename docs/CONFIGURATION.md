@@ -629,6 +629,59 @@ beyond it are stopped), so a script running agent CLIs headlessly cannot pile
 thousands up within that day; stopped orphan rows are removed after five
 minutes. `0` disables the cap.
 
+## Sharing settings between hosts
+
+```sh
+muxa config export -o muxa-settings.toml      # on the host you set up
+muxa config diff  muxa-settings.toml          # on another host: preview
+muxa config apply muxa-settings.toml          # then apply
+```
+
+The bundle is a plain TOML file, so move it however you move dotfiles: a git
+repo, `scp`, a gist. It works the way editor and dotfile sync tools do:
+
+- **Only portable settings travel.** Categories are `pipeline`, `skills`
+  (`[message.skills]`), `automation` (`enabled` and each rule by name),
+  `agent` (`[agent.<program>].options`), `watch`, `collaboration` and
+  `ticket` (including `[ticket.source.<name>]`). Settings tied to one
+  machine never leave it and are refused if a bundle carries them:
+  `[dashboard]`, `[ask]`, `[fleet]`, `[[route]]` (its paths are local),
+  `collaboration.path`, `ticket.cwd` / `additional_dirs`, the composer state
+  in `[watch]`, `automation.paused_until`, and `[agent.<program>].account`.
+  An automation rule that switches accounts (`swap_account`) stays home
+  whole, since it depends on tooling only that host has; export says so.
+- **Apply is three-way.** Each host remembers what it last applied from a
+  source (`$XDG_DATA_HOME/muxa/config-sync/`). An item changes only where the
+  local copy still matches that base: a local edit survives an unchanged
+  upstream, an upstream removal deletes only what sync put there, and an item
+  changed on both sides is a conflict. Conflicts stop the apply until you
+  resolve them, ignore the item, or choose `--prefer local|incoming`. The
+  first apply from a source adds and replaces but never deletes.
+- **Preview first.** `diff` writes nothing and exits like `kubectl diff`:
+  `0` nothing to change, `1` changes, `2` an error or conflict. It lists only
+  the changed items, never the neighbouring config.
+- **Safe writes.** `apply` edits only the planned items, so comments and
+  layout elsewhere stay as they were; it backs the file up, writes through
+  muxad (validated, and refused if the file changed meanwhile), and shares
+  Fleet sync's lock and recovery. Restart muxad afterwards to load it.
+
+A bundle remembers which host it came from. Applying one from a different
+source needs `--switch-source`, after which its items count as a first sync.
+
+What a host takes part in is its own choice, and is never exported:
+
+```toml
+[config_sync]
+categories = ["pipeline", "skills", "automation"]   # default: all
+ignore = ["pipeline.solo", "automation.rule.confirm-selected-yes", "ticket"]
+```
+
+Free-form text travels as written: pipeline prompts, skills, ticket prompts
+and provider options can hold paths or secrets, so read a bundle before you
+publish it, or `ignore` what should stay. Agent integration (hooks, MCP,
+skills) is not part of the bundle; run `muxa init` on each host, setting
+`CLAUDE_CONFIG_DIR` / `CODEX_HOME` for every provider home you use.
+
 ## Fleet
 
 ```toml

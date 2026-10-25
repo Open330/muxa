@@ -106,6 +106,9 @@ pub enum ConfigError {
     #[error("{path}: {message}")]
     InvalidAgent { path: String, message: String },
 
+    #[error("{0}")]
+    InvalidConfigSync(String),
+
     #[error("{path}: {message}")]
     InvalidAsk { path: String, message: String },
 
@@ -162,6 +165,9 @@ pub struct Config {
     /// Defaults for moving agents onto another `aas` account: `muxa swap`
     /// and the `swap_account` automation action.
     pub swap: crate::account_swap::SwapConfig,
+    /// This host's choices for `muxa config export` / `apply`: which
+    /// categories it takes part in and what it keeps to itself.
+    pub config_sync: crate::config_sync::ConfigSyncConfig,
     pub orchestration: crate::orchestration::OrchestrationConfig,
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
@@ -1577,6 +1583,9 @@ impl Config {
         validate_fleet(&self.fleet)?;
         validate_mcp(&self.mcp)?;
         validate_agents(&self.agent)?;
+        self.config_sync
+            .validate()
+            .map_err(ConfigError::InvalidConfigSync)?;
         validate_ask(&self.ask)?;
         // An automation types into a live agent, so a rule that does
         // not hold together fails the load rather than sitting in the

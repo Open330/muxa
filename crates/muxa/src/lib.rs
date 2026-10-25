@@ -50,6 +50,7 @@ pub mod collaboration;
 pub mod collaboration_audit;
 pub mod config;
 pub mod config_file;
+pub mod config_sync;
 pub mod dashboard;
 pub mod discovery;
 pub mod error;
