@@ -111,6 +111,10 @@ const fn mux_snapshot_only_missing() -> bool {
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
 const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+/// Backoff between attempts of a collaboration wait interrupted by a
+/// daemon restart, doubling up to the cap.
+const WAIT_RETRY_INITIAL: Duration = Duration::from_millis(200);
+const WAIT_RETRY_MAX: Duration = Duration::from_secs(2);
 /// A `work_command` waits for a 30 s child plus Fleet transport slack.
 const WORK_COMMAND_CLIENT_TIMEOUT: Duration = Duration::from_secs(50);
 
@@ -158,6 +162,12 @@ pub enum RuntimeError {
     /// into an empty result — see [`decode_agents`].
     #[error("{0}")]
     Daemon(String),
+
+    /// The connection closed before any answer arrived: muxad stopped or
+    /// restarted mid-request. Distinct from a malformed answer, so a caller
+    /// can tell "ask again" from "something is broken".
+    #[error("muxad closed the connection before answering (it may be restarting); retry")]
+    Disconnected,
 }
 
 impl RuntimeError {
@@ -980,6 +990,10 @@ pub struct Response {
     pub collaboration_overview: Option<collaboration::CollaborationOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
+    /// Set on the answer to a long poll that muxad cut short to restart:
+    /// nothing changed, and the same request may be asked again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restarting: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ask_entries: Option<Vec<AskEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1077,6 +1091,7 @@ impl Response {
             collaboration_requests: None,
             collaboration_overview: None,
             collaboration_request: None,
+            restarting: None,
             ask_entries: None,
             ask_entry: None,
             ask_conversations: None,
@@ -1247,6 +1262,14 @@ impl Response {
     ) -> Self {
         let mut r = Self::with_collaboration_requests(requests);
         r.collaboration_scope = Some(scope);
+        r
+    }
+    /// A read-only long poll ended early because muxad is restarting. It is
+    /// still answered, so the client hears "ask again" instead of a closed
+    /// socket.
+    fn restarting() -> Self {
+        let mut r = Self::err("muxad is restarting; retry the wait");
+        r.restarting = Some(true);
         r
     }
     fn with_collaboration_request(request: CollaborationRequest) -> Self {
@@ -4987,18 +5010,25 @@ async fn handle(
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
-                        Ok(current) => match collaboration
-                            .wait_for_terminal(
+                        // A read-only long poll may be cut short by shutdown,
+                        // but it is still answered before the drain deadline:
+                        // aborting it closed the socket with no reply, which
+                        // clients read as a broken response.
+                        Ok(current) => match until_server_shutdown(
+                            &mut stopping,
+                            collaboration.wait_for_terminal(
                                 &current,
                                 &request_id,
                                 Duration::from_secs(
                                     timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS),
                                 ),
-                            )
-                            .await
+                            ),
+                        )
+                        .await
                         {
-                            Ok(request) => Response::with_collaboration_request(request),
-                            Err(error) => Response::err(error.to_string()),
+                            Some(Ok(request)) => Response::with_collaboration_request(request),
+                            Some(Err(error)) => Response::err(error.to_string()),
+                            None => Response::restarting(),
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
@@ -7167,41 +7197,86 @@ impl Client {
         view: collaboration::CollaborationReadView,
     ) -> Result<CollaborationRequest, RuntimeError> {
         let timeout_secs = timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS);
-        let legacy_deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
-        let req = serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
-            "kind": "collaboration_wait", "view":view,
-            "origin": origin,
-            "request_id": request_id,
-            "timeout_secs": timeout_secs,
-        });
-        // Allow the normal connect/hello/serialization budget beyond the
-        // daemon-side wait deadline. This remains bounded even if muxad wedges.
-        let deadline = Duration::from_secs(timeout_secs).saturating_add(CLIENT_CALL_TIMEOUT);
-        let resp = self.call_with_timeout(&req, deadline).await?;
-        if resp["ok"].as_bool().unwrap_or(false) {
-            let mut request = serde_json::from_value(resp["collaboration_request"].clone())
-                .map_err(RuntimeError::Json)?;
-            view.apply(&mut request);
-            return Ok(request);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_secs);
+        let mut backoff = WAIT_RETRY_INITIAL;
+        let mut reached = false;
+        loop {
+            // Waiting is read-only, so after a restart it is asked again with
+            // the same request id, and only for what is left of the caller's
+            // original deadline.
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let secs = (remaining.as_secs() + u64::from(remaining.subsec_nanos() > 0)).max(1);
+            let req = serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "collaboration_wait",
+                "view": view,
+                "origin": origin,
+                "request_id": request_id,
+                "timeout_secs": secs,
+            });
+            // Allow the normal connect/hello/serialization budget beyond the
+            // daemon-side wait deadline. This remains bounded even if muxad wedges.
+            let budget = Duration::from_secs(secs).saturating_add(CLIENT_CALL_TIMEOUT);
+            let retry = match self.call_with_timeout(&req, budget).await {
+                Ok(resp) if resp["ok"].as_bool().unwrap_or(false) => {
+                    let mut request: CollaborationRequest =
+                        serde_json::from_value(resp["collaboration_request"].clone())
+                            .map_err(RuntimeError::Json)?;
+                    view.apply(&mut request);
+                    return Ok(request);
+                }
+                Ok(resp) if resp["restarting"].as_bool() == Some(true) => {
+                    reached = true;
+                    RuntimeError::Daemon(
+                        resp["error"]
+                            .as_str()
+                            .unwrap_or("muxad is restarting")
+                            .to_owned(),
+                    )
+                }
+                Ok(resp) => {
+                    let error = resp["error"]
+                        .as_str()
+                        .unwrap_or("collaboration wait failed");
+                    if collaboration_wait_is_unsupported(error) {
+                        tracing::debug!(
+                            request_id,
+                            "daemon lacks collaboration_wait; using bounded client-side compatibility wait"
+                        );
+                        let mut request = self
+                            .collaboration_wait_legacy(origin, request_id, deadline)
+                            .await?;
+                        view.apply(&mut request);
+                        return Ok(request);
+                    }
+                    return Err(RuntimeError::Json(serde::de::Error::custom(
+                        error.to_string(),
+                    )));
+                }
+                // The connection dropped mid-wait: an older daemon restarting
+                // without answering, or one that died.
+                Err(RuntimeError::Disconnected) => {
+                    reached = true;
+                    RuntimeError::Disconnected
+                }
+                // A connection the daemon closed while stopping can also
+                // fail on the write, before any read sees the end.
+                Err(error) if error.is_client_disconnect() => {
+                    reached = true;
+                    error
+                }
+                // While a restart is under way the socket can briefly be
+                // absent; a daemon that was never reached is simply down.
+                Err(error @ RuntimeError::NotConnected(_)) if reached => error,
+                Err(error) => return Err(error),
+            };
+            if tokio::time::Instant::now() + backoff >= deadline {
+                return Err(retry);
+            }
+            tracing::debug!(request_id, %retry, "collaboration wait interrupted; retrying");
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(WAIT_RETRY_MAX);
         }
-        let error = resp["error"]
-            .as_str()
-            .unwrap_or("collaboration wait failed");
-        if collaboration_wait_is_unsupported(error) {
-            tracing::debug!(
-                request_id,
-                "daemon lacks collaboration_wait; using bounded client-side compatibility wait"
-            );
-            let mut request = self
-                .collaboration_wait_legacy(origin, request_id, legacy_deadline)
-                .await?;
-            view.apply(&mut request);
-            return Ok(request);
-        }
-        Err(RuntimeError::Json(serde::de::Error::custom(
-            error.to_string(),
-        )))
     }
 
     async fn collaboration_wait_legacy(
@@ -7738,7 +7813,9 @@ impl Client {
         writer.write_all(&bytes).await?;
         writer.flush().await?;
         let mut ack = String::new();
-        read_limited_line(reader, &mut ack).await?;
+        if read_limited_line(reader, &mut ack).await? == 0 {
+            return Err(RuntimeError::Disconnected);
+        }
         // Parse but don't fail on a non-ok response — legacy daemons
         // will reject the unknown `kind`, which is fine; the caller's
         // request still goes through.
@@ -7791,7 +7868,9 @@ impl Client {
         writer.flush().await?;
 
         let mut line = String::new();
-        read_limited_line(&mut reader, &mut line).await?;
+        if read_limited_line(&mut reader, &mut line).await? == 0 {
+            return Err(RuntimeError::Disconnected);
+        }
         Ok(serde_json::from_str(line.trim())?)
     }
 
@@ -10416,6 +10495,229 @@ mod tests {
     }
 
     /// Server must wait for the socket to appear before tests dial in.
+    /// A server over `mailbox` with a sender (%1) and recipient (%2).
+    async fn wait_test_server(
+        socket: &Path,
+        store: &SharedStore,
+        mailbox: &Arc<collaboration::CollaborationStore>,
+    ) -> (broadcast::Sender<()>, tokio::task::JoinHandle<()>) {
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        });
+        let server = Server::new(socket.to_path_buf(), store.clone())
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (stop, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(socket).await;
+        (stop, serving)
+    }
+
+    fn pane_origin(pane: &str) -> CollaborationOrigin {
+        CollaborationOrigin {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wait_cut_short_by_a_restart_is_answered_and_retried_until_the_reply() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("wait-restart.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let mailbox = collaboration::CollaborationStore::in_memory(
+            collaboration::CollaborationOptions::default(),
+        );
+        let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+        let client = Client::new(socket.clone());
+        let request = client
+            .collaboration_send(
+                &pane_origin("%1"),
+                "pane:%2",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .collaboration_claim(&pane_origin("%2"), &request.id)
+            .await
+            .unwrap();
+
+        let waiting = client.clone();
+        let id = request.id.clone();
+        let waiter = tokio::spawn(async move {
+            waiting
+                .collaboration_wait(&pane_origin("%1"), &id, 20)
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // The interrupted wait is answered, so shutdown does not have to burn
+        // the drain budget aborting it.
+        let stopped = std::time::Instant::now();
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+        assert!(
+            stopped.elapsed() < HANDLER_DRAIN_TIMEOUT,
+            "shutdown waited {:?} on the wait handler",
+            stopped.elapsed()
+        );
+        assert!(!waiter.is_finished(), "the wait must ride out the restart");
+
+        let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+        let recipient: collaboration::Participant =
+            serde_json::from_value(serde_json::to_value(&request.to).unwrap()).unwrap();
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "real reply".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(10), waiter)
+            .await
+            .expect("the retried wait sees the reply")
+            .unwrap()
+            .expect("the wait succeeds after the restart");
+        assert_eq!(observed.status, RequestStatus::Completed);
+        assert_eq!(observed.reply.unwrap().body, "real reply");
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retries_stop_at_the_original_deadline_and_an_unreached_daemon_fails_at_once() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("wait-deadline.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let mailbox = collaboration::CollaborationStore::in_memory(
+            collaboration::CollaborationOptions::default(),
+        );
+        let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+        let client = Client::new(socket.clone());
+        let request = client
+            .collaboration_send(
+                &pane_origin("%1"),
+                "pane:%2",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let waiting = client.clone();
+        let id = request.id.clone();
+        let started = std::time::Instant::now();
+        let waiter =
+            tokio::spawn(
+                async move { waiting.collaboration_wait(&pane_origin("%1"), &id, 2).await },
+            );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+        // The daemon never comes back: the wait gives up near its own
+        // deadline instead of retrying forever or resetting the budget.
+        let outcome = waiter.await.unwrap();
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "gave up after {:?}",
+            started.elapsed()
+        );
+
+        // A daemon this wait never reached is down, not restarting.
+        let started = std::time::Instant::now();
+        let missing = Client::new(dir.path().join("missing.sock"));
+        let error = missing
+            .collaboration_wait(&pane_origin("%1"), &request.id, 30)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, RuntimeError::NotConnected(_)), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wait_retries_when_the_daemon_closes_right_after_hello() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("closing-after-hello.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        let closing = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                // Answer hello, then stop without reading the request: the
+                // client's write of the wait itself is what fails.
+                let _ = writer.write_all(b"{\"ok\":true}\n").await;
+            }
+        });
+        let started = std::time::Instant::now();
+        let error = Client::new(socket)
+            .collaboration_wait(&pane_origin("%1"), "req", 2)
+            .await
+            .unwrap_err();
+        assert!(
+            started.elapsed() >= Duration::from_secs(1),
+            "gave up after {:?} on {error}",
+            started.elapsed()
+        );
+        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        closing.abort();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connection_closed_without_an_answer_is_disconnected_not_bad_json() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("closing.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let closing = tokio::spawn(async move {
+            for answer_hello in [false, true] {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (reader, mut writer) = stream.into_split();
+                let mut reader = BufReader::new(reader);
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                if answer_hello {
+                    writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+                    line.clear();
+                    reader.read_line(&mut line).await.unwrap();
+                }
+                // Close without answering.
+            }
+        });
+        let client = Client::new(socket);
+        let request = serde_json::json!({"protocol": PROTOCOL_VERSION, "kind": "status"});
+        for _ in 0..2 {
+            let error = client.call(&request).await.unwrap_err();
+            assert!(matches!(error, RuntimeError::Disconnected), "{error}");
+        }
+        closing.await.unwrap();
+    }
+
     async fn wait_for_socket(sock: &Path) {
         for _ in 0..50 {
             if sock.exists() {
