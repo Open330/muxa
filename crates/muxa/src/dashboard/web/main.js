@@ -17,7 +17,7 @@ import {
   withTopologyHash,
 } from "./topology-model.mjs";
 import { logicalWorkKey, normalizeAgent, validateWorkSnapshot, WORK_STAGES } from "./work-model.mjs";
-import { fleetTotals, renderFleet } from "./fleet-view.mjs";
+import { fleetTotals, isPaneless, renderFleet } from "./fleet-view.mjs";
 import {
   buildRailEntries,
   findRailEntry,
@@ -1087,8 +1087,13 @@ async function copyToClipboard(text) {
 
 // ── Rendering ─────────────────────────────────────────────────────
 
+/** Agents bound to a pane; headless rows are hidden like the TUIs do. */
+function panedAgents() {
+  return [...store.agents.values()].filter((a) => !isPaneless(a));
+}
+
 function renderCounts() {
-  const a = store.agents.size;
+  const a = panedAgents().length;
   const p = store.panes.length;
   const e = store.paneErrors.length;
   let s = `${a} agent${a === 1 ? "" : "s"} · ${p} pane${p === 1 ? "" : "s"}`;
@@ -1149,7 +1154,7 @@ function renderSessionSidebar() {
     <span class="session-dot ${allState}"></span>
     <span class="session-main">
       <span class="session-name">all workspaces</span>
-      <span class="session-detail">${allWorks.length} works · ${store.agents.size} agents</span>
+      <span class="session-detail">${allWorks.length} works · ${panedAgents().length} agents</span>
     </span>
     <span class="session-score">${allAttention || "·"}</span>
   </button>`;
@@ -2133,18 +2138,20 @@ function renderTimelineSessionOptions(doc) {
 }
 
 function renderAgents() {
-  const rows = [...store.agents.values()].filter(
+  const paned = panedAgents();
+  const headless = store.agents.size - paned.length;
+  const rows = paned.filter(
     (a) =>
       agentMatchesSelectedSession(a) &&
       store.filters.agentStates.has(a.state) &&
       store.filters.agentKinds.has(a.kind)
   );
   rows.sort((x, y) => (y.last_activity_at || "").localeCompare(x.last_activity_at || ""));
-  if (dom.jumpAgentsCount) dom.jumpAgentsCount.textContent = String(store.agents.size);
+  if (dom.jumpAgentsCount) dom.jumpAgentsCount.textContent = String(paned.length);
   paneDrawer?.refreshAccess();
   dom.agentsMeta.textContent = selectedSession()
     ? `${rows.length} in ${selectedSession()}`
-    : `${rows.length} shown · ${store.agents.size} tracked`;
+    : `${rows.length} shown · ${paned.length} tracked${headless ? ` · ${headless} headless hidden` : ""}`;
   renderDataMeta();
 
   if (rows.length === 0) {

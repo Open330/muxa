@@ -92,7 +92,7 @@ async fn boundary(State(state): State<AppState>, request: Request, next: Next) -
 }
 
 async fn page() -> Response {
-    super::super::assets::serve_asset("share.html")
+    super::super::assets::serve_page("share.html")
 }
 
 #[derive(Deserialize)]

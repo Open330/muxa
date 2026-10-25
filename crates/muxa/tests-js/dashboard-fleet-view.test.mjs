@@ -1,14 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { fleetTotals, needsAttention, orderAgents, orderHosts, renderFleet, summarizeHost } from "../src/dashboard/web/fleet-view.mjs";
+import { fleetTotals, isPaneless, needsAttention, orderAgents, orderHosts, renderFleet, summarizeHost } from "../src/dashboard/web/fleet-view.mjs";
 
 const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const relTime = () => "1s ago";
 
 const local = {
   alias: "local", local: true, state: "online", muxa_version: "0.9.2", latency_ms: 0,
-  remote: { agents: [{ state: "working" }, { state: "waiting_input" }], panes: [{}, {}, {}], sessions: [{}] },
+  remote: { agents: [{ state: "working", pane: "%1" }, { state: "waiting_input", pane: "%2" }], panes: [{}, {}, {}], sessions: [{}] },
 };
 const mbp = {
   alias: "jiun-mbp", local: false, state: "online", muxa_version: "0.9.2", latency_ms: 225,
@@ -82,4 +82,24 @@ test("a host that is still connecting is not shown as an error", () => {
 test("an offline selection opens nothing; no hosts explains the config", () => {
   assert.doesNotMatch(renderFleet([local, rtzr], { selected: "rtzr", esc, relTime }), /fleet-agents"/);
   assert.match(renderFleet([], { selected: null, esc, relTime }), /\[fleet\.hosts\]/);
+});
+
+test("headless rows (no pane) are hidden from counts and the agent list, and noted", () => {
+  const host = {
+    alias: "local", local: true, state: "online",
+    remote: { agents: [
+      { state: "working", pane: "%1", tmux_session: "api" },
+      { state: "idle" },
+      { state: "waiting_input", pane: "" },
+    ], panes: [{}], sessions: [{}] },
+  };
+  assert.equal(isPaneless({ pane: "%1" }), false);
+  assert.equal(isPaneless({}), true);
+  const s = summarizeHost(host);
+  assert.equal(s.agents, 1);
+  assert.equal(s.headless, 2);
+  assert.equal(s.attention, 0);
+  const html = renderFleet([host], { selected: "local", esc, relTime });
+  assert.match(html, /2 headless hidden/);
+  assert.equal((html.match(/<tr>/g) || []).length, 2); // header + one agent
 });

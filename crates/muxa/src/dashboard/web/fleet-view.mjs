@@ -9,6 +9,16 @@
 const WAITING = new Set(["waiting_input", "waiting_choice"]);
 const STATE_RANK = { waiting_input: 0, waiting_choice: 0, error: 1, working: 2, starting: 3, idle: 4, stopped: 5 };
 
+/**
+ * A registry row with no pane: a headless run (a script or bridge driving an
+ * agent CLI without a terminal) whose hooks still reach muxad. The TUIs hide
+ * these by default (`[watch] hide_paneless`), and the reconciler stops and
+ * reaps them after `paneless_stale_timeout_secs`; the web views follow suit.
+ */
+export function isPaneless(agent) {
+  return !agent?.pane;
+}
+
 /** An agent needs the operator when it waits on input or a choice, or failed. */
 export function needsAttention(agent) {
   return WAITING.has(agent?.state) || agent?.state === "error";
@@ -17,7 +27,8 @@ export function needsAttention(agent) {
 /** One host's card numbers. Offline hosts keep their last error, no counts. */
 export function summarizeHost(host) {
   const remote = host?.remote || {};
-  const agents = Array.isArray(remote.agents) ? remote.agents : [];
+  const all = Array.isArray(remote.agents) ? remote.agents : [];
+  const agents = all.filter((a) => !isPaneless(a));
   const count = (pred) => agents.filter(pred).length;
   return {
     alias: host?.alias || "?",
@@ -29,6 +40,7 @@ export function summarizeHost(host) {
     lastSeenAt: host?.last_seen_at || remote.observed_at || null,
     error: host?.error || "",
     agents: agents.length,
+    headless: all.length - agents.length,
     panes: Array.isArray(remote.panes) ? remote.panes.length : 0,
     sessions: Array.isArray(remote.sessions) ? remote.sessions.length : 0,
     attention: count(needsAttention),
@@ -92,6 +104,7 @@ export function renderFleet(hosts, { selected, esc, relTime }) {
         : `<span class="fleet-pending">${esc(s.state)}…</span>`;
     const meta = [
       s.local ? "this node" : null,
+      s.headless ? `${s.headless} headless hidden` : null,
       s.version ? `v${s.version}` : null,
       s.latencyMs !== null && !s.local ? `${s.latencyMs} ms` : null,
       s.lastSeenAt ? relTime(s.lastSeenAt) : null,
@@ -107,7 +120,7 @@ export function renderFleet(hosts, { selected, esc, relTime }) {
   const open = ordered.find((h) => h.alias === selected && h.state === "online");
   let agents = "";
   if (open) {
-    const rows = orderAgents(open.remote?.agents).map((agent) => `<tr>
+    const rows = orderAgents((open.remote?.agents || []).filter((a) => !isPaneless(a))).map((agent) => `<tr>
         <td><span class="state-dot ${esc(agent.state)}"></span> ${esc(String(agent.state || "").replaceAll("_", " "))}</td>
         <td>${esc(agent.kind || "")}</td>
         <td class="mono">${esc(agentLocation(agent))}</td>
