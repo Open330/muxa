@@ -211,6 +211,11 @@ fn parse_path(raw: &str) -> Result<Vec<String>, String> {
             loop {
                 match chars.next() {
                     Some('"') => break,
+                    // `display_path` escapes quotes and backslashes.
+                    Some('\\') => match chars.next() {
+                        Some(c) => segment.push(c),
+                        None => return Err(format!("unterminated quote in {raw:?}")),
+                    },
                     Some(c) => segment.push(c),
                     None => return Err(format!("unterminated quote in {raw:?}")),
                 }
@@ -1554,6 +1559,11 @@ layout = "tiled"
         let path = parse_path("pipeline.\"a.b\"").unwrap();
         assert_eq!(path, ["pipeline", "a.b"]);
         assert_eq!(display_path(&path), "pipeline.\"a.b\"");
+        // A key written by display_path always reads back.
+        for name in ["a\"b", "back\\slash", "dot.and \"quote\""] {
+            let path = vec!["pipeline".to_owned(), name.to_owned()];
+            assert_eq!(parse_path(&display_path(&path)).unwrap(), path);
+        }
         assert!(parse_path("a..b").is_err());
         assert!(parse_path("\"open").is_err());
     }
