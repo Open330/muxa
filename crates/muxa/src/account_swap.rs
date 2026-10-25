@@ -1920,11 +1920,21 @@ fn wait_for_resume_answering(
             if let Some(line) = open_question(&last) {
                 return Resume::Blocked(format!("a dialog is waiting for an answer ({line})"));
             }
-            return if alive() {
-                Resume::Ready
-            } else {
-                Resume::Exited
-            };
+            if !alive() {
+                return Resume::Exited;
+            }
+            // Quiet is not ready: a wrapper or the agent itself can sit on
+            // the shell's echo of the relaunch for seconds before the TUI
+            // (or a trust dialog) draws. Wait for the agent's own prompt.
+            if !agent_prompt_visible(&last) {
+                if started.elapsed() >= timeout {
+                    return Resume::Unsettled;
+                }
+                quiet_since = Instant::now();
+                std::thread::sleep(tick);
+                continue;
+            }
+            return Resume::Ready;
         }
         if started.elapsed() >= timeout {
             // A blocker can sit on a screen that keeps redrawing (a clock,
@@ -1943,6 +1953,26 @@ fn wait_for_resume_answering(
         }
         std::thread::sleep(tick);
     }
+}
+
+/// Marks of an agent waiting at its own prompt, on the last lines of the
+/// screen: Claude's mode and shortcut line, Codex's `›` composer. Claude's
+/// `❯` is left out: shell prompts use it too.
+const PROMPT_MARKS: &[&str] = &[
+    "⏵⏵",
+    "for shortcuts",
+    "bypass permissions",
+    "auto mode on",
+    "accept edits on",
+    "plan mode on",
+    "Ask Codex",
+];
+
+/// Is the resumed agent's prompt on screen (not the shell's, not a dialog)?
+fn agent_prompt_visible(screen: &str) -> bool {
+    let tail = screen_tail(screen, 10);
+    PROMPT_MARKS.iter().any(|mark| tail.contains(mark))
+        || tail.lines().any(|line| line.starts_with("› "))
 }
 
 /// How many non-blank lines at the bottom of the screen a startup banner or
@@ -2378,6 +2408,53 @@ mod tests {
             &mut answered,
         );
         (resume, answered, keys.into_inner())
+    }
+
+    #[test]
+    fn a_quiet_screen_before_the_agent_draws_is_not_ready() {
+        // Seen live: `aas e …` printed nothing for seconds, the swap took the
+        // shell's echo for a ready agent, and the trust prompt drew after.
+        let echo = "~ ❯ aas e k-june@claude --dangerously-skip-permissions --resume c63f\n";
+        let mut captures = 0usize;
+        let mut answered = Vec::new();
+        let keys = std::cell::RefCell::new(Vec::<String>::new());
+        let resume = wait_for_resume_answering(
+            || {
+                captures += 1;
+                Some(
+                    match (captures, keys.borrow().len()) {
+                        (0..=30, _) => echo,
+                        (_, 0) => CLAUDE_TRUST,
+                        _ => CLAUDE_READY,
+                    }
+                    .to_owned(),
+                )
+            },
+            || true,
+            |k| {
+                keys.borrow_mut().push(k.to_owned());
+                true
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            &mut answered,
+        );
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answered, vec!["trusted the folder"]);
+    }
+
+    #[test]
+    fn an_agent_that_never_draws_its_prompt_is_unsettled_not_ready() {
+        let echo = "~ ❯ aas e k-june@claude --resume c63f\n";
+        let resume = wait_for_resume(
+            || Some(echo.to_owned()),
+            || true,
+            Duration::from_millis(150),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        );
+        assert_eq!(resume, Resume::Unsettled);
     }
 
     #[test]
