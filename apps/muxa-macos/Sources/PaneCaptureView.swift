@@ -38,6 +38,7 @@ final class PaneCaptureModel: ObservableObject {
     private var source = CaptureSource.placeholder
     private var wakeableSleep: Task<Void, Error>?
     private var renderGeneration: UInt64 = 0
+    private var needsRender = true
     private var colorScheme = ColorScheme.dark
 
     init(client: MuxaIPCClient, target: MuxaPaneTarget) {
@@ -97,6 +98,7 @@ final class PaneCaptureModel: ObservableObject {
     func setColorScheme(_ scheme: ColorScheme) {
         guard scheme != colorScheme else { return }
         colorScheme = scheme
+        needsRender = true
         Task { await render() }
     }
 
@@ -122,6 +124,7 @@ final class PaneCaptureModel: ObservableObject {
         screenText = text
         columns = width
         screenContent = trimmed
+        needsRender = false
     }
 
     private func refresh() async -> Bool {
@@ -144,8 +147,9 @@ final class PaneCaptureModel: ObservableObject {
             let changed = nextSource != source
             if changed {
                 source = nextSource
-                await render()
+                needsRender = true
             }
+            if needsRender { await render() }
             if errorMessage != nil { errorMessage = nil }
             return changed
         } catch is CancellationError {
