@@ -79,7 +79,8 @@ pub enum BareMode {
 #[serde(rename_all = "snake_case")]
 #[strum(serialize_all = "snake_case")]
 pub enum ContinueWhen {
-    /// Only agents that were stopped by a usage cap: their turn was cut off.
+    /// Only agents whose turn was cut off: stopped by a usage cap, or
+    /// interrupted mid-turn by the swap itself (`--force`).
     Limited,
     Always,
     Never,
@@ -152,11 +153,11 @@ impl SwapRequest {
         }
     }
 
-    fn continue_for(&self, was_limited: bool) -> Option<&str> {
+    fn continue_for(&self, was_cut_off: bool) -> Option<&str> {
         let wanted = match self.continue_when {
             ContinueWhen::Never => false,
             ContinueWhen::Always => true,
-            ContinueWhen::Limited => was_limited,
+            ContinueWhen::Limited => was_cut_off,
         };
         self.continue_text.as_deref().filter(|_| wanted)
     }
@@ -299,6 +300,16 @@ pub fn parse_candidates(json: &str) -> Result<Vec<Candidate>, String> {
     serde_json::from_str::<CandidateList>(json)
         .map(|list| list.accounts)
         .map_err(|error| format!("unreadable `aas candidates --json` output: {error}"))
+}
+
+/// The account an agent runs on: the one its launch line names, or, for an
+/// agent started bare, the account the provider marks active, since a bare
+/// CLI runs on that one. Without this, `auto` could "move" a bare agent onto
+/// the account it is already spending.
+fn current_account(line: &LaunchLine, candidates: &[Candidate]) -> Option<String> {
+    line.account()
+        .map(str::to_owned)
+        .or_else(|| candidates.iter().find(|c| c.active).map(|c| c.name.clone()))
 }
 
 /// The account each target moves to, in target order. `current` is each
@@ -812,7 +823,7 @@ pub fn run(
         };
         let current: Vec<Option<String>> = group
             .iter()
-            .map(|p| p.launch.line.account().map(str::to_owned))
+            .map(|p| current_account(&p.launch.line, candidates))
             .collect();
         let accounts = assign(&current, candidates, &request.to);
         for (planned, account) in group.into_iter().zip(accounts) {
@@ -859,7 +870,7 @@ fn swap_one(
         }
     };
     outcome.command = Some(command.clone());
-    let follow_up = request.continue_for(is_rate_limited(agent));
+    let follow_up = request.continue_for(is_rate_limited(agent) || is_busy(agent));
     if request.dry_run {
         outcome.status = SwapStatus::Planned;
         if let Some(text) = follow_up {
@@ -874,10 +885,12 @@ fn swap_one(
         pane_pid: pane.pane_pid,
         kind: agent.kind,
         session_id: session_id.clone(),
+        busy: is_busy(agent),
     };
     let (status, note) = match execute(&target, launch, &command, follow_up) {
         Ok(note) => (SwapStatus::Swapped, note),
-        Err(note) => (SwapStatus::Failed, note),
+        Err(Refusal::Failed(note)) => (SwapStatus::Failed, note),
+        Err(Refusal::Kept(note)) => (SwapStatus::Skipped, note),
     };
     outcome.status = status;
     outcome.note = note;
@@ -960,6 +973,8 @@ struct Target {
     pane_pid: u32,
     kind: AgentKind,
     session_id: String,
+    /// Mid-turn when the swap began (`--force`).
+    busy: bool,
 }
 
 /// Stop the agent, type `command` into the pane's shell, wait for the
@@ -969,10 +984,15 @@ fn execute(
     launch: &PaneLaunch,
     command: &str,
     follow_up: Option<&str>,
-) -> Result<String, String> {
-    stop(launch)?;
-    std::thread::sleep(SHELL_SETTLE);
+) -> Result<String, Refusal> {
     let socket = target.socket.as_deref();
+    let mut answered: Vec<&'static str> = Vec::new();
+    if target.kind == AgentKind::ClaudeCode {
+        exit_claude(target, launch, &mut answered)?;
+    } else {
+        stop(launch)?;
+    }
+    std::thread::sleep(SHELL_SETTLE);
     if !target.backend.send_text_on(socket, &target.pane, command)
         || !target.backend.send_text_on(socket, &target.pane, "\r")
     {
@@ -994,12 +1014,14 @@ fn execute(
     // A running process is not a resumed conversation: the TUI can be up and
     // showing that another app owns the conversation, or a startup error.
     // Every swap, with or without a follow-up, waits for a usable screen.
-    let readiness = wait_for_resume(
+    let readiness = wait_for_resume_answering(
         || target.backend.capture_pane_on(socket, &target.pane),
         || resumed_agent_running(target),
+        |keys| target.backend.send_text_on(socket, &target.pane, keys),
         READY_TIMEOUT,
         READY_QUIET,
         Duration::from_millis(250),
+        &mut answered,
     );
     match readiness {
         Resume::Ready => {}
@@ -1009,9 +1031,9 @@ fn execute(
             } else {
                 String::new()
             };
-            return Err(format!(
-                "relaunched, but {reason}{owners}; nothing was sent to the pane"
-            ));
+            return Err(
+                format!("relaunched, but {reason}{owners}; nothing was sent to the pane").into(),
+            );
         }
         Resume::Exited => {
             return Err(
@@ -1023,24 +1045,136 @@ fn execute(
                 "relaunched, but the conversation did not become ready within {}s; \
                  nothing was sent to the pane",
                 READY_TIMEOUT.as_secs()
-            ));
+            )
+            .into());
         }
     }
-    let Some(text) = follow_up else {
-        return Ok("resumed".into());
+    let answers = if answered.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", answered.join(", "))
     };
-    let sent = target
+    let Some(text) = follow_up else {
+        return Ok(format!("resumed{answers}"));
+    };
+    Ok(if send_follow_up(target, text) {
+        format!("sent {text:?}{answers}")
+    } else {
+        format!("resumed{answers}; follow-up could not be typed")
+    })
+}
+
+/// Type `text` and submit it.
+fn send_follow_up(target: &Target, text: &str) -> bool {
+    let socket = target.socket.as_deref();
+    target
         .backend
         .send_prompt_text_on(socket, &target.pane, text)
         && {
             std::thread::sleep(crate::backend::prompt_submit_grace(&target.pane));
             target.backend.send_text_on(socket, &target.pane, "\r")
-        };
-    Ok(if sent {
-        format!("sent {text:?}")
-    } else {
-        "resumed; follow-up could not be typed".into()
-    })
+        }
+}
+
+/// Why [`execute`] did not finish a swap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Refusal {
+    /// Something went wrong; the note says what and how far it got.
+    Failed(String),
+    /// The agent was deliberately left running on its account.
+    Kept(String),
+}
+
+impl From<String> for Refusal {
+    fn from(note: String) -> Self {
+        Self::Failed(note)
+    }
+}
+
+impl From<&str> for Refusal {
+    fn from(note: &str) -> Self {
+        Self::Failed(note.to_owned())
+    }
+}
+
+/// How long `/exit` gets to end a Claude session, dialogs included, before
+/// the signal path takes over.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Quit Claude the way a person would. A signal ends the session without
+/// its exit dialogs, so background shells and the worktree go with it;
+/// `/exit` asks about them and the swap keeps both. A session that owns
+/// scheduled tasks is left running: exiting would cancel them.
+fn exit_claude(
+    target: &Target,
+    launch: &PaneLaunch,
+    answered: &mut Vec<&'static str>,
+) -> Result<(), Refusal> {
+    let socket = target.socket.as_deref();
+    let send = |keys: &str| target.backend.send_text_on(socket, &target.pane, keys);
+    let alive = || is_alive(launch.agent_pid);
+    if target.busy {
+        // Interrupt the turn first; `/exit` is only read at the prompt.
+        send("\x1b");
+        std::thread::sleep(Duration::from_millis(1500));
+    }
+    // Ctrl-C clears a half-typed draft so `/exit` is not appended to it.
+    if !(send("\x03")
+        && {
+            std::thread::sleep(Duration::from_millis(300));
+            send("/exit")
+        }
+        && send("\r"))
+    {
+        return Err("could not type /exit into the pane".into());
+    }
+    let started = Instant::now();
+    while alive() && started.elapsed() < EXIT_TIMEOUT {
+        std::thread::sleep(Duration::from_millis(400));
+        let screen = target
+            .backend
+            .capture_pane_on(socket, &target.pane)
+            .unwrap_or_default();
+        if owns_scheduled_tasks(&screen) {
+            // "Stay" is the third row.
+            send(&format!("{DOWN}{DOWN}\r"));
+            if target.busy {
+                std::thread::sleep(Duration::from_millis(800));
+                send_follow_up(target, "continue");
+            }
+            return Err(Refusal::Kept(
+                "the session owns scheduled tasks, which exiting would cancel; \
+                 left it on its account"
+                    .into(),
+            ));
+        }
+        if let Some(dialog) = pending_dialog(&screen, EXIT_DIALOGS, answered) {
+            if send(dialog.keys) {
+                answered.push(dialog.label);
+            }
+            std::thread::sleep(dialog.pause);
+            continue;
+        }
+        if open_question(&screen).is_some() && started.elapsed() > Duration::from_secs(5) {
+            send("\x1b");
+            return Err(Refusal::Kept(
+                "/exit asked a question muxa does not know how to answer; \
+                 left the session running"
+                    .into(),
+            ));
+        }
+    }
+    if alive() {
+        // Wedged or not reading input: fall back to the signal path.
+        stop(launch)?;
+    }
+    Ok(())
+}
+
+/// Does the exit dialog on `screen` warn that scheduled tasks would stop?
+fn owns_scheduled_tasks(screen: &str) -> bool {
+    let tail = screen_tail(screen, DIALOG_TAIL_LINES);
+    tail.contains("Exit and stop tasks") && tail.contains("scheduled task")
 }
 
 /// `SIGTERM` the agent (the wrapper exits with it), then the wrapper, then
@@ -1156,12 +1290,38 @@ enum Resume {
 /// agent is still running and the screen is not an ownership or startup
 /// error. A stable screen alone proves nothing: "This conversation is open
 /// in another app" is stable too (Open330/muxa#275).
+#[cfg(test)]
 fn wait_for_resume(
-    mut capture: impl FnMut() -> Option<String>,
-    mut alive: impl FnMut() -> bool,
+    capture: impl FnMut() -> Option<String>,
+    alive: impl FnMut() -> bool,
     timeout: Duration,
     quiet: Duration,
     tick: Duration,
+) -> Resume {
+    wait_for_resume_answering(
+        capture,
+        alive,
+        |_| false,
+        timeout,
+        quiet,
+        tick,
+        &mut Vec::new(),
+    )
+}
+
+/// [`wait_for_resume`], answering the startup dialogs in
+/// [`STARTUP_DIALOGS`] through `answer` (which types keys into the pane and
+/// reports whether it could) and recording each answer in `answered`. A
+/// settled screen that still asks a question is never `Ready`: a follow-up
+/// typed into Claude's folder-trust prompt picks its default, "No, exit".
+fn wait_for_resume_answering(
+    mut capture: impl FnMut() -> Option<String>,
+    mut alive: impl FnMut() -> bool,
+    mut answer: impl FnMut(&str) -> bool,
+    timeout: Duration,
+    quiet: Duration,
+    tick: Duration,
+    answered: &mut Vec<&'static str>,
 ) -> Resume {
     let started = Instant::now();
     let mut last = String::new();
@@ -1172,8 +1332,23 @@ fn wait_for_resume(
             last = screen;
             quiet_since = Instant::now();
         } else if !last.trim().is_empty() && quiet_since.elapsed() >= quiet {
+            if let Some(dialog) = pending_dialog(&last, STARTUP_DIALOGS, answered) {
+                if answer(dialog.keys) {
+                    answered.push(dialog.label);
+                    // The answer redraws the screen; wait for it to settle again.
+                    last.clear();
+                    quiet_since = Instant::now();
+                    // Bounded by the overall timeout so retries cannot outlast it.
+                    std::thread::sleep(dialog.pause.min(timeout / 8));
+                    continue;
+                }
+                return Resume::Blocked(format!("a startup dialog is waiting ({})", dialog.label));
+            }
             if let Some(reason) = blocked_screen(&last) {
                 return Resume::Blocked(reason.to_owned());
+            }
+            if let Some(line) = open_question(&last) {
+                return Resume::Blocked(format!("a dialog is waiting for an answer ({line})"));
             }
             return if alive() {
                 Resume::Ready
@@ -1186,6 +1361,9 @@ fn wait_for_resume(
             // a spinner): report it rather than a bare timeout.
             if let Some(reason) = blocked_screen(&last) {
                 return Resume::Blocked(reason.to_owned());
+            }
+            if let Some(line) = open_question(&last) {
+                return Resume::Blocked(format!("a dialog is waiting for an answer ({line})"));
             }
             return if alive() {
                 Resume::Unsettled
@@ -1264,6 +1442,7 @@ fn blocked_screen(screen: &str) -> Option<&'static str> {
                         | '■'
                         | '▌'
                         | '⚠'
+                        | '🔒'
                         | '✗'
                         | '×'
                         | '•'
@@ -1291,6 +1470,147 @@ fn blocked_screen(screen: &str) -> Option<&'static str> {
             .find(|(opening, _)| text.starts_with(opening))
             .map(|(_, reason)| *reason)
     })
+}
+
+/// Down arrow, as typed into a pane.
+const DOWN: &str = "\x1b[B";
+
+/// A dialog a resumed or exiting agent can stop on, and the keys that answer
+/// it the way a swap needs.
+struct Dialog {
+    /// Every one of these must be on the screen's last
+    /// [`DIALOG_TAIL_LINES`] non-blank lines.
+    needles: &'static [&'static str],
+    /// Keys typed to answer it.
+    keys: &'static str,
+    /// Named in the report.
+    label: &'static str,
+    /// How many times one swap may answer it.
+    max: usize,
+    /// Time for the agent to act on the answer before the screen is read again.
+    pause: Duration,
+}
+
+/// How many non-blank lines at the bottom of the screen a dialog occupies.
+const DIALOG_TAIL_LINES: usize = 16;
+
+/// Dialogs a relaunched agent shows before its conversation takes input.
+/// The account changed, not the folder or the conversation, so each is
+/// answered the way the agent was already running.
+const STARTUP_DIALOGS: &[Dialog] = &[
+    // Claude, on a profile that has not seen this folder. The default row is
+    // "No, exit".
+    Dialog {
+        needles: &["Yes, I trust this folder", "Enter to confirm"],
+        keys: "\x1b[B\r",
+        label: "trusted the folder",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    Dialog {
+        needles: &["Teach auto mode", "Enter to confirm"],
+        keys: "\x1b[B\r",
+        label: "dismissed the auto-mode tour",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    // Codex: "1. Trust and continue" is the default row.
+    Dialog {
+        needles: &["Trust this folder", "Trust and continue"],
+        keys: "\r",
+        label: "trusted the folder",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    // Codex: the conversation's own last directory is the default row.
+    Dialog {
+        needles: &["Working directory · resume", "Use session directory"],
+        keys: "\r",
+        label: "kept the session directory",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    Dialog {
+        needles: &["1. Resume goal", "enter select"],
+        keys: "\r",
+        label: "resumed the paused goal",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    // Codex: the old process's app-server can still hold the thread for a
+    // few seconds after it exits.
+    Dialog {
+        needles: &["open in another app", "r to retry"],
+        keys: "r",
+        label: "retried a conversation another app still held",
+        max: 5,
+        pause: Duration::from_secs(3),
+    },
+];
+
+/// What `/exit` may ask before Claude quits, and what a swap answers.
+const EXIT_DIALOGS: &[Dialog] = &[
+    // Background shells or agents: keep them running past the exit.
+    Dialog {
+        needles: &["Move to background and exit", "Enter to confirm"],
+        keys: "\x1b[B\r",
+        label: "moved background work out of the way",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    Dialog {
+        needles: &["Keep worktree", "Enter to confirm"],
+        keys: "\r",
+        label: "kept the worktree",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+];
+
+/// The first dialog of `table` on `screen` that this swap may still answer.
+fn pending_dialog<'a>(
+    screen: &str,
+    table: &'a [Dialog],
+    answered: &[&'static str],
+) -> Option<&'a Dialog> {
+    let tail = screen_tail(screen, DIALOG_TAIL_LINES);
+    table.iter().find(|dialog| {
+        dialog.needles.iter().all(|needle| tail.contains(needle))
+            && answered
+                .iter()
+                .filter(|label| **label == dialog.label)
+                .count()
+                < dialog.max
+    })
+}
+
+/// The last `lines` non-blank lines of `screen`, joined.
+fn screen_tail(screen: &str, lines: usize) -> String {
+    let rows: Vec<&str> = screen.lines().filter(|l| !l.trim().is_empty()).collect();
+    rows[rows.len().saturating_sub(lines)..].join("\n")
+}
+
+/// Footers of a selection dialog, read case-insensitively on the last few
+/// lines. One means the agent waits for a choice muxa did not make.
+const QUESTION_FOOTERS: &[&str] = &[
+    "enter to confirm",
+    "esc to cancel",
+    "enter select",
+    "enter continue",
+    "r to retry",
+];
+
+/// The footer line of a dialog still waiting for an answer, if any. A
+/// dialog's key hints are its last line (two when a narrow pane wraps
+/// them); once answered, output below them means it is gone.
+fn open_question(screen: &str) -> Option<String> {
+    let tail = screen_tail(screen, 2);
+    tail.lines()
+        .find(|line| {
+            let line = line.to_lowercase();
+            QUESTION_FOOTERS.iter().any(|footer| line.contains(footer))
+        })
+        .map(|line| line.trim().chars().take(80).collect())
 }
 
 /// Codex app-servers outside this pane, which can keep writer ownership of a
@@ -1436,6 +1756,138 @@ mod tests {
         assert_eq!(
             blocked_screen("• the log said no conversation found yesterday\n› Ask Codex\n"),
             None
+        );
+    }
+
+    // ---- startup dialogs a relaunch must answer, never type a follow-up into ----
+
+    /// Claude on a profile that has not seen the folder (captured live).
+    const CLAUDE_TRUST: &str = " Accessing workspace:\n /Users/june/personal/barshelf\n \
+        Quick safety check: Is this a project you created or one you trust?\n \
+        ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n";
+    const CLAUDE_READY: &str = "⏺ Resumed.\n────────\n❯ \n────────\n  \
+        ⏵⏵ bypass permissions on (shift+tab to cycle)\n";
+    const CODEX_LOCKED: &str =
+        "  🔒  This conversation is open in another app        r to retry\n      \
+        Close it there and press R to continue here.\n   r retry   f fork   esc/⌃c/q exit\n";
+
+    /// Drive `wait_for_resume_answering` over a screen that becomes `after`
+    /// once it has been answered `flips_after` times.
+    fn answering(
+        before: &'static str,
+        after: &'static str,
+        flips_after: usize,
+        can_answer: bool,
+    ) -> (Resume, Vec<&'static str>, Vec<String>) {
+        let keys = std::cell::RefCell::new(Vec::<String>::new());
+        let mut answered = Vec::new();
+        let resume = wait_for_resume_answering(
+            || {
+                let n = keys.borrow().len();
+                Some(if n >= flips_after { after } else { before }.to_owned())
+            },
+            || true,
+            |k| {
+                if can_answer {
+                    keys.borrow_mut().push(k.to_owned());
+                }
+                can_answer
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            &mut answered,
+        );
+        (resume, answered, keys.into_inner())
+    }
+
+    #[test]
+    fn claudes_trust_prompt_is_answered_yes_before_the_session_counts_as_ready() {
+        let (resume, answered, keys) = answering(CLAUDE_TRUST, CLAUDE_READY, 1, true);
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answered, vec!["trusted the folder"]);
+        // Down to "Yes", then Enter: Enter alone would pick "No, exit".
+        assert_eq!(keys, vec!["\x1b[B\r".to_owned()]);
+    }
+
+    #[test]
+    fn a_trust_prompt_that_cannot_be_answered_is_blocked_not_ready() {
+        let (resume, _, _) = answering(CLAUDE_TRUST, CLAUDE_READY, 1, false);
+        assert!(matches!(resume, Resume::Blocked(r) if r.contains("trusted the folder")));
+    }
+
+    #[test]
+    fn an_unknown_dialog_is_blocked_so_no_follow_up_is_typed_into_it() {
+        let unknown =
+            "  Something new?\n  ❯ 1. Yes\n    2. No\n  Enter to confirm · Esc to cancel\n";
+        let (resume, answered, keys) = answering(unknown, CLAUDE_READY, 1, true);
+        assert!(matches!(resume, Resume::Blocked(r) if r.contains("Enter to confirm")));
+        assert!(answered.is_empty() && keys.is_empty());
+    }
+
+    #[test]
+    fn a_conversation_another_app_still_holds_is_retried_then_given_up_on() {
+        let (resume, answered, keys) = answering(CODEX_LOCKED, RESUMED, 2, true);
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answered.len(), 2);
+        assert!(keys.iter().all(|k| k == "r"));
+        // Still held after five tries: reported, not waited on forever.
+        let (resume, answered, _) = answering(CODEX_LOCKED, RESUMED, usize::MAX, true);
+        assert!(matches!(resume, Resume::Blocked(r) if r.contains("another app")));
+        assert_eq!(answered.len(), 5);
+    }
+
+    #[test]
+    fn codex_resume_menus_keep_the_session_directory_and_the_goal() {
+        let directory = "  Working directory · resume\n  Session = latest cwd recorded in the resumed session\n\
+            › 1. Use session directory (/Users/jiun/personal/steam)\n  2. Use current directory (/Users/jiun)\n\
+              enter continue · esc use session · ⌃c quit\n";
+        let (resume, answered, keys) = answering(directory, RESUMED, 1, true);
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answered, vec!["kept the session directory"]);
+        assert_eq!(keys, vec!["\r".to_owned()]);
+        let goal = "    필요한 구현·테스트·문서 개선을 완료한다.\n  › 1. Resume goal   Mark it active\n    2. Leave paused\n    enter select · esc back\n";
+        let (resume, answered, _) = answering(goal, RESUMED, 1, true);
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answered, vec!["resumed the paused goal"]);
+    }
+
+    #[test]
+    fn exit_dialogs_keep_background_work_and_worktrees_and_spot_scheduled_tasks() {
+        let background = "   Background work is running\n   The following will stop when you exit:\n   \
+            shell · bash /tmp/build.sh\n   ❯ 1. Exit and stop tasks\n     2. Move to background and exit\n     \
+            3. Stay\n   Enter to confirm · Esc to cancel\n";
+        let dialog = pending_dialog(background, EXIT_DIALOGS, &[]).expect("background dialog");
+        assert_eq!(dialog.keys, "\x1b[B\r");
+        assert!(!owns_scheduled_tasks(background));
+        let worktree = "   Exiting worktree session\n   ❯ 1. Keep worktree    Stays at /x/.claude/worktrees/a\n     \
+            2. Remove worktree  Clean up the worktree directory.\n   Enter to confirm · Esc to cancel\n";
+        assert_eq!(
+            pending_dialog(worktree, EXIT_DIALOGS, &[]).unwrap().keys,
+            "\r"
+        );
+        let scheduled = "   scheduled task · Every day at 9:03 AM · [mail check]\n   ❯ 1. Exit and stop tasks\n     \
+            2. Move to background and exit\n     3. Stay\n   Enter to confirm · Esc to cancel\n";
+        assert!(owns_scheduled_tasks(scheduled));
+        // An answered dialog is not answered twice.
+        assert!(pending_dialog(worktree, EXIT_DIALOGS, &["kept the worktree"]).is_none());
+    }
+
+    #[test]
+    fn a_bare_agent_counts_as_on_the_active_account_so_auto_moves_it_elsewhere() {
+        let mut active = candidate("e-ed@claude", true);
+        active.active = true;
+        let candidates = vec![active, candidate("k-june@claude", true)];
+        let bare = LaunchLine::bare("claude --dangerously-skip-permissions");
+        let current = current_account(&bare, &candidates);
+        assert_eq!(current.as_deref(), Some("e-ed@claude"));
+        let moves = assign(&[current], &candidates, &AccountChoice::Auto);
+        assert_eq!(moves, vec![Ok("k-june@claude".to_owned())]);
+        // A launch line's own account still wins.
+        let named = LaunchLine::from_aas("aas e k-june@claude").unwrap();
+        assert_eq!(
+            current_account(&named, &candidates).as_deref(),
+            Some("k-june@claude")
         );
     }
 
@@ -1836,20 +2288,36 @@ mod tests {
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let script = |name: &str, body: &str| {
-            let path = bin.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-            Command::new("chmod").arg("+x").arg(&path).status().unwrap();
+            crate::test_support::write_executable(
+                &bin.join(name),
+                format!("#!/bin/sh\n{body}\n"),
+                0o755,
+            );
         };
         // `aas e <name> args…` runs the agent as its child, like the real one.
-        script("aas", r#"shift 2; "$(dirname "$0")/claude" "$@""#);
+        script(
+            "aas",
+            r#"trap '' INT; shift 2; "$(dirname "$0")/claude" "$@""#,
+        );
+        // Like the real CLI: Ctrl-C does not quit it, `/exit` does, and a
+        // resume on a fresh profile first asks to trust the folder, where
+        // Enter alone means "No, exit".
         script(
             "claude",
-            r#"echo "FAKE CLAUDE $*"; while :; do sleep 1; done"#,
+            r#"trap '' INT
+echo "FAKE CLAUDE $*"
+case "$*" in *--resume*)
+  printf ' ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n'
+  read answer
+  case "$answer" in *'[B'*) echo TRUSTED ;; *) echo REFUSED; exit 1 ;; esac ;;
+esac
+echo '⏵⏵ bypass permissions on'
+while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; done"#,
         );
         let socket = dir.join("tmux.sock");
         let socket = socket.to_str().unwrap();
         let tmux = |args: &[&str]| {
-            let out = Command::new("tmux")
+            let out = Command::new(crate::tmux::tmux_binary())
                 .arg("-S")
                 .arg(socket)
                 .args(args)
@@ -1860,20 +2328,21 @@ mod tests {
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         Command::new("env")
             .arg(format!("PATH={path}"))
-            .args(["tmux", "-S", socket, "-f", "/dev/null", "new-session", "-d"])
+            .arg(crate::tmux::tmux_binary())
+            .args(["-S", socket, "-f", "/dev/null", "new-session", "-d"])
             .args(["-x", "160", "-y", "40", "/bin/sh"])
             .status()
             .unwrap();
         std::env::set_var("MUXA_TMUX_SOCKET", socket);
         let pane = tmux(&["display-message", "-p", "#{pane_id}"]);
         let sid = "5a95b526-0439-4938-adb8-a24055198731";
-        tmux(&[
-            "send-keys",
-            "-t",
-            &pane,
-            "aas e e-ed@claude --dangerously-skip-permissions fix it",
-            "Enter",
-        ]);
+        // By absolute path, so a real `aas` earlier on the pane shell's PATH
+        // can never run instead of the fixture.
+        let launch = format!(
+            "{} e e-ed@claude --dangerously-skip-permissions fix it",
+            bin.join("aas").display()
+        );
+        tmux(&["send-keys", "-t", &pane, &launch, "Enter"]);
         std::thread::sleep(Duration::from_secs(1));
 
         let mut capped = limited(&pane, sid);
@@ -1889,6 +2358,9 @@ mod tests {
         assert_eq!(outcomes.len(), 1, "{outcomes:?}");
         let outcome = &outcomes[0];
         assert_eq!(outcome.status, SwapStatus::Swapped, "{outcome:?}\n{screen}");
+        assert!(screen.contains("TRUSTED"), "{screen}");
+        assert!(outcome.note.contains("trusted the folder"), "{outcome:?}");
+        assert!(screen.trim_end().ends_with("GOT continue"), "{screen}");
         assert_eq!(outcome.from.as_deref(), Some("e-ed@claude"));
         let command = outcome.command.as_deref().unwrap_or_default();
         assert!(!command.starts_with("/bin/sh"), "{command}");
@@ -1904,7 +2376,6 @@ mod tests {
             )),
             "{screen}"
         );
-        assert!(screen.trim_end().ends_with("continue"), "{screen}");
     }
 
     #[test]

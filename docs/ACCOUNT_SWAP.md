@@ -17,14 +17,25 @@ For each agent, muxa:
 
 1. reads how the agent was started from its pane's process tree (`aas e
    <account> …`, or a bare `claude` / `codex`);
-2. picks the next account (`aas candidates --json`, or `--to <account>`);
-3. stops the agent (`SIGTERM`, then `SIGKILL` if it lingers) and waits for the
-   pane's shell;
+2. picks the next account (`aas candidates --json`, or `--to <account>`). A
+   bare agent counts as being on the account `aas` marks active, so `auto`
+   never "moves" it onto the account it is already spending;
+3. stops the agent and waits for the pane's shell. Claude gets `/exit` (after
+   an Escape when it is mid-turn), the way a person quits it, and its exit
+   dialogs are answered so nothing is lost: background work is moved out of
+   the way and a worktree is kept. A session that owns scheduled tasks is
+   left on its account (exiting would cancel them) and reported as skipped.
+   Codex, and a Claude that does not exit, get `SIGTERM`, then `SIGKILL`;
 4. types the same launch line back, on the new account, with `--resume <id>`
    (Claude) or `resume <id>` (Codex). Flags and their values are kept; the
    initial prompt is dropped so the task is not restarted;
-5. waits for the resumed agent to appear and its screen to settle, then sends
-   the follow-up prompt when one applies.
+5. waits for the resumed agent to appear and its screen to settle, answering
+   the startup dialogs a new account brings up: Claude's folder trust and
+   auto-mode tour, Codex's folder trust, "Working directory · resume" (the
+   session's directory), "Resume goal", and "open in another app" (retried a
+   few times while the old process lets go). Any other dialog is reported and
+   nothing is typed into it;
+6. sends the follow-up prompt when one applies.
 
 ## Choosing which agents
 
@@ -66,8 +77,9 @@ aas = "aas"              # the aas binary; the daemon also looks in /opt/homebre
 | `--dry-run` | Prints the plan and touches nothing. |
 | `--json` | Machine-readable report. |
 
-`continue_when = "limited"` sends the follow-up only to agents a usage cap cut
-off mid-turn; an idle agent moved with `--all` is only resumed.
+`continue_when = "limited"` sends the follow-up only to agents whose turn was
+cut off: by a usage cap, or by the swap itself when `--force` stopped them
+mid-turn. An idle agent moved with `--all` is only resumed.
 
 ## Automatic swap
 
@@ -109,5 +121,5 @@ launch then starts `aas e <best eligible account> …` instead of the bare CLI.
 - Codex keeps its thread index per `aas` profile, but `codex resume <id>`
   finds the thread's rollout in the shared `sessions/`, so it resumes under an
   account that never ran it. If the pane's shell is no longer in the thread's
-  directory, Codex first asks which directory to use; the follow-up prompt is
-  not a good answer to that menu, so `cd` back or pass `--no-continue`.
+  directory, Codex first asks which directory to use; muxa keeps the
+  session's directory.
