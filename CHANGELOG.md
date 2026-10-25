@@ -27,6 +27,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa swap` no longer reports a relaunch as resumed while the pane still
+  shows the shell's echo of it: a quiet screen counts only once the agent's
+  own prompt is visible, so a trust dialog that draws seconds later is still
+  answered.
 - `muxa swap` no longer stops an agent that was active in the last 20 seconds
   without `--force`; a long tool call leaves the state idle while the turn
   runs. A pane whose root is `sh script` or `sh -c …` is no longer treated as
