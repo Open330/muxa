@@ -33,9 +33,13 @@ same profile. Reconnect in the owning client, or restart/resume it when idle.
 The reload command leaves its running work and stdio MCP child intact.
 Other clients and global instructions may also require an agent restart. The manual setup below remains available.
 
-Start the daemon (`muxad`) first — the MCP server **refuses to start** when
-the socket is unreachable, with a clear error, so an agent never talks to a
-dead control plane. Then register it:
+Start the daemon (`muxad`) first. The MCP server still starts if the socket
+is unreachable, with a warning on stderr: agent hosts launch an MCP server
+once and never retry, so refusing would leave that agent without muxa tools
+for good. Until the daemon is back, tool calls return its error. After an
+upgrade an idle server re-executes the new binary on the same stdio and
+sends `notifications/tools/list_changed`, so agents pick up new tools
+without restarting. Then register it:
 
 ```bash
 claude mcp add --scope user muxa -- muxa mcp
