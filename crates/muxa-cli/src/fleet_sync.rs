@@ -211,15 +211,35 @@ pub(crate) fn pending_path(path: &std::path::Path) -> std::path::PathBuf {
 
 /// The one lock every sync writer of a config file takes, so Fleet sync and
 /// `muxa config apply` never interleave their journals.
-pub(crate) fn lock_config(path: &std::path::Path) -> Result<std::fs::File> {
+pub(crate) async fn lock_config(path: &std::path::Path) -> Result<std::fs::File> {
+    lock_config_within(path, LOCK_WAIT).await
+}
+
+/// How long a sync waits for the config lock before reporting contention.
+/// An flock lives as long as any copy of its descriptor, and a process
+/// spawned at the wrong moment holds a copy until it execs; failing on the
+/// first refusal turned that brief overlap into "another sync is applying".
+const LOCK_WAIT: Duration = Duration::from_secs(2);
+
+async fn lock_config_within(path: &std::path::Path, wait: Duration) -> Result<std::fs::File> {
     let lock = private_options()
         .read(true)
         .create(true)
         .truncate(false)
         .open(path.with_extension("toml.fleet-sync.lock"))?;
-    lock.try_lock()
-        .context("another sync is applying this config")?;
-    Ok(lock)
+    let deadline = std::time::Instant::now() + wait;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => return Ok(lock),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => {
+                return Err(anyhow::Error::from(error))
+                    .context("another sync is applying this config");
+            }
+        }
+    }
 }
 
 /// Open options for a file only this user may read: backups and journals
@@ -358,7 +378,7 @@ where
         return Ok("unchanged".into());
     }
     ensure_parent(&initial.path)?;
-    let _lock = lock_config(&initial.path)?;
+    let _lock = lock_config(&initial.path).await?;
     let other = crate::config_sync_cmd::journal_path(&initial.path);
     if other.exists() {
         bail!(
@@ -690,6 +710,30 @@ mod reload_recovery_tests {
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), count);
         shutdown.send(()).unwrap();
         task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_config_lock_waits_out_a_brief_holder_but_reports_real_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let held = lock_config(&config).await.unwrap();
+        // Released while the second writer is still waiting: it gets the lock.
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            drop(held);
+        });
+        let started = std::time::Instant::now();
+        let second = lock_config_within(&config, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(150));
+        release.join().unwrap();
+        // Held for longer than the wait: contention is reported.
+        let error = lock_config_within(&config, Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("another sync"), "{error}");
+        drop(second);
     }
 
     #[test]

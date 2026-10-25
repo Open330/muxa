@@ -373,7 +373,7 @@ pub(crate) async fn apply(
     // recovery records.
     let path = client.config_read().await?.path;
     ensure_parent(&path)?;
-    let _lock = lock_config(&path)?;
+    let _lock = lock_config(&path).await?;
     if crate::fleet_sync::pending_path(&path).exists() {
         bail!("an unfinished Fleet sync holds this config; rerun `muxa fleet sync --apply` first");
     }
