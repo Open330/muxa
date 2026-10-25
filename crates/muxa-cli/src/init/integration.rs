@@ -554,7 +554,15 @@ fn write_server(original: &str, host: Host, server: Option<&Value>) -> Result<St
             } else if let Some(servers) = obj.get_mut("mcpServers").and_then(Value::as_object_mut) {
                 servers.remove("muxa");
             }
-            Ok(format!("{}\n", serde_json::to_string_pretty(&root)?))
+            // Keep the file in the style it was written in: Claude Code and
+            // other tools may keep it on one line, and a pretty rewrite of a
+            // long file turns a one-entry edit into a thousand-line diff.
+            let compact = !original.trim().is_empty() && !original.trim_end().contains('\n');
+            Ok(if compact {
+                format!("{}\n", serde_json::to_string(&root)?)
+            } else {
+                format!("{}\n", serde_json::to_string_pretty(&root)?)
+            })
         }
         Host::Codex => {
             let mut doc = original
@@ -820,6 +828,14 @@ fn uninstall_record(plan: &mut Plan, record: &Record) -> Result<bool> {
 
 /// Read-only checks shared by init verification and doctor. No agent is spawned.
 pub fn diagnostics(config: Option<&Path>) -> Result<Vec<(bool, String)>> {
+    diagnostics_with(config, active_mcp_configs())
+}
+
+/// [`diagnostics`] against an explicit set of active provider configs.
+fn diagnostics_with(
+    config: Option<&Path>,
+    active: Vec<(Host, &'static str, PathBuf)>,
+) -> Result<Vec<(bool, String)>> {
     let root = bundle_root(config)?;
     let manifest_path = root.join("manifest.json");
     if !manifest_path.exists() {
@@ -868,7 +884,62 @@ pub fn diagnostics(config: Option<&Path>) -> Result<Vec<(bool, String)>> {
             "Agent integration is uninstalled (empty ownership manifest)".into(),
         ));
     }
+    out.extend(active_home_gaps(&manifest_path, active));
     Ok(out)
+}
+
+/// The config file each provider reads in this environment. A provider's
+/// own variable picks its home (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`), so the
+/// home a session runs under can differ from the one `muxa init` last
+/// wrote; muxa only follows those variables and knows nothing about what
+/// set them.
+fn active_mcp_configs() -> Vec<(Host, &'static str, PathBuf)> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        out.push((
+            Host::Claude,
+            "CLAUDE_CONFIG_DIR",
+            PathBuf::from(home).join(".claude.json"),
+        ));
+    }
+    if let Some(home) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        out.push((
+            Host::Codex,
+            "CODEX_HOME",
+            PathBuf::from(home).join("config.toml"),
+        ));
+    }
+    out
+}
+
+/// Active provider homes whose config has no muxa MCP server and that the
+/// ownership manifest does not cover: the manifest only re-checks files it
+/// installed, so a home that was never set up would otherwise pass.
+fn active_home_gaps(
+    manifest_path: &Path,
+    configs: Vec<(Host, &'static str, PathBuf)>,
+) -> Vec<(bool, String)> {
+    let recorded: Vec<PathBuf> = load_manifest(manifest_path)
+        .map(|m| m.records.into_iter().map(|r| r.path).collect())
+        .unwrap_or_default();
+    configs
+        .into_iter()
+        .filter(|(_, _, path)| !recorded.contains(path))
+        .filter_map(|(host, var, path)| {
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let present = read_server(&text, host).ok().flatten().is_some();
+            let home = path.parent().unwrap_or(&path).display().to_string();
+            (!present).then(|| {
+                (
+                    false,
+                    format!(
+                        "agent-mcp: {} has no muxa server, and it is the active {var}; run `{var}={home} muxa init --component agent-mcp`",
+                        path.display()
+                    ),
+                )
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -934,13 +1005,75 @@ mod tests {
         }
 
         fn checks(&self) -> Vec<(bool, String)> {
-            diagnostics(Some(&self.root.parent().unwrap().join("config.toml"))).unwrap()
+            // The caller's own provider homes are not part of a fixture.
+            diagnostics_with(
+                Some(&self.root.parent().unwrap().join("config.toml")),
+                Vec::new(),
+            )
+            .unwrap()
         }
     }
 
     fn write(path: &Path, content: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, content).unwrap();
+    }
+
+    #[test]
+    fn a_compact_claude_config_stays_compact_and_a_pretty_one_stays_pretty() {
+        let server = json!({"type": "stdio", "command": "muxa", "args": ["mcp"]});
+        let compact = "{\"theme\":\"dark\",\"projects\":{}}";
+        let out = write_server(compact, Host::Claude, Some(&server)).unwrap();
+        assert_eq!(out.trim_end().lines().count(), 1, "{out}");
+        assert!(out.contains("\"muxa\""), "{out}");
+        let pretty = "{\n  \"theme\": \"dark\"\n}\n";
+        let out = write_server(pretty, Host::Claude, Some(&server)).unwrap();
+        assert!(out.lines().count() > 3, "{out}");
+        let fresh = write_server("", Host::Claude, Some(&server)).unwrap();
+        assert!(fresh.lines().count() > 3, "{fresh}");
+    }
+
+    #[test]
+    fn an_active_provider_home_without_muxa_is_reported_with_its_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_string(&Manifest::default()).unwrap(),
+        )
+        .unwrap();
+        let bare = dir.path().join("profile-a");
+        fs::create_dir_all(&bare).unwrap();
+        fs::write(bare.join(".claude.json"), "{\"theme\":\"dark\"}").unwrap();
+        let wired = dir.path().join("profile-b");
+        fs::create_dir_all(&wired).unwrap();
+        fs::write(
+            wired.join(".claude.json"),
+            "{\"mcpServers\":{\"muxa\":{\"command\":\"muxa\",\"args\":[\"mcp\"]}}}",
+        )
+        .unwrap();
+        let gaps = active_home_gaps(
+            &manifest,
+            vec![
+                (Host::Claude, "CLAUDE_CONFIG_DIR", bare.join(".claude.json")),
+                (
+                    Host::Claude,
+                    "CLAUDE_CONFIG_DIR",
+                    wired.join(".claude.json"),
+                ),
+            ],
+        );
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        let (healthy, message) = &gaps[0];
+        assert!(!healthy);
+        assert!(message.starts_with("agent-mcp: "), "{message}");
+        assert!(
+            message.contains(&format!(
+                "CLAUDE_CONFIG_DIR={} muxa init --component agent-mcp",
+                bare.display()
+            )),
+            "{message}"
+        );
     }
 
     #[test]

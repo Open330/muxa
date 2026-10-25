@@ -57,6 +57,20 @@ The default directory is `~/Library/Application Support/muxa` on macOS and
 directory remains `~/.agents/skills`. `CLAUDE_CONFIG_DIR` relocates Claude's home,
 including `.claude.json` inside that custom directory.
 
+If you run a provider from more than one home (separate accounts or profiles,
+however you switch between them), run init once per home with that home's own
+variable, so every session finds the server:
+
+```sh
+for home in <each Claude home>; do CLAUDE_CONFIG_DIR=$home muxa init --component agent-mcp; done
+```
+
+`muxa doctor` checks the home of the session it runs in: an active
+`CLAUDE_CONFIG_DIR` or `CODEX_HOME` whose config has no muxa server is reported
+with the command that fixes it. Writes to `.claude.json` take Claude Code's own
+`.claude.json.lock` so a running session cannot interleave with them, and keep
+the file in the style it was written in.
+
 The global block tells the agent when to read the canonical `bootstrap.md`.
 It does not replace the whole instruction file or rely on Markdown links being
 automatically imported. Existing dotfile symlinks remain links; edits go to their

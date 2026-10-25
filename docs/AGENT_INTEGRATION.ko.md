@@ -48,6 +48,18 @@ macOS 기본 경로는 `~/Library/Application Support/muxa`, Linux에서는
 `~/.agents/skills`입니다. `CLAUDE_CONFIG_DIR`을 설정하면 해당 디렉터리에
 Claude 지침·스킬과 `.claude.json`을 둡니다.
 
+provider를 여러 홈에서 쓴다면(계정·프로필을 무엇으로 전환하든) 홈마다 그 홈의
+변수를 지정해 init을 한 번씩 실행해야 모든 세션이 서버를 찾습니다.
+
+```sh
+for home in <각 Claude 홈>; do CLAUDE_CONFIG_DIR=$home muxa init --component agent-mcp; done
+```
+
+`muxa doctor`는 실행한 세션의 홈을 검사합니다. 활성 `CLAUDE_CONFIG_DIR`이나
+`CODEX_HOME`의 설정에 muxa 서버가 없으면 고치는 명령과 함께 알려 줍니다.
+`.claude.json`을 쓸 때는 Claude Code 자신의 `.claude.json.lock`을 잡아 실행 중인
+세션과 섞이지 않게 하고, 파일이 쓰인 형식(한 줄/들여쓰기)을 그대로 유지합니다.
+
 전역 지침에는 muxa 협업이 필요할 때 공통 `bootstrap.md`를 읽으라는 짧은 블록만
 추가합니다. 기존 지침 파일 전체를 교체하지 않으며 기존 dotfile 심링크도
 유지하고 실제 대상 파일을 수정합니다. Codex의 비어 있지 않은 override가
