@@ -68,6 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A collaboration wait (`muxa msg wait`, MCP `muxa_wait_reply`) survives a
+  daemon restart. muxad answers an interrupted wait with a retryable
+  `restarting` response instead of aborting it after the drain timeout, and
+  the client asks again with the same request id for what is left of the
+  original deadline. A connection closed without any answer is reported as
+  "muxad closed the connection before answering" rather than
+  `json error: EOF while parsing a value`.
 - Fleet automation sync creates missing configuration directories, recovers
   incomplete reloads on retry, and serializes concurrent applies. Config
   documents report absolute paths so backups stay beside the daemon's file.
