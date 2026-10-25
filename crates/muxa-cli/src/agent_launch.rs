@@ -1432,10 +1432,10 @@ mod tests {
         let build = || {
             AgentProgram::Codex.permission_launch(&["--no-daemon".into()], Some("it's\nfine"), true)
         };
-        let routed = Ok(muxa::account_route::RoutedLaunch {
-            aas: "/opt/aas".into(),
-            account: "ok@codex".into(),
-        });
+        let routed = Ok(muxa::account_route::RoutedLaunch::via_aas(
+            "/opt/aas".into(),
+            "ok@codex".into(),
+        ));
         assert_eq!(
             build().on_account(Some(&routed)).argv(),
             [

@@ -35,6 +35,7 @@
 
 pub mod account_route;
 pub mod account_swap;
+pub mod accounts;
 pub mod activity;
 pub mod adapters;
 pub mod agent_control;

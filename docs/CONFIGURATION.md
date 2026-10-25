@@ -159,7 +159,7 @@ options = ['--model', 'claude-sonnet-5']
 `muxa work up --dry-run` prints the resolved list for every pane, so what it
 shows is what the launch will use.
 
-### Starting on an `aas` account
+### Starting on an account
 
 ```toml
 [agent.claude]
@@ -173,7 +173,13 @@ on whichever account `aas active` names, even while that one is capped.
 changes `aas active`); a name pins one of that provider's accounts, used even
 when capped. `claude` and `codex` only.
 
-`aas` stays optional: it is run, never linked, and only when `account` is set.
+With `[[accounts.claude]]` / `[[accounts.codex]]` entries (see
+[Account swap](ACCOUNT_SWAP.md)), the account is one of those instead and the
+launch is `env K=V … claude …`, with no external tool: `auto` takes the first
+listed account, a name pins one.
+
+`aas` stays optional: it is run, never linked, and only when `account` is set
+and the provider lists no `[[accounts]]`.
 When it is missing, takes longer than 5 seconds, or has no account with quota
 left, the agent starts bare as before, which may still be the capped account.
 The reason goes to stderr and to the `account` field of `muxa agent start

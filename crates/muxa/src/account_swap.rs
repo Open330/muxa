@@ -312,6 +312,64 @@ fn current_account(line: &LaunchLine, candidates: &[Candidate]) -> Option<String
         .or_else(|| candidates.iter().find(|c| c.active).map(|c| c.name.clone()))
 }
 
+/// A configured account `pid` runs on, read from its environment.
+fn profile_account(profiles: &[crate::accounts::AccountProfile], pid: u32) -> Option<String> {
+    crate::accounts::identify(profiles, &crate::accounts::process_environ(pid)).map(str::to_owned)
+}
+
+/// Configured accounts as ranked candidates, in config order; `capped` ones
+/// are ineligible.
+fn profile_candidates(
+    profiles: &[crate::accounts::AccountProfile],
+    provider: &str,
+    capped: &[&str],
+) -> Vec<Candidate> {
+    profiles
+        .iter()
+        .map(|profile| {
+            let is_capped = capped.contains(&profile.name.as_str());
+            Candidate {
+                name: profile.name.clone(),
+                provider: provider.to_owned(),
+                eligible: !is_capped,
+                active: false,
+                reason: if is_capped {
+                    "rate limited here".into()
+                } else {
+                    "configured".into()
+                },
+                remaining_pct: None,
+            }
+        })
+        .collect()
+}
+
+/// Where a relaunched agent turned out to run.
+enum Landed {
+    /// On this configured account, or on none of them.
+    On(Option<String>),
+    /// Its environment could not be read (macOS hides that of its own
+    /// signed binaries), so nothing can be said.
+    Unreadable,
+}
+
+/// The configured account the relaunched agent in `target`'s pane runs on.
+fn resumed_account(target: &Target, profiles: &[crate::accounts::AccountProfile]) -> Landed {
+    let Some(agent) = crate::process_tree::read_descendants(target.pane_pid)
+        .into_iter()
+        .find(|p| {
+            is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str())
+        })
+    else {
+        return Landed::On(None);
+    };
+    let environ = crate::accounts::process_environ(agent.pid);
+    if environ.is_empty() {
+        return Landed::Unreadable;
+    }
+    Landed::On(crate::accounts::identify(profiles, &environ).map(str::to_owned))
+}
+
 /// The account each target moves to, in target order. `current` is each
 /// target's present account (when known); an agent is never "moved" onto
 /// the account it is already on. `Err` carries the reason that target is
@@ -547,6 +605,52 @@ pub fn relaunch_line(
     Ok(crate::shell::Dialect::native().command_line(&words))
 }
 
+/// The line that resumes `session_id` on a configured account: the
+/// account's `env K=V … <agent>` prefix, then the agent's own flags. An
+/// agent started through `aas` (or any other wrapper) loses the wrapper,
+/// keeps its arguments.
+pub fn profile_relaunch_line(
+    line: &LaunchLine,
+    kind: AgentKind,
+    session_id: &str,
+    profile: &crate::accounts::AccountProfile,
+) -> Result<String, String> {
+    let (program, args) = agent_program_and_args(line, kind);
+    let mut words = profile.launch_prefix(&program);
+    words.extend(resume_free_args(args, kind));
+    words.extend(resume_suffix(kind, session_id));
+    let dialect = crate::shell::Dialect::native();
+    if cfg!(windows) {
+        return Err(
+            "configured accounts relaunch through `env`/`sh`, which this shell lacks".into(),
+        );
+    }
+    Ok(dialect.command_line(&words))
+}
+
+/// The agent's program word and its arguments. An `aas e <account> …` line
+/// names no program (the provider's CLI is implied); a bare one starts with
+/// it, possibly behind an interpreter (`node …/bin/codex`).
+fn agent_program_and_args(line: &LaunchLine, kind: AgentKind) -> (String, &[String]) {
+    let provider = provider_name(kind).unwrap_or("claude").to_owned();
+    if let Some(at) = line.account_at {
+        let rest = &line.tokens[at + 1..];
+        return match rest.first().map(String::as_str) {
+            Some("claude" | "codex") => (rest[0].clone(), &rest[1..]),
+            _ => (provider, rest),
+        };
+    }
+    match line
+        .tokens
+        .iter()
+        .take(2)
+        .position(|token| crate::discovery::classify_command(token) == Some(kind))
+    {
+        Some(at) => (line.tokens[at].clone(), &line.tokens[at + 1..]),
+        None => (provider, line.tokens.get(1..).unwrap_or(&[])),
+    }
+}
+
 /// Whether `process` is the interactive `kind` agent (not Codex's
 /// app-server or a headless `exec` run).
 pub(crate) fn is_agent_process(process: &ProcessInfo, kind: AgentKind) -> bool {
@@ -757,6 +861,7 @@ pub fn run(
     agents: &[Agent],
     backends: &[SharedBackend],
     config: &SwapConfig,
+    accounts: &crate::accounts::AccountsConfig,
 ) -> Vec<SwapOutcome> {
     let (mut chosen, mut outcomes) = select(agents, request);
     // A pane can carry a hook-fed row and a screen-detected one; the
@@ -798,10 +903,15 @@ pub fn run(
     for Planned { agent, .. } in &planned {
         let provider = provider_name(agent.kind).unwrap_or_default();
         if !by_provider.iter().any(|(name, _)| *name == provider) {
-            let candidates = match request.to {
-                // A named account needs no ranking.
-                AccountChoice::Named(_) => Ok(Vec::new()),
-                _ => query_candidates(&config.aas, provider),
+            let candidates = if accounts.for_provider(provider).is_empty() {
+                match request.to {
+                    // A named account needs no ranking.
+                    AccountChoice::Named(_) => Ok(Vec::new()),
+                    _ => query_candidates(&config.aas, provider),
+                }
+            } else {
+                // Configured accounts: ranked below, from what muxa sees.
+                Ok(Vec::new())
             };
             by_provider.push((provider, candidates));
         }
@@ -821,13 +931,41 @@ pub fn run(
                 continue;
             }
         };
+        let profiles = accounts.for_provider(provider);
+        if !profiles.is_empty() {
+            let current: Vec<Option<String>> = group
+                .iter()
+                .map(|p| profile_account(profiles, p.launch.agent_pid))
+                .collect();
+            // An account an agent here was capped on has no quota to give.
+            let capped: Vec<&str> = group
+                .iter()
+                .zip(&current)
+                .filter(|(p, _)| is_rate_limited(p.agent))
+                .filter_map(|(_, account)| account.as_deref())
+                .collect();
+            let ranked = profile_candidates(profiles, provider, &capped);
+            let choice = match &request.to {
+                AccountChoice::Named(name) => {
+                    AccountChoice::Named(crate::accounts::bare_name(name, provider).to_owned())
+                }
+                other => other.clone(),
+            };
+            let chosen = assign(&current, &ranked, &choice);
+            for ((planned, account), from) in group.into_iter().zip(chosen).zip(current) {
+                let mut outcome = swap_one(request, planned, account, &ranked, Some(profiles));
+                outcome.from = from;
+                outcomes.push(outcome);
+            }
+            continue;
+        }
         let current: Vec<Option<String>> = group
             .iter()
             .map(|p| current_account(&p.launch.line, candidates))
             .collect();
         let accounts = assign(&current, candidates, &request.to);
         for (planned, account) in group.into_iter().zip(accounts) {
-            outcomes.push(swap_one(request, planned, account, candidates));
+            outcomes.push(swap_one(request, planned, account, candidates, None));
         }
     }
     outcomes
@@ -839,6 +977,7 @@ fn swap_one(
     planned: &Planned,
     account: Result<String, String>,
     candidates: &[Candidate],
+    profiles: Option<&[crate::accounts::AccountProfile]>,
 ) -> SwapOutcome {
     let Planned {
         agent,
@@ -861,8 +1000,14 @@ fn swap_one(
         }
     };
     outcome.to = Some(account.clone());
-    let command = match relaunch_line(&launch.line, agent.kind, session_id, &account, request.bare)
-    {
+    let relaunched = match profiles {
+        Some(profiles) => match profiles.iter().find(|p| p.name == account) {
+            Some(profile) => profile_relaunch_line(&launch.line, agent.kind, session_id, profile),
+            None => Err(format!("no configured account named {account}")),
+        },
+        None => relaunch_line(&launch.line, agent.kind, session_id, &account, request.bare),
+    };
+    let command = match relaunched {
         Ok(command) => command,
         Err(note) => {
             outcome.note = note;
@@ -889,7 +1034,23 @@ fn swap_one(
         busy: agent.state == AgentState::Working,
     };
     let (status, note) = match execute(&target, launch, &command, follow_up) {
-        Ok(note) => (SwapStatus::Swapped, note),
+        Ok(note) => match profiles.map(|profiles| resumed_account(&target, profiles)) {
+            // The relaunch must have landed on the account it was meant for.
+            Some(Landed::On(landed)) if landed.as_deref() != Some(account.as_str()) => (
+                SwapStatus::Failed,
+                format!(
+                    "{note}, but the resumed agent runs on {}",
+                    landed.as_deref().unwrap_or("no configured account")
+                ),
+            ),
+            Some(Landed::Unreadable) => (
+                SwapStatus::Swapped,
+                format!(
+                    "{note} (the account is unconfirmed: its environment is not readable here)"
+                ),
+            ),
+            _ => (SwapStatus::Swapped, note),
+        },
         Err(Refusal::Failed(note)) => (SwapStatus::Failed, note),
         Err(Refusal::Kept(note)) => (SwapStatus::Skipped, note),
     };
@@ -2336,10 +2497,176 @@ mod tests {
 
     /// The whole swap against a private tmux server, with `aas` and
     /// `claude` stood in for by scripts: stop, retype, resume, follow up.
+    /// The live tests point the tmux backend at their own server through the
+    /// process-wide `MUXA_TMUX_SOCKET`; run in parallel, one would swap the
+    /// other's pane.
+    static LIVE_TMUX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn live_tmux() -> std::sync::MutexGuard<'static, ()> {
+        LIVE_TMUX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    // ---- configured accounts: no aas involved ----
+
+    fn account(name: &str, key: &str, value: &str) -> crate::accounts::AccountProfile {
+        crate::accounts::AccountProfile {
+            name: name.into(),
+            env: [(key.to_owned(), value.to_owned())].into(),
+            env_file: None,
+        }
+    }
+
+    #[test]
+    fn an_aas_started_agent_moves_onto_a_configured_account_without_aas() {
+        let line = LaunchLine::from_aas("aas e e-ed@claude --dangerously-skip-permissions fix it")
+            .unwrap();
+        let work = account(
+            "work",
+            "CLAUDE_CONFIG_DIR",
+            "/Users/j/Library/Application Support/claude-work",
+        );
+        let command = profile_relaunch_line(&line, AgentKind::ClaudeCode, "sid-1", &work).unwrap();
+        assert!(!command.contains("aas"), "{command}");
+        assert!(
+            command.starts_with(
+                "env 'CLAUDE_CONFIG_DIR=/Users/j/Library/Application Support/claude-work' claude"
+            ),
+            "{command}"
+        );
+        assert!(
+            command.ends_with("claude --dangerously-skip-permissions --resume sid-1"),
+            "{command}"
+        );
+    }
+
+    #[test]
+    fn a_bare_codex_behind_node_keeps_its_own_binary_and_flags() {
+        let line = LaunchLine::bare("node /opt/bin/codex --yolo resume 019a-old");
+        let home = account("home", "CODEX_HOME", "/h/.codex-home");
+        let command = profile_relaunch_line(&line, AgentKind::Codex, "019a-new", &home).unwrap();
+        assert_eq!(
+            command,
+            "env CODEX_HOME=/h/.codex-home /opt/bin/codex --yolo resume 019a-new"
+        );
+    }
+
+    #[test]
+    fn configured_accounts_rank_in_order_and_skip_the_current_and_capped_ones() {
+        let profiles = vec![
+            account("a", "K", "1"),
+            account("b", "K", "2"),
+            account("c", "K", "3"),
+        ];
+        let ranked = profile_candidates(&profiles, "claude", &["b"]);
+        assert_eq!(
+            ranked.iter().map(|c| c.eligible).collect::<Vec<_>>(),
+            [true, false, true]
+        );
+        let moves = assign(&[Some("a".to_owned()), None], &ranked, &AccountChoice::Auto);
+        assert_eq!(moves, vec![Ok("c".to_owned()), Ok("a".to_owned())]);
+    }
+
+    #[test]
+    #[ignore = "drives a private tmux server; run with --ignored"]
+    fn swaps_a_live_pane_between_configured_accounts() {
+        use std::process::Command;
+        let _live = live_tmux();
+        let dir = std::env::temp_dir().join(format!("muxa-swap-acct-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        // macOS hides the environment of its own signed binaries, `/bin/sh`
+        // included; a Homebrew shell's stays readable, as the real CLI's does.
+        let shell = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash"]
+            .into_iter()
+            .find(|path| cfg!(target_os = "macos") && std::path::Path::new(path).exists())
+            .unwrap_or("/bin/sh");
+        crate::test_support::write_executable(
+            &claude,
+            format!(
+                "#!{shell}\n{}",
+                r#"trap '' INT
+echo "FAKE CLAUDE on $CLAUDE_CONFIG_DIR $*"
+echo '⏵⏵ bypass permissions on'
+while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; done
+"#
+            ),
+            0o755,
+        );
+        let socket = dir.join("tmux.sock");
+        let socket = socket.to_str().unwrap();
+        let tmux = |args: &[&str]| {
+            let out = Command::new(crate::tmux::tmux_binary())
+                .arg("-S")
+                .arg(socket)
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        tmux(&[
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "160",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        std::env::set_var("MUXA_TMUX_SOCKET", socket);
+        let pane = tmux(&["display-message", "-p", "#{pane_id}"]);
+        let sid = "6f1d1c0e-0000-4000-8000-00000000a11c";
+        let launch = format!(
+            "env CLAUDE_CONFIG_DIR=/acct/work {} --dangerously-skip-permissions fix it",
+            claude.display()
+        );
+        tmux(&["send-keys", "-t", &pane, &launch, "Enter"]);
+        std::thread::sleep(Duration::from_secs(1));
+
+        let accounts = crate::accounts::AccountsConfig {
+            claude: vec![
+                account("work", "CLAUDE_CONFIG_DIR", "/acct/work"),
+                account("home", "CLAUDE_CONFIG_DIR", "/acct/home"),
+            ],
+            codex: Vec::new(),
+        };
+        let mut capped = limited(&pane, sid);
+        capped.tmux_socket = None;
+        let request = request(SwapScope::Targets(vec![pane.clone()]));
+        let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
+        let outcomes = run(
+            &request,
+            &[capped],
+            &[backend],
+            &SwapConfig::default(),
+            &accounts,
+        );
+        let screen = tmux(&["capture-pane", "-p", "-t", &pane]);
+        tmux(&["kill-server"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let outcome = &outcomes[0];
+        assert_eq!(outcome.status, SwapStatus::Swapped, "{outcome:?}\n{screen}");
+        assert_eq!(outcome.from.as_deref(), Some("work"), "{outcome:?}");
+        assert_eq!(outcome.to.as_deref(), Some("home"), "{outcome:?}");
+        assert!(
+            screen.contains(&format!(
+                "FAKE CLAUDE on /acct/home --dangerously-skip-permissions --resume {sid}"
+            )),
+            "{screen}"
+        );
+        assert!(screen.trim_end().ends_with("GOT continue"), "{screen}");
+    }
+
     #[test]
     #[ignore = "drives a private tmux server; run with --ignored"]
     fn swaps_a_live_pane_end_to_end() {
         use std::process::Command;
+        let _live = live_tmux();
         let dir = std::env::temp_dir().join(format!("muxa-swap-{}", std::process::id()));
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
@@ -2406,7 +2733,13 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; d
         let mut request = request(SwapScope::Targets(vec![pane.clone()]));
         request.to = AccountChoice::Named("jelly@claude".into());
         let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
-        let outcomes = run(&request, &[capped], &[backend], &SwapConfig::default());
+        let outcomes = run(
+            &request,
+            &[capped],
+            &[backend],
+            &SwapConfig::default(),
+            &crate::accounts::AccountsConfig::default(),
+        );
         let screen = tmux(&["capture-pane", "-p", "-t", &pane]);
         tmux(&["kill-server"]);
         let _ = std::fs::remove_dir_all(&dir);

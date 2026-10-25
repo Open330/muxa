@@ -124,13 +124,19 @@ fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
     request
 }
 
-pub(crate) async fn run(client: &Client, args: Args, config: &SwapConfig) -> Result<()> {
+pub(crate) async fn run(
+    client: &Client,
+    args: Args,
+    config: &SwapConfig,
+    accounts: &muxa::accounts::AccountsConfig,
+) -> Result<()> {
     let request = request(&args, config);
     let agents = client.snapshot().await.context("listing agents")?;
     let backends = muxa::backend::active_backends();
     let config = config.clone();
+    let accounts = accounts.clone();
     let outcomes = tokio::task::spawn_blocking(move || {
-        account_swap::run(&request, &agents, &backends, &config)
+        account_swap::run(&request, &agents, &backends, &config, &accounts)
     })
     .await
     .context("swap worker")?;

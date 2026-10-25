@@ -109,6 +109,9 @@ pub enum ConfigError {
     #[error("{0}")]
     InvalidConfigSync(String),
 
+    #[error("{0}")]
+    InvalidAccounts(String),
+
     #[error("{path}: {message}")]
     InvalidAsk { path: String, message: String },
 
@@ -165,6 +168,9 @@ pub struct Config {
     /// Defaults for moving agents onto another `aas` account: `muxa swap`
     /// and the `swap_account` automation action.
     pub swap: crate::account_swap::SwapConfig,
+    /// Accounts muxa starts and moves agents on without `aas`:
+    /// `[[accounts.claude]]` / `[[accounts.codex]]`. Host-local.
+    pub accounts: crate::accounts::AccountsConfig,
     /// This host's choices for `muxa config export` / `apply`: which
     /// categories it takes part in and what it keeps to itself.
     pub config_sync: crate::config_sync::ConfigSyncConfig,
@@ -255,6 +261,7 @@ impl Config {
             provider: program.to_owned(),
             choice,
             aas: self.swap.aas.clone(),
+            profiles: self.accounts.for_provider(program).to_vec(),
         })
     }
 
@@ -1583,6 +1590,9 @@ impl Config {
         validate_fleet(&self.fleet)?;
         validate_mcp(&self.mcp)?;
         validate_agents(&self.agent)?;
+        self.accounts
+            .validate()
+            .map_err(ConfigError::InvalidAccounts)?;
         self.config_sync
             .validate()
             .map_err(ConfigError::InvalidConfigSync)?;
@@ -1718,8 +1728,7 @@ fn validate_agents(
         {
             return Err(ConfigError::InvalidAgent {
                 path: format!("agent.{program}.account"),
-                message: "account routing goes through aas, which runs only claude and codex"
-                    .into(),
+                message: "account routing is for claude and codex only".into(),
             });
         }
         if launch
@@ -1729,7 +1738,7 @@ fn validate_agents(
         {
             return Err(ConfigError::InvalidAgent {
                 path: format!("agent.{program}.account"),
-                message: "expected \"auto\" or an aas account name".into(),
+                message: "expected \"auto\" or an account name".into(),
             });
         }
         if let Some((index, _)) = launch
@@ -2602,9 +2611,42 @@ options = ["--model", "gpt-5-codex"]
                 provider: "codex".into(),
                 choice: crate::account_route::SpawnAccount::Auto,
                 aas: "/opt/aas".into(),
+                profiles: Vec::new(),
             })
         );
         assert_eq!(cfg.account_route("claude"), None);
+    }
+
+    #[test]
+    fn configured_accounts_load_validate_and_reach_account_routing() {
+        let cfg: Config = toml::from_str(
+            "[agent.claude]\naccount = \"auto\"\n\
+             [[accounts.claude]]\nname = \"work\"\nenv = { CLAUDE_CONFIG_DIR = \"~/.claude-work\" }\n\
+             [[accounts.claude]]\nname = \"home\"\nenv_file = \"~/.secrets/home.env\"\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        let route = cfg.account_route("claude").unwrap();
+        assert_eq!(
+            route
+                .profiles
+                .iter()
+                .map(|p| p.name.as_str())
+                .collect::<Vec<_>>(),
+            ["work", "home"]
+        );
+        let repeated: Config = toml::from_str(
+            "[[accounts.codex]]\nname = \"a\"\nenv = { CODEX_HOME = \"/a\" }\n\
+             [[accounts.codex]]\nname = \"a\"\nenv = { CODEX_HOME = \"/b\" }\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            repeated.validate(),
+            Err(ConfigError::InvalidAccounts(ref m)) if m.contains("listed twice")
+        ));
+        assert!(
+            toml::from_str::<Config>("[[accounts.claude]]\nname = \"x\"\ntoken = \"t\"\n").is_err()
+        );
     }
 
     #[test]

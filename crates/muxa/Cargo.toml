@@ -39,9 +39,11 @@ base64 = { workspace = true }
 sha2 = "0.10"
 openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"] }
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 # Windows has neither `/proc` nor `ps`; sysinfo reads the process table
 # (pid, parent, argv) through safe bindings, so `unsafe_code` stays forbidden.
+# macOS reads a process's environment through it too: `ps eww` joins it with
+# spaces, which cuts values under `~/Library/Application Support`.
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
 [dev-dependencies]
