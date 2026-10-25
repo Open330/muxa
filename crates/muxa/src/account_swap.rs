@@ -313,8 +313,23 @@ fn current_account(line: &LaunchLine, candidates: &[Candidate]) -> Option<String
 }
 
 /// A configured account `pid` runs on, read from its environment.
-fn profile_account(profiles: &[crate::accounts::AccountProfile], pid: u32) -> Option<String> {
-    crate::accounts::identify(profiles, &crate::accounts::process_environ(pid)).map(str::to_owned)
+/// The configured account a launch runs on, read from the agent's
+/// environment. Where that cannot be read (macOS hides it for its own signed
+/// binaries), the account its `aas e <name>` line names, so `auto` still
+/// does not send it back to the account it is capped on.
+fn profile_account(
+    resolved: &crate::accounts::ResolvedAccounts,
+    launch: &PaneLaunch,
+    provider: &str,
+) -> Option<String> {
+    let environ = crate::accounts::process_environ(launch.agent_pid);
+    if environ.is_empty() {
+        return launch
+            .line
+            .account()
+            .map(|name| crate::accounts::bare_name(name, provider).to_owned());
+    }
+    resolved.identify(&environ).map(str::to_owned)
 }
 
 /// Configured accounts as ranked candidates, in config order; `capped` ones
@@ -354,7 +369,7 @@ enum Landed {
 }
 
 /// The configured account the relaunched agent in `target`'s pane runs on.
-fn resumed_account(target: &Target, profiles: &[crate::accounts::AccountProfile]) -> Landed {
+fn resumed_account(target: &Target, resolved: &crate::accounts::ResolvedAccounts) -> Landed {
     let Some(agent) = crate::process_tree::read_descendants(target.pane_pid)
         .into_iter()
         .find(|p| {
@@ -367,7 +382,7 @@ fn resumed_account(target: &Target, profiles: &[crate::accounts::AccountProfile]
     if environ.is_empty() {
         return Landed::Unreadable;
     }
-    Landed::On(crate::accounts::identify(profiles, &environ).map(str::to_owned))
+    Landed::On(resolved.identify(&environ).map(str::to_owned))
 }
 
 /// The account each target moves to, in target order. `current` is each
@@ -635,8 +650,11 @@ fn agent_program_and_args(line: &LaunchLine, kind: AgentKind) -> (String, &[Stri
     let provider = provider_name(kind).unwrap_or("claude").to_owned();
     if let Some(at) = line.account_at {
         let rest = &line.tokens[at + 1..];
+        // `aas e <name> <provider> …` names this agent's own CLI; any other
+        // frontend word is another provider's UI, not a program to keep.
         return match rest.first().map(String::as_str) {
-            Some("claude" | "codex") => (rest[0].clone(), &rest[1..]),
+            Some(word) if word == provider => (rest[0].clone(), &rest[1..]),
+            Some("claude" | "codex") => (provider, &rest[1..]),
             _ => (provider, rest),
         };
     }
@@ -933,30 +951,7 @@ pub fn run(
         };
         let profiles = accounts.for_provider(provider);
         if !profiles.is_empty() {
-            let current: Vec<Option<String>> = group
-                .iter()
-                .map(|p| profile_account(profiles, p.launch.agent_pid))
-                .collect();
-            // An account an agent here was capped on has no quota to give.
-            let capped: Vec<&str> = group
-                .iter()
-                .zip(&current)
-                .filter(|(p, _)| is_rate_limited(p.agent))
-                .filter_map(|(_, account)| account.as_deref())
-                .collect();
-            let ranked = profile_candidates(profiles, provider, &capped);
-            let choice = match &request.to {
-                AccountChoice::Named(name) => {
-                    AccountChoice::Named(crate::accounts::bare_name(name, provider).to_owned())
-                }
-                other => other.clone(),
-            };
-            let chosen = assign(&current, &ranked, &choice);
-            for ((planned, account), from) in group.into_iter().zip(chosen).zip(current) {
-                let mut outcome = swap_one(request, planned, account, &ranked, Some(profiles));
-                outcome.from = from;
-                outcomes.push(outcome);
-            }
+            outcomes.extend(swap_on_profiles(request, group, profiles, provider));
             continue;
         }
         let current: Vec<Option<String>> = group
@@ -971,13 +966,59 @@ pub fn run(
     outcomes
 }
 
+/// [`run`] for a provider that lists `[[accounts]]`: accounts, identity and
+/// relaunch all come from config, never `aas`.
+fn swap_on_profiles(
+    request: &SwapRequest,
+    group: Vec<&Planned>,
+    profiles: &[crate::accounts::AccountProfile],
+    provider: &str,
+) -> Vec<SwapOutcome> {
+    let mut outcomes = Vec::new();
+    let resolved = crate::accounts::ResolvedAccounts::new(profiles);
+    let current: Vec<Option<String>> = group
+        .iter()
+        .map(|p| profile_account(&resolved, &p.launch, provider))
+        .collect();
+    // An account an agent here was capped on has no quota to give.
+    let capped: Vec<&str> = group
+        .iter()
+        .zip(&current)
+        .filter(|(p, _)| is_rate_limited(p.agent))
+        .filter_map(|(_, account)| account.as_deref())
+        .collect();
+    let ranked = profile_candidates(profiles, provider, &capped);
+    let choice = match &request.to {
+        AccountChoice::Named(name) => {
+            AccountChoice::Named(crate::accounts::bare_name(name, provider).to_owned())
+        }
+        other => other.clone(),
+    };
+    let chosen = assign(&current, &ranked, &choice);
+    for ((planned, account), from) in group.into_iter().zip(chosen).zip(current) {
+        let mut outcome = swap_one(
+            request,
+            planned,
+            account,
+            &ranked,
+            Some((profiles, &resolved)),
+        );
+        outcome.from = from;
+        outcomes.push(outcome);
+    }
+    outcomes
+}
+
 /// Carry one planned target through to its outcome.
 fn swap_one(
     request: &SwapRequest,
     planned: &Planned,
     account: Result<String, String>,
     candidates: &[Candidate],
-    profiles: Option<&[crate::accounts::AccountProfile]>,
+    profiles: Option<(
+        &[crate::accounts::AccountProfile],
+        &crate::accounts::ResolvedAccounts,
+    )>,
 ) -> SwapOutcome {
     let Planned {
         agent,
@@ -1000,10 +1041,13 @@ fn swap_one(
         }
     };
     outcome.to = Some(account.clone());
+    let provider = provider_name(agent.kind).unwrap_or_default();
     let relaunched = match profiles {
-        Some(profiles) => match profiles.iter().find(|p| p.name == account) {
+        Some((profiles, _)) => match crate::accounts::find_profile(profiles, provider, &account) {
             Some(profile) => profile_relaunch_line(&launch.line, agent.kind, session_id, profile),
-            None => Err(format!("no configured account named {account}")),
+            None => Err(format!(
+                "no account named {account} in [[accounts.{provider}]] (aas accounts are not used once a provider lists its own)"
+            )),
         },
         None => relaunch_line(&launch.line, agent.kind, session_id, &account, request.bare),
     };
@@ -1033,24 +1077,25 @@ fn swap_one(
         session_id: session_id.clone(),
         busy: agent.state == AgentState::Working,
     };
-    let (status, note) = match execute(&target, launch, &command, follow_up) {
-        Ok(note) => match profiles.map(|profiles| resumed_account(&target, profiles)) {
-            // The relaunch must have landed on the account it was meant for.
-            Some(Landed::On(landed)) if landed.as_deref() != Some(account.as_str()) => (
-                SwapStatus::Failed,
-                format!(
-                    "{note}, but the resumed agent runs on {}",
-                    landed.as_deref().unwrap_or("no configured account")
-                ),
-            ),
-            Some(Landed::Unreadable) => (
-                SwapStatus::Swapped,
-                format!(
-                    "{note} (the account is unconfirmed: its environment is not readable here)"
-                ),
-            ),
-            _ => (SwapStatus::Swapped, note),
-        },
+    // The relaunch must land on the account it was meant for, checked before
+    // any follow-up starts work on the wrong one.
+    let verify = |target: &Target| -> Result<String, String> {
+        let Some((_, resolved)) = profiles else {
+            return Ok(String::new());
+        };
+        match resumed_account(target, resolved) {
+            Landed::On(landed) if landed.as_deref() != Some(account.as_str()) => Err(format!(
+                "the resumed agent runs on {}",
+                landed.as_deref().unwrap_or("no configured account")
+            )),
+            Landed::Unreadable => {
+                Ok(" (account unconfirmed: its environment is not readable here)".into())
+            }
+            Landed::On(_) => Ok(String::new()),
+        }
+    };
+    let (status, note) = match execute(&target, launch, &command, follow_up, &verify) {
+        Ok(note) => (SwapStatus::Swapped, note),
         Err(Refusal::Failed(note)) => (SwapStatus::Failed, note),
         Err(Refusal::Kept(note)) => (SwapStatus::Skipped, note),
     };
@@ -1146,6 +1191,7 @@ fn execute(
     launch: &PaneLaunch,
     command: &str,
     follow_up: Option<&str>,
+    verify: &dyn Fn(&Target) -> Result<String, String>,
 ) -> Result<String, Refusal> {
     let socket = target.socket.as_deref();
     let mut answered: Vec<&'static str> = Vec::new();
@@ -1211,10 +1257,12 @@ fn execute(
             .into());
         }
     }
+    let checked = verify(target)
+        .map_err(|why| format!("relaunched, but {why}; nothing was sent to the pane"))?;
     let answers = if answered.is_empty() {
-        String::new()
+        checked
     } else {
-        format!(" ({})", answered.join(", "))
+        format!(" ({}){checked}", answered.join(", "))
     };
     let Some(text) = follow_up else {
         return Ok(format!("resumed{answers}"));

@@ -147,7 +147,7 @@ fn route_account(
 ) -> Option<std::result::Result<muxa::account_route::RoutedLaunch, String>> {
     let outcome = muxa::account_route::decide(route?);
     if let Err(reason) = &outcome {
-        eprintln!("muxa: starting without an aas account: {reason}");
+        eprintln!("muxa: starting without an account: {reason}");
     }
     Some(outcome)
 }

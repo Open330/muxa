@@ -35,6 +35,11 @@ to recognise the account. `auto` tries accounts in the listed order and skips
 one an agent here was capped on. `[accounts]` is host-local: config sync
 never copies it.
 
+Once a provider lists accounts, its swaps use only those: an `aas` name is
+not one of them, and `--bare` no longer applies, since an agent started bare
+is relaunched with the account's environment like any other. An `env_file`
+must be an absolute or `~/` path.
+
 ```console
 $ muxa swap --dry-run
 planned  %1         claude_code e-ed@claude -> jelly@claude

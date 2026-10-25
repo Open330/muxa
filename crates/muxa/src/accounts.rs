@@ -62,8 +62,7 @@ impl AccountsConfig {
     /// it) for `provider`.
     #[must_use]
     pub fn find(&self, provider: &str, name: &str) -> Option<&AccountProfile> {
-        let name = bare_name(name, provider);
-        self.for_provider(provider).iter().find(|p| p.name == name)
+        find_profile(self.for_provider(provider), provider, name)
     }
 
     /// Problems a config load should reject: a blank or repeated name, an
@@ -82,10 +81,30 @@ impl AccountsConfig {
                 if profile.env.is_empty() && profile.env_file.is_none() {
                     return Err(format!("{path}: sets neither `env` nor `env_file`"));
                 }
+                // Sourced from the pane's shell, whose directory is not
+                // muxa's: a relative path would name two different files.
+                if profile
+                    .env_file
+                    .as_deref()
+                    .is_some_and(|file| !(file.starts_with('/') || file.starts_with("~/")))
+                {
+                    return Err(format!("{path}: env_file must be an absolute or ~/ path"));
+                }
             }
         }
         Ok(())
     }
+}
+
+/// The account named `name` (with or without `@provider`) in `profiles`.
+#[must_use]
+pub fn find_profile<'a>(
+    profiles: &'a [AccountProfile],
+    provider: &str,
+    name: &str,
+) -> Option<&'a AccountProfile> {
+    let name = bare_name(name, provider);
+    profiles.iter().find(|p| p.name == name)
 }
 
 /// `name` without a trailing `@provider`.
@@ -134,9 +153,7 @@ impl AccountProfile {
             .map(|(key, value)| (key.clone(), expand_home(value)))
             .collect();
         if let Some(file) = &self.env_file {
-            if let Ok(text) = std::fs::read_to_string(expand_home(file)) {
-                vars.extend(parse_env_file(&text));
-            }
+            vars.extend(source_env_file(&expand_home(file)));
         }
         vars
     }
@@ -146,13 +163,44 @@ impl AccountProfile {
     /// without a trailing slash.
     #[must_use]
     pub fn matches(&self, environ: &[(String, String)]) -> bool {
-        let wanted = self.resolved_env();
-        !wanted.is_empty()
-            && wanted.iter().all(|(key, value)| {
-                environ
-                    .iter()
-                    .any(|(k, v)| k == key && same_value(v, value))
-            })
+        env_matches(&self.resolved_env(), environ)
+    }
+}
+
+fn env_matches(wanted: &[(String, String)], environ: &[(String, String)]) -> bool {
+    !wanted.is_empty()
+        && wanted.iter().all(|(key, value)| {
+            environ
+                .iter()
+                .any(|(k, v)| k == key && same_value(v, value))
+        })
+}
+
+/// A provider's accounts with their environments resolved once, so
+/// identifying many agents reads each `env_file` a single time.
+#[derive(Debug, Clone)]
+pub struct ResolvedAccounts {
+    entries: Vec<(String, Vec<(String, String)>)>,
+}
+
+impl ResolvedAccounts {
+    #[must_use]
+    pub fn new(profiles: &[AccountProfile]) -> Self {
+        Self {
+            entries: profiles
+                .iter()
+                .map(|profile| (profile.name.clone(), profile.resolved_env()))
+                .collect(),
+        }
+    }
+
+    /// The account `environ` belongs to, by name.
+    #[must_use]
+    pub fn identify(&self, environ: &[(String, String)]) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(_, wanted)| env_matches(wanted, environ))
+            .map(|(name, _)| name.as_str())
     }
 }
 
@@ -166,6 +214,49 @@ pub fn identify<'a>(
         .iter()
         .find(|profile| profile.matches(environ))
         .map(|profile| profile.name.as_str())
+}
+
+/// The values an env file gives the variables it declares, as the launch's
+/// `sh` sees them (`$HOME`, quotes and comments resolved). Falls back to a
+/// literal read when `sh` cannot be run.
+#[must_use]
+pub fn source_env_file(path: &str) -> Vec<(String, String)> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let declared = parse_env_file(&text);
+    if cfg!(windows) {
+        return declared;
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let sourced = std::process::Command::new("sh")
+        .args(["-c", r#"set -a; . "$0" >/dev/null 2>&1; env"#, path])
+        .env_clear()
+        .env("HOME", &home)
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(std::process::Stdio::null())
+        .output();
+    let Ok(output) = sourced else {
+        return declared;
+    };
+    if !output.status.success() {
+        return declared;
+    }
+    let environ: Vec<(String, String)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+    declared
+        .into_iter()
+        .map(|(key, literal)| {
+            let value = environ
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map_or(literal, |(_, v)| v.clone());
+            (key, value)
+        })
+        .collect()
 }
 
 fn same_value(a: &str, b: &str) -> bool {
@@ -246,6 +337,10 @@ pub fn process_environ_raw(pid: u32) -> Option<Vec<u8>> {
         .iter()
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
+    // Without the argv to strip, its words could pass for variables.
+    if argv.is_empty() {
+        return None;
+    }
     let output = std::process::Command::new("ps")
         .args(["eww", "-o", "command=", "-p", &pid.to_string()])
         .stdin(std::process::Stdio::null())
@@ -356,7 +451,7 @@ mod tests {
         let file = dir.join("work.env");
         std::fs::write(
             &file,
-            "# work\nexport CLAUDE_CODE_OAUTH_TOKEN=\"sk-ant-oat-1\"\n",
+            "# work\nexport CLAUDE_CODE_OAUTH_TOKEN=\"sk-ant-oat-1\"\nCLAUDE_CONFIG_DIR=$HOME/.claude-work  # dir\n",
         )
         .unwrap();
         let account = AccountProfile {
@@ -364,8 +459,19 @@ mod tests {
             env: BTreeMap::new(),
             env_file: Some(file.display().to_string()),
         };
-        assert!(account.matches(&environ(&[("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-1")])));
-        assert!(!account.matches(&environ(&[("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat-2")])));
+        // Values as the launch's `sh` sees them: `$HOME` expanded, comment gone.
+        let home = std::env::var("HOME").unwrap();
+        let dir_value = format!("{home}/.claude-work");
+        let on = |token: &str| {
+            environ(&[
+                ("CLAUDE_CODE_OAUTH_TOKEN", token),
+                ("CLAUDE_CONFIG_DIR", &dir_value),
+            ])
+        };
+        assert!(account.matches(&on("sk-ant-oat-1")));
+        assert!(!account.matches(&on("sk-ant-oat-2")));
+        let resolved = ResolvedAccounts::new(std::slice::from_ref(&account));
+        assert_eq!(resolved.identify(&on("sk-ant-oat-1")), Some("work"));
         let words = account.launch_prefix("claude");
         assert!(words.iter().all(|w| !w.contains("sk-ant")), "{words:?}");
         assert_eq!(words.first().map(String::as_str), Some("sh"));
@@ -412,6 +518,15 @@ mod tests {
             .validate()
             .is_err());
         assert!(config(vec![profile("empty", &[])]).validate().is_err());
+        let relative = AccountProfile {
+            name: "rel".into(),
+            env: BTreeMap::new(),
+            env_file: Some("secrets/x.env".into()),
+        };
+        assert!(config(vec![relative])
+            .validate()
+            .unwrap_err()
+            .contains("absolute"));
     }
 
     /// Parks while the probe test reads this process's environment. Run

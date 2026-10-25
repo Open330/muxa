@@ -103,17 +103,14 @@ impl RoutedLaunch {
 /// quota to rank by at launch; a swap moves the agent on when it is capped.
 fn from_profiles(route: &AccountRoute) -> Result<RoutedLaunch, String> {
     let provider = route.provider.as_str();
+    if cfg!(windows) {
+        return Err("configured accounts launch through `env`/`sh`, which this shell lacks".into());
+    }
     let profile = match &route.choice {
-        SpawnAccount::Named(name) => {
-            let name = crate::accounts::bare_name(name, provider);
-            route
-                .profiles
-                .iter()
-                .find(|p| p.name == name)
-                .ok_or_else(|| {
-                    format!("no {provider} account named {name} in [[accounts.{provider}]]")
-                })?
-        }
+        SpawnAccount::Named(name) => crate::accounts::find_profile(&route.profiles, provider, name)
+            .ok_or_else(|| {
+                format!("no {provider} account named {name} in [[accounts.{provider}]]")
+            })?,
         SpawnAccount::Auto => route
             .profiles
             .first()
