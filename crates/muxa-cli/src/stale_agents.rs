@@ -15,6 +15,8 @@ use std::fmt::Write as _;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
 
+use muxa::adapters::proc_ancestry::codex_subcommand;
+
 /// A process older than the binary by less than this is treated as fresh:
 /// the install writes the file a moment before anything re-launches.
 const START_SLACK: Duration = Duration::from_secs(2);
@@ -214,24 +216,6 @@ fn classify(
 fn is_muxa_mcp(args: &str) -> bool {
     let mut words = args.split_whitespace();
     words.next().map(muxa::shell::program_name) == Some("muxa") && words.next() == Some("mcp")
-}
-
-fn codex_subcommand(args: &str) -> Option<&str> {
-    let mut words = args.split_whitespace();
-    let program = words.next()?;
-    (muxa::shell::program_name(program) == "codex").then(|| {
-        words
-            .find(|word| {
-                !matches!(
-                    *word,
-                    "--yolo"
-                        | "--no-daemon"
-                        | "--dangerously-bypass-approvals-and-sandbox"
-                        | "--no-alt-screen"
-                )
-            })
-            .unwrap_or("")
-    })
 }
 
 /// One pass over the process table: pid, parent pid, age, command line.
@@ -447,6 +431,29 @@ mod tests {
         assert!(text.contains("reconnect MCP in each agent client"));
         assert!(!text.contains("every pane at once"));
         assert!(StaleReport::default().guidance().is_none());
+    }
+
+    #[test]
+    fn an_app_server_started_with_config_overrides_is_still_shared() {
+        let procs = [
+            proc(
+                2693,
+                1,
+                9000,
+                "codex -c features.code_mode_host=true app-server --listen unix://",
+            ),
+            proc(16327, 2693, 9000, "muxa mcp"),
+        ];
+        let report = classify(&procs, Duration::from_secs(60), &[], |_| {
+            Some("/home/u/.codex".into())
+        });
+        assert_eq!(
+            report
+                .shared_codex
+                .get(&(2693, Some("/home/u/.codex".into()))),
+            Some(&1)
+        );
+        assert_eq!(report.other, 0);
     }
 
     #[test]
