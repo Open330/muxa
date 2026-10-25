@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- CLI and MCP message lists query filtered, paged history in the daemon.
+  Default lists omit task, reply and update bodies from IPC; full and exact
+  reads retain their contracts. Older daemons use the same local query rules.
+
+### Changed
+
 - Worker launch registration reuses the request's pane inventory when applying
   its process-fenced purpose grant, avoiding a second full discovery pass.
 - MCP reload handles up to four independent profiles concurrently while

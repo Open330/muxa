@@ -629,6 +629,12 @@ enum RequestBody {
         /// clients asked for.
         #[serde(default)]
         scope: MailboxScope,
+        #[serde(default)]
+        query: Option<collaboration::CollaborationQuery>,
+        #[serde(default)]
+        offset: usize,
+        #[serde(default)]
+        metadata_only: bool,
     },
     CollaborationReply {
         origin: CollaborationOrigin,
@@ -905,6 +911,8 @@ pub struct Response {
     /// silently reading a caller-scoped answer as a fleet-wide one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_scope: Option<MailboxScope>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_page: Option<collaboration::CollaborationPage>,
     /// Present only when the daemon can restart itself. It increments across
     /// each re-exec so a client can distinguish the replacement image from
     /// the old daemon still finishing an in-flight response.
@@ -1036,6 +1044,7 @@ impl Response {
             capabilities: None,
             version: None,
             collaboration_scope: None,
+            collaboration_page: None,
             generation: None,
             sessions: None,
             session: None,
@@ -3084,7 +3093,13 @@ fn represented_participant(
     let requests = response
         .collaboration_request
         .iter()
-        .chain(response.collaboration_requests.iter().flatten());
+        .chain(response.collaboration_requests.iter().flatten())
+        .chain(
+            response
+                .collaboration_page
+                .iter()
+                .flat_map(|page| &page.requests),
+        );
     if origin.console {
         // The origin pane is provenance (where the operator opened the
         // console), not the represented identity. In particular, when the
@@ -3146,6 +3161,12 @@ fn collaboration_audit_entry(
         .collaboration_requests
         .as_ref()
         .map(Vec::len)
+        .or_else(|| {
+            response
+                .collaboration_page
+                .as_ref()
+                .map(|page| page.requests.len())
+        })
         .or_else(|| response.collaboration_request.as_ref().map(|_| 1));
     let provenance = actor.provenance(&context.represented_origin);
     context.finish(
@@ -4676,6 +4697,9 @@ async fn handle(
                     origin,
                     mailbox,
                     scope,
+                    query,
+                    offset,
+                    metadata_only,
                 } => {
                     kind = "collaboration_list";
                     collaboration_actor.observe_pane(&backends).await;
@@ -4697,6 +4721,31 @@ async fn handle(
                     )
                     .await;
                     let response = match topology.resolve_origin(&origin) {
+                        Ok(current) if query.is_some() => {
+                            match collaboration
+                                .query_for_offset(
+                                    &current,
+                                    mailbox,
+                                    scope,
+                                    query.as_ref().expect("query present"),
+                                    offset,
+                                )
+                                .await
+                            {
+                                Ok(mut page) => {
+                                    if metadata_only {
+                                        for request in &mut page.requests {
+                                            request.omit_list_bodies();
+                                        }
+                                    }
+                                    let mut response = Response::ok();
+                                    response.collaboration_scope = Some(scope);
+                                    response.collaboration_page = Some(page);
+                                    response
+                                }
+                                Err(error) => Response::err(error.to_string()),
+                            }
+                        }
                         Ok(current) => match collaboration.list_for(&current, mailbox, scope).await
                         {
                             Ok(requests) => {
@@ -6753,6 +6802,41 @@ impl Client {
         serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Read a bounded display page; `metadata_only` removes instruction/reply bodies.
+    /// Older daemons fall back to the same local filtering and pagination.
+    pub async fn collaboration_query(
+        &self,
+        origin: &CollaborationOrigin,
+        mailbox: RequestMailbox,
+        scope: MailboxScope,
+        query: &collaboration::CollaborationQuery,
+        offset: usize,
+        metadata_only: bool,
+    ) -> Result<collaboration::CollaborationPage, RuntimeError> {
+        let response = self
+            .call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,
+            "kind":"collaboration_list","origin":origin,"mailbox":mailbox,"scope":scope,
+            "query":query,"offset":offset,"metadata_only":metadata_only}))
+            .await?;
+        if !matches!(scope, MailboxScope::Caller) && response["collaboration_scope"].is_null() {
+            return Err(RuntimeError::Daemon("this muxad predates scoped collaboration listing; restart the daemon (`muxa daemon restart`)".into()));
+        }
+        if !response["collaboration_page"].is_null() {
+            return serde_json::from_value(response["collaboration_page"].clone())
+                .map_err(RuntimeError::Json);
+        }
+        let requests: Vec<CollaborationRequest> =
+            serde_json::from_value(response["collaboration_requests"].clone())
+                .map_err(RuntimeError::Json)?;
+        let mut page = query.page(&requests, offset);
+        if metadata_only {
+            for request in &mut page.requests {
+                request.omit_list_bodies();
+            }
+        }
+        Ok(page)
+    }
+
     pub async fn collaboration_reply(
         &self,
         origin: &CollaborationOrigin,
@@ -7882,6 +7966,202 @@ mod tests {
         assert_eq!(worker.launch_purpose, collaboration::LaunchPurpose::Worker);
         shutdown.send(()).unwrap();
         serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn paged_list_omits_bodies_preserves_full_reads_and_unread_state() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("pages.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        });
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone())
+            .with_collaboration_audit(audit.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+        let room = client.collaboration_context(&origin).await.unwrap();
+        let sender = room.current;
+        let recipient = room.peers[0].clone();
+        let ids = create_private_list_history(&mailbox, &sender, &recipient).await;
+        let query = collaboration::CollaborationQuery {
+            limit: Some(1),
+            ..Default::default()
+        };
+        let unread = mailbox.unread_reply_count(&sender).await;
+        let page = client
+            .collaboration_query(
+                &origin,
+                RequestMailbox::All,
+                MailboxScope::Caller,
+                &query,
+                1,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert!(page.has_more);
+        assert_eq!(page.requests.len(), 1);
+        assert_eq!(page.requests[0].id, ids[1]);
+        let text = serde_json::to_string(&page).unwrap();
+        assert!(!text.contains("PRIVATE"));
+        assert!(
+            page.requests[0].reply.is_some(),
+            "receipt must retain final reply status"
+        );
+        assert_eq!(page.requests[0].updates.last().unwrap().sequence, 1);
+        assert_eq!(mailbox.unread_reply_count(&sender).await, unread);
+        let entries = audit.entries().await;
+        assert!(entries.last().unwrap().response_bytes.unwrap() < 5000);
+        assert_eq!(entries.last().unwrap().result_count, Some(1));
+        let full = client
+            .collaboration_query(
+                &origin,
+                RequestMailbox::All,
+                MailboxScope::Caller,
+                &query,
+                1,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(full.requests[0].body.contains("PRIVATE TASK"));
+        assert!(full.requests[0]
+            .reply
+            .as_ref()
+            .unwrap()
+            .body
+            .contains("PRIVATE REPLY"));
+        let legacy = client
+            .collaboration_list(&origin, RequestMailbox::All)
+            .await
+            .unwrap();
+        assert_eq!(legacy.len(), 3);
+        assert!(legacy
+            .iter()
+            .all(|request| request.body.contains("PRIVATE TASK")));
+        assert_eq!(mailbox.unread_reply_count(&sender).await, unread);
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+        assert_legacy_list_query_fallback(legacy, &origin, &query).await;
+    }
+
+    async fn create_private_list_history(
+        mailbox: &CollaborationStore,
+        sender: &Participant,
+        recipient: &Participant,
+    ) -> Vec<String> {
+        let mut ids = Vec::new();
+        for _ in 0..3 {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "PRIVATE TASK ".repeat(900),
+                        expects_reply: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox
+                .update_request(sender, &request.id, "PRIVATE UPDATE".into())
+                .await
+                .unwrap();
+            mailbox
+                .reply(
+                    recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "PRIVATE REPLY".repeat(300),
+                    vec![],
+                    vec![],
+                )
+                .await
+                .unwrap();
+            ids.push(request.id);
+        }
+        ids
+    }
+
+    async fn assert_legacy_list_query_fallback(
+        requests: Vec<CollaborationRequest>,
+        origin: &CollaborationOrigin,
+        query: &collaboration::CollaborationQuery,
+    ) {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("legacy-list.sock");
+        let listener = Listener::bind(&socket).unwrap();
+        let bytes = encode_line(
+            &serde_json::json!({"ok":true,"protocol":PROTOCOL_VERSION,
+            "collaboration_requests":requests}),
+            PROTOCOL_VERSION,
+        )
+        .unwrap();
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let stream = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut line = String::new();
+                let mut reader = BufReader::new(read);
+                reader.read_line(&mut line).await.unwrap();
+                write.write_all(b"{\"ok\":true}\n").await.unwrap();
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                assert!(line.contains("collaboration_list"));
+                write.write_all(&bytes).await.unwrap();
+            }
+        });
+        let client = Client::new(socket);
+        let page = client
+            .collaboration_query(
+                origin,
+                RequestMailbox::All,
+                MailboxScope::Caller,
+                query,
+                1,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, 3);
+        assert_eq!(page.requests.len(), 1);
+        assert!(!serde_json::to_string(&page).unwrap().contains("PRIVATE"));
+        let error = client
+            .collaboration_query(
+                origin,
+                RequestMailbox::All,
+                MailboxScope::Room,
+                query,
+                0,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("predates scoped"),
+            "old daemon must not silently weaken the requested scope"
+        );
+        server.await.unwrap();
     }
 
     #[test]

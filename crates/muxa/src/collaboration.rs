@@ -1309,10 +1309,37 @@ pub struct CollaborationCursor {
     pub id: String,
 }
 
+impl CollaborationRequest {
+    /// A display-only projection. Exact get/claim/reply paths retain their full contract.
+    pub fn omit_list_bodies(&mut self) {
+        self.body.clear();
+        self.paths.clear();
+        self.artifacts.clear();
+        self.links.clear();
+        self.air_artifacts.clear();
+        if let Some(reply) = &mut self.reply {
+            reply.body.clear();
+            reply.artifacts.clear();
+            reply.air_artifacts.clear();
+        }
+        if let Some(mut last) = self.updates.pop() {
+            last.body.clear();
+            self.updates.clear();
+            self.updates.push(last);
+        }
+    }
+}
+
 /// Indexed collaboration-history filters. `since` is inclusive; `cursor` is
 /// exclusive. Room matching is exact across host, socket and tmux window id.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollaborationQuery {
+    /// CLI calendar ranges use an exclusive upper bound; existing queries remain inclusive.
+    #[serde(default)]
+    pub until_exclusive: bool,
+    /// Either endpoint's window id, name, or session:window label (case insensitive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -2028,7 +2055,10 @@ fn append_search_query_filters(
     clauses: &mut Vec<String>,
     values: &mut Vec<Value>,
 ) -> Result<(), CollaborationError> {
-    for (operator, instant) in [(">=", query.since), ("<=", query.until)] {
+    for (operator, instant) in [
+        (">=", query.since),
+        (if query.until_exclusive { "<" } else { "<=" }, query.until),
+    ] {
         if let Some(instant) = instant {
             clauses.push(format!("created_at_ns {operator} ?"));
             values.push(Value::Integer(timestamp_nanos(instant)?));
@@ -2062,6 +2092,7 @@ fn query_database(
     mailbox: RequestMailbox,
     scope: MailboxScope,
     query: &CollaborationQuery,
+    offset: usize,
 ) -> Result<CollaborationPage, CollaborationError> {
     let connection = open_database(path)?;
     query_connection(
@@ -2070,7 +2101,7 @@ fn query_database(
         mailbox,
         scope,
         query,
-        0,
+        offset,
         MAX_QUERY_LIMIT,
     )
 }
@@ -2114,6 +2145,20 @@ pub fn read_history_page(
     )
 }
 
+fn append_window_query_filter(
+    query: &CollaborationQuery,
+    clauses: &mut Vec<String>,
+    values: &mut Vec<Value>,
+) {
+    if let Some(window) = &query.window {
+        let endpoints = ["from", "to"].into_iter().map(|side| format!(
+            "(lower(json_extract(payload, '$.{side}.room.window_id')) = lower(?) OR lower(json_extract(payload, '$.{side}.window_name')) = lower(?) OR lower(CASE WHEN json_extract(payload, '$.{side}.console') THEN 'console' ELSE COALESCE(json_extract(payload, '$.{side}.tmux_session_name'), json_extract(payload, '$.{side}.tmux_session_id'), '?') || ':' || COALESCE(json_extract(payload, '$.{side}.window_name'), json_extract(payload, '$.{side}.room.window_id')) END) = lower(?))"
+        )).collect::<Vec<_>>();
+        clauses.push(format!("({})", endpoints.join(" OR ")));
+        values.extend((0..6).map(|_| Value::Text(window.clone())));
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn query_connection(
     connection: &Connection,
@@ -2144,6 +2189,7 @@ fn query_connection(
         }
     }
     append_session_query_filters(connection, query, &mut clauses, &mut values)?;
+    append_window_query_filter(query, &mut clauses, &mut values);
     if let Some(kind) = query.kind {
         clauses.push("kind = ?".to_string());
         values.push(Value::Text(request_kind_name(kind).to_string()));
@@ -2246,6 +2292,78 @@ fn request_visible(
     }
 }
 
+fn endpoint_matches_window(participant: &Participant, wanted: &str) -> bool {
+    let label = if participant.console {
+        "console".into()
+    } else {
+        format!(
+            "{}:{}",
+            participant
+                .tmux_session_name
+                .as_deref()
+                .or(participant.tmux_session_id.as_deref())
+                .unwrap_or("?"),
+            participant
+                .window_name
+                .as_deref()
+                .unwrap_or(&participant.room.window_id)
+        )
+    };
+    participant
+        .window_name
+        .as_deref()
+        .is_some_and(|name| name.eq_ignore_ascii_case(wanted))
+        || participant.room.window_id.eq_ignore_ascii_case(wanted)
+        || label.eq_ignore_ascii_case(wanted)
+}
+
+impl CollaborationQuery {
+    /// Compatibility selection when an older daemon returns the unbounded mailbox.
+    pub fn page(&self, requests: &[CollaborationRequest], offset: usize) -> CollaborationPage {
+        select_query_page(requests.iter(), self, offset)
+    }
+}
+
+fn select_query_page<'a>(
+    requests: impl Iterator<Item = &'a CollaborationRequest>,
+    query: &CollaborationQuery,
+    offset: usize,
+) -> CollaborationPage {
+    let mut matched = requests
+        .filter(|request| request_matches_query(request, query))
+        .collect::<Vec<_>>();
+    matched.sort_by(|left, right| (right.created_at, &right.id).cmp(&(left.created_at, &left.id)));
+    let total = matched.len();
+    if let Some(cursor) = &query.cursor {
+        matched
+            .retain(|request| (request.created_at, &request.id) < (cursor.created_at, &cursor.id));
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_QUERY_LIMIT)
+        .clamp(1, MAX_QUERY_LIMIT);
+    let has_more = matched.len().saturating_sub(offset) > limit;
+    let requests: Vec<_> = matched
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .cloned()
+        .collect();
+    let next_cursor = has_more.then(|| {
+        let last = requests.last().expect("nonempty page");
+        CollaborationCursor {
+            created_at: last.created_at,
+            id: last.id.clone(),
+        }
+    });
+    CollaborationPage {
+        requests,
+        total,
+        has_more,
+        next_cursor,
+    }
+}
+
 fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQuery) -> bool {
     let session_anchor = if request.from.console {
         &request.to
@@ -2253,7 +2371,17 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
         &request.from
     };
     query.since.is_none_or(|since| request.created_at >= since)
-        && query.until.is_none_or(|until| request.created_at <= until)
+        && query.until.is_none_or(|until| {
+            if query.until_exclusive {
+                request.created_at < until
+            } else {
+                request.created_at <= until
+            }
+        })
+        && query.window.as_ref().is_none_or(|window| {
+            endpoint_matches_window(&request.from, window)
+                || endpoint_matches_window(&request.to, window)
+        })
         && query.request_id.as_ref().is_none_or(|id| request.id == *id)
         && query.search.as_ref().is_none_or(|search| {
             collaboration_search_text(request, query.search_bodies)
@@ -3350,51 +3478,35 @@ impl CollaborationStore {
         scope: MailboxScope,
         query: &CollaborationQuery,
     ) -> Result<CollaborationPage, CollaborationError> {
+        self.query_for_offset(caller, mailbox, scope, query, 0)
+            .await
+    }
+
+    pub async fn query_for_offset(
+        &self,
+        caller: &Participant,
+        mailbox: RequestMailbox,
+        scope: MailboxScope,
+        query: &CollaborationQuery,
+        offset: usize,
+    ) -> Result<CollaborationPage, CollaborationError> {
         self.ensure_enabled()?;
         if !matches!(scope, MailboxScope::Caller) && !caller.console {
             return Err(CollaborationError::ScopeDenied);
         }
         let _transaction = self.transaction_lock.lock().await;
         if let Some(path) = self.database_path.as_ref() {
-            return query_database(path, caller, mailbox, scope, query);
+            return query_database(path, caller, mailbox, scope, query, offset);
         }
 
-        let limit = query
-            .limit
-            .unwrap_or(DEFAULT_QUERY_LIMIT)
-            .clamp(1, MAX_QUERY_LIMIT);
         let requests = self.requests.read().await;
-        let mut matched: Vec<_> = requests
-            .values()
-            .filter(|request| request_visible(request, caller, mailbox, scope))
-            .filter(|request| request_matches_query(request, query))
-            .cloned()
-            .collect();
-        matched
-            .sort_by(|left, right| (right.created_at, &right.id).cmp(&(left.created_at, &left.id)));
-        let total = matched.len();
-        if let Some(cursor) = query.cursor.as_ref() {
-            matched.retain(|request| {
-                (request.created_at, &request.id) < (cursor.created_at, &cursor.id)
-            });
-        }
-        let has_more = matched.len() > limit;
-        matched.truncate(limit);
-        let next_cursor = has_more.then(|| {
-            let last = matched
-                .last()
-                .expect("a positive page limit with has_more has a last row");
-            CollaborationCursor {
-                created_at: last.created_at,
-                id: last.id.clone(),
-            }
-        });
-        Ok(CollaborationPage {
-            requests: matched,
-            total,
-            has_more,
-            next_cursor,
-        })
+        Ok(select_query_page(
+            requests
+                .values()
+                .filter(|request| request_visible(request, caller, mailbox, scope)),
+            query,
+            offset,
+        ))
     }
 
     /// Remove whole, fully delivered terminal threads whose newest activity
@@ -4769,6 +4881,129 @@ mod tests {
         assert_eq!(overview.links.len(), 64);
         assert_eq!(overview.links[0].request_id, active.id);
         assert!(!overview.links[0].status.is_terminal());
+    }
+
+    async fn create_window_query_history(
+        mailbox: &CollaborationStore,
+        sender: &Participant,
+        recipient: &Participant,
+    ) -> Vec<CollaborationRequest> {
+        let mut created = Vec::new();
+        for _ in 0..3 {
+            created.push(
+                mailbox
+                    .create(
+                        sender.clone(),
+                        recipient.clone(),
+                        NewRequest {
+                            body: "PRIVATE".into(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        created
+    }
+
+    #[tokio::test]
+    async fn list_window_and_time_filters_precede_offset_in_memory_and_sqlite() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mailbox = if durable {
+                CollaborationStore::load(CollaborationOptions {
+                    path: Some(dir.path().join("pages.sqlite3")),
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+            } else {
+                CollaborationStore::in_memory(CollaborationOptions::default())
+            };
+            let mut sender = participant("%1", "sender");
+            sender.tmux_session_name = Some("workspace".into());
+            sender.window_name = Some("review".into());
+            let mut recipient = participant("%2", "recipient");
+            recipient.window_name = Some("implement".into());
+            let created = create_window_query_history(&mailbox, &sender, &recipient).await;
+            let query = CollaborationQuery {
+                window: Some("WORKSPACE:REVIEW".into()),
+                limit: Some(1),
+                ..Default::default()
+            };
+            let page = mailbox
+                .query_for_offset(
+                    &sender,
+                    RequestMailbox::Sent,
+                    MailboxScope::Caller,
+                    &query,
+                    1,
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.total, 3);
+            assert_eq!(page.requests[0].id, created[1].id);
+            assert!(page.has_more);
+            mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "new arrival".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let next = mailbox
+                .query_for(
+                    &sender,
+                    RequestMailbox::Sent,
+                    MailboxScope::Caller,
+                    &CollaborationQuery {
+                        cursor: page.next_cursor,
+                        ..query.clone()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                next.requests[0].id, created[0].id,
+                "new arrivals must not duplicate the previous page"
+            );
+            let end = created[2].created_at;
+            let query = CollaborationQuery {
+                window: Some("IMPLEMENT".into()),
+                until: Some(end),
+                until_exclusive: true,
+                ..Default::default()
+            };
+            let page = mailbox
+                .query_for(&sender, RequestMailbox::All, MailboxScope::Caller, &query)
+                .await
+                .unwrap();
+            assert_eq!(page.total, 2, "upper time bound is exclusive");
+            let beyond = mailbox
+                .query_for_offset(
+                    &sender,
+                    RequestMailbox::All,
+                    MailboxScope::Caller,
+                    &query,
+                    usize::MAX,
+                )
+                .await
+                .unwrap();
+            assert_eq!(beyond.total, 2);
+            assert!(beyond.requests.is_empty());
+            assert!(!beyond.has_more);
+            assert!(matches!(
+                mailbox
+                    .query_for(&sender, RequestMailbox::All, MailboxScope::All, &query)
+                    .await,
+                Err(CollaborationError::ScopeDenied)
+            ));
+        }
     }
 
     #[tokio::test]

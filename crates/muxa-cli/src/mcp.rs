@@ -1574,10 +1574,39 @@ async fn call_tool(
                     Err(error) => error_result(&format!("list_messages failed: {error}")),
                 });
             }
-            Ok(match client.collaboration_list(&origin, mailbox).await {
-                Ok(requests) => json_result(&message_page(requests, &args)),
-                Err(error) => error_result(&format!("list_messages failed: {error}")),
-            })
+            let offset = usize::try_from(args.get("offset").and_then(Value::as_u64).unwrap_or(0))
+                .unwrap_or(usize::MAX);
+            let limit = usize::try_from(
+                args.get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(20)
+                    .clamp(1, 100),
+            )
+            .unwrap_or(100);
+            let query = muxa::collaboration::CollaborationQuery {
+                limit: Some(limit),
+                ..Default::default()
+            };
+            let metadata_only = args.get("full").and_then(Value::as_bool) != Some(true);
+            Ok(
+                match client
+                    .collaboration_query(
+                        &origin,
+                        mailbox,
+                        muxa::collaboration::MailboxScope::Caller,
+                        &query,
+                        offset,
+                        metadata_only,
+                    )
+                    .await
+                {
+                    Ok(page) => json_result(
+                        &json!({"requests": page.requests.iter().map(|request| message_view(request, &args)).collect::<Vec<_>>(),
+                    "has_more":page.has_more,"next_offset":page.has_more.then(|| offset.saturating_add(limit))}),
+                    ),
+                    Err(error) => error_result(&format!("list_messages failed: {error}")),
+                },
+            )
         }
         "muxa_update_request" | "muxa_fleet_update_request" => {
             let Some(request_id) = args.get("request_id").and_then(Value::as_str) else {
@@ -4432,6 +4461,7 @@ fn report_view(request: &CollaborationRequest, args: &Value) -> Value {
     }
 }
 
+#[cfg(test)]
 fn message_page(mut requests: Vec<CollaborationRequest>, args: &Value) -> Value {
     requests.sort_by(|left, right| {
         right

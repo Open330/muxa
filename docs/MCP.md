@@ -580,6 +580,12 @@ methods) for the underlying `send_prompt` / `capture` / `subscribe` IPC.
 
 ### Checking collaboration cost locally
 
+CLI and MCP message lists use server-side filters and pagination. Default
+list IPC responses omit task/reply bodies, paths, artifacts and update text;
+reply status and the latest update sequence remain available. `--full` and
+exact request reads preserve complete content. Older daemons fall back to
+local filtering and can still transfer the full mailbox until reloaded.
+
 New daemon audit rows include `response_bytes` (encoded IPC bytes including
 newline) and `elapsed_us` (time through encoding including waits, excluding audit IO and
 socket writes). The report aggregates measured samples separately: older rows

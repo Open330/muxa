@@ -2535,15 +2535,66 @@ async fn cmd_msg_list(
         }
         vec![request]
     } else {
-        client
-            .collaboration_list_scoped(&listing_origin, mailbox, scope)
-            .await?
+        return cmd_msg_list_page(client, &listing_origin, mailbox, scope, filters, full, json)
+            .await;
     };
     let total = requests
         .iter()
         .filter(|request| filters.matches(request))
         .count();
     let requests = filters.apply(requests);
+    if requests.len() < total.saturating_sub(filters.offset) {
+        eprintln!("Showing {} of {total} matching messages; next page: --offset {} (or --limit 0 for all).", requests.len(), filters.offset.saturating_add(requests.len()));
+    }
+    print_collaboration_messages(&requests, json, full, origin, scope)
+}
+
+async fn cmd_msg_list_page(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    mailbox: RequestMailbox,
+    scope: MailboxScope,
+    filters: &CollaborationListFilters,
+    full: bool,
+    json: bool,
+) -> Result<()> {
+    let mut query = muxa::collaboration::CollaborationQuery {
+        since: filters.range.as_ref().and_then(|range| range.since_at),
+        until: filters.range.as_ref().and_then(|range| range.until_at),
+        until_exclusive: true,
+        workspace_id: filters.workspace_id.clone(),
+        work_id: filters.work_id.clone(),
+        thread_id: filters.thread_id.clone(),
+        kind: filters.kind,
+        status: filters.status,
+        window: filters.window.clone(),
+        ..Default::default()
+    };
+    let wanted = filters
+        .limit
+        .filter(|limit| *limit != 0)
+        .unwrap_or(usize::MAX);
+    let mut requests = Vec::new();
+    let mut offset = filters.offset;
+    let mut total = None;
+    loop {
+        query.limit = Some(wanted.saturating_sub(requests.len()).min(500));
+        let page = client
+            .collaboration_query(origin, mailbox, scope, &query, offset, !full)
+            .await?;
+        total.get_or_insert(page.total);
+        let done = !page.has_more || page.requests.is_empty();
+        requests.extend(page.requests);
+        if done || requests.len() >= wanted {
+            break;
+        }
+        // A newly arrived message must not shift later pages and duplicate rows.
+        query.cursor = Some(page.next_cursor.ok_or_else(|| {
+            anyhow::anyhow!("daemon returned more history without a continuation cursor")
+        })?);
+        offset = 0;
+    }
+    let total = total.unwrap_or(0);
     if requests.len() < total.saturating_sub(filters.offset) {
         eprintln!("Showing {} of {total} matching messages; next page: --offset {} (or --limit 0 for all).", requests.len(), filters.offset.saturating_add(requests.len()));
     }
