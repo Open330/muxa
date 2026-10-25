@@ -325,6 +325,14 @@ private struct MuxaFleetSettingsRow: View {
 private struct MuxaRuntimeSettingsPane: View {
     @ObservedObject var model: AppModel
 
+    private static let buildCommit: String? = {
+        guard let url = Bundle.main.url(forResource: "muxa-build", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let commit = document["commit"] as? String else { return nil }
+        return String(commit.prefix(12))
+    }()
+
     private var localHost: MuxaFleetHost? {
         model.fleetHosts.first(where: \.local)
     }
@@ -367,6 +375,11 @@ private struct MuxaRuntimeSettingsPane: View {
             }
 
             Section("Runtime") {
+                if let commit = Self.buildCommit {
+                    LabeledContent("App build") {
+                        Text(verbatim: commit).font(.callout.monospaced()).textSelection(.enabled)
+                    }
+                }
                 LabeledContent("muxa") {
                     Group {
                         if let version = localHost?.muxaVersion {

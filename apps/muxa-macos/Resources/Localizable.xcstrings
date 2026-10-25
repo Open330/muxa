@@ -1,6 +1,16 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "App build" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "앱 빌드"
+          }
+        }
+      }
+    },
     "#%@ · %lld panes" : {
       "localizations" : {
         "en" : {

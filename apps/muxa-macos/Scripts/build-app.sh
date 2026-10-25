@@ -51,6 +51,16 @@ xcodebuild \
 
 APP_PATH="$DERIVED_DATA/Build/Products/$CONFIGURATION/Muxa.app"
 test -d "$APP_PATH"
+# Keep build identity in the bundle: main builds may share a release version.
+python3 - "$APP_PATH" "$REPO_DIR" "$APP_VERSION" <<'PYTHON'
+import json, pathlib, subprocess, sys
+app, repo, version = sys.argv[1:]
+commit = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"], text=True).strip()
+dirty = bool(subprocess.check_output(["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"], text=True).strip())
+path = pathlib.Path(app) / "Contents/Resources/muxa-build.json"
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps({"commit": commit, "version": version.lstrip("v"), "dirty": dirty}, indent=2) + "\n")
+PYTHON
 echo "Muxa for Mac: $APP_PATH"
 
 if [ "${1:-}" = "--open" ]; then

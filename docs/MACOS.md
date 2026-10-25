@@ -639,3 +639,19 @@ notification action that blindly types an approval into the terminal. Reading,
 opening or dismissing the banner does not resolve the request. Each Mac keeps
 its own notification receipts, while all connected clients see the response
 stored on the source host. See [Fleet setup](FLEET.md#human-attention-across-clients).
+
+### Responsiveness and runtime verification
+
+Work commands use an ordered transport per host. Fleet snapshots and background
+state reads use separate transports, while terminal input, resize and attachment
+control retain their own ordered control path. A slow remote options request
+therefore does not hold up another host or terminal input. Workspace projection
+sorting/grouping runs off the main actor; only the latest result is published.
+
+Settings → Runtime shows the daemon version/generation and, when the installed
+bundle has `Contents/Resources/muxa-build.json`, its app build commit. A matching
+version number alone does not establish matching code: several local main builds
+can report the same release version. The app's embedded `muxa` and `muxad` must
+also be refreshed when installing a newer main build. CLI-only commands do not
+automatically gain a native UI; Advanced settings exposes the daemon's complete
+configuration, while dedicated forms remain limited to their supported sections.

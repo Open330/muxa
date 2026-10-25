@@ -181,6 +181,7 @@ final class AppModel: ObservableObject {
     private var askEventRefreshTask: Task<Void, Never>?
     private var pipelineEventRefreshTask: Task<Void, Never>?
     private var connectionGeneration: UInt64 = 0
+    private var projectionGeneration: UInt64 = 0
     private var refreshInFlight = false
     private var fleetRefreshPending = false
     private var askRefreshPending = false
@@ -292,7 +293,7 @@ final class AppModel: ObservableObject {
                     try await daemon.ensureRunning(client: client)
                 }
                 guard connectionGeneration == generation else { return }
-                connectionState = .connected
+                if connectionState != .connected { connectionState = .connected }
                 await refresh(ifGeneration: generation)
                 // The Inbox badge and sidebar counts are derived from the
                 // operator mailbox. Load it once after connecting so they are
@@ -375,7 +376,8 @@ final class AppModel: ObservableObject {
             if sessionsChanged { sessions = updated }
             if runsChanged { pipelineRuns = sortedRuns }
             if executionChanged { executionSnapshot = listedExecution }
-            if runsChanged || executionChanged { rebuildWorkspaceProjections() }
+            if runsChanged || executionChanged { await rebuildWorkspaceProjections() }
+            if let generation, connectionGeneration != generation { return }
             if let listedAskEntries, askEntries != listedAskEntries {
                 askEntries = listedAskEntries
             }
@@ -401,7 +403,7 @@ final class AppModel: ObservableObject {
                 workspaceRevision &+= 1
                 reconcileSelection()
             }
-            connectionState = .connected
+            if connectionState != .connected { connectionState = .connected }
         } catch is CancellationError {
             return
         } catch {
@@ -595,7 +597,8 @@ final class AppModel: ObservableObject {
             }
             guard connectionGeneration == generation, pipelineRuns != listedRuns else { return }
             pipelineRuns = listedRuns
-            rebuildWorkspaceProjections()
+            await rebuildWorkspaceProjections()
+            guard connectionGeneration == generation else { return }
             workspaceRevision &+= 1
             reconcileSelection()
         } catch is CancellationError {
@@ -675,14 +678,15 @@ final class AppModel: ObservableObject {
             if sessionsChanged { sessions = sortedSessions }
             if executionChanged {
                 executionSnapshot = listedExecution
-                rebuildWorkspaceProjections()
+                await rebuildWorkspaceProjections()
             }
+            guard connectionGeneration == generation else { return }
             if sessionsChanged || executionChanged {
                 reconcileWatchSelection()
                 workspaceRevision &+= 1
                 reconcileSelection()
             }
-            connectionState = .connected
+            if connectionState != .connected { connectionState = .connected }
         } catch is CancellationError {
             return
         } catch {
@@ -692,18 +696,27 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func rebuildWorkspaceProjections() {
-        hostedAgents = executionSnapshot.hostedAgents
-            .filter { $0.agent.state != "stopped" }
-            .sorted { left, right in
-                let leftPriority = left.agent.status.priority
-                let rightPriority = right.agent.status.priority
-                if leftPriority != rightPriority { return leftPriority < rightPriority }
-                if left.host.local != right.host.local { return left.host.local }
-                if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
-                return left.agent.agentSessionID < right.agent.agentSessionID
-            }
-        workGroups = executionSnapshot.workGroups(pipelineRuns: pipelineRuns)
+    private func rebuildWorkspaceProjections() async {
+        projectionGeneration &+= 1
+        let token = projectionGeneration, connection = connectionGeneration
+        let snapshot = executionSnapshot, runs = pipelineRuns
+        let result = await Task.detached(priority: .userInitiated) {
+            let agents = snapshot.hostedAgents
+                .filter { $0.agent.state != "stopped" }
+                .sorted { left, right in
+                    let leftPriority = left.agent.status.priority
+                    let rightPriority = right.agent.status.priority
+                    if leftPriority != rightPriority { return leftPriority < rightPriority }
+                    if left.host.local != right.host.local { return left.host.local }
+                    if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
+                    return left.agent.agentSessionID < right.agent.agentSessionID
+                }
+            return (agents, snapshot.workGroups(pipelineRuns: runs))
+        }.value
+        // Another pipeline/Fleet event or reconnection may have overtaken us.
+        guard token == projectionGeneration, connection == connectionGeneration else { return }
+        hostedAgents = result.0
+        workGroups = result.1
     }
 
     func createShell() {
