@@ -656,6 +656,30 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             },
         }),
         json!({
+            "name": "muxa_swap_account",
+            "description": "Move Claude/Codex agents onto another account and resume each conversation in its own pane: \
+                stop the agent, relaunch it on the account with the same session, answer startup dialogs, and send a \
+                follow-up so a cut-off turn carries on. Default targets are agents stopped by a usage cap. Accounts come \
+                from [[accounts.<provider>]] on that host, or aas. Run on this host or a control-mode Fleet host. \
+                Use dry_run=true to see the plan first. CLI equivalent: `muxa swap`.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "host": { "type": "string", "description": "Fleet host alias. Omit (or \"local\") for this host." },
+                    "targets": { "type": "array", "items": { "type": "string" }, "description": "Panes (%5, rmux:%5) or provider session ids. Omit for every capped agent." },
+                    "all": { "type": "boolean", "description": "Every Claude/Codex agent, not only capped ones." },
+                    "provider": { "type": "string", "enum": ["claude", "codex"] },
+                    "to": { "type": "string", "description": "Account name, or auto (default)." },
+                    "spread": { "type": "boolean", "description": "Round-robin agents over every account with quota left." },
+                    "force": { "type": "boolean", "description": "Also stop agents that are mid-turn." },
+                    "continue": { "type": "string", "description": "Follow-up prompt for every swapped agent." },
+                    "no_continue": { "type": "boolean", "description": "Send no follow-up prompt." },
+                    "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." }
+                },
+                "additionalProperties": false
+            },
+        }),
+        json!({
             "name": "muxa_manage_tmux",
             "description": "Manage Muxa's tmux bindings: session=Workspace, window=current Run, \
                 and pane=agent session. List/show managed Workspaces and Work, interrupt an agent turn, \
@@ -1569,6 +1593,7 @@ async fn call_tool(
         }
         "muxa_call_peer" => Ok(call_peer(client, &args, config).await),
         "muxa_start_work" => Ok(start_work(client, &args, config).await),
+        "muxa_swap_account" => Ok(swap_account(client, &args).await),
         "muxa_peer_report" => Ok(peer_report(client, &args).await),
         "muxa_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
@@ -4749,6 +4774,74 @@ fn error_result(message: &str) -> Value {
     })
 }
 
+/// `muxa_swap_account`: `muxa swap --json` through the daemon's work
+/// command transport, here or on a Fleet host. The caller's own pane is
+/// never swapped from under its tool call.
+async fn swap_account(client: &Client, args: &Value) -> Value {
+    let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+    let text = |name: &str| args.get(name).and_then(Value::as_str);
+    let host = muxa::work_control::remote_host_alias(text("host"));
+    let mut words: Vec<String> = args
+        .get("targets")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    for (name, switch) in [
+        ("all", "--all"),
+        ("spread", "--spread"),
+        ("force", "--force"),
+        ("no_continue", "--no-continue"),
+        ("dry_run", "--dry-run"),
+    ] {
+        if flag(name) {
+            words.push(switch.to_owned());
+        }
+    }
+    for (name, option) in [
+        ("provider", "--provider"),
+        ("to", "--to"),
+        ("continue", "--continue"),
+    ] {
+        if let Some(value) = text(name) {
+            words.extend([option.to_owned(), value.to_owned()]);
+        }
+    }
+    if host.is_none() {
+        if let Some(pane) = muxa::default_backend()
+            .current_pane()
+            .or_else(current_process_host_pane)
+        {
+            words.extend(["--exclude".to_owned(), pane]);
+        }
+    }
+    let command_line = match crate::swap::checked_argv(&words) {
+        Ok(command_line) => command_line,
+        Err(error) => return error_result(&format!("swap: {error}")),
+    };
+    let output = match client.work_command(host, &command_line, None).await {
+        Ok(output) => output,
+        Err(error) => return error_result(&format!("swap failed: {error}")),
+    };
+    let Ok(outcomes) = serde_json::from_str::<Value>(&output.stdout) else {
+        return error_result(&format!(
+            "swap failed (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        ));
+    };
+    let report = json!({ "host": host.unwrap_or("local"), "outcomes": outcomes });
+    let failed = outcomes
+        .as_array()
+        .is_some_and(|all| all.iter().any(|o| o["status"] == "failed"));
+    if failed || output.exit_code != 0 {
+        error_result(&format!("some agents could not be swapped: {report}"))
+    } else {
+        json_result(&report)
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5897,6 +5990,7 @@ mod tests {
                 "muxa_guide",
                 "muxa_start_agent",
                 "muxa_start_work",
+                "muxa_swap_account",
                 "muxa_manage_tmux",
                 "muxa_send_prompt",
                 "muxa_capture_pane",
