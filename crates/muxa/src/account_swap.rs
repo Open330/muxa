@@ -870,7 +870,8 @@ fn swap_one(
         }
     };
     outcome.command = Some(command.clone());
-    let follow_up = request.continue_for(is_rate_limited(agent) || is_busy(agent));
+    let follow_up =
+        request.continue_for(is_rate_limited(agent) || agent.state == AgentState::Working);
     if request.dry_run {
         outcome.status = SwapStatus::Planned;
         if let Some(text) = follow_up {
@@ -885,7 +886,7 @@ fn swap_one(
         pane_pid: pane.pane_pid,
         kind: agent.kind,
         session_id: session_id.clone(),
-        busy: is_busy(agent),
+        busy: agent.state == AgentState::Working,
     };
     let (status, note) = match execute(&target, launch, &command, follow_up) {
         Ok(note) => (SwapStatus::Swapped, note),
@@ -988,7 +989,7 @@ fn execute(
     let socket = target.socket.as_deref();
     let mut answered: Vec<&'static str> = Vec::new();
     if target.kind == AgentKind::ClaudeCode {
-        exit_claude(target, launch, &mut answered)?;
+        exit_claude(target, launch, follow_up, &mut answered)?;
     } else {
         stop(launch)?;
     }
@@ -1108,24 +1109,32 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 fn exit_claude(
     target: &Target,
     launch: &PaneLaunch,
+    follow_up: Option<&str>,
     answered: &mut Vec<&'static str>,
 ) -> Result<(), Refusal> {
     let socket = target.socket.as_deref();
     let send = |keys: &str| target.backend.send_text_on(socket, &target.pane, keys);
-    let alive = || is_alive(launch.agent_pid);
+    // The relaunch is typed into the shell, so the `aas` wrapper must be gone
+    // too, not only the agent.
+    let alive = || is_alive(launch.agent_pid) || is_alive(launch.top_pid);
+    // A kept session that the swap interrupted gets its turn back.
+    let keep = |note: &str| {
+        if let Some(text) = follow_up.filter(|_| target.busy) {
+            std::thread::sleep(Duration::from_millis(800));
+            send_follow_up(target, text);
+        }
+        Err(Refusal::Kept(note.to_owned()))
+    };
     if target.busy {
         // Interrupt the turn first; `/exit` is only read at the prompt.
         send("\x1b");
         std::thread::sleep(Duration::from_millis(1500));
     }
     // Ctrl-C clears a half-typed draft so `/exit` is not appended to it.
-    if !(send("\x03")
-        && {
-            std::thread::sleep(Duration::from_millis(300));
-            send("/exit")
-        }
-        && send("\r"))
-    {
+    if !(send("\x03") && {
+        std::thread::sleep(Duration::from_millis(300));
+        send_follow_up(target, "/exit")
+    }) {
         return Err("could not type /exit into the pane".into());
     }
     let started = Instant::now();
@@ -1136,17 +1145,12 @@ fn exit_claude(
             .capture_pane_on(socket, &target.pane)
             .unwrap_or_default();
         if owns_scheduled_tasks(&screen) {
-            // "Stay" is the third row.
-            send(&format!("{DOWN}{DOWN}\r"));
-            if target.busy {
-                std::thread::sleep(Duration::from_millis(800));
-                send_follow_up(target, "continue");
-            }
-            return Err(Refusal::Kept(
+            // Esc cancels the exit, whatever rows the dialog lists.
+            send("\x1b");
+            return keep(
                 "the session owns scheduled tasks, which exiting would cancel; \
-                 left it on its account"
-                    .into(),
-            ));
+                 left it on its account",
+            );
         }
         if let Some(dialog) = pending_dialog(&screen, EXIT_DIALOGS, answered) {
             if send(dialog.keys) {
@@ -1157,11 +1161,10 @@ fn exit_claude(
         }
         if open_question(&screen).is_some() && started.elapsed() > Duration::from_secs(5) {
             send("\x1b");
-            return Err(Refusal::Kept(
+            return keep(
                 "/exit asked a question muxa does not know how to answer; \
-                 left the session running"
-                    .into(),
-            ));
+                 left the session running",
+            );
         }
     }
     if alive() {
@@ -1332,6 +1335,15 @@ fn wait_for_resume_answering(
             last = screen;
             quiet_since = Instant::now();
         } else if !last.trim().is_empty() && quiet_since.elapsed() >= quiet {
+            if answered_dialog_lingers(&last, answered)
+                && open_question(&last).is_some()
+                && started.elapsed() < timeout
+            {
+                // Answered already; the agent has not redrawn yet.
+                quiet_since = Instant::now();
+                std::thread::sleep(tick);
+                continue;
+            }
             if let Some(dialog) = pending_dialog(&last, STARTUP_DIALOGS, answered) {
                 if answer(dialog.keys) {
                     answered.push(dialog.label);
@@ -1472,9 +1484,6 @@ fn blocked_screen(screen: &str) -> Option<&'static str> {
     })
 }
 
-/// Down arrow, as typed into a pane.
-const DOWN: &str = "\x1b[B";
-
 /// A dialog a resumed or exiting agent can stop on, and the keys that answer
 /// it the way a swap needs.
 struct Dialog {
@@ -1581,6 +1590,18 @@ fn pending_dialog<'a>(
                 .filter(|label| **label == dialog.label)
                 .count()
                 < dialog.max
+    })
+}
+
+/// Is `screen` still showing a startup dialog this swap has already answered
+/// as often as it may, other than a lock it gave up retrying? Paired with
+/// [`open_question`]: output below an answered dialog means it is gone.
+fn answered_dialog_lingers(screen: &str, answered: &[&'static str]) -> bool {
+    let tail = screen_tail(screen, DIALOG_TAIL_LINES);
+    STARTUP_DIALOGS.iter().any(|dialog| {
+        dialog.max == 1
+            && answered.contains(&dialog.label)
+            && dialog.needles.iter().all(|needle| tail.contains(needle))
     })
 }
 
@@ -1808,6 +1829,41 @@ mod tests {
         assert_eq!(answered, vec!["trusted the folder"]);
         // Down to "Yes", then Enter: Enter alone would pick "No, exit".
         assert_eq!(keys, vec!["\x1b[B\r".to_owned()]);
+    }
+
+    #[test]
+    fn a_trust_prompt_that_redraws_slowly_after_its_answer_is_waited_out() {
+        let captures_after = std::cell::Cell::new(0usize);
+        let answers = std::cell::Cell::new(0usize);
+        let mut answered = Vec::new();
+        let resume = wait_for_resume_answering(
+            || {
+                if answers.get() == 0 {
+                    return Some(CLAUDE_TRUST.to_owned());
+                }
+                captures_after.set(captures_after.get() + 1);
+                // Well past the quiet window before the answer shows.
+                Some(
+                    if captures_after.get() < 40 {
+                        CLAUDE_TRUST
+                    } else {
+                        CLAUDE_READY
+                    }
+                    .to_owned(),
+                )
+            },
+            || true,
+            |_| {
+                answers.set(answers.get() + 1);
+                true
+            },
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            &mut answered,
+        );
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answers.get(), 1, "answered once, not again");
     }
 
     #[test]
