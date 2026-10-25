@@ -1958,7 +1958,7 @@ fn collaboration_guide(
         "user_launch_preferences": launch_guide_value(config),
         "message_skills": config.message.skills.keys().collect::<Vec<_>>(),
         "transport_contract": {
-            "discovery": "Resolve exact tool names and retain their handles/schema for the session. Do not print ALL_TOOLS again for a known tool; refresh only after a version/capability change or unknown-tool/argument error.",
+            "discovery": "Discover matching names only, then read one exact selected schema; never print all matching descriptions. Retain tool handles/schema for the session. Do not print ALL_TOOLS again for a known tool; refresh only after a version/capability change or unknown-tool/argument error.",
             "bounded_reads": "Prompt history defaults to 20 entries. Fleet status is a summary; full=true explicitly requests large data. Inbox already includes task instructions. include_body requires an exact request_id unless full=true.",
             "final_reply_received": "Only reports that a recipient submitted a final reply; never proves success.",
             "reported_status": "Recipient-declared completed/blocked/declined/failed. Muxa does not judge the work.",

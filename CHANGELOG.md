@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Worker launch registration reuses the request's pane inventory when applying
+  its process-fenced purpose grant, avoiding a second full discovery pass.
+- MCP reload handles up to four independent profiles concurrently while
+  preserving report order and per-profile failures and timeouts.
+- Collaboration audit rows optionally measure encoded IPC response bytes and
+  processing time without recording bodies. The cost audit reports measured
+  samples separately from legacy rows and model-facing output bytes.
+- Agent discovery guidance selects tool names before reading a single schema.
+
 ### Fixed
 
 - Fleet automation sync creates missing configuration directories, recovers

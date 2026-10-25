@@ -3132,12 +3132,11 @@ fn mux_snapshot_response(
     }
 }
 
-async fn record_collaboration_audit(
-    audit: &CollaborationAuditLog,
+fn collaboration_audit_entry(
     actor: &CollaborationConnectionActor,
     context: CollaborationAuditContext,
     response: &Response,
-) {
+) -> crate::collaboration_audit::CollaborationAuditEntry {
     let represented = represented_participant(response, &context.represented_origin);
     let response_request_id = response
         .collaboration_request
@@ -3149,14 +3148,13 @@ async fn record_collaboration_audit(
         .map(Vec::len)
         .or_else(|| response.collaboration_request.as_ref().map(|_| 1));
     let provenance = actor.provenance(&context.represented_origin);
-    let entry = context.finish(
+    context.finish(
         provenance,
         represented.as_ref(),
         response_request_id,
         result_count,
         response.error.as_deref(),
-    );
-    audit.append(entry).await;
+    )
 }
 
 fn orchestration_config_response(
@@ -3248,6 +3246,7 @@ async fn handle(
     loop {
         line.clear();
         collaboration_actor.request_panes = None;
+        let mut pending_audit = None;
         // Bound the wait for the *next* request line. A client that connects
         // and then neither sends a complete request nor closes its half would
         // otherwise park this handler — and pin its fd — forever. A live
@@ -4031,13 +4030,11 @@ async fn handle(
                             "agent collaboration is disabled; enable [collaboration].enabled",
                         )
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationIssueHandle {
@@ -4104,13 +4101,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::AskSend { prompt, credential } => {
@@ -4484,13 +4479,11 @@ async fn handle(
                         }
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationInbox { origin, request_id } => {
@@ -4522,13 +4515,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationPurpose { origin, purpose } => {
@@ -4585,13 +4576,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationWorkerLaunch {
@@ -4625,14 +4614,10 @@ async fn handle(
                                 .await
                             {
                                 Ok(()) => {
-                                    let _ = collaboration_participants(
-                                        &store,
-                                        &backends,
-                                        &collaboration,
-                                        None,
-                                        collaboration_actor.take_request_panes(),
-                                    )
-                                    .await;
+                                    let mut participants = topology.participants;
+                                    collaboration
+                                        .enrich_launch_purposes(&mut participants, &topology.panes)
+                                        .await;
                                     Response::ok()
                                 }
                                 Err(error) => Response::err(error.to_string()),
@@ -4721,13 +4706,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationUpdate {
@@ -4761,13 +4744,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationReply {
@@ -4812,13 +4793,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationGet { origin, request_id } => {
@@ -4844,13 +4823,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationPeek { origin, request_id } => {
@@ -4876,13 +4853,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationWait {
@@ -4921,13 +4896,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationExpire {
@@ -4970,13 +4943,11 @@ async fn handle(
                         }
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::CollaborationWithdrawReplyWakes {
@@ -5008,13 +4979,11 @@ async fn handle(
                         },
                         Err(error) => Response::err(error.to_string()),
                     };
-                    record_collaboration_audit(
-                        &collaboration_audit,
+                    pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
                         &response,
-                    )
-                    .await;
+                    ));
                     response
                 }
                 RequestBody::SpawnSession {
@@ -5209,6 +5178,12 @@ async fn handle(
         };
 
         let bytes = encode_line(&resp, negotiated.unwrap_or(PROTOCOL_VERSION))?;
+        if let Some(mut entry) = pending_audit {
+            entry.response_bytes = Some(bytes.len());
+            entry.elapsed_us =
+                Some(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
+            collaboration_audit.append(entry).await;
+        }
         if !write_line_or_closed(&mut writer, &bytes).await? {
             return Ok(());
         }
@@ -7848,6 +7823,67 @@ mod tests {
         serving.await.unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn worker_registration_uses_one_scan_and_keeps_worker_grants() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let child = Child(
+            std::process::Command::new("bash")
+                .args(["-c", "sleep 0.1; exec -a 'codex --no-daemon' sleep 30"])
+                .spawn()
+                .unwrap(),
+        );
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("worker.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "caller", AgentKind::Codex).await;
+        let mut worker = pid_pane("%2", child.0.id());
+        worker.agent_program = Some("codex".into());
+        let counting = CountingPaneBackend::new(
+            HostKind::Tmux,
+            vec![collaboration_test_pane("%1", "0"), worker],
+        );
+        let backend: SharedBackend = counting.clone();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(CollaborationStore::in_memory(
+                CollaborationOptions::default(),
+            ));
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let result = client
+            .call(&serde_json::json!({"protocol":PROTOCOL_VERSION,
+            "kind":"collaboration_worker_launch", "pane":"%2", "socket":"default",
+            "agent_kind":"codex", "launch_id":uuid::Uuid::new_v4().to_string()}))
+            .await
+            .unwrap();
+        assert_eq!(result["ok"], true, "{result}");
+        assert_eq!(
+            counting.counts().0,
+            1,
+            "registration must not rescan after its process-fenced grant"
+        );
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+        let context = client.collaboration_context(&origin).await.unwrap();
+        let worker = context.peers.iter().find(|peer| peer.pane == "%2").unwrap();
+        assert_eq!(worker.launch_purpose, collaboration::LaunchPurpose::Worker);
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
     #[test]
     fn scanned_caller_evidence_matches_native_resolution_and_rejects_stale_panes() {
         let tmux: SharedBackend =
@@ -8211,6 +8247,10 @@ mod tests {
             .await
             .is_err());
         let entries = audit.entries().await;
+        assert!(entries
+            .iter()
+            .all(|entry| entry.response_bytes.is_some_and(|bytes| bytes > 0)
+                && entry.elapsed_us.is_some()));
         assert_eq!(
             entries
                 .iter()

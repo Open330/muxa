@@ -19,7 +19,9 @@ have changed. Report your location from `self`; never derive it from `$TMUX_PANE
 tmux commands, which can name another pane (Codex's shared app-server). Tool
 schemas and returned IDs describe the currently installed capabilities. Discover
 exact tool names (for example a name ending in `__muxa_inbox`), not matches in
-shared descriptions. Retain resolved tool handles and schemas within the session;
+shared descriptions. For discovery, print matching names only
+(`ALL_TOOLS.filter(...).map(({name}) => name)`), then retrieve the description
+of one exact selected name. Never print every matching schema. Retain resolved tool handles and schemas within the session;
 do not print `ALL_TOOLS` again for a known tool. Refresh only after a version/
 capability change or an unknown-tool/argument error.
 

@@ -580,6 +580,12 @@ methods) for the underlying `send_prompt` / `capture` / `subscribe` IPC.
 
 ### Checking collaboration cost locally
 
+New daemon audit rows include `response_bytes` (encoded IPC bytes including
+newline) and `elapsed_us` (time through encoding including waits, excluding audit IO and
+socket writes). The report aggregates measured samples separately: older rows
+remain unmeasured, rather than counting as zero. These are daemon wire metrics;
+final CLI/MCP output and billed model tokens can differ.
+
 Run `python3 scripts/collaboration-cost-audit.py --hours 24` from the checkout
 to break existing daemon audit calls down by client and operation. `watch` calls
 are UI traffic; raw IPC counts are not model token counts. To measure recorded

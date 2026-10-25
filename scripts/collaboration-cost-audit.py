@@ -87,6 +87,7 @@ def session_events(path):
 def summarize(audit, sessions, since, repeat_seconds):
     ipc = collections.Counter()
     ipc_failed = collections.Counter()
+    ipc_metrics = collections.defaultdict(collections.Counter)
     unknown_at = 0
     if audit.exists():
         for row in records(audit):
@@ -96,6 +97,13 @@ def summarize(audit, sessions, since, repeat_seconds):
             client = row.get("actor", {}).get("client_kind", "unknown")
             key = (client, row.get("operation", "unknown"))
             ipc[key] += 1
+            for field in ("response_bytes", "elapsed_us"):
+                value = row.get(field)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    metrics = ipc_metrics[key]
+                    metrics[field] += value
+                    metrics[field + "_samples"] += 1
+                    metrics["max_" + field] = max(metrics["max_" + field], value)
             if row.get("ok") is False:
                 ipc_failed[key] += 1
     stats = {}
@@ -142,11 +150,12 @@ def summarize(audit, sessions, since, repeat_seconds):
         "since": since.isoformat(),
         "units": "UTF-8 bytes of recorded tool results; not billed tokens",
         "caveats": ["IPC calls include watch/UI traffic, which is not model input.",
+                    "IPC bytes are daemon wire responses, not final MCP/CLI output or billed tokens; timings exclude audit IO and socket writes.",
                     "Mixed execution outputs can include unrelated commands.",
                     "Identical short-window results are candidates for review, not proven waste.",
                     "Only supplied session files are measured; provider caching/tokenization is unknown."],
         "audit_available": audit.exists(),
-        "ipc": [{"client": c, "operation": op, "calls": count, "failed": ipc_failed[(c, op)]}
+        "ipc": [{"client": c, "operation": op, "calls": count, "failed": ipc_failed[(c, op)], **ipc_metrics[(c, op)]}
                 for (c, op), count in sorted(ipc.items())],
         "sessions_scanned": len(seen_files),
         "unmeasured_calls_without_timestamp": unknown_at,
@@ -180,6 +189,11 @@ def main():
         print("  Audit file unavailable; IPC usage is unknown, not zero.")
     for row in report["ipc"]:
         print(f"  {row['client']:8} {row['operation']:12} {row['calls']:6} calls {row['failed']:4} failed")
+        if row.get("response_bytes_samples"):
+            print(f"    IPC responses: {row['response_bytes']} bytes / {row['response_bytes_samples']} measured calls")
+        if row.get("elapsed_us_samples"):
+            print(f"    request elapsed: mean {row['elapsed_us'] / row['elapsed_us_samples'] / 1000:.2f} ms, "
+                  f"max {row['max_elapsed_us'] / 1000:.2f} ms / {row['elapsed_us_samples']} measured calls")
     print(f"Tool results from {report['sessions_scanned']} supplied sessions:")
     for row in report["tool_results"]:
         print(f"  {row['tool']}: {row['calls']} calls, {row['output_bytes']} bytes, "

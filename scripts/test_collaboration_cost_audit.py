@@ -50,6 +50,25 @@ class CostAuditTests(unittest.TestCase):
             self.assertEqual(by_tool["mcp__muxa__muxa_room_context"]["calls"], 1)
             self.assertNotIn("private result", json.dumps(report))
 
+    def test_ipc_metrics_keep_legacy_rows_and_do_not_count_invalid_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "audit.ndjson"
+            base = {"at": "2026-10-20T01:00:00Z", "actor": {"client_kind": "mcp"},
+                    "operation": "list", "ok": True}
+            rows = [base, dict(base, response_bytes=100, elapsed_us=2000),
+                    dict(base, response_bytes=300, elapsed_us=4000),
+                    dict(base, response_bytes=-1, elapsed_us=True)]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows))
+            report = audit.summarize(ledger, [], dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc), 300)
+            row = report["ipc"][0]
+            self.assertEqual(row["calls"], 4)
+            self.assertEqual(row["response_bytes_samples"], 2)
+            self.assertEqual(row["response_bytes"], 400)
+            self.assertEqual(row["max_response_bytes"], 300)
+            self.assertEqual(row["elapsed_us_samples"], 2)
+            self.assertEqual(row["elapsed_us"], 6000)
+            self.assertEqual(row["max_elapsed_us"], 4000)
+
     def test_missing_audit_and_source_mentions_do_not_invent_model_calls(self):
         self.assertIsNone(audit.muxa_call("Bash", {"command": "rg muxa src/main.rs"}))
         self.assertIsNone(audit.muxa_call("unrelated_muxa_room_context", {}))

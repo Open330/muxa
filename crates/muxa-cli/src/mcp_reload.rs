@@ -163,64 +163,102 @@ fn plan(args: &McpReloadArgs, stale: &crate::stale_agents::StaleReport) -> Resul
     })
 }
 
+async fn refresh_host(
+    mut host: HostResult,
+    binary: &std::path::Path,
+    revision: &str,
+    args: &McpReloadArgs,
+) -> HostResult {
+    let update =
+        match crate::mcp_revision::RevisionPlan::prepare(&host.codex_home, binary, revision) {
+            Ok(update) => update,
+            Err(error) => {
+                host.state = "unavailable";
+                host.detail = error.to_string();
+                return host;
+            }
+        };
+    host.binary_revision_update = update.is_some();
+    if args.dry_run {
+        return host;
+    }
+    let started = Instant::now();
+    let (state, detail) = reload_host(
+        &host.codex_home,
+        &host.control_socket,
+        Duration::from_secs(args.timeout_secs),
+        update.as_ref(),
+        &mut host.config_backup,
+    )
+    .await;
+    host.state = state;
+    host.detail = detail;
+    if state == "queued" {
+        match verify_host(
+            &host.control_socket,
+            revision,
+            Duration::from_secs(args.timeout_secs).saturating_sub(started.elapsed()),
+        )
+        .await
+        {
+            Ok((total, current)) => {
+                host.muxa_connections = Some(total);
+                host.current_revision_connections = Some(current);
+                if total > 0 && current == total {
+                    host.state = "reloaded";
+                    host.detail = format!(
+                        "{current} loaded Muxa connection(s) report the installed binary revision"
+                    );
+                } else if total > current {
+                    host.detail = format!("refresh accepted; {current}/{total} loaded Muxa connection(s) report the current revision; finish active steps or reconnect in the client");
+                }
+            }
+            Err(_) => {
+                host.detail = "refresh accepted; connection verification is unavailable, so application is not confirmed".into();
+            }
+        }
+    }
+    host
+}
+
+async fn refresh_hosts(
+    hosts: Vec<HostResult>,
+    binary: &std::path::Path,
+    revision: &str,
+    args: &McpReloadArgs,
+) -> Vec<HostResult> {
+    // Different profiles can symlink the same config. Serialize those writers
+    // so their version-checked host API updates cannot race each other.
+    let mut locks = std::collections::BTreeMap::new();
+    let hosts: Vec<_> = hosts
+        .into_iter()
+        .map(|host| {
+            let path = host.codex_home.join("config.toml");
+            let key = path.canonicalize().unwrap_or(path);
+            let lock = locks
+                .entry(key)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone();
+            (host, lock)
+        })
+        .collect();
+    futures_util::stream::iter(hosts)
+        .map(|(host, lock)| async move {
+            let _guard = lock.lock().await;
+            refresh_host(host, binary, revision, args).await
+        })
+        .buffered(4)
+        .collect()
+        .await
+}
+
 pub async fn run(args: McpReloadArgs) -> Result<()> {
     let binary = crate::stale_agents::installed_muxa()
         .context("cannot locate installed muxa to discover stale owners")?;
     let owners = crate::stale_agents::scan(&binary);
     let mut report = plan(&args, &owners)?;
     let revision = crate::mcp_revision::binary_revision(&binary)?;
-    for host in &mut report.hosts {
-        let update = match crate::mcp_revision::RevisionPlan::prepare(
-            &host.codex_home,
-            &binary,
-            &revision,
-        ) {
-            Ok(update) => update,
-            Err(error) => {
-                host.state = "unavailable";
-                host.detail = error.to_string();
-                continue;
-            }
-        };
-        host.binary_revision_update = update.is_some();
-        if args.dry_run {
-            continue;
-        }
-        let started = Instant::now();
-        let (state, detail) = reload_host(
-            &host.codex_home,
-            &host.control_socket,
-            Duration::from_secs(args.timeout_secs),
-            update.as_ref(),
-            &mut host.config_backup,
-        )
-        .await;
-        host.state = state;
-        host.detail = detail;
-        if state == "queued" {
-            match verify_host(
-                &host.control_socket,
-                &revision,
-                Duration::from_secs(args.timeout_secs).saturating_sub(started.elapsed()),
-            )
-            .await
-            {
-                Ok((total, current)) => {
-                    host.muxa_connections = Some(total);
-                    host.current_revision_connections = Some(current);
-                    if total > 0 && current == total {
-                        host.state = "reloaded";
-                        host.detail = format!("{current} loaded Muxa connection(s) report the installed binary revision");
-                    } else if total > current {
-                        host.detail = format!("refresh accepted; {current}/{total} loaded Muxa connection(s) report the current revision; finish active steps or reconnect in the client");
-                    }
-                }
-                Err(_) => {
-                    host.detail = "refresh accepted; connection verification is unavailable, so application is not confirmed".into();
-                }
-            }
-        }
-    }
+    report.hosts = refresh_hosts(report.hosts, &binary, &revision, &args).await;
     if !args.dry_run {
         let after = crate::stale_agents::scan(&binary);
         for host in &mut report.hosts {
@@ -637,6 +675,89 @@ mod tests {
             .contains("standalone Codex CLI")
             && message.contains("when idle")));
         assert!(all.scope.contains("registered Muxa connections"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reload_profiles_overlap_with_a_four_host_limit_and_stable_order() {
+        check_reload_parallelism(false).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn profiles_sharing_a_config_do_not_race_their_config_writers() {
+        check_reload_parallelism(true).await;
+    }
+
+    #[cfg(unix)]
+    async fn check_reload_parallelism(shared_config: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        let directory = tempfile::tempdir().unwrap();
+        let limit = if shared_config { 1 } else { 4 };
+        let barrier = Arc::new(tokio::sync::Barrier::new(limit));
+        let shared_path = directory.path().join("shared-config.toml");
+        std::fs::write(&shared_path, "").unwrap();
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut hosts = Vec::new();
+        let mut servers = Vec::new();
+        for index in 0..8 {
+            let home = directory.path().join(index.to_string());
+            std::fs::create_dir(&home).unwrap();
+            if shared_config {
+                std::os::unix::fs::symlink(&shared_path, home.join("config.toml")).unwrap();
+            }
+            let socket = directory.path().join(format!("{index}.sock"));
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (barrier, active, peak) = (barrier.clone(), active.clone(), peak.clone());
+            servers.push(tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut connection = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let _ = connection.next().await.unwrap().unwrap();
+                send(&mut connection, json!({"id":1,"result":{}}))
+                    .await
+                    .unwrap();
+                let _ = connection.next().await.unwrap().unwrap(); // initialized
+                let request = connection.next().await.unwrap().unwrap();
+                assert!(request
+                    .to_text()
+                    .unwrap()
+                    .contains("config/mcpServer/reload"));
+                let count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(count, Ordering::SeqCst);
+                barrier.wait().await; // Independent profiles must reach this concurrently.
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                send(&mut connection, json!({"id":2,"error":{"code":-32601}}))
+                    .await
+                    .unwrap();
+            }));
+            let mut options = args();
+            options.codex_home = Some(home);
+            let mut host = plan(&options, &crate::stale_agents::StaleReport::default())
+                .unwrap()
+                .hosts
+                .remove(0);
+            host.control_socket = socket;
+            hosts.push(host);
+        }
+        let mut options = args();
+        options.dry_run = false;
+        let results = tokio::time::timeout(
+            Duration::from_secs(5),
+            refresh_hosts(hosts, &directory.path().join("muxa"), "revision", &options),
+        )
+        .await
+        .unwrap();
+        assert_eq!(peak.load(Ordering::SeqCst), limit);
+        for (index, result) in results.iter().enumerate() {
+            assert_eq!(result.codex_home, directory.path().join(index.to_string()));
+            assert_eq!(result.state, "unsupported");
+        }
+        for server in servers {
+            server.await.unwrap();
+        }
     }
 
     #[cfg(unix)]

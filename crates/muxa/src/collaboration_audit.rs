@@ -79,6 +79,12 @@ pub struct CollaborationAuditEntry {
     /// The purpose an operator purpose change asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<crate::collaboration::LaunchPurpose>,
+    /// Encoded daemon IPC response size, including its newline; not model tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_bytes: Option<usize>,
+    /// Request elapsed time through encoding (including waits), excluding audit IO and socket writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_us: Option<u64>,
     pub ok: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -144,6 +150,8 @@ impl CollaborationAuditContext {
             result_count,
             target_sessions: self.target_sessions,
             purpose: self.purpose,
+            response_bytes: None,
+            elapsed_us: None,
             ok: error.is_none(),
             error: error.map(str::to_string),
         }
