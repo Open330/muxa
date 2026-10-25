@@ -243,16 +243,18 @@ impl<L: LivenessSource> Reconciler<L> {
         self
     }
 
-    /// Enable age-based reaping of fully orphaned rows (no pane, surface, or
-    /// pid) — flips them to `Stopped` after `t` of inactivity so the GC
-    /// removes them. `Duration::ZERO` (the default) keeps the sweep off.
+    /// Bound live orphan rows (see `Store::cap_live_orphans`). `0` (the
+    /// default) keeps the cap off.
     #[must_use]
-    /// Bound live orphan rows (see `Store::cap_live_orphans`).
     pub fn with_paneless_max_live(mut self, max: usize) -> Self {
         self.paneless_max_live = max;
         self
     }
 
+    /// Enable age-based reaping of fully orphaned rows (no pane, surface, or
+    /// pid) — flips them to `Stopped` after `t` of inactivity so the GC
+    /// removes them. `Duration::ZERO` (the default) keeps the sweep off.
+    #[must_use]
     pub fn with_paneless_stale_timeout(mut self, t: Duration) -> Self {
         self.paneless_stale_timeout = t;
         self

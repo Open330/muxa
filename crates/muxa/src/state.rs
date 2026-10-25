@@ -1928,7 +1928,7 @@ impl Store {
         if live.len() <= max {
             return 0;
         }
-        live.sort_by(|a, b| b.0.cmp(&a.0));
+        live.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
         let now = OffsetDateTime::now_utc();
         let mut flipped = 0_usize;
         for (_, key) in live.into_iter().skip(max) {
