@@ -45,18 +45,64 @@ pub fn router<S: Clone + Send + Sync + 'static>() -> Router<S> {
 }
 
 async fn index_handler() -> Response {
-    serve_asset("index.html")
+    serve_page("index.html")
 }
 
 async fn static_handler(Path(path): Path<String>) -> Response {
-    serve_asset(&path)
+    serve_asset(unversioned(&path))
 }
 
-/// Asset URLs are not versioned, so a cache in front of the daemon (a
-/// Cloudflare tunnel caches `.css`/`.js` for hours by default) would keep
-/// serving the previous build's files next to the new `index.html` after
-/// an upgrade. `no-cache` makes every cache revalidate with the daemon.
+/// `no-cache` asks every cache to revalidate with the daemon. It is not
+/// enough on its own: a CDN in front of muxad can rewrite it (Cloudflare's
+/// Browser Cache TTL turns it into `max-age=14400`), so browsers kept the
+/// previous build's `main.js` next to the new `index.html` for hours after
+/// an upgrade. Pages therefore also link assets under a build-specific
+/// path (`serve_page`).
 const ASSET_CACHE_CONTROL: &str = "no-cache";
+
+/// Identifies this build's embedded web assets: a digest of every file's
+/// content hash, so it changes exactly when any asset does.
+fn asset_build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        use std::hash::{Hash as _, Hasher as _};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for path in WebAssets::iter() {
+            path.hash(&mut hasher);
+            if let Some(file) = WebAssets::get(&path) {
+                file.metadata.sha256_hash().hash(&mut hasher);
+            }
+        }
+        format!("{:012x}", hasher.finish() & 0xffff_ffff_ffff)
+    })
+}
+
+/// `/static/v/<build>/main.js` is `/static/main.js`. Any build id is
+/// accepted: a page cached from an older build still loads (current) files.
+fn unversioned(path: &str) -> &str {
+    path.strip_prefix("v/")
+        .and_then(|rest| rest.split_once('/'))
+        .map_or(path, |(_, file)| file)
+}
+
+/// Serve an HTML page with its `/static/` links moved under this build's
+/// path. Relative module imports inside those scripts resolve under the
+/// same prefix, so one new build id changes every asset URL the page uses.
+pub(super) fn serve_page(path: &str) -> Response {
+    let Some(file) = WebAssets::get(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let html = String::from_utf8_lossy(&file.data)
+        .replace("/static/", &format!("/static/v/{}/", asset_build_id()));
+    (
+        [
+            (header::CONTENT_TYPE, mime_for(path)),
+            (header::CACHE_CONTROL, ASSET_CACHE_CONTROL),
+        ],
+        html,
+    )
+        .into_response()
+}
 
 pub(super) fn serve_asset(path: &str) -> Response {
     match WebAssets::get(path) {
@@ -172,6 +218,35 @@ mod tests {
                 "{css}"
             );
         }
+    }
+
+    #[test]
+    fn pages_link_assets_under_this_builds_path_and_those_paths_resolve() {
+        let id = asset_build_id();
+        assert_eq!(id.len(), 12);
+        assert_eq!(id, asset_build_id(), "stable within a build");
+        assert_eq!(unversioned(&format!("v/{id}/main.js")), "main.js");
+        assert_eq!(
+            unversioned("v/older/landing/board-dark.webp"),
+            "landing/board-dark.webp"
+        );
+        assert_eq!(unversioned("main.js"), "main.js");
+        assert_eq!(unversioned("v"), "v");
+        let versioned = serve_asset(unversioned(&format!("v/{id}/main.js")));
+        assert_eq!(versioned.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn index_html_points_every_static_link_at_the_build_path() {
+        use http_body_util::BodyExt as _;
+        let response = serve_page("index.html");
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(body.to_vec()).unwrap();
+        let prefix = format!("/static/v/{}/", asset_build_id());
+        assert!(html.contains(&format!("{prefix}main.js")));
+        assert!(html.contains(&format!("{prefix}style.css")));
+        assert!(!html.replace(&prefix, "").contains("/static/"));
     }
 
     #[test]
