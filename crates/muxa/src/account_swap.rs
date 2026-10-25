@@ -1926,7 +1926,10 @@ fn wait_for_resume_answering(
             // Quiet is not ready: a wrapper or the agent itself can sit on
             // the shell's echo of the relaunch for seconds before the TUI
             // (or a trust dialog) draws. Wait for the agent's own prompt.
-            if !agent_prompt_visible(&last) && started.elapsed() < timeout {
+            if !agent_prompt_visible(&last) {
+                if started.elapsed() >= timeout {
+                    return Resume::Unsettled;
+                }
                 quiet_since = Instant::now();
                 std::thread::sleep(tick);
                 continue;
@@ -2439,6 +2442,19 @@ mod tests {
         );
         assert_eq!(resume, Resume::Ready);
         assert_eq!(answered, vec!["trusted the folder"]);
+    }
+
+    #[test]
+    fn an_agent_that_never_draws_its_prompt_is_unsettled_not_ready() {
+        let echo = "~ ❯ aas e k-june@claude --resume c63f\n";
+        let resume = wait_for_resume(
+            || Some(echo.to_owned()),
+            || true,
+            Duration::from_millis(150),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+        );
+        assert_eq!(resume, Resume::Unsettled);
     }
 
     #[test]
