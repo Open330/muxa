@@ -1265,10 +1265,7 @@ fn execute(
     let mut answered: Vec<&'static str> = Vec::new();
     // Clearing the prompt to quit loses what was half-typed there; it is
     // typed back once the agent is up again (or stays, if it is kept).
-    let draft = target
-        .backend
-        .capture_pane_on(socket, &target.pane)
-        .and_then(|screen| composer_draft(&screen, target.kind));
+    let draft = screen_text(target).and_then(|screen| composer_draft(&screen, target.kind));
     stop_agent(target, launch, follow_up, draft.as_deref(), &mut answered)?;
     if target.direct {
         relaunch_in_place(target, command)?;
@@ -1309,7 +1306,7 @@ fn execute(
     // showing that another app owns the conversation, or a startup error.
     // Every swap, with or without a follow-up, waits for a usable screen.
     let readiness = wait_for_resume_answering(
-        || target.backend.capture_pane_on(socket, &target.pane),
+        || screen_text(target),
         || resumed_agent_running(target),
         |keys| target.backend.send_text_on(socket, &target.pane, keys),
         READY_TIMEOUT,
@@ -1388,10 +1385,7 @@ fn follow_through(
         return restore(format!("resumed{answers}; follow-up could not be typed"));
     }
     let started = wait_until(Duration::from_secs(20), || {
-        target
-            .backend
-            .capture_pane_on(socket, &target.pane)
-            .is_some_and(|screen| turn_running(&screen))
+        screen_text(target).is_some_and(|screen| turn_running(&screen))
     });
     restore(if started {
         format!("sent {text:?}, and the agent picked the turn back up{answers}")
@@ -1553,6 +1547,16 @@ fn relaunch_in_place(target: &Target, command: &str) -> Result<(), Refusal> {
     Err("respawned the pane, but could not find it again to follow the relaunch".into())
 }
 
+/// The pane's visible text. Captures carry the TUI's colours (`-e`), and
+/// Claude colours each word of a footer apart (`Enter` `to` `confirm`), so
+/// every rule here reads the screen with the escapes stripped.
+fn screen_text(target: &Target) -> Option<String> {
+    target
+        .backend
+        .capture_pane_on(target.socket.as_deref(), &target.pane)
+        .map(|screen| crate::screen::strip_ansi(&screen))
+}
+
 /// Type `text` and submit it.
 fn send_follow_up(target: &Target, text: &str) -> bool {
     let socket = target.socket.as_deref();
@@ -1635,10 +1639,7 @@ fn exit_claude(
     let started = Instant::now();
     while alive() && started.elapsed() < EXIT_TIMEOUT {
         std::thread::sleep(Duration::from_millis(400));
-        let screen = target
-            .backend
-            .capture_pane_on(socket, &target.pane)
-            .unwrap_or_default();
+        let screen = screen_text(target).unwrap_or_default();
         if owns_scheduled_tasks(&screen) {
             // Esc cancels the exit, whatever rows the dialog lists.
             send("\x1b");
@@ -2408,6 +2409,23 @@ mod tests {
             &mut answered,
         );
         (resume, answered, keys.into_inner())
+    }
+
+    #[test]
+    fn a_coloured_trust_prompt_is_still_recognised() {
+        // Claude colours each footer word apart; `capture-pane -e` keeps it.
+        let raw = " ❯ No, exit\n   Yes, I trust this folder\n \
+            \x1b[38;5;246mEnter\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mconfirm\x1b[39m \
+            \x1b[38;5;246m·\x1b[39m \x1b[38;5;246mEsc\x1b[39m \x1b[38;5;246mto\x1b[39m \x1b[38;5;246mcancel\x1b[39m\n";
+        assert!(
+            pending_dialog(raw, STARTUP_DIALOGS, &[]).is_none(),
+            "raw escapes defeat it"
+        );
+        let plain = crate::screen::strip_ansi(raw);
+        assert_eq!(
+            pending_dialog(&plain, STARTUP_DIALOGS, &[]).map(|d| d.label),
+            Some("trusted the folder")
+        );
     }
 
     #[test]
@@ -3385,7 +3403,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
             r#"trap '' INT
 echo "FAKE CLAUDE $*"
 case "$*" in *--resume*)
-  printf ' ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel\n'
+  printf ' ❯ No, exit\n   Yes, I trust this folder\n \033[38;5;246mEnter\033[39m \033[38;5;246mto\033[39m \033[38;5;246mconfirm\033[39m · Esc to cancel\n'
   read answer
   case "$answer" in *'[B'*) echo TRUSTED ;; *) echo REFUSED; exit 1 ;; esac ;;
 esac
