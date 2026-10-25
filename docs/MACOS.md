@@ -660,3 +660,8 @@ Queued IPC work that is cancelled before it starts never reaches muxad. Cancelli
 an in-flight operation does not undo an already-sent command. Live pane preview
 ANSI parsing runs off the main actor and rejects superseded renders; inactive
 previews wake immediately on reactivation instead of waiting for the idle timer.
+
+Fleet snapshot construction indexes panes per host and then resolves only the
+matching pane ID's candidates. Matching retains the same socket precedence and
+ambiguity rules; the index is rebuilt for each snapshot, so it does not retain
+a pane target after a host's topology changes.

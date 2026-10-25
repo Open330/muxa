@@ -520,12 +520,15 @@ struct MuxaExecutionSnapshot: Sendable {
         for host in hosts {
             let hostPanes = host.remote?.panes ?? []
             let hostAgents = host.remote?.agents ?? []
+            // Build once per host: matching every agent by scanning every
+            // pane turns each Fleet refresh into agents × panes work.
+            let hostPanesByID = Dictionary(grouping: hostPanes, by: \.paneID)
             let hostAgentsByPane = Dictionary(grouping: hostAgents.compactMap { agent in
                 agent.pane.map { ($0, agent) }
             }, by: { $0.0 }).mapValues { $0.map(\.1) }
 
             for agent in hostAgents {
-                let pane = Self.pane(for: agent, among: hostPanes)
+                let pane = agent.pane.flatMap { Self.pane(for: agent, among: hostPanesByID[$0] ?? []) }
                 hosted.append(MuxaHostedAgent(host: host.identity, agent: agent, pane: pane))
                 if let pane {
                     panesByAgent[agent.agentSessionID, default: []].append(pane)
@@ -622,8 +625,8 @@ struct MuxaExecutionSnapshot: Sendable {
            let exact = panes.first(where: { $0.paneID == paneID && $0.socket == socket }) {
             return exact
         }
-        let candidates = panes.filter { $0.paneID == paneID }
-        return candidates.count == 1 ? candidates[0] : nil
+        // Caller already scoped this list to the agent's pane ID.
+        return panes.count == 1 ? panes[0] : nil
     }
 
     func agent(for pane: MuxaPaneInfo) -> MuxaAgent? {

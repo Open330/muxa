@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Mac Fleet snapshots index panes once per host instead of scanning all panes
+  for every agent. Socket ambiguity and host isolation retain their prior
+  behavior while avoiding quadratic matching work on large workspaces.
+
 ### Changed
 
 - Watch loads preview history in 500-row pages. Full-body history widens its
