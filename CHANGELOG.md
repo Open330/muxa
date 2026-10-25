@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa swap` types a dialog answer one key at a time. Claude's input
+  layer read Down+Enter arriving in one write as a single unknown sequence,
+  so the folder-trust prompt stayed up.
 - `muxa swap` reads panes with their colour escapes stripped. Claude colours
   each word of a dialog footer apart, so on a real screen its folder-trust
   prompt went unrecognised and the swap stalled on it.

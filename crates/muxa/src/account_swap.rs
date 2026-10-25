@@ -1308,7 +1308,12 @@ fn execute(
     let readiness = wait_for_resume_answering(
         || screen_text(target),
         || resumed_agent_running(target),
-        |keys| target.backend.send_text_on(socket, &target.pane, keys),
+        |keys| {
+            type_keys(
+                |key| target.backend.send_text_on(socket, &target.pane, key),
+                keys,
+            )
+        },
         READY_TIMEOUT,
         READY_QUIET,
         Duration::from_millis(250),
@@ -1649,7 +1654,7 @@ fn exit_claude(
             );
         }
         if let Some(dialog) = pending_dialog(&screen, EXIT_DIALOGS, answered) {
-            if send(dialog.keys) {
+            if type_keys(send, dialog.keys) {
                 answered.push(dialog.label);
             }
             std::thread::sleep(dialog.pause);
@@ -1879,7 +1884,7 @@ fn wait_for_resume(
 fn wait_for_resume_answering(
     mut capture: impl FnMut() -> Option<String>,
     mut alive: impl FnMut() -> bool,
-    mut answer: impl FnMut(&str) -> bool,
+    mut answer: impl FnMut(&[&str]) -> bool,
     timeout: Duration,
     quiet: Duration,
     tick: Duration,
@@ -2080,13 +2085,31 @@ struct Dialog {
     /// [`DIALOG_TAIL_LINES`] non-blank lines.
     needles: &'static [&'static str],
     /// Keys typed to answer it.
-    keys: &'static str,
+    keys: &'static [&'static str],
     /// Named in the report.
     label: &'static str,
     /// How many times one swap may answer it.
     max: usize,
     /// Time for the agent to act on the answer before the screen is read again.
     pause: Duration,
+}
+
+/// Down arrow and Enter, as typed into a pane. A dialog's keys go one at a
+/// time: Claude's input layer reads `ESC [ B CR` arriving in one write as
+/// a single unknown sequence, not as Down then Enter.
+const DOWN: &str = "\x1b[B";
+const ENTER: &str = "\r";
+/// Pause between the keys of one answer.
+const KEY_GAP: Duration = Duration::from_millis(300);
+
+/// Type `keys` one by one, [`KEY_GAP`] apart. `false` if any could not be.
+fn type_keys(mut send: impl FnMut(&str) -> bool, keys: &[&str]) -> bool {
+    keys.iter().enumerate().all(|(i, key)| {
+        if i > 0 {
+            std::thread::sleep(KEY_GAP);
+        }
+        send(key)
+    })
 }
 
 /// How many non-blank lines at the bottom of the screen a dialog occupies.
@@ -2100,14 +2123,14 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     // "No, exit".
     Dialog {
         needles: &["Yes, I trust this folder", "Enter to confirm"],
-        keys: "\x1b[B\r",
+        keys: &[DOWN, ENTER],
         label: "trusted the folder",
         max: 1,
         pause: Duration::from_millis(500),
     },
     Dialog {
         needles: &["Teach auto mode", "Enter to confirm"],
-        keys: "\x1b[B\r",
+        keys: &[DOWN, ENTER],
         label: "dismissed the auto-mode tour",
         max: 1,
         pause: Duration::from_millis(500),
@@ -2115,7 +2138,7 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     // Codex: "1. Trust and continue" is the default row.
     Dialog {
         needles: &["Trust this folder", "Trust and continue"],
-        keys: "\r",
+        keys: &[ENTER],
         label: "trusted the folder",
         max: 1,
         pause: Duration::from_millis(500),
@@ -2123,14 +2146,14 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     // Codex: the conversation's own last directory is the default row.
     Dialog {
         needles: &["Working directory · resume", "Use session directory"],
-        keys: "\r",
+        keys: &[ENTER],
         label: "kept the session directory",
         max: 1,
         pause: Duration::from_millis(500),
     },
     Dialog {
         needles: &["1. Resume goal", "enter select"],
-        keys: "\r",
+        keys: &[ENTER],
         label: "resumed the paused goal",
         max: 1,
         pause: Duration::from_millis(500),
@@ -2139,7 +2162,7 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     // few seconds after it exits.
     Dialog {
         needles: &["open in another app", "r to retry"],
-        keys: "r",
+        keys: &["r"],
         label: "retried a conversation another app still held",
         max: 5,
         pause: Duration::from_secs(3),
@@ -2151,14 +2174,14 @@ const EXIT_DIALOGS: &[Dialog] = &[
     // Background shells or agents: keep them running past the exit.
     Dialog {
         needles: &["Move to background and exit", "Enter to confirm"],
-        keys: "\x1b[B\r",
+        keys: &[DOWN, ENTER],
         label: "moved background work out of the way",
         max: 1,
         pause: Duration::from_millis(500),
     },
     Dialog {
         needles: &["Keep worktree", "Enter to confirm"],
-        keys: "\r",
+        keys: &[ENTER],
         label: "kept the worktree",
         max: 1,
         pause: Duration::from_millis(500),
@@ -2399,7 +2422,7 @@ mod tests {
             || true,
             |k| {
                 if can_answer {
-                    keys.borrow_mut().push(k.to_owned());
+                    keys.borrow_mut().push(k.concat());
                 }
                 can_answer
             },
@@ -2450,7 +2473,7 @@ mod tests {
             },
             || true,
             |k| {
-                keys.borrow_mut().push(k.to_owned());
+                keys.borrow_mut().push(k.concat());
                 true
             },
             Duration::from_secs(10),
@@ -2567,13 +2590,13 @@ mod tests {
             shell · bash /tmp/build.sh\n   ❯ 1. Exit and stop tasks\n     2. Move to background and exit\n     \
             3. Stay\n   Enter to confirm · Esc to cancel\n";
         let dialog = pending_dialog(background, EXIT_DIALOGS, &[]).expect("background dialog");
-        assert_eq!(dialog.keys, "\x1b[B\r");
+        assert_eq!(dialog.keys, [DOWN, ENTER]);
         assert!(!owns_scheduled_tasks(background));
         let worktree = "   Exiting worktree session\n   ❯ 1. Keep worktree    Stays at /x/.claude/worktrees/a\n     \
             2. Remove worktree  Clean up the worktree directory.\n   Enter to confirm · Esc to cancel\n";
         assert_eq!(
             pending_dialog(worktree, EXIT_DIALOGS, &[]).unwrap().keys,
-            "\r"
+            [ENTER]
         );
         let scheduled = "   scheduled task · Every day at 9:03 AM · [mail check]\n   ❯ 1. Exit and stop tasks\n     \
             2. Move to background and exit\n     3. Stay\n   Enter to confirm · Esc to cancel\n";
