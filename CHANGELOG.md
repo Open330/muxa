@@ -27,6 +27,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa swap` reads panes with their colour escapes stripped. Claude colours
+  each word of a dialog footer apart, so on a real screen its folder-trust
+  prompt went unrecognised and the swap stalled on it.
 - `muxa swap` no longer reports a relaunch as resumed while the pane still
   shows the shell's echo of it: a quiet screen counts only once the agent's
   own prompt is visible, so a trust dialog that draws seconds later is still

@@ -362,7 +362,7 @@ pub fn prepare_capture(raw: &str, max_lines: usize) -> String {
 /// (`ESC [ … final`), OSC (`ESC ] … BEL`), and stray two-byte escapes. Not a
 /// full terminal parser — just enough that the text rules match on the visible
 /// characters.
-fn strip_ansi(s: &str) -> String {
+pub(crate) fn strip_ansi(s: &str) -> String {
     static ANSI: OnceLock<Regex> = OnceLock::new();
     let re = ANSI.get_or_init(|| {
         // CSI: ESC [ params intermediates final | OSC: ESC ] ... BEL |
