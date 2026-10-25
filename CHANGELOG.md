@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa swap` relaunches agents in panes that run them directly
+  (`exec claude …`, `aas e …` as the pane command) by keeping the pane open
+  past the exit and respawning it in place on tmux and rmux, instead of
+  skipping them. A half-typed prompt is typed back after the resume, and the
+  report says whether the follow-up actually started a turn.
+
+### Fixed
+
+- `muxa swap` no longer stops an agent that was active in the last 20 seconds
+  without `--force`; a long tool call leaves the state idle while the turn
+  runs. A pane whose root is `sh script` or `sh -c …` is no longer treated as
+  a shell prompt to type into.
+
+### Added
+
 - `[[accounts.claude]]` / `[[accounts.codex]]` list accounts by the
   environment that selects them (`env`, or an `env_file` for tokens).
   `muxa swap`, the `swap_account` action and `[agent.*].account` launches use

@@ -86,6 +86,29 @@ impl PaneBackend for TmuxBackend {
         crate::tmux::send_text(pane_id, text)
     }
 
+    fn set_remain_on_exit_on(&self, socket: Option<&str>, pane_id: &str, on: bool) -> bool {
+        let value = if on { "on" } else { "off" };
+        tmux::run_control_on(
+            socket,
+            &["set-option", "-p", "-t", pane_id, "remain-on-exit", value],
+        )
+        .is_ok()
+    }
+
+    fn respawn_pane_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        cwd: &str,
+        command: &str,
+    ) -> bool {
+        tmux::run_control_on(
+            socket,
+            &["respawn-pane", "-k", "-c", cwd, "-t", pane_id, command],
+        )
+        .is_ok()
+    }
+
     fn send_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
         // Control-plane injection pinned to the pane's recorded server via
         // `-S <socket>` — `%5` exists on every tmux server, so this targets

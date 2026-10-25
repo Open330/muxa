@@ -562,6 +562,26 @@ pub trait PaneBackend: Send + Sync + 'static {
         BackendCaps::default()
     }
 
+    /// Keep `pane_id` open (dead) after its process exits, or stop doing so.
+    /// `false` when the backend has no such option; a pane that runs its
+    /// agent directly then cannot be relaunched in place.
+    fn set_remain_on_exit_on(&self, _socket: Option<&str>, _pane_id: &str, _on: bool) -> bool {
+        false
+    }
+
+    /// Start `command` (a shell command line) in `pane_id`, in `cwd`,
+    /// replacing whatever runs there and keeping the pane id. `false` when
+    /// unsupported or it failed.
+    fn respawn_pane_on(
+        &self,
+        _socket: Option<&str>,
+        _pane_id: &str,
+        _cwd: &str,
+        _command: &str,
+    ) -> bool {
+        false
+    }
+
     /// Ingest a wholesale pane snapshot pushed by an out-of-process
     /// source — today the zellij WASM plugin, which forwards zellij
     /// `PaneUpdate` events to the daemon over the `BackendPaneSnapshot`
@@ -618,6 +638,18 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
         (**self).send_prompt_text_on(socket, pane_id, text)
+    }
+    fn set_remain_on_exit_on(&self, socket: Option<&str>, pane_id: &str, on: bool) -> bool {
+        (**self).set_remain_on_exit_on(socket, pane_id, on)
+    }
+    fn respawn_pane_on(
+        &self,
+        socket: Option<&str>,
+        pane_id: &str,
+        cwd: &str,
+        command: &str,
+    ) -> bool {
+        (**self).respawn_pane_on(socket, pane_id, cwd, command)
     }
     fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
         (**self).capture_pane_on(socket, pane_id)
