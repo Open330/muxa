@@ -340,8 +340,23 @@ impl Units {
     }
 }
 
-fn table_like(item: Option<&Item>) -> Option<&dyn toml_edit::TableLike> {
-    item.and_then(Item::as_table_like)
+/// A category's root table. Absent is fine; present as anything but a
+/// table is malformed, never an empty category: treating `watch = 42` as
+/// "no watch settings" would turn bad input into deletions.
+fn section<'r>(root: &'r Table, key: &str) -> Result<Option<&'r dyn toml_edit::TableLike>, String> {
+    match root.get(key) {
+        None => Ok(None),
+        Some(item) => item
+            .as_table_like()
+            .map(Some)
+            .ok_or_else(|| format!("{key} must be a table")),
+    }
+}
+
+/// An automation rule that switches accounts depends on host tooling.
+fn switches_accounts(rule: &dyn toml_edit::TableLike) -> bool {
+    rule.get("action").and_then(|a| a.as_str()) == Some("swap_account")
+        || rule.contains_key("account")
 }
 
 fn owned(parts: &[&str]) -> Vec<String> {
@@ -371,7 +386,7 @@ impl Extractor<'_> {
     }
 
     fn pipelines(&mut self, root: &Table) -> Result<(), String> {
-        let Some(pipelines) = table_like(root.get("pipeline")) else {
+        let Some(pipelines) = section(root, "pipeline")? else {
             return Ok(());
         };
         if self.wants(Category::Pipeline) {
@@ -383,7 +398,7 @@ impl Extractor<'_> {
     }
 
     fn skills(&mut self, root: &Table) -> Result<(), String> {
-        let Some(message) = table_like(root.get("message")) else {
+        let Some(message) = section(root, "message")? else {
             return Ok(());
         };
         for (key, item) in message.iter() {
@@ -405,7 +420,7 @@ impl Extractor<'_> {
     }
 
     fn automation(&mut self, root: &Table) -> Result<(), String> {
-        let Some(automation) = table_like(root.get("automation")) else {
+        let Some(automation) = section(root, "automation")? else {
             return Ok(());
         };
         let wanted = self.wants(Category::Automation);
@@ -436,9 +451,7 @@ impl Extractor<'_> {
         // An account switch only means something on a host with the tool
         // that performs it. Stripping the account would change what the
         // rule does, so the rule stays home whole.
-        if rule.get("action").and_then(|a| a.as_str()) == Some("swap_account")
-            || rule.contains_key("account")
-        {
+        if switches_accounts(&rule) {
             if self.strict {
                 return Err(format!(
                     "{} switches accounts, which stays on the host that can",
@@ -455,7 +468,7 @@ impl Extractor<'_> {
     }
 
     fn agents(&mut self, root: &Table) -> Result<(), String> {
-        let Some(agents) = table_like(root.get("agent")) else {
+        let Some(agents) = section(root, "agent")? else {
             return Ok(());
         };
         for (program, item) in agents.iter() {
@@ -486,7 +499,7 @@ impl Extractor<'_> {
         portable: &[&str],
         local: &[&str],
     ) -> Result<(), String> {
-        let Some(settings) = table_like(root.get(table)) else {
+        let Some(settings) = section(root, table)? else {
             return Ok(());
         };
         for (key, item) in settings.iter() {
@@ -679,7 +692,8 @@ pub fn render_bundle(
     }
     document.insert("categories", toml_edit::value(names));
     for unit in units.iter() {
-        set_unit(&mut document, &unit.path, unit.item.clone());
+        set_unit(&mut document, &unit.path, unit.item.clone())
+            .expect("a fresh bundle holds nothing protected");
     }
     let mut text = String::from(
         "# muxa portable settings. Apply on another host with:\n\
@@ -737,12 +751,73 @@ pub struct Plan {
     pub base: Base,
     /// Categories this apply manages: the bundle's, narrowed by the host's.
     pub categories: BTreeSet<Category>,
+    /// Incoming items left alone because this host holds a host-specific
+    /// item of the same name (an account-switching rule).
+    pub protected: Vec<String>,
 }
 
 impl Plan {
     #[must_use]
     pub fn is_noop(&self) -> bool {
         self.steps.is_empty() && self.conflicts.is_empty()
+    }
+}
+
+/// The three-way decision for one item: a step, a conflict, or nothing.
+fn decide(
+    key: &str,
+    path: &[String],
+    local: Option<&Unit>,
+    incoming: Option<&Unit>,
+    base: Option<&Base>,
+    prefer: Option<Prefer>,
+) -> Option<Result<Step, Conflict>> {
+    let lv = local.map(Unit::value);
+    let rv = incoming.map(Unit::value);
+    if lv == rv {
+        return None;
+    }
+    let take = |change: Change| {
+        Ok(Step {
+            key: key.to_owned(),
+            change,
+            path: path.to_vec(),
+            before: lv.cloned(),
+            after: incoming.map(|unit| unit.item.clone()),
+            after_value: rv.cloned(),
+        })
+    };
+    let toward_incoming = || match (lv, rv) {
+        (None, Some(_)) => Some(Change::Add),
+        (Some(_), Some(_)) => Some(Change::Update),
+        (Some(_), None) => Some(Change::Remove),
+        (None, None) => None,
+    };
+    let Some(base) = base else {
+        // First sync from this source: never delete what is already here.
+        return match (lv, rv) {
+            (None, Some(_)) => Some(take(Change::Add)),
+            (Some(_), Some(_)) => Some(take(Change::Replace)),
+            (_, None) => None,
+        };
+    };
+    let bv = base.get(key);
+    if lv == bv {
+        toward_incoming().map(take)
+    } else if rv == bv {
+        // Changed only here: keep it.
+        None
+    } else {
+        match prefer {
+            Some(Prefer::Incoming) => toward_incoming().map(take),
+            Some(Prefer::Local) => None,
+            None => Some(Err(Conflict {
+                key: key.to_owned(),
+                base: bv.cloned(),
+                local: lv.cloned(),
+                incoming: rv.cloned(),
+            })),
+        }
     }
 }
 
@@ -772,7 +847,22 @@ pub fn plan(
         Category::of(path).is_some_and(|c| categories.contains(&c))
             && !ignored.iter().any(|pattern| path.starts_with(pattern))
     };
-    let incoming: Vec<&Unit> = bundle.units.iter().filter(|u| managed(&u.path)).collect();
+    // A withheld local item occupies its name: an incoming item of the same
+    // name must not replace it, nor may sync claim it in the base.
+    let held: BTreeSet<&str> = local.withheld.iter().map(|w| w.path.as_str()).collect();
+    let mut protected = Vec::new();
+    let incoming: Vec<&Unit> = bundle
+        .units
+        .iter()
+        .filter(|u| managed(&u.path))
+        .filter(|u| {
+            let free = !held.contains(u.key().as_str());
+            if !free {
+                protected.push(u.key());
+            }
+            free
+        })
+        .collect();
 
     let mut keys: Vec<(String, Vec<String>)> = Vec::new();
     let mut seen = BTreeSet::new();
@@ -786,58 +876,12 @@ pub fn plan(
     let mut steps = Vec::new();
     let mut conflicts = Vec::new();
     for (key, path) in keys {
-        let l = local.get(&key);
-        let r = incoming.iter().find(|unit| unit.key() == key).copied();
-        let lv = l.map(Unit::value);
-        let rv = r.map(Unit::value);
-        if lv == rv {
-            continue;
-        }
-        let take = |change: Change| Step {
-            key: key.clone(),
-            change,
-            path: path.clone(),
-            before: lv.cloned(),
-            after: r.map(|unit| unit.item.clone()),
-            after_value: rv.cloned(),
-        };
-        let Some(base) = base else {
-            match (lv, rv) {
-                (None, Some(_)) => steps.push(take(Change::Add)),
-                (Some(_), Some(_)) => steps.push(take(Change::Replace)),
-                // First sync never deletes what this host already had.
-                (_, None) => {}
-            }
-            continue;
-        };
-        let bv = base.get(&key);
-        let apply_incoming = || match (lv, rv) {
-            (None, Some(_)) => Some(Change::Add),
-            (Some(_), Some(_)) => Some(Change::Update),
-            (Some(_), None) => Some(Change::Remove),
-            (None, None) => None,
-        };
-        if lv == bv {
-            if let Some(change) = apply_incoming() {
-                steps.push(take(change));
-            }
-        } else if rv == bv {
-            // Changed only here: keep it.
-        } else {
-            match prefer {
-                Some(Prefer::Incoming) => {
-                    if let Some(change) = apply_incoming() {
-                        steps.push(take(change));
-                    }
-                }
-                Some(Prefer::Local) => {}
-                None => conflicts.push(Conflict {
-                    key: key.clone(),
-                    base: bv.cloned(),
-                    local: lv.cloned(),
-                    incoming: rv.cloned(),
-                }),
-            }
+        let local = local.get(&key);
+        let incoming = incoming.iter().find(|unit| unit.key() == key).copied();
+        match decide(&key, &path, local, incoming, base, prefer) {
+            Some(Ok(step)) => steps.push(step),
+            Some(Err(conflict)) => conflicts.push(conflict),
+            None => {}
         }
     }
 
@@ -847,7 +891,9 @@ pub fn plan(
     let mut next: Base = base
         .into_iter()
         .flatten()
-        .filter(|(key, _)| parse_path(key).map_or(true, |path| !managed(&path)))
+        .filter(|(key, _)| {
+            held.contains(key.as_str()) || parse_path(key).map_or(true, |path| !managed(&path))
+        })
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     for unit in incoming {
@@ -859,6 +905,7 @@ pub fn plan(
         conflicts,
         base: next,
         categories,
+        protected,
     })
 }
 
@@ -873,8 +920,8 @@ pub fn apply(local_text: &str, plan: &Plan) -> Result<String, String> {
         .map_err(|e| format!("config.toml does not parse: {e}"))?;
     for step in &plan.steps {
         match &step.after {
-            Some(item) => set_unit(&mut document, &step.path, item.clone()),
-            None => remove_unit(&mut document, &step.path),
+            Some(item) => set_unit(&mut document, &step.path, item.clone())?,
+            None => remove_unit(&mut document, &step.path)?,
         }
     }
     Ok(document.to_string())
@@ -930,12 +977,11 @@ fn without_positions(item: Item) -> Item {
     }
 }
 
-fn set_unit(document: &mut DocumentMut, path: &[String], item: Item) {
+fn set_unit(document: &mut DocumentMut, path: &[String], item: Item) -> Result<(), String> {
     let item = without_positions(item);
     if let [first, second, name] = path {
         if first == "automation" && second == "rule" {
-            set_rule(document, name, item);
-            return;
+            return set_rule(document, name, item);
         }
     }
     let (last, parents) = path.split_last().expect("unit paths are not empty");
@@ -951,13 +997,13 @@ fn set_unit(document: &mut DocumentMut, path: &[String], item: Item) {
             table.insert(last, item);
         }
     }
+    Ok(())
 }
 
-fn remove_unit(document: &mut DocumentMut, path: &[String]) {
+fn remove_unit(document: &mut DocumentMut, path: &[String]) -> Result<(), String> {
     if let [first, second, name] = path {
         if first == "automation" && second == "rule" {
-            remove_rule(document, name);
-            return;
+            return remove_rule(document, name);
         }
     }
     let (last, parents) = path.split_last().expect("unit paths are not empty");
@@ -965,34 +1011,54 @@ fn remove_unit(document: &mut DocumentMut, path: &[String]) {
     for segment in parents {
         match table.get_mut(segment).and_then(Item::as_table_like_mut) {
             Some(next) => table = next,
-            None => return,
+            None => return Ok(()),
         }
     }
     table.remove(last);
+    Ok(())
 }
 
 fn is_rule(table: &dyn toml_edit::TableLike, name: &str) -> bool {
     table.get("name").and_then(|n| n.as_str()) == Some(name)
 }
 
-fn set_rule(document: &mut DocumentMut, name: &str, item: Item) {
-    let Item::Table(rule) = item else { return };
+fn protected_rule(name: &str) -> String {
+    format!("automation.rule.{name} here switches accounts; sync never replaces or removes it")
+}
+
+fn set_rule(document: &mut DocumentMut, name: &str, item: Item) -> Result<(), String> {
+    let Item::Table(rule) = item else {
+        return Err(format!("automation.rule.{name} must be a table"));
+    };
     let automation = table_at(document, &["automation".to_owned()]);
     match automation.get_mut("rule") {
         Some(Item::ArrayOfTables(array)) => {
             let at = array.iter().position(|t| is_rule(t, name));
             match at {
                 Some(index) => {
-                    *array.get_mut(index).expect("position is in range") = rule;
+                    let old = array.get_mut(index).expect("position is in range");
+                    if switches_accounts(old) {
+                        return Err(protected_rule(name));
+                    }
+                    *old = rule;
                 }
                 None => array.push(rule),
             }
         }
         Some(Item::Value(toml_edit::Value::Array(array))) => {
-            let inline = toml_edit::Value::InlineTable(rule.into_inline_table());
             let at = array
                 .iter()
                 .position(|v| v.as_inline_table().is_some_and(|t| is_rule(t, name)));
+            if let Some(index) = at {
+                if array
+                    .get(index)
+                    .and_then(toml_edit::Value::as_inline_table)
+                    .is_some_and(|t| switches_accounts(t))
+                {
+                    return Err(protected_rule(name));
+                }
+            }
+            let inline = toml_edit::Value::InlineTable(rule.into_inline_table());
             match at {
                 Some(index) => {
                     array.replace(index, inline);
@@ -1000,25 +1066,30 @@ fn set_rule(document: &mut DocumentMut, name: &str, item: Item) {
                 None => array.push(inline),
             }
         }
-        _ => {
+        None => {
             let mut array = toml_edit::ArrayOfTables::new();
             array.push(rule);
             automation.insert("rule", Item::ArrayOfTables(array));
         }
+        Some(_) => return Err("automation.rule must be an array of tables".into()),
     }
+    Ok(())
 }
 
-fn remove_rule(document: &mut DocumentMut, name: &str) {
+fn remove_rule(document: &mut DocumentMut, name: &str) -> Result<(), String> {
     let Some(automation) = document
         .get_mut("automation")
         .and_then(Item::as_table_like_mut)
     else {
-        return;
+        return Ok(());
     };
     match automation.get_mut("rule") {
         Some(Item::ArrayOfTables(array)) => {
             let at = array.iter().position(|t| is_rule(t, name));
             if let Some(index) = at {
+                if array.get(index).is_some_and(|t| switches_accounts(t)) {
+                    return Err(protected_rule(name));
+                }
                 array.remove(index);
             }
         }
@@ -1027,11 +1098,19 @@ fn remove_rule(document: &mut DocumentMut, name: &str) {
                 .iter()
                 .position(|v| v.as_inline_table().is_some_and(|t| is_rule(t, name)));
             if let Some(index) = at {
+                if array
+                    .get(index)
+                    .and_then(toml_edit::Value::as_inline_table)
+                    .is_some_and(|t| switches_accounts(t))
+                {
+                    return Err(protected_rule(name));
+                }
                 array.remove(index);
             }
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Checks the merged document must pass beyond `Config::validate`: a route
@@ -1412,6 +1491,62 @@ layout = "tiled"
         let config: crate::Config =
             toml::from_str("[[route]]\nmatch = 'x'\npipeline = 'gone'\n").unwrap();
         assert!(check_references(&config).unwrap_err().contains("gone"));
+    }
+
+    #[test]
+    fn a_local_account_rule_is_never_replaced_by_a_same_named_incoming_rule() {
+        let local = "[[automation.rule]]\nname = \"resume\"\non = \"rate_limited\"\n\
+                     action = \"swap_account\"\naccount = \"local-only\"\n";
+        let bundle = Bundle::parse(
+            "schema_version = 1\nsource = \"s\"\ncategories = [\"automation\"]\n\
+             [[automation.rule]]\nname = \"resume\"\non = \"error\"\naction = \"notify\"\n\
+             message = \"shared\"\n",
+        )
+        .unwrap();
+        for base in [None, Some(Base::new())] {
+            let p = plan(
+                local,
+                &bundle,
+                base.as_ref(),
+                &ConfigSyncConfig::default(),
+                None,
+            )
+            .unwrap();
+            assert!(
+                p.steps.is_empty(),
+                "{:?}",
+                p.steps.iter().map(|s| &s.key).collect::<Vec<_>>()
+            );
+            assert_eq!(p.protected, ["automation.rule.resume"]);
+            assert!(!p.base.contains_key("automation.rule.resume"));
+            let out = apply(local, &p).unwrap();
+            assert!(out.contains("account = \"local-only\""), "{out}");
+        }
+        // Even a hand-built step cannot overwrite or remove it.
+        let mut document: DocumentMut = local.parse().unwrap();
+        let rule: Table = "name = \"resume\"\naction = \"notify\"\n"
+            .parse::<DocumentMut>()
+            .unwrap()
+            .as_table()
+            .clone();
+        assert!(set_rule(&mut document, "resume", Item::Table(rule)).is_err());
+        assert!(remove_rule(&mut document, "resume").is_err());
+    }
+
+    #[test]
+    fn a_category_root_that_is_not_a_table_is_malformed_not_empty() {
+        for body in [
+            "categories = [\"watch\"]\nwatch = 42\n",
+            "categories = [\"pipeline\"]\npipeline = 1\n",
+            "categories = [\"skills\"]\nmessage = 1\n",
+            "categories = [\"automation\"]\nautomation = 1\n",
+            "categories = [\"agent\"]\nagent = 1\n",
+            "categories = [\"ticket\"]\nticket = \"x\"\n",
+        ] {
+            let error =
+                Bundle::parse(&format!("schema_version = 1\nsource = \"s\"\n{body}")).unwrap_err();
+            assert!(error.contains("must be a table"), "{body}: {error}");
+        }
     }
 
     #[test]

@@ -112,12 +112,34 @@ fn store_state(config: &Path, text: &str) -> Result<()> {
         file.sync_all()?;
         drop(file);
         std::fs::rename(&temp, &path)?;
+        // The rename, and a directory created for it, must reach the disk
+        // before the journal that could redo them is removed.
+        sync_dir(parent)?;
+        if let Some(grandparent) = parent.parent() {
+            sync_dir(grandparent)?;
+        }
         Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+fn sync_dir(dir: &Path) -> Result<()> {
+    #[cfg(unix)]
+    std::fs::File::open(dir)?.sync_all()?;
+    let _ = dir;
+    Ok(())
+}
+
+/// Remove a finished journal, durably.
+fn remove_journal(journal: &Path) -> Result<()> {
+    std::fs::remove_file(journal)?;
+    if let Some(parent) = journal.parent() {
+        sync_dir(parent)?;
+    }
+    Ok(())
 }
 
 fn host_sync(text: &str) -> Result<ConfigSyncConfig> {
@@ -190,10 +212,14 @@ pub(crate) async fn export(
     Ok(())
 }
 
-/// The plan for `bundle` against the daemon's current file.
+/// The plan for `bundle` against the daemon's current file, and the
+/// document it would produce, already validated. `diff` and `apply` share
+/// this, so a preview never promises what apply would refuse.
 struct Planned {
     document: muxa::config_file::ConfigDocument,
     plan: Plan,
+    /// The resulting text; `None` while conflicts are unresolved.
+    next: Option<String>,
     state_changed: bool,
 }
 
@@ -220,12 +246,22 @@ async fn planned(
     };
     let plan = config_sync::plan(&document.text, bundle, base, &sync, prefer.map(Into::into))
         .map_err(anyhow::Error::msg)?;
+    let next = if plan.conflicts.is_empty() {
+        let next = config_sync::apply(&document.text, &plan).map_err(anyhow::Error::msg)?;
+        muxa::config_file::check(&next).context("the merged config would not load")?;
+        let merged: muxa::Config = toml::from_str(&next)?;
+        config_sync::check_references(&merged).map_err(anyhow::Error::msg)?;
+        Some(next)
+    } else {
+        None
+    };
     let state_changed = state
         .as_ref()
         .is_none_or(|state| state.source != bundle.source || state.units != plan.base);
     Ok(Planned {
         document,
         plan,
+        next,
         state_changed,
     })
 }
@@ -259,6 +295,12 @@ fn render(plan: &Plan) -> String {
         for line in step.after_value.iter().flat_map(value_lines) {
             let _ = writeln!(out, "    + {line}");
         }
+    }
+    for key in &plan.protected {
+        let _ = writeln!(
+            out,
+            "= {key} (kept: this host's rule of that name switches accounts)"
+        );
     }
     for conflict in &plan.conflicts {
         let _ = writeln!(
@@ -296,6 +338,10 @@ pub(crate) async fn diff(
 ) -> i32 {
     let result = async {
         let bundle = read_bundle(bundle)?;
+        let path = client.config_read().await?.path;
+        if journal_path(&path).exists() {
+            bail!("an unfinished `muxa config apply` holds this config; rerun apply to finish it");
+        }
         let planned = planned(client, &bundle, prefer, switch_source).await?;
         print!("{}", render(&planned.plan));
         Ok::<_, anyhow::Error>(if planned.plan.conflicts.is_empty() {
@@ -322,20 +368,34 @@ pub(crate) async fn apply(
     switch_source: bool,
 ) -> Result<()> {
     let bundle = read_bundle(bundle_path)?;
+    // Lock, then finish any interrupted apply, and only then read the base
+    // and plan: a plan made before recovery would overwrite the base that
+    // recovery records.
+    let path = client.config_read().await?.path;
+    ensure_parent(&path)?;
+    let _lock = lock_config(&path)?;
+    if crate::fleet_sync::pending_path(&path).exists() {
+        bail!("an unfinished Fleet sync holds this config; rerun `muxa fleet sync --apply` first");
+    }
+    let journal = journal_path(&path);
+    if journal.exists() {
+        recover(&client.config_read().await?, &journal)?;
+    }
     let Planned {
         document,
         plan,
+        next,
         state_changed,
     } = planned(client, &bundle, prefer, switch_source).await?;
     print!("{}", render(&plan));
-    if !plan.conflicts.is_empty() {
+    let Some(next) = next else {
         bail!(
             "{} conflicting item(s); resolve them locally, ignore them in [config_sync], \
              or rerun with --prefer local|incoming",
             plan.conflicts.len()
         );
-    }
-    if plan.steps.is_empty() && !state_changed && !journal_path(&document.path).exists() {
+    };
+    if plan.steps.is_empty() && !state_changed {
         println!("already up to date");
         return Ok(());
     }
@@ -351,11 +411,6 @@ pub(crate) async fn apply(
             bail!("cancelled");
         }
     }
-
-    let next = config_sync::apply(&document.text, &plan).map_err(anyhow::Error::msg)?;
-    muxa::config_file::check(&next).context("the merged config would not load")?;
-    let merged: muxa::Config = toml::from_str(&next)?;
-    config_sync::check_references(&merged).map_err(anyhow::Error::msg)?;
     let state = toml::to_string(&State {
         target: document.path.clone(),
         source: bundle.source.clone(),
@@ -363,20 +418,8 @@ pub(crate) async fn apply(
         units: plan.base.clone(),
     })?;
 
-    ensure_parent(&document.path)?;
-    let _lock = lock_config(&document.path)?;
-    if crate::fleet_sync::pending_path(&document.path).exists() {
-        bail!("an unfinished Fleet sync holds this config; rerun `muxa fleet sync --apply` first");
-    }
-    let journal = journal_path(&document.path);
-    let current = client.config_read().await?;
-    if journal.exists() {
-        recover(&current, &journal)?;
-    }
-    if client.config_read().await?.text != document.text {
-        bail!("config changed while planning; run apply again");
-    }
-
+    // The lock keeps other sync writers out; the conditional write below
+    // refuses if anything else edited the file since it was read.
     let backup = if next == document.text {
         None
     } else {
@@ -400,10 +443,13 @@ pub(crate) async fn apply(
     if next != document.text {
         // Keep the journal if the response is lost: the write may have
         // landed, and the next apply finishes it under the same lock.
-        client.config_write(&next, Some(&document.text)).await?;
+        client
+            .config_write(&next, Some(&document.text))
+            .await
+            .context("config changed while planning, or the write failed; run apply again")?;
     }
     store_state(&document.path, &state)?;
-    std::fs::remove_file(&journal)?;
+    remove_journal(&journal)?;
 
     match backup {
         Some(backup) => {
@@ -436,7 +482,7 @@ fn recover(current: &muxa::config_file::ConfigDocument, journal: &Path) -> Resul
                 .unwrap_or_default()
         );
     }
-    std::fs::remove_file(journal)?;
+    remove_journal(journal)?;
     Ok(())
 }
 
