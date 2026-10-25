@@ -318,10 +318,37 @@ fn parse_etime(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(days * 86_400 + seconds))
 }
 
-/// The server's `CODEX_HOME`, which names the daemon to restart. Only
-/// readable from `/proc`; elsewhere the default home is implied.
+/// The server's `CODEX_HOME`, which names the daemon to restart.
+#[cfg(target_os = "linux")]
 fn codex_home_of(pid: u32) -> Option<String> {
     let raw = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    codex_home_from_environment(&raw)
+}
+
+/// The server's `CODEX_HOME`, which names the daemon to restart. There is
+/// no `/proc` here, and `ps eww` joins the environment with spaces, so a
+/// profile under `~/Library/Application Support/…` would be cut at the
+/// space; sysinfo returns each entry whole (macOS `KERN_PROCARGS2`).
+#[cfg(not(target_os = "linux"))]
+fn codex_home_of(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        // macOS parses argv and the environment from one KERN_PROCARGS2
+        // read; sysinfo fills `environ` only when `cmd` is refreshed too.
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    let raw: Vec<u8> = system
+        .process(pid)?
+        .environ()
+        .iter()
+        .flat_map(|entry| entry.as_encoded_bytes().iter().copied().chain([0]))
+        .collect();
     codex_home_from_environment(&raw)
 }
 
@@ -463,5 +490,56 @@ mod tests {
             Some("/profile".into())
         );
         assert_eq!(codex_home_from_environment(b"OTHER=value\0"), None);
+    }
+
+    #[test]
+    fn a_profile_path_with_spaces_is_kept_whole() {
+        assert_eq!(
+            codex_home_from_environment(
+                b"HOME=/Users/u\0CODEX_HOME=/Users/u/Library/Application Support/asx/profiles/codex-a\0"
+            ),
+            Some("/Users/u/Library/Application Support/asx/profiles/codex-a".into())
+        );
+    }
+
+    /// Parks a child process for the live lookup below; never run directly.
+    #[test]
+    #[ignore = "helper process for reads_a_live_processs_codex_home_including_spaces"]
+    fn codex_home_lookup_sleeper() {
+        std::thread::sleep(std::time::Duration::from_secs(30));
+    }
+
+    /// The real lookup on this OS (`/proc` on Linux, sysinfo elsewhere)
+    /// against a live process whose profile path contains a space, as
+    /// `asx` profiles under `~/Library/Application Support` do. The child is
+    /// this test binary: macOS withholds the environment of platform
+    /// binaries such as `/bin/sleep`, which a Codex app-server is not.
+    #[cfg(unix)]
+    #[test]
+    fn reads_a_live_processs_codex_home_including_spaces() {
+        let home = "/tmp/muxa test/Application Support/codex-profile";
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "stale_agents::tests::codex_home_lookup_sleeper",
+            ])
+            .env("CODEX_HOME", home)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn helper");
+        // Readable once the child has reached `exec`.
+        let mut found = None;
+        for _ in 0..100 {
+            found = codex_home_of(child.id());
+            if found.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(found.as_deref(), Some(home));
     }
 }

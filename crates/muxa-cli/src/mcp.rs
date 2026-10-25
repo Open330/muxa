@@ -20,11 +20,13 @@
 //! line from stdin, write one response object per line to stdout. Observation
 //! and collaboration tools proxy the daemon through [`Client`]; deterministic
 //! managed-tmux lifecycle tools invoke same-user tmux locally. The
-//! server refuses to start when the daemon socket is unreachable (a clear
-//! stderr message + non-zero exit) so an agent never talks to a dead
-//! control plane.
+//! server starts even when the daemon is unreachable (with a stderr
+//! warning): agent hosts never respawn a server that exited, so tools
+//! report the daemon's error until it is back instead. When its binary is
+//! upgraded, an idle server re-executes itself on the same stdio
+//! ([`UpgradeWatch`]).
 
-use anyhow::{bail, Result};
+use anyhow::Result;
 use muxa::collaboration::{
     AirArtifactReference, CollaborationOrigin, CollaborationRequest, NewRequest, Participant,
     RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
@@ -36,7 +38,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 use tokio::task::JoinSet;
 
@@ -79,25 +81,129 @@ const MCP_SERVER_INSTRUCTIONS: &str =
 /// cheap snapshot round-trips.
 const RECONCILE_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Run the MCP stdio server until stdin closes. Refuses to start if the
-/// daemon socket is unreachable.
+/// Run the MCP stdio server until stdin closes.
+///
+/// It starts even when muxad is unreachable. Agent hosts launch MCP servers
+/// once and do not retry: refusing to start because the daemon was
+/// restarting (or, once, because its full snapshot outgrew an IPC frame)
+/// left that agent without muxa tools for the rest of its life. Each tool
+/// call opens its own daemon connection, so calls fail with the daemon's
+/// error while it is down and work again when it is back.
 pub async fn run(client: Client, config: muxa::config::Config) -> Result<()> {
-    // Refuse to start against an absent/dead daemon: a control plane the
-    // tools can't reach is worse than a clear failure.
-    if let Err(e) = client.snapshot_with_timeout(PROBE_TIMEOUT).await {
-        bail!(
-            "muxa daemon is not reachable ({e}). Start `muxad` (or check MUXA_SOCKET) \
-             before launching `muxa mcp`.",
+    if let Err(e) = client.hello(PROBE_TIMEOUT).await {
+        eprintln!(
+            "muxa mcp: daemon is not reachable ({e}); serving anyway. Tools report the \
+             error until `muxad` is back (check MUXA_SOCKET)."
         );
     }
-
+    let mut stdout = tokio::io::stdout();
+    if std::env::var_os(REEXEC_ENV).is_some() {
+        // Re-executed after an upgrade: the tool set may have changed.
+        let note = json!({ "jsonrpc": "2.0", "method": "notifications/tools/list_changed" });
+        let mut bytes = serde_json::to_vec(&note).unwrap_or_default();
+        bytes.push(b'\n');
+        stdout.write_all(&bytes).await?;
+        stdout.flush().await?;
+    }
     serve_with_config(
         client,
         BufReader::new(tokio::io::stdin()),
-        tokio::io::stdout(),
+        stdout,
         Arc::new(config),
+        UpgradeWatch::for_this_process(),
     )
     .await
+}
+
+/// How often an idle server checks whether its binary was upgraded.
+const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Set on a server re-executed by [`UpgradeWatch`].
+const REEXEC_ENV: &str = "MUXA_MCP_REEXEC";
+
+/// What the launch path resolves to, and that file's size and mtime: an
+/// upgrade either repoints the path (per-commit builds behind a symlink)
+/// or rewrites the file in place (`cargo install`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryStamp {
+    target: std::path::PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+impl BinaryStamp {
+    fn of(path: &std::path::Path) -> Option<Self> {
+        let target = std::fs::canonicalize(path).ok()?;
+        let metadata = std::fs::metadata(&target).ok()?;
+        Some(Self {
+            target,
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+        })
+    }
+}
+
+/// Re-executes the server in place when its binary is upgraded, so agents
+/// keep muxa tools current without restarting. Agent hosts spawn `muxa
+/// mcp` once per session and never respawn it; before this, every upgrade
+/// left each agent's tools on the old build until the agent restarted.
+/// The server keeps no session state (each call opens its own daemon
+/// connection), so the new process can take over the same stdio.
+struct UpgradeWatch {
+    /// The path the server was launched from (`muxa` on PATH), not the
+    /// build it resolved to: that is what an upgrade repoints.
+    path: std::path::PathBuf,
+    started: BinaryStamp,
+    reexec: Box<dyn FnMut(&std::path::Path) + Send>,
+}
+
+impl UpgradeWatch {
+    #[cfg(unix)]
+    fn for_this_process() -> Option<Self> {
+        let path = launch_path()?;
+        let started = BinaryStamp::of(&path)?;
+        Some(Self {
+            path,
+            started,
+            reexec: Box::new(reexec_in_place),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn for_this_process() -> Option<Self> {
+        None
+    }
+
+    fn replaced(&self) -> bool {
+        BinaryStamp::of(&self.path).is_some_and(|now| now != self.started)
+    }
+}
+
+/// `argv[0]` as a path: absolute as given, relative to the working
+/// directory when it has a directory part, else looked up on PATH.
+#[cfg(unix)]
+fn launch_path() -> Option<std::path::PathBuf> {
+    let argv0 = std::env::args_os().next()?;
+    let path = std::path::PathBuf::from(&argv0);
+    if path.is_absolute() {
+        Some(path)
+    } else if path.components().count() > 1 {
+        std::env::current_dir().ok().map(|dir| dir.join(path))
+    } else {
+        which::which(&argv0).ok()
+    }
+}
+
+/// Replace this process with `path`, same arguments and stdio. Returns
+/// only if the exec failed, after which the old server keeps serving.
+#[cfg(unix)]
+fn reexec_in_place(path: &std::path::Path) {
+    use std::os::unix::process::CommandExt as _;
+    let error = std::process::Command::new(path)
+        .args(std::env::args_os().skip(1))
+        .env(REEXEC_ENV, "1")
+        .exec();
+    tracing::warn!(%error, path = %path.display(), "mcp: could not re-exec the upgraded binary; keeping this one");
 }
 
 /// Read newline-delimited JSON-RPC requests from `reader` and write one
@@ -120,9 +226,9 @@ pub async fn run(client: Client, config: muxa::config::Config) -> Result<()> {
 /// Generic over the transport so tests can drive it through an in-memory
 /// duplex pipe instead of the real stdio handles.
 #[cfg(test)]
-async fn serve<R, W>(client: Client, reader: R, writer: W) -> Result<()>
+async fn serve<R, W>(client: Client, reader: BufReader<R>, writer: W) -> Result<()>
 where
-    R: AsyncBufRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     serve_with_config(
@@ -130,18 +236,20 @@ where
         reader,
         writer,
         Arc::new(muxa::config::Config::default()),
+        None,
     )
     .await
 }
 
 async fn serve_with_config<R, W>(
     client: Client,
-    reader: R,
+    reader: BufReader<R>,
     writer: W,
     config: Arc<muxa::config::Config>,
+    mut upgrade: Option<UpgradeWatch>,
 ) -> Result<()>
 where
-    R: AsyncBufRead + Unpin,
+    R: tokio::io::AsyncRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let mut lines = reader.lines();
@@ -149,8 +257,29 @@ where
     // In-flight dispatch tasks, tracked so we can drain them when stdin
     // closes rather than dropping a response mid-flight.
     let mut tasks: JoinSet<()> = JoinSet::new();
+    let mut upgrade_poll = tokio::time::interval(UPGRADE_POLL_INTERVAL);
+    upgrade_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    while let Some(line) = lines.next_line().await? {
+    loop {
+        // `next_line` is cancel-safe, so polling for an upgrade beside it
+        // never loses part of a request.
+        let line = tokio::select! {
+            line = lines.next_line() => line?,
+            _ = upgrade_poll.tick(), if upgrade.is_some() => {
+                while tasks.try_join_next().is_some() {}
+                // Only between requests: nothing in flight, nothing read but
+                // unparsed, every response already flushed.
+                let idle = tasks.is_empty() && lines.get_ref().buffer().is_empty();
+                if let Some(watch) = upgrade.as_mut().filter(|watch| idle && watch.replaced()) {
+                    let path = watch.path.clone();
+                    (watch.reexec)(&path);
+                    // Still here: the exec failed (or a test hook returned).
+                    upgrade = None;
+                }
+                continue;
+            }
+        };
+        let Some(line) = line else { break };
         if line.trim().is_empty() {
             continue;
         }
@@ -298,7 +427,7 @@ fn initialize_result(_config: &muxa::config::Config) -> Value {
     let instructions = MCP_SERVER_INSTRUCTIONS;
     json!({
         "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": { "tools": {} },
+        "capabilities": { "tools": { "listChanged": true } },
         "serverInfo": {
             "name": "muxa",
             "version": crate::mcp_revision::server_version(),
@@ -6891,6 +7020,86 @@ mod tests {
 
     /// A raw line that isn't JSON at all yields a `-32700` parse error with a
     /// null id, and never crashes the server loop.
+    #[cfg(unix)]
+    #[test]
+    fn an_upgrade_is_noticed_whether_the_link_moves_or_the_file_is_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let (old, new, link) = (
+            dir.path().join("old"),
+            dir.path().join("new"),
+            dir.path().join("muxa"),
+        );
+        std::fs::write(&old, b"build one").unwrap();
+        std::fs::write(&new, b"build two!").unwrap();
+        std::os::unix::fs::symlink(&old, &link).unwrap();
+        let started = BinaryStamp::of(&link).unwrap();
+        assert_eq!(BinaryStamp::of(&link), Some(started.clone()), "unchanged");
+
+        // Per-commit installs repoint the link.
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&new, &link).unwrap();
+        assert_ne!(BinaryStamp::of(&link), Some(started));
+
+        // `cargo install` rewrites the file in place.
+        let before = BinaryStamp::of(&link).unwrap();
+        std::fs::write(&new, b"build three, longer").unwrap();
+        assert_ne!(BinaryStamp::of(&link), Some(before));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_server_reexecs_only_after_its_binary_is_replaced() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("muxa");
+        std::fs::write(&binary, b"build one").unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let watch = UpgradeWatch {
+            path: binary.clone(),
+            started: BinaryStamp::of(&binary).unwrap(),
+            reexec: Box::new(move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }),
+        };
+        let client = Client::new(std::path::PathBuf::from("/nonexistent/muxa.sock"));
+        let (mut client_in, server_in) = tokio::io::duplex(4096);
+        let (server_out, client_out) = tokio::io::duplex(4096);
+        let handle = tokio::spawn(serve_with_config(
+            client,
+            BufReader::new(server_in),
+            server_out,
+            Arc::new(muxa::config::Config::default()),
+            Some(watch),
+        ));
+        let mut client_out = BufReader::new(client_out);
+
+        // Not replaced: polls come and go, nothing happens, requests work.
+        tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        client_out.read_line(&mut line).await.unwrap();
+        assert!(line.contains("\"id\":1"));
+
+        // Replaced: the next idle poll hands over to the new binary once.
+        std::fs::write(&binary, b"build two, longer").unwrap();
+        tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        drop(client_in);
+        handle.await.unwrap().unwrap();
+    }
+
+    #[test]
+    fn initialize_advertises_tool_list_changes() {
+        let init = initialize_result(&muxa::config::Config::default());
+        assert_eq!(init["capabilities"]["tools"]["listChanged"], true);
+    }
+
     #[tokio::test]
     async fn serve_reports_parse_error_for_garbage_line() {
         let client = Client::new(std::path::PathBuf::from("/nonexistent/muxa.sock"));
