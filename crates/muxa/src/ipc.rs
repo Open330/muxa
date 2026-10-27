@@ -120,6 +120,13 @@ const fn mux_snapshot_only_missing() -> bool {
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
 const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Default observed-idle time past which a worker is flagged as long idle.
+pub const DEFAULT_WORKER_IDLE_SECS: u64 = 24 * 60 * 60;
+
+fn default_worker_idle_secs() -> u64 {
+    DEFAULT_WORKER_IDLE_SECS
+}
 /// Backoff between attempts of a collaboration wait interrupted by a
 /// daemon restart, doubling up to the cap.
 const WAIT_RETRY_INITIAL: Duration = Duration::from_millis(200);
@@ -656,6 +663,13 @@ enum RequestBody {
     CollaborationOverview {
         origin: CollaborationOrigin,
     },
+    /// Every worker muxa launched that is still live, host-wide. Read-only,
+    /// like `snapshot`: it names agents and counts open requests without
+    /// reading any body, and changes nothing.
+    CollaborationWorkers {
+        #[serde(default = "default_worker_idle_secs")]
+        idle_threshold_secs: u64,
+    },
     CollaborationList {
         origin: CollaborationOrigin,
         #[serde(default)]
@@ -1021,6 +1035,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_spawns: Option<Vec<collaboration::WorkerSpawnView>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_inventory: Option<collaboration::WorkerInventory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
     /// Set on the answer to a long poll that muxad cut short to restart:
     /// nothing changed, and the same request may be asked again.
@@ -1124,6 +1140,7 @@ impl Response {
             collaboration_overview: None,
             worker_spawn: None,
             worker_spawns: None,
+            worker_inventory: None,
             collaboration_request: None,
             restarting: None,
             ask_entries: None,
@@ -4937,6 +4954,30 @@ async fn handle(
                     .await
                     .unwrap_or(Ok(()));
                 }
+                RequestBody::CollaborationWorkers {
+                    idle_threshold_secs,
+                } => {
+                    kind = "collaboration_workers";
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    let mut response = Response::ok();
+                    response.worker_inventory = Some(
+                        collaboration
+                            .worker_inventory(
+                                &topology.participants,
+                                &topology.agents,
+                                idle_threshold_secs,
+                            )
+                            .await,
+                    );
+                    response
+                }
                 RequestBody::CollaborationOverview { origin } => {
                     kind = "collaboration_overview";
                     let topology = collaboration_participants(
@@ -7135,6 +7176,21 @@ impl Client {
     }
 
     /// Body-free room relationship data for an operator surface.
+    /// Every live worker muxa launched, host-wide. Read-only.
+    pub async fn collaboration_workers(
+        &self,
+        idle_threshold_secs: u64,
+    ) -> Result<collaboration::WorkerInventory, RuntimeError> {
+        let response = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "collaboration_workers",
+                "idle_threshold_secs": idle_threshold_secs,
+            }))
+            .await?;
+        serde_json::from_value(response["worker_inventory"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn collaboration_overview(
         &self,
         origin: &CollaborationOrigin,
@@ -11026,6 +11082,50 @@ mod tests {
             .collaboration_worker_spawn(tickets[0], &WorkerSpawnAction::Renew)
             .await
             .unwrap();
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_worker_inventory_lists_only_sessions_that_are_workers() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("workers.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "primary", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%2", "worker", AgentKind::Codex).await;
+        let mailbox = collaboration::CollaborationStore::in_memory(
+            collaboration::CollaborationOptions::default(),
+        );
+        let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+        let client = Client::new(socket.clone());
+        assert!(client
+            .collaboration_workers(3600)
+            .await
+            .unwrap()
+            .workers
+            .is_empty());
+
+        client
+            .collaboration_purpose(&pane_origin("%2"), collaboration::LaunchPurpose::Worker)
+            .await
+            .unwrap();
+        client
+            .collaboration_send(
+                &pane_origin("%1"),
+                "pane:%2",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let inventory = client.collaboration_workers(3600).await.unwrap();
+        assert_eq!(inventory.workers.len(), 1, "{inventory:?}");
+        let worker = &inventory.workers[0];
+        assert_eq!(worker.agent_session_id, "worker");
+        assert_eq!(worker.queued_requests, 1);
+        assert_eq!(inventory.idle_threshold_secs, 3600);
         stop.send(()).unwrap();
         serving.await.unwrap();
     }

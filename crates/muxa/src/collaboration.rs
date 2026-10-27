@@ -15,11 +15,13 @@ pub use spawn_coordination::{
     WorkerSpawnTicket, WorkerSpawnView, WORKER_SPAWN_CAPABILITY, WORKER_SPAWN_RELEASE_CAPABILITY,
 };
 mod purpose;
+mod worker_inventory;
 use purpose::{load_purposes, PurposeGrant};
 pub use purpose::{
     LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PIPELINE_PURPOSE_CAPABILITY,
     PURPOSE_PROMOTE_CAPABILITY,
 };
+pub use worker_inventory::{ObservedIdle, WorkerEntry, WorkerFlag, WorkerInventory};
 
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
