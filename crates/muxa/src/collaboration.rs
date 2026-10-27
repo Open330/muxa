@@ -9,11 +9,13 @@ pub use overview::{
     CollaborationEndpoint, CollaborationLink, CollaborationLocation, CollaborationOverview,
 };
 mod purpose;
+mod worker_inventory;
 use purpose::{load_purposes, PurposeGrant};
 pub use purpose::{
     LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PIPELINE_PURPOSE_CAPABILITY,
     PURPOSE_PROMOTE_CAPABILITY,
 };
+pub use worker_inventory::{ObservedIdle, WorkerEntry, WorkerFlag, WorkerInventory};
 
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
