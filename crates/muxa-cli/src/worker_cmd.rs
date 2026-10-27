@@ -37,6 +37,23 @@ enum Action {
         #[arg(long)]
         reason: String,
     },
+    /// Quit idle (or, with --error, errored) workers muxa launched, after
+    /// muxad confirms each has no open work. A dry run unless --execute.
+    /// Each quit is the provider's own command, typed once into an empty
+    /// prompt; nothing is forced, and the pane is kept.
+    Prune {
+        /// Hours a worker must have been observed idle.
+        #[arg(long, default_value_t = 24)]
+        idle_hours: u64,
+        /// Also retire workers in an error state.
+        #[arg(long)]
+        error: bool,
+        /// Quit the eligible workers. Without it only the plan is shown.
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// What `muxa workers --json` prints: the inventory, plus launches that
@@ -51,6 +68,15 @@ struct Listing<'a> {
 }
 
 pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
+    if let Some(Action::Prune {
+        idle_hours,
+        error,
+        execute,
+        json,
+    }) = args.action
+    {
+        return prune(client, idle_hours, error, execute, json).await;
+    }
     if let Some(Action::Release { launch_id, reason }) = args.action {
         let origin = crate::watch::watch_collaboration_origin(std::env::var("TMUX_PANE").ok());
         client
@@ -498,9 +524,235 @@ mod tests {
     }
 
     #[test]
+    fn the_plan_separates_what_would_go_from_what_stays() {
+        use muxa::collaboration::{WorkerDrainCandidate, WorkerDrainPlan, WorkerDrainTarget};
+        let candidate = |pane: &str, eligible: bool, reason: &str| WorkerDrainCandidate {
+            target: WorkerDrainTarget {
+                session_id: "s".into(),
+                agent_kind: AgentKind::Codex,
+                pane: pane.into(),
+                socket: None,
+                room: RoomId {
+                    host: "rmux".into(),
+                    socket: None,
+                    window_id: "@1".into(),
+                },
+            },
+            state: AgentState::Idle,
+            observed_idle_since: None,
+            eligible,
+            reason: reason.into(),
+        };
+        let text = render_plan(&WorkerDrainPlan {
+            candidates: vec![
+                candidate("rmux:%133", true, "observed idle 2d"),
+                candidate("rmux:%174", false, "3 queued requests"),
+            ],
+        });
+        assert!(
+            text.contains("Would retire (dry run):\n  rmux:%133  codex  idle  observed idle 2d"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Kept:\n  rmux:%174  codex  3 queued requests"),
+            "{text}"
+        );
+        assert!(text.contains("Re-run with --execute"), "{text}");
+        let none = render_plan(&WorkerDrainPlan {
+            candidates: vec![candidate("rmux:%1", false, "busy")],
+        });
+        assert!(none.starts_with("No worker can be retired now."), "{none}");
+        assert!(!none.contains("--execute"), "{none}");
+    }
+
+    #[test]
+    fn prune_results_count_each_outcome_and_flag_the_unfinished() {
+        let r = |outcome: &str| Pruned {
+            pane: "rmux:%1".into(),
+            agent: "codex".into(),
+            outcome: outcome.into(),
+            detail: String::new(),
+        };
+        let results = [
+            r("exited"),
+            r("refused"),
+            r("skipped"),
+            r("left_running"),
+            r("uncertain"),
+        ];
+        let text = render_pruned(&results);
+        assert!(
+            text.contains(
+                "1 exited, 2 refused or skipped (nothing typed), 1 left running, 1 uncertain."
+            ),
+            "{text}"
+        );
+        assert!(!r("exited").unfinished() && !r("refused").unfinished());
+        assert!(r("left_running").unfinished() && r("uncertain").unfinished());
+        assert_eq!(render_pruned(&[]), "No worker was eligible.\n");
+    }
+
+    #[test]
     fn durations_read_in_days_hours_or_minutes() {
         assert_eq!(duration(2 * 86_400 + 3 * 3600), "2d3h");
         assert_eq!(duration(5 * 3600 + 59), "5h");
         assert_eq!(duration(600), "10m");
     }
+}
+
+/// One worker's result in `prune --execute`.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct Pruned {
+    pane: String,
+    agent: String,
+    outcome: String,
+    detail: String,
+}
+
+impl Pruned {
+    /// Left in a state someone should look at.
+    fn unfinished(&self) -> bool {
+        matches!(self.outcome.as_str(), "left_running" | "uncertain")
+    }
+}
+
+async fn prune(
+    client: &Client,
+    idle_hours: u64,
+    allow_error: bool,
+    execute: bool,
+    json: bool,
+) -> Result<()> {
+    use muxa::collaboration::{WorkerDrainAcquire, WorkerDrainPolicy, WorkerDrainTarget};
+    let origin = crate::watch::watch_collaboration_origin(std::env::var("TMUX_PANE").ok());
+    let policy = WorkerDrainPolicy {
+        min_observed_idle_secs: idle_hours.saturating_mul(3600),
+        allow_error,
+    };
+    // The daemon judges eligibility; the CLI never filters on its own.
+    let plan = client
+        .worker_drain_plan(&origin, &policy)
+        .await
+        .context("asking muxad which workers can be retired (an older daemon lacks it)")?;
+    if !execute {
+        if json {
+            println!("{}", serde_json::to_string(&plan)?);
+        } else {
+            print!("{}", render_plan(&plan));
+        }
+        return Ok(());
+    }
+    let mut results = Vec::new();
+    for candidate in plan.candidates.iter().filter(|c| c.eligible) {
+        let target: &WorkerDrainTarget = &candidate.target;
+        let agent = wire_name(target.agent_kind);
+        let result = match client.worker_drain_acquire(&origin, target, &policy).await {
+            Ok(WorkerDrainAcquire::Skipped { reason }) => Pruned {
+                pane: target.pane.clone(),
+                agent,
+                outcome: "skipped".into(),
+                detail: reason,
+            },
+            Ok(WorkerDrainAcquire::Acquired { token }) => {
+                let operation = uuid::Uuid::new_v4().to_string();
+                match client.worker_drain_stop(&origin, &token, &operation).await {
+                    Ok(stop) => Pruned {
+                        pane: target.pane.clone(),
+                        agent,
+                        outcome: wire_name(stop.outcome),
+                        detail: stop.drain.detail,
+                    },
+                    // The stop may still be running in muxad: never call it
+                    // done or abort it from here.
+                    Err(error) => Pruned {
+                        pane: target.pane.clone(),
+                        agent,
+                        outcome: "uncertain".into(),
+                        detail: format!(
+                            "lost contact during the stop ({error}); check `muxa workers`"
+                        ),
+                    },
+                }
+            }
+            Err(error) => Pruned {
+                pane: target.pane.clone(),
+                agent,
+                outcome: "skipped".into(),
+                detail: format!("could not reserve: {error}"),
+            },
+        };
+        results.push(result);
+    }
+    if json {
+        println!("{}", serde_json::to_string(&results)?);
+    } else {
+        print!("{}", render_pruned(&results));
+    }
+    if results.iter().any(Pruned::unfinished) {
+        // Unfinished, not failed: the same exit as other partial results.
+        std::process::exit(2);
+    }
+    Ok(())
+}
+
+fn render_plan(plan: &muxa::collaboration::WorkerDrainPlan) -> String {
+    let mut out = String::new();
+    let eligible: Vec<_> = plan.candidates.iter().filter(|c| c.eligible).collect();
+    let skipped: Vec<_> = plan.candidates.iter().filter(|c| !c.eligible).collect();
+    if eligible.is_empty() {
+        out.push_str("No worker can be retired now.\n");
+    } else {
+        out.push_str("Would retire (dry run):\n");
+        for c in &eligible {
+            let _ = writeln!(
+                out,
+                "  {}  {}  {}  {}",
+                c.target.pane,
+                wire_name(c.target.agent_kind),
+                wire_name(c.state),
+                c.reason
+            );
+        }
+    }
+    if !skipped.is_empty() {
+        out.push_str("Kept:\n");
+        for c in &skipped {
+            let _ = writeln!(
+                out,
+                "  {}  {}  {}",
+                c.target.pane,
+                wire_name(c.target.agent_kind),
+                c.reason
+            );
+        }
+    }
+    if !eligible.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n{} worker(s) eligible. Re-run with --execute to quit them: each gets \
+             its own quit command once, only at an empty prompt, and its pane is kept.",
+            eligible.len()
+        );
+    }
+    out
+}
+
+fn render_pruned(results: &[Pruned]) -> String {
+    if results.is_empty() {
+        return "No worker was eligible.\n".into();
+    }
+    let mut out = String::new();
+    for r in results {
+        let _ = writeln!(out, "{}  {}  {}  {}", r.pane, r.agent, r.outcome, r.detail);
+    }
+    let count = |o: &str| results.iter().filter(|r| r.outcome == o).count();
+    let _ = writeln!(
+        out,
+        "\n{} exited, {} refused or skipped (nothing typed), {} left running, {} uncertain.",
+        count("exited"),
+        count("refused") + count("skipped"),
+        count("left_running"),
+        count("uncertain"),
+    );
+    out
 }
