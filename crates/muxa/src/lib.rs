@@ -96,6 +96,7 @@ pub mod work_control;
 pub mod mux_snapshot_control;
 pub mod work_pipeline_spec;
 pub mod work_presets;
+pub mod worker_stop;
 
 // ---------------------------------------------------------------------------
 // Stable public surface.
