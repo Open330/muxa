@@ -2641,6 +2641,14 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
             Err(error) => return error_result(&error),
         };
         match capacity {
+            muxa::collaboration::WorkerSpawnAcquisition::Draining {
+                drain_id,
+                expires_at,
+            } => {
+                return json_result(
+                    &json!({"sent":false,"reason":"worker_draining","drain_id":drain_id,"expires_at":expires_at,"next_step":"Retry after the worker drain completes; no replacement was spawned."}),
+                );
+            }
             muxa::collaboration::WorkerSpawnAcquisition::Reuse { peer }
             | muxa::collaboration::WorkerSpawnAcquisition::Pending {
                 peer: Some(peer), ..
@@ -3494,6 +3502,9 @@ fn is_pane_selector(target: &str) -> bool {
 }
 
 fn peer_is_eligible(peer: &Participant) -> bool {
+    if peer.draining {
+        return false;
+    }
     !matches!(peer.agent_kind, AgentKind::Task | AgentKind::Unknown)
         && !matches!(peer.state, AgentState::Error | AgentState::Stopped)
 }

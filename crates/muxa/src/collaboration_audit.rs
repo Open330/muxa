@@ -39,6 +39,12 @@ pub enum CollaborationAuditOperation {
     Cancel,
     PromotePurpose,
     WorkerSpawnRelease,
+    WorkerDrainPlan,
+    WorkerDrainAcquire,
+    WorkerDrainRenew,
+    WorkerDrainStop,
+    WorkerDrainFinish,
+    WorkerDrains,
     WithdrawReplyWakes,
 }
 

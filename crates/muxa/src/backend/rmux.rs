@@ -310,6 +310,43 @@ impl PaneBackend for RmuxBackend {
         self.send_text_on(None, pane_id, text)
     }
 
+    fn remain_on_exit_override(
+        &self,
+        socket: Option<&str>,
+        pane: &str,
+    ) -> Result<Option<String>, String> {
+        let scoped = Self {
+            endpoint: socket.map(str::to_string).or_else(|| self.endpoint.clone()),
+        };
+        let text = scoped.capture_control(&["show-options", "-p", "-t", strip_prefix(pane)])?;
+        Ok(text
+            .lines()
+            .find_map(|line| line.strip_prefix("remain-on-exit ").map(str::to_owned)))
+    }
+    fn restore_remain_on_exit(
+        &self,
+        socket: Option<&str>,
+        pane: &str,
+        value: Option<&str>,
+    ) -> bool {
+        let scoped = Self {
+            endpoint: socket.map(str::to_string).or_else(|| self.endpoint.clone()),
+        };
+        match value {
+            Some(value) if matches!(value, "on" | "off" | "failed") => scoped
+                .run_control(&[
+                    "set-option",
+                    "-p",
+                    "-t",
+                    strip_prefix(pane),
+                    "remain-on-exit",
+                    value,
+                ])
+                .is_ok(),
+            None => self.set_remain_on_exit_on(socket, pane, false),
+            _ => false,
+        }
+    }
     fn set_remain_on_exit_on(&self, endpoint: Option<&str>, pane_id: &str, on: bool) -> bool {
         let scoped = Self {
             endpoint: endpoint

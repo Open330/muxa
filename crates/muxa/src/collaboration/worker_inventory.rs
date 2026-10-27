@@ -32,6 +32,8 @@ pub struct WorkerEntry {
     /// A launch whose process is verified but whose session has not
     /// registered yet (Codex registers on its first prompt).
     pub pending: bool,
+    #[serde(default)]
+    pub draining: bool,
     /// How long the row has read `Idle`, as observed by muxa. `None` when it
     /// is not idle or no observation exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -163,6 +165,7 @@ pub fn project<'a>(
                 alias: p.alias.clone(),
                 state: p.state,
                 pending: is_pending_session(&p.agent_session_id),
+                draining: p.draining,
                 observed_idle,
                 queued_requests: queued,
                 claimed_requests: claimed,
@@ -254,6 +257,7 @@ mod tests {
     fn worker(pane: &str, session: &str, window: &str, kind: AgentKind) -> Participant {
         Participant {
             launch_purpose: LaunchPurpose::Worker,
+            draining: false,
             agent_kind: kind,
             agent_session_id: session.into(),
             pane: pane.into(),
