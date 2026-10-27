@@ -526,6 +526,7 @@ mod tests {
     #[test]
     fn the_plan_separates_what_would_go_from_what_stays() {
         use muxa::collaboration::{WorkerDrainCandidate, WorkerDrainPlan, WorkerDrainTarget};
+        let now = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
         let candidate = |pane: &str, eligible: bool, reason: &str| WorkerDrainCandidate {
             target: WorkerDrainTarget {
                 session_id: "s".into(),
@@ -539,28 +540,41 @@ mod tests {
                 },
             },
             state: AgentState::Idle,
-            observed_idle_since: None,
+            observed_idle_since: eligible.then_some(now - time::Duration::hours(50)),
             eligible,
             reason: reason.into(),
         };
-        let text = render_plan(&WorkerDrainPlan {
-            candidates: vec![
-                candidate("rmux:%133", true, "observed idle 2d"),
-                candidate("rmux:%174", false, "3 queued requests"),
-            ],
-        });
+        let text = render_plan(
+            &WorkerDrainPlan {
+                candidates: vec![
+                    candidate("rmux:%133", true, "eligible"),
+                    candidate("rmux:%174", false, "open_requests_or_reply_wakes"),
+                    candidate("rmux:%16", false, "primary"),
+                    candidate("rmux:%17", false, "primary"),
+                ],
+            },
+            now,
+        );
         assert!(
-            text.contains("Would retire (dry run):\n  rmux:%133  codex  idle  observed idle 2d"),
+            text.contains("Would retire (dry run):\n  rmux:%133  codex  idle 2d2h\n"),
             "{text}"
         );
         assert!(
-            text.contains("Kept:\n  rmux:%174  codex  3 queued requests"),
+            text.contains("Kept:\n  rmux:%174  codex  open_requests_or_reply_wakes\n"),
+            "{text}"
+        );
+        assert!(!text.contains("%16"), "{text}");
+        assert!(
+            text.contains("(2 primary session(s) are never retired.)"),
             "{text}"
         );
         assert!(text.contains("Re-run with --execute"), "{text}");
-        let none = render_plan(&WorkerDrainPlan {
-            candidates: vec![candidate("rmux:%1", false, "busy")],
-        });
+        let none = render_plan(
+            &WorkerDrainPlan {
+                candidates: vec![candidate("rmux:%1", false, "busy")],
+            },
+            now,
+        );
         assert!(none.starts_with("No worker can be retired now."), "{none}");
         assert!(!none.contains("--execute"), "{none}");
     }
@@ -638,7 +652,7 @@ async fn prune(
         if json {
             println!("{}", serde_json::to_string(&plan)?);
         } else {
-            print!("{}", render_plan(&plan));
+            print!("{}", render_plan(&plan, time::OffsetDateTime::now_utc()));
         }
         return Ok(());
     }
@@ -695,28 +709,44 @@ async fn prune(
     Ok(())
 }
 
-fn render_plan(plan: &muxa::collaboration::WorkerDrainPlan) -> String {
+fn render_plan(plan: &muxa::collaboration::WorkerDrainPlan, now: time::OffsetDateTime) -> String {
     let mut out = String::new();
     let eligible: Vec<_> = plan.candidates.iter().filter(|c| c.eligible).collect();
-    let skipped: Vec<_> = plan.candidates.iter().filter(|c| !c.eligible).collect();
+    // Primaries are never retired; listing each one only buries the rest.
+    let primaries = plan
+        .candidates
+        .iter()
+        .filter(|c| !c.eligible && c.reason == "primary")
+        .count();
+    let kept: Vec<_> = plan
+        .candidates
+        .iter()
+        .filter(|c| !c.eligible && c.reason != "primary")
+        .collect();
     if eligible.is_empty() {
         out.push_str("No worker can be retired now.\n");
     } else {
         out.push_str("Would retire (dry run):\n");
         for c in &eligible {
+            let idle = c.observed_idle_since.map_or_else(
+                || "idle".to_owned(),
+                |since| {
+                    let secs = u64::try_from((now - since).whole_seconds()).unwrap_or(0);
+                    format!("idle {}", duration(secs))
+                },
+            );
             let _ = writeln!(
                 out,
-                "  {}  {}  {}  {}",
+                "  {}  {}  {}",
                 c.target.pane,
                 wire_name(c.target.agent_kind),
-                wire_name(c.state),
-                c.reason
+                idle
             );
         }
     }
-    if !skipped.is_empty() {
+    if !kept.is_empty() {
         out.push_str("Kept:\n");
-        for c in &skipped {
+        for c in &kept {
             let _ = writeln!(
                 out,
                 "  {}  {}  {}",
@@ -725,6 +755,9 @@ fn render_plan(plan: &muxa::collaboration::WorkerDrainPlan) -> String {
                 c.reason
             );
         }
+    }
+    if primaries > 0 {
+        let _ = writeln!(out, "({primaries} primary session(s) are never retired.)");
     }
     if !eligible.is_empty() {
         let _ = writeln!(
