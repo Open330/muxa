@@ -577,6 +577,16 @@ mod tests {
         );
         assert!(none.starts_with("No worker can be retired now."), "{none}");
         assert!(!none.contains("--execute"), "{none}");
+        let mut errored = candidate("rmux:%9", true, "eligible");
+        errored.state = AgentState::Error;
+        errored.observed_idle_since = None;
+        let text = render_plan(
+            &WorkerDrainPlan {
+                candidates: vec![errored],
+            },
+            now,
+        );
+        assert!(text.contains("  rmux:%9  codex  error\n"), "{text}");
     }
 
     #[test]
@@ -593,16 +603,22 @@ mod tests {
             r("skipped"),
             r("left_running"),
             r("uncertain"),
+            r("failed"),
         ];
         let text = render_pruned(&results);
         assert!(
             text.contains(
-                "1 exited, 2 refused or skipped (nothing typed), 1 left running, 1 uncertain."
+                "1 exited, 2 refused or skipped (nothing typed), 1 failed to reserve, \
+                 1 left running, 1 uncertain."
             ),
             "{text}"
         );
         assert!(!r("exited").unfinished() && !r("refused").unfinished());
         assert!(r("left_running").unfinished() && r("uncertain").unfinished());
+        assert!(
+            r("failed").unfinished(),
+            "a failed reservation must not exit 0"
+        );
         assert_eq!(render_pruned(&[]), "No worker was eligible.\n");
     }
 
@@ -626,7 +642,10 @@ struct Pruned {
 impl Pruned {
     /// Left in a state someone should look at.
     fn unfinished(&self) -> bool {
-        matches!(self.outcome.as_str(), "left_running" | "uncertain")
+        matches!(
+            self.outcome.as_str(),
+            "left_running" | "uncertain" | "failed"
+        )
     }
 }
 
@@ -691,7 +710,8 @@ async fn prune(
             Err(error) => Pruned {
                 pane: target.pane.clone(),
                 agent,
-                outcome: "skipped".into(),
+                // Not the daemon's decision to skip: the reservation failed.
+                outcome: "failed".into(),
                 detail: format!("could not reserve: {error}"),
             },
         };
@@ -728,8 +748,9 @@ fn render_plan(plan: &muxa::collaboration::WorkerDrainPlan, now: time::OffsetDat
     } else {
         out.push_str("Would retire (dry run):\n");
         for c in &eligible {
+            // Only an idle worker has an idle age; an errored one says so.
             let idle = c.observed_idle_since.map_or_else(
-                || "idle".to_owned(),
+                || wire_name(c.state),
                 |since| {
                     let secs = u64::try_from((now - since).whole_seconds()).unwrap_or(0);
                     format!("idle {}", duration(secs))
@@ -781,9 +802,11 @@ fn render_pruned(results: &[Pruned]) -> String {
     let count = |o: &str| results.iter().filter(|r| r.outcome == o).count();
     let _ = writeln!(
         out,
-        "\n{} exited, {} refused or skipped (nothing typed), {} left running, {} uncertain.",
+        "\n{} exited, {} refused or skipped (nothing typed), {} failed to reserve, \
+         {} left running, {} uncertain.",
         count("exited"),
         count("refused") + count("skipped"),
+        count("failed"),
         count("left_running"),
         count("uncertain"),
     );
