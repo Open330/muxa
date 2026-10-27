@@ -89,6 +89,10 @@ pub struct WorkerSpawnTicket {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub enum WorkerSpawnAcquisition {
+    Draining {
+        drain_id: String,
+        expires_at: OffsetDateTime,
+    },
     Reuse {
         peer: Participant,
     },
@@ -166,6 +170,25 @@ pub struct WorkerSpawnView {
 }
 
 impl WorkerSpawnRecord {
+    fn kind_matches_drain(&self, token: &super::WorkerDrainToken) -> bool {
+        self.agent_kind == token.target.agent_kind
+            && self.room.host == token.target.room.host
+            && self.socket == token.target.socket
+    }
+    pub(super) fn incomplete_at(&self, pane: &str, socket: Option<&str>) -> bool {
+        !matches!(
+            self.phase,
+            WorkerSpawnPhase::Failed | WorkerSpawnPhase::SessionBound
+        ) && self.pane.as_deref() == Some(pane)
+            && self.socket.as_deref() == socket
+    }
+
+    pub(super) fn incomplete_for(&self, p: &Participant) -> bool {
+        !matches!(
+            self.phase,
+            WorkerSpawnPhase::Failed | WorkerSpawnPhase::SessionBound
+        ) && (self.owner.same_session(p) || self.incomplete_at(&p.pane, p.socket.as_deref()))
+    }
     fn close(&mut self, detail: String) {
         self.phase = WorkerSpawnPhase::Failed;
         self.closed_at = Some(OffsetDateTime::now_utc());
@@ -218,6 +241,19 @@ pub(super) fn load_spawns(
 }
 
 impl CollaborationStore {
+    pub(super) fn close_drained_spawn(
+        &self,
+        record: &mut WorkerSpawnRecord,
+        token: &super::WorkerDrainToken,
+    ) -> Result<(), CollaborationError> {
+        if record.fence.as_ref() == Some(&token.process_fence) && record.kind_matches_drain(token) {
+            let mut updated = record.clone();
+            updated.close("fenced worker exited through graceful prune".into());
+            self.persist_spawn(&updated)?;
+            *record = updated;
+        }
+        Ok(())
+    }
     pub async fn worker_spawn_records(&self) -> Vec<WorkerSpawnView> {
         self.worker_spawns
             .lock()
@@ -287,7 +323,16 @@ impl CollaborationStore {
         }
         let spec = spec.normalize()?;
         let mut records = self.worker_spawns.lock().await;
+        {
+            let _transaction = self.transaction_lock.lock().await;
+            self.admit_worker_work(caller).await?;
+        }
         self.prune_closed_spawns(&mut records)?;
+        // Availability may have changed after this client's inventory scan.
+        // Drain acquisition shares this spawn mutex, so refresh inside it.
+        let mut current_participants = participants.to_vec();
+        self.enrich_worker_drains(&mut current_participants).await;
+        let participants = current_participants.as_slice();
         for record in records.iter_mut().filter(|r| {
             r.room == caller.room
                 && r.agent_kind == spec.agent_kind
@@ -307,6 +352,7 @@ impl CollaborationStore {
                     && !p.same_session(caller)
                     && p.agent_kind == spec.agent_kind
                     && p.launch_purpose == LaunchPurpose::Worker
+                    && !p.draining
                     && !matches!(p.state, AgentState::Error | AgentState::Stopped)
                     && spec.accepts_role(&p.roles)
             })
@@ -321,6 +367,15 @@ impl CollaborationStore {
             });
         if let Some(peer) = peer {
             return Ok(WorkerSpawnAcquisition::Reuse { peer: peer.clone() });
+        }
+        if let Some(drain) = self
+            .draining_worker_pool(caller, spec.agent_kind, spec.role.as_deref())
+            .await
+        {
+            return Ok(WorkerSpawnAcquisition::Draining {
+                drain_id: drain.token.drain_id,
+                expires_at: drain.token.expires_at,
+            });
         }
         if let Some(record) = records.iter().find(|r| {
             r.room == caller.room

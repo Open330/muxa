@@ -48,6 +48,7 @@ fn agent(pane: &PaneInfo, session: &str, purpose: LaunchPurpose) -> Participant 
         roles: pane.agent_role.iter().cloned().collect(),
         console: false,
         launch_purpose: purpose,
+        draining: false,
     }
 }
 

@@ -39,14 +39,24 @@ impl std::str::FromStr for LaunchPurpose {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(super) struct ProcessFence {
-    pid: u32,
-    birth: String,
+pub struct ProcessFence {
+    pub pid: u32,
+    pub birth: String,
 }
 
 impl ProcessFence {
+    pub(crate) fn exited_status(&self) -> Option<bool> {
+        if let Some(birth) = process_birth(self.pid) {
+            Some(birth != self.birth)
+        } else if self.definitely_exited() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
     /// Missing birth data alone can mean an observation failure, not exit.
-    pub(super) fn definitely_exited(&self) -> bool {
+    pub(crate) fn definitely_exited(&self) -> bool {
         if let Some(birth) = process_birth(self.pid) {
             return birth != self.birth;
         }
@@ -71,7 +81,7 @@ impl ProcessFence {
         }
     }
 
-    pub(super) fn observe(pane: &PaneInfo, kind: AgentKind) -> Option<Self> {
+    pub(crate) fn observe(pane: &PaneInfo, kind: AgentKind) -> Option<Self> {
         #[cfg(target_os = "linux")]
         let root = crate::process_tree::read_proc(pane.pane_pid, 0);
         #[cfg(not(target_os = "linux"))]
@@ -203,6 +213,15 @@ fn verify_pending_grants(
 }
 
 impl CollaborationStore {
+    pub(crate) async fn effective_worker(&self, participant: &Participant) -> bool {
+        self.purposes
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|g| g.owns_session(participant))
+            .is_some_and(|g| g.purpose == LaunchPurpose::Worker)
+    }
     pub(super) async fn worker_launch_binding(&self, id: &str) -> Option<String> {
         self.purposes
             .read()
@@ -342,6 +361,13 @@ impl CollaborationStore {
             .any(|session| session.console || is_pending_session(&session.agent_session_id))
         {
             return Err(CollaborationError::ConsoleIdentity);
+        }
+        let mut panes = sessions.iter().map(|p| p.pane.clone()).collect::<Vec<_>>();
+        panes.sort();
+        panes.dedup();
+        let mut action_guards = Vec::new();
+        for pane in panes {
+            action_guards.push(self.worker_action_guard(&pane).await);
         }
         let _transaction = self.transaction_lock.lock().await;
         let mut grants = self.purposes.write().await;

@@ -1344,6 +1344,7 @@ mod tests {
             alias: None,
             state: muxa::event::AgentState::Idle,
             pending: false,
+            draining: false,
             observed_idle: None,
             queued_requests: 0,
             claimed_requests: 0,
@@ -1399,6 +1400,7 @@ mod tests {
     fn test_participant(pane: &str, session: &str) -> muxa::collaboration::Participant {
         muxa::collaboration::Participant {
             launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
+            draining: false,
             agent_kind: muxa::AgentKind::Codex,
             agent_session_id: session.into(),
             pane: pane.into(),

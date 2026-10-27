@@ -315,6 +315,7 @@ mod tests {
             alias: None,
             state: AgentState::Error,
             pending: false,
+            draining: false,
             observed_idle: None,
             queued_requests: 1,
             claimed_requests: 0,
