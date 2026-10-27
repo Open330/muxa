@@ -703,22 +703,26 @@ fn agent_program_and_args(line: &LaunchLine, kind: AgentKind) -> (String, &[Stri
 /// Whether `process` is the interactive `kind` agent (not Codex's
 /// app-server or a headless `exec` run).
 pub(crate) fn is_agent_process(process: &ProcessInfo, kind: AgentKind) -> bool {
-    let mut tokens = process.cmdline.split_whitespace();
+    let tokens: Vec<&str> = process.cmdline.split_whitespace().collect();
     // `node …/bin/codex` — the npm shim — names the agent in its second word.
-    let named = tokens
-        .by_ref()
+    let Some(program) = tokens
+        .iter()
         .take(2)
-        .any(|token| crate::discovery::classify_command(token) == Some(kind));
-    if !named {
+        .position(|token| crate::discovery::classify_command(token) == Some(kind))
+    else {
         return false;
-    }
+    };
     kind != AgentKind::Codex
-        || !process.cmdline.split_whitespace().any(|token| {
-            matches!(
-                token,
-                "app-server" | "exec" | "review" | "mcp-server" | "exec-server"
-            )
-        })
+        // Only the first positional word after `codex` names a subcommand;
+        // later words belong to the prompt, and a worker prompt such as
+        // "You review …" must not read as `codex review`.
+        || !crate::adapters::proc_ancestry::codex_subcommand(&tokens[program..].join(" "))
+            .is_some_and(|subcommand| {
+                matches!(
+                    subcommand,
+                    "app-server" | "exec" | "review" | "mcp-server" | "exec-server"
+                )
+            })
 }
 
 /// What a pane runs, found among the processes under its shell.
@@ -2661,6 +2665,47 @@ mod tests {
             outside_codex_servers(processes.iter(), 10, &in_pane),
             vec!["pid 40".to_owned()]
         );
+    }
+
+    #[test]
+    fn a_codex_prompt_word_is_not_read_as_a_subcommand() {
+        let codex = |cmdline: &str| is_agent_process(&proc(1, 0, 0, cmdline), AgentKind::Codex);
+        // A pipeline reviewer's prompt starts "You review …": still the TUI.
+        assert!(codex(
+            "/home/u/.local/bin/codex --yolo --no-daemon You review role:implementer's work"
+        ));
+        assert!(codex(
+            "node /opt/bin/codex -m gpt-6 --no-daemon run exec then review"
+        ));
+        assert!(codex("codex -c model=x resume 019a"));
+        // The subcommand position still excludes non-interactive runs.
+        assert!(!codex("codex exec --json hi"));
+        assert!(!codex("node /opt/bin/codex review"));
+        assert!(!codex(
+            "codex -c features.x=true app-server --listen unix://"
+        ));
+        assert!(!codex("/opt/homebrew/bin/codex --profile work mcp-server"));
+    }
+
+    #[test]
+    fn a_reviewer_prompt_does_not_hide_the_codex_launch_under_aas() {
+        let processes = [
+            proc(
+                10,
+                1,
+                0,
+                "aas e chatgpt@codex --yolo --no-daemon You review the commit",
+            ),
+            proc(
+                11,
+                10,
+                1,
+                "/home/u/.local/bin/codex --yolo --no-daemon You review the commit",
+            ),
+        ];
+        let launch = find_launch(&processes, 10, AgentKind::Codex).expect("codex found");
+        assert_eq!(launch.agent_pid, 11);
+        assert_eq!(launch.top_pid, 10);
     }
     use crate::event::RateLimitScope;
 
