@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `muxa reload mcp --all` no longer ends in `Error:` when the only thing left
+  is a client muxa cannot refresh. It says when no shared Codex profile needed
+  a refresh, lists the clients that need a reconnect under a heading, names a
+  standalone Codex CLI's session so it can be resumed after a restart, and
+  exits 2 (unfinished) instead of 1. Unacknowledged host requests still fail.
 - `muxa swap` types a dialog answer one key at a time. Claude's input
   layer read Down+Enter arriving in one write as a single unknown sequence,
   so the folder-trust prompt stayed up.
