@@ -81,6 +81,39 @@ pub fn remove_endpoint(endpoint: &Path) {
     let _ = imp::clear(endpoint);
 }
 
+/// A daemon's exclusive hold on an endpoint, kept for as long as it serves.
+///
+/// [`endpoint_is_live`] alone cannot tell a busy daemon from a leftover file:
+/// on macOS a socket whose listen backlog is full refuses a connect at once,
+/// exactly as an orphaned one does. A second daemon that read that as stale
+/// would unlink the live socket and strand every client of the first. The
+/// claim settles it: the OS drops the lock with its holder, so a crashed
+/// daemon never leaves one behind.
+#[derive(Debug)]
+pub struct EndpointClaim {
+    _held: imp::Claim,
+}
+
+/// Take the claim on `endpoint`, or `None` while another process holds it.
+pub fn claim_endpoint(endpoint: &Path) -> io::Result<Option<EndpointClaim>> {
+    Ok(imp::claim(endpoint)?.map(|held| EndpointClaim { _held: held }))
+}
+
+/// Which file now occupies `endpoint`, to notice it being removed or
+/// replaced under a running daemon. Always `None` on Windows, where a pipe
+/// has no file to lose.
+pub fn endpoint_identity(endpoint: &Path) -> Option<EndpointIdentity> {
+    imp::identity(endpoint)
+}
+
+/// Device and inode of an endpoint file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(windows, allow(dead_code))] // never built: a pipe has no file
+pub struct EndpointIdentity {
+    device: u64,
+    inode: u64,
+}
+
 /// Connect a synchronous client, with `deadline` applied to reads and writes.
 ///
 /// For callers with no runtime to await on. Returns
@@ -211,6 +244,66 @@ mod imp {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             other => other,
         }
+    }
+
+    /// An advisory lock on `<endpoint>.lock`, removed again on release. The
+    /// lock goes with the process (also across `exec`: the descriptor is
+    /// close-on-exec), so a crash leaves at most an unlocked file behind.
+    #[derive(Debug)]
+    pub(super) struct Claim {
+        file: std::fs::File,
+        path: std::path::PathBuf,
+    }
+
+    impl Drop for Claim {
+        fn drop(&mut self) {
+            // Still holding the lock, so nobody else can be using this file.
+            if same_file(&self.file, &self.path) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    fn same_file(file: &std::fs::File, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), std::fs::symlink_metadata(path)) {
+            (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+            _ => false,
+        }
+    }
+
+    pub(super) fn claim(endpoint: &Path) -> io::Result<Option<Claim>> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut path = endpoint.as_os_str().to_owned();
+        path.push(".lock");
+        let path = std::path::PathBuf::from(path);
+        if let Some(parent) = endpoint.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)?;
+        match file.try_lock() {
+            // A releasing holder unlinks the file; a lock taken on the
+            // unlinked copy would guard nothing, so treat it as still held
+            // and let the caller retry on the fresh path.
+            Ok(()) if same_file(&file, &path) => Ok(Some(Claim { file, path })),
+            Ok(()) | Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            Err(std::fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    pub(super) fn identity(endpoint: &Path) -> Option<super::EndpointIdentity> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(endpoint).ok()?;
+        Some(super::EndpointIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        })
     }
 
     pub(super) fn blocking_connect(
@@ -439,6 +532,20 @@ mod imp {
     #[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
     pub(super) fn clear(_endpoint: &Path) -> io::Result<()> {
         Ok(())
+    }
+
+    #[derive(Debug)]
+    pub(super) struct Claim;
+
+    /// `first_pipe_instance` already refuses a second server on the same
+    /// pipe, so there is no separate claim to take.
+    #[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
+    pub(super) fn claim(_endpoint: &Path) -> io::Result<Option<Claim>> {
+        Ok(Some(Claim))
+    }
+
+    pub(super) fn identity(_endpoint: &Path) -> Option<super::EndpointIdentity> {
+        None
     }
 
     pub(super) fn blocking_connect(

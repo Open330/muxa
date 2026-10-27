@@ -83,6 +83,15 @@ const MAX_IPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// time out client-side instead of consuming another daemon fd.
 const MAX_INFLIGHT_HANDLERS: usize = 256;
 
+/// How often the server confirms its socket file is still the one it bound.
+/// Anything that unlinks `/tmp/muxa-<uid>.sock` (a tmp cleaner, a stray
+/// script) otherwise leaves the daemon running but unreachable until restart.
+const ENDPOINT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a starting server waits for another holder to release the
+/// endpoint claim before deciding a daemon already owns it.
+const CLAIM_WAIT: Duration = Duration::from_secs(2);
+
 /// How long a connection may sit between requests without sending a complete
 /// line before the handler closes it. Generous enough that a legitimately
 /// idle persistent client is never dropped mid-session, tight enough that a
@@ -1778,6 +1787,7 @@ pub struct Server {
     /// whole. `None` when muxad was started without one.
     config_path: Option<PathBuf>,
     handler_limit: usize,
+    endpoint_check: Duration,
 }
 
 impl Server {
@@ -1803,6 +1813,7 @@ impl Server {
             mux_snapshots,
             config_path: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
+            endpoint_check: ENDPOINT_CHECK_INTERVAL,
         }
     }
 
@@ -1926,6 +1937,13 @@ impl Server {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_endpoint_check(mut self, interval: Duration) -> Self {
+        self.endpoint_check = interval;
+        self
+    }
+
     /// Run until `shutdown` fires or an I/O error occurs.
     ///
     /// In-flight connection handlers are tracked on a `JoinSet` so a
@@ -1936,9 +1954,15 @@ impl Server {
     /// a bounded timeout so a hung handler can't block daemon exit.
     #[allow(clippy::too_many_lines)] // accept loop plus bounded drain and socket cleanup
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<(), RuntimeError> {
+        // Held until `run` returns, so a second daemon can never clear this
+        // one's socket.
+        let _claim = self.claim_endpoint().await?;
         self.bind_with_perms()?;
-        let listener = Listener::bind(&self.socket_path)?;
+        let mut listener = Listener::bind(&self.socket_path)?;
+        let mut bound = transport::endpoint_identity(&self.socket_path);
         tracing::info!(socket = %self.socket_path.display(), "listening");
+        let mut endpoint_check = tokio::time::interval(self.endpoint_check);
+        endpoint_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut handlers: JoinSet<()> = JoinSet::new();
         // Sticky signal: a handler entering push mode after shutdown still
@@ -1957,6 +1981,10 @@ impl Server {
                 _ = shutdown.recv() => {
                     tracing::info!("shutdown signal received; closing listener");
                     break;
+                }
+                _ = endpoint_check.tick() => {
+                    self.restore_endpoint(&mut listener, &mut bound);
+                    continue;
                 }
                 joined = handlers.join_next(), if !handlers.is_empty() => {
                     if let Some(Err(e)) = joined {
@@ -1977,6 +2005,10 @@ impl Server {
                     drop(permit);
                     tracing::info!("shutdown signal received; closing listener");
                     break;
+                }
+                _ = endpoint_check.tick() => {
+                    drop(permit);
+                    self.restore_endpoint(&mut listener, &mut bound);
                 }
                 accept = listener.accept() => {
                     let stream = match accept {
@@ -2085,9 +2117,60 @@ impl Server {
             );
         }
 
-        // Remove our own socket file so next startup is clean.
-        transport::remove_endpoint(&self.socket_path);
+        // Remove our own socket file so next startup is clean — but only
+        // ours: a file someone else put there since is not ours to delete.
+        if transport::endpoint_identity(&self.socket_path) == bound {
+            transport::remove_endpoint(&self.socket_path);
+        }
         Ok(())
+    }
+
+    /// Take the endpoint claim, waiting out a brief hold. A child forked
+    /// a moment ago keeps a copy of the lock until it execs, so the daemon
+    /// that just released the claim — or this same daemon, re-executed —
+    /// can find it held for a few milliseconds by no daemon at all.
+    async fn claim_endpoint(&self) -> Result<transport::EndpointClaim, RuntimeError> {
+        let deadline = Instant::now() + CLAIM_WAIT;
+        loop {
+            if let Some(claim) = transport::claim_endpoint(&self.socket_path)? {
+                return Ok(claim);
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::SocketInUse(self.socket_path.clone()));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Bind the socket path again if it no longer holds the file this server
+    /// bound. The claim proves no other daemon owns the path, so whatever is
+    /// there now (nothing, or a stray file) is safe to replace. Connections
+    /// already accepted are unaffected.
+    fn restore_endpoint(
+        &self,
+        listener: &mut Listener,
+        bound: &mut Option<transport::EndpointIdentity>,
+    ) {
+        if bound.is_none() || transport::endpoint_identity(&self.socket_path) == *bound {
+            return;
+        }
+        tracing::warn!(
+            socket = %self.socket_path.display(),
+            "IPC socket file was removed or replaced; binding it again",
+        );
+        let rebound = transport::clear_endpoint(&self.socket_path)
+            .and_then(|()| Listener::bind(&self.socket_path));
+        match rebound {
+            Ok(fresh) => {
+                *listener = fresh;
+                *bound = transport::endpoint_identity(&self.socket_path);
+            }
+            Err(error) => tracing::error!(
+                socket = %self.socket_path.display(),
+                %error,
+                "could not bind the IPC socket again; retrying",
+            ),
+        }
     }
 
     /// Pre-bind sequence: if a stale socket exists, remove it; then the
@@ -10438,6 +10521,70 @@ mod tests {
             "the abandoned wait must close the connection, not answer it"
         );
         let _ = sessions.terminate(&session.id);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_server_leaves_a_running_daemons_socket_alone() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-claimed.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let bound = transport::endpoint_identity(&sock);
+
+        // However the probe reads the first daemon — a full backlog refuses
+        // like an orphan on macOS — its claim keeps the second one out.
+        let (_tx2, rx2) = broadcast::channel(1);
+        let second = Server::new(sock.clone(), Store::shared()).run(rx2).await;
+        assert!(matches!(second, Err(RuntimeError::SocketInUse(_))));
+        assert_eq!(transport::endpoint_identity(&sock), bound);
+        Client::new(sock.clone())
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+        assert!(!sock.exists(), "the daemon removes the socket it bound");
+        assert!(
+            !dir.path().join("muxa-claimed.sock.lock").exists(),
+            "and its claim"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_removed_socket_file_is_bound_again() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-unlinked.sock");
+        let server = Server::new(sock.clone(), Store::shared())
+            .with_endpoint_check(Duration::from_millis(20));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        std::fs::remove_file(&sock).unwrap();
+        wait_for_socket(&sock).await;
+        Client::new(sock.clone())
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // A file someone else put at the path is not the daemon's to delete.
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+        let server =
+            Server::new(sock.clone(), Store::shared()).with_endpoint_check(Duration::from_secs(60));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        std::fs::remove_file(&sock).unwrap();
+        std::fs::write(&sock, b"not a socket").unwrap();
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+        assert_eq!(std::fs::read(&sock).unwrap(), b"not a socket");
     }
 
     #[tokio::test]

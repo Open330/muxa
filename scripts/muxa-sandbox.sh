@@ -300,7 +300,7 @@ cmd_down() {
     kill -9 "$pid" 2>/dev/null || true
   done
 
-  rm -f "$SB_SOCKET" "$SB_TMUX_SOCKET" "$SB_CONFIG" "$SB_PID" "$SB_LOG"
+  rm -f "$SB_SOCKET" "$SB_SOCKET.lock" "$SB_TMUX_SOCKET" "$SB_CONFIG" "$SB_PID" "$SB_LOG"
   # Belt and braces on top of the ownership marker: recurse only into the two
   # exact child directories created by this script.
   case "$SB_DATA" in "$SB_ROOT"/data) rm -rf "$SB_DATA" ;; esac
