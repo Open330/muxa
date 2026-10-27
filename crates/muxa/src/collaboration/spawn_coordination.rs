@@ -16,7 +16,9 @@ use std::path::Path;
 use time::OffsetDateTime;
 
 pub const WORKER_SPAWN_CAPABILITY: &str = "collaboration_worker_spawn_v1";
+pub const WORKER_SPAWN_RELEASE_CAPABILITY: &str = "collaboration_worker_spawn_release_v1";
 const LEASE_SECONDS: i64 = 30;
+const CLOSED_RETENTION_DAYS: i64 = 7;
 
 /// A provider target is a wildcard over roles; a role target requires its
 /// exact role. The role stamped on a new launch is retained even for wildcard
@@ -113,8 +115,17 @@ pub enum WorkerSpawnAction {
         pane: String,
         socket: Option<String>,
     },
+    /// The single mux create command finished unsuccessfully without a pane
+    /// ID. This is a definite rejection, unlike a killed/timed-out command.
+    CreateRejected {
+        detail: String,
+    },
     Uncertain {
         detail: String,
+    },
+    /// Explicit abandonment after investigation; does not stop any process.
+    Release {
+        reason: String,
     },
 }
 
@@ -133,6 +144,39 @@ pub(super) struct WorkerSpawnRecord {
     #[serde(default)]
     bound_session: Option<String>,
     detail: Option<String>,
+    #[serde(default)]
+    closed_at: Option<OffsetDateTime>,
+}
+
+/// Body-free lifecycle information for operator inventory and recovery.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerSpawnView {
+    pub launch_id: String,
+    pub room: RoomId,
+    pub agent_kind: AgentKind,
+    pub role: String,
+    pub phase: WorkerSpawnPhase,
+    pub pane: Option<String>,
+    pub socket: Option<String>,
+    pub detail: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub lease_until: OffsetDateTime,
+    #[serde(default, with = "time::serde::rfc3339::option")]
+    pub closed_at: Option<OffsetDateTime>,
+}
+
+impl WorkerSpawnRecord {
+    fn close(&mut self, detail: String) {
+        self.phase = WorkerSpawnPhase::Failed;
+        self.closed_at = Some(OffsetDateTime::now_utc());
+        self.detail = Some(detail.chars().take(512).collect());
+    }
+
+    fn expired_history(&self) -> bool {
+        self.phase == WorkerSpawnPhase::Failed
+            && self.closed_at.unwrap_or(self.lease_until)
+                < OffsetDateTime::now_utc() - time::Duration::days(CLOSED_RETENTION_DAYS)
+    }
 }
 
 pub(super) fn load_spawns(
@@ -145,10 +189,77 @@ pub(super) fn load_spawns(
     let mut statement =
         connection.prepare("SELECT payload FROM collaboration_worker_spawns ORDER BY rowid")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    rows.map(|row| Ok(serde_json::from_str(&row?)?)).collect()
+    let mut records: Vec<WorkerSpawnRecord> = rows
+        .map(|row| Ok(serde_json::from_str(&row?)?))
+        .collect::<Result<_, CollaborationError>>()?;
+    drop(statement);
+    for record in &mut records {
+        if record.phase != WorkerSpawnPhase::Failed
+            && record
+                .fence
+                .as_ref()
+                .is_some_and(ProcessFence::definitely_exited)
+        {
+            record.close("observed worker process exited".into());
+            connection.execute(
+                "UPDATE collaboration_worker_spawns SET payload=?2 WHERE id=?1",
+                params![record.launch_id, serde_json::to_string(record)?],
+            )?;
+        }
+        if record.expired_history() {
+            connection.execute(
+                "DELETE FROM collaboration_worker_spawns WHERE id=?1",
+                [&record.launch_id],
+            )?;
+        }
+    }
+    records.retain(|r| !r.expired_history());
+    Ok(records)
 }
 
 impl CollaborationStore {
+    pub async fn worker_spawn_records(&self) -> Vec<WorkerSpawnView> {
+        self.worker_spawns
+            .lock()
+            .await
+            .iter()
+            .map(|r| WorkerSpawnView {
+                launch_id: r.launch_id.clone(),
+                room: r.room.clone(),
+                agent_kind: r.agent_kind,
+                role: r.role.clone(),
+                phase: r.phase,
+                pane: r.pane.clone(),
+                socket: r.socket.clone(),
+                detail: r.detail.clone(),
+                lease_until: r.lease_until,
+                closed_at: r.closed_at,
+            })
+            .collect()
+    }
+
+    fn prune_closed_spawns(
+        &self,
+        records: &mut Vec<WorkerSpawnRecord>,
+    ) -> Result<(), CollaborationError> {
+        if !records.iter().any(WorkerSpawnRecord::expired_history) {
+            return Ok(());
+        }
+        if let Some(path) = &self.database_path {
+            let mut connection = open_database(path)?;
+            let tx = connection.transaction()?;
+            for record in records.iter().filter(|r| r.expired_history()) {
+                tx.execute(
+                    "DELETE FROM collaboration_worker_spawns WHERE id=?1",
+                    [&record.launch_id],
+                )?;
+            }
+            tx.commit()?;
+        }
+        records.retain(|r| !r.expired_history());
+        Ok(())
+    }
+
     fn persist_spawn(&self, record: &WorkerSpawnRecord) -> Result<(), CollaborationError> {
         if let Some(path) = &self.database_path {
             open_database(path)?.execute(
@@ -176,6 +287,7 @@ impl CollaborationStore {
         }
         let spec = spec.normalize()?;
         let mut records = self.worker_spawns.lock().await;
+        self.prune_closed_spawns(&mut records)?;
         for record in records.iter_mut().filter(|r| {
             r.room == caller.room
                 && r.agent_kind == spec.agent_kind
@@ -240,6 +352,7 @@ impl CollaborationStore {
             fence: None,
             bound_session: None,
             detail: None,
+            closed_at: None,
         };
         self.persist_spawn(&record)?;
         records.push(record);
@@ -257,6 +370,11 @@ impl CollaborationStore {
         panes: &[PaneInfo],
     ) -> Result<(), CollaborationError> {
         self.ensure_enabled()?;
+        if let WorkerSpawnAction::Release { reason } = action {
+            return self
+                .release_worker_spawn(caller, launch_id, &reason, panes)
+                .await;
+        }
         let mut records = self.worker_spawns.lock().await;
         let record = records
             .iter_mut()
@@ -308,18 +426,122 @@ impl CollaborationStore {
                     })?;
                 self.observe_spawn_pane(&mut updated, observed).await?;
             }
-            WorkerSpawnAction::Uncertain { detail } => {
-                if matches!(
+            WorkerSpawnAction::CreateRejected { detail } => {
+                if !matches!(
                     record.phase,
-                    WorkerSpawnPhase::Requested
-                        | WorkerSpawnPhase::Launching
-                        | WorkerSpawnPhase::Uncertain
-                ) {
-                    updated.phase = WorkerSpawnPhase::Uncertain;
-                    updated.detail = Some(detail.chars().take(512).collect());
+                    WorkerSpawnPhase::Launching | WorkerSpawnPhase::Uncertain
+                ) || record.fence.is_some()
+                    || panes
+                        .iter()
+                        .any(|p| p.worker_launch_id.as_deref() == Some(launch_id))
+                {
+                    return Err(CollaborationError::DispatchConflict(launch_id.into()));
+                }
+                updated.close(format!("mux create rejected: {detail}"));
+            }
+            WorkerSpawnAction::Uncertain { detail } => {
+                match record.phase {
+                    // No Begin means no physical effect was authorized. Close
+                    // the token so late Begin cannot resurrect it.
+                    WorkerSpawnPhase::Requested => {
+                        updated.close(format!("failed before Begin: {detail}"));
+                    }
+                    WorkerSpawnPhase::Launching | WorkerSpawnPhase::Uncertain => {
+                        updated.phase = WorkerSpawnPhase::Uncertain;
+                        updated.detail = Some(detail.chars().take(512).collect());
+                    }
+                    _ => {}
                 }
             }
+            WorkerSpawnAction::Release { .. } => {
+                unreachable!("release dispatched before taking the lock")
+            }
         }
+        self.persist_spawn(&updated)?;
+        *record = updated;
+        self.publish_change();
+        Ok(())
+    }
+
+    /// A console/operator or the exact originating session can abandon a
+    /// reservation. This is explicit recovery, never an automatic lease expiry.
+    pub async fn release_worker_spawn(
+        &self,
+        caller: &Participant,
+        launch_id: &str,
+        reason: &str,
+        panes: &[PaneInfo],
+    ) -> Result<(), CollaborationError> {
+        self.ensure_enabled()?;
+        let reason = reason.trim();
+        if reason.is_empty() || reason.len() > 512 {
+            return Err(CollaborationError::UnknownTarget(
+                "release needs a reason (1-512 bytes)".into(),
+            ));
+        }
+        let mut records = self.worker_spawns.lock().await;
+        let record = records
+            .iter_mut()
+            .find(|r| r.launch_id == launch_id)
+            .ok_or_else(|| CollaborationError::UnknownTarget("unknown worker launch".into()))?;
+        if !caller.console && !record.owner.same_session(caller) {
+            return Err(CollaborationError::ScopeDenied);
+        }
+        if record.phase == WorkerSpawnPhase::Failed {
+            return Ok(());
+        }
+        if record.phase == WorkerSpawnPhase::Launching
+            && record.lease_until > OffsetDateTime::now_utc()
+        {
+            return Err(CollaborationError::UnknownTarget(
+                "launch is still active; stop the launcher and let its lease expire before release"
+                    .into(),
+            ));
+        }
+        let fence = match record.fence.clone() {
+            Some(fence) => Some(fence),
+            None => self.worker_launch_fence(launch_id).await,
+        };
+        if let Some(fence) = fence {
+            let (exited, location) = observe_fence(
+                fence,
+                record.agent_kind,
+                record.pane.clone(),
+                record.socket.clone(),
+                panes.to_vec(),
+            )
+            .await;
+            let moved = location
+                .as_ref()
+                .is_some_and(|p| !same_spawn_location(record, p));
+            if !exited && !moved {
+                return Err(CollaborationError::UnknownTarget("worker process still matches or cannot be disproved; stop it or verify its move before release".into()));
+            }
+        } else {
+            // Without a committed grant, a stamp is still evidence of a
+            // live effect; inspect it without minting worker authority.
+            let kind = record.agent_kind;
+            let stamped: Vec<_> = panes
+                .iter()
+                .filter(|p| p.worker_launch_id.as_deref() == Some(launch_id))
+                .cloned()
+                .collect();
+            if tokio::task::spawn_blocking(move || {
+                stamped
+                    .iter()
+                    .any(|p| ProcessFence::observe(p, kind).is_some())
+            })
+            .await
+            .unwrap_or(true)
+            {
+                return Err(CollaborationError::UnknownTarget(
+                    "stamped worker process is still live; inspect or stop it before release"
+                        .into(),
+                ));
+            }
+        }
+        let mut updated = record.clone();
+        updated.close(format!("released: {reason}"));
         self.persist_spawn(&updated)?;
         *record = updated;
         self.publish_change();
@@ -364,7 +586,7 @@ impl CollaborationStore {
         if record.phase == WorkerSpawnPhase::Requested {
             if record.lease_until <= now {
                 // No physical effect was authorized. Late Begin will refuse.
-                record.phase = WorkerSpawnPhase::Failed;
+                record.close("reservation expired before Begin".into());
             }
             return Ok(());
         }
@@ -412,31 +634,40 @@ impl CollaborationStore {
         if let Some(session) = self.worker_launch_binding(&record.launch_id).await {
             record.bound_session = Some(session);
         }
+        // Grant commit and record commit are separate writes. Recover the
+        // existing fence even if its stamped pane has moved out of this room.
+        if record.fence.is_none() {
+            record.fence = self.worker_launch_fence(&record.launch_id).await;
+        }
         let Some(fence) = record.fence.clone() else {
             return Ok(());
         };
-        let pane = record.pane.clone();
-        let socket = record.socket.clone();
         let kind = record.agent_kind;
-        let observed = panes.to_vec();
-        let room = record.room.clone();
-        let (exited, matches) = tokio::task::spawn_blocking(move || {
-            (
-                fence.definitely_exited(),
-                pane.as_deref()
-                    .and_then(|id| super::unique_pane(id, socket.as_deref(), &observed))
-                    .is_some_and(|p| {
-                        pane_room(&p.pane_id, p, p.socket.clone()) == room
-                            && ProcessFence::observe(p, kind).as_ref() == Some(&fence)
-                    }),
-            )
-        })
-        .await
-        .unwrap_or((false, false));
+        let (exited, location) = observe_fence(
+            fence,
+            kind,
+            record.pane.clone(),
+            record.socket.clone(),
+            panes.to_vec(),
+        )
+        .await;
+        if record.pane.is_none() {
+            if let Some(pane) = location.as_ref().filter(|p| same_spawn_location(record, p)) {
+                record.pane = Some(pane.pane_id.clone());
+                record.socket.clone_from(&pane.socket);
+                record.phase = WorkerSpawnPhase::PaneObserved;
+            }
+        }
         if exited {
-            record.phase = WorkerSpawnPhase::Failed;
-            record.detail = Some("observed worker process exited".into());
-        } else if !matches {
+            record.close("observed worker process exited".into());
+        } else if location
+            .as_ref()
+            .is_some_and(|p| !same_spawn_location(record, p))
+        {
+            // Positive process evidence in another room/endpoint is a move,
+            // not uncertainty about whether the old room still owns capacity.
+            record.close("worker moved to another room or endpoint".into());
+        } else if location.is_none() {
             record.phase = WorkerSpawnPhase::Uncertain;
             record.detail = Some("worker endpoint no longer matches its process fence".into());
         } else if let Some(peer) = participants.iter().find(|p| {
@@ -448,14 +679,59 @@ impl CollaborationStore {
                 && !is_pending_session(&p.agent_session_id)
         }) {
             record.bound_session = Some(peer.agent_session_id.clone());
-            record.phase = if matches!(peer.state, AgentState::Error | AgentState::Stopped) {
-                WorkerSpawnPhase::Failed
+            if matches!(peer.state, AgentState::Error | AgentState::Stopped) {
+                record.close("worker became ineligible for reuse".into());
             } else {
-                WorkerSpawnPhase::SessionBound
-            };
+                record.phase = WorkerSpawnPhase::SessionBound;
+            }
         }
         Ok(())
     }
+}
+
+fn same_spawn_location(record: &WorkerSpawnRecord, pane: &PaneInfo) -> bool {
+    pane_room(&pane.pane_id, pane, pane.socket.clone()) == record.room
+        && record.pane.as_deref().is_none_or(|id| id == pane.pane_id)
+        && record
+            .socket
+            .as_deref()
+            .is_none_or(|socket| pane.socket.as_deref() == Some(socket))
+}
+
+async fn observe_fence(
+    fence: ProcessFence,
+    kind: AgentKind,
+    pane: Option<String>,
+    socket: Option<String>,
+    panes: Vec<PaneInfo>,
+) -> (bool, Option<PaneInfo>) {
+    tokio::task::spawn_blocking(move || {
+        let exited = fence.definitely_exited();
+        let matches = |p: &&PaneInfo| ProcessFence::observe(p, kind).as_ref() == Some(&fence);
+        // The fast path avoids probing unrelated panes on ordinary calls.
+        if let Some(found) = pane
+            .as_deref()
+            .and_then(|id| super::unique_pane(id, socket.as_deref(), &panes))
+            .filter(|p| matches(p))
+        {
+            return (exited, Some(found.clone()));
+        }
+        let locations: Vec<_> = panes.iter().filter(matches).collect();
+        let location = locations
+            .first()
+            .filter(|first| {
+                locations.iter().all(|p| {
+                    p.pane_id == first.pane_id
+                        && p.socket == first.socket
+                        && pane_room(&p.pane_id, p, p.socket.clone())
+                            == pane_room(&first.pane_id, first, first.socket.clone())
+                })
+            })
+            .map(|p| (*p).clone());
+        (exited, location)
+    })
+    .await
+    .unwrap_or((false, None))
 }
 
 fn state_rank(state: AgentState) -> u8 {
@@ -718,6 +994,16 @@ mod tests {
             "tty":"", "current_command":"codex", "title":"", "pane_pid":child.0.id(), "socket":"default",
             "agent_program":"codex", "agent_role":"reviewer", "worker_launch_id":id
         })).unwrap();
+        // Some tests inspect an uncommitted launch directly, without the
+        // registration path's own startup wait. Synchronize the fixture's exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while ProcessFence::observe(&pane, AgentKind::Codex).is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker fixture did not exec"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         (child, pane)
     }
 
@@ -868,6 +1154,367 @@ mod tests {
         ));
         child.0.kill().unwrap();
         child.0.wait().unwrap();
+        assert!(
+            matches!(store.acquire_worker_spawn(&caller(), origin(), spec(None), &[], &[pane]).await.unwrap(), WorkerSpawnAcquisition::LaunchToken { ticket } if ticket.launch_id != first.launch_id)
+        );
+    }
+    #[tokio::test]
+    async fn pre_begin_failure_closes_capacity_and_fences_late_begin() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let first = ticket(acquire(&store, None).await);
+        store
+            .update_worker_spawn(
+                &caller(),
+                &first.launch_id,
+                WorkerSpawnAction::Uncertain {
+                    detail: "unsupported host / invalid account / prepare_launch failed".into(),
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.worker_spawn_records().await[0].phase,
+            WorkerSpawnPhase::Failed
+        );
+        assert!(store
+            .update_worker_spawn(&caller(), &first.launch_id, WorkerSpawnAction::Begin, &[])
+            .await
+            .is_err());
+        assert!(
+            matches!(acquire(&store, None).await, WorkerSpawnAcquisition::LaunchToken { ticket } if ticket.launch_id != first.launch_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_mux_create_closes_capacity_even_after_begin() {
+        for lease_expired in [false, true] {
+            let store = CollaborationStore::in_memory(CollaborationOptions::default());
+            let first = ticket(acquire(&store, None).await);
+            store
+                .update_worker_spawn(&caller(), &first.launch_id, WorkerSpawnAction::Begin, &[])
+                .await
+                .unwrap();
+            if lease_expired {
+                expire(&store).await;
+                let _ = acquire(&store, None).await;
+                assert_eq!(
+                    store.worker_spawn_records().await[0].phase,
+                    WorkerSpawnPhase::Uncertain
+                );
+            }
+            store
+                .update_worker_spawn(
+                    &caller(),
+                    &first.launch_id,
+                    WorkerSpawnAction::CreateRejected {
+                        detail: "target pane vanished; command returned 1 without pane id".into(),
+                    },
+                    &[],
+                )
+                .await
+                .unwrap();
+            // The MCP's generic error report must not reopen a known failure.
+            store
+                .update_worker_spawn(
+                    &caller(),
+                    &first.launch_id,
+                    WorkerSpawnAction::Uncertain {
+                        detail: "spawn_peer returned an error".into(),
+                    },
+                    &[],
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                store.worker_spawn_records().await[0].phase,
+                WorkerSpawnPhase::Failed
+            );
+            assert!(matches!(
+                acquire(&store, None).await,
+                WorkerSpawnAcquisition::LaunchToken { .. }
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn observed_worker() -> (
+        std::sync::Arc<CollaborationStore>,
+        WorkerSpawnTicket,
+        Child,
+        PaneInfo,
+    ) {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let first = ticket(acquire(&store, None).await);
+        store
+            .update_worker_spawn(&caller(), &first.launch_id, WorkerSpawnAction::Begin, &[])
+            .await
+            .unwrap();
+        let (child, pane) = worker_pane(&first.launch_id);
+        store
+            .update_worker_spawn(
+                &caller(),
+                &first.launch_id,
+                WorkerSpawnAction::Observe {
+                    pane: pane.pane_id.clone(),
+                    socket: pane.socket.clone(),
+                },
+                std::slice::from_ref(&pane),
+            )
+            .await
+            .unwrap();
+        (store, first, child, pane)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn positively_moved_live_worker_releases_original_capacity() {
+        for change_room in [true, false] {
+            let (store, first, _child, mut pane) = observed_worker().await;
+            if change_room {
+                pane.window_id = "@2".into();
+            } else {
+                pane.pane_id = "%9".into();
+            }
+            // Process fence stays identical: the worker moved, it did not die.
+            assert!(
+                matches!(store.acquire_worker_spawn(&caller(), origin(), spec(None), &[], &[pane]).await.unwrap(), WorkerSpawnAcquisition::LaunchToken { ticket } if ticket.launch_id != first.launch_id)
+            );
+            assert!(store
+                .worker_spawn_records()
+                .await
+                .iter()
+                .any(|r| r.launch_id == first.launch_id
+                    && r.phase == WorkerSpawnPhase::Failed
+                    && r.detail.as_ref().is_some_and(|d| d.contains("moved"))));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn uncertain_release_checks_ownership_and_live_process_then_allows_recovery() {
+        let (store, first, mut child, pane) = observed_worker().await;
+        // An incomplete inventory makes this Uncertain, not dead.
+        assert!(matches!(
+            acquire(&store, None).await,
+            WorkerSpawnAcquisition::Pending {
+                phase: WorkerSpawnPhase::Uncertain,
+                ..
+            }
+        ));
+        let action = || WorkerSpawnAction::Release {
+            reason: "inspected the launch and stopped its launcher".into(),
+        };
+        assert!(
+            store
+                .update_worker_spawn(
+                    &caller(),
+                    &first.launch_id,
+                    action(),
+                    std::slice::from_ref(&pane)
+                )
+                .await
+                .is_err(),
+            "a matching live fence must block release"
+        );
+        assert!(
+            store
+                .update_worker_spawn(&caller(), &first.launch_id, action(), &[])
+                .await
+                .is_err(),
+            "missing inventory is not proof of death"
+        );
+        let mut stranger = caller();
+        stranger.agent_session_id = "stranger".into();
+        assert!(store
+            .update_worker_spawn(&stranger, &first.launch_id, action(), &[])
+            .await
+            .is_err());
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        store
+            .update_worker_spawn(&caller(), &first.launch_id, action(), &[pane])
+            .await
+            .unwrap();
+        assert!(matches!(
+            acquire(&store, None).await,
+            WorkerSpawnAcquisition::LaunchToken { .. }
+        ));
+        assert!(store
+            .update_worker_spawn(&caller(), &first.launch_id, WorkerSpawnAction::Begin, &[])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn operator_can_release_unknown_effects_but_not_an_active_launch() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let first = ticket(acquire(&store, None).await);
+        store
+            .update_worker_spawn(&caller(), &first.launch_id, WorkerSpawnAction::Begin, &[])
+            .await
+            .unwrap();
+        let console = Participant::console(caller().room);
+        assert!(store
+            .release_worker_spawn(
+                &console,
+                &first.launch_id,
+                "confirmed old launcher stopped",
+                &[]
+            )
+            .await
+            .is_err());
+        expire(&store).await;
+        let _ = acquire(&store, None).await;
+        assert!(store
+            .release_worker_spawn(&console, &first.launch_id, " ", &[])
+            .await
+            .is_err());
+        store
+            .release_worker_spawn(
+                &console,
+                &first.launch_id,
+                "confirmed old launcher stopped; no worker process exists",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.worker_spawn_records().await[0].phase,
+            WorkerSpawnPhase::Failed
+        );
+        assert!(matches!(
+            acquire(&store, None).await,
+            WorkerSpawnAcquisition::LaunchToken { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn old_closed_records_are_pruned_but_unknown_effects_survive_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let opts = CollaborationOptions {
+            path: Some(dir.path().join("retention.sqlite3")),
+            ..Default::default()
+        };
+        let store = CollaborationStore::load(opts.clone()).await.unwrap();
+        let old = ticket(acquire(&store, None).await);
+        store
+            .update_worker_spawn(
+                &caller(),
+                &old.launch_id,
+                WorkerSpawnAction::Uncertain {
+                    detail: "failed before Begin".into(),
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        {
+            let mut records = store.worker_spawns.lock().await;
+            records[0].closed_at =
+                Some(OffsetDateTime::now_utc() - time::Duration::days(CLOSED_RETENTION_DAYS + 1));
+            store.persist_spawn(&records[0]).unwrap();
+        }
+        let pending = ticket(acquire(&store, None).await);
+        assert!(store
+            .worker_spawn_records()
+            .await
+            .iter()
+            .all(|r| r.launch_id != old.launch_id));
+        store
+            .update_worker_spawn(&caller(), &pending.launch_id, WorkerSpawnAction::Begin, &[])
+            .await
+            .unwrap();
+        {
+            let mut records = store.worker_spawns.lock().await;
+            records[0].phase = WorkerSpawnPhase::Uncertain;
+            records[0].lease_until = OffsetDateTime::now_utc() - time::Duration::days(365);
+            store.persist_spawn(&records[0]).unwrap();
+        }
+        {
+            // Also exercise load-time retention, independent of acquire's
+            // in-memory cleanup. Unknown effects remain alongside this tombstone.
+            let mut closed = store.worker_spawns.lock().await[0].clone();
+            closed.launch_id = uuid::Uuid::new_v4().to_string();
+            closed.close("historical failure".into());
+            closed.closed_at =
+                Some(OffsetDateTime::now_utc() - time::Duration::days(CLOSED_RETENTION_DAYS + 1));
+            store.persist_spawn(&closed).unwrap();
+        }
+        drop(store);
+        let store = CollaborationStore::load(opts).await.unwrap();
+        assert_eq!(store.worker_spawn_records().await.len(), 1);
+        assert!(
+            matches!(acquire(&store, None).await, WorkerSpawnAcquisition::Pending { launch_id, .. } if launch_id == pending.launch_id)
+        );
+        assert!(store
+            .update_worker_spawn(&caller(), &old.launch_id, WorkerSpawnAction::Begin, &[])
+            .await
+            .is_err());
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn release_cannot_ignore_a_stamped_live_process_without_a_committed_grant() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let first = ticket(acquire(&store, None).await);
+        store
+            .update_worker_spawn(&caller(), &first.launch_id, WorkerSpawnAction::Begin, &[])
+            .await
+            .unwrap();
+        let (mut child, pane) = worker_pane(&first.launch_id);
+        store
+            .update_worker_spawn(
+                &caller(),
+                &first.launch_id,
+                WorkerSpawnAction::Uncertain {
+                    detail: "crashed after stamp".into(),
+                },
+                &[],
+            )
+            .await
+            .unwrap();
+        assert!(store
+            .release_worker_spawn(
+                &caller(),
+                &first.launch_id,
+                "investigated",
+                std::slice::from_ref(&pane)
+            )
+            .await
+            .is_err());
+        assert!(
+            store.worker_launch_fence(&first.launch_id).await.is_none(),
+            "release must not mint a grant to inspect a stamp"
+        );
+        child.0.kill().unwrap();
+        child.0.wait().unwrap();
+        store
+            .release_worker_spawn(
+                &caller(),
+                &first.launch_id,
+                "stamped process was stopped",
+                &[pane],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            acquire(&store, None).await,
+            WorkerSpawnAcquisition::LaunchToken { .. }
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn committed_grant_with_missing_record_endpoint_can_still_follow_a_move() {
+        let (store, first, _child, mut pane) = observed_worker().await;
+        {
+            // Crash after the grant write but before the launch record write.
+            let mut records = store.worker_spawns.lock().await;
+            records[0].fence = None;
+            records[0].pane = None;
+            records[0].socket = None;
+            records[0].phase = WorkerSpawnPhase::Launching;
+        }
+        pane.window_id = "@moved".into();
         assert!(
             matches!(store.acquire_worker_spawn(&caller(), origin(), spec(None), &[], &[pane]).await.unwrap(), WorkerSpawnAcquisition::LaunchToken { ticket } if ticket.launch_id != first.launch_id)
         );

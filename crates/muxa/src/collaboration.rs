@@ -12,7 +12,7 @@ mod spawn_coordination;
 use spawn_coordination::{load_spawns, WorkerSpawnRecord};
 pub use spawn_coordination::{
     WorkerSpawnAcquisition, WorkerSpawnAction, WorkerSpawnPhase, WorkerSpawnSpec,
-    WorkerSpawnTicket, WORKER_SPAWN_CAPABILITY,
+    WorkerSpawnTicket, WorkerSpawnView, WORKER_SPAWN_CAPABILITY, WORKER_SPAWN_RELEASE_CAPABILITY,
 };
 mod purpose;
 use purpose::{load_purposes, PurposeGrant};

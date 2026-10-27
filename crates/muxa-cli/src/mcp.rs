@@ -2661,7 +2661,7 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
                 return json_result(&json!({
                     "sent":false, "reason":"launch_pending", "launch_id":launch_id, "phase":phase,
                     "pane":pane, "socket":socket, "detail":detail,
-                    "next_step":"The existing launch owns this capacity. Retry this call after reconciliation; no replacement was spawned.",
+                    "next_step":"The existing launch owns this capacity. Reconcile it, or explicitly release it after stopping its launcher; no replacement was spawned.",
                 }));
             }
             muxa::collaboration::WorkerSpawnAcquisition::LaunchToken { ticket } => {
@@ -2689,9 +2689,21 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
                                 },
                             )
                             .await;
+                        let phase =
+                            client
+                                .collaboration_worker_spawns()
+                                .await
+                                .ok()
+                                .and_then(|records| {
+                                    records
+                                        .into_iter()
+                                        .find(|r| r.launch_id == ticket.launch_id)
+                                        .map(|r| r.phase)
+                                });
+                        let failed = phase == Some(muxa::collaboration::WorkerSpawnPhase::Failed);
                         return json_result(&json!({
-                            "sent":false, "reason":"launch_pending", "launch_id":ticket.launch_id,
-                            "error":error, "next_step":"Reconcile this launch before creating another worker.",
+                            "sent":false, "reason":if failed { "worker_spawn_failed" } else { "launch_pending" }, "launch_id":ticket.launch_id,
+                            "phase":phase, "error":error, "next_step":if failed { "Reservation closed; correct the reported failure and retry." } else { "Reconcile or explicitly release this launch before creating another worker." },
                         }));
                     }
                 }
@@ -3679,7 +3691,7 @@ async fn acquire_peer_capacity(
         .iter()
         .any(|cap| cap == muxa::collaboration::WORKER_SPAWN_CAPABILITY)
     {
-        return Err("automatic worker creation requires muxad with collaboration_worker_spawn_v1; upgrade the daemon".into());
+        return Err("automatic worker creation requires muxad with collaboration_worker_spawn_v1; upgrade/restart muxad and run `muxa doctor` to check daemon and MCP version skew".into());
     }
     let spec = muxa::collaboration::WorkerSpawnSpec {
         agent_kind: muxa::discovery::classify_command(program.label())

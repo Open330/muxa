@@ -627,6 +627,14 @@ enum RequestBody {
         purpose: collaboration::LaunchPurpose,
     },
     /// Daemon-owned worker capacity. Kept separate from inventory reads.
+    /// Operator recovery; the supplied origin must resolve to the console.
+    CollaborationWorkerSpawnRelease {
+        origin: CollaborationOrigin,
+        launch_id: String,
+        reason: String,
+    },
+    /// Body-free launch lifecycle records, with the same trust model as snapshot.
+    CollaborationWorkerSpawns,
     CollaborationWorkerAcquire {
         origin: CollaborationOrigin,
         spec: collaboration::WorkerSpawnSpec,
@@ -864,6 +872,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_mailbox",
     collaboration::HUMAN_PRIORITY_CAPABILITY,
     collaboration::WORKER_SPAWN_CAPABILITY,
+    collaboration::WORKER_SPAWN_RELEASE_CAPABILITY,
     "collaboration_overview_v1",
     "collaboration_expire_v1",
     "collaboration_lifecycle",
@@ -1010,6 +1019,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_spawn: Option<collaboration::WorkerSpawnAcquisition>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_spawns: Option<Vec<collaboration::WorkerSpawnView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
     /// Set on the answer to a long poll that muxad cut short to restart:
     /// nothing changed, and the same request may be asked again.
@@ -1112,6 +1123,7 @@ impl Response {
             collaboration_requests: None,
             collaboration_overview: None,
             worker_spawn: None,
+            worker_spawns: None,
             collaboration_request: None,
             restarting: None,
             ask_entries: None,
@@ -4741,6 +4753,48 @@ async fn handle(
                     ));
                     response
                 }
+                RequestBody::CollaborationWorkerSpawns => {
+                    kind = "collaboration_worker_spawns";
+                    let mut response = Response::ok();
+                    response.worker_spawns = Some(collaboration.worker_spawn_records().await);
+                    response
+                }
+                RequestBody::CollaborationWorkerSpawnRelease {
+                    origin,
+                    launch_id,
+                    reason,
+                } => {
+                    kind = "collaboration_worker_spawn_release";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::WorkerSpawnRelease,
+                        origin.clone(),
+                    );
+                    audit_context.target = Some(launch_id.clone());
+                    audit_context.release_reason = Some(reason.chars().take(512).collect());
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(caller) if caller.console => match collaboration.release_worker_spawn(&caller, &launch_id, &reason, &topology.panes).await {
+                            Ok(()) => Response::ok(),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Ok(_) => Response::err("operator release requires a console origin; owners use the Release action"),
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    pending_audit = Some(collaboration_audit_entry(
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    ));
+                    response
+                }
                 RequestBody::CollaborationWorkerAcquire { origin, spec } => {
                     kind = "collaboration_worker_acquire";
                     let topology = collaboration_participants(
@@ -4774,6 +4828,19 @@ async fn handle(
                 }
                 RequestBody::CollaborationWorkerSpawn { ticket, action } => {
                     kind = "collaboration_worker_spawn";
+                    let audit_context =
+                        if let collaboration::WorkerSpawnAction::Release { reason } = &action {
+                            collaboration_actor.observe_pane(&backends).await;
+                            let mut context = CollaborationAuditContext::new(
+                                CollaborationAuditOperation::WorkerSpawnRelease,
+                                ticket.origin.clone(),
+                            );
+                            context.target = Some(ticket.launch_id.clone());
+                            context.release_reason = Some(reason.chars().take(512).collect());
+                            Some(context)
+                        } else {
+                            None
+                        };
                     let topology = collaboration_participants(
                         &store,
                         &backends,
@@ -4782,7 +4849,7 @@ async fn handle(
                         collaboration_actor.take_request_panes(),
                     )
                     .await;
-                    match topology.resolve_origin(&ticket.origin) {
+                    let response = match topology.resolve_origin(&ticket.origin) {
                         Ok(caller) => match collaboration
                             .update_worker_spawn(
                                 &caller,
@@ -4796,7 +4863,15 @@ async fn handle(
                             Err(error) => Response::err(error.to_string()),
                         },
                         Err(error) => Response::err(error.to_string()),
+                    };
+                    if let Some(context) = audit_context {
+                        pending_audit = Some(collaboration_audit_entry(
+                            &collaboration_actor,
+                            context,
+                            &response,
+                        ));
                     }
+                    response
                 }
                 RequestBody::CollaborationWorkerLaunch {
                     pane,
@@ -6494,6 +6569,23 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         Ok(resp["capture"].as_str().map(str::to_owned))
+    }
+
+    pub async fn collaboration_worker_spawns(
+        &self,
+    ) -> Result<Vec<collaboration::WorkerSpawnView>, RuntimeError> {
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawns"})).await?;
+        serde_json::from_value(response["worker_spawns"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_worker_spawn_release(
+        &self,
+        origin: &CollaborationOrigin,
+        launch_id: &str,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawn_release", "origin":origin, "launch_id":launch_id, "reason":reason})).await?;
+        Ok(())
     }
 
     pub async fn collaboration_worker_acquire(
@@ -10763,6 +10855,109 @@ mod tests {
             console: false,
             agent_session_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn worker_spawn_release_is_console_scoped_and_audits_owner_and_operator_attempts() {
+        use collaboration::{
+            WorkerSpawnAcquisition, WorkerSpawnAction, WorkerSpawnPhase, WorkerSpawnSpec,
+        };
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("worker-release.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "owner", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%2", "other", AgentKind::ClaudeCode).await;
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        });
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox)
+            .with_collaboration_audit(audit.clone());
+        let (stop, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let spec = WorkerSpawnSpec {
+            agent_kind: AgentKind::Codex,
+            role: None,
+            launch_role: "reviewer".into(),
+        };
+        let mut console = pane_origin("%2");
+        console.console = true;
+        for owner_release in [true, false] {
+            let WorkerSpawnAcquisition::LaunchToken { ticket } = client
+                .collaboration_worker_acquire(&pane_origin("%1"), &spec)
+                .await
+                .unwrap()
+            else {
+                panic!("capacity not released")
+            };
+            client
+                .collaboration_worker_spawn(&ticket, &WorkerSpawnAction::Begin)
+                .await
+                .unwrap();
+            client
+                .collaboration_worker_spawn(
+                    &ticket,
+                    &WorkerSpawnAction::Uncertain {
+                        detail: "create result unknown".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(client
+                .collaboration_worker_spawn_release(
+                    &pane_origin("%2"),
+                    &ticket.launch_id,
+                    "not a console"
+                )
+                .await
+                .is_err());
+            if owner_release {
+                client
+                    .collaboration_worker_spawn(
+                        &ticket,
+                        &WorkerSpawnAction::Release {
+                            reason: "owner verified no effects and stopped launcher".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .collaboration_worker_spawn_release(
+                        &console,
+                        &ticket.launch_id,
+                        "operator verified no effects and stopped launcher",
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(client
+                .collaboration_worker_spawns()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.launch_id == ticket.launch_id && r.phase == WorkerSpawnPhase::Failed));
+        }
+        let entries = audit.entries().await;
+        let releases: Vec<_> = entries
+            .iter()
+            .filter(|e| e.operation == CollaborationAuditOperation::WorkerSpawnRelease)
+            .collect();
+        assert_eq!(releases.len(), 4);
+        assert_eq!(releases.iter().filter(|e| e.ok).count(), 2);
+        assert!(releases
+            .iter()
+            .all(|e| e.target.is_some() && e.release_reason.is_some()));
+        stop.send(()).unwrap();
+        serving.await.unwrap();
     }
 
     #[tokio::test]

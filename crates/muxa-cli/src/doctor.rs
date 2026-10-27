@@ -271,10 +271,7 @@ async fn check_muxad(socket: &Path) -> CheckResult {
         )
         .await
         {
-            Ok(Ok(hello)) => hello.version_skew().map_or_else(
-                || CheckResult::Ok(format!("muxad responding at {}", socket.display())),
-                |skew| CheckResult::Warn(skew.to_string()),
-            ),
+            Ok(Ok(hello)) => muxad_hello_verdict(&hello, socket),
             _ => CheckResult::Ok(format!("muxad responding at {}", socket.display())),
         },
         // The inner error already carries the failure mode — including
@@ -299,6 +296,20 @@ async fn check_muxad(socket: &Path) -> CheckResult {
             socket.display()
         )),
     }
+}
+
+fn muxad_hello_verdict(hello: &muxa::ipc::Hello, socket: &Path) -> CheckResult {
+    if let Some(skew) = hello.version_skew() {
+        return CheckResult::Warn(skew.to_string());
+    }
+    if !hello
+        .capabilities
+        .iter()
+        .any(|cap| cap == muxa::collaboration::WORKER_SPAWN_CAPABILITY)
+    {
+        return CheckResult::Warn("muxad lacks collaboration_worker_spawn_v1; automatic worker creation is disabled — upgrade/restart muxad".into());
+    }
+    CheckResult::Ok(format!("muxad responding at {}", socket.display()))
 }
 
 /// One-shot snapshot fetch shared by the post-IPC checks. Returns
@@ -1214,6 +1225,29 @@ fn uid_string() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_version_daemon_without_spawn_coordination_still_warns() {
+        let mut hello = muxa::ipc::Hello {
+            capabilities: Vec::new(),
+            generation: None,
+            protocol: muxa::event::PROTOCOL_VERSION,
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+        };
+        let CheckResult::Warn(message) = muxad_hello_verdict(&hello, Path::new("/tmp/test-muxad"))
+        else {
+            panic!("missing capability must not look healthy")
+        };
+        assert!(message.contains("automatic worker creation is disabled"));
+        assert!(message.contains("upgrade/restart muxad"));
+        hello
+            .capabilities
+            .push(muxa::collaboration::WORKER_SPAWN_CAPABILITY.into());
+        assert!(matches!(
+            muxad_hello_verdict(&hello, Path::new("/tmp/test-muxad")),
+            CheckResult::Ok(_)
+        ));
+    }
 
     /// A shell rc autostart is the supported setup without systemd.
     #[test]

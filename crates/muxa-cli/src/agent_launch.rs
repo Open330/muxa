@@ -798,6 +798,20 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .context("run tmux agent launcher")?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if create_was_rejected(&output) {
+            if let Some(ticket) = &request.worker_spawn {
+                // Only a completed, unsuccessful single create command with
+                // no pane ID is definite. A missing reply or partial output
+                // remains uncertain and is never silently retried.
+                update_spawn(
+                    &request.socket,
+                    ticket,
+                    &muxa::collaboration::WorkerSpawnAction::CreateRejected {
+                        detail: stderr.clone(),
+                    },
+                )?;
+            }
+        }
         // Name the resolved `-t` value: the input the caller gave (a pane id,
         // a session name) is not what tmux was asked for, and the difference
         // between them is usually the bug.
@@ -948,6 +962,13 @@ fn account_suffix(decision: Option<&muxa::account_route::AccountDecision>) -> St
     decision
         .and_then(|decision| decision.account.as_deref())
         .map_or_else(String::new, |account| format!(" on {account}"))
+}
+
+fn create_was_rejected(output: &std::process::Output) -> bool {
+    !output.status.success()
+        && !String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim().starts_with('%'))
 }
 
 fn update_spawn(
@@ -1403,6 +1424,29 @@ mod tests {
     /// room while the right one never heard, free to hand it out again.
     /// `scripts/alias-socket-check.py` shows the two panes that results in;
     /// this pins the wiring that carries the socket at all.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_completed_rejected_create_without_a_pane_id_is_definite_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(256),
+            stdout: Vec::new(),
+            stderr: b"target not found".to_vec(),
+        };
+        assert!(create_was_rejected(&output));
+        output.stdout = b"%42\n".to_vec();
+        assert!(
+            !create_was_rejected(&output),
+            "partial create output must retain uncertainty"
+        );
+        output.status = std::process::ExitStatus::from_raw(0);
+        output.stdout.clear();
+        assert!(
+            !create_was_rejected(&output),
+            "success without a pane id is ambiguous, not a rejection"
+        );
+    }
+
     #[test]
     fn agent_start_carries_the_callers_socket() {
         let args = StartArgs {
