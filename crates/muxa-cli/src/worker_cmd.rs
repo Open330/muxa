@@ -40,12 +40,14 @@ enum Action {
 }
 
 /// What `muxa workers --json` prints: the inventory, plus launches that
-/// still hold capacity without a registered worker.
+/// still hold capacity without a registered worker. `launches` is `null`
+/// when the daemon predates launch coordination, never an empty list
+/// standing in for "could not tell".
 #[derive(Serialize)]
 struct Listing<'a> {
     #[serde(flatten)]
     inventory: &'a WorkerInventory,
-    launches: Vec<&'a WorkerSpawnView>,
+    launches: Option<Vec<&'a WorkerSpawnView>>,
 }
 
 pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
@@ -62,13 +64,29 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
         .collaboration_workers(args.idle_hours.saturating_mul(3600))
         .await
         .context("reading the worker inventory from muxad (an older daemon lacks it)")?;
-    // Launch records come from the spawn coordinator; a daemon without it
-    // simply has none to show.
-    let spawns = client
-        .collaboration_worker_spawns()
+    // Launch records come from the spawn coordinator. Only a daemon that
+    // lacks it may show none; any other failure is reported, because an empty
+    // list would hide the very launch that blocks a room.
+    let supported = client
+        .hello(std::time::Duration::from_secs(3))
         .await
-        .unwrap_or_default();
-    let launches = unfinished(&spawns);
+        .context("asking muxad what it supports")?
+        .capabilities
+        .iter()
+        .any(|cap| cap == muxa::collaboration::WORKER_SPAWN_RELEASE_CAPABILITY);
+    let spawns = if supported {
+        Some(
+            client
+                .collaboration_worker_spawns()
+                .await
+                .context("reading worker launch records from muxad")?,
+        )
+    } else {
+        None
+    };
+    let launches = spawns
+        .as_deref()
+        .map(|spawns| unfinished(spawns, &inventory));
     if args.json {
         println!(
             "{}",
@@ -79,21 +97,37 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
         );
     } else {
         print!("{}", render(&inventory));
-        print!("{}", render_launches(&launches));
+        match &launches {
+            Some(launches) => print!("{}", render_launches(launches)),
+            None => println!(
+                "\nLaunch records: not available from this muxad (it predates launch \
+                 coordination); upgrade and restart it."
+            ),
+        }
     }
     Ok(())
 }
 
-/// Launches still holding capacity without a bound worker session.
-fn unfinished(spawns: &[WorkerSpawnView]) -> Vec<&WorkerSpawnView> {
+/// Launches still holding capacity that the worker list does not already
+/// account for. A bound launch is hidden only when its worker is listed: a
+/// bound worker that started a new (protected) session still holds the
+/// launch's capacity, and that launch is what a caller's `launch_pending`
+/// points at.
+fn unfinished<'a>(
+    spawns: &'a [WorkerSpawnView],
+    inventory: &WorkerInventory,
+) -> Vec<&'a WorkerSpawnView> {
+    let listed = |spawn: &WorkerSpawnView| {
+        inventory.workers.iter().any(|worker| {
+            spawn.pane.as_deref() == Some(worker.pane.as_str()) && spawn.room == worker.room
+        })
+    };
     spawns
         .iter()
         .filter(|spawn| {
             spawn.closed_at.is_none()
-                && !matches!(
-                    spawn.phase,
-                    WorkerSpawnPhase::Failed | WorkerSpawnPhase::SessionBound
-                )
+                && spawn.phase != WorkerSpawnPhase::Failed
+                && !(spawn.phase == WorkerSpawnPhase::SessionBound && listed(spawn))
         })
         .collect()
 }
@@ -333,19 +367,33 @@ mod tests {
 
     #[test]
     fn only_launches_still_holding_capacity_are_shown_with_how_to_free_them() {
+        let mut bound = spawn("bound", WorkerSpawnPhase::SessionBound, false);
+        bound.pane = Some("rmux:%5".into());
+        // Bound, but its worker started a new protected session and is no
+        // longer listed: it still holds capacity, so it must show.
+        let mut orphaned = spawn("orphaned", WorkerSpawnPhase::SessionBound, false);
+        orphaned.pane = Some("rmux:%6".into());
         let spawns = [
-            spawn("bound", WorkerSpawnPhase::SessionBound, false),
+            bound,
+            orphaned,
             spawn("failed", WorkerSpawnPhase::Failed, false),
             spawn("closed", WorkerSpawnPhase::Uncertain, true),
             spawn("stuck", WorkerSpawnPhase::Uncertain, false),
             spawn("starting", WorkerSpawnPhase::Launching, false),
         ];
-        let open = unfinished(&spawns);
+        let mut listed = worker("rmux:%5", vec![]);
+        listed.room.window_id = "@34".into();
+        let inventory = WorkerInventory {
+            workers: vec![listed],
+            idle_threshold_secs: 3600,
+            recorded_grants: 0,
+        };
+        let open = unfinished(&spawns, &inventory);
         assert_eq!(
             open.iter()
                 .map(|s| s.launch_id.as_str())
                 .collect::<Vec<_>>(),
-            ["stuck", "starting"]
+            ["orphaned", "stuck", "starting"]
         );
         let text = render_launches(&open);
         assert!(
@@ -358,7 +406,7 @@ mod tests {
             "{text}"
         );
         // Nothing uncertain, no release advice.
-        assert!(!render_launches(&open[1..]).contains("release"));
+        assert!(!render_launches(&open[2..]).contains("release"));
         assert!(render_launches(&[]).is_empty());
     }
 
@@ -376,6 +424,76 @@ mod tests {
         let column = |line: &str| line.find("reviewer").unwrap();
         assert_eq!(column(lines[1]), column(lines[2]), "{text}");
         assert!(text.contains("claude_code"), "{text}");
+    }
+
+    /// A daemon that answers `collaboration_workers` and fails
+    /// `collaboration_worker_spawns`, advertising `capabilities`.
+    #[cfg(unix)]
+    fn half_working_daemon(dir: &std::path::Path, capabilities: Vec<String>) -> Client {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+        let socket = dir.join("muxad.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let capabilities = capabilities.clone();
+                tokio::spawn(async move {
+                    let (reader, mut writer) = stream.into_split();
+                    let mut lines = BufReader::new(reader).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let answer = match request["kind"].as_str().unwrap_or_default() {
+                            "hello" => serde_json::json!({
+                                "ok": true,
+                                "capabilities": capabilities,
+                                "protocol": muxa::event::PROTOCOL_VERSION,
+                            }),
+                            "collaboration_workers" => serde_json::json!({
+                                "ok": true,
+                                "worker_inventory": {
+                                    "workers": [],
+                                    "idle_threshold_secs": 3600,
+                                    "recorded_grants": 0,
+                                },
+                            }),
+                            _ => serde_json::json!({"ok": false, "error": "coordinator busy"}),
+                        };
+                        let mut bytes = serde_json::to_vec(&answer).unwrap();
+                        bytes.push(b'\n');
+                        if writer.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        Client::new(socket)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_failed_launch_lookup_is_an_error_not_an_empty_list() {
+        let list = || Args {
+            action: None,
+            idle_hours: 1,
+            json: true,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let client = half_working_daemon(
+            dir.path(),
+            vec![muxa::collaboration::WORKER_SPAWN_RELEASE_CAPABILITY.into()],
+        );
+        let error = run(list(), &client).await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("reading worker launch records"),
+            "{error:#}"
+        );
+        // A daemon without launch coordination is not an error: it has none.
+        let older = tempfile::tempdir().unwrap();
+        let client = half_working_daemon(older.path(), Vec::new());
+        run(list(), &client).await.unwrap();
     }
 
     #[test]
