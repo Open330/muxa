@@ -130,7 +130,9 @@ pub fn installed_muxa() -> Option<std::path::PathBuf> {
         })
 }
 
-/// Scan for `muxa mcp` processes started before `binary` was last written.
+/// Scan for `muxa mcp` processes started before `binary` was last written
+/// that are not already running it. A server that re-executed itself after
+/// the upgrade keeps its old start time, so its age alone would misreport it.
 pub fn scan(binary: &Path) -> StaleReport {
     let Some(installed) = std::fs::metadata(binary)
         .and_then(|meta| meta.modified())
@@ -149,7 +151,15 @@ pub fn scan(binary: &Path) -> StaleReport {
         .into_iter()
         .flat_map(|backend| backend.list_panes())
         .collect();
-    classify(&procs, age_of_binary, &panes, codex_home_of)
+    let candidates: Vec<u32> = procs
+        .iter()
+        .filter(|proc| is_muxa_mcp(&proc.args) && proc.age > age_of_binary + START_SLACK)
+        .map(|proc| proc.pid)
+        .collect();
+    let images = running_images(&candidates);
+    let installed = file_id(binary);
+    let runs_installed = |pid: u32| installed.is_some() && images.get(&pid).copied() == installed;
+    classify(&procs, age_of_binary, &panes, codex_home_of, runs_installed)
 }
 
 fn classify(
@@ -157,6 +167,7 @@ fn classify(
     age_of_binary: Duration,
     panes: &[muxa::tmux::PaneInfo],
     codex_home: impl Fn(u32) -> Option<String>,
+    runs_installed: impl Fn(u32) -> bool,
 ) -> StaleReport {
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
     // A pane in a grouped session is listed once per `~view~` client
@@ -169,7 +180,10 @@ fn classify(
         .collect();
     let mut report = StaleReport::default();
     for proc in procs {
-        if !is_muxa_mcp(&proc.args) || proc.age <= age_of_binary + START_SLACK {
+        if !is_muxa_mcp(&proc.args)
+            || proc.age <= age_of_binary + START_SLACK
+            || runs_installed(proc.pid)
+        {
             continue;
         }
         let mut cur = proc.parent_pid;
@@ -302,6 +316,83 @@ fn parse_etime(value: &str) -> Option<Duration> {
     Some(Duration::from_secs(days * 86_400 + seconds))
 }
 
+/// `(device, inode)` of a file, following symlinks: the file `muxa` names now.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// `(device, inode)` of the file each process is executing, which `exec`
+/// replaces while the start time stays. The launch path will not do: it is
+/// the symlink the agent ran, which now names the new build.
+#[cfg(target_os = "linux")]
+fn running_images(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
+    pids.iter()
+        .filter_map(|&pid| Some((pid, file_id(Path::new(&format!("/proc/{pid}/exe")))?)))
+        .collect()
+}
+
+/// macOS keeps no `/proc`; `lsof` reports each process's mapped executable as
+/// its first `txt` file, with device and inode, in one call for all of them.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn running_images(pids: &[u32]) -> HashMap<u32, (u64, u64)> {
+    if pids.is_empty() {
+        return HashMap::new();
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let Ok(output) = std::process::Command::new("lsof")
+        .args(["-a", "-d", "txt", "-FpDi", "-p", &list])
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return HashMap::new();
+    };
+    parse_lsof_images(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(unix))]
+fn running_images(_pids: &[u32]) -> HashMap<u32, (u64, u64)> {
+    HashMap::new()
+}
+
+/// `lsof -F pDi` output: a `p` line opens each process, then `f`/`D`/`i`
+/// lines per file. Only the first file of each process is kept.
+#[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(dead_code))]
+fn parse_lsof_images(text: &str) -> HashMap<u32, (u64, u64)> {
+    let mut images = HashMap::new();
+    let (mut pid, mut device) = (None, None);
+    for line in text.lines() {
+        let (tag, value) = line.split_at(line.len().min(1));
+        match tag {
+            "p" => (pid, device) = (value.parse().ok(), None),
+            "D" => {
+                device = value
+                    .strip_prefix("0x")
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                    .or_else(|| value.parse().ok());
+            }
+            "i" => {
+                if let (Some(pid), Some(device), Ok(inode)) = (pid, device, value.parse()) {
+                    images.entry(pid).or_insert((device, inode));
+                }
+            }
+            _ => {}
+        }
+    }
+    images
+}
+
 /// The server's `CODEX_HOME`, which names the daemon to restart. Read from
 /// its environment whole: on macOS `ps eww` would cut a profile under
 /// `~/Library/Application Support/…` at the space.
@@ -390,6 +481,7 @@ mod tests {
                 pane("rmux:%217", 200),
             ],
             |_| Some("/home/u/.codex".into()),
+            |_| false,
         );
         assert_eq!(
             report
@@ -417,9 +509,13 @@ mod tests {
             ),
             proc(16327, 2693, 9000, "muxa mcp"),
         ];
-        let report = classify(&procs, Duration::from_secs(60), &[], |_| {
-            Some("/home/u/.codex".into())
-        });
+        let report = classify(
+            &procs,
+            Duration::from_secs(60),
+            &[],
+            |_| Some("/home/u/.codex".into()),
+            |_| false,
+        );
         assert_eq!(
             report
                 .shared_codex
@@ -448,6 +544,7 @@ mod tests {
             Duration::from_secs(60),
             &[pane("rmux:%439", 200)],
             |_| Some("/profiles/shared".into()),
+            |_| false,
         );
         assert_eq!(
             report
@@ -521,5 +618,61 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(found.as_deref(), Some(home));
+    }
+
+    #[test]
+    fn a_server_that_reexecuted_into_the_installed_binary_is_not_stale() {
+        let procs = [
+            proc(200, 1, 9000, "zsh"),
+            proc(201, 200, 9000, "claude"),
+            // Started long before the install, but now running it.
+            proc(202, 201, 9000, "muxa mcp"),
+            proc(203, 201, 9000, "muxa mcp"),
+        ];
+        let report = classify(
+            &procs,
+            Duration::from_secs(60),
+            &[pane("rmux:%7", 200)],
+            |_| None,
+            |pid| pid == 202,
+        );
+        assert_eq!(report.panes.get("rmux:%7 (callabo:4.1)"), Some(&1));
+        assert_eq!(report.total(), 1);
+    }
+
+    #[test]
+    fn lsof_images_keep_each_processs_first_text_file() {
+        let text = "p13873\nftxt\nD0x100000d\ni236278975\nftxt\nD0x100000d\ni99\np14935\nftxt\nD16777229\ni251672943\n";
+        let images = parse_lsof_images(text);
+        assert_eq!(images.get(&13873), Some(&(0x100_000d, 236_278_975)));
+        assert_eq!(images.get(&14935), Some(&(16_777_229, 251_672_943)));
+        assert_eq!(images.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_the_image_a_live_process_is_running() {
+        let exe = std::env::current_exe().unwrap();
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "stale_agents::tests::codex_home_lookup_sleeper",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn helper");
+        let mut found = None;
+        for _ in 0..100 {
+            found = running_images(&[child.id()]).get(&child.id()).copied();
+            if found.is_some() && found == file_id(&exe) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(found, file_id(&exe));
     }
 }
