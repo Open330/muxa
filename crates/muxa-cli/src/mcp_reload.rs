@@ -108,7 +108,39 @@ fn stale_count(socket: &std::path::Path, owners: &crate::stale_agents::StaleRepo
         .sum()
 }
 
-fn plan(args: &McpReloadArgs, stale: &crate::stale_agents::StaleReport) -> Result<Report> {
+/// Provider session ids of standalone Codex owners, by owner label. A
+/// standalone client is refreshed only by restarting it, and naming its
+/// conversation is what makes that a resume rather than a lost session.
+type Sessions = std::collections::BTreeMap<String, String>;
+
+async fn standalone_sessions(
+    client: &muxa::ipc::Client,
+    stale: &crate::stale_agents::StaleReport,
+) -> Sessions {
+    let mut out = Sessions::new();
+    for owner in &stale.standalone_codex {
+        // Labels read `<pane> (<session>:<window>.<pane>)`.
+        let Some(pane) = owner.split_whitespace().next() else {
+            continue;
+        };
+        let lookup = tokio::time::timeout(Duration::from_secs(2), client.by_pane(pane)).await;
+        if let Ok(Ok(agents)) = lookup {
+            if let Some(agent) = agents
+                .iter()
+                .find(|agent| agent.kind == muxa::event::AgentKind::Codex)
+            {
+                out.insert(owner.clone(), agent.session_id.clone());
+            }
+        }
+    }
+    out
+}
+
+fn plan(
+    args: &McpReloadArgs,
+    stale: &crate::stale_agents::StaleReport,
+    sessions: &Sessions,
+) -> Result<Report> {
     let mut homes = BTreeSet::new();
     let mut manual = Vec::new();
     if args.all {
@@ -123,7 +155,12 @@ fn plan(args: &McpReloadArgs, stale: &crate::stale_agents::StaleReport) -> Resul
         }
         for owner in stale.panes.keys() {
             manual.push(if stale.standalone_codex.contains(owner) {
-                format!("{owner}: standalone Codex CLI, not an app-server connection; reconnect MCP in that client, or restart/resume it when idle")
+                // Codex has no in-client MCP reconnect; a standalone CLI picks
+                // up the new server only when it starts again.
+                match sessions.get(owner) {
+                    Some(id) => format!("{owner}: standalone Codex CLI, outside the app-server reload; when it is idle, exit it and start it again the way it was launched with `resume {id}` (e.g. `codex resume {id}`)"),
+                    None => format!("{owner}: standalone Codex CLI, outside the app-server reload; when it is idle, exit it and resume its conversation (`codex resume`)"),
+                }
             } else { format!("{owner}: reconnect MCP in its agent client") });
         }
         if stale.other > 0 {
@@ -252,11 +289,16 @@ async fn refresh_hosts(
         .await
 }
 
-pub async fn run(args: McpReloadArgs) -> Result<()> {
+pub async fn run(client: &muxa::ipc::Client, args: McpReloadArgs) -> Result<()> {
     let binary = crate::stale_agents::installed_muxa()
         .context("cannot locate installed muxa to discover stale owners")?;
     let owners = crate::stale_agents::scan(&binary);
-    let mut report = plan(&args, &owners)?;
+    let sessions = if args.all {
+        standalone_sessions(client, &owners).await
+    } else {
+        Sessions::new()
+    };
+    let mut report = plan(&args, &owners, &sessions)?;
     let revision = crate::mcp_revision::binary_revision(&binary)?;
     report.hosts = refresh_hosts(report.hosts, &binary, &revision, &args).await;
     if !args.dry_run {
@@ -277,6 +319,12 @@ pub async fn run(args: McpReloadArgs) -> Result<()> {
                 host.detail
             );
         }
+        if report.hosts.is_empty() && !report.manual_reconnect.is_empty() {
+            println!("No shared Codex profile needed a refresh.");
+        }
+        if !report.manual_reconnect.is_empty() {
+            println!("Needs a manual reconnect:");
+        }
         for owner in &report.manual_reconnect {
             println!("manual  {owner}");
         }
@@ -286,6 +334,16 @@ pub async fn run(args: McpReloadArgs) -> Result<()> {
     }
     if !args.dry_run {
         require_acknowledged(&report)?;
+        if !report.manual_reconnect.is_empty() {
+            // Everything muxa can refresh was refreshed; what is left is a
+            // client only its owner can restart. That is unfinished, not a
+            // failure: exit 2, the same as a refresh still pending.
+            eprintln!(
+                "{} MCP owner(s) still run an older muxa and need the reconnect listed above",
+                report.manual_reconnect.len()
+            );
+            std::process::exit(2);
+        }
     }
     if !args.dry_run && pending_refresh(&report) {
         // A queued API acknowledgement does not mean old tool connections were replaced.
@@ -302,9 +360,6 @@ fn require_acknowledged(report: &Report) -> Result<()> {
         .count();
     if failed > 0 {
         bail!("{failed} host request(s) were not acknowledged; {} owner(s) need manual reconnect; inspect the per-profile result", report.manual_reconnect.len());
-    }
-    if !report.manual_reconnect.is_empty() {
-        bail!("{} MCP owner(s) are outside the app-server reload API; see manual_reconnect for the owning client and recovery", report.manual_reconnect.len());
     }
     Ok(())
 }
@@ -574,7 +629,7 @@ mod tests {
     #[test]
     fn acknowledgement_with_retained_processes_is_pending_not_finished() {
         let owners = crate::stale_agents::StaleReport::default();
-        let mut report = plan(&args(), &owners).unwrap();
+        let mut report = plan(&args(), &owners, &Sessions::new()).unwrap();
         let host = &mut report.hosts[0];
         host.state = "queued";
         host.muxa_connections = Some(3);
@@ -613,6 +668,7 @@ mod tests {
                 ..args()
             },
             &stale,
+            &Sessions::new(),
         )
         .unwrap();
         assert_eq!(report.hosts.len(), 1);
@@ -653,7 +709,7 @@ mod tests {
         stale.panes.insert("claude@%9".into(), 1);
         stale.panes.insert("codex@%10".into(), 1);
         stale.standalone_codex.insert("codex@%10".into());
-        let single = plan(&args(), &stale).unwrap();
+        let single = plan(&args(), &stale, &Sessions::new()).unwrap();
         assert_eq!(
             single.hosts[0].codex_home,
             PathBuf::from("/profiles/current")
@@ -666,14 +722,18 @@ mod tests {
                 ..args()
             },
             &stale,
+            &Sessions::from([("codex@%10".to_owned(), "019a-thread".to_owned())]),
         )
         .unwrap();
         assert_eq!(all.hosts.len(), 1);
         assert_eq!(all.hosts[0].codex_home, PathBuf::from("/profiles/a"));
         assert_eq!(all.manual_reconnect.len(), 3);
-        assert!(all.manual_reconnect.iter().any(|message| message
-            .contains("standalone Codex CLI")
-            && message.contains("when idle")));
+        assert!(all
+            .manual_reconnect
+            .iter()
+            .any(|message| message.contains("standalone Codex CLI")
+                && message.contains("when it is idle")
+                && message.contains("resume 019a-thread")));
         assert!(all.scope.contains("registered Muxa connections"));
     }
 
@@ -735,10 +795,14 @@ mod tests {
             }));
             let mut options = args();
             options.codex_home = Some(home);
-            let mut host = plan(&options, &crate::stale_agents::StaleReport::default())
-                .unwrap()
-                .hosts
-                .remove(0);
+            let mut host = plan(
+                &options,
+                &crate::stale_agents::StaleReport::default(),
+                &Sessions::new(),
+            )
+            .unwrap()
+            .hosts
+            .remove(0);
             host.control_socket = socket;
             hosts.push(host);
         }
@@ -895,7 +959,12 @@ mod tests {
             (2, 1)
         );
         server.await.unwrap();
-        let mut report = plan(&args(), &crate::stale_agents::StaleReport::default()).unwrap();
+        let mut report = plan(
+            &args(),
+            &crate::stale_agents::StaleReport::default(),
+            &Sessions::new(),
+        )
+        .unwrap();
         report.hosts[0].state = "reloaded";
         report.hosts[0].stale_muxa_processes_after = Some(10);
         report.hosts[0].muxa_connections = Some(2);

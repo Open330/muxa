@@ -701,7 +701,7 @@ fn live_shape(endpoint: &BackendEndpoint) -> Option<plan::LiveShape> {
 
 pub async fn reload(client: &Client, args: ReloadArgs) -> Result<()> {
     match args.target {
-        Some(ReloadTarget::Mcp(args)) => crate::mcp_reload::run(args).await,
+        Some(ReloadTarget::Mcp(args)) => crate::mcp_reload::run(client, args).await,
         Some(ReloadTarget::Mux(args)) => reload_multiplexer(client, args).await,
         None => reload_multiplexer(client, args.multiplexer).await,
     }
