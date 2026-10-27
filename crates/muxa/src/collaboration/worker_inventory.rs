@@ -11,7 +11,6 @@ use super::{addresses, is_pending_session, LaunchPurpose, Participant, RequestSt
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use time::OffsetDateTime;
 
 /// One live worker.
@@ -89,12 +88,29 @@ impl WorkerInventory {
     }
 }
 
+/// When `participant` became idle, read from its agent row. A registered
+/// session is matched by session id; a pending launch has no session yet,
+/// so it is matched by its exact pane the way topology does. Only a row that
+/// reads `Idle` counts; no row, or another state, is no observation.
+#[must_use]
+pub fn idle_since(participant: &Participant, agents: &[Agent]) -> Option<OffsetDateTime> {
+    let row = if is_pending_session(&participant.agent_session_id) {
+        super::live_pane_row(&participant.pane, participant.socket.as_deref(), agents)
+    } else {
+        agents
+            .iter()
+            .find(|agent| agent.session_id == participant.agent_session_id)
+    };
+    row.filter(|agent| agent.state == AgentState::Idle)
+        .map(|agent| agent.state_entered_at)
+}
+
 /// Build the inventory from the enriched participants of the whole host,
-/// when each agent row entered its current state, and the open requests.
+/// when each became idle, and the open requests.
 #[must_use]
 pub fn project<'a>(
     participants: &[Participant],
-    entered: &HashMap<String, OffsetDateTime>,
+    idle_since: impl Fn(&Participant) -> Option<OffsetDateTime>,
     requests: impl IntoIterator<Item = (&'a Participant, RequestStatus)> + Clone,
     recorded_grants: usize,
     idle_threshold_secs: u64,
@@ -119,11 +135,11 @@ pub fn project<'a>(
                         }
                     });
             let observed_idle = (p.state == AgentState::Idle)
-                .then(|| entered.get(&p.agent_session_id))
+                .then(|| idle_since(p))
                 .flatten()
                 .map(|since| ObservedIdle {
-                    since: *since,
-                    seconds: u64::try_from((now - *since).whole_seconds()).unwrap_or(0),
+                    since,
+                    seconds: u64::try_from((now - since).whole_seconds()).unwrap_or(0),
                     source: "state_entered_at".into(),
                 });
             let mut flags = Vec::new();
@@ -167,10 +183,16 @@ pub fn project<'a>(
 /// carries a role the other lacks. A pipeline's implementer and reviewer
 /// differ by role and are left alone even when one provider runs both.
 fn mark_possible_overlap(workers: &mut [WorkerEntry]) {
+    // One role call could reach either: one is unroled, or they share a role,
+    // compared case-insensitively the way routing does.
+    let share_role = |a: &[String], b: &[String]| {
+        a.iter()
+            .any(|left| b.iter().any(|right| left.eq_ignore_ascii_case(right)))
+    };
     let compatible = |a: &WorkerEntry, b: &WorkerEntry| {
         a.room == b.room
             && a.agent_kind == b.agent_kind
-            && (a.roles.is_empty() || b.roles.is_empty() || a.roles == b.roles)
+            && (a.roles.is_empty() || b.roles.is_empty() || share_role(&a.roles, &b.roles))
     };
     let overlapping: Vec<bool> = workers
         .iter()
@@ -199,10 +221,6 @@ impl super::CollaborationStore {
         idle_threshold_secs: u64,
     ) -> WorkerInventory {
         let recorded_grants = self.purposes.read().await.len();
-        let entered: HashMap<String, OffsetDateTime> = agents
-            .iter()
-            .map(|agent| (agent.session_id.clone(), agent.state_entered_at))
-            .collect();
         let requests = self.requests.read().await;
         let open: Vec<(&Participant, RequestStatus)> = requests
             .values()
@@ -211,7 +229,7 @@ impl super::CollaborationStore {
             .collect();
         project(
             participants,
-            &entered,
+            |participant| idle_since(participant, agents),
             open.iter().copied(),
             recorded_grants,
             idle_threshold_secs,
@@ -223,6 +241,7 @@ impl super::CollaborationStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     fn room(window: &str) -> RoomId {
         RoomId {
@@ -259,10 +278,10 @@ mod tests {
         let entered = idle
             .iter()
             .map(|(session, hours)| ((*session).to_owned(), now() - time::Duration::hours(*hours)))
-            .collect();
+            .collect::<HashMap<String, OffsetDateTime>>();
         project(
             participants,
-            &entered,
+            |p| entered.get(&p.agent_session_id).copied(),
             std::iter::empty(),
             7,
             24 * 3600,
@@ -348,6 +367,100 @@ mod tests {
         assert_eq!(overlapping, ["%12", "%13"]);
     }
 
+    fn row(pane: &str, session: &str, state: AgentState, hours_ago: i64) -> Agent {
+        let at = now() - time::Duration::hours(hours_ago);
+        Agent {
+            tmux_socket: Some("/tmp/rmux".into()),
+            tmux_session: None,
+            kind: AgentKind::Codex,
+            session_id: session.into(),
+            surface: None,
+            pid: None,
+            workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
+            pane: Some(pane.into()),
+            cwd: None,
+            state,
+            last_prompt: None,
+            last_prompt_at: None,
+            last_response: None,
+            recap: None,
+            ai_title: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: at,
+            last_activity_at: at,
+            state_entered_at: at,
+        }
+    }
+
+    #[test]
+    fn a_pending_worker_reads_its_idle_time_from_its_pane_row() {
+        // A verified launch that never registered: its participant carries a
+        // pending id, its discovery row a synthetic one.
+        let pending_id = super::super::pending_session_id("%7", Some("/tmp/rmux"));
+        let mut pending = worker("%7", &pending_id, "@1", AgentKind::Codex);
+        assert!(is_pending_session(&pending.agent_session_id));
+        let synthetic = format!("{}codex-7", crate::state::SYNTHETIC_SESSION_PREFIX);
+        let agents = [row("%7", &synthetic, AgentState::Idle, 49)];
+        assert_eq!(
+            idle_since(&pending, &agents),
+            Some(now() - time::Duration::hours(49))
+        );
+        let listed = project(
+            std::slice::from_ref(&pending),
+            |p| idle_since(p, &agents),
+            std::iter::empty(),
+            0,
+            24 * 3600,
+            now(),
+        );
+        assert!(listed.workers[0].pending);
+        assert_eq!(listed.workers[0].flags, [WorkerFlag::LongIdle]);
+        // A row in another state is no idle observation.
+        let busy = [row("%7", &synthetic, AgentState::Working, 49)];
+        assert_eq!(idle_since(&pending, &busy), None);
+        // Nor is a row for a different pane.
+        pending.pane = "%8".into();
+        assert_eq!(idle_since(&pending, &agents), None);
+        // A registered session is matched by its own id.
+        let registered = worker("%9", "real", "@1", AgentKind::Codex);
+        assert_eq!(
+            idle_since(&registered, &[row("%9", "real", AgentState::Idle, 3)]),
+            Some(now() - time::Duration::hours(3))
+        );
+    }
+
+    #[test]
+    fn overlap_compares_roles_the_way_routing_does() {
+        let mut plain = worker("%30", "a", "@5", AgentKind::Codex);
+        plain.roles = vec!["reviewer".into()];
+        let mut wider = worker("%31", "b", "@5", AgentKind::Codex);
+        wider.roles = vec!["Reviewer".into(), "security".into()];
+        let mut other = worker("%32", "c", "@6", AgentKind::Codex);
+        other.roles = vec!["implementer".into()];
+        let mut disjoint = worker("%33", "d", "@6", AgentKind::Codex);
+        disjoint.roles = vec!["reviewer".into(), "docs".into()];
+        let listed = inventory(&[plain, wider, other, disjoint], &[]);
+        let overlapping: Vec<&str> = listed
+            .workers
+            .iter()
+            .filter(|w| w.flags.contains(&WorkerFlag::PossibleOverlap))
+            .map(|w| w.pane.as_str())
+            .collect();
+        // A subset and a case variant share a role; disjoint sets do not.
+        assert_eq!(overlapping, ["%30", "%31"]);
+    }
+
     #[test]
     fn open_requests_count_by_the_addressing_rule() {
         let target = worker("%20", "w", "@1", AgentKind::Codex);
@@ -361,7 +474,7 @@ mod tests {
         ];
         let listed = project(
             std::slice::from_ref(&target),
-            &HashMap::new(),
+            |_| None,
             requests.iter().copied(),
             0,
             3600,
