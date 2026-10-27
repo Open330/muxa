@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa workers` lists every worker muxa launched for peer work, host-wide:
+  room, role, state, observed idle time (with its source), open requests, and
+  flags for workers in error (never reused, so a replacement may be spawned),
+  long idle, or possibly overlapping. Read-only, and only sessions positively
+  known to be workers appear. `muxa doctor` reports the same findings.
+  Launches still holding capacity are listed too, and
+  `muxa workers release <launch-id> --reason <why>` frees an uncertain one.
 - `muxa swap --host <alias>` swaps agents on a control-mode Fleet host
   through the work-command transport, and the `muxa_swap_account` MCP tool
   does the same for agents, here or on a host.

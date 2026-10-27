@@ -8657,7 +8657,7 @@ pub async fn run(
     Ok(jump_target)
 }
 
-fn watch_collaboration_origin(initial_pane: Option<String>) -> CollaborationOrigin {
+pub(crate) fn watch_collaboration_origin(initial_pane: Option<String>) -> CollaborationOrigin {
     watch_collaboration_origin_from(
         initial_pane,
         std::env::var("RMUX").ok(),
@@ -19250,6 +19250,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -19284,6 +19285,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -25157,6 +25159,7 @@ sort = ["state"]
         let panes = vec![PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

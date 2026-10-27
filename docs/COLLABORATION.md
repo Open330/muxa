@@ -18,7 +18,42 @@ using configured provider permissions, without injected bypass flags. Set
 call with `spawn_if_missing`. Explicit `worker_bypass_permissions=true` enables
 bypass flags for these workers. Work pipeline agents that have a `role` launch
 as workers; set `purpose = "primary"` on one to keep it protected. General
-`start` and role-less pipeline agents remain primary. There is no worker pool.
+`start` and role-less pipeline agents remain primary.
+
+Automatic creation requires the daemon capability
+`collaboration_worker_spawn_v1`. muxad reserves creation capacity for the observed
+room, provider and compatible role before the CLI creates a pane. Concurrent
+provider and matching role calls share the pending launch. Busy workers remain
+reusable; this does not add caller affinity or change logical-recipient routing.
+Older daemons without this capability refuse automatic creation. Upgrade/restart
+muxad and run `muxa doctor`; existing eligible workers can still be reused.
+
+The launch UUID is persisted before creation, stamped on the new pane, and reused
+for the process-fenced worker grant. A renewable lease covers startup. Expiry
+after creation has been authorized is uncertain, not permission to spawn again.
+A call that cannot resolve that launch returns `sent=false`,
+`reason="launch_pending"`, its launch UUID, and any known endpoint. No message
+request has been created in that result. Retry the call after reconciling the
+existing launch; do not create an additional worker to bypass uncertainty.
+A committed grant can be recovered after a daemon restart. A crash before the
+pane stamp or before its grant commits remains uncertain and requires operator
+investigation. Explicit recovery uses the audited
+`collaboration_worker_spawn_release` IPC with a console origin, launch UUID and
+reason, or the owner's `Release` action. First verify that the old launcher has
+stopped: release abandons its reservation and never stops a process. An active
+launch or a fenced worker still occupying its original location blocks release;
+a verified process move releases the original room's capacity automatically.
+The read-only `collaboration_worker_spawns` IPC returns phases, endpoints,
+lease deadlines and failure/release details. These recovery APIs require
+`collaboration_worker_spawn_release_v1`.
+
+A failure before Begin or a completed, unsuccessful create command without a
+pane ID closes the reservation as Failed; `worker_spawn_failed` permits a retry
+after correcting the error. Missing replies or partial creation remain uncertain.
+Failed records expire after seven days on load/acquisition; uncertain records and
+purpose-grant history are not automatically removed.
+Pane marks alone never establish worker purpose. A consumed grant
+cannot bootstrap another conversation in the same CLI (including `/new`).
 
 Use `muxa start --agent claude --purpose worker` to launch a worker, or
 `muxa identity purpose worker` inside an existing dedicated worker session.

@@ -8,12 +8,20 @@ mod overview;
 pub use overview::{
     CollaborationEndpoint, CollaborationLink, CollaborationLocation, CollaborationOverview,
 };
+mod spawn_coordination;
+use spawn_coordination::{load_spawns, WorkerSpawnRecord};
+pub use spawn_coordination::{
+    WorkerSpawnAcquisition, WorkerSpawnAction, WorkerSpawnPhase, WorkerSpawnSpec,
+    WorkerSpawnTicket, WorkerSpawnView, WORKER_SPAWN_CAPABILITY, WORKER_SPAWN_RELEASE_CAPABILITY,
+};
 mod purpose;
+mod worker_inventory;
 use purpose::{load_purposes, PurposeGrant};
 pub use purpose::{
     LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PIPELINE_PURPOSE_CAPABILITY,
     PURPOSE_PROMOTE_CAPABILITY,
 };
+pub use worker_inventory::{ObservedIdle, WorkerEntry, WorkerFlag, WorkerInventory};
 
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
@@ -1473,6 +1481,9 @@ pub enum CollaborationError {
     AmbiguousTarget(String),
     #[error("target {0:?} is not a peer in this tmux window")]
     UnknownTarget(String),
+    /// A worker launch reservation refused or not found.
+    #[error("worker launch: {0}")]
+    WorkerLaunch(String),
     #[error("message is empty")]
     EmptyMessage,
     #[error("message exceeds the configured {0}-byte limit")]
@@ -1702,6 +1713,7 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
              identity_key TEXT PRIMARY KEY,
              payload TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS collaboration_worker_spawns (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS collaboration_purposes (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS collaboration_metadata (
              key TEXT PRIMARY KEY,
@@ -2545,6 +2557,7 @@ pub struct CollaborationStore {
     requests: RwLock<HashMap<String, CollaborationRequest>>,
     identities: RwLock<Vec<CollaborationIdentity>>,
     purposes: RwLock<Vec<PurposeGrant>>,
+    worker_spawns: Mutex<Vec<WorkerSpawnRecord>>,
     /// Serializes each in-memory mutation with its durable row update. Wake
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
@@ -2587,6 +2600,7 @@ impl CollaborationStore {
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
             purposes: RwLock::new(Vec::new()),
+            worker_spawns: Mutex::new(Vec::new()),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             reply_wake_tokens: AtomicU64::new(1),
@@ -2653,12 +2667,14 @@ impl CollaborationStore {
         }
         let (changes, _) = watch::channel(0);
         let purposes = load_purposes(database_path.as_deref())?;
+        let worker_spawns = load_spawns(database_path.as_deref())?;
         let store = Arc::new(Self {
             opts: options,
             database_path,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
             purposes: RwLock::new(purposes),
+            worker_spawns: Mutex::new(worker_spawns),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             reply_wake_tokens: AtomicU64::new(1),
@@ -5676,6 +5692,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -5725,6 +5742,7 @@ mod tests {
     fn managed_pane(pane_id: &str, role: &str, alias: &str) -> PaneInfo {
         PaneInfo {
             agent_program: None,
+            worker_launch_id: None,
             agent_role: Some(role.into()),
             agent_alias: Some(alias.into()),
             ..pane_info(pane_id)
