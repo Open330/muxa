@@ -360,6 +360,7 @@ async fn main() -> Result<()> {
         backends.clone(),
         cfg.swap.clone(),
         cfg.accounts.clone(),
+        collaboration.clone(),
         &shutdown_tx,
     );
 
@@ -861,6 +862,7 @@ fn build_automation(cfg: &Config, config_path: Option<PathBuf>) -> Arc<Automatio
 /// Always spawned, even with no rules: a rule written through
 /// `automation_set_rule` must take effect without a daemon restart, and an
 /// engine with nothing to do costs one refcount bump per transition.
+#[allow(clippy::too_many_arguments)] // Explicit shared services for the automation task.
 fn spawn_automation_task(
     automation: Arc<AutomationStore>,
     ask: Arc<AskStore>,
@@ -868,6 +870,7 @@ fn spawn_automation_task(
     backends: Vec<muxa::SharedBackend>,
     swap: muxa::account_swap::SwapConfig,
     accounts: muxa::accounts::AccountsConfig,
+    collaboration: Arc<CollaborationStore>,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -880,6 +883,7 @@ fn spawn_automation_task(
         engine.ask = Some(ask);
         engine.swap = swap;
         engine.accounts = accounts;
+        engine.collaboration = Some(collaboration);
         engine.rescan().await;
         let mut reconcile =
             tokio::time::interval(std::time::Duration::from_secs(AUTOMATION_RECONCILE_SECONDS));
@@ -905,6 +909,7 @@ fn spawn_automation_task(
                     engine.pending.clear();
                     engine.armed.clear();
                     engine.queued_rules.clear();
+                    engine.drain_reservations.clear();
                     // A rule was added, edited, enabled, or paused. Drop
                     // pending firings whose rule no longer exists and
                     // re-evaluate everything against the new set.
@@ -939,6 +944,9 @@ struct AutomationEngine {
     /// episode" hold both within a daemon run and across a restart.
     armed: HashSet<(String, String, String)>,
     queued_rules: HashMap<(String, String, String), (AutomationRule, u64)>,
+    collaboration: Option<Arc<CollaborationStore>>,
+    drain_reservations:
+        HashMap<(String, String, String), muxa::collaboration::WorkerAutomationReservation>,
     panes: Vec<muxa::tmux::PaneInfo>,
     panes_read_at: Option<std::time::Instant>,
     ask: Option<Arc<AskStore>>,
@@ -957,6 +965,7 @@ struct JudgedFiring {
     revision: u64,
     context: Option<JudgmentContext>,
     judgment: AutomationJudgment,
+    _drain_reservation: Option<muxa::collaboration::WorkerAutomationReservation>,
 }
 
 impl AutomationEngine {
@@ -972,6 +981,8 @@ impl AutomationEngine {
             pending: BinaryHeap::new(),
             armed: HashSet::new(),
             queued_rules: HashMap::new(),
+            collaboration: None,
+            drain_reservations: HashMap::new(),
             panes: Vec::new(),
             panes_read_at: None,
             ask: None,
@@ -1022,6 +1033,8 @@ impl AutomationEngine {
             .retain(|(rule, _, _)| live.contains(rule.as_str()));
         self.queued_rules
             .retain(|(rule, _, _), _| live.contains(rule.as_str()));
+        self.drain_reservations
+            .retain(|(rule, _, _), _| live.contains(rule.as_str()));
         if !active || rules.is_empty() {
             return;
         }
@@ -1066,6 +1079,19 @@ impl AutomationEngine {
                 let guards = ledger.guard_state(&rule.name, &pane, &episode, now).await;
                 match Scheduler::arm(&config, rule, subject, guards, now, jitter_ratio()) {
                     Decision::Fire(firing) => {
+                        if let Some(collaboration) = &self.collaboration {
+                            let Some(reservation) = collaboration
+                                .reserve_worker_automation(
+                                    &subject.agent_session_id,
+                                    &pane,
+                                    subject.socket.as_deref(),
+                                )
+                                .await
+                            else {
+                                continue;
+                            };
+                            self.drain_reservations.insert(key.clone(), reservation);
+                        }
                         tracing::info!(
                             rule = %rule.name,
                             pane = %pane,
@@ -1113,6 +1139,14 @@ impl AutomationEngine {
                 firing.episode.clone(),
             ));
             self.fire(&firing, now).await;
+            let key = (
+                firing.rule.clone(),
+                firing.pane.clone(),
+                firing.episode.clone(),
+            );
+            if !self.armed.contains(&key) {
+                self.drain_reservations.remove(&key);
+            }
         }
     }
 
@@ -1264,6 +1298,11 @@ impl AutomationEngine {
         }
         let ask = self.ask.clone();
         let backends = self.backends.clone();
+        let drain_reservation = self.drain_reservations.remove(&(
+            firing.rule.clone(),
+            firing.pane.clone(),
+            firing.episode.clone(),
+        ));
         self.judgments.spawn(async move {
             let _permit = permit;
             let context = automation_judge::capture_context(&subject, &backends).await;
@@ -1283,6 +1322,7 @@ impl AutomationEngine {
                 revision,
                 context: context.ok(),
                 judgment,
+                _drain_reservation: drain_reservation,
             }
         });
     }
@@ -1389,13 +1429,27 @@ impl AutomationEngine {
     /// function, so "what an automation can do to a pane" has exactly one
     /// place to read.
     async fn perform(&self, firing: &PlannedFiring) -> bool {
+        let io_guard = if let Some(collaboration) = &self.collaboration {
+            let gate = collaboration.worker_action_guard(&firing.pane).await;
+            if collaboration
+                .worker_input_blocked(&firing.pane, firing.socket.as_deref())
+                .await
+            {
+                return false;
+            }
+            Some(Arc::new(gate))
+        } else {
+            None
+        };
         match firing.action {
-            AutomationAction::PressEnter => self.confirm_selected_yes(firing).await,
+            AutomationAction::PressEnter => {
+                self.confirm_selected_yes(firing, io_guard.clone()).await
+            }
             AutomationAction::SendPrompt => {
                 let Some(text) = firing.text.as_deref() else {
                     return false;
                 };
-                if !send_automation_text(&self.backends, firing, text).await {
+                if !send_automation_text(&self.backends, firing, text, io_guard.clone()).await {
                     return false;
                 }
                 if !firing.submit {
@@ -1404,7 +1458,7 @@ impl AutomationEngine {
                 // Native hosts use explicit paste boundaries; only hosts
                 // without that support need a best-effort fallback delay.
                 tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
-                send_automation_text(&self.backends, firing, "\r").await
+                send_automation_text(&self.backends, firing, "\r", io_guard.clone()).await
             }
             // A notice, not a keystroke: nothing is typed into the pane. The
             // ledger entry is the durable half, and `muxa automation log`
@@ -1422,16 +1476,16 @@ impl AutomationEngine {
             // ETX — the same byte `muxa agent control --action interrupt`
             // writes into a native PTY session.
             AutomationAction::Interrupt => {
-                send_automation_text(&self.backends, firing, "\u{3}").await
+                send_automation_text(&self.backends, firing, "\u{3}", io_guard.clone()).await
             }
-            AutomationAction::SwapAccount => self.swap_account(firing).await,
+            AutomationAction::SwapAccount => self.swap_account(firing, io_guard.clone()).await,
         }
     }
 
     /// Move the capped agent onto another `aas` account and resume it. The
     /// firing was re-checked just before this, so the agent is the one the
     /// rule armed on; `force` only lets a cap that reads as `Starting` through.
-    async fn swap_account(&self, firing: &PlannedFiring) -> bool {
+    async fn swap_account(&self, firing: &PlannedFiring, io_guard: Option<WorkerIoGuard>) -> bool {
         use muxa::account_swap::{self, AccountChoice, SwapRequest, SwapScope, SwapStatus};
         let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
             return false;
@@ -1449,6 +1503,7 @@ impl AutomationEngine {
         let config = self.swap.clone();
         let accounts = self.accounts.clone();
         let outcomes = tokio::task::spawn_blocking(move || {
+            let _held_guard = io_guard;
             account_swap::run(
                 &request,
                 std::slice::from_ref(&agent),
@@ -1476,7 +1531,11 @@ impl AutomationEngine {
 
     /// Capture immediately before Enter; a waiting state alone cannot identify
     /// the selected option. Recheck state/config after the blocking capture.
-    async fn confirm_selected_yes(&self, firing: &PlannedFiring) -> bool {
+    async fn confirm_selected_yes(
+        &self,
+        firing: &PlannedFiring,
+        io_guard: Option<WorkerIoGuard>,
+    ) -> bool {
         let revision = *self.automation.subscribe().borrow();
         let Some(kind) = muxa::backend::pane_id_host_kind(&firing.pane) else {
             return false;
@@ -1525,7 +1584,7 @@ impl AutomationEngine {
         {
             return false;
         }
-        send_automation_text(&self.backends, firing, "\r").await
+        send_automation_text(&self.backends, firing, "\r", io_guard.clone()).await
     }
 
     /// The registry row behind a firing, as the live store has it now.
@@ -1612,10 +1671,13 @@ fn jitter_ratio() -> f64 {
 /// its id namespace. Mirrors `send_collaboration_text`; a backend without
 /// `send_text` (zellij) simply refuses, which the caller records as a
 /// failure rather than a silent success.
+type WorkerIoGuard = Arc<tokio::sync::OwnedMutexGuard<()>>;
+
 async fn send_automation_text(
     backends: &[muxa::SharedBackend],
     firing: &PlannedFiring,
     text: &str,
+    io_guard: Option<WorkerIoGuard>,
 ) -> bool {
     let Some(kind) = muxa::backend::pane_id_host_kind(&firing.pane) else {
         return false;
@@ -1631,6 +1693,7 @@ async fn send_automation_text(
     let socket = firing.socket.clone();
     let text = text.to_string();
     tokio::task::spawn_blocking(move || {
+        let _held_guard = io_guard;
         if text == "\r" || text == "\u{3}" {
             backend.send_text_on(socket.as_deref(), &pane, &text)
         } else {
@@ -1808,6 +1871,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
     collaboration
         .enrich_launch_purposes(&mut participants, &panes)
         .await;
+    collaboration.enrich_worker_drains(&mut participants).await;
 
     // Follow vanished recipients for every undelivered request, quiet ones
     // included; a readdressed request comes back through the next pass.
@@ -1852,7 +1916,8 @@ async fn wake_idle_collaboration_peers_with_inflight(
             );
         }
         let prompt = with_quiet_notices(mailbox_collaboration_request_prompt(&request), quiet);
-        let (sent, submitted) = send_collaboration_wake(recipient, &prompt, backends, store).await;
+        let (sent, submitted) =
+            send_collaboration_wake(collaboration, recipient, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -1987,7 +2052,8 @@ async fn wake_senders_of_ready_replies(
             continue;
         }
         let prompt = reply_wake_prompt(&batch, time::OffsetDateTime::now_utc());
-        let (sent, submitted) = send_collaboration_wake(sender, &prompt, backends, store).await;
+        let (sent, submitted) =
+            send_collaboration_wake(collaboration, sender, &prompt, backends, store).await;
         if submitted {
             wake_inflight.insert(wake_key);
         }
@@ -2067,6 +2133,13 @@ async fn deliver_full_collaboration_request(
     backends: &[muxa::SharedBackend],
     quiet: usize,
 ) -> bool {
+    let io_guard = Arc::new(collaboration.worker_action_guard(&recipient.pane).await);
+    if collaboration
+        .worker_input_blocked(&recipient.pane, recipient.socket.as_deref())
+        .await
+    {
+        return false;
+    }
     let (request, newly_prepared) = if pending.status == muxa::collaboration::RequestStatus::Queued
     {
         match collaboration
@@ -2098,7 +2171,7 @@ async fn deliver_full_collaboration_request(
                 },
                 quiet,
             );
-            if !send_collaboration_text(recipient, &prompt, backends).await {
+            if !send_collaboration_text(recipient, &prompt, backends, io_guard.clone()).await {
                 return false;
             }
             if let Err(error) = collaboration.mark_wake_prompt_written(&request.id).await {
@@ -2109,14 +2182,26 @@ async fn deliver_full_collaboration_request(
                 );
             }
             tokio::time::sleep(muxa::backend::prompt_submit_grace(&recipient.pane)).await;
-            submit_direct_collaboration_prompt(collaboration, recipient, &request.id, backends)
-                .await
+            submit_direct_collaboration_prompt(
+                collaboration,
+                recipient,
+                &request.id,
+                backends,
+                io_guard.clone(),
+            )
+            .await
         }
         Some(WakeDeliveryState::PromptWritten) => {
             // The body or recovery notice is already in the input buffer.
             // Retrying only Enter avoids executing the request twice.
-            submit_direct_collaboration_prompt(collaboration, recipient, &request.id, backends)
-                .await
+            submit_direct_collaboration_prompt(
+                collaboration,
+                recipient,
+                &request.id,
+                backends,
+                io_guard.clone(),
+            )
+            .await
         }
         None => false,
     }
@@ -2127,8 +2212,9 @@ async fn submit_direct_collaboration_prompt(
     recipient: &muxa::collaboration::Participant,
     request_id: &str,
     backends: &[muxa::SharedBackend],
+    io_guard: WorkerIoGuard,
 ) -> bool {
-    if !send_collaboration_text(recipient, "\r", backends).await {
+    if !send_collaboration_text(recipient, "\r", backends, io_guard.clone()).await {
         return false;
     }
     mark_collaboration_request_notified(collaboration, request_id).await;
@@ -2369,11 +2455,19 @@ fn clear_wake_inflight_for_agent(
 }
 
 async fn send_collaboration_wake(
+    collaboration: &CollaborationStore,
     participant: &muxa::collaboration::Participant,
     prompt: &str,
     backends: &[muxa::SharedBackend],
     store: &muxa::Store,
 ) -> (bool, bool) {
+    let io_guard = Arc::new(collaboration.worker_action_guard(&participant.pane).await);
+    if collaboration
+        .worker_input_blocked(&participant.pane, participant.socket.as_deref())
+        .await
+    {
+        return (false, false);
+    }
     let agents = store.by_pane(&participant.pane).await;
     let observer = muxa::prompt_delivery::SubmissionObserver::new(
         store,
@@ -2381,10 +2475,10 @@ async fn send_collaboration_wake(
         participant.socket.as_deref(),
         prompt,
     );
-    let sent = send_collaboration_text(participant, prompt, backends).await;
+    let sent = send_collaboration_text(participant, prompt, backends, io_guard.clone()).await;
     let submitted = if sent {
         tokio::time::sleep(muxa::backend::prompt_submit_grace(&participant.pane)).await;
-        send_collaboration_text(participant, "\r", backends).await
+        send_collaboration_text(participant, "\r", backends, io_guard.clone()).await
     } else {
         false
     };
@@ -2406,6 +2500,7 @@ async fn send_collaboration_text(
     participant: &muxa::collaboration::Participant,
     text: &str,
     backends: &[muxa::SharedBackend],
+    io_guard: WorkerIoGuard,
 ) -> bool {
     let Some(kind) = muxa::backend::pane_id_host_kind(&participant.pane) else {
         return false;
@@ -2421,6 +2516,7 @@ async fn send_collaboration_text(
     let socket = participant.socket.clone();
     let text = text.to_string();
     tokio::task::spawn_blocking(move || {
+        let _held_guard = io_guard;
         if text == "\r" || text == "\u{3}" {
             backend.send_text_on(socket.as_deref(), &pane, &text)
         } else {
@@ -3601,6 +3697,7 @@ mod tests {
     ) -> muxa::collaboration::Participant {
         muxa::collaboration::Participant {
             launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
+            draining: false,
             agent_kind: AgentKind::Codex,
             agent_session_id: session.into(),
             pane: pane.into(),
@@ -6059,5 +6156,113 @@ mod tests {
             "only the pane whose work id matches may be typed into: {sends:?}",
         );
         assert_eq!(sends.len(), 2);
+    }
+    #[cfg(target_os = "linux")]
+    struct Child(std::process::Child);
+    #[cfg(target_os = "linux")]
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn worker_drain_gates_ordinary_wakes_full_delivery_and_automation_io() {
+        let child = Child(
+            std::process::Command::new("bash")
+                .args(["-c", "exec -a 'codex --no-daemon' sleep 60"])
+                .spawn()
+                .unwrap(),
+        );
+        for _ in 0..300 {
+            if std::fs::read(format!("/proc/{}/cmdline", child.0.id()))
+                .unwrap_or_default()
+                .starts_with(b"codex --no-daemon")
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let store = muxa::Store::shared();
+        add_agent(&store, "%2", "worker", AgentKind::Codex).await;
+        let event=serde_json::from_value(serde_json::json!({"type":"turn_stopped","id":{"kind":"codex","session_id":"worker","pane":"%2","tmux_socket":"default"},"response":"ready","at":OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap()})).unwrap();
+        store.apply(&event).await;
+        let mut pane = collaboration_pane("%2", "1");
+        pane.pane_pid = child.0.id();
+        pane.current_command = "codex".into();
+        let (backends, sends) = automation_backend(vec![pane.clone()]);
+        let rows = store.snapshot().await;
+        let participants = worker_participants(&rows, std::slice::from_ref(&pane));
+        let p = participants
+            .iter()
+            .find(|p| p.agent_session_id == "worker")
+            .unwrap();
+        let c = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&c, std::slice::from_ref(p)).await;
+        let acquired = c
+            .worker_drain_acquire(
+                &muxa::collaboration::WorkerDrainTarget::from(p),
+                muxa::collaboration::WorkerDrainPolicy {
+                    min_observed_idle_secs: 0,
+                    allow_error: false,
+                },
+                &participants,
+                &rows,
+                &[pane],
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            acquired,
+            muxa::collaboration::WorkerDrainAcquire::Acquired { .. }
+        ));
+        assert_eq!(
+            send_collaboration_wake(&c, p, "notice", &backends, &store).await,
+            (false, false)
+        );
+        let other = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut sender = p.clone();
+        sender.agent_session_id = "sender".into();
+        sender.pane = "%1".into();
+        let request = other
+            .create(
+                sender,
+                p.clone(),
+                NewRequest {
+                    body: "request".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let request = other
+            .prepare_direct_wake(p, &request.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!deliver_full_collaboration_request(&c, p, &request, &backends, 0).await);
+        let mut engine = AutomationEngine::new(
+            AutomationStore::in_memory(resume_rule_config()),
+            store,
+            backends,
+        );
+        engine.collaboration = Some(c);
+        let firing = PlannedFiring {
+            rule: "rule".into(),
+            pane: p.pane.clone(),
+            socket: p.socket.clone(),
+            agent_session_id: p.agent_session_id.clone(),
+            agent: p.agent_kind,
+            episode: "episode".into(),
+            fire_at: OffsetDateTime::now_utc(),
+            action: AutomationAction::SendPrompt,
+            text: Some("automation".into()),
+            submit: true,
+            only_if_still: muxa::automation::AutomationCondition::Idle,
+            account: None,
+        };
+        assert!(!engine.perform(&firing).await);
+        assert!(sends.lock().unwrap().is_empty());
     }
 }

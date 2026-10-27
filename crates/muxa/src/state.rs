@@ -1469,6 +1469,32 @@ impl Store {
         );
     }
 
+    /// Retire exactly the observed row; a concurrently resumed conversation wins.
+    pub(crate) async fn mark_drained_if_unchanged(&self, expected: &Agent) {
+        let mut agents = self.agents.write().await;
+        let Some(agent) = agents.get_mut(&expected.session_id) else {
+            return;
+        };
+        if agent.kind != expected.kind
+            || agent.pane != expected.pane
+            || agent.tmux_socket != expected.tmux_socket
+            || agent.last_activity_at != expected.last_activity_at
+            || agent.state != expected.state
+        {
+            return;
+        }
+        let from = agent.state;
+        agent.state = AgentState::Stopped;
+        agent.state_entered_at = OffsetDateTime::now_utc();
+        let _ = self.transitions.send(Transition {
+            from,
+            to: agent.state,
+            agent: Arc::new(agent.clone()),
+        });
+        drop(agents);
+        self.dirty.notify_one();
+        self.changes.send_replace(());
+    }
     pub async fn snapshot(&self) -> Vec<Agent> {
         self.agents.read().await.values().cloned().collect()
     }

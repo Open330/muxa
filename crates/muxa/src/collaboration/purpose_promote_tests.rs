@@ -23,6 +23,7 @@ fn agent(pane: &str, session: &str) -> Participant {
         roles: Vec::new(),
         console: false,
         launch_purpose: LaunchPurpose::Primary,
+        draining: false,
     }
 }
 

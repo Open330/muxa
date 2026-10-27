@@ -19,6 +19,8 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
+#[path = "worker_drain_control.rs"]
+mod worker_drain_control;
 use crate::ask::{
     AskConversation, AskCredential, AskEntry, AskProviderAdd, AskProviderEdit, AskProviderInfo,
     AskStore,
@@ -641,6 +643,33 @@ enum RequestBody {
         reason: String,
     },
     /// Body-free launch lifecycle records, with the same trust model as snapshot.
+    WorkerDrainPlan {
+        origin: CollaborationOrigin,
+        policy: collaboration::WorkerDrainPolicy,
+    },
+    WorkerDrainAcquire {
+        origin: CollaborationOrigin,
+        target: collaboration::WorkerDrainTarget,
+        policy: collaboration::WorkerDrainPolicy,
+    },
+    WorkerDrainRenew {
+        origin: CollaborationOrigin,
+        token: collaboration::WorkerDrainToken,
+    },
+    WorkerDrainStop {
+        origin: CollaborationOrigin,
+        token: collaboration::WorkerDrainToken,
+        operation_id: String,
+    },
+    WorkerDrainFinish {
+        origin: CollaborationOrigin,
+        token: collaboration::WorkerDrainToken,
+        outcome: collaboration::WorkerDrainFinish,
+        detail: String,
+    },
+    WorkerDrains {
+        origin: CollaborationOrigin,
+    },
     CollaborationWorkerSpawns,
     CollaborationWorkerAcquire {
         origin: CollaborationOrigin,
@@ -886,6 +915,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_mailbox",
     collaboration::HUMAN_PRIORITY_CAPABILITY,
     collaboration::WORKER_SPAWN_CAPABILITY,
+    collaboration::WORKER_DRAIN_CAPABILITY,
     collaboration::WORKER_SPAWN_RELEASE_CAPABILITY,
     "collaboration_overview_v1",
     "collaboration_expire_v1",
@@ -1031,6 +1061,18 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_overview: Option<collaboration::CollaborationOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_plan: Option<collaboration::WorkerDrainPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_acquire: Option<collaboration::WorkerDrainAcquire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_token: Option<collaboration::WorkerDrainToken>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_stop: Option<collaboration::WorkerDrainStop>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain: Option<collaboration::WorkerDrainView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drains: Option<Vec<collaboration::WorkerDrainView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_spawn: Option<collaboration::WorkerSpawnAcquisition>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_spawns: Option<Vec<collaboration::WorkerSpawnView>>,
@@ -1138,6 +1180,12 @@ impl Response {
             handle: None,
             collaboration_requests: None,
             collaboration_overview: None,
+            worker_drain_plan: None,
+            worker_drain_acquire: None,
+            worker_drain_token: None,
+            worker_drain_stop: None,
+            worker_drain: None,
+            worker_drains: None,
             worker_spawn: None,
             worker_spawns: None,
             worker_inventory: None,
@@ -2953,6 +3001,7 @@ async fn collaboration_participants(
     collaboration
         .enrich_launch_purposes(&mut participants, &panes)
         .await;
+    collaboration.enrich_worker_drains(&mut participants).await;
     CollaborationTopology {
         participants,
         panes,
@@ -4109,49 +4158,65 @@ async fn handle(
                             match unique_pane_endpoint(&pane, &agents) {
                                 Err(error) => Response::err(error),
                                 Ok(socket) => {
-                                    // `send_text_on` is a blocking shell-out /
-                                    // socket call, so run it off the async worker.
-                                    // Text and submit CR are TWO non-atomic
-                                    // injections; report the outcomes separately.
-                                    let observer = crate::prompt_delivery::SubmissionObserver::new(
-                                        &store,
-                                        &agents,
-                                        socket.as_deref(),
-                                        &text,
-                                    );
-                                    let (sent, submitted) =
-                                        tokio::task::spawn_blocking(move || {
-                                            let s = socket.as_deref();
-                                            let sent = target.send_prompt_text_on(s, &pane, &text);
-                                            let submitted = if sent && submit {
-                                                if !text.is_empty() {
-                                                    std::thread::sleep(
-                                                        crate::backend::prompt_submit_grace(&pane),
-                                                    );
-                                                }
-                                                target.send_text_on(s, &pane, "\r")
-                                            } else {
-                                                false
-                                            };
-                                            (sent, submitted)
-                                        })
+                                    let action_guard =
+                                        collaboration.worker_action_guard(&pane).await;
+                                    if collaboration
+                                        .worker_input_blocked(&pane, socket.as_deref())
                                         .await
-                                        .unwrap_or((false, false));
-                                    if sent {
-                                        tracing::debug!(submit, submitted, "send_prompt");
-                                        let mut response =
-                                            Response::with_send_result(sent, submitted);
-                                        if submitted {
-                                            response.submission_confirmed =
-                                                observer.confirm().await;
-                                        }
-                                        response
-                                    } else {
-                                        // Nothing landed — safe for the caller to
-                                        // retry the whole send.
+                                    {
                                         Response::err(
-                                            "send_text failed: pane gone or host unreachable",
+                                            "worker_draining: managed terminal input is paused",
                                         )
+                                    } else {
+                                        // `send_text_on` is a blocking shell-out /
+                                        // socket call, so run it off the async worker.
+                                        // Text and submit CR are TWO non-atomic
+                                        // injections; report the outcomes separately.
+                                        let observer =
+                                            crate::prompt_delivery::SubmissionObserver::new(
+                                                &store,
+                                                &agents,
+                                                socket.as_deref(),
+                                                &text,
+                                            );
+                                        let (sent, submitted) =
+                                            tokio::task::spawn_blocking(move || {
+                                                let _action = action_guard;
+                                                let s = socket.as_deref();
+                                                let sent =
+                                                    target.send_prompt_text_on(s, &pane, &text);
+                                                let submitted = if sent && submit {
+                                                    if !text.is_empty() {
+                                                        std::thread::sleep(
+                                                            crate::backend::prompt_submit_grace(
+                                                                &pane,
+                                                            ),
+                                                        );
+                                                    }
+                                                    target.send_text_on(s, &pane, "\r")
+                                                } else {
+                                                    false
+                                                };
+                                                (sent, submitted)
+                                            })
+                                            .await
+                                            .unwrap_or((false, false));
+                                        if sent {
+                                            tracing::debug!(submit, submitted, "send_prompt");
+                                            let mut response =
+                                                Response::with_send_result(sent, submitted);
+                                            if submitted {
+                                                response.submission_confirmed =
+                                                    observer.confirm().await;
+                                            }
+                                            response
+                                        } else {
+                                            // Nothing landed — safe for the caller to
+                                            // retry the whole send.
+                                            Response::err(
+                                                "send_text failed: pane gone or host unreachable",
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -4763,6 +4828,192 @@ async fn handle(
                         },
                         Err(error) => Response::err(error),
                     };
+                    pending_audit = Some(collaboration_audit_entry(
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    ));
+                    response
+                }
+                drain_request @ (RequestBody::WorkerDrainPlan { .. }
+                | RequestBody::WorkerDrainAcquire { .. }
+                | RequestBody::WorkerDrainRenew { .. }
+                | RequestBody::WorkerDrainStop { .. }
+                | RequestBody::WorkerDrainFinish { .. }
+                | RequestBody::WorkerDrains { .. }) => {
+                    let (origin, operation, target, guard_pane) = match &drain_request {
+                        RequestBody::WorkerDrainPlan { origin, .. } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainPlan,
+                            None,
+                            None,
+                        ),
+                        RequestBody::WorkerDrainAcquire { origin, target, .. } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainAcquire,
+                            Some(serde_json::to_string(target).unwrap_or_default()),
+                            Some(target.pane.clone()),
+                        ),
+                        RequestBody::WorkerDrainRenew { origin, token } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainRenew,
+                            Some(serde_json::to_string(token).unwrap_or_default()),
+                            None,
+                        ),
+                        RequestBody::WorkerDrainStop {
+                            origin,
+                            token,
+                            operation_id,
+                        } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainStop,
+                            Some(
+                                serde_json::json!({"token":token,"operation_id":operation_id})
+                                    .to_string(),
+                            ),
+                            None,
+                        ),
+                        RequestBody::WorkerDrainFinish { origin, token, .. } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainFinish,
+                            Some(serde_json::to_string(token).unwrap_or_default()),
+                            Some(token.target.pane.clone()),
+                        ),
+                        RequestBody::WorkerDrains { origin } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrains,
+                            None,
+                            None,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    kind = match operation {
+                        CollaborationAuditOperation::WorkerDrainPlan => "worker_drain_plan",
+                        CollaborationAuditOperation::WorkerDrainAcquire => "worker_drain_acquire",
+                        CollaborationAuditOperation::WorkerDrainRenew => "worker_drain_renew",
+                        CollaborationAuditOperation::WorkerDrainStop => "worker_drain_stop",
+                        CollaborationAuditOperation::WorkerDrainFinish => "worker_drain_finish",
+                        _ => "worker_drains",
+                    };
+                    let origin = origin.clone();
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context =
+                        CollaborationAuditContext::new(operation, origin.clone());
+                    audit_context.target = target;
+                    let _gate = if let Some(pane) = guard_pane {
+                        Some(collaboration.worker_action_guard(&pane).await)
+                    } else {
+                        None
+                    };
+                    // The acquire/finish gate precedes this scan; cached caller
+                    // provenance must never become stop authority.
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration, None, None)
+                            .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(caller) if caller.console => {
+                            let result: Result<Response, String> = async {
+                                let mut response = Response::ok();
+                                match drain_request {
+                                    RequestBody::WorkerDrainPlan { policy, .. } => {
+                                        response.worker_drain_plan = Some(
+                                            collaboration
+                                                .worker_drain_plan(
+                                                    &topology.participants,
+                                                    &topology.agents,
+                                                    &policy,
+                                                )
+                                                .await,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainAcquire { target, policy, .. } => {
+                                        response.worker_drain_acquire = Some(
+                                            collaboration
+                                                .worker_drain_acquire(
+                                                    &target,
+                                                    policy,
+                                                    &topology.participants,
+                                                    &topology.agents,
+                                                    &topology.panes,
+                                                )
+                                                .await
+                                                .map_err(|e| e.to_string())?,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainRenew { token, .. } => {
+                                        response.worker_drain_token = Some(
+                                            collaboration
+                                                .worker_drain_renew(&token)
+                                                .await
+                                                .map_err(|e| e.to_string())?,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainStop {
+                                        token,
+                                        operation_id,
+                                        ..
+                                    } => {
+                                        response.worker_drain_stop = Some(
+                                            worker_drain_control::stop(
+                                                store.clone(),
+                                                collaboration.clone(),
+                                                backends.clone(),
+                                                token,
+                                                operation_id,
+                                            )
+                                            .await?,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainFinish {
+                                        token,
+                                        outcome,
+                                        detail,
+                                        ..
+                                    } => {
+                                        let view = collaboration
+                                            .worker_drain_finish(&token, outcome, &detail)
+                                            .await
+                                            .map_err(|e| e.to_string())?;
+                                        if view.phase == collaboration::WorkerDrainPhase::Exited {
+                                            worker_drain_control::settle_row(
+                                                &store, &backends, &token,
+                                            )
+                                            .await;
+                                        }
+                                        response.worker_drain = Some(view);
+                                    }
+                                    RequestBody::WorkerDrains { .. } => {
+                                        response.worker_drains =
+                                            Some(collaboration.worker_drains().await);
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                Ok(response)
+                            }
+                            .await;
+                            result.unwrap_or_else(Response::err)
+                        }
+                        Ok(_) => Response::err("worker drain requires a console origin"),
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    audit_context.release_reason = response
+                        .worker_drain_stop
+                        .as_ref()
+                        .map(|s| s.drain.detail.clone())
+                        .or_else(|| {
+                            response
+                                .worker_drain_acquire
+                                .as_ref()
+                                .and_then(|a| match a {
+                                    collaboration::WorkerDrainAcquire::Skipped { reason } => {
+                                        Some(reason.clone())
+                                    }
+                                    collaboration::WorkerDrainAcquire::Acquired { .. } => None,
+                                })
+                        });
+                    if let Some(view) = &response.worker_drain {
+                        audit_context.release_reason = Some(view.detail.clone());
+                    }
                     pending_audit = Some(collaboration_audit_entry(
                         &collaboration_actor,
                         audit_context,
@@ -6612,6 +6863,75 @@ impl Client {
         Ok(resp["capture"].as_str().map(str::to_owned))
     }
 
+    pub async fn worker_drain_plan(
+        &self,
+        origin: &CollaborationOrigin,
+        policy: &collaboration::WorkerDrainPolicy,
+    ) -> Result<collaboration::WorkerDrainPlan, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_plan","origin":origin,"policy":policy}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_plan"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_acquire(
+        &self,
+        origin: &CollaborationOrigin,
+        target: &collaboration::WorkerDrainTarget,
+        policy: &collaboration::WorkerDrainPolicy,
+    ) -> Result<collaboration::WorkerDrainAcquire, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_acquire","origin":origin,"target":target,"policy":policy}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_acquire"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_renew(
+        &self,
+        origin: &CollaborationOrigin,
+        token: &collaboration::WorkerDrainToken,
+    ) -> Result<collaboration::WorkerDrainToken, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_renew","origin":origin,"token":token}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_token"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_stop(
+        &self,
+        origin: &CollaborationOrigin,
+        token: &collaboration::WorkerDrainToken,
+        operation_id: &str,
+    ) -> Result<collaboration::WorkerDrainStop, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_stop","origin":origin,"token":token,"operation_id":operation_id}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_stop"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_finish(
+        &self,
+        origin: &CollaborationOrigin,
+        token: &collaboration::WorkerDrainToken,
+        outcome: collaboration::WorkerDrainFinish,
+        detail: &str,
+    ) -> Result<collaboration::WorkerDrainView, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_finish","origin":origin,"token":token,"outcome":outcome,"detail":detail}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drains(
+        &self,
+        origin: &CollaborationOrigin,
+    ) -> Result<Vec<collaboration::WorkerDrainView>, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drains","origin":origin}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drains"].clone()).map_err(RuntimeError::Json)
+    }
     pub async fn collaboration_worker_spawns(
         &self,
     ) -> Result<Vec<collaboration::WorkerSpawnView>, RuntimeError> {
@@ -8239,6 +8559,7 @@ mod tests {
                     roles: Vec::new(),
                     console: false,
                     launch_purpose: collaboration::LaunchPurpose::Primary,
+                    draining: false,
                 })
                 .collect(),
             panes: Vec::new(),

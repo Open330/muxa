@@ -5940,6 +5940,7 @@ mod tests {
     fn collaboration_participant(pane: &str, window: &str) -> Participant {
         Participant {
             launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
+            draining: false,
             agent_kind: AgentKind::Codex,
             agent_session_id: format!("agent-{pane}"),
             pane: pane.to_string(),

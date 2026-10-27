@@ -86,6 +86,33 @@ impl PaneBackend for TmuxBackend {
         crate::tmux::send_text(pane_id, text)
     }
 
+    fn remain_on_exit_override(
+        &self,
+        socket: Option<&str>,
+        pane: &str,
+    ) -> Result<Option<String>, String> {
+        let text = tmux::capture_control_on(socket, &["show-options", "-p", "-t", pane])
+            .map_err(|e| e.to_string())?;
+        Ok(text
+            .lines()
+            .find_map(|line| line.strip_prefix("remain-on-exit ").map(str::to_owned)))
+    }
+    fn restore_remain_on_exit(
+        &self,
+        socket: Option<&str>,
+        pane: &str,
+        value: Option<&str>,
+    ) -> bool {
+        match value {
+            Some(value) if matches!(value, "on" | "off" | "failed") => tmux::run_control_on(
+                socket,
+                &["set-option", "-p", "-t", pane, "remain-on-exit", value],
+            )
+            .is_ok(),
+            None => self.set_remain_on_exit_on(socket, pane, false),
+            _ => false,
+        }
+    }
     fn set_remain_on_exit_on(&self, socket: Option<&str>, pane_id: &str, on: bool) -> bool {
         // Off means unset: the pane goes back to the window or global
         // setting instead of a pane-local override.

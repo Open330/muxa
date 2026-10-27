@@ -5275,6 +5275,7 @@ mod tests {
     ) -> Participant {
         Participant {
             launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
+            draining: false,
             agent_kind: AgentKind::Codex,
             agent_session_id: session_id.into(),
             pane: pane.into(),

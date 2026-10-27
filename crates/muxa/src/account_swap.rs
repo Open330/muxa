@@ -1420,7 +1420,7 @@ fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
 /// Does the bottom of `screen` show a turn in progress? Both TUIs print an
 /// interrupt hint while working; Claude's spinner line also counts up
 /// (`✻ Thinking… (12s · ↓ 300 tokens)`).
-fn turn_running(screen: &str) -> bool {
+pub(crate) fn turn_running(screen: &str) -> bool {
     let tail = screen_tail(screen, 12);
     tail.contains("esc to interrupt")
         || tail.lines().any(|line| {
@@ -1433,7 +1433,7 @@ fn turn_running(screen: &str) -> bool {
 }
 
 /// Placeholder text an empty Codex composer shows.
-const CODEX_PLACEHOLDERS: &[&str] = &[
+pub(crate) const CODEX_PLACEHOLDERS: &[&str] = &[
     "Ask Codex to do anything",
     "Find and fix a bug",
     "Explain this codebase",
@@ -1793,10 +1793,41 @@ fn is_shell(command: &str) -> bool {
     })
 }
 
-/// Is there an interactive shell between the agent and its pane's root
-/// (the root included), one a relaunch can be typed into? `None` when the
-/// root could not be read. A pane can start a wrapper that starts the shell
-/// (`reattach-to-user-namespace -l zsh`), so the root alone does not tell.
+/// Fresh provider observation including the pane root for direct-exec panes.
+pub(crate) fn pane_has_agent_process(pane_pid: u32) -> Option<bool> {
+    let processes = pane_processes(pane_pid);
+    if processes.is_empty() {
+        #[cfg(target_os = "linux")]
+        {
+            return std::path::Path::new(&format!("/proc/{pane_pid}"))
+                .try_exists()
+                .ok()
+                .filter(|exists| !exists)
+                .map(|_| false);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            return None;
+        }
+    }
+    Some(processes.iter().any(|p| {
+        [
+            AgentKind::ClaudeCode,
+            AgentKind::Codex,
+            AgentKind::GeminiCli,
+            AgentKind::Opencode,
+            AgentKind::Antigravity,
+        ]
+        .iter()
+        .any(|kind| is_agent_process(p, *kind))
+    }))
+}
+
+/// Does this pane preserve an interactive shell above its provider process?
+pub(crate) fn pane_has_shell(pane_pid: u32, agent_pid: u32) -> Option<bool> {
+    shell_above(&pane_processes(pane_pid), agent_pid, pane_pid)
+}
+
 fn shell_above(processes: &[ProcessInfo], agent_pid: u32, pane_pid: u32) -> Option<bool> {
     let by_pid = |pid: u32| processes.iter().find(|p| p.pid == pid);
     let root = by_pid(pane_pid)?;
@@ -2240,7 +2271,7 @@ const QUESTION_FOOTERS: &[&str] = &[
 /// The footer line of a dialog still waiting for an answer, if any. A
 /// dialog's key hints are its last line (two when a narrow pane wraps
 /// them); once answered, output below them means it is gone.
-fn open_question(screen: &str) -> Option<String> {
+pub(crate) fn open_question(screen: &str) -> Option<String> {
     let tail = screen_tail(screen, 2);
     tail.lines()
         .find(|line| {
