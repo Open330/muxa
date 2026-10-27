@@ -10548,6 +10548,10 @@ mod tests {
         tx.send(()).unwrap();
         handle.await.unwrap();
         assert!(!sock.exists(), "the daemon removes the socket it bound");
+        assert!(
+            !dir.path().join("muxa-claimed.sock.lock").exists(),
+            "and its claim"
+        );
     }
 
     #[cfg(unix)]

@@ -246,15 +246,37 @@ mod imp {
         }
     }
 
-    pub(super) type Claim = std::fs::File;
+    /// An advisory lock on `<endpoint>.lock`, removed again on release. The
+    /// lock goes with the process (also across `exec`: the descriptor is
+    /// close-on-exec), so a crash leaves at most an unlocked file behind.
+    #[derive(Debug)]
+    pub(super) struct Claim {
+        file: std::fs::File,
+        path: std::path::PathBuf,
+    }
 
-    /// An advisory lock on `<endpoint>.lock`. The file itself stays; only the
-    /// lock matters, and it goes with the process (including across `exec`,
-    /// since the descriptor is close-on-exec).
+    impl Drop for Claim {
+        fn drop(&mut self) {
+            // Still holding the lock, so nobody else can be using this file.
+            if same_file(&self.file, &self.path) {
+                let _ = std::fs::remove_file(&self.path);
+            }
+        }
+    }
+
+    fn same_file(file: &std::fs::File, path: &Path) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        match (file.metadata(), std::fs::symlink_metadata(path)) {
+            (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+            _ => false,
+        }
+    }
+
     pub(super) fn claim(endpoint: &Path) -> io::Result<Option<Claim>> {
         use std::os::unix::fs::OpenOptionsExt;
         let mut path = endpoint.as_os_str().to_owned();
         path.push(".lock");
+        let path = std::path::PathBuf::from(path);
         if let Some(parent) = endpoint.parent() {
             std::fs::create_dir_all(parent)?;
         }
@@ -264,10 +286,13 @@ mod imp {
             .create(true)
             .truncate(false)
             .mode(0o600)
-            .open(path)?;
+            .open(&path)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(file)),
-            Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+            // A releasing holder unlinks the file; a lock taken on the
+            // unlinked copy would guard nothing, so treat it as still held
+            // and let the caller retry on the fresh path.
+            Ok(()) if same_file(&file, &path) => Ok(Some(Claim { file, path })),
+            Ok(()) | Err(std::fs::TryLockError::WouldBlock) => Ok(None),
             Err(std::fs::TryLockError::Error(error)) => Err(error),
         }
     }
