@@ -1420,7 +1420,7 @@ fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
 /// Does the bottom of `screen` show a turn in progress? Both TUIs print an
 /// interrupt hint while working; Claude's spinner line also counts up
 /// (`✻ Thinking… (12s · ↓ 300 tokens)`).
-fn turn_running(screen: &str) -> bool {
+pub(crate) fn turn_running(screen: &str) -> bool {
     let tail = screen_tail(screen, 12);
     tail.contains("esc to interrupt")
         || tail.lines().any(|line| {
@@ -1433,7 +1433,7 @@ fn turn_running(screen: &str) -> bool {
 }
 
 /// Placeholder text an empty Codex composer shows.
-const CODEX_PLACEHOLDERS: &[&str] = &[
+pub(crate) const CODEX_PLACEHOLDERS: &[&str] = &[
     "Ask Codex to do anything",
     "Find and fix a bug",
     "Explain this codebase",
@@ -2240,7 +2240,7 @@ const QUESTION_FOOTERS: &[&str] = &[
 /// The footer line of a dialog still waiting for an answer, if any. A
 /// dialog's key hints are its last line (two when a narrow pane wraps
 /// them); once answered, output below them means it is gone.
-fn open_question(screen: &str) -> Option<String> {
+pub(crate) fn open_question(screen: &str) -> Option<String> {
     let tail = screen_tail(screen, 2);
     tail.lines()
         .find(|line| {
