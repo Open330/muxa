@@ -1269,6 +1269,7 @@ async fn call_tool(
             };
             let request = crate::agent_launch::StartRequest {
                 creator,
+                worker_spawn: None,
                 bypass_permissions: true,
                 purpose,
                 socket: client.socket().to_path_buf(),
@@ -2635,12 +2636,66 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
                 "available_peers": room.peers,
             }));
         }
-        match spawn_peer(client, &origin, &room, args, target, suggested, config).await {
-            Ok((new_selection, start_result)) => {
-                selection = Some(new_selection);
-                spawned = Some(start_result);
-            }
+        let capacity = match acquire_peer_capacity(client, &origin, args, target, suggested).await {
+            Ok(capacity) => capacity,
             Err(error) => return error_result(&error),
+        };
+        match capacity {
+            muxa::collaboration::WorkerSpawnAcquisition::Reuse { peer }
+            | muxa::collaboration::WorkerSpawnAcquisition::Pending {
+                peer: Some(peer), ..
+            } => {
+                selection = Some(PeerSelection::registered(
+                    peer,
+                    "daemon worker capacity reuse".into(),
+                ));
+            }
+            muxa::collaboration::WorkerSpawnAcquisition::Pending {
+                launch_id,
+                phase,
+                pane,
+                socket,
+                detail,
+                peer: None,
+            } => {
+                return json_result(&json!({
+                    "sent":false, "reason":"launch_pending", "launch_id":launch_id, "phase":phase,
+                    "pane":pane, "socket":socket, "detail":detail,
+                    "next_step":"The existing launch owns this capacity. Retry this call after reconciliation; no replacement was spawned.",
+                }));
+            }
+            muxa::collaboration::WorkerSpawnAcquisition::LaunchToken { ticket } => {
+                match spawn_peer(
+                    client,
+                    &room,
+                    args,
+                    target,
+                    suggested,
+                    config,
+                    ticket.clone(),
+                )
+                .await
+                {
+                    Ok((new_selection, start_result)) => {
+                        selection = Some(new_selection);
+                        spawned = Some(start_result);
+                    }
+                    Err(error) => {
+                        let _ = client
+                            .collaboration_worker_spawn(
+                                &ticket,
+                                &muxa::collaboration::WorkerSpawnAction::Uncertain {
+                                    detail: error.clone(),
+                                },
+                            )
+                            .await;
+                        return json_result(&json!({
+                            "sent":false, "reason":"launch_pending", "launch_id":ticket.launch_id,
+                            "error":error, "next_step":"Reconcile this launch before creating another worker.",
+                        }));
+                    }
+                }
+            }
         }
     }
 
@@ -3608,14 +3663,72 @@ fn spawned_peer_role<'a>(target: &'a str, args: &Value) -> &'a str {
     })
 }
 
-async fn spawn_peer(
+async fn acquire_peer_capacity(
     client: &Client,
     origin: &CollaborationOrigin,
+    args: &Value,
+    target: &str,
+    program: crate::agent_launch::AgentProgram,
+) -> std::result::Result<muxa::collaboration::WorkerSpawnAcquisition, String> {
+    let hello = client
+        .hello(Duration::from_secs(3))
+        .await
+        .map_err(|e| e.to_string())?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|cap| cap == muxa::collaboration::WORKER_SPAWN_CAPABILITY)
+    {
+        return Err("automatic worker creation requires muxad with collaboration_worker_spawn_v1; upgrade the daemon".into());
+    }
+    let spec = muxa::collaboration::WorkerSpawnSpec {
+        agent_kind: muxa::discovery::classify_command(program.label())
+            .ok_or("unknown worker provider")?,
+        role: target.strip_prefix("role:").map(str::to_owned),
+        launch_role: spawned_peer_role(target, args).into(),
+    };
+    let timeout = args
+        .get("spawn_timeout_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_SPAWN_GRACE_SECS)
+        .clamp(1, 60);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout);
+    // Subscribe before acquisition, so a fast creator's Observe is not lost.
+    let mut updates = client
+        .collaboration_subscribe()
+        .await
+        .map_err(|e| e.to_string())?;
+    loop {
+        let acquisition = client
+            .collaboration_worker_acquire(origin, &spec)
+            .await
+            .map_err(|e| e.to_string())?;
+        if !matches!(&acquisition, muxa::collaboration::WorkerSpawnAcquisition::Pending { peer: None, phase, .. } if *phase != muxa::collaboration::WorkerSpawnPhase::Uncertain)
+            || tokio::time::Instant::now() >= deadline
+        {
+            return Ok(acquisition);
+        }
+        // Periodic reconciliation covers a launcher that died without publishing
+        // a change. Expired Launching leases still cannot create another token.
+        let wake = std::cmp::min(
+            deadline,
+            tokio::time::Instant::now() + Duration::from_secs(5),
+        );
+        match tokio::time::timeout_at(wake, updates.recv()).await {
+            Ok(Ok(Some(_))) | Err(_) => {}
+            Ok(Ok(None) | Err(_)) => return Ok(acquisition),
+        }
+    }
+}
+
+async fn spawn_peer(
+    client: &Client,
     room: &RoomContext,
     args: &Value,
     target: &str,
     program: crate::agent_launch::AgentProgram,
     config: &muxa::config::Config,
+    ticket: muxa::collaboration::WorkerSpawnTicket,
 ) -> std::result::Result<(PeerSelection, crate::agent_launch::StartResult), String> {
     let host = muxa::backend::pane_id_host_kind(&room.current.pane)
         .filter(|host| crate::mux_control::supported(*host))
@@ -3629,6 +3742,7 @@ async fn spawn_peer(
         .unwrap_or(&room.current.pane);
     let request = crate::agent_launch::StartRequest {
         creator: Some((&room.current).into()),
+        worker_spawn: Some(ticket.clone()),
         bypass_permissions: config.collaboration.worker_bypass_permissions,
         purpose: muxa::collaboration::LaunchPurpose::Worker,
         socket: client.socket().to_path_buf(),
@@ -3662,12 +3776,23 @@ async fn spawn_peer(
         .subscribe()
         .await
         .map_err(|error| format!("call_peer could not watch peer registration: {error}"))?;
-    let mut started = tokio::task::spawn_blocking(move || {
+    let mut launch = tokio::task::spawn_blocking(move || {
         crate::mux_control::with_endpoint(Some(endpoint), || crate::agent_launch::start(request))
-    })
-    .await
-    .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
-    .map_err(|error| format!("call_peer spawn failed: {error}"))?;
+    });
+    let mut renewal = tokio::time::interval(Duration::from_secs(5));
+    renewal.tick().await;
+    let mut started = loop {
+        tokio::select! {
+            result = &mut launch => break result
+                .map_err(|error| format!("call_peer spawn worker failed: {error}"))?
+                .map_err(|error| format!("call_peer spawn failed: {error}"))?,
+            _ = renewal.tick() => {
+                // Failure never authorizes takeover. Begin is fenced, and a
+                // launch already begun remains reserved even after expiry.
+                let _ = client.collaboration_worker_spawn(&ticket, &muxa::collaboration::WorkerSpawnAction::Renew).await;
+            }
+        }
+    };
     if host == muxa::HostKind::Rmux {
         started.pane = format!("rmux:{}", started.pane);
     }
@@ -3678,7 +3803,7 @@ async fn spawn_peer(
         .clamp(1, 60);
     let peer = wait_for_spawned_peer_registration(
         client,
-        origin,
+        &ticket.origin,
         &started.pane,
         timeout_secs,
         registrations,
@@ -5125,6 +5250,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

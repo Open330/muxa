@@ -626,6 +626,15 @@ enum RequestBody {
         session_ids: Vec<String>,
         purpose: collaboration::LaunchPurpose,
     },
+    /// Daemon-owned worker capacity. Kept separate from inventory reads.
+    CollaborationWorkerAcquire {
+        origin: CollaborationOrigin,
+        spec: collaboration::WorkerSpawnSpec,
+    },
+    CollaborationWorkerSpawn {
+        ticket: collaboration::WorkerSpawnTicket,
+        action: collaboration::WorkerSpawnAction,
+    },
     CollaborationWorkerLaunch {
         pane: String,
         socket: Option<String>,
@@ -854,6 +863,7 @@ const CAPABILITIES: &[&str] = &[
     "rate_limited",
     "collaboration_mailbox",
     collaboration::HUMAN_PRIORITY_CAPABILITY,
+    collaboration::WORKER_SPAWN_CAPABILITY,
     "collaboration_overview_v1",
     "collaboration_expire_v1",
     "collaboration_lifecycle",
@@ -998,6 +1008,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_overview: Option<collaboration::CollaborationOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_spawn: Option<collaboration::WorkerSpawnAcquisition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
     /// Set on the answer to a long poll that muxad cut short to restart:
     /// nothing changed, and the same request may be asked again.
@@ -1099,6 +1111,7 @@ impl Response {
             handle: None,
             collaboration_requests: None,
             collaboration_overview: None,
+            worker_spawn: None,
             collaboration_request: None,
             restarting: None,
             ask_entries: None,
@@ -4728,6 +4741,63 @@ async fn handle(
                     ));
                     response
                 }
+                RequestBody::CollaborationWorkerAcquire { origin, spec } => {
+                    kind = "collaboration_worker_acquire";
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    match topology.resolve_origin(&origin) {
+                        Ok(caller) => match collaboration
+                            .acquire_worker_spawn(
+                                &caller,
+                                origin,
+                                spec,
+                                &topology.participants,
+                                &topology.panes,
+                            )
+                            .await
+                        {
+                            Ok(acquisition) => {
+                                let mut response = Response::ok();
+                                response.worker_spawn = Some(acquisition);
+                                response
+                            }
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationWorkerSpawn { ticket, action } => {
+                    kind = "collaboration_worker_spawn";
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        ticket.origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    match topology.resolve_origin(&ticket.origin) {
+                        Ok(caller) => match collaboration
+                            .update_worker_spawn(
+                                &caller,
+                                &ticket.launch_id,
+                                action,
+                                &topology.panes,
+                            )
+                            .await
+                        {
+                            Ok(()) => Response::ok(),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationWorkerLaunch {
                     pane,
                     socket,
@@ -6424,6 +6494,28 @@ impl Client {
         });
         let resp = self.call_checked(&req).await?;
         Ok(resp["capture"].as_str().map(str::to_owned))
+    }
+
+    pub async fn collaboration_worker_acquire(
+        &self,
+        origin: &CollaborationOrigin,
+        spec: &collaboration::WorkerSpawnSpec,
+    ) -> Result<collaboration::WorkerSpawnAcquisition, RuntimeError> {
+        let response = self.call_checked(&serde_json::json!({
+            "protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_acquire", "origin":origin, "spec":spec,
+        })).await?;
+        serde_json::from_value(response["worker_spawn"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_worker_spawn(
+        &self,
+        ticket: &collaboration::WorkerSpawnTicket,
+        action: &collaboration::WorkerSpawnAction,
+    ) -> Result<(), RuntimeError> {
+        self.call_checked(&serde_json::json!({
+            "protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawn", "ticket":ticket, "action":action,
+        })).await?;
+        Ok(())
     }
 
     pub async fn collaboration_context(
@@ -8859,6 +8951,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: Some("callabo".into()),
@@ -10673,6 +10766,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn worker_capacity_is_shared_by_independent_ipc_clients() {
+        use collaboration::{WorkerSpawnAcquisition, WorkerSpawnAction, WorkerSpawnSpec};
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("worker-capacity.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "first-caller", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%2", "second-caller", AgentKind::ClaudeCode).await;
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+        // Distinct clients/connections model two separate MCP server processes;
+        // neither can rely on a local mutex or the other's cached room view.
+        let first = Client::new(socket.clone());
+        let second = Client::new(socket);
+        assert!(first
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap()
+            .capabilities
+            .iter()
+            .any(|c| c == collaboration::WORKER_SPAWN_CAPABILITY));
+        let provider = WorkerSpawnSpec {
+            agent_kind: AgentKind::Codex,
+            role: None,
+            launch_role: "reviewer".into(),
+        };
+        let role = WorkerSpawnSpec {
+            role: Some("reviewer".into()),
+            ..provider.clone()
+        };
+        let first_origin = pane_origin("%1");
+        let mut second_origin = pane_origin("%2");
+        second_origin.socket = Some("/tmp/tmux-1000/default".into());
+        let (a, b) = tokio::join!(
+            first.collaboration_worker_acquire(&first_origin, &provider),
+            second.collaboration_worker_acquire(&second_origin, &role),
+        );
+        let outcomes = [a.unwrap(), b.unwrap()];
+        let tickets = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                WorkerSpawnAcquisition::LaunchToken { ticket } => Some(ticket),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tickets.len(), 1);
+        let pending = outcomes
+            .iter()
+            .find_map(|o| match o {
+                WorkerSpawnAcquisition::Pending { launch_id, .. } => Some(launch_id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pending, &tickets[0].launch_id);
+        first
+            .collaboration_worker_spawn(tickets[0], &WorkerSpawnAction::Begin)
+            .await
+            .unwrap();
+        assert!(second
+            .collaboration_worker_spawn(tickets[0], &WorkerSpawnAction::Begin)
+            .await
+            .is_err());
+        first
+            .collaboration_worker_spawn(tickets[0], &WorkerSpawnAction::Renew)
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_wait_cut_short_by_a_restart_is_answered_and_retried_until_the_reply() {
         let dir = tempdir().unwrap();
         let socket = dir.path().join("wait-restart.sock");
@@ -12431,6 +12594,7 @@ mod tests {
         let pane = PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

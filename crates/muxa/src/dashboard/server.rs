@@ -3133,6 +3133,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3611,6 +3612,7 @@ mod tests {
         let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -3644,6 +3646,7 @@ mod tests {
             vec![crate::tmux::PaneInfo {
                 session_group: None,
                 agent_program: None,
+                worker_launch_id: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,
@@ -3679,6 +3682,7 @@ mod tests {
             panes: vec![crate::tmux::PaneInfo {
                 session_group: None,
                 agent_program: None,
+                worker_launch_id: None,
                 agent_role: None,
                 agent_alias: None,
                 workspace_id: None,

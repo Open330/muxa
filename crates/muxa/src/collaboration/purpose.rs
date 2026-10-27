@@ -39,13 +39,39 @@ impl std::str::FromStr for LaunchPurpose {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ProcessFence {
+pub(super) struct ProcessFence {
     pid: u32,
     birth: String,
 }
 
 impl ProcessFence {
-    fn observe(pane: &PaneInfo, kind: AgentKind) -> Option<Self> {
+    /// Missing birth data alone can mean an observation failure, not exit.
+    pub(super) fn definitely_exited(&self) -> bool {
+        if let Some(birth) = process_birth(self.pid) {
+            return birth != self.birth;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            matches!(
+                std::path::Path::new(&format!("/proc/{}", self.pid)).try_exists(),
+                Ok(false)
+            )
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            false
+        } // No authoritative negative process observation on this path.
+        #[cfg(windows)]
+        {
+            !crate::process_snapshot::pid_exists(self.pid)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
+    pub(super) fn observe(pane: &PaneInfo, kind: AgentKind) -> Option<Self> {
         #[cfg(target_os = "linux")]
         let root = crate::process_tree::read_proc(pane.pane_pid, 0);
         #[cfg(not(target_os = "linux"))]
@@ -177,6 +203,24 @@ fn verify_pending_grants(
 }
 
 impl CollaborationStore {
+    pub(super) async fn worker_launch_binding(&self, id: &str) -> Option<String> {
+        self.purposes
+            .read()
+            .await
+            .iter()
+            .find(|g| g.id == id)
+            .and_then(|g| g.consumed_by.clone())
+    }
+
+    pub(super) async fn worker_launch_fence(&self, id: &str) -> Option<ProcessFence> {
+        self.purposes
+            .read()
+            .await
+            .iter()
+            .find(|g| g.id == id)
+            .and_then(|g| g.fence.clone())
+    }
+
     fn persist_purposes(
         &self,
         grants: &[PurposeGrant],

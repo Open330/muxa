@@ -642,6 +642,9 @@ pub struct PaneInfo {
     /// Provider recorded by the Muxa launcher, before the first hook.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_program: Option<String>,
+    /// Stable daemon reservation stamped immediately after physical creation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_launch_id: Option<String>,
     /// `@muxa_agent_role` — the role a muxa-managed launch stamped on this
     /// pane (`implementer`, `reviewer`, ...). Declared by the launcher, not
     /// self-registered by the agent, so it survives the window before the
@@ -721,7 +724,7 @@ pub struct ClientInfo {
 /// `tmux -F` format string for `list-panes`. Tab-separated columns parsed
 /// in `parse_pane_lines`. Kept `pub(crate)` so [`scanner`] can reuse it.
 pub(crate) const PANE_FMT: &str =
-    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_agent_alias}\t#{session_group}";
+    "#{pane_id}\t#{session_name}\t#{window_index}\t#{pane_index}\t#{pane_tty}\t#{pane_current_command}\t#{pane_title}\t#{pane_pid}\t#{pane_current_path}\t#{session_id}\t#{window_id}\t#{window_name}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}\t#{@muxa_agent_alias}\t#{session_group}\t#{@muxa_worker_launch}";
 
 pub(crate) const SESSION_FMT: &str =
     "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_group}";
@@ -777,6 +780,7 @@ pub(crate) fn parse_pane_lines_for_socket(stdout: &str, socket: Option<&str>) ->
             workspace_id: first_non_empty(cols.get(22), cols.get(12)),
             work_id: first_non_empty(cols.get(23), cols.get(15)),
             agent_program: non_empty(cols.get(18)),
+            worker_launch_id: non_empty(cols.get(33)),
             agent_role: non_empty(cols.get(19)),
             agent_alias: non_empty(cols.get(31)),
             session_group: non_empty(cols.get(32)),
@@ -1643,6 +1647,7 @@ mod tests {
         let pane = PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             pane_id: "%1".into(),
@@ -1696,6 +1701,22 @@ mod tests {
         let panes = parse_pane_lines(&format!("{}\n", cols.join("\t")));
         assert_eq!(panes[0].workspace_id.as_deref(), Some("workspace"));
         assert_eq!(panes[0].work_id.as_deref(), Some("CAL-7345"));
+    }
+
+    #[test]
+    fn parses_worker_launch_stamp_and_accepts_older_inventory() {
+        let mut cols = vec!["%10", "main", "0", "0", "/dev/pts/0", "codex", "title"];
+        assert!(parse_pane_lines(&cols.join("\t"))[0]
+            .worker_launch_id
+            .is_none());
+        cols.resize(33, "");
+        cols.push("stable-launch-uuid");
+        assert_eq!(
+            parse_pane_lines(&cols.join("\t"))[0]
+                .worker_launch_id
+                .as_deref(),
+            Some("stable-launch-uuid")
+        );
     }
 
     #[test]

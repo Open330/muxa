@@ -505,6 +505,7 @@ fn to_pane_info(pane: &HerdrPaneInfo, process: Option<&HerdrProcessInfo>) -> Pan
     PaneInfo {
         session_group: None,
         agent_program: None,
+        worker_launch_id: None,
         agent_role: None,
         agent_alias: None,
         pane_id: format!("{PANE_ID_PREFIX}{}", pane.pane_id),

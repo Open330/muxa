@@ -370,6 +370,7 @@ pub struct WorkStartArgs {
 #[derive(Debug, Clone)]
 pub struct StartRequest {
     pub creator: Option<muxa::collaboration::CollaborationEndpoint>,
+    pub worker_spawn: Option<muxa::collaboration::WorkerSpawnTicket>,
     pub bypass_permissions: bool,
     pub purpose: muxa::collaboration::LaunchPurpose,
     pub agent: AgentProgram,
@@ -420,6 +421,7 @@ impl StartRequest {
     pub fn from_args(args: &StartArgs, socket: &Path, cfg: &muxa::config::Config) -> Self {
         Self {
             creator: None,
+            worker_spawn: None,
             bypass_permissions: true,
             purpose: args.purpose,
             agent: args.agent,
@@ -687,6 +689,7 @@ pub fn run_work_start(
     let json = args.json;
     let result = start(StartRequest {
         creator: None,
+        worker_spawn: None,
         bypass_permissions: true,
         purpose: muxa::collaboration::LaunchPurpose::Primary,
         socket: socket.to_path_buf(),
@@ -732,6 +735,10 @@ pub fn run_work_start(
 /// `spawn_blocking` by async callers.
 #[allow(clippy::too_many_lines)] // launch, metadata stamping, and rollback form one physical transaction
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
+    let launch_id = request.worker_spawn.as_ref().map_or_else(
+        || uuid::Uuid::new_v4().to_string(),
+        |ticket| ticket.launch_id.clone(),
+    );
     if request.purpose == muxa::collaboration::LaunchPurpose::Worker {
         // Dedicated workers must report their own pane, rather than inherit
         // a human TUI's environment through Codex's shared app-server.
@@ -779,6 +786,13 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             .argv(),
     );
     let args = tmux_args(&request, &cwd, &command)?;
+    if let Some(ticket) = &request.worker_spawn {
+        update_spawn(
+            &request.socket,
+            ticket,
+            &muxa::collaboration::WorkerSpawnAction::Begin,
+        )?;
+    }
     let output = crate::mux_control::ambient_command_with_args(&args)?
         .output()
         .context("run tmux agent launcher")?;
@@ -808,6 +822,29 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         .find(|line| line.starts_with('%'))
         .ok_or_else(|| anyhow::anyhow!("tmux created the surface but returned no pane id"))?
         .to_string();
+
+    if request.worker_spawn.is_some() {
+        // Launching was persisted before creation. A crash in the small
+        // create-to-stamp gap remains Uncertain and cannot trigger a respawn.
+        // Once stamped, any daemon client can reconcile this exact launch.
+        crate::mux_control::ambient_command_with_args(&[
+            "set-option",
+            "-p",
+            "-t",
+            &pane,
+            "@muxa_worker_launch",
+            &launch_id,
+        ])?
+        .output()
+        .and_then(|output| {
+            if output.status.success() {
+                Ok(())
+            } else {
+                Err(std::io::Error::other("cannot stamp worker launch"))
+            }
+        })
+        .context("record worker launch identity; pane left for reconciliation")?;
+    }
 
     let managed = work.is_some();
     let session = managed
@@ -872,12 +909,12 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // Missing/older daemons remain supported; periodic discovery retries.
     register_launched_agent(&request, &pane);
     if request.purpose == muxa::collaboration::LaunchPurpose::Worker {
-        if let Err(error) = register_worker_purpose(&request, &pane) {
+        if let Err(error) = register_worker_purpose(&request, &pane, &launch_id) {
             crate::tmux_work::cleanup_pane(&pane);
             return Err(error).context("register worker launch purpose");
         }
     }
-    crate::spawn_provenance::record(&request, &pane);
+    crate::spawn_provenance::record(&request, &pane, &launch_id);
     // Minting belongs to the agent's session-start hook, which reaches the
     // room's arbiter. Doing it here too would allocate from a namespace this
     // process cannot see all of — the bug the arbiter exists to close — so an
@@ -913,7 +950,25 @@ fn account_suffix(decision: Option<&muxa::account_route::AccountDecision>) -> St
         .map_or_else(String::new, |account| format!(" on {account}"))
 }
 
-fn register_worker_purpose(request: &StartRequest, pane: &str) -> Result<()> {
+fn update_spawn(
+    socket: &Path,
+    ticket: &muxa::collaboration::WorkerSpawnTicket,
+    action: &muxa::collaboration::WorkerSpawnAction,
+) -> Result<()> {
+    let response = muxa::ipc::blocking_call(socket, &serde_json::json!({
+        "protocol":muxa::event::PROTOCOL_VERSION, "kind":"collaboration_worker_spawn", "ticket":ticket, "action":action,
+    }), std::time::Duration::from_secs(5)).context("worker launch coordination timed out")?;
+    anyhow::ensure!(
+        response["ok"] == true,
+        "{}",
+        response["error"]
+            .as_str()
+            .unwrap_or("worker launch coordination failed")
+    );
+    Ok(())
+}
+
+fn register_worker_purpose(request: &StartRequest, pane: &str, launch_id: &str) -> Result<()> {
     use muxa::backend::PaneBackend;
     let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
         rmux.resolve_pane(&format!("rmux:{pane}"))
@@ -921,6 +976,16 @@ fn register_worker_purpose(request: &StartRequest, pane: &str) -> Result<()> {
         muxa::TmuxBackend::new().resolve_pane(pane)
     }
     .context("worker pane is not observable")?;
+    if let Some(ticket) = &request.worker_spawn {
+        return update_spawn(
+            &request.socket,
+            ticket,
+            &muxa::collaboration::WorkerSpawnAction::Observe {
+                pane: observed.pane_id,
+                socket: observed.socket,
+            },
+        );
+    }
     let kind = muxa::discovery::classify_command(request.agent.label())
         .context("unknown worker provider")?;
     let result = muxa::ipc::blocking_call(
@@ -928,7 +993,7 @@ fn register_worker_purpose(request: &StartRequest, pane: &str) -> Result<()> {
         &serde_json::json!({
             "protocol":muxa::event::PROTOCOL_VERSION,"kind":"collaboration_worker_launch",
             "pane":observed.pane_id,"socket":observed.socket,"agent_kind":kind,
-            "launch_id":uuid::Uuid::new_v4().to_string(),
+            "launch_id":launch_id,
         }),
         std::time::Duration::from_secs(5),
     )
@@ -1406,6 +1471,7 @@ mod tests {
     fn request(agent: AgentProgram, placement: Placement) -> StartRequest {
         StartRequest {
             creator: None,
+            worker_spawn: None,
             bypass_permissions: true,
             purpose: muxa::collaboration::LaunchPurpose::Primary,
             socket: muxa::paths::default_socket(),

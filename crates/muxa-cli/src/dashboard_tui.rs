@@ -5232,6 +5232,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
