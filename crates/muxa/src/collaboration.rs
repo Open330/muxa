@@ -1481,6 +1481,9 @@ pub enum CollaborationError {
     AmbiguousTarget(String),
     #[error("target {0:?} is not a peer in this tmux window")]
     UnknownTarget(String),
+    /// A worker launch reservation refused or not found.
+    #[error("worker launch: {0}")]
+    WorkerLaunch(String),
     #[error("message is empty")]
     EmptyMessage,
     #[error("message exceeds the configured {0}-byte limit")]

@@ -8657,7 +8657,7 @@ pub async fn run(
     Ok(jump_target)
 }
 
-fn watch_collaboration_origin(initial_pane: Option<String>) -> CollaborationOrigin {
+pub(crate) fn watch_collaboration_origin(initial_pane: Option<String>) -> CollaborationOrigin {
     watch_collaboration_origin_from(
         initial_pane,
         std::env::var("RMUX").ok(),

@@ -7,11 +7,16 @@
 use std::fmt::Write as _;
 
 use anyhow::{Context, Result};
-use muxa::collaboration::{WorkerEntry, WorkerFlag, WorkerInventory};
+use muxa::collaboration::{
+    WorkerEntry, WorkerFlag, WorkerInventory, WorkerSpawnPhase, WorkerSpawnView,
+};
 use muxa::ipc::Client;
+use serde::Serialize;
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {
+    #[command(subcommand)]
+    action: Option<Action>,
     /// Hours of observed idle time after which a worker is flagged.
     #[arg(long, default_value_t = 24)]
     idle_hours: u64,
@@ -19,17 +24,113 @@ pub(crate) struct Args {
     json: bool,
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum Action {
+    /// Give up the capacity an unfinished worker launch still holds, so the
+    /// room can launch a worker again. muxad refuses while a live process
+    /// still matches the launch; it never stops a process. Verify the old
+    /// launcher has stopped first. Audited.
+    Release {
+        /// The launch id `muxa workers` lists under launches.
+        launch_id: String,
+        /// Why it is safe to release, recorded in the audit log.
+        #[arg(long)]
+        reason: String,
+    },
+}
+
+/// What `muxa workers --json` prints: the inventory, plus launches that
+/// still hold capacity without a registered worker.
+#[derive(Serialize)]
+struct Listing<'a> {
+    #[serde(flatten)]
+    inventory: &'a WorkerInventory,
+    launches: Vec<&'a WorkerSpawnView>,
+}
+
 pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
+    if let Some(Action::Release { launch_id, reason }) = args.action {
+        let origin = crate::watch::watch_collaboration_origin(std::env::var("TMUX_PANE").ok());
+        client
+            .collaboration_worker_spawn_release(&origin, &launch_id, &reason)
+            .await
+            .with_context(|| format!("releasing worker launch {launch_id}"))?;
+        println!("released {launch_id}");
+        return Ok(());
+    }
     let inventory = client
         .collaboration_workers(args.idle_hours.saturating_mul(3600))
         .await
         .context("reading the worker inventory from muxad (an older daemon lacks it)")?;
+    // Launch records come from the spawn coordinator; a daemon without it
+    // simply has none to show.
+    let spawns = client
+        .collaboration_worker_spawns()
+        .await
+        .unwrap_or_default();
+    let launches = unfinished(&spawns);
     if args.json {
-        println!("{}", serde_json::to_string(&inventory)?);
+        println!(
+            "{}",
+            serde_json::to_string(&Listing {
+                inventory: &inventory,
+                launches,
+            })?
+        );
     } else {
         print!("{}", render(&inventory));
+        print!("{}", render_launches(&launches));
     }
     Ok(())
+}
+
+/// Launches still holding capacity without a bound worker session.
+fn unfinished(spawns: &[WorkerSpawnView]) -> Vec<&WorkerSpawnView> {
+    spawns
+        .iter()
+        .filter(|spawn| {
+            spawn.closed_at.is_none()
+                && !matches!(
+                    spawn.phase,
+                    WorkerSpawnPhase::Failed | WorkerSpawnPhase::SessionBound
+                )
+        })
+        .collect()
+}
+
+fn render_launches(launches: &[&WorkerSpawnView]) -> String {
+    if launches.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\nLaunches holding capacity:\n");
+    for spawn in launches {
+        let phase = wire_name(spawn.phase);
+        let _ = writeln!(
+            out,
+            "  {}  {} {} in {}  {}  pane {}{}",
+            spawn.launch_id,
+            wire_name(spawn.agent_kind),
+            spawn.role,
+            spawn.room.window_id,
+            phase,
+            spawn.pane.as_deref().unwrap_or("-"),
+            spawn
+                .detail
+                .as_deref()
+                .map_or_else(String::new, |detail| format!(" — {detail}")),
+        );
+    }
+    if launches
+        .iter()
+        .any(|spawn| spawn.phase == WorkerSpawnPhase::Uncertain)
+    {
+        out.push_str(
+            "An uncertain launch blocks new workers of that kind in its room. Once \
+             you have checked its launcher stopped, free it with \
+             `muxa workers release <launch-id> --reason <why>`.\n",
+        );
+    }
+    out
 }
 
 fn duration(seconds: u64) -> String {
@@ -48,7 +149,16 @@ fn flag_label(flag: WorkerFlag) -> &'static str {
     }
 }
 
-fn row(worker: &WorkerEntry) -> String {
+/// A kind or state as muxa names it on the wire (`claude_code`, `idle`).
+fn wire_name(value: impl Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The columns of one worker row, before alignment.
+fn cells(worker: &WorkerEntry) -> [String; 7] {
     let place = match (&worker.tmux_session_name, &worker.window_name) {
         (Some(session), Some(window)) => format!("{session}:{window}"),
         _ => worker.room.window_id.clone(),
@@ -61,25 +171,51 @@ fn row(worker: &WorkerEntry) -> String {
     let state = if worker.pending {
         "registering".to_owned()
     } else {
-        format!("{:?}", worker.state).to_lowercase()
+        wire_name(worker.state)
     };
     let idle = worker
         .observed_idle
         .as_ref()
         .map_or_else(|| "-".to_owned(), |idle| duration(idle.seconds));
     let flags: Vec<&str> = worker.flags.iter().map(|f| flag_label(*f)).collect();
-    format!(
-        "{:<12} {:<11} {:<24} {:<12} {:<12} {:>6}  q{} c{}  {}",
-        worker.pane,
-        format!("{:?}", worker.agent_kind).to_lowercase(),
+    [
+        worker.pane.clone(),
+        wire_name(worker.agent_kind),
         place,
         role,
         state,
         idle,
-        worker.queued_requests,
-        worker.claimed_requests,
-        flags.join(",")
-    )
+        format!(
+            "q{} c{}  {}",
+            worker.queued_requests,
+            worker.claimed_requests,
+            flags.join(",")
+        ),
+    ]
+}
+
+/// Rows aligned to their widest cell, so long room names keep columns.
+fn table(rows: &[[String; 7]]) -> String {
+    let mut widths = [0usize; 7];
+    for row in rows {
+        for (width, cell) in widths.iter_mut().zip(row) {
+            *width = (*width).max(cell.chars().count());
+        }
+    }
+    let mut out = String::new();
+    for row in rows {
+        let mut line = String::new();
+        for (i, (cell, width)) in row.iter().zip(widths).enumerate() {
+            if i + 1 == row.len() {
+                line.push_str(cell);
+            } else {
+                let _ = write!(line, "{cell:<width$}  ");
+            }
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 fn render(inventory: &WorkerInventory) -> String {
@@ -87,15 +223,20 @@ fn render(inventory: &WorkerInventory) -> String {
     if inventory.workers.is_empty() {
         out.push_str("No live workers.\n");
     } else {
-        let _ = writeln!(
-            out,
-            "{:<12} {:<11} {:<24} {:<12} {:<12} {:>6}  OPEN  FLAGS",
-            "PANE", "AGENT", "ROOM", "ROLE", "STATE", "IDLE"
-        );
-        for worker in &inventory.workers {
-            out.push_str(&row(worker));
-            out.push('\n');
-        }
+        let header = [
+            "PANE",
+            "AGENT",
+            "ROOM",
+            "ROLE",
+            "STATE",
+            "IDLE",
+            "OPEN  FLAGS",
+        ]
+        .map(str::to_owned);
+        let rows: Vec<[String; 7]> = std::iter::once(header)
+            .chain(inventory.workers.iter().map(cells))
+            .collect();
+        out.push_str(&table(&rows));
     }
     let error = inventory.flagged(WorkerFlag::Error);
     let idle = inventory.flagged(WorkerFlag::LongIdle);
@@ -157,6 +298,8 @@ mod tests {
         let text = render(&inventory);
         assert!(text.contains("rmux:%304"), "{text}");
         assert!(text.contains("muxa:main"), "{text}");
+        assert!(text.contains("codex"), "{text}");
+        assert!(text.contains("error"), "{text}");
         assert!(text.contains("q1 c0"), "{text}");
         assert!(text.contains("1 in error (not reused; a replacement may be spawned)"));
         assert!(text.contains("96 launch grant(s) on record, including finished sessions"));
@@ -166,6 +309,73 @@ mod tests {
             recorded_grants: 0
         })
         .starts_with("No live workers."));
+    }
+
+    fn spawn(id: &str, phase: WorkerSpawnPhase, closed: bool) -> WorkerSpawnView {
+        let at = time::OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        WorkerSpawnView {
+            launch_id: id.into(),
+            room: RoomId {
+                host: "rmux".into(),
+                socket: None,
+                window_id: "@34".into(),
+            },
+            agent_kind: AgentKind::Codex,
+            role: "reviewer".into(),
+            phase,
+            pane: None,
+            socket: None,
+            detail: Some("create result unknown".into()),
+            lease_until: at,
+            closed_at: closed.then_some(at),
+        }
+    }
+
+    #[test]
+    fn only_launches_still_holding_capacity_are_shown_with_how_to_free_them() {
+        let spawns = [
+            spawn("bound", WorkerSpawnPhase::SessionBound, false),
+            spawn("failed", WorkerSpawnPhase::Failed, false),
+            spawn("closed", WorkerSpawnPhase::Uncertain, true),
+            spawn("stuck", WorkerSpawnPhase::Uncertain, false),
+            spawn("starting", WorkerSpawnPhase::Launching, false),
+        ];
+        let open = unfinished(&spawns);
+        assert_eq!(
+            open.iter()
+                .map(|s| s.launch_id.as_str())
+                .collect::<Vec<_>>(),
+            ["stuck", "starting"]
+        );
+        let text = render_launches(&open);
+        assert!(
+            text.contains("stuck  codex reviewer in @34  uncertain"),
+            "{text}"
+        );
+        assert!(text.contains("create result unknown"), "{text}");
+        assert!(
+            text.contains("muxa workers release <launch-id> --reason"),
+            "{text}"
+        );
+        // Nothing uncertain, no release advice.
+        assert!(!render_launches(&open[1..]).contains("release"));
+        assert!(render_launches(&[]).is_empty());
+    }
+
+    #[test]
+    fn columns_stay_aligned_past_a_long_room_name() {
+        let mut long = worker("rmux:%1", vec![]);
+        long.window_name = Some("RELEASE-1025-STREAMING".into());
+        long.agent_kind = AgentKind::ClaudeCode;
+        let text = render(&WorkerInventory {
+            workers: vec![long, worker("rmux:%22", vec![WorkerFlag::LongIdle])],
+            idle_threshold_secs: 3600,
+            recorded_grants: 0,
+        });
+        let lines: Vec<&str> = text.lines().take(3).collect();
+        let column = |line: &str| line.find("reviewer").unwrap();
+        assert_eq!(column(lines[1]), column(lines[2]), "{text}");
+        assert!(text.contains("claude_code"), "{text}");
     }
 
     #[test]

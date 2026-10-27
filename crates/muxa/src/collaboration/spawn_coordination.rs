@@ -40,7 +40,7 @@ impl WorkerSpawnSpec {
                 | AgentKind::Opencode
                 | AgentKind::Antigravity
         ) {
-            return Err(CollaborationError::UnknownTarget(
+            return Err(CollaborationError::WorkerLaunch(
                 "not a worker provider".into(),
             ));
         }
@@ -53,7 +53,7 @@ impl WorkerSpawnSpec {
                 .as_ref()
                 .is_some_and(|r| r.is_empty() || r.len() > 64 || *r != self.launch_role)
         {
-            return Err(CollaborationError::UnknownTarget(
+            return Err(CollaborationError::WorkerLaunch(
                 "invalid worker routing role".into(),
             ));
         }
@@ -379,7 +379,11 @@ impl CollaborationStore {
         let record = records
             .iter_mut()
             .find(|r| r.launch_id == launch_id)
-            .ok_or_else(|| CollaborationError::UnknownTarget("unknown worker launch".into()))?;
+            .ok_or_else(|| {
+                CollaborationError::WorkerLaunch(
+                    "no such launch id; list launches with `muxa workers`".into(),
+                )
+            })?;
         if !record.owner.same_session(caller) || record.room != caller.room {
             return Err(CollaborationError::ScopeDenied);
         }
@@ -420,7 +424,7 @@ impl CollaborationStore {
                             && pane_room(&p.pane_id, p, p.socket.clone()) == record.room
                     })
                     .ok_or_else(|| {
-                        CollaborationError::UnknownTarget(
+                        CollaborationError::WorkerLaunch(
                             "worker launch stamp absent or ambiguous".into(),
                         )
                     })?;
@@ -475,7 +479,7 @@ impl CollaborationStore {
         self.ensure_enabled()?;
         let reason = reason.trim();
         if reason.is_empty() || reason.len() > 512 {
-            return Err(CollaborationError::UnknownTarget(
+            return Err(CollaborationError::WorkerLaunch(
                 "release needs a reason (1-512 bytes)".into(),
             ));
         }
@@ -483,7 +487,11 @@ impl CollaborationStore {
         let record = records
             .iter_mut()
             .find(|r| r.launch_id == launch_id)
-            .ok_or_else(|| CollaborationError::UnknownTarget("unknown worker launch".into()))?;
+            .ok_or_else(|| {
+                CollaborationError::WorkerLaunch(
+                    "no such launch id; list launches with `muxa workers`".into(),
+                )
+            })?;
         if !caller.console && !record.owner.same_session(caller) {
             return Err(CollaborationError::ScopeDenied);
         }
@@ -493,7 +501,7 @@ impl CollaborationStore {
         if record.phase == WorkerSpawnPhase::Launching
             && record.lease_until > OffsetDateTime::now_utc()
         {
-            return Err(CollaborationError::UnknownTarget(
+            return Err(CollaborationError::WorkerLaunch(
                 "launch is still active; stop the launcher and let its lease expire before release"
                     .into(),
             ));
@@ -515,7 +523,7 @@ impl CollaborationStore {
                 .as_ref()
                 .is_some_and(|p| !same_spawn_location(record, p));
             if !exited && !moved {
-                return Err(CollaborationError::UnknownTarget("worker process still matches or cannot be disproved; stop it or verify its move before release".into()));
+                return Err(CollaborationError::WorkerLaunch("worker process still matches or cannot be disproved; stop it or verify its move before release".into()));
             }
         } else {
             // Without a committed grant, a stamp is still evidence of a
@@ -534,7 +542,7 @@ impl CollaborationStore {
             .await
             .unwrap_or(true)
             {
-                return Err(CollaborationError::UnknownTarget(
+                return Err(CollaborationError::WorkerLaunch(
                     "stamped worker process is still live; inspect or stop it before release"
                         .into(),
                 ));
