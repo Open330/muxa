@@ -713,50 +713,16 @@ pub(crate) fn is_agent_process(process: &ProcessInfo, kind: AgentKind) -> bool {
         return false;
     };
     kind != AgentKind::Codex
-        || !codex_subcommand(&tokens[program + 1..]).is_some_and(|subcommand| {
-            matches!(
-                subcommand,
-                "app-server" | "exec" | "review" | "mcp-server" | "exec-server"
-            )
-        })
-}
-
-/// The first positional word after `codex`, skipping its options.
-///
-/// Only that position names a subcommand. A later word belongs to the
-/// prompt, and a worker prompt such as "You review …" must not read as
-/// `codex review`.
-fn codex_subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
-    const TAKES_VALUE: &[&str] = &[
-        "-c",
-        "--config",
-        "-m",
-        "--model",
-        "-p",
-        "--profile",
-        "-C",
-        "--cd",
-        "-s",
-        "--sandbox",
-        "-a",
-        "--ask-for-approval",
-        "-i",
-        "--image",
-        "--add-dir",
-        "--enable",
-        "--disable",
-        "--local-provider",
-    ];
-    let mut args = args.iter();
-    while let Some(arg) = args.next() {
-        if !arg.starts_with('-') {
-            return Some(arg);
-        }
-        if TAKES_VALUE.contains(arg) {
-            args.next();
-        }
-    }
-    None
+        // Only the first positional word after `codex` names a subcommand;
+        // later words belong to the prompt, and a worker prompt such as
+        // "You review …" must not read as `codex review`.
+        || !crate::adapters::proc_ancestry::codex_subcommand(&tokens[program..].join(" "))
+            .is_some_and(|subcommand| {
+                matches!(
+                    subcommand,
+                    "app-server" | "exec" | "review" | "mcp-server" | "exec-server"
+                )
+            })
 }
 
 /// What a pane runs, found among the processes under its shell.
