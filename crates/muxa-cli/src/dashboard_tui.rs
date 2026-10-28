@@ -1517,6 +1517,7 @@ fn dashboard_collaboration_origin_from(
         (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(pane), path))
     });
     CollaborationOrigin {
+        exact_session: false,
         pane: pane.unwrap_or_default(),
         socket,
         console: true,
@@ -1560,6 +1561,7 @@ fn dashboard_mailbox_anchor(app: &DashboardApp) -> Option<CollaborationAnchor> {
         });
     Some(CollaborationAnchor {
         origin: CollaborationOrigin {
+            exact_session: false,
             pane,
             socket,
             console: false,
@@ -5363,6 +5365,7 @@ mod tests {
         // under the cursor, which these fixtures park on `current`.
         let inbox = CollaborationAnchor {
             origin: CollaborationOrigin {
+                exact_session: false,
                 pane: current.pane.clone(),
                 socket: None,
                 console: false,
@@ -5372,6 +5375,7 @@ mod tests {
         };
         data.collaboration = CollaborationData {
             origin: Some(CollaborationOrigin {
+                exact_session: false,
                 pane: current.pane.clone(),
                 socket: current.socket.clone(),
                 console: true,
@@ -5695,6 +5699,7 @@ mod tests {
         attach_collaboration(&mut stale, current.clone(), vec![peer.clone()]);
         stale.collaboration.inbox = Some(CollaborationAnchor {
             origin: CollaborationOrigin {
+                exact_session: false,
                 pane: "%9".into(),
                 socket: None,
                 console: false,

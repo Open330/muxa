@@ -22,7 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agent under the cursor (recipient pane and session fixed when pressed; not
   sent to a replacement agent), `b` opens its mailbox and `i`/`e` claim and
   reply as that agent. The watch mailbox gains `x` to withdraw a queued request
-  this console sent.
+  this console sent. Collaboration targets accept `session:<agent session
+  id>` and origins accept `exact_session`, both refusing rather than falling
+  back to a pane's new occupant (`collaboration_exact_session_v1`).
 
 - Opt-in versioned collaboration task contracts bind requests to daemon-created
   attempt IDs, exact basis commits and structured reported evidence. Read-only

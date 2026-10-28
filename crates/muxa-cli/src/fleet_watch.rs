@@ -2123,6 +2123,7 @@ fn clear_delivered_broadcast_marks(app: &mut App, report: &BroadcastReport) {
 fn fleet_watch_console_origin(pane: &PaneKey) -> CollaborationOrigin {
     let endpoint = &pane.window.session.endpoint;
     CollaborationOrigin {
+        exact_session: false,
         pane: pane.pane_id.clone(),
         socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
             .then(|| endpoint.socket.clone()),

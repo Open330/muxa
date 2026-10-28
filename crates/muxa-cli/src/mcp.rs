@@ -4151,6 +4151,7 @@ fn origin_for_session(
     // onto another agent's pane.
     let pane = agent.pane.clone().unwrap_or_default();
     Ok(CollaborationOrigin {
+        exact_session: false,
         pane,
         socket: agent.tmux_socket.clone(),
         console: false,
@@ -4182,6 +4183,7 @@ pub(crate) fn current_collaboration_origin() -> std::result::Result<Collaboratio
     // An MCP caller *is* the agent in the pane, so it keeps the pane identity:
     // replies must route back to it and wake it.
     Ok(CollaborationOrigin {
+        exact_session: false,
         pane,
         socket,
         console: false,
@@ -5452,6 +5454,7 @@ mod tests {
     #[tokio::test]
     async fn a_slot_send_falls_back_only_after_an_explicit_refusal() {
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: None,
             console: false,
@@ -6125,6 +6128,7 @@ mod tests {
         let client = Client::new(sock);
         let registrations = client.subscribe().await.unwrap();
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
@@ -6976,6 +6980,7 @@ mod tests {
             ],
         );
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: None,
             console: false,

@@ -5239,6 +5239,7 @@ mod tests {
     fn only_untracked_unpinned_terminal_lists_use_operator_identity() {
         use muxa::ipc::RuntimeError;
         let mut origin = CollaborationOrigin {
+            exact_session: false,
             pane: "rmux:%71".into(),
             socket: Some("/tmp/rmux/default".into()),
             console: false,

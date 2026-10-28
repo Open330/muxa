@@ -5616,6 +5616,7 @@ mod tests {
         let recipient = participants[0].clone();
         let console = muxa::collaboration::resolve_origin(
             &muxa::collaboration::CollaborationOrigin {
+                exact_session: false,
                 pane: "%2".into(),
                 socket: None,
                 console: true,

@@ -923,6 +923,7 @@ const CAPABILITIES: &[&str] = &[
     collaboration::WORKER_SPAWN_CAPABILITY,
     collaboration::WORKER_DRAIN_CAPABILITY,
     collaboration::WORKER_SPAWN_RELEASE_CAPABILITY,
+    collaboration::EXACT_SESSION_CAPABILITY,
     "collaboration_overview_v1",
     "collaboration_expire_v1",
     "collaboration_lifecycle",
@@ -4832,6 +4833,7 @@ async fn handle(
                     )
                     .await;
                     let origin = CollaborationOrigin {
+                        exact_session: false,
                         pane: collaboration_actor
                             .observed_pane
                             .clone()
@@ -8925,6 +8927,7 @@ mod tests {
         wait_for_socket(&socket).await;
         let client = Client::new(socket);
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
@@ -9007,6 +9010,7 @@ mod tests {
             "registration must not rescan after its process-fenced grant"
         );
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
@@ -9043,6 +9047,7 @@ mod tests {
         wait_for_socket(&socket).await;
         let client = Client::new(socket);
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
@@ -9141,6 +9146,7 @@ mod tests {
         wait_for_socket(&socket).await;
         let client = Client::new(socket);
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
@@ -9591,6 +9597,7 @@ mod tests {
 
         let client = Client::new(socket);
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
@@ -9629,6 +9636,7 @@ mod tests {
             request_panes: None,
         };
         let provenance = actor.provenance(&CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
@@ -9684,6 +9692,7 @@ mod tests {
         wait_for_socket(&socket).await;
         let client = Client::new(socket);
         let origin = |pane: &str, console| CollaborationOrigin {
+            exact_session: false,
             pane: pane.into(),
             socket: Some("default".into()),
             console,
@@ -9785,6 +9794,7 @@ mod tests {
         wait_for_socket(&socket).await;
         let client = Client::new(socket);
         let origin = |pane: &str| CollaborationOrigin {
+            exact_session: false,
             pane: pane.into(),
             socket: Some("default".into()),
             console: false,
@@ -9878,6 +9888,7 @@ mod tests {
         let client =
             Client::new(sock).with_collaboration_client_kind(CollaborationClientKind::Watch);
         let origin = |pane: &str, console: bool| CollaborationOrigin {
+            exact_session: false,
             pane: pane.into(),
             socket: Some("default".into()),
             console,
@@ -9994,18 +10005,21 @@ mod tests {
         let client =
             Client::new(sock).with_collaboration_client_kind(CollaborationClientKind::Watch);
         let sender = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,
             agent_session_id: None,
         };
         let recipient = CollaborationOrigin {
+            exact_session: false,
             pane: "%2".into(),
             socket: Some("default".into()),
             console: false,
             agent_session_id: None,
         };
         let verifier = CollaborationOrigin {
+            exact_session: false,
             pane: "%3".into(),
             socket: Some("default".into()),
             console: false,
@@ -10355,6 +10369,7 @@ mod tests {
         let console_request = client
             .collaboration_send(
                 &CollaborationOrigin {
+                    exact_session: false,
                     pane: "%1".into(),
                     socket: Some("default".into()),
                     console: true,
@@ -11305,6 +11320,7 @@ mod tests {
 
     fn pane_origin(pane: &str) -> CollaborationOrigin {
         CollaborationOrigin {
+            exact_session: false,
             pane: pane.into(),
             socket: Some("default".into()),
             console: false,

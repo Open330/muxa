@@ -1038,6 +1038,10 @@ async fn restart_daemon_from_watch(client: &Client) -> std::result::Result<(), S
 async fn probe_version_skew(client: &Client, app: &mut App) {
     if let Ok(hello) = client.hello(Duration::from_secs(2)).await {
         app.version_skew = hello.version_skew();
+        app.exact_session_supported = hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == muxa::collaboration::EXACT_SESSION_CAPABILITY);
     }
 }
 
@@ -2708,6 +2712,13 @@ impl MailboxHistoryScope {
                         participant.socket.as_deref() == Some(socket)
                             || participant.room.socket.as_deref() == Some(socket)
                     })
+                    // An anchor pinned to one agent session shows only that
+                    // session's history, not a predecessor's in the same pane.
+                    && anchor
+                        .origin
+                        .agent_session_id
+                        .as_deref()
+                        .is_none_or(|session| participant.agent_session_id == session)
             }
             Self::Window { key, .. } => {
                 participant_matches_session(participant, &key.session)
@@ -3310,6 +3321,10 @@ pub(crate) struct App {
     /// writing to: no other action may write to those panes meanwhile.
     pending_outcomes: Vec<(Vec<PaneKey>, tokio::sync::oneshot::Receiver<ActionOutcome>)>,
     board_stats: BoardStats,
+    /// The daemon resolves exact agent sessions (`session:` targets and
+    /// exact-session origins). Board collaboration acts for one exact agent,
+    /// so it is refused without this rather than risk a pane fallback.
+    exact_session_supported: bool,
     collaboration_composer: Option<CollaborationComposer>,
     /// Agents the operator marked with `Space`, to be addressed together.
     ///
@@ -3657,6 +3672,7 @@ impl App {
             board_refresher: BoardRefresher::default(),
             board_pending: None,
             board_stats: BoardStats::default(),
+            exact_session_supported: false,
             pending_outcomes: Vec::new(),
             collaboration_composer: None,
             collaboration_marks: std::collections::HashSet::new(),
@@ -8941,6 +8957,7 @@ fn watch_collaboration_origin_from(
         (!path.is_empty()).then(|| muxa::backend::pane_endpoint_identity(Some(pane), path))
     });
     CollaborationOrigin {
+        exact_session: false,
         pane: pane.unwrap_or_default(),
         socket,
         console: true,
@@ -9605,6 +9622,7 @@ fn mailbox_anchor_for_pane(pane: &PaneNode) -> Option<MailboxAnchor> {
     let endpoint = &pane.key.window.session.endpoint;
     Some(MailboxAnchor {
         origin: CollaborationOrigin {
+            exact_session: false,
             pane: pane.key.pane_id.clone(),
             socket: matches!(endpoint.host, muxa::HostKind::Tmux | muxa::HostKind::Rmux)
                 .then(|| endpoint.socket.clone()),
@@ -9640,6 +9658,7 @@ fn mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
     };
     Some(MailboxAnchor {
         origin: CollaborationOrigin {
+            exact_session: false,
             pane,
             socket,
             console: false,
@@ -10232,7 +10251,8 @@ fn open_watch_collaboration_composer(app: &mut App) {
         ));
         return;
     }
-    let (peer_pane, peer_label, pane_key, _) = match collaboration_target_at_cursor(app) {
+    let (peer_pane, peer_label, pane_key, peer_session) = match collaboration_target_at_cursor(app)
+    {
         Ok(target) => target,
         // The keystrokes fallback types into the topology selection, which
         // is not what the board shows; `p` is the board's keystrokes path.
@@ -10256,14 +10276,27 @@ fn open_watch_collaboration_composer(app: &mut App) {
     // while positions are legible and drift.
     let label = format!("{peer_label} · {}", app.pane_label(&peer_pane));
     let defaults = app.collaboration_compose_defaults;
+    // The board addresses one exact agent session, which the daemon resolves
+    // or refuses — never a successor in the pane. It is a request only:
+    // keystrokes are `p`, so just-send is not on offer here.
+    let (target, mode) = match (on_board, peer_session) {
+        (true, Some(session)) => (
+            format!("session:{session}"),
+            match defaults.mode {
+                ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
+                mode => mode,
+            },
+        ),
+        _ => (format!("pane:{peer_pane}"), defaults.mode),
+    };
     app.collaboration_composer = Some(CollaborationComposer::new(
         CollaborationComposeTarget::Send {
             origin,
-            target: format!("pane:{peer_pane}"),
+            target,
             pane: peer_pane,
             pane_key,
             kind: defaults.kind,
-            mode: defaults.mode,
+            mode,
         },
         label,
     ));
@@ -12028,7 +12061,12 @@ fn handle_board_screen_key(
         KeyCode::Char('R') if browsing => return Some(board_abort_action(app, false)),
         KeyCode::Char('A') if browsing => return Some(board_abort_action(app, true)),
         KeyCode::Char('m') if browsing => return Some(board_message_action(app)),
-        KeyCode::Char('b' | 'M') if browsing => return Some(Action::OpenCollaborationMailbox),
+        KeyCode::Char('b' | 'M') if browsing => {
+            if board_collaboration_unsupported(app) {
+                return Some(Action::None);
+            }
+            return Some(Action::OpenCollaborationMailbox);
+        }
         KeyCode::Char('i') if browsing => return Some(board_claim_action(app)),
         _ => return None,
     }
@@ -12245,15 +12283,32 @@ fn board_mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
                 .then(|| endpoint.socket.clone()),
             console: false,
             agent_session_id: Some(agent.session_id.clone()),
+            exact_session: true,
         },
         label: format!("{}@{}", agent.kind, key.pane_id),
     })
+}
+
+/// Refuse board collaboration when the daemon cannot pin an exact agent
+/// session: the fallback it would use acts as whoever holds the pane.
+fn board_collaboration_unsupported(app: &mut App) -> bool {
+    if app.exact_session_supported {
+        return false;
+    }
+    app.set_hint(
+        "this muxad cannot pin an exact agent session — restart it onto this build",
+        HintLevel::Err,
+    );
+    true
 }
 
 /// `m` on the board: message the agent under the cursor. Its identity is
 /// frozen now; the composer opens for exactly that agent, and the message
 /// is sent only if the same agent session still runs in that pane.
 fn board_message_action(app: &mut App) -> Action {
+    if board_collaboration_unsupported(app) {
+        return Action::None;
+    }
     match board_cursor_agent(app) {
         Ok((pane, agent)) => {
             app.board_pending = Some(BoardPending::Message {
@@ -12272,6 +12327,9 @@ fn board_message_action(app: &mut App) -> Action {
 /// `i` on the board: claim the cursor agent's queued requests, acting as
 /// that agent — the recipient — never as the console.
 fn board_claim_action(app: &mut App) -> Action {
+    if board_collaboration_unsupported(app) {
+        return Action::None;
+    }
     if let Some(anchor) = board_mailbox_anchor(app) {
         Action::ClaimBoardInbox {
             origin: anchor.origin,
@@ -12907,9 +12965,14 @@ fn composer_cycle_option(app: &mut App) -> bool {
 /// Cycle Ctrl-E's delivery mode and remember it for the next composer.
 fn composer_cycle_mode(app: &mut App) -> bool {
     let changed = match app.collaboration_composer.as_mut().map(|c| &mut c.target) {
-        Some(CollaborationComposeTarget::Send { kind, mode, .. }) => {
+        Some(CollaborationComposeTarget::Send {
+            kind, mode, target, ..
+        }) => {
             *mode = match *mode {
                 ComposeSendMode::ReadOnly => ComposeSendMode::Execute,
+                // A `session:` recipient is a request to one agent session;
+                // keystrokes have no session to check, so they are skipped.
+                ComposeSendMode::Execute if is_session_target(target) => ComposeSendMode::ReadOnly,
                 ComposeSendMode::Execute => ComposeSendMode::JustSend,
                 ComposeSendMode::JustSend => ComposeSendMode::ReadOnly,
             };
@@ -12954,6 +13017,10 @@ fn composer_cycle_mode(app: &mut App) -> bool {
     }
 }
 
+fn is_session_target(target: &str) -> bool {
+    target.starts_with("session:")
+}
+
 /// Resolve Enter inside the composer.
 ///
 /// `just send` bypasses the mailbox entirely: the text goes into the pane
@@ -12967,6 +13034,21 @@ fn composer_submit_action(app: &mut App) -> Action {
         .is_none_or(|composer| composer.input.trim().is_empty());
     if empty {
         app.set_hint("message cannot be empty", HintLevel::Warn);
+        return Action::None;
+    }
+    // Refused before the composer is taken, so the draft survives.
+    if matches!(
+        app.collaboration_composer.as_ref().map(|c| &c.target),
+        Some(CollaborationComposeTarget::Send {
+            mode: ComposeSendMode::JustSend,
+            target,
+            ..
+        }) if is_session_target(target)
+    ) {
+        app.set_hint(
+            "a message to one agent session is a request — use p for keystrokes",
+            HintLevel::Warn,
+        );
         return Action::None;
     }
     match app.collaboration_composer.take() {
@@ -22774,6 +22856,7 @@ mod tests {
         let peer = fake_collaboration_participant("%2", "peer", Some("reviewer"));
         app.collaboration = WatchCollaboration {
             origin: Some(CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: Some("default".into()),
                 console: true,
@@ -23881,6 +23964,7 @@ mod tests {
         let mut app = app_with_paneless_and_pane();
         app.collaboration_scope = muxa::config::CollaborationScope::Host;
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: None,
             console: true,
@@ -23910,6 +23994,7 @@ mod tests {
         let mut app = topology_watch(WatchView::Window, agents, panes);
         app.collaboration_scope = muxa::config::CollaborationScope::Host;
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
@@ -23946,6 +24031,7 @@ mod tests {
         let first = fake_collaboration_participant("%1", "agent-1", None);
         let second = fake_collaboration_participant("%2", "agent-2", None);
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
@@ -23994,6 +24080,7 @@ mod tests {
         let mut app = topology_watch(WatchView::Pane, agents, panes);
         let peer = fake_collaboration_participant("%1", "agent-1", None);
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
@@ -24029,6 +24116,7 @@ mod tests {
         let mut app = topology_watch(WatchView::Pane, agents, panes);
         let peer = fake_collaboration_participant("%1", "agent-1", None);
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
@@ -24070,6 +24158,7 @@ mod tests {
         let mut app = topology_watch(WatchView::Pane, agents, panes);
         let replacement = fake_collaboration_participant("%1", "agent-2", None);
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
@@ -24100,6 +24189,7 @@ mod tests {
         let mut app = topology_watch(WatchView::Pane, agents, panes);
         let peer = fake_collaboration_participant("%1", "agent-1", None);
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
@@ -24174,6 +24264,7 @@ mod tests {
         let first = fake_collaboration_participant("%1", "agent-1", None);
         let second = fake_collaboration_participant("%2", "agent-2", None);
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "console".into(),
             socket: Some("default".into()),
             console: true,
@@ -24209,6 +24300,7 @@ mod tests {
         let mut app = app_with_paneless_and_pane();
         app.collaboration_scope = muxa::config::CollaborationScope::Host;
         app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
             pane: "%42".into(),
             socket: None,
             console: true,
@@ -24687,6 +24779,7 @@ mod tests {
         // it would be rejected as a non-participant.
         app.collaboration.inbox = Some(MailboxAnchor {
             origin: CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: None,
                 console: false,
@@ -29948,6 +30041,7 @@ sort = ["state"]
         let (_mailbox_sender, mailbox_rx) = tokio::sync::watch::channel(None);
         app.collaboration_history.changes = Some(mailbox_rx);
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
@@ -30018,6 +30112,7 @@ sort = ["state"]
             )],
         );
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
@@ -30053,6 +30148,7 @@ sort = ["state"]
         let (sender, changes) = tokio::sync::watch::channel(Some(7));
         app.collaboration_history.changes = Some(changes);
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
@@ -30125,6 +30221,7 @@ sort = ["state"]
             )],
         );
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
@@ -30171,6 +30268,7 @@ sort = ["state"]
                 ],
             );
             let origin = CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: Some("default".into()),
                 console: true,
@@ -30464,6 +30562,7 @@ sort = ["state"]
         let (mut app, keys) = board_with_tracked_topology_agent();
         app.collaboration_scope = muxa::config::CollaborationScope::Host;
         app.collaboration.origin = Some(watch_collaboration_origin(Some("%99".into())));
+        app.exact_session_supported = true;
         (app, keys)
     }
 
@@ -30491,7 +30590,10 @@ sort = ["state"]
             Some(CollaborationComposeTarget::Send {
                 target, pane_key, ..
             }) => {
-                assert_eq!(target, "pane:%1");
+                assert_eq!(
+                    target, "session:%1",
+                    "the exact agent session, not the pane"
+                );
                 assert_eq!(pane_key.as_ref(), Some(&keys[0]));
             }
             other => panic!("expected a message to %1, got {other:?}"),
@@ -30575,9 +30677,93 @@ sort = ["state"]
             Action::ClaimBoardInbox { origin, .. } => {
                 assert_eq!(origin.pane, "%2");
                 assert!(!origin.console, "claiming is the recipient's move");
+                assert!(origin.exact_session, "never a successor in that pane");
             }
             _ => panic!("i should claim for the cursor agent"),
         }
+    }
+
+    #[test]
+    fn board_collaboration_is_refused_by_a_daemon_that_cannot_pin_a_session() {
+        let (mut app, _) = board_ready_to_message();
+        app.exact_session_supported = false;
+        for c in ['m', 'b', 'i'] {
+            assert!(
+                matches!(press_key(&mut app, KeyCode::Char(c)), Action::None),
+                "{c}"
+            );
+        }
+        assert!(app.board_pending.is_none());
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("exact agent session")));
+    }
+
+    #[test]
+    fn a_board_message_is_always_a_request_and_keeps_its_draft() {
+        let (mut app, _) = board_ready_to_message();
+        app.collaboration_compose_defaults.mode = ComposeSendMode::JustSend;
+        let _ = press_key(&mut app, KeyCode::Char('m'));
+        open_watch_collaboration_composer(&mut app);
+        let mode = |app: &App| match app.collaboration_composer.as_ref().map(|c| &c.target) {
+            Some(CollaborationComposeTarget::Send { mode, .. }) => *mode,
+            other => panic!("expected a request composer, got {other:?}"),
+        };
+        assert_eq!(
+            mode(&app),
+            ComposeSendMode::ReadOnly,
+            "a persisted just-send is not used"
+        );
+        let ctrl_e = || Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        let _ = handle_event(ctrl_e(), &mut app);
+        assert_eq!(mode(&app), ComposeSendMode::Execute);
+        let _ = handle_event(ctrl_e(), &mut app);
+        assert_eq!(
+            mode(&app),
+            ComposeSendMode::ReadOnly,
+            "just-send is skipped"
+        );
+        // Should one appear anyway, Enter refuses it and keeps the draft.
+        let _ = press_key(&mut app, KeyCode::Char('x'));
+        if let Some(CollaborationComposeTarget::Send { mode, .. }) =
+            app.collaboration_composer.as_mut().map(|c| &mut c.target)
+        {
+            *mode = ComposeSendMode::JustSend;
+        }
+        assert!(matches!(press_key(&mut app, KeyCode::Enter), Action::None));
+        assert_eq!(
+            app.collaboration_composer
+                .as_ref()
+                .map(|c| c.input.as_str()),
+            Some("x")
+        );
+    }
+
+    #[test]
+    fn a_session_pinned_mailbox_hides_a_predecessors_history_in_the_same_pane() {
+        let mut predecessor = collab_participant("%1", "callabo", "CAL-1");
+        predecessor.agent_session_id = "old".into();
+        let mut current = predecessor.clone();
+        current.agent_session_id = "new".into();
+        let anchor = |session: Option<&str>| {
+            MailboxHistoryScope::Pane(MailboxAnchor {
+                origin: CollaborationOrigin {
+                    exact_session: session.is_some(),
+                    pane: "%1".into(),
+                    socket: None,
+                    console: false,
+                    agent_session_id: session.map(str::to_owned),
+                },
+                label: "codex@%1".into(),
+            })
+        };
+        assert!(anchor(Some("new")).matches(&current));
+        assert!(!anchor(Some("new")).matches(&predecessor));
+        assert!(
+            anchor(None).matches(&predecessor),
+            "unpinned anchors keep pane history"
+        );
     }
 
     #[test]

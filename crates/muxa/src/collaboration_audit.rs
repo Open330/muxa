@@ -275,6 +275,7 @@ mod tests {
         CollaborationAuditContext::new(
             CollaborationAuditOperation::Send,
             CollaborationOrigin {
+                exact_session: false,
                 pane: "%3".into(),
                 socket: Some("default".into()),
                 console: false,
