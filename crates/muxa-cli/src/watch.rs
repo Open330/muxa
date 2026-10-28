@@ -1108,6 +1108,20 @@ pub(crate) enum QuickAction {
     /// Endpoint-pinned form used by the topology tree. Raw `%N` is not a
     /// sufficient control target when multiple tmux sockets are visible.
     SendPromptTo { pane: PaneKey, text: String },
+    /// The same prompt to several exact panes (every live agent of a Work).
+    /// Each is attempted; the outcome reports how many succeeded.
+    /// `unavailable` names intended agents that could not be resolved to a
+    /// pane; they count as failures so the result never overstates reach.
+    SendPromptToMany {
+        panes: Vec<PaneKey>,
+        unavailable: Vec<String>,
+        text: String,
+    },
+    /// Interrupt several exact panes, reporting partial success.
+    InterruptPanes {
+        panes: Vec<PaneKey>,
+        unavailable: Vec<String>,
+    },
     /// Toggle the `?` help overlay. Pure UI — no side-effects.
     ShowHelp,
     /// Legacy no-selection fallback: create or reuse a session and window at `dir`, then
@@ -1813,6 +1827,49 @@ fn run_status(bin: &str, args: &[&str]) -> std::result::Result<(), String> {
     }
 }
 
+/// Run one effect per pane, once each, and say how many of the intended
+/// agents it reached. The denominator is everything the operator was shown:
+/// resolved panes plus `unavailable` ones, which count as failures. Any
+/// failure makes the outcome an error naming the server and pane. Nothing is
+/// retried: a write that may have landed must not be typed twice.
+fn many_pane_outcome(
+    panes: &[PaneKey],
+    unavailable: &[String],
+    verb: &str,
+    mut run: impl FnMut(&PaneKey) -> std::result::Result<(), String>,
+) -> ActionOutcome {
+    let mut failures: Vec<String> = unavailable
+        .iter()
+        .map(|label| format!("{label}: no longer open"))
+        .collect();
+    let mut seen = Vec::new();
+    let mut done = 0usize;
+    for pane in panes {
+        if seen.contains(&pane) {
+            continue;
+        }
+        seen.push(pane);
+        match run(pane) {
+            Ok(()) => done += 1,
+            Err(error) => failures.push(format!("{}: {error}", pane_target_label(pane))),
+        }
+    }
+    let intended = seen.len() + unavailable.len();
+    if failures.is_empty() {
+        ActionOutcome::Ok(format!("✔ {verb} {done}/{intended} Work agents"))
+    } else {
+        ActionOutcome::Err(format!(
+            "✗ {verb} {done}/{intended} Work agents · {}",
+            failures.join("; ")
+        ))
+    }
+}
+
+/// `socket:pane` — a pane id alone is ambiguous across servers.
+fn pane_target_label(pane: &PaneKey) -> String {
+    format!("{}:{}", pane.window.session.endpoint.socket, pane.pane_id)
+}
+
 /// Run a [`QuickAction`] against an [`Effects`] sink and return what
 /// the run loop should surface in the footer. Pure with respect to UI
 /// state — the caller mutates `App` based on the returned outcome.
@@ -1879,6 +1936,18 @@ pub(crate) fn dispatch_quick_action(action: QuickAction, fx: &mut dyn Effects) -
             )),
             Err(error) => ActionOutcome::Err(format!("✗ send failed: {error}")),
         },
+        QuickAction::SendPromptToMany {
+            panes,
+            unavailable,
+            text,
+        } => many_pane_outcome(&panes, &unavailable, "prompted", |pane| {
+            fx.send_prompt_to(pane, &text)
+        }),
+        QuickAction::InterruptPanes { panes, unavailable } => {
+            many_pane_outcome(&panes, &unavailable, "interrupted", |pane| {
+                fx.interrupt_pane(pane)
+            })
+        }
         QuickAction::ShowHelp => ActionOutcome::HelpToggled,
     }
 }
@@ -2527,6 +2596,11 @@ fn persist_watch_collab_layout(
     path: &Path,
     layout: CollabLayout,
 ) -> std::result::Result<(), String> {
+    persist_watch_value(path, "collab_layout", collab_screen::layout_label(layout))
+}
+
+/// Write one `[watch]` key, keeping the rest of the file as it was.
+fn persist_watch_value(path: &Path, key: &str, value: &str) -> std::result::Result<(), String> {
     let original = match std::fs::read_to_string(path) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
@@ -2549,7 +2623,7 @@ fn persist_watch_collab_layout(
     let watch = doc["watch"]
         .as_table_mut()
         .ok_or_else(|| "[watch] is not a table".to_string())?;
-    watch["collab_layout"] = toml_edit::value(collab_screen::layout_label(layout));
+    watch[key] = toml_edit::value(value);
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -2757,6 +2831,13 @@ enum CollaborationComposeTarget {
     Prompt { pane: String },
     /// Endpoint-pinned keystrokes composer opened from a topology node.
     PromptTopology { pane: PaneKey },
+    /// One prompt typed into several exact panes: every live agent of the
+    /// Work selected on the board, frozen when the composer opened. Always
+    /// keystrokes: it never becomes a collaboration request.
+    PromptPanes {
+        panes: Vec<PaneKey>,
+        unavailable: Vec<String>,
+    },
 }
 
 /// What Ctrl-E cycles: how the composed text leaves the composer.
@@ -3215,6 +3296,12 @@ pub(crate) struct App {
     /// it scans every multiplexer and reads the Work records.
     pub(crate) board: BoardScreen,
     board_refresher: BoardRefresher,
+    /// Panes a board composer or confirmation was opened for. Its eventual
+    /// action may touch exactly these, whatever the board shows by then.
+    board_frozen: Vec<PaneKey>,
+    board_stats: BoardStats,
+    /// Background many-pane actions still running.
+    pending_outcomes: Vec<tokio::sync::oneshot::Receiver<ActionOutcome>>,
     collaboration_composer: Option<CollaborationComposer>,
     /// Agents the operator marked with `Space`, to be addressed together.
     ///
@@ -3508,6 +3595,8 @@ impl App {
         };
         let mut collab = CollabScreen::default();
         collab.set_layout(cfg.collab_layout);
+        let mut board = BoardScreen::default();
+        board.set_sort(cfg.board_sort);
         Self {
             rows: Vec::new(),
             topology: TopologySnapshot::build(OffsetDateTime::now_utc(), Vec::new(), Vec::new()),
@@ -3556,8 +3645,11 @@ impl App {
             collaboration_mailbox: CollaborationMailboxState::default(),
             previous_layout: WatchLayout::Tree,
             collab,
-            board: BoardScreen::default(),
+            board,
             board_refresher: BoardRefresher::default(),
+            board_frozen: Vec::new(),
+            board_stats: BoardStats::default(),
+            pending_outcomes: Vec::new(),
             collaboration_composer: None,
             collaboration_marks: std::collections::HashSet::new(),
             broadcast_report: None,
@@ -8111,6 +8203,24 @@ pub async fn run(
                     };
                     app.set_hint(format!("layout: {label}"), HintLevel::Ok);
                 }
+                Action::SetBoardSort(sort) => {
+                    app.board.set_sort(sort);
+                    app.watch_cfg.board_sort = sort;
+                    let label = board_screen::sort_label(sort);
+                    match sort_persist_path
+                        .as_deref()
+                        .map(|path| persist_watch_value(path, "board_sort", label))
+                    {
+                        Some(Ok(())) => {
+                            app.set_hint(format!("board sort: {label} (saved)"), HintLevel::Ok);
+                        }
+                        Some(Err(error)) => app.set_hint(
+                            format!("board sort: {label} (save failed: {error})"),
+                            HintLevel::Warn,
+                        ),
+                        None => app.set_hint(format!("board sort: {label}"), HintLevel::Ok),
+                    }
+                }
                 Action::SetCollabLayout(layout) => {
                     app.collab.set_layout(layout);
                     app.watch_cfg.collab_layout = layout;
@@ -8382,6 +8492,9 @@ pub async fn run(
                 Action::ConfirmYes => {
                     if let Some(popup) = app.confirm.take() {
                         match popup.on_confirm {
+                            ConfirmAction::Quick(action) if is_many_pane(&action) => {
+                                start_quick_in_background(&mut app, action);
+                            }
                             ConfirmAction::Quick(action) => {
                                 // Pane and clipboard actions shell out
                                 // synchronously. Keep them off the input loop.
@@ -8465,6 +8578,8 @@ pub async fn run(
                 Action::Quick(qa) => {
                     if matches!(qa, QuickAction::ShowHelp) {
                         app.help_open = !app.help_open;
+                    } else if is_many_pane(&qa) {
+                        start_quick_in_background(&mut app, qa);
                     } else {
                         // Copy shells out to clipboard helpers (and can fall
                         // back to a /tmp write) — off the loop thread it
@@ -8651,6 +8766,35 @@ pub async fn run(
             .as_ref()
             .is_some_and(|changes| changes.has_changed().unwrap_or(false))
             && app.collaboration.unavailable.is_none();
+        // Many-pane writes report back when they finish, never blocking keys.
+        let finished = take_finished_quick(&mut app);
+        for outcome in finished {
+            apply_outcome_to_app(&mut app, outcome);
+            needs_render = true;
+        }
+        if app.board_stats.poll() {
+            needs_render = true;
+        }
+        if app.watch_cfg.screen == WatchScreen::Board && app.board_stats.due() {
+            let client = client.clone();
+            let config = sort_persist_path
+                .clone()
+                .or_else(muxa::paths::default_config_file);
+            let window = board_window(&app);
+            app.board_stats.start(async move {
+                let cfg = muxa::config::Config::load_or_default(config.as_deref())
+                    .map_err(|error| error.to_string())?;
+                crate::stats::session_active_stats(
+                    &client,
+                    &cfg,
+                    &window,
+                    &muxa::ScopeExclusions::default(),
+                )
+                .await
+                .map(|stats| stats.totals)
+                .map_err(|error| error.to_string())
+            });
+        }
         // The scan runs off this loop: a slow backend must not freeze input.
         if let Some((snapshot, notes)) = app.board_refresher.take_finished() {
             app.board.set_snapshot(snapshot, notes);
@@ -9019,6 +9163,121 @@ async fn refresh_selected_collaboration_detail(client: &Client, app: &mut App) {
 
 /// How often an open Work board rescans; Works change on human timescales.
 const BOARD_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Writes to every agent of a Work take one submit grace per pane; they run
+/// in the background so the keyboard stays live meanwhile.
+fn is_many_pane(action: &QuickAction) -> bool {
+    matches!(
+        action,
+        QuickAction::SendPromptToMany { .. } | QuickAction::InterruptPanes { .. }
+    )
+}
+
+fn start_quick_in_background(app: &mut App, action: QuickAction) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    tokio::task::spawn_blocking(move || {
+        let mut fx = RealEffects;
+        let _ = tx.send(dispatch_quick_action(action, &mut fx));
+    });
+    app.pending_outcomes.push(rx);
+    app.set_hint("sending to the Work's agents…", HintLevel::Ok);
+}
+
+fn take_finished_quick(app: &mut App) -> Vec<ActionOutcome> {
+    let mut finished = Vec::new();
+    app.pending_outcomes.retain_mut(|rx| match rx.try_recv() {
+        Ok(outcome) => {
+            finished.push(outcome);
+            false
+        }
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+            finished.push(ActionOutcome::Err("✗ action task failed".into()));
+            false
+        }
+    });
+    finished
+}
+
+/// The board's ACT/WACT summary: all sessions in a window, fetched in the
+/// background at most every [`BOARD_STATS_INTERVAL`] while the board shows.
+#[derive(Debug, Default)]
+pub(crate) struct BoardStats {
+    /// `None` until the first fetch returns; an error is kept apart from a
+    /// window with no activity.
+    value: Option<std::result::Result<crate::stats::ActiveDuration, String>>,
+    in_flight: Option<
+        tokio::sync::oneshot::Receiver<std::result::Result<crate::stats::ActiveDuration, String>>,
+    >,
+    started: Option<std::time::Instant>,
+}
+
+const BOARD_STATS_INTERVAL: Duration = Duration::from_secs(30);
+
+impl BoardStats {
+    fn due(&self) -> bool {
+        self.in_flight.is_none()
+            && self
+                .started
+                .is_none_or(|started| started.elapsed() >= BOARD_STATS_INTERVAL)
+    }
+
+    fn start(
+        &mut self,
+        fetch: impl std::future::Future<Output = std::result::Result<crate::stats::ActiveDuration, String>>
+            + Send
+            + 'static,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(fetch.await);
+        });
+        self.in_flight = Some(rx);
+        self.started = Some(std::time::Instant::now());
+    }
+
+    /// Take a finished fetch; returns whether the value changed.
+    fn poll(&mut self) -> bool {
+        let Some(rx) = self.in_flight.as_mut() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(value) => {
+                self.value = Some(value);
+                self.in_flight = None;
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.value = Some(Err("stats task failed".into()));
+                self.in_flight = None;
+                true
+            }
+        }
+    }
+
+    /// `all sessions · today · ACT 3h · WACT 2h`, or why there is none.
+    fn label(&self, window: &str) -> String {
+        let figures = match &self.value {
+            None => "ACT …".to_string(),
+            Some(Err(_)) => "ACT unavailable".to_string(),
+            Some(Ok(active)) => format!(
+                "ACT {} · WACT {}",
+                board_screen::active_label(active.active_secs),
+                board_screen::active_label(active.work_active_secs)
+            ),
+        };
+        format!("all sessions · {window} · {figures}")
+    }
+}
+
+/// The ACT/WACT window the board summarises.
+fn board_window(app: &App) -> String {
+    app.watch_cfg
+        .board_since
+        .clone()
+        .unwrap_or_else(|| "today".into())
+}
 
 /// One Work-board scan as it arrives: the projection and any scan problems.
 type BoardScan = (muxa::work::WorkSnapshot, Vec<String>);
@@ -10033,7 +10292,8 @@ async fn run_watch_collaboration_single(
             ActionOutcome::Err("broadcast is dispatched by its own runner".into())
         }
         CollaborationComposeTarget::Prompt { .. }
-        | CollaborationComposeTarget::PromptTopology { .. } => ActionOutcome::Err(
+        | CollaborationComposeTarget::PromptTopology { .. }
+        | CollaborationComposeTarget::PromptPanes { .. } => ActionOutcome::Err(
             "keystrokes go to the pane directly and cannot become a request".into(),
         ),
         CollaborationComposeTarget::Reply {
@@ -10341,6 +10601,8 @@ pub(crate) enum Action {
     SetLayout(WatchLayout),
     /// Change the collaboration screen's independent table/sequence axis.
     SetCollabLayout(CollabLayout),
+    /// Reorder the Work board; persisted apart from the topology sort.
+    SetBoardSort(muxa::config::WatchBoardSort),
     SetScreen(WatchScreen),
     /// Resolve the selected row as a same-window collaboration peer and open
     /// the durable request composer.
@@ -10510,6 +10772,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "show Works and their Runs",
     },
     CommandSpec {
+        command: "sort busy",
+        description: "board: most agents working first",
+    },
+    CommandSpec {
         command: "kill",
         description: "close selected session/window/pane (confirm)",
     },
@@ -10548,6 +10814,22 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
     if app.watch_cfg.screen == WatchScreen::Board && !board_palette_allows(&command) {
         app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
         return Action::None;
+    }
+    // `sort` means the board's own order on the board; topology sort keys
+    // are left alone and keep meaning what they mean on the other screens.
+    if let Some(key) = command.strip_prefix("sort ") {
+        if app.watch_cfg.screen == WatchScreen::Board {
+            return board_screen::parse_sort(key.trim()).map_or_else(
+                || {
+                    app.set_hint(
+                        "board sorts: attention, activity, busy, name",
+                        HintLevel::Warn,
+                    );
+                    Action::None
+                },
+                Action::SetBoardSort,
+            );
+        }
     }
     match command.as_str() {
         "q" | "quit" => Action::Quit,
@@ -10642,12 +10924,25 @@ fn gate_board_action(app: &mut App, action: Action) -> Action {
         | Action::SetView(_)
         | Action::SetLayout(_)
         | Action::SetCollabLayout(_)
+        | Action::SetBoardSort(_)
         | Action::SetScreen(_)
         | Action::InspectorSplitChanged
         | Action::DismissBroadcastReport
         | Action::ConfirmCancel
         | Action::CancelCollaborationComposer
-        | Action::Quick(QuickAction::ShowHelp) => action,
+        | Action::Quick(QuickAction::ShowHelp)
+        | Action::ConfirmYes => action,
+        // Board actions, and their confirmation and submission, carry exact
+        // keys; they pass only while those keys are the selected Work's.
+        Action::AskConfirm(ConfirmPopup {
+            on_confirm: ConfirmAction::Quick(ref quick),
+            ..
+        })
+        | Action::Quick(ref quick)
+            if board_quick_panes(quick).is_some_and(|panes| board_owns_panes(app, &panes)) =>
+        {
+            action
+        }
         Action::OpenPreview => match board_selected_pane(app) {
             Ok(key) => Action::OpenPreviewFor(key),
             Err(hint) => {
@@ -10659,6 +10954,19 @@ fn gate_board_action(app: &mut App, action: Action) -> Action {
             app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
             Action::None
         }
+    }
+}
+
+/// The panes a quick action addresses, for the board actions only.
+fn board_quick_panes(quick: &QuickAction) -> Option<Vec<&PaneKey>> {
+    match quick {
+        QuickAction::InterruptPane(pane) | QuickAction::SendPromptTo { pane, .. } => {
+            Some(vec![pane])
+        }
+        QuickAction::InterruptPanes { panes, .. } | QuickAction::SendPromptToMany { panes, .. } => {
+            Some(panes.iter().collect())
+        }
+        _ => None,
     }
 }
 
@@ -11543,6 +11851,14 @@ fn handle_board_screen_key(
             }
         }
         KeyCode::Enter => return Some(board_attach_action(app)),
+        KeyCode::Tab => app.board.cycle_agent(1, &filter),
+        KeyCode::BackTab => app.board.cycle_agent(-1, &filter),
+        KeyCode::Char(']') if browsing => app.board.cycle_agent(1, &filter),
+        KeyCode::Char('[') if browsing => app.board.cycle_agent(-1, &filter),
+        KeyCode::Char('p') if browsing => return Some(board_prompt_action(app, false)),
+        KeyCode::Char('P') if browsing => return Some(board_prompt_action(app, true)),
+        KeyCode::Char('R') if browsing => return Some(board_abort_action(app, false)),
+        KeyCode::Char('A') if browsing => return Some(board_abort_action(app, true)),
         _ => return None,
     }
     Some(Action::None)
@@ -11556,6 +11872,133 @@ fn open_preview_for(app: &mut App, key: PaneKey) {
         mode: PreviewMode::Popup,
         content: app.watch_cfg.preview.default_content,
     });
+}
+
+/// What a board action addresses, frozen when its composer or confirmation
+/// opens: the exact panes, the intended agents that no longer resolve, and a
+/// label naming them.
+struct BoardTargets {
+    panes: Vec<PaneKey>,
+    unavailable: Vec<String>,
+    label: String,
+}
+
+/// The agent under the cursor, or every live agent of the selected Work.
+/// Each must resolve through the topology, so no raw pane id and no same-id
+/// pane on another server is ever targeted; ones that do not resolve are
+/// kept as `unavailable` rather than silently dropped.
+fn board_agent_targets(app: &App, all: bool) -> Result<BoardTargets, String> {
+    let filter = &app.search_query;
+    let Some(work) = app.board.selected_work(filter) else {
+        return Err("no Work selected".into());
+    };
+    let work_label = format!("{}/{}", work.identity.workspace_id, work.identity.work_id);
+    let agents = board_screen::live_agents(work);
+    if agents.is_empty() {
+        return Err(format!("{work_label} has no live agent"));
+    }
+    let chosen: Vec<_> = if all {
+        agents
+    } else {
+        agents
+            .get(app.board.selected_agent_index(filter))
+            .copied()
+            .into_iter()
+            .collect()
+    };
+    let mut panes: Vec<PaneKey> = Vec::new();
+    let mut unavailable = Vec::new();
+    for (run, pane) in chosen {
+        match app.board_pane_key(run, &pane.pane_id) {
+            Some(key) if !panes.contains(&key) => panes.push(key),
+            Some(_) => {}
+            None => unavailable.push(format!("{}:{}", run.execution.socket, pane.pane_id)),
+        }
+    }
+    if panes.is_empty() {
+        return Err(format!("{work_label}'s agents are no longer open"));
+    }
+    let label = if all {
+        let missing = if unavailable.is_empty() {
+            String::new()
+        } else {
+            format!(", {} unavailable", unavailable.len())
+        };
+        format!(
+            "{work_label} · all {} agents{missing}",
+            panes.len() + unavailable.len()
+        )
+    } else {
+        format!(
+            "{work_label} · {}",
+            topology_key_label(&TopologyNodeKey::Pane(panes[0].clone()))
+        )
+    };
+    Ok(BoardTargets {
+        panes,
+        unavailable,
+        label,
+    })
+}
+
+/// `p` / `P` on the board: a keystrokes composer for the agent under the
+/// cursor, or for every live agent of the Work.
+fn board_prompt_action(app: &mut App, all: bool) -> Action {
+    match board_agent_targets(app, all) {
+        Ok(BoardTargets {
+            mut panes,
+            unavailable,
+            label,
+        }) => {
+            app.board_frozen.clone_from(&panes);
+            let target = if all {
+                CollaborationComposeTarget::PromptPanes { panes, unavailable }
+            } else {
+                CollaborationComposeTarget::PromptTopology {
+                    pane: panes.remove(0),
+                }
+            };
+            app.collaboration_composer = Some(CollaborationComposer::new(target, label));
+            Action::None
+        }
+        Err(hint) => {
+            app.set_hint(hint, HintLevel::Warn);
+            Action::None
+        }
+    }
+}
+
+/// `R` / `A` on the board: interrupt the agent under the cursor, or every
+/// live agent of the Work, after a confirmation naming them.
+fn board_abort_action(app: &mut App, all: bool) -> Action {
+    match board_agent_targets(app, all) {
+        Ok(BoardTargets {
+            mut panes,
+            unavailable,
+            label,
+        }) => {
+            app.board_frozen.clone_from(&panes);
+            Action::AskConfirm(ConfirmPopup {
+                message: format!("Interrupt {label}?"),
+                on_confirm: ConfirmAction::Quick(if all {
+                    QuickAction::InterruptPanes { panes, unavailable }
+                } else {
+                    QuickAction::InterruptPane(panes.remove(0))
+                }),
+            })
+        }
+        Err(hint) => {
+            app.set_hint(hint, HintLevel::Warn);
+            Action::None
+        }
+    }
+}
+
+/// Whether every pane an action names was frozen by a board composer or
+/// confirmation — the only panes board actions may touch. A refresh in the
+/// meantime cannot retarget them.
+fn board_owns_panes(app: &App, panes: &[&PaneKey]) -> bool {
+    !panes.is_empty() && panes.iter().all(|pane| app.board_frozen.contains(pane))
 }
 
 /// Resolve `Enter` on the Work board to the exact pane of one of its Runs.
@@ -12106,6 +12549,10 @@ fn composer_cycle_option(app: &mut App) -> bool {
             };
             None
         }
+        CollaborationComposeTarget::PromptPanes { .. } => {
+            hint = Some("a prompt to every agent of a Work is keystrokes only");
+            None
+        }
         CollaborationComposeTarget::Prompt { .. }
         | CollaborationComposeTarget::PromptTopology { .. } => {
             hint = Some("requests need a same-window peer — keystrokes only here");
@@ -12154,7 +12601,8 @@ fn composer_cycle_mode(app: &mut App) -> bool {
         }
         Some(
             CollaborationComposeTarget::Prompt { .. }
-            | CollaborationComposeTarget::PromptTopology { .. },
+            | CollaborationComposeTarget::PromptTopology { .. }
+            | CollaborationComposeTarget::PromptPanes { .. },
         ) => {
             app.set_hint(
                 "requests need a same-window peer — keystrokes only here",
@@ -12195,6 +12643,15 @@ fn composer_submit_action(app: &mut App) -> Action {
             input,
             ..
         }) => Action::Quick(QuickAction::SendPromptTo { pane, text: input }),
+        Some(CollaborationComposer {
+            target: CollaborationComposeTarget::PromptPanes { panes, unavailable },
+            input,
+            ..
+        }) => Action::Quick(QuickAction::SendPromptToMany {
+            panes,
+            unavailable,
+            text: input,
+        }),
         Some(CollaborationComposer {
             target:
                 CollaborationComposeTarget::Send {
@@ -14308,7 +14765,8 @@ fn collaboration_composer_title(
             ..
         }
         | CollaborationComposeTarget::Prompt { .. }
-        | CollaborationComposeTarget::PromptTopology { .. } => (
+        | CollaborationComposeTarget::PromptTopology { .. }
+        | CollaborationComposeTarget::PromptPanes { .. } => (
             Line::from(vec![
                 Span::raw(" "),
                 Span::styled(
@@ -15110,17 +15568,22 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
     // Totals describe the rows on screen; executions no Work claims are said
     // apart so the board never reads as everything that is running.
     if app.board.unlinked() > 0 {
-        let _ = write!(
-            title,
-            "· {} unlinked Run(s) in topology ",
-            app.board.unlinked()
-        );
+        let _ = write!(title, "· {} unlinked ", app.board.unlinked());
     }
+    let _ = write!(
+        title,
+        "· by {} ",
+        board_screen::sort_label(app.board.sort())
+    );
+    // Activity is for every session in the window, not the Works on screen,
+    // so it sits apart from the counts and never follows the filter.
+    let activity = format!(" {} ", app.board_stats.label(&board_window(app)));
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style())
         .border_type(theme.border_type)
-        .title(title);
+        .title(title)
+        .title(Line::from(activity).right_aligned());
 
     if visible.is_empty() {
         let hint = if !app.board.loaded {
@@ -15149,7 +15612,11 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
     let detail = app
         .board
         .selected_work(&filter)
-        .map(|work| board_screen::detail_lines(work, now, theme))
+        .map(|work| {
+            let agents = board_screen::live_agents(work);
+            let selected = agents.get(app.board.selected_agent_index(&filter)).copied();
+            board_screen::detail_lines(work, now, theme, selected)
+        })
         .unwrap_or_default();
     let notes = app.board.notes.clone();
     // The detail sits below the list on narrow terminals and beside it on
@@ -19184,6 +19651,12 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
                 Span::raw(" commands  "),
                 Span::styled(" ⏎ ", theme.action_badge()),
                 Span::raw(" go to Run  "),
+                Span::styled(" Tab ", theme.key_badge()),
+                Span::raw(" agent  "),
+                Span::styled(" p/P ", theme.action_badge()),
+                Span::raw(" prompt one/all  "),
+                Span::styled(" R/A ", theme.action_badge()),
+                Span::raw(" interrupt one/all  "),
                 Span::styled(" Alt-1 ", theme.key_badge()),
                 Span::raw(" topology  "),
                 Span::styled(" ? ", theme.key_badge()),
@@ -19232,7 +19705,8 @@ fn render_collaboration_composer_footer(
         }
         Some(
             CollaborationComposeTarget::Prompt { .. }
-            | CollaborationComposeTarget::PromptTopology { .. },
+            | CollaborationComposeTarget::PromptTopology { .. }
+            | CollaborationComposeTarget::PromptPanes { .. },
         )
         | None => {}
     }
@@ -23429,6 +23903,7 @@ mod tests {
                 Some(
                     CollaborationComposeTarget::Prompt { .. }
                         | CollaborationComposeTarget::PromptTopology { .. }
+                        | CollaborationComposeTarget::PromptPanes { .. }
                 )
             ),
             "a row with no agent must not resolve to the launch window's agent"
@@ -28092,6 +28567,7 @@ sort = ["state"]
                 app.pane_capture = None;
             }
             Action::OpenPreviewFor(key) => open_preview_for(app, key),
+            Action::SetBoardSort(sort) => app.board.set_sort(sort),
             Action::OpenWorkUp => app.work_composer = Some(WorkComposer::default()),
             // The real handler shells out to tmux; the test harness stops at
             // the state change so nothing spawns a window.
@@ -29417,6 +29893,317 @@ sort = ["state"]
             works,
             unlinked_executions: Vec::new(),
         }
+    }
+
+    /// A Work whose one Run holds three agent panes on socket a: %1 working,
+    /// %2 waiting, %3 stopped. Returns the app on the board and the keys.
+    fn board_with_agents() -> (App, Vec<PaneKey>) {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.set_data(
+            Vec::new(),
+            ["%1", "%2", "%3"]
+                .iter()
+                .enumerate()
+                .map(|(index, pane)| {
+                    fake_topology_pane(
+                        "/tmp/a",
+                        "$1",
+                        "callabo",
+                        "@4",
+                        "CAL-1",
+                        1,
+                        pane,
+                        u32::try_from(index).unwrap(),
+                    )
+                })
+                .collect(),
+        );
+        let keys: Vec<PaneKey> = ["%1", "%2", "%3"]
+            .iter()
+            .map(|pane| app.pane_key_for(pane, Some("a")).unwrap())
+            .collect();
+        let mut work = board_work("CAL-1", Some(&keys[0]));
+        let template = work.runs[0].panes[0].clone();
+        work.runs[0].panes = [
+            ("%1", AgentState::Working),
+            ("%2", AgentState::WaitingInput),
+            ("%3", AgentState::Stopped),
+        ]
+        .into_iter()
+        .map(|(pane, state)| {
+            let mut snapshot = template.clone();
+            snapshot.pane_id = pane.into();
+            snapshot.agent = Some(fake_agent(
+                pane,
+                Some(pane),
+                AgentKind::Codex,
+                state,
+                None,
+                None,
+                None,
+                None,
+            ));
+            snapshot
+        })
+        .collect();
+        app.board
+            .set_snapshot(board_snapshot(vec![work]), Vec::new());
+        app.apply_screen(WatchScreen::Board);
+        (app, keys)
+    }
+
+    fn press_key(app: &mut App, code: KeyCode) -> Action {
+        handle_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)), app)
+    }
+
+    #[test]
+    fn board_prompts_every_live_agent_of_the_work_and_nothing_else() {
+        let (mut app, keys) = board_with_agents();
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('P')),
+            Action::None
+        ));
+        match app.collaboration_composer.as_ref().map(|c| &c.target) {
+            Some(CollaborationComposeTarget::PromptPanes { panes, unavailable }) => {
+                assert!(unavailable.is_empty());
+                assert_eq!(panes, &keys[..2], "the stopped agent is not prompted");
+            }
+            other => panic!("expected a Work-wide prompt composer, got {other:?}"),
+        }
+        for c in "go".chars() {
+            let _ = press_key(&mut app, KeyCode::Char(c));
+        }
+        match press_key(&mut app, KeyCode::Enter) {
+            Action::Quick(QuickAction::SendPromptToMany { panes, text, .. }) => {
+                assert_eq!((panes.as_slice(), text.as_str()), (&keys[..2], "go"));
+            }
+            _ => panic!("submitting should send to every agent"),
+        }
+    }
+
+    #[test]
+    fn board_agent_cursor_picks_who_p_and_r_address() {
+        let (mut app, keys) = board_with_agents();
+        let _ = press_key(&mut app, KeyCode::Tab);
+        assert_eq!(app.board.selected_agent_index(""), 1);
+        let _ = press_key(&mut app, KeyCode::Tab);
+        assert_eq!(
+            app.board.selected_agent_index(""),
+            0,
+            "wraps over live agents only"
+        );
+        let _ = press_key(&mut app, KeyCode::BackTab);
+        match press_key(&mut app, KeyCode::Char('R')) {
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(QuickAction::InterruptPane(key)),
+                ..
+            }) => assert_eq!(key, keys[1]),
+            _ => panic!("R should confirm interrupting the agent under the cursor"),
+        }
+        match press_key(&mut app, KeyCode::Char('A')) {
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(QuickAction::InterruptPanes { panes, .. }),
+                message,
+            }) => {
+                assert_eq!(panes, keys[..2]);
+                assert!(message.contains("all 2 agents"), "{message}");
+            }
+            _ => panic!("A should confirm interrupting every live agent"),
+        }
+        let _ = press_key(&mut app, KeyCode::Char('p'));
+        assert!(matches!(
+            app.collaboration_composer.as_ref().map(|c| &c.target),
+            Some(CollaborationComposeTarget::PromptTopology { pane }) if *pane == keys[1]
+        ));
+    }
+
+    #[test]
+    fn board_gate_lets_through_only_the_selected_works_panes() {
+        let (mut app, keys) = board_with_agents();
+        // Nothing passes before a board composer or confirmation froze it.
+        assert!(matches!(
+            gate_board_action(
+                &mut app,
+                Action::Quick(QuickAction::InterruptPane(keys[0].clone()))
+            ),
+            Action::None
+        ));
+        let _ = press_key(&mut app, KeyCode::Char('A'));
+        let mut elsewhere = keys[0].clone();
+        elsewhere.pane_id = "%9".into();
+        for (pane, allowed) in [
+            (keys[0].clone(), true),
+            (keys[2].clone(), false),
+            (elsewhere, false),
+        ] {
+            let action = gate_board_action(
+                &mut app,
+                Action::Quick(QuickAction::InterruptPane(pane.clone())),
+            );
+            assert_eq!(
+                matches!(action, Action::Quick(_)),
+                allowed,
+                "{} allowed={allowed}",
+                pane.pane_id
+            );
+        }
+    }
+
+    #[test]
+    fn many_pane_actions_count_the_intended_set_once_each() {
+        let (_, keys) = board_with_agents();
+        let ok = many_pane_outcome(&keys[..2], &[], "prompted", |_| Ok(()));
+        assert!(matches!(ok, ActionOutcome::Ok(ref m) if m.contains("prompted 2/2")));
+        // A failed write, a target that no longer resolves, and a duplicate.
+        let mut writes = Vec::new();
+        let partial = many_pane_outcome(
+            &[keys[0].clone(), keys[1].clone(), keys[0].clone()],
+            &["/tmp/a:%7".into()],
+            "prompted",
+            |pane| {
+                writes.push(pane.pane_id.clone());
+                if pane.pane_id == "%2" {
+                    Err("gone".into())
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(writes, ["%1", "%2"], "each pane is written once");
+        let ActionOutcome::Err(message) = partial else {
+            panic!("partial failure must be an error")
+        };
+        assert!(message.contains("prompted 1/3"), "{message}");
+        assert!(
+            message.contains("a:%2: gone"),
+            "names the server: {message}"
+        );
+        assert!(message.contains("/tmp/a:%7: no longer open"), "{message}");
+    }
+
+    #[test]
+    fn a_work_wide_prompt_stays_keystrokes_whatever_ctrl_e_and_tab_do() {
+        let (mut app, keys) = board_with_agents();
+        let _ = press_key(&mut app, KeyCode::Char('P'));
+        for event in [
+            Event::Key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL)),
+            Event::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
+        ] {
+            let _ = handle_event(event, &mut app);
+            match app.collaboration_composer.as_ref().map(|c| &c.target) {
+                Some(CollaborationComposeTarget::PromptPanes { panes, .. }) => {
+                    assert_eq!(panes, &keys[..2]);
+                }
+                other => panic!("the composer changed into {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn board_freezes_targets_when_the_composer_opens() {
+        let (mut app, keys) = board_with_agents();
+        let _ = press_key(&mut app, KeyCode::Char('P'));
+        // A refresh lands mid-compose and the Work loses an agent.
+        let mut work = app.board.selected_work("").unwrap().clone();
+        work.runs[0].panes.remove(0);
+        app.board
+            .set_snapshot(board_snapshot(vec![work]), Vec::new());
+        for c in "hi".chars() {
+            let _ = press_key(&mut app, KeyCode::Char(c));
+        }
+        match press_key(&mut app, KeyCode::Enter) {
+            Action::Quick(QuickAction::SendPromptToMany { panes, .. }) => {
+                assert_eq!(panes, keys[..2], "the set shown when it opened");
+            }
+            _ => panic!("the frozen prompt must still be sent"),
+        }
+    }
+
+    #[test]
+    fn board_agent_cursor_follows_the_agent_across_a_refresh() {
+        let (mut app, keys) = board_with_agents();
+        let _ = press_key(&mut app, KeyCode::Tab);
+        // A refresh puts a new agent first: the cursor stays on %2.
+        let mut work = app.board.selected_work("").unwrap().clone();
+        let mut newcomer = work.runs[0].panes[0].clone();
+        newcomer.pane_id = "%0".into();
+        work.runs[0].panes.insert(0, newcomer);
+        app.board
+            .set_snapshot(board_snapshot(vec![work]), Vec::new());
+        match press_key(&mut app, KeyCode::Char('R')) {
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(QuickAction::InterruptPane(key)),
+                ..
+            }) => assert_eq!(key, keys[1]),
+            _ => panic!("R should still address %2"),
+        }
+    }
+
+    #[test]
+    fn board_reports_agents_that_no_longer_resolve_instead_of_dropping_them() {
+        let (mut app, keys) = board_with_agents();
+        let mut work = app.board.selected_work("").unwrap().clone();
+        let mut ghost = work.runs[0].panes[0].clone();
+        ghost.pane_id = "%7".into();
+        work.runs[0].panes.push(ghost);
+        app.board
+            .set_snapshot(board_snapshot(vec![work]), Vec::new());
+        match press_key(&mut app, KeyCode::Char('A')) {
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(QuickAction::InterruptPanes { panes, unavailable }),
+                message,
+            }) => {
+                assert_eq!(panes, keys[..2]);
+                assert_eq!(unavailable.len(), 1, "{unavailable:?}");
+                assert!(message.contains("all 3 agents, 1 unavailable"), "{message}");
+            }
+            _ => panic!("A should confirm with the unavailable agent named"),
+        }
+    }
+
+    #[test]
+    fn board_sort_is_its_own_and_sort_on_the_board_never_touches_topology() {
+        let (mut app, _) = board_with_agents();
+        let topology_sort = app.watch_cfg.sort.clone();
+        let key = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let _ = handle_event(key(':'), &mut app);
+        for c in "sort busy".chars() {
+            let _ = handle_event(key(c), &mut app);
+        }
+        let action = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        );
+        assert!(matches!(
+            action,
+            Action::SetBoardSort(muxa::config::WatchBoardSort::Busy)
+        ));
+        assert_eq!(app.watch_cfg.sort, topology_sort);
+        assert!(matches!(
+            execute_palette_command(&mut app, "sort duration"),
+            Action::None
+        ));
+        app.apply_screen(WatchScreen::Topology);
+        assert!(!matches!(
+            execute_palette_command(&mut app, "sort duration"),
+            Action::SetBoardSort(_) | Action::None
+        ));
+    }
+
+    #[test]
+    fn board_stats_label_tells_loading_unavailable_and_figures_apart() {
+        let mut stats = BoardStats::default();
+        assert_eq!(stats.label("today"), "all sessions · today · ACT …");
+        stats.value = Some(Err("daemon down".into()));
+        assert_eq!(
+            stats.label("today"),
+            "all sessions · today · ACT unavailable"
+        );
+        stats.value = Some(Ok(crate::stats::ActiveDuration {
+            active_secs: 3 * 3600 + 5 * 60,
+            work_active_secs: 0,
+        }));
+        assert_eq!(stats.label("7d"), "all sessions · 7d · ACT 3h05m · WACT -");
     }
 
     #[test]

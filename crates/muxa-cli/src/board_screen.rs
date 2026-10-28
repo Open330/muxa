@@ -11,10 +11,13 @@
 use std::cmp::Reverse;
 use std::fmt::Write as _;
 
+use muxa::config::WatchBoardSort;
 use muxa::event::AgentState;
 use muxa::state::Agent;
 use muxa::work::WorkSnapshotItem;
-use muxa::work::{BoardStage, RunSnapshot, WorkIdentity, WorkSignal, WorkSnapshot};
+use muxa::work::{
+    BoardStage, RunPaneSnapshot, RunSnapshot, WorkIdentity, WorkSignal, WorkSnapshot,
+};
 use ratatui::layout::Constraint;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -41,13 +44,39 @@ pub(crate) struct BoardScreen {
     pub(crate) notes: Vec<String>,
     /// A snapshot has been attempted; separates "loading" from "no Work".
     pub(crate) loaded: bool,
+    /// The agent cursor inside the selected Work, by the agent's exact pane,
+    /// and the Work it belongs to. It follows the agent across refreshes and
+    /// falls back to the first live agent when the Work changes or the agent
+    /// is gone.
+    agent: Option<AgentRef>,
+    agent_work: Option<WorkIdentity>,
+    sort: WatchBoardSort,
+}
+
+/// One agent pane, exactly: server, session, window and pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AgentRef {
+    socket: String,
+    session_id: String,
+    window_id: String,
+    pane_id: String,
+}
+
+impl AgentRef {
+    fn of(run: &RunSnapshot, pane: &RunPaneSnapshot) -> Self {
+        Self {
+            socket: run.execution.socket.clone(),
+            session_id: run.execution.session_id.clone(),
+            window_id: run.execution.window_id.clone(),
+            pane_id: pane.pane_id.clone(),
+        }
+    }
 }
 
 impl BoardScreen {
     pub(crate) fn set_snapshot(&mut self, snapshot: WorkSnapshot, notes: Vec<String>) {
-        let mut works = snapshot.works;
-        works.sort_by_key(attention_order);
-        self.works = works;
+        self.works = snapshot.works;
+        self.sort_works();
         // Commit the Work the cursor shows, so the next reordering refresh
         // keeps it: on first load, and when the selected Work is gone. A
         // Work a filter merely hides keeps its identity for when the filter
@@ -62,6 +91,29 @@ impl BoardScreen {
         self.unlinked = snapshot.unlinked_executions.len();
         self.notes = notes;
         self.loaded = true;
+    }
+
+    pub(crate) fn sort(&self) -> WatchBoardSort {
+        self.sort
+    }
+
+    /// Reorder the board; the cursor stays on its Work.
+    pub(crate) fn set_sort(&mut self, sort: WatchBoardSort) {
+        self.sort = sort;
+        self.sort_works();
+    }
+
+    fn sort_works(&mut self) {
+        match self.sort {
+            WatchBoardSort::Attention => self.works.sort_by_key(attention_order),
+            WatchBoardSort::Activity => self
+                .works
+                .sort_by_key(|work| (Reverse(work.latest_at), work.identity.clone())),
+            WatchBoardSort::Busy => self
+                .works
+                .sort_by_key(|work| (Reverse(busy_agents(work)), attention_order(work))),
+            WatchBoardSort::Name => self.works.sort_by(|a, b| a.identity.cmp(&b.identity)),
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -113,6 +165,42 @@ impl BoardScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.selected = Some(visible[next].identity.clone());
+    }
+
+    /// Index of the agent cursor among the selected Work's live agents.
+    pub(crate) fn selected_agent_index(&self, filter: &str) -> usize {
+        let Some(work) = self.selected_work(filter) else {
+            return 0;
+        };
+        if self.agent_work.as_ref() != Some(&work.identity) {
+            return 0;
+        }
+        let Some(agent) = &self.agent else {
+            return 0;
+        };
+        live_agents(work)
+            .iter()
+            .position(|(run, pane)| &AgentRef::of(run, pane) == agent)
+            .unwrap_or(0)
+    }
+
+    /// Cycle the agent cursor within the selected Work, wrapping.
+    pub(crate) fn cycle_agent(&mut self, delta: isize, filter: &str) {
+        let Some(work) = self.selected_work(filter) else {
+            return;
+        };
+        let count = live_agents(work).len();
+        if count == 0 {
+            return;
+        }
+        let identity = work.identity.clone();
+        let current = self.selected_agent_index(filter);
+        let count_i = isize::try_from(count).unwrap_or(isize::MAX);
+        let current = isize::try_from(current).unwrap_or(0);
+        let next = usize::try_from((current + delta).rem_euclid(count_i)).unwrap_or(0);
+        let agents = live_agents(work);
+        self.agent = agents.get(next).map(|(run, pane)| AgentRef::of(run, pane));
+        self.agent_work = Some(identity);
     }
 
     pub(crate) fn select_first(&mut self, filter: &str) {
@@ -177,6 +265,43 @@ fn attention_order(
     )
 }
 
+/// Agents of the Work that are working or starting.
+pub(crate) fn busy_agents(work: &WorkSnapshotItem) -> usize {
+    agents(work)
+        .filter(|agent| matches!(agent.state, AgentState::Working | AgentState::Starting))
+        .count()
+}
+
+/// Active time, compact: `-`, `45s`, `12m`, `3h05m`, `2d4h`.
+pub(crate) fn active_label(secs: u64) -> String {
+    match secs {
+        0 => "-".into(),
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+        s => format!("{}d{}h", s / 86_400, (s % 86_400) / 3600),
+    }
+}
+
+pub(crate) fn sort_label(sort: WatchBoardSort) -> &'static str {
+    match sort {
+        WatchBoardSort::Attention => "attention",
+        WatchBoardSort::Activity => "activity",
+        WatchBoardSort::Busy => "busy",
+        WatchBoardSort::Name => "name",
+    }
+}
+
+pub(crate) fn parse_sort(value: &str) -> Option<WatchBoardSort> {
+    match value {
+        "attention" | "needs" => Some(WatchBoardSort::Attention),
+        "activity" | "latest" | "recent" => Some(WatchBoardSort::Activity),
+        "busy" | "working" => Some(WatchBoardSort::Busy),
+        "name" | "id" => Some(WatchBoardSort::Name),
+        _ => None,
+    }
+}
+
 /// A signal on the Work, or an agent in it waiting on a person or failing.
 pub(crate) fn needs_operator(work: &WorkSnapshotItem) -> bool {
     !work.signals.is_empty() || agents(work).any(|agent| waits_on_operator(agent.state))
@@ -213,6 +338,20 @@ fn matches_filter(work: &WorkSnapshotItem, needle: &str) -> bool {
                 .map(|item| item.display_key.as_str()),
         )
         .any(|text| text.to_lowercase().contains(needle))
+}
+
+/// The Work's agents that are still running, in the order the detail pane
+/// lists them: Run by Run, pane by pane.
+pub(crate) fn live_agents(work: &WorkSnapshotItem) -> Vec<(&RunSnapshot, &RunPaneSnapshot)> {
+    work.runs
+        .iter()
+        .flat_map(|run| run.panes.iter().map(move |pane| (run, pane)))
+        .filter(|(_, pane)| {
+            pane.agent
+                .as_ref()
+                .is_some_and(|agent| agent.state != AgentState::Stopped)
+        })
+        .collect()
 }
 
 /// Where `Enter` goes for a Work: the agent pane that is waiting on the
@@ -330,6 +469,7 @@ pub(crate) fn detail_lines<'a>(
     work: &WorkSnapshotItem,
     now: OffsetDateTime,
     theme: WatchThemeSpec,
+    selected_agent: Option<(&RunSnapshot, &RunPaneSnapshot)>,
 ) -> Vec<Line<'a>> {
     let mut lines = Vec::new();
     let mut head = vec![
@@ -385,8 +525,18 @@ pub(crate) fn detail_lines<'a>(
             let Some(agent) = &pane.agent else {
                 continue;
             };
+            let selected = selected_agent.is_some_and(|(selected_run, selected_pane)| {
+                std::ptr::eq(selected_run, run) && std::ptr::eq(selected_pane, pane)
+            });
             let mut spans = vec![
-                Span::raw(format!("  {} ", pane.pane_id)),
+                Span::styled(
+                    format!("{} {} ", if selected { "▸" } else { " " }, pane.pane_id),
+                    if selected {
+                        theme.selected_style()
+                    } else {
+                        ratatui::style::Style::default()
+                    },
+                ),
                 Span::styled(
                     crate::state_icon(agent.state),
                     theme.state_style(agent.state),
@@ -712,6 +862,76 @@ mod tests {
         assert_eq!(jump_target(&item).unwrap().1, "%7");
         item.runs.clear();
         assert!(jump_target(&item).is_none());
+    }
+
+    #[test]
+    fn each_board_sort_orders_by_what_it_names_and_keeps_the_cursor() {
+        let mut busy = work("CAL-2", BoardStage::Queued, Vec::new(), 50);
+        busy.runs = vec![run(
+            "/s",
+            vec![
+                ("%1", Some(AgentState::Working)),
+                ("%2", Some(AgentState::Starting)),
+            ],
+        )];
+        let mut board = BoardScreen::default();
+        board.set_snapshot(
+            snapshot(vec![
+                work("CAL-3", BoardStage::InProgress, Vec::new(), 1),
+                busy,
+                work("CAL-1", BoardStage::Review, vec![WorkSignal::Blocked], 90),
+            ]),
+            Vec::new(),
+        );
+        let order = |board: &BoardScreen| -> Vec<String> {
+            board
+                .visible("")
+                .iter()
+                .map(|work| work.identity.work_id.clone())
+                .collect()
+        };
+        assert_eq!(order(&board), ["CAL-1", "CAL-3", "CAL-2"]);
+        board.move_selection(1, "");
+        board.set_sort(WatchBoardSort::Activity);
+        assert_eq!(order(&board), ["CAL-3", "CAL-2", "CAL-1"]);
+        board.set_sort(WatchBoardSort::Busy);
+        assert_eq!(order(&board)[0], "CAL-2");
+        board.set_sort(WatchBoardSort::Name);
+        assert_eq!(order(&board), ["CAL-1", "CAL-2", "CAL-3"]);
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-3");
+        assert_eq!(parse_sort("working"), Some(WatchBoardSort::Busy));
+        assert_eq!(parse_sort("active"), None, "active means time, not a count");
+    }
+
+    #[test]
+    fn the_agent_cursor_reaches_every_live_run_and_skips_stopped_agents() {
+        let mut item = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        item.runs = vec![
+            run(
+                "/a",
+                vec![
+                    ("%1", Some(AgentState::Idle)),
+                    ("%2", Some(AgentState::Stopped)),
+                ],
+            ),
+            run("/b", vec![("%1", Some(AgentState::Working))]),
+        ];
+        let mut board = BoardScreen::default();
+        board.set_snapshot(snapshot(vec![item]), Vec::new());
+        let selected = |board: &BoardScreen| {
+            let work = board.selected_work("").unwrap();
+            let (run, pane) = live_agents(work)[board.selected_agent_index("")];
+            (run.execution.socket.clone(), pane.pane_id.clone())
+        };
+        assert_eq!(selected(&board), ("/a".to_string(), "%1".to_string()));
+        board.cycle_agent(1, "");
+        assert_eq!(
+            selected(&board),
+            ("/b".to_string(), "%1".to_string()),
+            "same id, other server"
+        );
+        board.cycle_agent(1, "");
+        assert_eq!(selected(&board), ("/a".to_string(), "%1".to_string()));
     }
 
     #[test]

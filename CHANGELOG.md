@@ -13,7 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--screen board`, `[watch] screen = "board"`): Works from the same projection
   as `muxa dashboard`, those that need you first, with goal, issue and every
   Run's agents for the selected one, and `Enter` to the exact pane of its Run.
-  `muxa dashboard` is unchanged for now.
+  `muxa dashboard` is unchanged for now. On the board, `p`/`P` prompt the
+  agent under the `Tab` cursor or every live agent of the Work and `R`/`A`
+  interrupt them, with targets fixed when the prompt or confirmation opens and
+  results that count unreachable agents; `:sort attention|activity|busy|name`
+  (`--board-sort`) orders it apart from the topology sort; and the corner shows
+  ACT/WACT for all sessions in `--since` (default today).
 
 - Opt-in versioned collaboration task contracts bind requests to daemon-created
   attempt IDs, exact basis commits and structured reported evidence. Read-only

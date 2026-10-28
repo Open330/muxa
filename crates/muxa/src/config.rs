@@ -2069,6 +2069,22 @@ pub enum WatchCollabLayout {
     Sequence,
 }
 
+/// Order of the Work board. Persisted apart from the topology sort, whose
+/// keys mean different things.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchBoardSort {
+    /// Works that need the operator first, then stage, then recency.
+    #[default]
+    Attention,
+    /// Most recent activity first.
+    Activity,
+    /// Most agents working or starting first.
+    Busy,
+    /// By workspace, then Work id.
+    Name,
+}
+
 /// `[watch]` config — controls the `muxa watch` TUI columns.
 ///
 /// Validation of column keys and width specs happens lazily at render time
@@ -2112,6 +2128,13 @@ pub struct WatchConfig {
     /// Which list `muxa watch` opens on. Defaults to `topology`.
     #[serde(default)]
     pub screen: WatchScreen,
+    /// Order of the Work board screen.
+    #[serde(default)]
+    pub board_sort: WatchBoardSort,
+    /// Window for the Work board's ACT/WACT summary, in `muxa stats --since`
+    /// form. Defaults to `today`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub board_since: Option<String>,
     /// How tree children are revealed. `focus` keeps only the selected path
     /// open, `always` expands every node through the configured `view`, and
     /// `manual` changes expansion only through the tree navigation keys.
@@ -2387,6 +2410,8 @@ impl Default for WatchConfig {
             layout: WatchLayout::Tree,
             collab_layout: WatchCollabLayout::Table,
             screen: WatchScreen::Topology,
+            board_sort: WatchBoardSort::Attention,
+            board_since: None,
             tree_expansion: WatchTreeExpansion::Focus,
             summary: WatchSummary::default(),
             detail: DetailConfig::default(),
