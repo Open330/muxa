@@ -7,8 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.3] - 2026-10-28
+
 ### Added
 
+- Concurrent requests for a worker in the same room, provider and role share
+  one launch. muxad records each launch (requested, launching, pane observed,
+  then bound, failed or uncertain) and hands later callers the pending or
+  running worker instead of spawning another. A launch that fails before it
+  starts frees its slot; one muxa cannot account for is held until it is
+  released.
+- `muxa workers prune` retires workers muxa launched that have sat idle
+  (default 24h; `--error` adds errored ones). It is a dry run unless
+  `--execute`. muxad reserves each worker and re-checks it right before the
+  stop: the provider's own quit (`/exit`, `/quit`) is typed once, only at an
+  empty prompt, and the pane is kept. Workers with open requests, a draft or
+  a dialog are skipped, and primary sessions are never touched.
+- The web dashboard shows Fleet hosts: one card per host with its state,
+  version and agent counts, and an online host's agents when selected.
 - `muxa workers` lists every worker muxa launched for peer work, host-wide:
   room, role, state, observed idle time (with its source), open requests, and
   flags for workers in error (never reused, so a replacement may be spawned),
@@ -31,6 +47,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   environment (so bare and hand-started agents are recognised), and check
   that a swapped agent landed on the account it was sent to. Providers with
   no entries keep using `aas`.
+- `muxa config export` / `diff` / `apply` share portable settings between
+  hosts through any transport. Machine-specific settings never travel and are
+  refused in a bundle; apply is three-way against the last-applied base, so
+  local edits survive and changes on both sides are reported as conflicts.
+  `diff` exits 0/1/2 like `kubectl diff`. `[config_sync]` lets a host choose
+  its categories and ignore items.
+- `muxa fleet sync --from HOST --to HOSTS` previews automation rule changes
+  across Fleet hosts; `--apply` backs up, conditionally saves, and reloads
+  changed hosts. Target-only rules, pauses, and unrelated settings remain local.
+
+### Changed
+
+- Watch loads preview history in 500-row pages. Full-body history widens its
+  conservative page size only after the daemon acknowledges a payload budget,
+  reducing round trips while retaining whole records and continuation cursors.
+- Watch subscribes to mailbox revisions, reads bounded preview pages only when
+  history changes, reuses them for console-sent history, and
+  loads only selected conversation details. Full-body search keeps its complete
+  matching behavior and refreshes only records whose summaries changed.
+- Peer reports select the newest matching reply from metadata pages before an
+  exact read. CLI default list scope resolves inside the authorized list call.
+- Opt-in read views omit repeated task/reply bodies from outcome, progress and
+  mutation responses. Existing full reads and legacy JSON receipts remain intact.
+- CLI and MCP message lists query filtered, paged history in the daemon.
+  Default lists omit task, reply and update bodies from IPC; full and exact
+  reads retain their contracts. Older daemons use the same local query rules.
+- Worker launch registration reuses the request's pane inventory when applying
+  its process-fenced purpose grant, avoiding a second full discovery pass.
+- MCP reload handles up to four independent profiles concurrently while
+  preserving report order and per-profile failures and timeouts.
+- Collaboration audit rows optionally measure encoded IPC response bytes and
+  processing time without recording bodies. The cost audit reports measured
+  samples separately from legacy rows and model-facing output bytes.
+- Agent discovery guidance selects tool names before reading a single schema.
+- Collaboration requests reuse their fresh pane observation for caller evidence
+  and participant discovery, avoiding a second inventory scan without adding a
+  cross-request authorization cache.
+- Ask waits fetch only their turn, and watch scopes history refreshes to the
+  selected conversation. Optional wire filters retain older-client behavior.
+- Codex polling shares one parsed tail and reuses settled, unchanged files;
+  hook timestamps, quota recovery, rotation and truncation still invalidate or
+  reconcile against current state. Recently written files bypass reuse.
+- Screen detection gives idle hook-owned Codex panes a settling capture and
+  bounded fallback instead of capturing every tick. Known rmux locations avoid
+  extra inventory scans, with fresh resolution if a pane moved.
+- MCP initialization points to the collaboration guide with a compact contract,
+  reducing instructions repeated by MCP hosts across tool descriptions.
+- Global Ask publishes bounded Codex/Claude assistant progress through the
+  existing revision stream, without exposing tool payloads or reasoning or
+  treating progress as completion. CLI waits use notifications where available.
+- Fresh Ask conversations receive compact preparation guidance to avoid broad
+  tool catalogs and repeated instruction reads while preserving project rules.
 
 ### Fixed
 
@@ -64,74 +132,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   follow-up prompt under `continue_when = "limited"`.
 - `muxa swap --to auto` treats a bare agent as running on the active account,
   so it is moved to another account rather than onto the one it already uses.
-
-### Fixed
-
 - Mac Fleet snapshots index panes once per host instead of scanning all panes
   for every agent. Socket ambiguity and host isolation retain their prior
   behavior while avoiding quadratic matching work on large workspaces.
-
-### Changed
-
-- Watch loads preview history in 500-row pages. Full-body history widens its
-  conservative page size only after the daemon acknowledges a payload budget,
-  reducing round trips while retaining whole records and continuation cursors.
-
-### Fixed
-
 - Mac usage displays reuse RFC 3339 formatters and bound their parse cache,
   avoiding repeated ICU setup on every agent comparison and UI update.
 - Mac IPC skips cancelled requests still waiting in a transport queue. Live pane
   previews parse terminal styling off the main actor and wake promptly when
   their view or app becomes active, rather than waiting for idle backoff.
-
-### Fixed
-
 - Mac app Work commands run independently per host instead of blocking terminal
   input and background refreshes on the control IPC queue. Snapshot and state
   reads have separate bounded transports; workspace projections compute off the
   main actor and reject stale results. Unchanged connection status no longer
   triggers another UI update. Runtime settings display installed build metadata.
-
-### Added
-
-- `muxa config export` / `diff` / `apply` share portable settings between
-  hosts through any transport. Machine-specific settings never travel and are
-  refused in a bundle; apply is three-way against the last-applied base, so
-  local edits survive and changes on both sides are reported as conflicts.
-  `diff` exits 0/1/2 like `kubectl diff`. `[config_sync]` lets a host choose
-  its categories and ignore items.
-
-### Changed
-
-- Watch subscribes to mailbox revisions, reads bounded preview pages only when
-  history changes, reuses them for console-sent history, and
-  loads only selected conversation details. Full-body search keeps its complete
-  matching behavior and refreshes only records whose summaries changed.
-- Peer reports select the newest matching reply from metadata pages before an
-  exact read. CLI default list scope resolves inside the authorized list call.
-- Opt-in read views omit repeated task/reply bodies from outcome, progress and
-  mutation responses. Existing full reads and legacy JSON receipts remain intact.
-
-### Changed
-
-- CLI and MCP message lists query filtered, paged history in the daemon.
-  Default lists omit task, reply and update bodies from IPC; full and exact
-  reads retain their contracts. Older daemons use the same local query rules.
-
-### Changed
-
-- Worker launch registration reuses the request's pane inventory when applying
-  its process-fenced purpose grant, avoiding a second full discovery pass.
-- MCP reload handles up to four independent profiles concurrently while
-  preserving report order and per-profile failures and timeouts.
-- Collaboration audit rows optionally measure encoded IPC response bytes and
-  processing time without recording bodies. The cost audit reports measured
-  samples separately from legacy rows and model-facing output bytes.
-- Agent discovery guidance selects tool names before reading a single schema.
-
-### Fixed
-
 - A collaboration wait (`muxa msg wait`, MCP `muxa_wait_reply`) survives a
   daemon restart. muxad answers an interrupted wait with a retryable
   `restarting` response instead of aborting it after the drain timeout, and
@@ -149,45 +162,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fleet automation sync creates missing configuration directories, recovers
   incomplete reloads on retry, and serializes concurrent applies. Config
   documents report absolute paths so backups stay beside the daemon's file.
-
-### Added
-
-- `muxa fleet sync --from HOST --to HOSTS` previews automation rule changes
-  across Fleet hosts; `--apply` backs up, conditionally saves, and reloads
-  changed hosts. Target-only rules, pauses, and unrelated settings remain local.
-
-### Changed
-
-- Collaboration requests reuse their fresh pane observation for caller evidence
-  and participant discovery, avoiding a second inventory scan without adding a
-  cross-request authorization cache.
-- Ask waits fetch only their turn, and watch scopes history refreshes to the
-  selected conversation. Optional wire filters retain older-client behavior.
-- Codex polling shares one parsed tail and reuses settled, unchanged files;
-  hook timestamps, quota recovery, rotation and truncation still invalidate or
-  reconcile against current state. Recently written files bypass reuse.
-- Screen detection gives idle hook-owned Codex panes a settling capture and
-  bounded fallback instead of capturing every tick. Known rmux locations avoid
-  extra inventory scans, with fresh resolution if a pane moved.
-- MCP initialization points to the collaboration guide with a compact contract,
-  reducing instructions repeated by MCP hosts across tool descriptions.
-
-- Global Ask publishes bounded Codex/Claude assistant progress through the
-  existing revision stream, without exposing tool payloads or reasoning or
-  treating progress as completion. CLI waits use notifications where available.
-- Fresh Ask conversations receive compact preparation guidance to avoid broad
-  tool catalogs and repeated instruction reads while preserving project rules.
-
-### Fixed
-
 - `reload mcp --all` explains standalone Codex CLI owners that are outside the
   shared app-server API instead of only giving a generic manual-reconnect hint.
 - Bounded Ask progress no longer reprints the retained 32 KiB tail when it rolls.
   Watch subscribes to Ask changes independently of agent hook activity.
-
 - Peek qualifies pane geometry queries with the caller's session and window,
   so `prefix + q` stays open when an older rmux server reports a linked window
   ID as ambiguous across sessions.
+- Codex command lines are read for their subcommand only after global
+  options, so a prompt containing `review` or `exec` no longer stops a Codex
+  reviewer from being recognised, and an app-server started with `-c …` is
+  identified for MCP reload.
+- muxad keeps its socket: a second daemon leaves a running one's socket
+  alone, shutdown removes only the file it bound, and a deleted socket file is
+  bound again within seconds.
+- `muxa mcp` starts while muxad is restarting or its registry is large,
+  follows upgrades in place once idle, and identifies macOS Codex profiles.
+  `muxa reload mcp` judges a server stale by the binary it is running, not by
+  its start time.
+- Agents with no pane (headless CLIs whose hooks still reach muxad) are
+  capped by `[reconciler] paneless_max_live_rows` (default 256) and collected
+  after 5 minutes once stopped, and the dashboard no longer counts them.
+  Dashboard assets are versioned per build so browsers never mix builds.
+- `muxa swap` reports success only after the resumed conversation settles
+  with the agent still running and no ownership banner or startup error, and
+  names a Codex app-server outside the pane that may still own it.
 
 ## [0.9.2] - 2026-10-22
 
