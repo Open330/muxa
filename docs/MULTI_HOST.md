@@ -137,8 +137,9 @@ With the set in place, the CLI reads aggregate across it:
 - **Other surfaces**: `muxa registry panes`, `stats`, and `timeline` enumerate
   via `all_panes()` (concat across the set); `muxa registry panes` prints a
   per-host empty hint for any host in the set that contributed zero.
-  Live pane captures (`watch` preview, `dashboard`) resolve the backend
-  by pane-id namespace (`backend_for_pane`). `current_pane`/status-line
+  Live pane captures (the `watch` preview and inspector, on every screen
+  including the Work board) target the exact topology pane, whose endpoint
+  names the host and server to capture from. `current_pane`/status-line
   ("where am I") stay single-host — env-based location is inherently one
   host.
 - Inline time data (ACT/DUR from the ledger) needs nothing new — keys
