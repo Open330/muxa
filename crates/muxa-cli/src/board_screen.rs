@@ -340,6 +340,41 @@ pub(crate) fn collab_summary(
     summary
 }
 
+/// A Work's workers — agents muxa launched for peer work — and their flags.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct WorkerSummary {
+    pub(crate) workers: usize,
+    pub(crate) long_idle: usize,
+    pub(crate) error: usize,
+    pub(crate) overlap: usize,
+}
+
+/// Match the inventory to the Work's agents by exact agent session, across
+/// every Run; each worker once.
+pub(crate) fn worker_summary(
+    work: &WorkSnapshotItem,
+    workers: &[muxa::collaboration::WorkerEntry],
+) -> WorkerSummary {
+    use muxa::collaboration::WorkerFlag;
+    let sessions: std::collections::HashSet<&str> = agents(work)
+        .map(|agent| agent.session_id.as_str())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut summary = WorkerSummary::default();
+    for worker in workers {
+        if !sessions.contains(worker.agent_session_id.as_str())
+            || !seen.insert(worker.agent_session_id.as_str())
+        {
+            continue;
+        }
+        summary.workers += 1;
+        summary.long_idle += usize::from(worker.flags.contains(&WorkerFlag::LongIdle));
+        summary.error += usize::from(worker.flags.contains(&WorkerFlag::Error));
+        summary.overlap += usize::from(worker.flags.contains(&WorkerFlag::PossibleOverlap));
+    }
+    summary
+}
+
 /// Agents of the Work that are working or starting.
 pub(crate) fn busy_agents(work: &WorkSnapshotItem) -> usize {
     agents(work)

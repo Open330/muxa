@@ -255,7 +255,11 @@ scope = "host"`이면 어떤 pane이든 닿으며, 서버 사이에 겹치는 id
 거부합니다. topology 표시(`Space`)는 여기 적용되지 않습니다. detail에는 Work의 열린 협업 —
 모든 Run의 agent에게 온, 또 그들이 보낸 미완료 요청을 요청마다 한 번씩 — 도
 표시되며, board가 떠 있는 동안 15초마다 기록 목록으로 갱신하고(claim하지 않음),
-목록을 읽지 못하면 0 대신 `unavailable`이라고 표시합니다. `b`(또는 `M`)는 그
+목록을 읽지 못하면 0 대신 `unavailable`이라고 표시합니다. `workers` 줄은 muxa가 peer
+작업용으로 띄운 그 Work의 agent를 agent session 기준으로 세고, 오래 대기(24시간
+초과)·오류·역할 겹침 수를 보여줍니다. 읽기 전용이며, 호스트 전체를 대상으로 기본 dry-run이고 열린 작업이 있는
+worker는 건너뛰며 오류 worker는 `--error`일 때만 다루는 `muxa workers prune`을
+안내합니다. `b`(또는 `M`)는 그
 agent의 메일함을 행동하기 전까지 읽기 전용으로 열고, `i`는 대기 중인 요청을 claim,
 `e`는 답장하며 둘 다 console이 아니라 그 agent로서 동작합니다. 어느 메일함에서든
 Sent 탭의 `x`는 이 console이 보냈고 아직 대기 중인 요청을 확인 뒤 철회합니다.
