@@ -227,7 +227,26 @@ agent와 마지막 프롬프트로 펼쳐집니다. 제목줄은 화면에 있�
 그 Run의 pane — 기다리는 agent가 있으면 그 pane — 으로, 정확히 그 서버에서
 이동합니다. live Run이 없는 Work는 그렇다고 알려줍니다. 커서는 행이 아니라
 Work를 따라가므로 새로고침으로 순서가 바뀌어도 움직이지 않습니다. `o`는 같은
-pane을 미리 봅니다. kill, abort, message, move, rename처럼 topology 노드를
+pane을 미리 봅니다.
+
+`Tab` / `]`와 `Shift-Tab` / `[`는 선택한 Work의 live agent(모든 Run, detail에
+`▸` 표시) 사이에서 agent 커서를 옮기며, 새로고침 뒤에도 그 pane을 따라갑니다.
+`p`는 그 agent에, `P`는 Work의 모든 live agent에 프롬프트를 입력하고, `R`은 그
+agent를, `A`는 모두를 대상 이름을 보여주는 확인 뒤에 중단합니다. 대상은 입력창이나
+확인창이 열릴 때 고정되므로 그사이 새로고침이 대상을 바꾸지 못하고, 각 대상에
+한 번만 쓰며 재시도하지 않습니다. pane을 더 찾을 수 없는 agent는 unavailable로
+표시되어 결과에 포함되고(`prompted 2/3 Work agents · /tmp/…:%7: no longer
+open`), 실패는 pane과 함께 서버를 밝힙니다. Work 전체 프롬프트는 항상 키 입력이며
+협업 요청으로 바뀌지 않습니다.
+
+`:sort attention|activity|busy|name`(또는 `--board-sort`, `[watch] board_sort`)는
+topology 정렬을 건드리지 않고 board 순서를 바꿉니다. `busy`는 작업 중이거나
+시작 중인 agent 수입니다. board 오른쪽 위는 기간(`--since`, `[watch]
+board_since`, 기본 `today`) 동안 **모든 세션**의 ACT·WACT 합계입니다. Work별이
+아니고 필터를 따르지 않으며, 읽을 수 없으면 0 대신 `unavailable`이라고
+표시합니다.
+
+kill, message, move, rename처럼 topology 노드를
 겨누는 동작은 숨은 topology 커서가 가리키던 대상에 실행되지 않도록 여기서는
 거부되며 `Alt-1`로 돌아가면 쓸 수 있습니다. board는 화면에 떠 있는 동안에만
 3초마다, 키 입력을 막지 않도록 백그라운드에서 다시 스캔합니다. 이 호스트 전용이라

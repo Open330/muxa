@@ -308,10 +308,16 @@ enum Cmd {
         /// This is independent from the topology `--layout`.
         #[arg(long, value_parser = parse_watch_collab_layout)]
         collab_layout: Option<watch::CollabLayout>,
-        /// Which list to open on: the topology (default), or collaboration
-        /// across every room the daemon holds.
+        /// Which list to open on: the topology (default), collaboration
+        /// across every room the daemon holds, or the Work board.
         #[arg(long, value_enum)]
         screen: Option<WatchScreenArg>,
+        /// Work board order: attention (default), activity, busy, or name.
+        #[arg(long, value_parser = parse_board_sort)]
+        board_sort: Option<muxa::config::WatchBoardSort>,
+        /// Work board ACT/WACT window, as `muxa stats --since` takes it.
+        #[arg(long, value_name = "SINCE")]
+        since: Option<String>,
         /// One-shot sibling sort: name, latest/activity/act, duration/dur, st/state, pane, or pane-id.
         #[arg(long, value_enum)]
         sort: Option<WatchSortArg>,
@@ -1069,6 +1075,11 @@ impl From<WatchLayoutArg> for muxa::config::WatchLayout {
     }
 }
 
+fn parse_board_sort(value: &str) -> std::result::Result<muxa::config::WatchBoardSort, String> {
+    board_screen::parse_sort(value)
+        .ok_or_else(|| format!("unknown board sort `{value}` (attention, activity, busy, name)"))
+}
+
 fn parse_watch_collab_layout(value: &str) -> std::result::Result<watch::CollabLayout, String> {
     match value {
         "table" | "sequence" => watch::parse_collab_layout(value)
@@ -1662,12 +1673,20 @@ async fn main() -> Result<()> {
             layout,
             collab_layout,
             screen,
+            board_sort,
+            since,
             sort,
             theme,
             caller_client,
             caller_pane,
         } => {
             let mut cfg = cfg;
+            if let Some(board_sort) = board_sort {
+                cfg.watch.board_sort = board_sort;
+            }
+            if let Some(since) = since {
+                cfg.watch.board_since = Some(since);
+            }
             if let Some(collab_layout) = collab_layout {
                 cfg.watch.collab_layout = collab_layout;
             }

@@ -284,9 +284,29 @@ are not rows here. Typing filters on title, workspace, Work id, goal, next
 action and issue key. `Enter` goes to the Run's pane — the agent waiting on you
 if there is one — on that exact server; a Work with no live Run says so. The
 cursor follows the Work, not the row, so a refresh that reorders the board does
-not move it. `o` previews that same pane. Actions that aim at a topology node —
-kill, abort, message, move, rename — are refused here rather than applied to
-whatever the hidden topology cursor last pointed at; `Alt-1` gets them back.
+not move it. `o` previews that same pane.
+
+`Tab` / `]` and `Shift-Tab` / `[` move an agent cursor through the selected
+Work's live agents (every Run, marked `▸` in the detail); it follows that exact
+pane across refreshes. `p` types a prompt into that agent and `P` into every live
+agent of the Work; `R` interrupts that agent and `A` every one, after a
+confirmation naming them. The targets are fixed when the prompt or confirmation
+opens, so a refresh meanwhile cannot redirect them, and each is written once,
+never retried. An agent whose pane no longer resolves is listed as unavailable
+and counted in the result (`prompted 2/3 Work agents · /tmp/…:%7: no longer
+open`), and failures name the server as well as the pane. A Work-wide prompt is
+always keystrokes; it cannot be turned into a collaboration request.
+
+`:sort attention|activity|busy|name` (or `--board-sort`, `[watch] board_sort`)
+orders the board without touching the topology sort. `busy` counts agents
+working or starting. The top-right of the board sums ACT and WACT for **all
+sessions** in a window (`--since`, `[watch] board_since`, default `today`); it
+is not per Work and does not follow the filter, and says `unavailable` rather
+than showing zero when the figures cannot be read.
+
+Actions that aim at a topology node — kill, message, move, rename — are refused
+here rather than applied to whatever the hidden topology cursor last pointed
+at; `Alt-1` gets them back.
 The board rescans every three seconds while it is on show, in the background so
 a slow multiplexer never stalls the keyboard, and never otherwise. It is local
 to this host: `--fleet --screen board` is refused when other hosts are present.
