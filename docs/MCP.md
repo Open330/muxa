@@ -12,6 +12,13 @@ deterministic agent launcher invokes same-user tmux locally, using the same
 socket routing as the CLI. The MCP server adds no network listener: it can only
 do what a shell on the same machine could already do through `muxa` and tmux.
 
+`muxa_agent_search` searches historical Claude/Codex conversations and tool
+executions with a Korean/English natural-language query; `muxa_agent_read`
+expands a hit into surrounding events and paired command results. These tools
+read local provider files without the daemon and report search coverage. See
+[agent-record search](AGENT_RECORDS.md) for query interpretation, evidence
+handling, indexing limits and CLI equivalents.
+
 ## Wire it into Claude Code and Codex
 
 The recommended setup is `muxa init --preset standard`, which installs hooks,
@@ -296,6 +303,15 @@ muxa_call_peer(target="@codex", intent="task", execute=true,
 The MCP process reads `[message.skills]` at startup. Restart an already-running
 agent after `muxa skill add/remove`, after editing the table, or after upgrading
 Muxa so it loads the current skills and tool definitions.
+
+### Versioned task contracts
+
+`muxa_send_message`, `muxa_call_peer` and `muxa_fleet_call_peer` accept an optional
+`task_contract` and `supersedes_request_id`. `muxa_reply` accepts a matching
+`report`. Contract completion checks attempt identity, requested revision and
+reported criterion evidence; it never independently verifies success. Superseding
+read-only investigations preserves late reports as history without waking the
+sender or completing the successor. See [Task contracts](COLLABORATION_CONTRACTS.md).
 
 ### Delivery observations and declared work results
 

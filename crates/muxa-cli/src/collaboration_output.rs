@@ -71,6 +71,29 @@ pub(crate) fn mutation_receipt(request: &CollaborationRequest) -> Value {
     if let Some(reply) = &request.reply {
         value["reported_status"] = json!(reply.status);
     }
+    if let Some(attempt) = &request.attempt {
+        value["attempt"] = json!(attempt);
+        value["requested_basis_revision"] = json!(attempt.basis_revision);
+        if request.reply.as_ref().is_some_and(|r| r.report.is_some()) {
+            value["report_basis_matched"] = json!(true);
+        }
+        if request.reply.is_some() || !request.late_replies.is_empty() {
+            value["evidence_verification"] = json!("not_independently_verified");
+        }
+    }
+    if request.superseded_by.is_some() {
+        value["result_applicability"] = json!("superseded");
+    }
+    if let Some(id) = &request.supersedes_request_id {
+        value["supersedes_request_id"] = json!(id);
+    }
+    if let Some(id) = &request.superseded_by {
+        value["superseded_by"] = json!(id);
+    }
+    if !request.late_replies.is_empty() {
+        value["late_reply_count"] = json!(request.late_replies.len());
+    }
+
     if let Some(update) = request.updates.last() {
         value["next_after_update"] = json!(update.sequence);
     }
@@ -92,6 +115,9 @@ pub(crate) fn outcome(request: &CollaborationRequest) -> Value {
     if let Some(interruption) = &request.interruption {
         value["interruption"] = json!(interruption);
     }
+    if !request.late_replies.is_empty() {
+        value["late_replies"] = json!(request.late_replies);
+    }
     if request.peer_interrupted() {
         value["reason"] = json!("peer_interrupted");
     }
@@ -107,6 +133,12 @@ pub(crate) fn message(request: &CollaborationRequest, include_body: bool) -> Val
         value["next_after_update"] = json!(update.sequence);
     }
     if include_body {
+        if let Some(contract) = &request.task_contract {
+            value["task_contract"] = json!(contract);
+        }
+        if !request.late_replies.is_empty() {
+            value["late_replies"] = json!(request.late_replies);
+        }
         value["body"] = json!(request.body);
         value["paths"] = json!(request.paths);
         value["artifacts"] = json!(request.artifacts);
@@ -241,6 +273,7 @@ mod tests {
             let mut request = fixture();
             request.status = status;
             request.reply = Some(CollaborationReply {
+                report: None,
                 status,
                 body: "pending is discussed here; this is a final reply".into(),
                 artifacts: vec![],
@@ -316,5 +349,63 @@ mod tests {
         assert_eq!(updates(&request, 3), json!([]));
         assert_eq!(inbox["next_after_update"], 3);
         assert_eq!(inbox["updates"].as_array().unwrap().len(), 3);
+    }
+    #[test]
+    fn compact_contract_results_keep_attribution_and_hide_evidence_bodies() {
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["task_contract"] = json!({"version":1,"task_id":"review","objective":"private-objective","acceptance_criteria":["private-criterion"],"basis_revision":"a".repeat(40)});
+        value["attempt"] =
+            json!({"id":"attempt-id","task_id":"review","basis_revision":"a".repeat(40)});
+        value["status"] = json!("cancelled");
+        value["superseded_by"] = json!("new-request");
+        value["late_replies"] = json!([{"status":"completed","body":"private-late-result","report":{"attempt_id":"attempt-id","basis_revision":"a".repeat(40),"criteria":[],"evidence":[{"kind":"agent_event","locator":"private-evidence"}]},"at":"2026-10-14T00:01:00Z"}]);
+        let request: CollaborationRequest = serde_json::from_value(value).unwrap();
+        let mut metadata = request.clone();
+        muxa::collaboration::CollaborationReadView::Metadata.apply(&mut metadata);
+        let compact = mutation_receipt(&metadata);
+        assert_eq!(compact["result_applicability"], "superseded");
+        assert_eq!(compact["late_reply_count"], 1);
+        assert_eq!(
+            compact["evidence_verification"],
+            "not_independently_verified"
+        );
+        assert_eq!(compact["final_reply_received"], false);
+        let serialized = serde_json::to_string(&metadata).unwrap();
+        for private in [
+            "private-objective",
+            "private-criterion",
+            "private-late-result",
+            "private-evidence",
+        ] {
+            assert!(!serialized.contains(private));
+        }
+        let mut read = request;
+        muxa::collaboration::CollaborationReadView::Outcome.apply(&mut read);
+        let result = outcome(&read);
+        assert_eq!(
+            result["late_replies"][0]["report"]["evidence"][0]["locator"],
+            "private-evidence"
+        );
+        assert_eq!(result["final_reply_received"], false);
+    }
+    #[test]
+    fn metadata_keeps_report_presence_without_criterion_or_evidence_bodies() {
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["attempt"] =
+            json!({"id":"attempt","task_id":"review","basis_revision":"a".repeat(40)});
+        value["status"] = json!("completed");
+        value["reply"] = json!({"status":"completed","body":"private-result","at":"2026-10-14T00:00:00Z","report":{"attempt_id":"attempt","basis_revision":"a".repeat(40),"criteria":[{"criterion":0,"outcome":"pass","evidence":[{"kind":"artifact","locator":"private-evidence"}]}],"evidence":[]}});
+        let mut request: CollaborationRequest = serde_json::from_value(value).unwrap();
+        muxa::collaboration::CollaborationReadView::Metadata.apply(&mut request);
+        let compact = mutation_receipt(&request);
+        assert_eq!(compact["report_basis_matched"], true);
+        assert_eq!(compact["requested_basis_revision"], "a".repeat(40));
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("private-result"));
+        assert!(!serialized.contains("private-evidence"));
+        request.reply.as_mut().unwrap().report = None;
+        assert!(mutation_receipt(&request)
+            .get("report_basis_matched")
+            .is_none());
     }
 }

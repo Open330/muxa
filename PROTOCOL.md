@@ -3,7 +3,7 @@
 This document describes the wire protocol spoken between
 `muxa` (the CLI), third-party adapters, and `muxad` (the daemon).
 
-Current version: **`5`** (defined in `crates/muxa/src/event.rs`).
+Current version: **`6`** (defined in `crates/muxa/src/event.rs`).
 
 ## Stability
 
@@ -915,3 +915,13 @@ is gone.
   yet. Allocating anywhere else means allocating from a partial view, which
   is how one room came to answer to `@claude` twice.
 - Responses gain an optional `handle` field.
+
+## Task contracts extension
+
+`collaboration_task_contract_v1` adds opt-in immutable task contracts, attempt-bound
+reports and read-only supersession. Contract-bearing operations use distinct
+`collaboration_send_contract`, `collaboration_reply_contract` and
+`fleet_command_contract` wire kinds so older daemons fail closed. The existing
+request statuses and legacy operations remain unchanged. See
+[Task contracts](docs/COLLABORATION_CONTRACTS.md) for schemas, validation, storage
+compatibility and evidence semantics.

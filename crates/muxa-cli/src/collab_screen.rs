@@ -612,6 +612,11 @@ mod tests {
 
     fn request(id: &str, from: Participant, to: Participant, body: &str) -> CollaborationRequest {
         CollaborationRequest {
+            task_contract: None,
+            attempt: None,
+            supersedes_request_id: None,
+            superseded_by: None,
+            late_replies: Vec::new(),
             dispatch_id: None,
             source_node_id: None,
             delegation_parent: None,
@@ -813,6 +818,7 @@ mod tests {
         first.created_at = now - time::Duration::minutes(5);
         first.status = RequestStatus::Completed;
         first.reply = Some(CollaborationReply {
+            report: None,
             status: RequestStatus::Completed,
             body: "changes required".into(),
             artifacts: Vec::new(),

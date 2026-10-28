@@ -87,6 +87,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "collaboration",
     "collaboration_get",
     "collaboration_dispatch_v1",
+    crate::collaboration::TASK_CONTRACT_CAPABILITY,
     "collaboration_update",
     FLEET_MAILBOX_WATCH_CAPABILITY,
     "exact_pane_ref",
@@ -534,6 +535,11 @@ pub enum RelayRequest {
         pane: PaneKey,
         request: Box<NewRequest>,
     },
+    CollaborationSendContract {
+        request_id: String,
+        pane: PaneKey,
+        request: Box<NewRequest>,
+    },
     CollaborationMailbox {
         request_id: String,
         pane: PaneKey,
@@ -562,6 +568,19 @@ pub enum RelayRequest {
         collaboration_request_id: String,
         status: RequestStatus,
         body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "crate::collaboration::deserialize_report_input")]
+        report: Option<crate::collaboration::TaskReport>,
+    },
+    CollaborationReplyContract {
+        request_id: String,
+        pane: PaneKey,
+        collaboration_request_id: String,
+        status: RequestStatus,
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "crate::collaboration::deserialize_report_input")]
+        report: Option<crate::collaboration::TaskReport>,
     },
     /// Run an allowlisted `muxa work …` argv on the remote node with its own
     /// binary. Advertised by [`FLEET_WORK_COMMAND_CAPABILITY`].
@@ -588,6 +607,8 @@ impl RelayRequest {
             | Self::CollaborationUpdate { request_id, .. }
             | Self::CollaborationClaim { request_id, .. }
             | Self::CollaborationReply { request_id, .. }
+            | Self::CollaborationSendContract { request_id, .. }
+            | Self::CollaborationReplyContract { request_id, .. }
             | Self::WorkCommand { request_id, .. } => request_id,
         }
     }
@@ -674,6 +695,9 @@ pub enum FleetOperation {
         request_id: String,
         status: RequestStatus,
         body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(deserialize_with = "crate::collaboration::deserialize_report_input")]
+        report: Option<crate::collaboration::TaskReport>,
     },
     /// Run an allowlisted `muxa work …` argv on the host and return its exit
     /// code and streams in the `command_*` result fields. See
@@ -683,6 +707,18 @@ pub enum FleetOperation {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stdin: Option<String>,
     },
+}
+
+impl FleetOperation {
+    pub fn requires_task_contract(&self) -> bool {
+        match self {
+            Self::CollaborationSend { request, .. } => {
+                request.task_contract.is_some() || request.supersedes_request_id.is_some()
+            }
+            Self::CollaborationReply { report, .. } => report.is_some(),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1528,6 +1564,8 @@ mod tests {
             request_id: "relay-1".into(),
             pane: pane.clone(),
             request: Box::new(NewRequest {
+                task_contract: None,
+                supersedes_request_id: None,
                 dispatch_id: None,
                 source_node_id: None,
                 delegation_parent: None,

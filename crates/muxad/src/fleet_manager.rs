@@ -515,6 +515,7 @@ impl LocalTask {
                 request_id,
                 status,
                 body,
+                report,
             } => {
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_reply", body.len());
                 let request = self
@@ -526,13 +527,15 @@ impl LocalTask {
                     exact_local_backend(&self.backends, &pane).await?;
                 }
                 self.client
-                    .collaboration_reply(
+                    .collaboration_reply_report_view(
                         &fleet_collaboration_origin(&pane, request.to.console),
                         &request_id,
                         status,
                         &body,
                         &[],
                         &[],
+                        report.as_ref(),
+                        muxa::collaboration::CollaborationReadView::Full,
                     )
                     .await
                     .map(FleetCommandResult::collaboration_request)
@@ -1271,6 +1274,10 @@ impl HostTask {
                         )));
                         continue;
                     }
+                    if command.operation.requires_task_contract() && !connected.hello.capabilities.iter().any(|c|c==muxa::collaboration::TASK_CONTRACT_CAPABILITY) {
+                        let _=command.reply.send(Err(format!("host '{}' does not support task contracts; upgrade muxa",self.alias)));
+                        continue;
+                    }
                     if matches!(command.operation, FleetOperation::CollaborationUpdate { .. })
                         && !connected.hello.capabilities.iter().any(|c| c == "collaboration_update") {
                         let _ = command.reply.send(Err(format!("host '{}' does not support request updates; upgrade muxa", self.alias)));
@@ -1345,7 +1352,7 @@ impl HostTask {
                                 id.clone(),
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
-                            RelayRequest::CollaborationSend { request_id: id, pane, request }
+                            if request.task_contract.is_some() || request.supersedes_request_id.is_some() { RelayRequest::CollaborationSendContract {request_id:id,pane,request} } else { RelayRequest::CollaborationSend { request_id: id, pane, request } }
                         }
                         FleetOperation::CollaborationMailbox { pane, operator_only } => {
                             audit_operation(&self.alias, "collaboration_mailbox", 0);
@@ -1380,18 +1387,16 @@ impl HostTask {
                             pending.insert(id.clone(), PendingRequest::new(PendingReply::Command(command.reply), command_timeout));
                             RelayRequest::CollaborationUpdate { request_id: id, pane, collaboration_request_id: request_id, body }
                         }
-                        FleetOperation::CollaborationReply { pane, request_id, status, body } => {
+                        FleetOperation::CollaborationReply { pane, request_id, status, body, report } => {
                             audit_operation(&self.alias, "collaboration_reply", body.len());
                             pending.insert(
                                 id.clone(),
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
-                            RelayRequest::CollaborationReply {
-                                request_id: id,
-                                pane,
-                                collaboration_request_id: request_id,
-                                status,
-                                body,
+                            if report.is_some() {
+                                RelayRequest::CollaborationReplyContract {request_id:id,pane,collaboration_request_id:request_id,status,body,report}
+                            } else {
+                                RelayRequest::CollaborationReply {request_id:id,pane,collaboration_request_id:request_id,status,body,report}
                             }
                         }
                         FleetOperation::WorkCommand { args, stdin } => {

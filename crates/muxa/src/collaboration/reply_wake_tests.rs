@@ -448,6 +448,7 @@ fn legacy_rows_derive_their_release_from_timestamps() {
     let now = OffsetDateTime::now_utc();
     let mut request = CollaborationRequest {
         reply: Some(CollaborationReply {
+            report: None,
             status: RequestStatus::Completed,
             body: "done".into(),
             artifacts: Vec::new(),
@@ -488,6 +489,11 @@ fn legacy_rows_derive_their_release_from_timestamps() {
 
 fn legacy_request(pair: &Pair) -> CollaborationRequest {
     CollaborationRequest {
+        task_contract: None,
+        attempt: None,
+        supersedes_request_id: None,
+        superseded_by: None,
+        late_replies: Vec::new(),
         dispatch_id: None,
         source_node_id: None,
         delegation_parent: None,

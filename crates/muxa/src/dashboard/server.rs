@@ -3197,6 +3197,8 @@ mod tests {
                         from.clone(),
                         to.clone(),
                         NewRequest {
+                            task_contract: None,
+                            supersedes_request_id: None,
                             dispatch_id: None,
                             source_node_id: None,
                             delegation_parent: None,
@@ -3230,6 +3232,8 @@ mod tests {
                     from,
                     to,
                     NewRequest {
+                        task_contract: None,
+                        supersedes_request_id: None,
                         dispatch_id: None,
                         source_node_id: None,
                         delegation_parent: None,

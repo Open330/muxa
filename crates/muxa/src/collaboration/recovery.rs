@@ -33,17 +33,15 @@ fn exact_agent<'a>(participant: &Participant, agents: &'a [Agent]) -> Option<&'a
     if participant.console {
         return None;
     }
+    // Session identity survives pane/socket moves; process state must follow it.
     agents.iter().find(|a| {
         a.kind == participant.agent_kind
             && a.session_id == participant.agent_session_id
-            && a.pane.as_deref() == Some(&participant.pane)
-            && match (a.tmux_socket.as_deref(), participant.socket.as_deref()) {
-                (Some(a), Some(b)) => {
-                    crate::backend::pane_endpoints_match(Some(&participant.pane), a, b)
-                }
-                (None, None) => true,
-                _ => false,
-            }
+            && (!a
+                .session_id
+                .starts_with(crate::state::SYNTHETIC_SESSION_PREFIX)
+                || (a.pane.as_deref() == Some(participant.pane.as_str())
+                    && a.tmux_socket == participant.socket))
     })
 }
 
@@ -64,6 +62,11 @@ fn recovery_action(
 ) -> CollaborationRequest {
     let mut action = parent.clone();
     action.id = id;
+    action.late_replies.clear();
+    action.task_contract = None;
+    action.attempt = None;
+    action.supersedes_request_id = None;
+    action.superseded_by = None;
     action.dispatch_id = None;
     action.source_node_id = None;
     action.delegation_parent = None;
@@ -471,5 +474,17 @@ mod tests {
             .await
             .unwrap();
         assert!(mailbox.pending_human_notifications().await.is_empty());
+    }
+    #[tokio::test]
+    async fn recovery_follows_real_session_moves_but_not_cross_socket_synthetic_ids() {
+        let (participant, mut agent) = actor("%1", "real-session").await;
+        agent.pane = Some("%9".into());
+        assert!(exact_agent(&participant, std::slice::from_ref(&agent)).is_some());
+        let mut synthetic = participant;
+        synthetic.agent_session_id = format!("{}%1", crate::state::SYNTHETIC_SESSION_PREFIX);
+        agent.session_id = synthetic.agent_session_id.clone();
+        agent.pane = Some("%1".into());
+        agent.tmux_socket = Some("other-server".into());
+        assert!(exact_agent(&synthetic, &[agent]).is_none());
     }
 }

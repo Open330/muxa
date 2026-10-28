@@ -1374,6 +1374,8 @@ fn handle_key(
                             )
                         };
                         let request = NewRequest {
+                            task_contract: None,
+                            supersedes_request_id: None,
                             dispatch_id: None,
                             source_node_id: None,
                             delegation_parent: None,
@@ -2323,6 +2325,7 @@ fn spawn_collaboration_reply(
             .fleet_execute(
                 &host,
                 &FleetOperation::CollaborationReply {
+                    report: None,
                     pane,
                     request_id,
                     status: RequestStatus::Completed,
@@ -4864,6 +4867,8 @@ mod tests {
 
     fn broadcast_request() -> NewRequest {
         NewRequest {
+            task_contract: None,
+            supersedes_request_id: None,
             dispatch_id: None,
             source_node_id: None,
             delegation_parent: None,
