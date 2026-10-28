@@ -38,7 +38,7 @@ and saves the order (`[watch] board_sort`).
 | `c` | Copy the `▸` agent's last prompt |
 | `m` | Message the `▸` agent (exact agent session) |
 | `b` / `M` | That agent's mailbox; inside it `i` claims, `e` replies, `x` withdraws a queued sent request |
-| `/` or typing | Filter Works |
+| `/` then type | Filter Works (plain letters are actions) |
 | `?` | Help |
 
 ## Changes from the earlier dashboard

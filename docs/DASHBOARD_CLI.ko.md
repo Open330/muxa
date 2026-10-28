@@ -37,7 +37,7 @@ muxa dashboard --theme mono
 | `c` | `▸` agent의 마지막 프롬프트 복사 |
 | `m` | `▸` agent에게 메시지(정확한 agent session) |
 | `b` / `M` | 그 agent의 메일함. 안에서 `i` claim, `e` 답장, `x` 대기 중인 보낸 요청 철회 |
-| `/` 또는 타이핑 | Work 필터 |
+| `/` 후 입력 | Work 필터 (그냥 누르는 글자는 동작 키) |
 | `?` | 도움말 |
 
 ## 이전 dashboard와 달라진 점
