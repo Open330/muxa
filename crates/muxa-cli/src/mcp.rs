@@ -560,7 +560,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
          profile expands the local cx behavior to codex --yolo. Returns the exact new pane id. {}",
         launch_guide_summary(config)
     );
-    vec![
+    let mut tools = vec![
         json!({
             "name": "muxa_status",
             "description": "Focused observation of muxa agents. With no arguments, \
@@ -1074,7 +1074,9 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                 "additionalProperties": false
             },
         }),
-    ]
+    ];
+    tools.extend(crate::agent_records::definitions());
+    tools
 }
 
 /// Execute a `tools/call`. Returns `Err` only for protocol-level problems
@@ -1116,6 +1118,12 @@ async fn call_tool(
     };
 
     match name {
+        "muxa_agent_search" | "muxa_agent_read" => {
+            Ok(match crate::agent_records::call(name, args).await {
+                Ok(result) => json_result(&result),
+                Err(error) => error_result(&error.to_string()),
+            })
+        }
         "muxa_status" => {
             let pane = args.get("pane").and_then(Value::as_str);
             let full = args.get("full").and_then(Value::as_bool).unwrap_or(false);
@@ -6017,6 +6025,8 @@ mod tests {
                 "muxa_wait_reply",
                 "muxa_withdraw_reply_wake",
                 "muxa_cancel_message",
+                "muxa_agent_search",
+                "muxa_agent_read",
             ],
         );
         let start_agent = tools
@@ -7171,6 +7181,28 @@ mod tests {
             result["content"][0]["text"],
             r#"{"answer":[1,2],"ok":true}"#
         );
+    }
+
+    #[tokio::test]
+    async fn record_tools_validate_arguments_without_a_daemon() {
+        let client = Client::new(std::path::PathBuf::from("/missing/muxa-record-test.sock"));
+        for (name, args) in [
+            (
+                "muxa_agent_search",
+                json!({"providers":["unknown"],"query":"bucket"}),
+            ),
+            (
+                "muxa_agent_read",
+                json!({"event_id":"test","unexpected":true}),
+            ),
+        ] {
+            let reply=dispatch(&client,&json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":name,"arguments":args}})).await.unwrap();
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+            assert!(!reply["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("socket"));
+        }
     }
 
     #[tokio::test]

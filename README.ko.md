@@ -323,6 +323,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |
 | `muxa peek [--plain] [--expanded]` | 현재 tmux window의 pane별 오버레이. `--plain`은 텍스트로 출력. 오버레이는 tmux popup이므로 이를 그릴 수 없는 환경 — client를 붙이지 않는 프런트엔드(cmux), control mode 클라이언트(`tmux -CC` — amux, iTerm2) — 에서는 텍스트 리포트로 대체하고 이유를 stderr에 알림. |
 | `muxa recap [--pane %N]` | 보관된 disk history에서 최근 prompt 조회. |
+| `muxa agent search '질문'` / `muxa agent read EVENT_ID` | 한국어·영어 질문으로 Claude·Codex의 과거 대화와 명령을 검색하고 앞뒤 원문·도구 실행 결과를 조회. [사용법](docs/AGENT_RECORDS.md). |
 | `muxa peers` / `muxa identity` / `muxa msg` | 같은 tmux window의 agent를 찾고 이름/역할을 지정해 durable request/reply 메시지를 주고받음. |
 | `muxa skill add/list/show/remove` | watch/dashboard 메시지, watch ask, MCP peer call에서 사용할 `/` prompt 템플릿 관리. |
 | `muxa fleet host add/list/label/annotate/doctor` | physical SSH node와 Kubernetes-style label/annotation 관리. |

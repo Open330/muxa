@@ -3,6 +3,7 @@
 mod activity_query;
 mod agent_launch;
 mod agent_move;
+mod agent_records;
 mod ask_progress;
 mod attend;
 mod automation;
@@ -207,7 +208,7 @@ enum Cmd {
     Host(fleet_cli::HostArgs),
     /// Observe and control this node plus SSH-connected Muxa hosts.
     Fleet(fleet_cli::FleetArgs),
-    /// Deterministic tmux agent lifecycle operations.
+    /// Agent lifecycle and searchable conversation/command evidence.
     Agent {
         #[command(subcommand)]
         action: AgentCmd,
@@ -840,6 +841,10 @@ enum AskProviderCmd {
 
 #[derive(Debug, Subcommand)]
 enum AgentCmd {
+    /// Search historical Claude/Codex records with a natural-language question.
+    Search(agent_records::SearchArgs),
+    /// Read surrounding evidence and paired tool results from a search hit.
+    Read(agent_records::ReadArgs),
     /// Start an allowlisted agent in tmux or a muxa-owned PTY session.
     Start(agent_launch::StartArgs),
     /// Interrupt or terminate one muxa-managed tmux pane or native PTY session.
@@ -1090,6 +1095,8 @@ async fn run_agent_cmd(
     cfg: &Config,
 ) -> Result<()> {
     match action {
+        AgentCmd::Search(args) => agent_records::search(args),
+        AgentCmd::Read(args) => agent_records::read(args),
         AgentCmd::Start(args) => agent_launch::run(args, client, socket_path, cfg).await,
         AgentCmd::Control(args) => tmux_work::run_agent_control(args, client).await,
         AgentCmd::Move(args) => agent_move::run(args, Some(client.socket().to_path_buf())).await,

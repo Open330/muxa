@@ -25,3 +25,10 @@ keeps work open, and an answer is not automatic approval.
 Discover exact tool names; shared descriptions can match unrelated tools.
 Retain needed tool handles/schemas; do not rediscover a known tool until its
 version/capabilities change or an unknown-tool/argument error occurs. Check guide capabilities before using optional protocols.
+
+For requested historical agent-record investigations, use muxa_agent_search with
+the user's natural-language question, then muxa_agent_read on relevant event IDs.
+Inspect the interpreted terms/time range and coverage, follow command/result pairs,
+and broaden terms or the time/session scope before drawing conclusions. Exclude
+the investigating session when it repeats the evidence. A prose claim or quoted
+log is not proof of execution, and an incomplete search cannot prove absence.

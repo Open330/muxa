@@ -376,6 +376,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `muxa status-line [--pane %N]` | tmux status-line output. |
 | `muxa peek [--plain] [--expanded]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. The overlay is a tmux popup, so where nothing can draw one — a front-end that attaches no client (cmux), or a control-mode client (`tmux -CC` — amux, iTerm2) — peek prints the text report instead and says why on stderr. |
 | `muxa recap [--pane %N]` | Recent prompts from retained disk history. |
+| `muxa agent search 'question'` / `muxa agent read EVENT_ID` | Search historical Claude/Codex conversations and commands with a Korean/English question, then inspect surrounding evidence and paired tool results. [Guide](docs/AGENT_RECORDS.md). |
 | `muxa peers` / `muxa identity` / `muxa msg` | Discover and name same-window agents, then exchange durable request/reply messages. |
 | `muxa skill add/list/show/remove` | Manage reusable `/` prompt templates for watch/dashboard messages, watch ask, and MCP peer calls. |
 | `muxa fleet host add/list/label/annotate/doctor` | Manage physical SSH nodes and Kubernetes-style labels/annotations. |

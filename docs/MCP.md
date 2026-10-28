@@ -12,6 +12,13 @@ deterministic agent launcher invokes same-user tmux locally, using the same
 socket routing as the CLI. The MCP server adds no network listener: it can only
 do what a shell on the same machine could already do through `muxa` and tmux.
 
+`muxa_agent_search` searches historical Claude/Codex conversations and tool
+executions with a Korean/English natural-language query; `muxa_agent_read`
+expands a hit into surrounding events and paired command results. These tools
+read local provider files without the daemon and report search coverage. See
+[agent-record search](AGENT_RECORDS.md) for query interpretation, evidence
+handling, indexing limits and CLI equivalents.
+
 ## Wire it into Claude Code and Codex
 
 The recommended setup is `muxa init --preset standard`, which installs hooks,

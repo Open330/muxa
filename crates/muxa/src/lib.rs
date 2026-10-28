@@ -39,6 +39,7 @@ pub mod accounts;
 pub mod activity;
 pub mod adapters;
 pub mod agent_control;
+pub mod agent_records;
 pub mod ask;
 pub mod automation;
 pub mod automation_choice;

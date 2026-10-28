@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa agent search` / `read` and MCP `muxa_agent_search` / `muxa_agent_read`
+  find historical Claude/Codex conversation and command evidence using local
+  Korean/English query expansion, event-time filters, source-attributed context,
+  and paired tool results. A private resumable index reports partial coverage,
+  parse gaps and truncation; transcript files remain unchanged.
+
 - `muxa swap --host <alias>` swaps agents on a control-mode Fleet host
   through the work-command transport, and the `muxa_swap_account` MCP tool
   does the same for agents, here or on a host.
