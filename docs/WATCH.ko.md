@@ -250,7 +250,10 @@ board의 협업도 같은 agent 커서를 따릅니다. `m`은 그 agent에게 �
 누른 순간 pane과 agent 세션이 고정되고, 그사이 그 pane에서 다른 agent가 시작됐으면
 보내지 않습니다. window scope에서는 이 room에 있는 agent여야 하고, `[collaboration]
 scope = "host"`이면 어떤 pane이든 닿으며, 서버 사이에 겹치는 id는 추측하지 않고
-거부합니다. topology 표시(`Space`)는 여기 적용되지 않습니다. `b`(또는 `M`)는 그
+거부합니다. topology 표시(`Space`)는 여기 적용되지 않습니다. detail에는 Work의 열린 협업 —
+모든 Run의 agent에게 온, 또 그들이 보낸 미완료 요청을 요청마다 한 번씩 — 도
+표시되며, board가 떠 있는 동안 15초마다 기록 목록으로 갱신하고(claim하지 않음),
+목록을 읽지 못하면 0 대신 `unavailable`이라고 표시합니다. `b`(또는 `M`)는 그
 agent의 메일함을 행동하기 전까지 읽기 전용으로 열고, `i`는 대기 중인 요청을 claim,
 `e`는 답장하며 둘 다 console이 아니라 그 agent로서 동작합니다. 어느 메일함에서든
 Sent 탭의 `x`는 이 console이 보냈고 아직 대기 중인 요청을 확인 뒤 철회합니다.

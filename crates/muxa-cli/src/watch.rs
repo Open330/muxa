@@ -3321,6 +3321,7 @@ pub(crate) struct App {
     /// writing to: no other action may write to those panes meanwhile.
     pending_outcomes: Vec<(Vec<PaneKey>, tokio::sync::oneshot::Receiver<ActionOutcome>)>,
     board_stats: BoardStats,
+    board_collab: BoardCollab,
     /// The daemon resolves exact agent sessions (`session:` targets and
     /// exact-session origins). Board collaboration acts for one exact agent,
     /// so it is refused without this rather than risk a pane fallback.
@@ -3672,6 +3673,7 @@ impl App {
             board_refresher: BoardRefresher::default(),
             board_pending: None,
             board_stats: BoardStats::default(),
+            board_collab: BoardCollab::default(),
             exact_session_supported: false,
             pending_outcomes: Vec::new(),
             collaboration_composer: None,
@@ -8838,8 +8840,19 @@ pub async fn run(
             apply_outcome_to_app(&mut app, outcome);
             needs_render = true;
         }
-        if app.board_stats.poll() {
+        if app.board_stats.poll() | app.board_collab.poll() {
             needs_render = true;
+        }
+        if app.watch_cfg.screen == WatchScreen::Board && app.board_collab.due() {
+            if let Some(origin) = app.collaboration.origin.clone() {
+                let client = client.clone();
+                let origin = CollaborationOrigin {
+                    console: true,
+                    ..origin
+                };
+                app.board_collab
+                    .start(async move { read_watch_history(&client, &origin, false).await });
+            }
         }
         if app.watch_cfg.screen == WatchScreen::Board && app.board_stats.due() {
             let client = client.clone();
@@ -9370,6 +9383,77 @@ impl BoardStats {
             ),
         };
         format!("all sessions · {window} · {figures}")
+    }
+}
+
+/// Collaboration history behind the board's per-Work summary: one console
+/// listing (previews, never claims), fetched in the background at most every
+/// [`BOARD_COLLAB_INTERVAL`] while the board shows.
+#[derive(Debug, Default)]
+pub(crate) struct BoardCollab {
+    value: Option<std::result::Result<Vec<CollaborationRequest>, String>>,
+    in_flight: Option<
+        tokio::sync::oneshot::Receiver<std::result::Result<Vec<CollaborationRequest>, String>>,
+    >,
+    started: Option<std::time::Instant>,
+}
+
+const BOARD_COLLAB_INTERVAL: Duration = Duration::from_secs(15);
+
+impl BoardCollab {
+    fn due(&self) -> bool {
+        self.in_flight.is_none()
+            && self
+                .started
+                .is_none_or(|started| started.elapsed() >= BOARD_COLLAB_INTERVAL)
+    }
+
+    fn start(
+        &mut self,
+        fetch: impl std::future::Future<Output = std::result::Result<Vec<CollaborationRequest>, String>>
+            + Send
+            + 'static,
+    ) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(fetch.await);
+        });
+        self.in_flight = Some(rx);
+        self.started = Some(std::time::Instant::now());
+    }
+
+    fn poll(&mut self) -> bool {
+        let Some(rx) = self.in_flight.as_mut() else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(value) => {
+                self.value = Some(value);
+                self.in_flight = None;
+                true
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                self.value = Some(Err("history task failed".into()));
+                self.in_flight = None;
+                true
+            }
+        }
+    }
+
+    /// The detail line for one Work: counts, still loading, or why not.
+    fn line(&self, work: &muxa::work::WorkSnapshotItem) -> String {
+        match &self.value {
+            None => "collab  …".into(),
+            Some(Err(_)) => "collab  unavailable".into(),
+            Some(Ok(requests)) => {
+                let summary = board_screen::collab_summary(work, requests);
+                format!(
+                    "collab  {} open to its agents · {} open from them",
+                    summary.open_to, summary.open_from
+                )
+            }
+        }
     }
 }
 
@@ -16083,15 +16167,7 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
 
     let now = OffsetDateTime::now_utc();
     let selected = app.board.selected_index(&filter);
-    let detail = app
-        .board
-        .selected_work(&filter)
-        .map(|work| {
-            let agents = board_screen::live_agents(work);
-            let selected = agents.get(app.board.selected_agent_index(&filter)).copied();
-            board_screen::detail_lines(work, now, theme, selected)
-        })
-        .unwrap_or_default();
+    let detail = board_detail(app, &filter, now, theme);
     let notes = app.board.notes.clone();
     // The detail sits below the list on narrow terminals and beside it on
     // wide ones, sized to what it has to say.
@@ -16136,6 +16212,27 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
     if let Some(detail_area) = detail_area {
         render_board_detail(f, detail_area, detail, notes, theme);
     }
+}
+
+/// The selected Work's detail lines, with its collaboration count under
+/// the title.
+fn board_detail(
+    app: &App,
+    filter: &str,
+    now: OffsetDateTime,
+    theme: WatchThemeSpec,
+) -> Vec<Line<'static>> {
+    let Some(work) = app.board.selected_work(filter) else {
+        return Vec::new();
+    };
+    let agents = board_screen::live_agents(work);
+    let selected = agents.get(app.board.selected_agent_index(filter)).copied();
+    let mut lines = board_screen::detail_lines(work, now, theme, selected);
+    lines.insert(
+        1.min(lines.len()),
+        Line::from(Span::styled(app.board_collab.line(work), theme.dim_style())),
+    );
+    lines
 }
 
 fn render_board_detail(
@@ -30853,6 +30950,45 @@ sort = ["state"]
         assert!(
             anchor(None).matches(&predecessor),
             "unpinned anchors keep pane history"
+        );
+    }
+
+    #[test]
+    fn the_board_counts_each_works_open_collaboration_once_by_agent_session() {
+        let (app, _) = board_with_agents();
+        let work = app.board.selected_work("").unwrap().clone();
+        let request = |id: &str, from: &str, to: &str, status: RequestStatus| {
+            let mut request = collab_request("%1");
+            request.id = id.into();
+            request.from.agent_session_id = from.into();
+            request.to.agent_session_id = to.into();
+            request.status = status;
+            request
+        };
+        let requests = vec![
+            request("r1", "elsewhere", "%1", RequestStatus::Queued),
+            // Listed twice (a page boundary, say): still one request.
+            request("r1", "elsewhere", "%1", RequestStatus::Queued),
+            request("r2", "%2", "elsewhere", RequestStatus::Claimed),
+            // Between two of its own agents: owed and awaited.
+            request("r3", "%1", "%3", RequestStatus::Queued),
+            request("r4", "elsewhere", "%2", RequestStatus::Completed),
+            request("r5", "elsewhere", "other-work", RequestStatus::Queued),
+        ];
+        let summary = board_screen::collab_summary(&work, &requests);
+        assert_eq!(
+            (summary.open_to, summary.open_from),
+            (2, 2),
+            "r1 + r3 to it; r2 + r3 from it; r4 is done; r5 is not its"
+        );
+        let mut collab = BoardCollab::default();
+        assert_eq!(collab.line(&work), "collab  …");
+        collab.value = Some(Err("refused".into()));
+        assert_eq!(collab.line(&work), "collab  unavailable");
+        collab.value = Some(Ok(requests));
+        assert_eq!(
+            collab.line(&work),
+            "collab  2 open to its agents · 2 open from them"
         );
     }
 
