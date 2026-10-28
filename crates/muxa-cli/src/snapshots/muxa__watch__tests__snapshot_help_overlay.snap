@@ -27,7 +27,7 @@ j/k move  ·  / filter  ·  : commands  ·  ? help
 │                           │  [/] · f/c      (in preview) agent / geometry / content                          │                           │
 │                           │  Enter          (in preview) jump to pinned pane                                 │                           │
 │                           │  m / M / Alt-M  message / mailbox / move pane or window; Space marks             │                           │
-│                           │  Alt-1/2 · W    screen topology / collab · W is the work table                   │                           │
+│                           │  Alt-1/2/3 · W  screen topology / collab / board · W is the work table           │                           │
 │                           │  v              (in collab) toggle table / sequence history                      │                           │
 │                           │  i / e          (in mailbox) claim inbox / reply                                 │                           │
 │                           │Sorting                                                                           │                           │

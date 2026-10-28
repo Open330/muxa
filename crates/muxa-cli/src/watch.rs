@@ -74,6 +74,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
+use crate::board_screen::{self, BoardScreen};
 pub use crate::collab_screen::CollabLayout;
 use crate::collab_screen::{self, CollabRow, CollabScreen, SequenceRow};
 use crate::message_skill::{
@@ -1927,7 +1928,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M / Alt-M  message / mailbox / move pane or window; Space marks",
-        "  Alt-1/2 · W    screen topology / collab · W is the work table",
+        "  Alt-1/2/3 · W  screen topology / collab / board · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
         "Sorting",
@@ -3210,6 +3211,10 @@ pub(crate) struct App {
     /// the one on show — an operator surface has no business polling every
     /// room in the daemon to render a topology tree.
     pub(crate) collab: CollabScreen,
+    /// The Work board, populated only while its screen is on show: building
+    /// it scans every multiplexer and reads the Work records.
+    pub(crate) board: BoardScreen,
+    board_refresher: BoardRefresher,
     collaboration_composer: Option<CollaborationComposer>,
     /// Agents the operator marked with `Space`, to be addressed together.
     ///
@@ -3551,6 +3556,8 @@ impl App {
             collaboration_mailbox: CollaborationMailboxState::default(),
             previous_layout: WatchLayout::Tree,
             collab,
+            board: BoardScreen::default(),
+            board_refresher: BoardRefresher::default(),
             collaboration_composer: None,
             collaboration_marks: std::collections::HashSet::new(),
             broadcast_report: None,
@@ -3895,6 +3902,38 @@ impl App {
                     })
             })
             .map(|pane| pane.key.clone())
+    }
+
+    /// The topology key for a pane of a Work's Run, when it is on screen.
+    ///
+    /// Host, session, window and pane must agree, and the server through
+    /// [`muxa::backend::pane_endpoints_match`]: a tmux socket's path and its
+    /// short name are the same server, while rmux and cmux endpoints are
+    /// compared whole, since two servers can share a file name.
+    pub(crate) fn board_pane_key(
+        &self,
+        run: &muxa::work::RunSnapshot,
+        pane_id: &str,
+    ) -> Option<PaneKey> {
+        let wanted = &run.execution;
+        self.topology
+            .sessions
+            .iter()
+            .flat_map(|session| session.windows.iter())
+            .flat_map(|window| window.panes.iter())
+            .map(|pane| &pane.key)
+            .find(|key| {
+                key.pane_id == pane_id
+                    && key.window.session.endpoint.host == wanted.host
+                    && key.window.window_id == wanted.window_id
+                    && key.window.session.session_id == wanted.session_id
+                    && muxa::backend::pane_endpoints_match(
+                        Some(pane_id),
+                        &key.window.session.endpoint.socket,
+                        &wanted.socket,
+                    )
+            })
+            .cloned()
     }
 
     /// What `W` would switch to from here, without switching.
@@ -7790,6 +7829,7 @@ pub async fn run(
     let mut needs_render = true;
     let mut last_render = std::time::Instant::now();
     let mut last_mailbox_refresh = std::time::Instant::now();
+    let mut last_board_refresh = std::time::Instant::now();
 
     loop {
         // Animate on a fast cadence only while there's something to move:
@@ -7935,6 +7975,7 @@ pub async fn run(
                     }
                     request_refresh(&mut app, &wake_tx);
                 }
+                Action::OpenPreviewFor(key) => open_preview_for(&mut app, key),
                 Action::OpenPreview => {
                     let pane_key = if app.uses_tree() {
                         app.selected_action_pane().map(|pane| pane.key.clone())
@@ -8049,8 +8090,14 @@ pub async fn run(
                     let label = match screen {
                         WatchScreen::Topology => "topology",
                         WatchScreen::Collab => "collab",
+                        WatchScreen::Board => "board",
                     };
                     app.set_hint(format!("screen: {label}"), HintLevel::Ok);
+                    if screen == WatchScreen::Board
+                        && app.board_refresher.start_scan(app.current_agents())
+                    {
+                        last_board_refresh = std::time::Instant::now();
+                    }
                     // Arriving at an empty list and waiting out a poll tick
                     // would read as "nothing is happening" on a busy fleet.
                     refresh_fleet_collaboration(client, &mut app).await;
@@ -8604,6 +8651,18 @@ pub async fn run(
             .as_ref()
             .is_some_and(|changes| changes.has_changed().unwrap_or(false))
             && app.collaboration.unavailable.is_none();
+        // The scan runs off this loop: a slow backend must not freeze input.
+        if let Some((snapshot, notes)) = app.board_refresher.take_finished() {
+            app.board.set_snapshot(snapshot, notes);
+            needs_render = true;
+        }
+        if app.watch_cfg.screen == WatchScreen::Board
+            && (last_board_refresh.elapsed() >= BOARD_REFRESH_INTERVAL || !app.board.loaded)
+            && !app.board_refresher.busy()
+            && app.board_refresher.start_scan(app.current_agents())
+        {
+            last_board_refresh = std::time::Instant::now();
+        }
         if (app.collaboration_mailbox.open || matches!(app.watch_cfg.screen, WatchScreen::Collab))
             && (last_mailbox_refresh.elapsed() >= Duration::from_secs(2)
                 || (mailbox_changed
@@ -8956,6 +9015,80 @@ async fn refresh_selected_collaboration_detail(client: &Client, app: &mut App) {
             );
         }
     }
+}
+
+/// How often an open Work board rescans; Works change on human timescales.
+const BOARD_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// One Work-board scan as it arrives: the projection and any scan problems.
+type BoardScan = (muxa::work::WorkSnapshot, Vec<String>);
+
+/// At most one Work-board scan in flight, polled without blocking.
+#[derive(Debug, Default)]
+pub(crate) struct BoardRefresher {
+    in_flight: Option<tokio::sync::oneshot::Receiver<BoardScan>>,
+}
+
+impl BoardRefresher {
+    /// Start a scan with the agents watch already holds, unless one is
+    /// running. Returns whether a scan was started.
+    fn start_scan(&mut self, agents: Vec<Agent>) -> bool {
+        self.start(scan_board(agents))
+    }
+
+    fn busy(&self) -> bool {
+        self.in_flight.is_some()
+    }
+
+    fn start(
+        &mut self,
+        scan: impl std::future::Future<Output = BoardScan> + Send + 'static,
+    ) -> bool {
+        if self.in_flight.is_some() {
+            return false;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _ = tx.send(scan.await);
+        });
+        self.in_flight = Some(rx);
+        true
+    }
+
+    /// The finished scan, if there is one; never waits.
+    fn take_finished(&mut self) -> Option<BoardScan> {
+        let rx = self.in_flight.as_mut()?;
+        match rx.try_recv() {
+            Ok(scan) => {
+                self.in_flight = None;
+                Some(scan)
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                // The task died; let the next tick start another.
+                self.in_flight = None;
+                None
+            }
+        }
+    }
+}
+
+/// Build the Work board from the same projection `muxa dashboard` and the
+/// web dashboard use: Work records joined with every backend's windows. Issue
+/// marks found on panes are attached for display (the daemon persists them).
+async fn scan_board(agents: Vec<Agent>) -> BoardScan {
+    let now = OffsetDateTime::now_utc();
+    let backends = std::sync::Arc::new(muxa::active_backends());
+    let scan = muxa::dashboard::multi_host_pane_scan(backends).await;
+    let notes = scan
+        .errors
+        .iter()
+        .map(|error| format!("scan {}: {}", error.socket.display(), error.message))
+        .collect();
+    let records = muxa::dashboard::load_work_records(muxa::paths::default_dashboard_work_file());
+    let mut snapshot = muxa::work::build_snapshot(&scan.panes, &agents, &records, now);
+    board_screen::attach_pane_issues(&mut snapshot, &scan.panes, scan.fetched_at);
+    (snapshot, notes)
 }
 
 fn sync_collab_screen_from_cache(app: &mut App) {
@@ -10190,6 +10323,9 @@ pub(crate) enum Action {
     },
     /// Pop open the preview overlay for the selected row.
     OpenPreview,
+    /// Preview an exact pane chosen by a screen whose cursor is not on the
+    /// topology (the Work board's selected Run).
+    OpenPreviewFor(PaneKey),
     /// Close the preview overlay and return to the table.
     ClosePreview,
     /// Swap the preview between popup and full-screen modes.
@@ -10370,6 +10506,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "show collaboration across every room",
     },
     CommandSpec {
+        command: "screen board",
+        description: "show Works and their Runs",
+    },
+    CommandSpec {
         command: "kill",
         description: "close selected session/window/pane (confirm)",
     },
@@ -10404,6 +10544,11 @@ fn command_suggestions(input: &str) -> Vec<CommandSpec> {
 fn execute_palette_command(app: &mut App, input: &str) -> Action {
     let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let command = normalized.to_lowercase();
+    // Refused before any command opens a form for the hidden topology node.
+    if app.watch_cfg.screen == WatchScreen::Board && !board_palette_allows(&command) {
+        app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
+        return Action::None;
+    }
     match command.as_str() {
         "q" | "quit" => Action::Quit,
         "r" | "refresh" => Action::Refresh,
@@ -10453,6 +10598,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "view pane" | "view panes" => Action::SetView(WatchView::Pane),
         "screen topology" | "topology" => Action::SetScreen(WatchScreen::Topology),
         "screen collab" | "collab" => Action::SetScreen(WatchScreen::Collab),
+        "screen board" | "board" => Action::SetScreen(WatchScreen::Board),
         "layout work" | "work" => Action::SetLayout(WatchLayout::Work),
         "layout tree" => Action::SetLayout(WatchLayout::Tree),
         "layout swarm" => Action::SetLayout(WatchLayout::Swarm),
@@ -10469,8 +10615,109 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
     }
 }
 
-#[allow(clippy::too_many_lines)] // one ordered input-mode dispatcher keeps modal precedence explicit
 fn handle_event(ev: Event, app: &mut App) -> Action {
+    let action = handle_event_on_any_screen(ev, app);
+    if app.watch_cfg.screen == WatchScreen::Board {
+        return gate_board_action(app, action);
+    }
+    action
+}
+
+/// The Work board's cursor is on a Work, not on the topology. Every action
+/// that targets "the selected node" would act on whatever the hidden
+/// topology cursor last pointed at, so on the board those are refused until
+/// they have a Work-aware target. Preview is redirected to the selected
+/// Work's Run.
+fn gate_board_action(app: &mut App, action: Action) -> Action {
+    match action {
+        Action::None
+        | Action::Quit
+        | Action::Refresh
+        | Action::RestartDaemon
+        | Action::AttachTopologyPane(_)
+        | Action::OpenPreviewFor(_)
+        | Action::ClosePreview
+        | Action::TogglePreviewMode
+        | Action::TogglePreviewContent
+        | Action::SetView(_)
+        | Action::SetLayout(_)
+        | Action::SetCollabLayout(_)
+        | Action::SetScreen(_)
+        | Action::InspectorSplitChanged
+        | Action::DismissBroadcastReport
+        | Action::ConfirmCancel
+        | Action::CancelCollaborationComposer
+        | Action::Quick(QuickAction::ShowHelp) => action,
+        Action::OpenPreview => match board_selected_pane(app) {
+            Ok(key) => Action::OpenPreviewFor(key),
+            Err(hint) => {
+                app.set_hint(hint, HintLevel::Warn);
+                Action::None
+            }
+        },
+        _ => {
+            app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
+            Action::None
+        }
+    }
+}
+
+const BOARD_REFUSAL: &str = "not on the Work board yet — Alt-1 to act on the topology";
+
+/// Browsing keys whose handlers act on the topology cursor directly — open a
+/// form for it, or move it — before any `Action` exists for the outer gate to
+/// refuse. Typing into a filter is unaffected: these only apply while browsing.
+/// Modifiers do not matter: the shared branches match the bare key, so Ctrl-N
+/// would open the same form. Alt never gets here, and the board's own Ctrl
+/// bindings were consumed before this runs.
+fn board_refuses_key(code: KeyCode, app: &mut App) -> bool {
+    let refused = match code {
+        // Expand and collapse the hidden tree.
+        KeyCode::Left | KeyCode::Right => return true,
+        KeyCode::Char(c) => {
+            app.browse_keys_active()
+                && matches!(
+                    c,
+                    'm' | ' ' | 'n' | 'C' | '|' | 'a' | 'A' | 'w' | 'R' | 'h' | 'l' | 'd'
+                )
+        }
+        _ => false,
+    };
+    if refused {
+        app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
+    }
+    refused
+}
+
+/// Palette commands that mean the same on the board: navigation between
+/// screens and presentations, global panels, and leaving.
+fn board_palette_allows(command: &str) -> bool {
+    matches!(
+        command,
+        "" | "q"
+            | "quit"
+            | "r"
+            | "refresh"
+            | "o"
+            | "open"
+            | "preview"
+            | "help"
+            | "?"
+            | "topology"
+            | "collab"
+            | "board"
+            | "attention"
+            | "events"
+            | "inspector"
+            | "split"
+            | "daemon restart"
+    ) || ["screen ", "view ", "layout ", "sort "]
+        .iter()
+        .any(|prefix| command.starts_with(prefix))
+}
+
+#[allow(clippy::too_many_lines)] // one ordered input-mode dispatcher keeps modal precedence explicit
+fn handle_event_on_any_screen(ev: Event, app: &mut App) -> Action {
     // Bracketed paste arrives as one event carrying the whole payload.
     // Prompt/command modes keep it literal; table mode treats it as a search
     // query, matching ordinary direct typing.
@@ -10678,6 +10925,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             // having is already spoken for.
             KeyCode::Char('1') => Action::SetScreen(WatchScreen::Topology),
             KeyCode::Char('2') => Action::SetScreen(WatchScreen::Collab),
+            KeyCode::Char('3') => Action::SetScreen(WatchScreen::Board),
             KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
             _ => Action::None,
         };
@@ -10689,6 +10937,14 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
         if let Some(action) = handle_collab_screen_key(code, modifiers, app) {
             return action;
+        }
+    }
+    if app.watch_cfg.screen == WatchScreen::Board {
+        if let Some(action) = handle_board_screen_key(code, modifiers, app) {
+            return action;
+        }
+        if board_refuses_key(code, app) {
+            return Action::None;
         }
     }
 
@@ -11250,6 +11506,84 @@ fn handle_collab_screen_key(
         _ => return None,
     }
     Some(Action::None)
+}
+
+/// Keys the Work board claims. Like the collab screen, everything else —
+/// filter typing, `:`, `/`, `?`, `q` — falls through to watch.
+fn handle_board_screen_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    app: &mut App,
+) -> Option<Action> {
+    let filter = app.search_query.clone();
+    let page = isize::try_from(app.table_page_rows.max(1)).unwrap_or(isize::MAX);
+    let browsing = app.browse_keys_active();
+    match code {
+        KeyCode::Down => app.board.move_selection(1, &filter),
+        KeyCode::Up => app.board.move_selection(-1, &filter),
+        KeyCode::Char('j') if browsing => app.board.move_selection(1, &filter),
+        KeyCode::Char('k') if browsing => app.board.move_selection(-1, &filter),
+        KeyCode::PageDown => app.board.move_selection(page, &filter),
+        KeyCode::PageUp => app.board.move_selection(-page, &filter),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.board.move_selection(page / 2, &filter);
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.board.move_selection(-(page / 2), &filter);
+        }
+        KeyCode::Home => app.board.select_first(&filter),
+        KeyCode::End => app.board.select_last(&filter),
+        KeyCode::Char('G') if browsing => app.board.select_last(&filter),
+        KeyCode::Char('g') if browsing => {
+            if app.pending_g {
+                app.pending_g = false;
+                app.board.select_first(&filter);
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Enter => return Some(board_attach_action(app)),
+        _ => return None,
+    }
+    Some(Action::None)
+}
+
+fn open_preview_for(app: &mut App, key: PaneKey) {
+    app.preview = Some(PreviewState {
+        pane_id: key.pane_id.clone(),
+        pane_key: Some(key),
+        scroll: 0,
+        mode: PreviewMode::Popup,
+        content: app.watch_cfg.preview.default_content,
+    });
+}
+
+/// Resolve `Enter` on the Work board to the exact pane of one of its Runs.
+fn board_attach_action(app: &mut App) -> Action {
+    match board_selected_pane(app) {
+        Ok(key) => Action::AttachTopologyPane(key),
+        Err(hint) => {
+            app.set_hint(hint, HintLevel::Warn);
+            Action::None
+        }
+    }
+}
+
+/// The topology pane the selected Work leads to, or why there is none. The
+/// key comes from the topology, so the same pane id on another server is
+/// never the one returned.
+fn board_selected_pane(app: &App) -> Result<PaneKey, String> {
+    let filter = &app.search_query;
+    let Some(work) = app.board.selected_work(filter) else {
+        return Err("no Work selected".into());
+    };
+    let label = format!("{}/{}", work.identity.workspace_id, work.identity.work_id);
+    let Some((run, pane_id)) = board_screen::jump_target(work) else {
+        return Err(format!("{label} has no live Run"));
+    };
+    // The board refreshes on its own clock; the window may have closed since.
+    app.board_pane_key(run, pane_id)
+        .ok_or_else(|| format!("{label}'s Run is no longer open"))
 }
 
 /// Resolve `Enter` on the collaboration screen to a pane to attach to.
@@ -14763,6 +15097,132 @@ const COLLAB_DETAIL_HEIGHT: u16 = 9;
 /// one `M` away instead of leaving three rows of listing.
 const COLLAB_DETAIL_MIN_HEIGHT: u16 = 16;
 
+fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
+    use std::fmt::Write as _;
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let filter = app.search_query.clone();
+    let visible = app.board.visible(&filter);
+    let waiting = visible
+        .iter()
+        .filter(|work| board_screen::needs_operator(work))
+        .count();
+    let mut title = format!(" Board · {} Works · {waiting} need you ", visible.len());
+    // Totals describe the rows on screen; executions no Work claims are said
+    // apart so the board never reads as everything that is running.
+    if app.board.unlinked() > 0 {
+        let _ = write!(
+            title,
+            "· {} unlinked Run(s) in topology ",
+            app.board.unlinked()
+        );
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(title);
+
+    if visible.is_empty() {
+        let hint = if !app.board.loaded {
+            "loading Works…"
+        } else if app.board.is_empty() {
+            "no Work yet — `muxa work start` or `muxa work up` creates one"
+        } else {
+            "no Work matches this filter"
+        };
+        // A scan that failed must not read as an empty board.
+        let mut lines = vec![Line::from(hint)];
+        lines.extend(app.board.notes.iter().map(|note| Line::from(note.clone())));
+        f.render_widget(
+            Paragraph::new(lines)
+                .style(theme.dim_style())
+                .block(block)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let selected = app.board.selected_index(&filter);
+    let detail = app
+        .board
+        .selected_work(&filter)
+        .map(|work| board_screen::detail_lines(work, now, theme))
+        .unwrap_or_default();
+    let notes = app.board.notes.clone();
+    // The detail sits below the list on narrow terminals and beside it on
+    // wide ones, sized to what it has to say.
+    let detail_height = u16::try_from(detail.len() + notes.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height / 2);
+    let (list_area, detail_area) = if area.width >= 140 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+        (columns[0], Some(columns[1]))
+    } else if area.height >= 14 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(detail_height.max(4))])
+            .split(area);
+        (rows[0], Some(rows[1]))
+    } else {
+        (area, None)
+    };
+    let rows: Vec<Row> = visible
+        .iter()
+        .enumerate()
+        .map(|(index, work)| board_screen::row(work, now, theme, index == selected))
+        .collect();
+    let header = Row::new(
+        board_screen::HEADERS
+            .iter()
+            .map(|header| Cell::from(*header).style(theme.table_header_style())),
+    )
+    .height(1);
+    let table = Table::new(rows, board_screen::COLUMNS)
+        .header(header)
+        .block(block)
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always);
+    let mut state = TableState::default();
+    state.select(Some(selected));
+    f.render_stateful_widget(table, list_area, &mut state);
+
+    if let Some(detail_area) = detail_area {
+        render_board_detail(f, detail_area, detail, notes, theme);
+    }
+}
+
+fn render_board_detail(
+    f: &mut Frame,
+    area: Rect,
+    mut lines: Vec<Line<'static>>,
+    notes: Vec<String>,
+    theme: WatchThemeSpec,
+) {
+    lines.extend(
+        notes
+            .into_iter()
+            .map(|note| Line::from(Span::styled(note, theme.dim_style()))),
+    );
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border_style())
+                    .border_type(theme.border_type)
+                    .title(" Work "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 #[allow(clippy::too_many_lines)] // table and sequence share selection and detail-pane state
 fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
@@ -15443,7 +15903,7 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App, tree_targets: Option<&[
         // The inspector describes the selected *pane*, and the collab screen's
         // cursor is on a request. Halving the table to show an unrelated pane
         // costs the two columns that identify both ends of a message.
-        && !matches!(app.watch_cfg.screen, WatchScreen::Collab)
+        && !matches!(app.watch_cfg.screen, WatchScreen::Collab | WatchScreen::Board)
         && area.width >= 120
         && if app.uses_tree() {
             selected_tree_target_from(app, tree_targets.unwrap_or_default()).is_some()
@@ -15503,6 +15963,10 @@ fn render_primary_body(
     app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
     if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
         render_collab_screen(f, area, app);
+        return;
+    }
+    if app.watch_cfg.screen == WatchScreen::Board {
+        render_board_screen(f, area, app);
         return;
     }
     if app.legacy_flat_table {
@@ -18702,6 +19166,26 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
                 Span::raw(" topology  "),
                 Span::styled(" m ", theme.action_badge()),
                 Span::raw(" message  "),
+                Span::styled(" ? ", theme.key_badge()),
+                Span::raw(" help"),
+            ])),
+            area,
+        );
+        return true;
+    }
+    if app.watch_cfg.screen == WatchScreen::Board {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" j/k ", theme.key_badge()),
+                Span::raw(" move  "),
+                Span::styled(" / ", theme.action_badge()),
+                Span::raw(" filter  "),
+                Span::styled(" : ", theme.action_badge()),
+                Span::raw(" commands  "),
+                Span::styled(" ⏎ ", theme.action_badge()),
+                Span::raw(" go to Run  "),
+                Span::styled(" Alt-1 ", theme.key_badge()),
+                Span::raw(" topology  "),
                 Span::styled(" ? ", theme.key_badge()),
                 Span::raw(" help"),
             ])),
@@ -27607,6 +28091,7 @@ sort = ["state"]
                 app.preview = None;
                 app.pane_capture = None;
             }
+            Action::OpenPreviewFor(key) => open_preview_for(app, key),
             Action::OpenWorkUp => app.work_composer = Some(WorkComposer::default()),
             // The real handler shells out to tmux; the test harness stops at
             // the state change so nothing spawns a window.
@@ -28865,6 +29350,426 @@ sort = ["state"]
             alt_key_action(&mut app, '1'),
             Action::SetScreen(WatchScreen::Topology)
         ));
+    }
+
+    fn board_work(id: &str, key: Option<&PaneKey>) -> muxa::work::WorkSnapshotItem {
+        let at = OffsetDateTime::now_utc();
+        muxa::work::WorkSnapshotItem {
+            identity: muxa::work::WorkIdentity {
+                workspace_id: "callabo".into(),
+                work_id: id.into(),
+            },
+            title: format!("work {id}"),
+            goal: Some("ship it".into()),
+            next_action: None,
+            stage: muxa::work::BoardStage::InProgress,
+            signals: Vec::new(),
+            external_items: Vec::new(),
+            runs: key
+                .map(|key| muxa::work::RunSnapshot {
+                    id: "run".into(),
+                    state: muxa::work::RunState::Running,
+                    linked: true,
+                    work: None,
+                    execution: muxa::work::ExecutionIdentity {
+                        host: key.window.session.endpoint.host,
+                        socket: key.window.session.endpoint.socket.clone(),
+                        session_id: key.window.session.session_id.clone(),
+                        window_id: key.window.window_id.clone(),
+                    },
+                    session_name: "callabo".into(),
+                    window_name: id.into(),
+                    window_index: "1".into(),
+                    cwd: None,
+                    panes: vec![muxa::work::RunPaneSnapshot {
+                        pane_id: key.pane_id.clone(),
+                        pane_index: "0".into(),
+                        current_command: "codex".into(),
+                        title: String::new(),
+                        current_path: String::new(),
+                        attach_command: String::new(),
+                        role: None,
+                        task: None,
+                        agent: None,
+                    }],
+                    latest_at: None,
+                })
+                .into_iter()
+                .collect(),
+            participants: 0,
+            latest_at: Some(at),
+            source: muxa::work::WorkSource::Persisted,
+            metadata: muxa::work::WorkMetadata {
+                title: None,
+                goal: None,
+                next_action: None,
+                stage: muxa::work::WorkStage::default(),
+                updated_at: at,
+            },
+        }
+    }
+
+    fn board_snapshot(works: Vec<muxa::work::WorkSnapshotItem>) -> muxa::work::WorkSnapshot {
+        muxa::work::WorkSnapshot {
+            schema_version: 1,
+            generated_at: OffsetDateTime::now_utc(),
+            workspaces: Vec::new(),
+            works,
+            unlinked_executions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn alt_3_and_the_palette_reach_the_board() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        assert!(matches!(
+            alt_key_action(&mut app, '3'),
+            Action::SetScreen(WatchScreen::Board)
+        ));
+        assert!(matches!(
+            execute_palette_command(&mut app, "screen board"),
+            Action::SetScreen(WatchScreen::Board)
+        ));
+        assert!(matches!(
+            execute_palette_command(&mut app, "board"),
+            Action::SetScreen(WatchScreen::Board)
+        ));
+    }
+
+    #[test]
+    fn board_enter_attaches_the_runs_exact_pane_not_a_same_id_pane_elsewhere() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.set_data(
+            Vec::new(),
+            vec![
+                fake_topology_pane("/tmp/a", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0),
+                fake_topology_pane("/tmp/b", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0),
+            ],
+        );
+        let on_b = app.pane_key_for("%2", Some("b")).expect("pane on b");
+        // The Work projection may name the server by its path where the
+        // topology uses its short name. Either way it must resolve to b.
+        let mut spelled_as_path = on_b.clone();
+        spelled_as_path.window.session.endpoint.socket = "/tmp/b".into();
+        app.board.set_snapshot(
+            board_snapshot(vec![board_work("CAL-1", Some(&spelled_as_path))]),
+            Vec::new(),
+        );
+        app.apply_screen(WatchScreen::Board);
+        match handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        ) {
+            Action::AttachTopologyPane(key) => assert_eq!(key, on_b),
+            _ => panic!("Enter should attach the Run's pane"),
+        }
+    }
+
+    #[test]
+    fn board_enter_never_substitutes_the_same_pane_id_on_another_server() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.set_data(
+            Vec::new(),
+            vec![fake_topology_pane(
+                "/tmp/a", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0,
+            )],
+        );
+        let mut elsewhere = app.pane_key_for("%2", Some("a")).expect("pane on a");
+        elsewhere.window.session.endpoint.socket = "/tmp/c".into();
+        app.board.set_snapshot(
+            board_snapshot(vec![board_work("CAL-1", Some(&elsewhere))]),
+            Vec::new(),
+        );
+        app.apply_screen(WatchScreen::Board);
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::None
+        ));
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("no longer open")));
+    }
+
+    /// Topology cursor on pane A (%1); the board on Work B, whose Run is %2.
+    fn board_on_b_topology_on_a() -> (App, PaneKey) {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.set_data(
+            Vec::new(),
+            vec![
+                fake_topology_pane("/tmp/a", "$1", "callabo", "@4", "CAL-A", 1, "%1", 0),
+                fake_topology_pane("/tmp/a", "$1", "callabo", "@5", "CAL-B", 2, "%2", 0),
+            ],
+        );
+        let b = app.pane_key_for("%2", Some("a")).expect("pane B");
+        app.board.set_snapshot(
+            board_snapshot(vec![board_work("CAL-B", Some(&b))]),
+            Vec::new(),
+        );
+        app.apply_screen(WatchScreen::Board);
+        (app, b)
+    }
+
+    #[test]
+    fn board_preview_opens_the_selected_works_run_not_the_topology_cursor() {
+        let (mut app, b) = board_on_b_topology_on_a();
+        for preview in [
+            Event::Key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            Event::Key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::ALT)),
+        ] {
+            match handle_event(preview, &mut app) {
+                Action::OpenPreviewFor(key) => assert_eq!(key, b),
+                _ => panic!("preview should target the Work's Run"),
+            }
+        }
+    }
+
+    #[test]
+    fn board_refuses_topology_actions_aimed_at_the_hidden_cursor() {
+        let (mut app, _) = board_on_b_topology_on_a();
+        for c in ['k', 'x', 'm'] {
+            let action = handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)),
+                &mut app,
+            );
+            assert!(
+                matches!(action, Action::None),
+                "Alt-{c} must not act on pane A"
+            );
+        }
+        let kill = quick_kill_action(&app);
+        assert!(
+            !matches!(kill, Action::None),
+            "the topology would offer a kill"
+        );
+        assert!(matches!(gate_board_action(&mut app, kill), Action::None));
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("not on the Work board")));
+        // Screen switching still works.
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::ALT)),
+                &mut app
+            ),
+            Action::SetScreen(WatchScreen::Topology)
+        ));
+    }
+
+    #[test]
+    fn board_never_opens_a_form_for_the_hidden_topology_node() {
+        let key = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let (mut app, _) = board_on_b_topology_on_a();
+        let selected = app.selected_node_key();
+        for c in ['R', 'n', 'm', 'w', 'C', 'h', 'l'] {
+            let _ = handle_event(key(c), &mut app);
+            assert!(
+                app.rename.is_none(),
+                "{c} opened rename for the hidden node"
+            );
+            assert!(app.spawn.is_none(), "{c} opened spawn for the hidden node");
+            assert!(
+                app.collaboration_composer.is_none(),
+                "{c} opened a composer"
+            );
+            assert!(app.work_composer.is_none(), "{c} opened the work composer");
+        }
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            for arrow in [KeyCode::Left, KeyCode::Right] {
+                let _ = handle_event(Event::Key(KeyEvent::new(arrow, modifiers)), &mut app);
+            }
+            for c in ['n', 'h', 'l', 'R'] {
+                let _ = handle_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(c), modifiers)),
+                    &mut app,
+                );
+                assert!(app.spawn.is_none(), "{modifiers:?}-{c} opened spawn");
+                assert!(app.rename.is_none(), "{modifiers:?}-{c} opened rename");
+            }
+        }
+        // The board's own Ctrl bindings are consumed before the refusal.
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+                &mut app
+            ),
+            Action::Refresh
+        ));
+        assert_eq!(
+            app.selected_node_key(),
+            selected,
+            "the hidden cursor never moved"
+        );
+        // The real palette route: `:` then typing, then Enter.
+        for command in ["rename", "kill", "message", "move"] {
+            let _ = handle_event(key(':'), &mut app);
+            for c in command.chars() {
+                let _ = handle_event(key(c), &mut app);
+            }
+            let action = handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app,
+            );
+            assert!(
+                matches!(action, Action::None),
+                ":{command} returned an action"
+            );
+            assert!(app.rename.is_none(), ":{command} opened rename");
+        }
+        // Typing a filter still works on the board.
+        app.arm_explicit_search();
+        let _ = handle_event(key('R'), &mut app);
+        assert_eq!(app.search_query, "R");
+    }
+
+    #[test]
+    fn board_enter_refuses_an_rmux_server_that_only_shares_a_file_name() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        let mut pane = fake_topology_pane(
+            "/tmp/rmux-new/default",
+            "$1",
+            "callabo",
+            "@4",
+            "CAL-1",
+            1,
+            "rmux:%2",
+            0,
+        );
+        pane.pane_id = "rmux:%2".into();
+        app.set_data(Vec::new(), vec![pane]);
+        let mut old = app
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|s| s.windows.iter())
+            .flat_map(|w| w.panes.iter())
+            .map(|p| p.key.clone())
+            .next()
+            .expect("rmux pane");
+        old.window.session.endpoint.socket = "/tmp/rmux-old/default".into();
+        app.board.set_snapshot(
+            board_snapshot(vec![board_work("CAL-1", Some(&old))]),
+            Vec::new(),
+        );
+        app.apply_screen(WatchScreen::Board);
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::None
+        ));
+    }
+
+    #[tokio::test]
+    async fn board_scans_never_block_and_only_one_runs_at_a_time() {
+        let mut refresher = BoardRefresher::default();
+        let (release, gate) = tokio::sync::oneshot::channel::<()>();
+        assert!(refresher.start(async move {
+            let _ = gate.await;
+            (board_snapshot(vec![board_work("CAL-1", None)]), Vec::new())
+        }));
+        assert!(!refresher.start(async { (board_snapshot(Vec::new()), Vec::new()) }));
+        assert!(
+            refresher.take_finished().is_none(),
+            "a pending scan is not waited on"
+        );
+        release.send(()).unwrap();
+        let mut result = None;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+            if let Some(scan) = refresher.take_finished() {
+                result = Some(scan);
+                break;
+            }
+        }
+        let (snapshot, _) = result.expect("scan arrives");
+        assert_eq!(snapshot.works.len(), 1);
+        assert!(refresher.start(async { (board_snapshot(Vec::new()), Vec::new()) }));
+    }
+
+    #[test]
+    fn an_empty_board_still_shows_why_the_scan_failed() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.board.set_snapshot(
+            board_snapshot(Vec::new()),
+            vec!["scan /tmp/x: refused".into()],
+        );
+        app.apply_screen(WatchScreen::Board);
+        let mut terminal = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("scan /tmp/x: refused"), "{screen}");
+    }
+
+    #[test]
+    fn board_enter_on_a_work_without_a_live_run_says_so() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.board
+            .set_snapshot(board_snapshot(vec![board_work("CAL-1", None)]), Vec::new());
+        app.apply_screen(WatchScreen::Board);
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::None
+        ));
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("no live Run")));
+    }
+
+    #[test]
+    fn board_renders_works_with_their_detail_and_moves_with_j() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        let mut snap = board_snapshot(vec![board_work("CAL-1", None), board_work("CAL-2", None)]);
+        snap.unlinked_executions = Vec::new();
+        app.board.set_snapshot(snap, Vec::new());
+        app.apply_screen(WatchScreen::Board);
+        let draw = |app: &mut App, width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            (0..terminal.backend().buffer().area().height)
+                .map(|y| row_text(terminal.backend().buffer(), y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let screen = draw(&mut app, 110);
+        assert!(screen.contains("Board · 2 Works · 0 need you"), "{screen}");
+        assert!(screen.contains("callabo/CAL-1"), "{screen}");
+        assert!(screen.contains("goal  ship it"), "{screen}");
+        assert!(screen.contains("go to Run"), "{screen}");
+        let first = app
+            .board
+            .selected_work("")
+            .unwrap()
+            .identity
+            .work_id
+            .clone();
+        let _ = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        let second = app
+            .board
+            .selected_work("")
+            .unwrap()
+            .identity
+            .work_id
+            .clone();
+        assert_ne!(first, second);
+        // Wide terminals put the detail beside the list.
+        let wide = draw(&mut app, 160);
+        assert!(wide.contains(&format!("work {second}")), "{wide}");
     }
 
     #[test]

@@ -7,6 +7,7 @@ mod agent_records;
 mod ask_progress;
 mod attend;
 mod automation;
+mod board_screen;
 mod collab_screen;
 mod collaboration_output;
 mod config_cmd;
@@ -1045,6 +1046,7 @@ pub(crate) enum WatchLayoutArg {
 pub(crate) enum WatchScreenArg {
     Topology,
     Collab,
+    Board,
 }
 
 impl From<WatchScreenArg> for muxa::config::WatchScreen {
@@ -1052,6 +1054,7 @@ impl From<WatchScreenArg> for muxa::config::WatchScreen {
         match value {
             WatchScreenArg::Topology => Self::Topology,
             WatchScreenArg::Collab => Self::Collab,
+            WatchScreenArg::Board => Self::Board,
         }
     }
 }
@@ -3416,6 +3419,16 @@ pub(crate) async fn cmd_fleet_watch(
     // surface. Host hierarchy becomes visible only when it carries information.
     if fleet_watch::uses_native_local_watch(&initial) {
         return cmd_watch(client, cfg, config_path, invocation.clone()).await;
+    }
+    // The Work board reads this host's Work records and multiplexers; under
+    // a host header it would pass off one host's Works as the fleet's.
+    let screen = invocation
+        .screen
+        .map_or(cfg.watch.screen, muxa::config::WatchScreen::from);
+    if screen == muxa::config::WatchScreen::Board {
+        anyhow::bail!(
+            "the Work board is local to this host; run `muxa watch --screen board` without --fleet"
+        );
     }
     fleet_watch::run(
         client.clone(),

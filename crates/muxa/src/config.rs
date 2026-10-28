@@ -2243,6 +2243,10 @@ pub enum WatchScreen {
     Topology,
     /// Collaboration requests across every room the daemon holds.
     Collab,
+    /// Works and their Runs: persisted Work records joined with the
+    /// executions scanned for them, so a Work with no live window still
+    /// has a row.
+    Board,
 }
 
 /// Expansion policy for the selectable watch topology tree.

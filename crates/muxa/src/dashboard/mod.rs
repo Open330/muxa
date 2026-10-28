@@ -34,7 +34,7 @@ pub mod sharing;
 pub mod work_store;
 
 pub use config::{DashboardConfig, DashboardConfigError, DashboardOverrides};
-pub use server::{router, serve, AppState, DashboardRuntimeConfig};
+pub use server::{multi_host_pane_scan, router, serve, AppState, DashboardRuntimeConfig};
 
 /// Read the durable Work records without constructing the HTTP dashboard.
 /// CLI surfaces use this together with [`crate::work::build_snapshot`] so the
