@@ -32,3 +32,8 @@ Inspect the interpreted terms/time range and coverage, follow command/result pai
 and broaden terms or the time/session scope before drawing conclusions. Exclude
 the investigating session when it repeats the evidence. A prose claim or quoted
 log is not proof of execution, and an incomplete search cannot prove absence.
+
+When supported, use task_contract for versioned reviews, then echo the received
+attempt.id and basis_revision in a structured report with criterion evidence.
+Reported checks are not independently verified. Supersede an outdated read-only
+request explicitly; never use supersession to take over a running editor.

@@ -531,6 +531,12 @@ enum MsgCmd {
     Send {
         target: String,
         body: String,
+        /// Typed v1 task contract JSON file (requires a supporting daemon).
+        #[arg(long)]
+        task_contract: Option<PathBuf>,
+        /// Replace the relevance of your read-only task; retain late replies as history.
+        #[arg(long, requires = "task_contract")]
+        supersedes: Option<String>,
         /// Decision required from the operator; use with target `human`.
         #[arg(long, value_parser = ["approval", "choice", "information"])]
         human_action: Option<String>,
@@ -652,6 +658,9 @@ enum MsgCmd {
     /// Complete, block, decline, or fail a request.
     Reply {
         request_id: String,
+        /// Typed task report JSON file, bound to the request attempt and revision.
+        #[arg(long)]
+        report: Option<PathBuf>,
         body: String,
         #[arg(long, default_value = "completed")]
         status: String,
@@ -2219,6 +2228,8 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         MsgCmd::Send {
             target,
             body,
+            task_contract,
+            supersedes,
             human_action,
             kind,
             thread,
@@ -2256,6 +2267,15 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &origin,
                     &target,
                     &NewRequest {
+                        task_contract: task_contract
+                            .as_deref()
+                            .map(|p| {
+                                let value = read_collaboration_json(p)?;
+                                muxa::collaboration::TaskContract::from_input(value)
+                                    .map_err(anyhow::Error::msg)
+                            })
+                            .transpose()?,
+                        supersedes_request_id: supersedes,
                         dispatch_id: None,
                         source_node_id: None,
                         delegation_parent: None,
@@ -2370,21 +2390,30 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         }
         MsgCmd::Reply {
             request_id,
+            report,
             body,
             status,
             artifacts,
             air_refs,
             json,
         } => {
+            let report: Option<muxa::collaboration::TaskReport> = report
+                .as_deref()
+                .map(|p| {
+                    let value = read_collaboration_json(p)?;
+                    muxa::collaboration::TaskReport::from_input(value).map_err(anyhow::Error::msg)
+                })
+                .transpose()?;
             let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
-                .collaboration_reply_view(
+                .collaboration_reply_report_view(
                     &origin,
                     &request_id,
                     collaboration_reply_status(&status)?,
                     &body,
                     &artifacts,
                     &air_artifacts,
+                    report.as_ref(),
                     if json {
                         muxa::collaboration::CollaborationReadView::Full
                     } else {
@@ -2690,6 +2719,18 @@ async fn cmd_msg_list_page(
     print_collaboration_messages(&requests, json, full, origin, scope)
 }
 
+fn read_collaboration_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
+    use std::io::Read as _;
+    let mut data = Vec::new();
+    std::fs::File::open(path)?
+        .take(65537)
+        .read_to_end(&mut data)?;
+    if data.len() > 65536 {
+        anyhow::bail!("collaboration JSON file exceeds 64 KiB");
+    }
+    serde_json::from_slice(&data).map_err(Into::into)
+}
+
 fn render_inbox_request(request: &muxa::collaboration::CollaborationRequest) -> String {
     let mut text = format!(
         "{}  {:?} from {}  {:?}  expects_reply={}\n  {}",
@@ -2703,6 +2744,10 @@ fn render_inbox_request(request: &muxa::collaboration::CollaborationRequest) -> 
     // Preserve the complete execution contract without requiring another full read.
     let contract = collaboration_output::message(request, true);
     for key in [
+        "task_contract",
+        "attempt",
+        "supersedes_request_id",
+        "superseded_by",
         "paths",
         "artifacts",
         "links",
@@ -5267,6 +5312,7 @@ mod tests {
         let body = "pending\nquote: \" \\ path\n한글";
         request.status = RequestStatus::Failed;
         request.reply = Some(muxa::collaboration::CollaborationReply {
+            report: None,
             status: RequestStatus::Failed,
             body: body.into(),
             artifacts: vec![],
@@ -5972,6 +6018,11 @@ mod tests {
         status: RequestStatus,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            task_contract: None,
+            attempt: None,
+            supersedes_request_id: None,
+            superseded_by: None,
+            late_replies: Vec::new(),
             dispatch_id: None,
             source_node_id: None,
             delegation_parent: None,

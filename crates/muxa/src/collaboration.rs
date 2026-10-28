@@ -4,6 +4,12 @@
 //! the concrete agent session occupying a pane so a later process reusing the
 //! pane never inherits stale work.
 
+mod contract;
+pub(crate) use contract::deserialize_report_input;
+pub use contract::{
+    task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,
+    EvidenceReference, TaskAttempt, TaskContract, TaskReport, TASK_CONTRACT_CAPABILITY,
+};
 mod overview;
 pub use overview::{
     CollaborationEndpoint, CollaborationLink, CollaborationLocation, CollaborationOverview,
@@ -30,7 +36,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{watch, Mutex, RwLock};
 
 pub const COLLABORATION_SCHEMA_VERSION: u32 = 1;
-const COLLABORATION_DATABASE_SCHEMA_VERSION: u32 = 1;
+const COLLABORATION_DATABASE_SCHEMA_VERSION: u32 = 2;
 const DEFAULT_QUERY_LIMIT: usize = 100;
 const MAX_QUERY_LIMIT: usize = 500;
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -177,6 +183,8 @@ fn dispatch_matches(
     existing.from.same_endpoint(from)
         && same_slot != Some(false)
         && (existing.to.same_endpoint(to) || addresses(&existing.to, to) || same_slot == Some(true))
+        && existing.task_contract == input.task_contract
+        && existing.supersedes_request_id == input.supersedes_request_id
         && existing.kind == input.kind
         && existing.body == body
         && existing.expects_reply == input.expects_reply
@@ -746,6 +754,8 @@ impl RequestStatus {
 pub struct CollaborationReply {
     pub status: RequestStatus,
     pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<TaskReport>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -790,7 +800,8 @@ pub struct CollaborationRequest {
     pub from: Participant,
     pub to: Participant,
     /// Advisory identity of the agent initiating a Fleet console request;
-    /// never used for authorization or participant matching.
+    /// not caller authentication. Console task supersession compares it only to
+    /// prevent mixing requests dispatched for different initiating agents.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initiator: Option<Box<Participant>>,
     /// Bounded nonterminal conversation on this exact request.
@@ -891,6 +902,16 @@ pub struct CollaborationRequest {
     pub reply_wake: Option<ReplyWake>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply: Option<CollaborationReply>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_contract: Option<TaskContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<TaskAttempt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub superseded_by: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub late_replies: Vec<CollaborationReply>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1059,6 +1080,11 @@ pub struct NewRequest {
     /// from a client.
     #[serde(skip)]
     pub recipient_slot: Option<RecipientSlot>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "contract::deserialize_contract_input")]
+    pub task_contract: Option<TaskContract>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes_request_id: Option<String>,
 }
 
 impl Default for NewRequest {
@@ -1085,6 +1111,8 @@ impl Default for NewRequest {
             air_artifacts: Vec::new(),
             withdraw_reply_wakes: Vec::new(),
             recipient_slot: None,
+            task_contract: None,
+            supersedes_request_id: None,
         }
     }
 }
@@ -1342,8 +1370,10 @@ impl CollaborationReadView {
             }
             Self::Outcome => {
                 let reply = request.reply.take();
+                let late_replies = std::mem::take(&mut request.late_replies);
                 request.omit_list_bodies();
                 request.reply = reply;
+                request.late_replies = late_replies;
             }
             Self::Progress { after_update } => {
                 let updates = std::mem::take(&mut request.updates)
@@ -1366,12 +1396,26 @@ impl CollaborationRequest {
     /// A display-only projection. Exact get/claim/reply paths retain their full contract.
     pub fn omit_list_bodies(&mut self) {
         self.body.clear();
+        self.task_contract = None;
+        for late in &mut self.late_replies {
+            late.body.clear();
+            if let Some(report) = &mut late.report {
+                report.criteria.clear();
+                report.evidence.clear();
+            }
+            late.artifacts.clear();
+            late.air_artifacts.clear();
+        }
         self.paths.clear();
         self.artifacts.clear();
         self.links.clear();
         self.air_artifacts.clear();
         if let Some(reply) = &mut self.reply {
             reply.body.clear();
+            if let Some(report) = &mut reply.report {
+                report.criteria.clear();
+                report.evidence.clear();
+            }
             reply.artifacts.clear();
             reply.air_artifacts.clear();
         }
@@ -1455,6 +1499,10 @@ pub struct CollaborationPage {
 
 #[derive(Debug, thiserror::Error)]
 pub enum CollaborationError {
+    #[error("collaboration unavailable: {0}; repair the mailbox and restart muxad")]
+    Unavailable(String),
+    #[error("invalid task contract: {0}")]
+    InvalidTaskContract(String),
     #[error("invalid dispatch metadata: {0}")]
     InvalidDispatch(String),
     #[error("dispatch {0} already exists with a different recipient or payload")]
@@ -1710,8 +1758,8 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
     )?;
     // Every persist opens the database. Writing an unchanged user_version
     // would still be a committed, fsync'd write transaction each time.
-    if version != COLLABORATION_DATABASE_SCHEMA_VERSION {
-        connection.pragma_update(None, "user_version", COLLABORATION_DATABASE_SCHEMA_VERSION)?;
+    if version == 0 {
+        connection.pragma_update(None, "user_version", 1)?;
     }
     secure_database_files(path)?;
     Ok(connection)
@@ -1802,6 +1850,15 @@ fn write_request(
     request: &CollaborationRequest,
     import_only: bool,
 ) -> Result<(), CollaborationError> {
+    // Upgrade semantic storage only when contract state is actually persisted.
+    // This pragma is inside the caller's transaction, so a failed write rolls it back.
+    if request.task_contract.is_some()
+        || request.attempt.is_some()
+        || request.superseded_by.is_some()
+        || !request.late_replies.is_empty()
+    {
+        connection.pragma_update(None, "user_version", COLLABORATION_DATABASE_SCHEMA_VERSION)?;
+    }
     let payload = serde_json::to_string(request)?;
     let anchor = if request.from.console {
         &request.to
@@ -2539,6 +2596,7 @@ fn request_latest_activity(request: &CollaborationRequest) -> OffsetDateTime {
 /// cheap while `transaction_lock` preserves atomic durable visibility.
 pub struct CollaborationStore {
     opts: CollaborationOptions,
+    initialization_error: Option<String>,
     /// Indexed `SQLite` sidecar. The configured JSON path remains the migration
     /// source and is deliberately retained as a recoverable backup.
     database_path: Option<PathBuf>,
@@ -2583,6 +2641,7 @@ impl CollaborationStore {
                 path: None,
                 ..options
             },
+            initialization_error: None,
             database_path: None,
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
@@ -2655,6 +2714,7 @@ impl CollaborationStore {
         let purposes = load_purposes(database_path.as_deref())?;
         let store = Arc::new(Self {
             opts: options,
+            initialization_error: None,
             database_path,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
@@ -2671,6 +2731,19 @@ impl CollaborationStore {
             store.prune_history(cutoff).await?;
         }
         Ok(store)
+    }
+
+    pub fn unavailable(mut options: CollaborationOptions, reason: String) -> Arc<Self> {
+        options.enabled = false;
+        let mut store = Self::in_memory(options);
+        Arc::get_mut(&mut store)
+            .expect("new store is unshared")
+            .initialization_error = Some(reason);
+        store
+    }
+
+    pub fn initialization_error(&self) -> Option<&str> {
+        self.initialization_error.as_deref()
     }
 
     pub fn enabled(&self) -> bool {
@@ -2945,6 +3018,31 @@ impl CollaborationStore {
                 self.opts.max_message_bytes,
             ));
         }
+        if let Some(contract) = &input.task_contract {
+            contract.validate()?;
+            if !input.expects_reply
+                || input.kind == RequestKind::Notice
+                || input.human_action.is_some()
+                || to.console
+            {
+                return Err(CollaborationError::InvalidTaskContract(
+                    "a contract requires a reply-bearing agent task, review or question".into(),
+                ));
+            }
+            let bytes = serde_json::to_vec(contract)
+                .map_err(|e| CollaborationError::InvalidTaskContract(e.to_string()))?
+                .len();
+            if bytes.saturating_add(body.len()) > self.opts.max_message_bytes {
+                return Err(CollaborationError::MessageTooLarge(
+                    self.opts.max_message_bytes,
+                ));
+            }
+        }
+        if input.supersedes_request_id.is_some() && input.task_contract.is_none() {
+            return Err(CollaborationError::InvalidTaskContract(
+                "supersession requires a task contract".into(),
+            ));
+        }
         validate_air_artifact_references(&input.air_artifacts)?;
         reject_blank_withdrawals(&input.withdraw_reply_wakes)?;
         let _transaction = self.transaction_lock.lock().await;
@@ -2959,10 +3057,30 @@ impl CollaborationStore {
                 Err(CollaborationError::DispatchConflict(id))
             };
         }
+        if let Some(old_id) = &input.supersedes_request_id {
+            let requests = self.requests.read().await;
+            let old = requests
+                .get(old_id)
+                .ok_or_else(|| CollaborationError::NotFound(old_id.clone()))?;
+            contract::validate_supersession(old, &from, &input)?;
+        }
         let withdrawals = normalize_withdrawals(&input.withdraw_reply_wakes);
         self.validate_reply_wake_withdrawals(&from, &withdrawals)
             .await?;
-        let supplied_thread_id = normalize_optional_id(input.thread_id);
+        let inherited_thread = if input.thread_id.is_none() && input.parent_request_id.is_none() {
+            if let Some(id) = &input.supersedes_request_id {
+                self.requests
+                    .read()
+                    .await
+                    .get(id)
+                    .and_then(|r| r.thread_id.clone().or_else(|| Some(r.id.clone())))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let supplied_thread_id = normalize_optional_id(input.thread_id).or(inherited_thread);
         let parent_request_id = normalize_optional_id(input.parent_request_id);
         let thread_id = if let Some(parent_request_id) = parent_request_id.as_deref() {
             let requests = self.requests.read().await;
@@ -2994,7 +3112,21 @@ impl CollaborationStore {
         } else {
             Some(supplied_thread_id.unwrap_or_else(|| id.clone()))
         };
+        if let Some(old_id) = &input.supersedes_request_id {
+            let requests = self.requests.read().await;
+            let old = requests.get(old_id).expect("supersession was validated");
+            if thread_id.as_deref() != Some(old.thread_id.as_deref().unwrap_or(&old.id)) {
+                return Err(CollaborationError::InvalidTaskContract(
+                    "superseding requests must retain the original causal thread".into(),
+                ));
+            }
+        }
         let request = CollaborationRequest {
+            attempt: input.task_contract.as_ref().map(TaskContract::attempt),
+            task_contract: input.task_contract,
+            supersedes_request_id: input.supersedes_request_id,
+            superseded_by: None,
+            late_replies: Vec::new(),
             dispatch_id: input.dispatch_id,
             source_node_id: input.source_node_id,
             delegation_parent: input.delegation_parent,
@@ -3037,6 +3169,48 @@ impl CollaborationStore {
             let mut requests = self.requests.write().await;
             let mut changed =
                 withdraw_reply_wakes_in(&mut requests, &request.withdrew_reply_wakes, now);
+            if let Some(old_id) = &request.supersedes_request_id {
+                // Supersession changes result relevance, never execution authority.
+                // Only read-only requests can reach this path; preserve late replies.
+                if let Some(old) = requests.get_mut(old_id) {
+                    if old.status == RequestStatus::Claimed {
+                        let notice = contract::supersession_notice(old, &request, now);
+                        old.updates.push(CollaborationUpdate {
+                            sequence: old
+                                .updates
+                                .last()
+                                .map_or(1, |u| u.sequence.saturating_add(1)),
+                            author: request.from.clone(),
+                            body: notice.body.clone(),
+                            at: now,
+                        });
+                        while old.updates.len() > 32
+                            || old.updates.iter().map(|u| u.body.len()).sum::<usize>() > 32768
+                        {
+                            old.updates.remove(0);
+                        }
+                        changed.push(notice);
+                    }
+                    old.superseded_by = Some(request.id.clone());
+                    if !old.status.is_terminal() {
+                        old.status = RequestStatus::Cancelled;
+                        // A written input line still needs its Enter after a crash.
+                        if old.wake_delivery != Some(WakeDeliveryState::PromptWritten) {
+                            old.wake_delivery = None;
+                        }
+                    }
+                    if !matches!(old.reply_wake, Some(ReplyWake::Released { .. })) {
+                        old.reply_wake = Some(ReplyWake::Released {
+                            reason: ReplyWakeRelease::Withdrawn,
+                            at: now,
+                        });
+                    }
+                    changed.push(old.clone());
+                }
+            }
+            for record in &changed {
+                requests.insert(record.id.clone(), record.clone());
+            }
             requests.insert(request.id.clone(), request.clone());
             changed.push(request.clone());
             changed
@@ -3350,6 +3524,29 @@ impl CollaborationStore {
         artifacts: Vec<String>,
         air_artifacts: Vec<AirArtifactReference>,
     ) -> Result<CollaborationRequest, CollaborationError> {
+        self.reply_with_report(
+            caller,
+            request_id,
+            status,
+            body,
+            artifacts,
+            air_artifacts,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Reply and retired notices share one atomic persistence/rollback boundary.
+    pub async fn reply_with_report(
+        &self,
+        caller: &Participant,
+        request_id: &str,
+        status: RequestStatus,
+        body: String,
+        artifacts: Vec<String>,
+        air_artifacts: Vec<AirArtifactReference>,
+        report: Option<TaskReport>,
+    ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         if !matches!(
             status,
@@ -3389,21 +3586,87 @@ impl CollaborationStore {
             if !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
-            if request.status.is_terminal() {
+            let identical = |previous: &CollaborationReply| {
+                previous.status == status
+                    && previous.body == body
+                    && previous.artifacts == artifacts
+                    && previous.air_artifacts == air_artifacts
+                    && previous.report == report
+            };
+            if report.is_some() && request.reply.as_ref().is_some_and(identical) {
+                return Ok(request.clone());
+            }
+            if request.superseded_by.is_some() && request.late_replies.iter().any(identical) {
+                return Ok(request.clone());
+            }
+            let late = request.status == RequestStatus::Cancelled
+                && request.superseded_by.is_some()
+                && request.reply.is_none();
+            if request.status.is_terminal() && !late {
                 return Err(CollaborationError::AlreadyTerminal(request_id.to_string()));
             }
-            pin_pending_recipient(request, caller);
-            request.status = status;
-            request.reply = Some(CollaborationReply {
+            if !late {
+                contract::validate_report(request, status, report.as_ref())?;
+            } else if let Some(report) = &report {
+                contract::validate_report(request, RequestStatus::Blocked, Some(report))?;
+            }
+            if let Some(report) = &report {
+                let bytes = serde_json::to_vec(report)
+                    .map_err(|e| CollaborationError::InvalidTaskContract(e.to_string()))?
+                    .len();
+                if bytes.saturating_add(body.len()) > self.opts.max_message_bytes {
+                    return Err(CollaborationError::MessageTooLarge(
+                        self.opts.max_message_bytes,
+                    ));
+                }
+            }
+            let reply = CollaborationReply {
+                report,
                 status,
                 body,
                 artifacts,
                 air_artifacts,
                 at: OffsetDateTime::now_utc(),
-            });
+            };
+            if late {
+                if request.late_replies.len() >= 4 {
+                    return Err(CollaborationError::InvalidTaskContract(
+                        "at most four historical late reports can be retained".into(),
+                    ));
+                }
+                request.late_replies.push(reply);
+            } else {
+                pin_pending_recipient(request, caller);
+                request.status = status;
+                request.reply = Some(reply);
+            }
             request.clone()
         };
-        if let Err(error) = self.persist_requests(std::slice::from_ref(&updated)) {
+        let mut changed = vec![updated.clone()];
+        if updated.superseded_by.is_some() && !updated.late_replies.is_empty() {
+            let mut requests = self.requests.write().await;
+            for notice in requests.values_mut().filter(|n| {
+                n.kind == RequestKind::Notice
+                    && n.parent_request_id.as_deref() == Some(updated.id.as_str())
+                    && n.status == RequestStatus::Queued
+                    && n.from.same_session(&updated.from)
+                    && n.body.starts_with(&format!(
+                        "Read-only request {} was superseded by {}.",
+                        updated.id,
+                        updated.superseded_by.as_deref().unwrap_or_default()
+                    ))
+                    && addresses(&n.to, caller)
+            }) {
+                // Do not abandon text already in a terminal input buffer.
+                if notice.wake_delivery.is_none() {
+                    notice.status = RequestStatus::Completed;
+                    notice.claimed_at = Some(OffsetDateTime::now_utc());
+                    notice.notified_at = notice.claimed_at;
+                    changed.push(notice.clone());
+                }
+            }
+        }
+        if let Err(error) = self.persist_requests(&changed) {
             *self.requests.write().await = previous;
             return Err(error);
         }
@@ -3863,7 +4126,7 @@ impl CollaborationStore {
         let previous = self.requests.read().await.clone();
         let batch = {
             let mut requests = self.requests.write().await;
-            let mine = |request: &CollaborationRequest| request.from.same_endpoint(sender);
+            let mine = |request: &CollaborationRequest| request.from.same_session(sender);
             if requests.values().any(|request| {
                 mine(request) && matches!(request.reply_wake, Some(ReplyWake::Reserved { .. }))
             }) {
@@ -4034,7 +4297,9 @@ impl CollaborationStore {
     }
 
     fn ensure_enabled(&self) -> Result<(), CollaborationError> {
-        if self.opts.enabled {
+        if let Some(error) = &self.initialization_error {
+            Err(CollaborationError::Unavailable(error.clone()))
+        } else if self.opts.enabled {
             Ok(())
         } else {
             Err(CollaborationError::Disabled)
@@ -8800,6 +9065,7 @@ mod tests {
         unread.created_at = old;
         unread.status = RequestStatus::Completed;
         unread.reply = Some(CollaborationReply {
+            report: None,
             status: RequestStatus::Completed,
             body: "not read".into(),
             artifacts: Vec::new(),
@@ -8878,3 +9144,6 @@ mod recovery;
 #[cfg(test)]
 mod reply_wake_tests;
 pub use recovery::PeerInterruption;
+
+#[cfg(test)]
+mod contract_tests;

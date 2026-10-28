@@ -271,6 +271,7 @@ async fn check_muxad(socket: &Path) -> CheckResult {
         )
         .await
         {
+            Ok(Ok(hello)) if hello.collaboration_error.is_some() => CheckResult::Fail(format!("muxad responding; collaboration unavailable: {} — repair the mailbox and restart muxad",hello.collaboration_error.as_deref().unwrap_or_default())),
             Ok(Ok(hello)) => hello.version_skew().map_or_else(
                 || CheckResult::Ok(format!("muxad responding at {}", socket.display())),
                 |skew| CheckResult::Warn(skew.to_string()),
@@ -1771,5 +1772,32 @@ mod tests {
         let s = format_warning_line(&huge);
         // Body should be capped at 200 chars; prefix has zero Zs.
         assert_eq!(s.chars().filter(|c| *c == 'Z').count(), 200);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn doctor_reports_a_disabled_mailbox_while_registry_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("disabled-mailbox.sock");
+        let mailbox = muxa::collaboration::CollaborationStore::unavailable(
+            muxa::collaboration::CollaborationOptions::default(),
+            "corrupt durable mailbox".into(),
+        );
+        let server = muxa::ipc::Server::new(socket.clone(), muxa::Store::shared())
+            .with_collaboration(mailbox);
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let result = check_muxad(&socket).await;
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+        match result {
+            CheckResult::Fail(message) => assert!(message.contains("corrupt durable mailbox")),
+            _ => panic!("expected an explicit collaboration diagnostic"),
+        }
     }
 }

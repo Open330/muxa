@@ -2914,6 +2914,8 @@ async fn collaboration_send(
     work_id: Option<String>,
 ) -> ActionOutcome {
     let request = NewRequest {
+        task_contract: None,
+        supersedes_request_id: None,
         dispatch_id: None,
         source_node_id: None,
         delegation_parent: None,
@@ -5302,6 +5304,11 @@ mod tests {
         now: OffsetDateTime,
     ) -> CollaborationRequest {
         CollaborationRequest {
+            task_contract: None,
+            attempt: None,
+            supersedes_request_id: None,
+            superseded_by: None,
+            late_replies: Vec::new(),
             dispatch_id: None,
             source_node_id: None,
             delegation_parent: None,

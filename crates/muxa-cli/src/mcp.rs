@@ -1075,6 +1075,19 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             },
         }),
     ];
+    for tool in &mut tools {
+        if matches!(
+            tool["name"].as_str(),
+            Some("muxa_send_message" | "muxa_call_peer" | "muxa_fleet_call_peer")
+        ) {
+            tool["inputSchema"]["properties"]["task_contract"] =
+                muxa::collaboration::task_contract_schema();
+            tool["inputSchema"]["properties"]["supersedes_request_id"] = json!({"type":"string","description":"Supersede your read-only request for the same task_id, room and work. The old request closes without interrupting a process; late reports remain historical and do not wake the sender. Never transfers edit authority."});
+        }
+        if tool["name"] == "muxa_reply" {
+            tool["inputSchema"]["properties"]["report"] = muxa::collaboration::task_report_schema();
+        }
+    }
     tools.extend(crate::agent_records::definitions());
     tools
 }
@@ -1867,6 +1880,14 @@ async fn call_tool(
                 Ok(status) => status,
                 Err(error) => return Ok(error_result(error)),
             };
+            let report: Option<muxa::collaboration::TaskReport> = match args
+                .get("report")
+                .map(|v| muxa::collaboration::TaskReport::from_input(v.clone()))
+                .transpose()
+            {
+                Ok(v) => v,
+                Err(e) => return Ok(error_result(&format!("invalid task report: {e}"))),
+            };
             let artifacts = string_array(&args, "artifacts");
             let air_artifacts = match parse_air_artifact_references(&args) {
                 Ok(references) => references,
@@ -1878,13 +1899,14 @@ async fn call_tool(
             };
             Ok(
                 match client
-                    .collaboration_reply_view(
+                    .collaboration_reply_report_view(
                         &origin,
                         request_id,
                         status,
                         body,
                         &artifacts,
                         &air_artifacts,
+                        report.as_ref(),
                         muxa::collaboration::CollaborationReadView::Metadata,
                     )
                     .await
@@ -2576,6 +2598,17 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
             Ok(request) => request,
             Err(error) => return error_result(&error),
         };
+    if request.task_contract.is_some() {
+        if let Err(error) = crate::require_capability(
+            client,
+            muxa::collaboration::TASK_CONTRACT_CAPABILITY,
+            "contracted peer request",
+        )
+        .await
+        {
+            return error_result(&error.to_string());
+        }
+    }
     if let Err(error) =
         crate::mcp_output::require_reply_wake_withdraw(client, &request.withdraw_reply_wakes).await
     {
@@ -2854,6 +2887,11 @@ async fn fleet_call_peer(
             request.initiator = Some(Box::new(room.current));
         }
     }
+    if request.task_contract.is_some() && request.initiator.is_none() {
+        return error_result(
+            "contracted Fleet dispatch requires a resolved initiating agent session",
+        );
+    }
     if let Err(error) = ensure_fleet_collaboration_ready(client, host).await {
         return error_result(&format!("fleet_call_peer refused: {error}"));
     }
@@ -2873,6 +2911,18 @@ async fn fleet_call_peer(
         Ok(snapshot) => snapshot,
         Err(error) => return error_result(&error.to_string()),
     };
+    if request.task_contract.is_some()
+        && !snapshot.hosts.iter().any(|h| {
+            h.alias == host
+                && h.capabilities
+                    .iter()
+                    .any(|c| c == muxa::collaboration::TASK_CONTRACT_CAPABILITY)
+        })
+    {
+        return error_result(
+            "target must advertise collaboration_task_contract_v1 before contracted dispatch",
+        );
+    }
     request.source_node_id = snapshot
         .hosts
         .iter()
@@ -4087,7 +4137,26 @@ fn new_request_from_args(
     paths: Vec<String>,
     air_artifacts: Vec<AirArtifactReference>,
 ) -> std::result::Result<NewRequest, String> {
+    let task_contract: Option<muxa::collaboration::TaskContract> = args
+        .get("task_contract")
+        .map(|v| muxa::collaboration::TaskContract::from_input(v.clone()))
+        .transpose()
+        .map_err(|e| format!("invalid task_contract: {e}"))?;
+    if let Some(contract) = &task_contract {
+        contract.validate().map_err(|e| e.to_string())?;
+    }
+    let supersedes_request_id = optional_string(args, "supersedes_request_id")?;
+    if supersedes_request_id.is_some() && task_contract.is_none() {
+        return Err("supersession requires task_contract".into());
+    }
+    if task_contract.is_some()
+        && (!expects_reply || kind == RequestKind::Notice || args.get("human_action").is_some())
+    {
+        return Err("task_contract requires a reply-bearing agent request".into());
+    }
     Ok(NewRequest {
+        task_contract,
+        supersedes_request_id,
         dispatch_id: optional_string(args, "dispatch_id")?,
         source_node_id: None,
         delegation_parent: args
@@ -4954,6 +5023,7 @@ mod tests {
         let mut request = crate::collaboration_output::fixture();
         request.status = RequestStatus::Completed;
         request.reply = Some(muxa::collaboration::CollaborationReply {
+            report: None,
             status: RequestStatus::Completed,
             body: "large final reply".repeat(4096),
             artifacts: vec![],
@@ -6725,6 +6795,7 @@ mod tests {
         let mut newer = crate::collaboration_output::fixture();
         newer.status = RequestStatus::Completed;
         newer.reply = Some(muxa::collaboration::CollaborationReply {
+            report: None,
             status: RequestStatus::Completed,
             body: "review result".into(),
             artifacts: vec![],
@@ -7497,5 +7568,110 @@ mod tests {
 
         tx.send(()).unwrap();
         daemon.await.unwrap();
+    }
+    fn task_contract_fixture() -> Value {
+        json!({"version":1,"task_id":"review-current","objective":"Review the exact commit","basis_revision":"a".repeat(40),"acceptance_criteria":["Check correctness"]})
+    }
+
+    #[test]
+    fn task_contract_tools_advertise_and_parse_the_same_bounded_contract() {
+        let defs = tool_definitions(&muxa::config::Config::default());
+        for name in [
+            "muxa_call_peer",
+            "muxa_send_message",
+            "muxa_fleet_call_peer",
+        ] {
+            let tool = defs.iter().find(|t| t["name"] == name).unwrap();
+            assert_eq!(
+                tool["inputSchema"]["properties"]["task_contract"]["properties"]["version"]
+                    ["const"],
+                1
+            );
+        }
+        let reply = defs.iter().find(|t| t["name"] == "muxa_reply").unwrap();
+        assert!(reply["inputSchema"]["properties"]["report"].is_object());
+        let args = json!({"task_contract":task_contract_fixture()});
+        let request = new_request_from_args(
+            &args,
+            RequestKind::Review,
+            "Review".into(),
+            true,
+            WorkMode::ReadOnly,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(request.task_contract.unwrap().task_id, "review-current");
+        let mut bad = args;
+        bad["task_contract"]["version"] = json!(2);
+        assert!(new_request_from_args(
+            &bad,
+            RequestKind::Review,
+            "Review".into(),
+            true,
+            WorkMode::ReadOnly,
+            vec![],
+            vec![]
+        )
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn contract_send_and_reply_fail_closed_against_an_older_daemon() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("old-daemon.sock");
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![
+                (
+                    json!({"/kind":"collaboration_send_contract"}),
+                    json!({"ok":false,"error":"unknown request kind: collaboration_send_contract"}),
+                ),
+                (
+                    json!({"/kind":"collaboration_reply_contract"}),
+                    json!({"ok":false,"error":"unknown request kind: collaboration_reply_contract"}),
+                ),
+            ],
+        );
+        let client = Client::new(socket);
+        let origin: CollaborationOrigin =
+            serde_json::from_value(json!({"pane":"%1","agent_session_id":"sender"})).unwrap();
+        let request = new_request_from_args(
+            &json!({"task_contract":task_contract_fixture()}),
+            RequestKind::Review,
+            "Review".into(),
+            true,
+            WorkMode::ReadOnly,
+            vec![],
+            vec![],
+        )
+        .unwrap();
+        let error = client
+            .collaboration_send(&origin, "%2", &request)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown request kind"));
+        let report = muxa::collaboration::TaskReport {
+            attempt_id: "attempt".into(),
+            basis_revision: Some("a".repeat(40)),
+            criteria: vec![],
+            evidence: vec![],
+        };
+        let error = client
+            .collaboration_reply_report_view(
+                &origin,
+                "request",
+                RequestStatus::Completed,
+                "Done",
+                &[],
+                &[],
+                Some(&report),
+                muxa::collaboration::CollaborationReadView::Full,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("unknown request kind"));
+        server.await.unwrap();
     }
 }

@@ -319,6 +319,7 @@ enum RequestBody {
         selector: Option<String>,
     },
     /// Route one exact operation through the per-host persistent SSH relay.
+    #[serde(alias = "fleet_command_contract")]
     FleetCommand {
         host: String,
         operation: FleetOperation,
@@ -423,10 +424,11 @@ enum RequestBody {
         #[serde(default)]
         roles: Vec<String>,
     },
+    #[serde(alias = "collaboration_send_contract")]
     CollaborationSend {
         origin: CollaborationOrigin,
         target: String,
-        request: NewRequest,
+        request: Box<NewRequest>,
     },
     /// Queue a headless question. Returns the pending entry immediately;
     /// the answer lands in the store when the agent exits.
@@ -650,6 +652,7 @@ enum RequestBody {
         #[serde(default)]
         auto_scope: bool,
     },
+    #[serde(alias = "collaboration_reply_contract")]
     CollaborationReply {
         origin: CollaborationOrigin,
         request_id: String,
@@ -660,6 +663,9 @@ enum RequestBody {
         artifacts: Vec<String>,
         #[serde(default)]
         air_artifacts: Vec<AirArtifactReference>,
+        #[serde(default)]
+        #[serde(deserialize_with = "collaboration::deserialize_report_input")]
+        report: Option<collaboration::TaskReport>,
         #[serde(default)]
         view: collaboration::CollaborationReadView,
     },
@@ -862,6 +868,7 @@ const CAPABILITIES: &[&str] = &[
     "fleet_wait_reply",
     "collaboration_update",
     "collaboration_peer_recovery",
+    collaboration::TASK_CONTRACT_CAPABILITY,
     collaboration::HUMAN_ACTIONS_CAPABILITY,
     collaboration::PURPOSE_PROMOTE_CAPABILITY,
     collaboration::PIPELINE_PURPOSE_CAPABILITY,
@@ -915,6 +922,8 @@ pub struct Response {
     pub prompts: Option<Vec<crate::history::HistoryEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub health: Option<HealthInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub min_protocol: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1069,6 +1078,7 @@ impl Response {
             agents: None,
             prompts: None,
             health: None,
+            collaboration_error: None,
             min_protocol: None,
             max_protocol: None,
             capabilities: None,
@@ -3465,6 +3475,8 @@ async fn handle(
                             "hello"
                         );
                         let mut r = Response::hello(restart.as_deref());
+                        r.collaboration_error =
+                            collaboration.initialization_error().map(str::to_owned);
                         r.protocol = requested;
                         r
                     } else {
@@ -3825,15 +3837,25 @@ async fn handle(
                 }
                 RequestBody::FleetCommand { host, operation } => {
                     kind = "fleet_command";
-                    match &fleet {
-                        Some(fleet) => match fleet
-                            .execute(host, operation, Duration::from_secs(20))
-                            .await
-                        {
-                            Ok(result) => Response::with_fleet_result(result),
-                            Err(error) => Response::err(error),
-                        },
-                        None => Response::err("fleet is not enabled in muxad"),
+                    let invalid = match &operation {
+                        FleetOperation::CollaborationSend { request, .. } => {
+                            request.validate_fleet_contract().err()
+                        }
+                        _ => None,
+                    };
+                    if let Some(error) = invalid {
+                        Response::err(error)
+                    } else {
+                        match &fleet {
+                            Some(fleet) => match fleet
+                                .execute(host, operation, Duration::from_secs(20))
+                                .await
+                            {
+                                Ok(result) => Response::with_fleet_result(result),
+                                Err(error) => Response::err(error),
+                            },
+                            None => Response::err("fleet is not enabled in muxad"),
+                        }
                     }
                 }
                 RequestBody::FleetWaitReply {
@@ -3898,7 +3920,10 @@ async fn handle(
                 }
                 RequestBody::Health => {
                     kind = "health";
-                    Response::health()
+                    let mut response = Response::health();
+                    response.collaboration_error =
+                        collaboration.initialization_error().map(str::to_owned);
+                    response
                 }
                 RequestBody::Stop => {
                     kind = "stop";
@@ -4530,7 +4555,7 @@ async fn handle(
                                 .create_with_provenance(
                                     sender,
                                     recipient,
-                                    request,
+                                    *request,
                                     Some(provenance),
                                 )
                                 .await
@@ -4874,6 +4899,7 @@ async fn handle(
                     artifacts,
                     air_artifacts,
                     view,
+                    report,
                 } => {
                     response_view = view;
                     kind = "collaboration_reply";
@@ -4895,13 +4921,14 @@ async fn handle(
                     .await;
                     let response = match topology.resolve_origin(&origin) {
                         Ok(current) => match collaboration
-                            .reply(
+                            .reply_with_report(
                                 &current,
                                 &request_id,
                                 status,
                                 body,
                                 artifacts,
                                 air_artifacts,
+                                report,
                             )
                             .await
                         {
@@ -5014,7 +5041,7 @@ async fn handle(
                         // but it is still answered before the drain deadline:
                         // aborting it closed the socket with no reply, which
                         // clients read as a broken response.
-                        Ok(current) => match until_server_shutdown(
+                        Ok(current) => match Box::pin(until_server_shutdown(
                             &mut stopping,
                             collaboration.wait_for_terminal(
                                 &current,
@@ -5023,7 +5050,7 @@ async fn handle(
                                     timeout_secs.clamp(1, MAX_COLLABORATION_WAIT_SECS),
                                 ),
                             ),
-                        )
+                        ))
                         .await
                         {
                             Some(Ok(request)) => Response::with_collaboration_request(request),
@@ -5480,6 +5507,7 @@ pub struct Client {
 /// Identity and feature information returned by the daemon's `hello` method.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Hello {
+    pub collaboration_error: Option<String>,
     pub capabilities: Vec<String>,
     pub generation: Option<u64>,
     /// The daemon's crate version. `None` from a daemon built before the
@@ -6049,7 +6077,7 @@ impl Client {
     ) -> Result<FleetCommandResult, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
-            "kind": "fleet_command",
+            "kind": if operation.requires_task_contract() { "fleet_command_contract" } else {"fleet_command"},
             "host": host,
             "operation": operation,
         });
@@ -6212,6 +6240,7 @@ impl Client {
             ))));
         }
         Ok(Hello {
+            collaboration_error: resp["collaboration_error"].as_str().map(str::to_owned),
             capabilities: resp["capabilities"]
                 .as_array()
                 .map(|capabilities| {
@@ -6810,7 +6839,7 @@ impl Client {
     ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
-            "kind": "collaboration_send",
+            "kind": if request.task_contract.is_some() || request.supersedes_request_id.is_some() { "collaboration_send_contract" } else { "collaboration_send" },
             "origin": origin,
             "target": target,
             "request": request,
@@ -7089,9 +7118,35 @@ impl Client {
         air_artifacts: &[AirArtifactReference],
         view: collaboration::CollaborationReadView,
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_reply_report_view(
+            origin,
+            request_id,
+            status,
+            body,
+            artifacts,
+            air_artifacts,
+            None,
+            view,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn collaboration_reply_report_view(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        status: RequestStatus,
+        body: &str,
+        artifacts: &[String],
+        air_artifacts: &[AirArtifactReference],
+        report: Option<&collaboration::TaskReport>,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION, "view": view,
-            "kind": "collaboration_reply",
+            "kind": if report.is_some() {"collaboration_reply_contract"} else {"collaboration_reply"},
+            "report": report,
             "origin": origin,
             "request_id": request_id,
             "status": status,
@@ -8009,6 +8064,7 @@ mod tests {
     #[test]
     fn hello_reports_no_skew_against_a_matching_daemon() {
         let hello = Hello {
+            collaboration_error: None,
             capabilities: Vec::new(),
             generation: None,
             protocol: PROTOCOL_VERSION,
@@ -8022,6 +8078,7 @@ mod tests {
         // The case protocol negotiation cannot see: both halves speak the same
         // wire format, and the daemon is still months of logic behind.
         let hello = Hello {
+            collaboration_error: None,
             capabilities: Vec::new(),
             generation: None,
             protocol: PROTOCOL_VERSION,
@@ -8040,6 +8097,7 @@ mod tests {
         // A daemon old enough to predate the `version` field has, by that fact
         // alone, established that it is older than this client.
         let hello = Hello {
+            collaboration_error: None,
             capabilities: Vec::new(),
             generation: None,
             protocol: PROTOCOL_VERSION,
@@ -8586,6 +8644,8 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        task_contract: None,
+                        supersedes_request_id: None,
                         body: "PRIVATE TASK ".repeat(900),
                         expects_reply: true,
                         ..Default::default()
@@ -8989,6 +9049,8 @@ mod tests {
                 &origin("%1", true),
                 "pane:%1",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     body: "review".into(),
                     ..NewRequest::default()
                 },
@@ -9088,6 +9150,8 @@ mod tests {
                 &origin("%1"),
                 "pane:%2",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     body: "review".into(),
                     ..NewRequest::default()
                 },
@@ -9182,6 +9246,8 @@ mod tests {
                         &from,
                         to,
                         &NewRequest {
+                            task_contract: None,
+                            supersedes_request_id: None,
                             dispatch_id: None,
                             source_node_id: None,
                             delegation_parent: None,
@@ -9332,6 +9398,8 @@ mod tests {
                 &sender,
                 "role:review",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -9363,6 +9431,8 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -9489,6 +9559,8 @@ mod tests {
                 &sender,
                 "role:rust",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -9573,6 +9645,8 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     body: "first attempt".into(),
                     ..NewRequest::default()
                 },
@@ -9584,6 +9658,8 @@ mod tests {
                 &sender,
                 "@reviewer",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     body: "second attempt".into(),
                     withdraw_reply_wakes: vec![abandoned.id.clone()],
                     ..NewRequest::default()
@@ -9641,6 +9717,8 @@ mod tests {
                 },
                 "pane:%1",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -10542,6 +10620,8 @@ mod tests {
                 &pane_origin("%1"),
                 "pane:%2",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     body: "review".into(),
                     ..NewRequest::default()
                 },
@@ -10616,6 +10696,8 @@ mod tests {
                 &pane_origin("%1"),
                 "pane:%2",
                 &NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     body: "review".into(),
                     ..NewRequest::default()
                 },

@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in versioned collaboration task contracts bind requests to daemon-created
+  attempt IDs, exact basis commits and structured reported evidence. Read-only
+  supersession retains late replies as history without completing newer work.
+  Contract-aware IPC and Fleet fail closed against older daemons; mailbox schema
+  v2 is enabled only on contracted writes and prevents older binaries silently
+  discarding contract fields. Mailbox load errors no longer silently lose
+  persistence through an in-memory fallback; non-schema load failures disable
+  collaboration with a health/doctor diagnostic while other services stay online.
+  Do not downgrade after using contracts: old daemons cannot read mailbox v2.
+- Reply notifications and interruption recovery follow agent session identity
+  after pane moves, so a sender's new pane receives its outstanding replies.
+
 - `muxa agent search` / `read` and MCP `muxa_agent_search` / `muxa_agent_read`
   find historical Claude/Codex conversation and command evidence using local
   Korean/English query expansion, event-time filters, source-attributed context,

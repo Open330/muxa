@@ -230,7 +230,7 @@ async fn main() -> Result<()> {
     let (history, history_writer_handle) =
         build_history(&cfg, &writer_shutdown_tx, pane_session_cache.clone()).await;
     let store = Store::shared_with_history(history.clone());
-    let collaboration = build_collaboration(&cfg).await;
+    let collaboration = build_collaboration(&cfg).await?;
     let collaboration_audit = build_collaboration_audit(&cfg);
     let ask = build_ask(&cfg, config_path.clone(), Some(socket.clone())).await;
     let automation = build_automation(&cfg, config_path.clone());
@@ -667,7 +667,7 @@ async fn build_ask(
     store
 }
 
-async fn build_collaboration(cfg: &Config) -> Arc<CollaborationStore> {
+async fn build_collaboration(cfg: &Config) -> Result<Arc<CollaborationStore>> {
     let options = CollaborationOptions {
         enabled: cfg.collaboration.enabled,
         scope: cfg.collaboration.scope,
@@ -694,11 +694,15 @@ async fn build_collaboration(cfg: &Config) -> Arc<CollaborationStore> {
                     "agent collaboration enabled",
                 );
             }
-            store
+            Ok(store)
+        }
+        Err(error @ muxa::collaboration::CollaborationError::UnsupportedSchema(_)) => {
+            Err(anyhow::Error::new(error)
+                .context("unsupported durable mailbox schema; refusing a downgrade"))
         }
         Err(error) => {
-            tracing::warn!(%error, "could not load collaboration mailbox; using memory only");
-            CollaborationStore::in_memory(options)
+            tracing::error!(%error,"collaboration disabled: durable mailbox could not be loaded; other daemon services remain available");
+            Ok(CollaborationStore::unavailable(options, error.to_string()))
         }
     }
 }
@@ -1648,7 +1652,7 @@ fn spawn_collaboration_waker_task(
     backends: Vec<muxa::SharedBackend>,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    if !cfg.collaboration.enabled {
+    if !cfg.collaboration.enabled || !collaboration.enabled() {
         return None;
     }
     let mut shutdown_rx = shutdown_tx.subscribe();
@@ -1830,7 +1834,8 @@ async fn wake_idle_collaboration_peers_with_inflight(
             continue;
         }
         let quiet = collaboration.quiet_notices_waiting(recipient).await;
-        let direct_wake = collaboration_wake_includes_body(wake_payload, &request);
+        let direct_wake = request.wake_delivery.is_some()
+            || collaboration_wake_includes_body(wake_payload, &request);
         if direct_wake && direct_wake_body_is_terminal_safe(&request.body) {
             if deliver_full_collaboration_request(
                 collaboration,
@@ -2015,11 +2020,20 @@ fn reply_wake_prompt(
 ) -> String {
     let entry = |request: &CollaborationRequest| {
         format!(
-            "{:?} reply from {}{}",
+            "{:?} reply from {}{}{}",
             request.status,
             request.to.label(),
             requested_ago(request.created_at, now)
                 .map(|ago| format!(" (requested {ago} ago)"))
+                .unwrap_or_default(),
+            request
+                .attempt
+                .as_ref()
+                .map(|a| format!(
+                    " [attempt {}, basis {}; recipient report, not independently verified]",
+                    a.id,
+                    a.basis_revision.as_deref().unwrap_or("unspecified")
+                ))
                 .unwrap_or_default(),
         )
     };
@@ -2115,6 +2129,12 @@ async fn deliver_full_collaboration_request(
         Some(WakeDeliveryState::PromptWritten) => {
             // The body or recovery notice is already in the input buffer.
             // Retrying only Enter avoids executing the request twice.
+            if let Some(successor) = &request.superseded_by {
+                let suffix=format!("\n[muxa] This request was superseded by {successor}; do not act on it. Read the mailbox for the current task.");
+                if !send_collaboration_text(recipient, &suffix, backends).await {
+                    return false;
+                }
+            }
             submit_direct_collaboration_prompt(collaboration, recipient, &request.id, backends)
                 .await
         }
@@ -2142,6 +2162,9 @@ async fn mark_collaboration_request_notified(collaboration: &CollaborationStore,
 }
 
 fn collaboration_reply_instruction(request: &CollaborationRequest) -> String {
+    if let (Some(contract), Some(attempt)) = (&request.task_contract, &request.attempt) {
+        return format!("Carries task contract {}, attempt {}. Completion requires a typed report. Use a supporting CLI: `muxa msg inbox --json`, then `muxa msg reply {} BODY --report FILE`; upgrade/reload an older MCP if it omits the contract/report fields. Follow the full contract and do not infer completion from prose.",contract.task_id,attempt.id,request.id);
+    }
     if request.expects_reply {
         format!(
             "When finished, respond with muxa_reply for request {} or `muxa msg reply {0} <body>`.",
@@ -2164,7 +2187,7 @@ fn mailbox_collaboration_request_prompt(request: &CollaborationRequest) -> Strin
 
 fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     let paths = serde_json::to_string(&request.paths).unwrap_or_else(|_| "[]".into());
-    let air_artifacts = if request.air_artifacts.is_empty() {
+    let mut air_artifacts = if request.air_artifacts.is_empty() {
         String::new()
     } else {
         format!(
@@ -2172,6 +2195,10 @@ fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
             serde_json::to_string(&request.air_artifacts).unwrap_or_else(|_| "[]".into())
         )
     };
+    if let Some(contract) = &request.task_contract {
+        use std::fmt::Write as _;
+        let _=write!(air_artifacts,"\ntask_contract: {}\nattempt: {}\nFor completed work, provide a typed report with the attempt id, basis_revision, every criterion and evidence. These remain recipient-reported claims.",serde_json::to_string(contract).unwrap_or_default(),serde_json::to_string(&request.attempt).unwrap_or_default());
+    }
     let reply = collaboration_reply_instruction(request);
     format!(
         "[muxa:{}] New {} request {}. This request is already claimed; do not call muxa_inbox for it.\nkind: {}\nwork_mode: {}\npaths: {}{}\nexpects_reply: {}\n{}\n\n--- request body ({} bytes) ---\n{}\n--- end request body ---",
@@ -2330,9 +2357,7 @@ fn idle_collaboration_participant<'a>(
     target: &muxa::collaboration::Participant,
 ) -> Option<&'a muxa::collaboration::Participant> {
     participants.iter().find(|participant| {
-        participant.pane == target.pane
-            && participant.socket == target.socket
-            && participant.agent_session_id == target.agent_session_id
+        participant.same_session(target)
             && participant.state == muxa::AgentState::Idle
             && !participant
                 .agent_session_id
@@ -4166,6 +4191,8 @@ mod tests {
                 sender,
                 recipient,
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -4401,6 +4428,8 @@ mod tests {
                 sender,
                 pending,
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -4499,6 +4528,8 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -4562,6 +4593,8 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -4631,6 +4664,8 @@ mod tests {
                 console,
                 recipient.clone(),
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -4721,6 +4756,8 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -4799,6 +4836,8 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        task_contract: None,
+                        supersedes_request_id: None,
                         dispatch_id: None,
                         source_node_id: None,
                         delegation_parent: None,
@@ -4943,6 +4982,8 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -5361,6 +5402,8 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -5491,6 +5534,8 @@ mod tests {
                 console.clone(),
                 recipient.clone(),
                 NewRequest {
+                    task_contract: None,
+                    supersedes_request_id: None,
                     dispatch_id: None,
                     source_node_id: None,
                     delegation_parent: None,
@@ -6058,5 +6103,215 @@ mod tests {
             "only the pane whose work id matches may be typed into: {sends:?}",
         );
         assert_eq!(sends.len(), 2);
+    }
+    #[tokio::test]
+    async fn a_moved_sender_receives_its_reply_at_its_current_pane() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "moving-sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "reviewer", AgentKind::ClaudeCode).await;
+        let initial = worker_participants(
+            &store.snapshot().await,
+            &[collaboration_pane("%1", "0"), collaboration_pane("%2", "1")],
+        );
+        let sender = initial.iter().find(|p| p.pane == "%1").unwrap().clone();
+        let reviewer = initial.iter().find(|p| p.pane == "%2").unwrap().clone();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let request = mailbox
+            .create(
+                sender,
+                reviewer.clone(),
+                NewRequest {
+                    body: "Review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox
+            .reply(
+                &reviewer,
+                &request.id,
+                RequestStatus::Completed,
+                "Findings".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        // Seed the post-move registry binding, rather than simulating a new
+        // Started hook (which deliberately cannot replace an established pane).
+        let moved_store = muxa::Store::shared();
+        let mut moved_agents = store.snapshot().await;
+        moved_agents
+            .iter_mut()
+            .find(|a| a.session_id == "moving-sender")
+            .unwrap()
+            .pane = Some("%9".into());
+        moved_store.seed_if_absent(moved_agents).await;
+        let store = moved_store;
+        add_agent(&store, "%1", "other-session", AgentKind::Codex).await;
+        let panes = vec![
+            collaboration_pane("%1", "0"),
+            collaboration_pane("%2", "1"),
+            collaboration_pane("%9", "2"),
+        ];
+        let participants = worker_participants(&store.snapshot().await, &panes);
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        wake_senders_of_ready_replies(
+            &mailbox,
+            &participants,
+            &[backend],
+            mailbox.pending_reply_unnotified().await,
+            &mut HashSet::new(),
+            &store,
+        )
+        .await;
+        {
+            let sent = sends.lock().unwrap();
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0].0, "%9");
+            assert!(sent[0].1.contains(&request.id));
+        }
+        assert!(mailbox.pending_reply_unnotified().await.is_empty());
+    }
+    #[tokio::test]
+    async fn a_corrupt_mailbox_never_silently_falls_back_to_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.sqlite");
+        std::fs::write(&path, "not a database").unwrap();
+        let mut config = Config::default();
+        config.collaboration.enabled = true;
+        config.collaboration.path = Some(path);
+        assert!(build_collaboration(&config)
+            .await
+            .unwrap()
+            .initialization_error()
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn contract_notices_preserve_the_cli_fallback_even_for_an_old_mcp() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "reviewer", AgentKind::ClaudeCode).await;
+        let participants = worker_participants(
+            &store.snapshot().await,
+            &[collaboration_pane("%1", "0"), collaboration_pane("%2", "1")],
+        );
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let request = mailbox
+            .create(
+                participants[0].clone(),
+                participants[1].clone(),
+                NewRequest {
+                    body: "Review".into(),
+                    task_contract: Some(muxa::collaboration::TaskContract {
+                        version: 1,
+                        task_id: "typed-review".into(),
+                        objective: "Review this revision".into(),
+                        acceptance_criteria: vec!["Check compatibility".into()],
+                        basis_revision: None,
+                        inputs: vec![],
+                    }),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        for prompt in [
+            mailbox_collaboration_request_prompt(&request),
+            interrupted_collaboration_request_prompt(&request),
+        ] {
+            assert!(prompt.contains("typed-review"));
+            assert!(prompt.contains(&request.attempt.as_ref().unwrap().id));
+            assert!(prompt.contains("--report FILE"));
+            assert!(prompt.contains("upgrade/reload"));
+        }
+    }
+
+    #[tokio::test]
+    async fn supersession_finishes_an_already_written_line_before_sending_the_stop_notice() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "reviewer", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = worker_participants(&store.snapshot().await, &panes);
+        let sender = participants
+            .iter()
+            .find(|p| p.pane == "%1")
+            .unwrap()
+            .clone();
+        let reviewer = participants
+            .iter()
+            .find(|p| p.pane == "%2")
+            .unwrap()
+            .clone();
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
+        let input = NewRequest {
+            kind: RequestKind::Review,
+            body: "Original review".into(),
+            task_contract: Some(muxa::collaboration::TaskContract {
+                version: 1,
+                task_id: "review".into(),
+                objective: "Review".into(),
+                acceptance_criteria: vec!["Check code".into()],
+                basis_revision: None,
+                inputs: vec![],
+            }),
+            ..NewRequest::default()
+        };
+        let old = mailbox
+            .create(sender.clone(), reviewer.clone(), input.clone())
+            .await
+            .unwrap();
+        mailbox
+            .prepare_direct_wake(&reviewer, &old.id)
+            .await
+            .unwrap();
+        mailbox.mark_wake_prompt_written(&old.id).await.unwrap();
+        let mut next = input;
+        next.supersedes_request_id = Some(old.id.clone());
+        let mut other = reviewer;
+        other.pane = "%3".into();
+        other.agent_session_id = "other".into();
+        mailbox.create(sender, other, next).await.unwrap();
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        wake_idle_collaboration_peers_with_full_payload(
+            &mailbox,
+            &store,
+            std::slice::from_ref(&backend),
+        )
+        .await;
+        {
+            let sent = sends.lock().unwrap();
+            assert_eq!(sent.len(), 2);
+            assert!(sent[0].1.contains("do not act"));
+            assert_eq!(sent[1], ("%2".into(), "\r".into()));
+        }
+        sends.lock().unwrap().clear();
+        wake_idle_collaboration_peers_with_full_payload(
+            &mailbox,
+            &store,
+            std::slice::from_ref(&backend),
+        )
+        .await;
+        {
+            let sent = sends.lock().unwrap();
+            assert_eq!(sent.len(), 2);
+            assert!(sent[0].1.contains("Its results will not be used"));
+            assert_eq!(sent[1].1, "\r");
+        }
+        sends.lock().unwrap().clear();
+        wake_idle_collaboration_peers_with_full_payload(&mailbox, &store, &[backend]).await;
+        assert!(sends.lock().unwrap().is_empty());
     }
 }

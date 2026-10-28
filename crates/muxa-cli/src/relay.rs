@@ -440,7 +440,15 @@ async fn handle_request(
             request_id,
             pane,
             request,
+        }
+        | RelayRequest::CollaborationSendContract {
+            request_id,
+            pane,
+            request,
         } => {
+            request
+                .validate_fleet_contract()
+                .map_err(anyhow::Error::msg)?;
             exact_backend(&backends, &pane).await?;
             let origin = collaboration_origin(&pane, true);
             let target = format!("pane:{}", pane.pane_id);
@@ -534,6 +542,15 @@ async fn handle_request(
             collaboration_request_id,
             status,
             body,
+            report,
+        }
+        | RelayRequest::CollaborationReplyContract {
+            request_id,
+            pane,
+            collaboration_request_id,
+            status,
+            body,
+            report,
         } => {
             let agent = collaboration_origin(&pane, false);
             let stored = client
@@ -551,7 +568,16 @@ async fn handle_request(
                 agent
             };
             let request = client
-                .collaboration_reply(&agent, &collaboration_request_id, status, &body, &[], &[])
+                .collaboration_reply_report_view(
+                    &agent,
+                    &collaboration_request_id,
+                    status,
+                    &body,
+                    &[],
+                    &[],
+                    report.as_ref(),
+                    muxa::collaboration::CollaborationReadView::Full,
+                )
                 .await
                 .context("replying to collaboration request")?;
             Ok(RelayFrame::Result {
@@ -978,6 +1004,7 @@ mod tests {
                 collaboration_request_id: request.id.clone(),
                 status: RequestStatus::Completed,
                 body: "Use staging only".into(),
+                report: None,
             },
             client.clone(),
             vec![],
