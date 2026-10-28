@@ -8425,12 +8425,15 @@ pub async fn run(
                         app.set_hint(reason, HintLevel::Err);
                         continue;
                     }
-                    if matches!(app.board_pending, Some(BoardPending::Message { .. })) {
-                        app.board_pending = None;
-                    }
                     if let Some(composer) = app.collaboration_composer.take() {
+                        // A board message keeps its draft and frozen recipient
+                        // until it is delivered; a refusal hands both back.
+                        let board_draft =
+                            matches!(app.board_pending, Some(BoardPending::Message { .. }))
+                                .then(|| composer.clone());
                         let (outcome, report) =
                             run_watch_collaboration_composer(client, composer).await;
+                        let outcome = finish_board_message(&mut app, board_draft, outcome);
                         if let Some(report) = report.as_ref() {
                             // A delivered recipient consumes its mark; a failed
                             // one keeps it, so the retry is the same key press
@@ -12344,31 +12347,51 @@ fn board_claim_action(app: &mut App) -> Action {
     }
 }
 
-/// Why a board message composed for one agent must not be sent now: the
-/// agent session in that pane changed, or the pane is gone.
+/// Why a board message composed for one agent session must not be sent
+/// now: that session is no longer running anywhere watch can see. The send
+/// follows the session (it may have moved panes), as the daemon does; this
+/// only saves a round trip the daemon would refuse anyway.
 fn board_message_stale(app: &App) -> Option<String> {
     let Some(BoardPending::Message { pane, session }) = app.board_pending.as_ref() else {
         return None;
     };
-    let current = app
+    let running = app
         .topology
         .sessions
         .iter()
         .flat_map(|s| s.windows.iter())
         .flat_map(|w| w.panes.iter())
-        .find(|node| &node.key == pane)
-        .and_then(|node| node.agent.as_ref())
-        .map(|agent| agent.session_id.clone());
-    match current {
-        Some(current) if &current == session => None,
-        Some(_) => Some(format!(
-            "the agent in {} changed since you started writing — not sent",
+        .filter_map(|node| node.agent.as_ref())
+        .any(|agent| &agent.session_id == session);
+    (!running).then(|| {
+        format!(
+            "the agent you were writing to (in {}) is no longer running — not sent",
             pane_target_label(pane)
-        )),
-        None => Some(format!(
-            "{} is no longer open — not sent",
-            pane_target_label(pane)
-        )),
+        )
+    })
+}
+
+/// Settle a board message after the send: delivered ends the board's
+/// authority; anything else puts the draft and its frozen recipient back so
+/// nothing typed is lost. It is never re-sent automatically — a send whose
+/// fate is unknown may have landed.
+fn finish_board_message(
+    app: &mut App,
+    draft: Option<CollaborationComposer>,
+    outcome: ActionOutcome,
+) -> ActionOutcome {
+    let Some(draft) = draft else {
+        return outcome;
+    };
+    match outcome {
+        ActionOutcome::Err(error) => {
+            app.collaboration_composer = Some(draft);
+            ActionOutcome::Err(format!("{error} — draft kept; Enter retries, Esc drops it"))
+        }
+        delivered => {
+            app.board_pending = None;
+            delivered
+        }
     }
 }
 
@@ -30634,10 +30657,77 @@ sort = ["state"]
             )],
             panes,
         );
-        assert!(board_message_stale(&app).is_some_and(|reason| reason.contains("changed")));
+        assert!(
+            board_message_stale(&app).is_some_and(|reason| reason.contains("no longer running"))
+        );
         // Cancelling ends the board's authority over that recipient.
         let _ = gate_board_action(&mut app, Action::CancelCollaborationComposer);
         assert!(app.board_pending.is_none());
+    }
+
+    #[test]
+    fn a_board_message_the_daemon_refuses_keeps_its_draft_and_recipient() {
+        let (mut app, _) = board_ready_to_message();
+        let _ = press_key(&mut app, KeyCode::Char('m'));
+        open_watch_collaboration_composer(&mut app);
+        for c in "hello".chars() {
+            let _ = press_key(&mut app, KeyCode::Char(c));
+        }
+        // The cached topology still shows the session, so watch lets it go…
+        assert!(board_message_stale(&app).is_none());
+        let pending = app.board_pending.clone();
+        let draft = app.collaboration_composer.take();
+        // …and the daemon refuses it: the session is gone.
+        let outcome = finish_board_message(
+            &mut app,
+            draft,
+            ActionOutcome::Err("collaboration send failed: unknown target session:%1".into()),
+        );
+        assert!(matches!(outcome, ActionOutcome::Err(ref m) if m.contains("draft kept")));
+        match app.collaboration_composer.as_ref() {
+            Some(CollaborationComposer {
+                target: CollaborationComposeTarget::Send { target, .. },
+                input,
+                ..
+            }) => assert_eq!((target.as_str(), input.as_str()), ("session:%1", "hello")),
+            other => panic!("the draft must come back, got {other:?}"),
+        }
+        assert_eq!(
+            app.board_pending, pending,
+            "and its frozen recipient with it"
+        );
+        // Delivered ends both.
+        let draft = app.collaboration_composer.take();
+        let _ = finish_board_message(&mut app, draft, ActionOutcome::Ok("sent".into()));
+        assert!(app.board_pending.is_none() && app.collaboration_composer.is_none());
+    }
+
+    #[test]
+    fn a_board_message_follows_its_session_to_another_pane() {
+        let (mut app, _) = board_ready_to_message();
+        let _ = press_key(&mut app, KeyCode::Char('m'));
+        let panes: Vec<PaneInfo> = ["%1", "%2", "%3"]
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| {
+                fake_topology_pane(
+                    "/tmp/a",
+                    "$1",
+                    "callabo",
+                    "@4",
+                    "CAL-1",
+                    1,
+                    pane,
+                    u32::try_from(index).unwrap(),
+                )
+            })
+            .collect();
+        // Session %1 was moved to pane %3.
+        app.set_data(
+            vec![topology_agent("%1", "%3", "a", AgentState::Working, "", 0)],
+            panes,
+        );
+        assert!(board_message_stale(&app).is_none());
     }
 
     #[test]
