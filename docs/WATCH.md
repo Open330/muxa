@@ -309,7 +309,11 @@ agent: its pane and agent session are fixed when you press it, and the message
 is not sent if a different agent has started in that pane meanwhile. In window
 scope the agent must be in this room; `[collaboration] scope = "host"` reaches
 any pane, and an id that repeats across servers is refused rather than guessed.
-Topology marks (`Space`) do not apply here. `b` (or `M`) opens that agent's
+Topology marks (`Space`) do not apply here. The detail also counts the Work's
+open collaboration — unfinished requests to its agents and from them, across
+every Run, each request once — from a history listing refreshed every fifteen
+seconds while the board shows (it never claims anything), and says
+`unavailable` rather than zero when the listing fails. `b` (or `M`) opens that agent's
 mailbox, read-only until you act; `i` claims its queued requests and `e`
 replies, both as that agent, never as the console. In any mailbox, `x` on the
 Sent tab withdraws a request this console sent that is still queued, after a

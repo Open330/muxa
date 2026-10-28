@@ -305,6 +305,41 @@ fn attention_order(
     )
 }
 
+/// Collaboration traffic of a Work's agents, from a history listing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CollabSummary {
+    /// Unfinished requests addressed to one of its agents.
+    pub(crate) open_to: usize,
+    /// Unfinished requests one of its agents sent.
+    pub(crate) open_from: usize,
+}
+
+/// Count unfinished requests to and from every agent of every Run of the
+/// Work, by exact agent session, each request once. A request between two of
+/// its own agents counts on both sides: it is both owed and awaited.
+pub(crate) fn collab_summary(
+    work: &WorkSnapshotItem,
+    requests: &[muxa::collaboration::CollaborationRequest],
+) -> CollabSummary {
+    let sessions: std::collections::HashSet<&str> = agents(work)
+        .map(|agent| agent.session_id.as_str())
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let mut summary = CollabSummary::default();
+    for request in requests {
+        if request.status.is_terminal() || !seen.insert(request.id.as_str()) {
+            continue;
+        }
+        if !request.to.console && sessions.contains(request.to.agent_session_id.as_str()) {
+            summary.open_to += 1;
+        }
+        if !request.from.console && sessions.contains(request.from.agent_session_id.as_str()) {
+            summary.open_from += 1;
+        }
+    }
+    summary
+}
+
 /// Agents of the Work that are working or starting.
 pub(crate) fn busy_agents(work: &WorkSnapshotItem) -> usize {
     agents(work)
