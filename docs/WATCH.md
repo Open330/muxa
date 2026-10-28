@@ -288,7 +288,9 @@ not move it. `o` previews that same pane.
 
 `Tab` / `]` and `Shift-Tab` / `[` move an agent cursor through the selected
 Work's live agents (every Run, marked `▸` in the detail); it follows that exact
-pane across refreshes. `p` types a prompt into that agent and `P` into every live
+pane across refreshes. `Enter` and `o` go to that agent's pane (a Work with no
+live agent falls back to its Run), `c` copies its last prompt, and `K` closes
+its pane after a confirmation. `p` types a prompt into that agent and `P` into every live
 agent of the Work; `R` interrupts that agent and `A` every one, after a
 confirmation naming them. The targets are fixed when the prompt or confirmation
 opens, so a refresh meanwhile cannot redirect them, and each is written once,

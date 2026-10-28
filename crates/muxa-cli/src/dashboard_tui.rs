@@ -84,6 +84,40 @@ enum DashboardSort {
     Name,
 }
 
+impl Args {
+    /// The Work board's order for this invocation. `active` ordered cards by
+    /// active time, which the board cannot attribute per Work yet; it is
+    /// refused rather than quietly mapped to something else.
+    pub(crate) fn board_sort(&self) -> Result<muxa::config::WatchBoardSort> {
+        use muxa::config::WatchBoardSort;
+        Ok(match self.sort {
+            DashboardSort::Attention => WatchBoardSort::Attention,
+            DashboardSort::Activity => WatchBoardSort::Activity,
+            DashboardSort::Name => WatchBoardSort::Name,
+            DashboardSort::Active => anyhow::bail!(
+                "`--sort active` ordered Works by active time, which the Work board cannot \
+                 attribute per Work yet; use --sort attention, activity or name (or `busy` \
+                 in the board for agents at work), or `--legacy` for the old dashboard"
+            ),
+        })
+    }
+
+    /// The ACT/WACT window, checked the way `muxa stats --since` checks it.
+    pub(crate) fn board_since(&self) -> Result<String> {
+        crate::stats::parse_since(&self.since, time::OffsetDateTime::now_utc())
+            .with_context(|| format!("invalid --since {:?}", self.since))?;
+        Ok(self.since.clone())
+    }
+
+    pub(crate) fn include_paneless(&self) -> bool {
+        self.include_paneless
+    }
+
+    pub(crate) fn theme(&self) -> Option<ThemeArg> {
+        self.theme
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OpenTarget {
     TopologyPane(PaneKey),

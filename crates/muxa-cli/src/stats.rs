@@ -2405,7 +2405,7 @@ fn prompt_metrics(prompt: &HistoryEntry) -> PromptMetrics {
     }
 }
 
-fn parse_since(raw: &str, now: OffsetDateTime) -> Result<TimeRange> {
+pub(crate) fn parse_since(raw: &str, now: OffsetDateTime) -> Result<TimeRange> {
     crate::time_range::parse_since(raw, now, "all retained history")
 }
 
