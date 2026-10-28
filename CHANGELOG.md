@@ -14,8 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `K` closes it. `--since`, `--sort attention|activity|name`,
   `--include-paneless` and `--theme` carry over for the run; `--sort active` is
   refused (active time cannot be attributed per Work yet) and per-card
-  ACT/WACT gives way to an all-sessions summary. `--legacy` opens the old
-  console for one release. See docs/DASHBOARD_CLI.md.
+  ACT/WACT gives way to an all-sessions summary. The card console is
+  removed. See docs/DASHBOARD_CLI.md.
 
 ### Added
 

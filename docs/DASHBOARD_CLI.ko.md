@@ -51,4 +51,4 @@ muxa dashboard --theme mono
   합계가 나옵니다.
 - **muxa가 소유한 PTY session**은 Work가 아니어서 나오지 않습니다. `muxa watch`가
   보여줍니다.
-- `muxa dashboard --legacy`는 한 릴리스 동안 이전 콘솔을 엽니다.
+- 이전 카드 콘솔은 제거되었습니다.

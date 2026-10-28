@@ -13,7 +13,7 @@ mod collaboration_output;
 mod config_cmd;
 mod config_sync_cmd;
 mod daemon;
-mod dashboard_tui;
+mod dashboard_cmd;
 mod doctor;
 mod doctor_report;
 mod fleet_cli;
@@ -247,7 +247,7 @@ enum Cmd {
     Timeline(timeline::Args),
     /// The Work board: `muxa watch` opened on its board screen, tracking Work,
     /// Runs, external issues, agents and their collaboration.
-    Dashboard(DashboardArgs),
+    Dashboard(dashboard_cmd::Args),
     /// Explore session/window/pane message connections in an interactive terminal graph.
     Graph(graph::Args),
     /// Former name of `muxa stats activity`.
@@ -1648,13 +1648,9 @@ async fn main() -> Result<()> {
         Cmd::Stats(stats_command) => stats::run_command(&client, &cfg, stats_command).await,
         Cmd::Report(report) => stats::run_report(&client, &cfg, &report.window, report.args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
-        Cmd::Dashboard(DashboardArgs { legacy: true, args }) => {
-            cmd_dashboard(&client, &cfg, args).await
+        Cmd::Dashboard(args) => {
+            cmd_dashboard(&client, cfg.clone(), config_path.clone(), &args).await
         }
-        Cmd::Dashboard(DashboardArgs {
-            legacy: false,
-            args,
-        }) => cmd_dashboard_board(&client, cfg.clone(), config_path.clone(), &args).await,
         Cmd::Graph(args) => graph::run(&cfg, args).await,
         Cmd::Activity(activity) => activity_query::run(&cfg, &activity.window, activity.args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
@@ -3563,23 +3559,13 @@ pub(crate) async fn cmd_watch(
     Ok(())
 }
 
-#[derive(Debug, Clone, clap::Args)]
-pub(crate) struct DashboardArgs {
-    /// Open the previous dashboard instead of the Work board. Kept for one
-    /// release while the board replaces it.
-    #[arg(long, hide = true)]
-    legacy: bool,
-    #[command(flatten)]
-    args: dashboard_tui::Args,
-}
-
 /// `muxa dashboard`: `muxa watch` on its Work board screen, with the
 /// dashboard's flags carried over for this run only.
-async fn cmd_dashboard_board(
+async fn cmd_dashboard(
     client: &Client,
     mut cfg: Config,
     config_path: Option<PathBuf>,
-    args: &dashboard_tui::Args,
+    args: &dashboard_cmd::Args,
 ) -> Result<()> {
     cfg.watch.board_sort = args.board_sort()?;
     cfg.watch.board_since = Some(args.board_since()?);
@@ -3598,32 +3584,6 @@ async fn cmd_dashboard_board(
         },
     )
     .await
-}
-
-async fn cmd_dashboard(client: &Client, cfg: &Config, args: dashboard_tui::Args) -> Result<()> {
-    let activity_path = cfg
-        .activity
-        .enabled
-        .then(|| {
-            cfg.activity
-                .path
-                .clone()
-                .or_else(paths::default_activity_file)
-        })
-        .flatten();
-    match dashboard_tui::run(client, cfg, args).await? {
-        Some(dashboard_tui::OpenTarget::TopologyPane(key)) => {
-            jump_to_topology_pane_logged(&key, activity_path.as_deref()).await;
-        }
-        Some(dashboard_tui::OpenTarget::Pane(pane_id)) => {
-            jump_to_pane_logged(&pane_id, activity_path.as_deref()).await;
-        }
-        Some(dashboard_tui::OpenTarget::PtySession(session_id)) => {
-            attach_session(client, &session_id).await?;
-        }
-        None => {}
-    }
-    Ok(())
 }
 
 async fn jump_to_pane_logged(pane_id: &str, activity_path: Option<&Path>) {
@@ -3932,17 +3892,6 @@ pub(crate) fn backend_for_kind(kind: muxa::HostKind) -> muxa::SharedBackend {
         muxa::HostKind::Rmux => std::sync::Arc::new(muxa::RmuxBackend::new()),
         muxa::HostKind::Zellij => std::sync::Arc::new(muxa::ZellijBackend::new()),
         muxa::HostKind::Herdr => std::sync::Arc::new(muxa::backend::herdr::HerdrBackend::new()),
-    }
-}
-
-/// Resolve the backend that owns `pane_id` by its namespace, falling back
-/// to the process-global backend for unrecognized ids. Used by the live
-/// pane-capture paths (`watch` preview, `dashboard` capture) so a capture
-/// hits the host the pane actually lives on.
-pub(crate) fn backend_for_pane(pane_id: &str) -> muxa::SharedBackend {
-    match muxa::backend::pane_id_host_kind(pane_id) {
-        Some(kind) => backend_for_kind(kind),
-        None => muxa::default_backend(),
     }
 }
 
@@ -5304,7 +5253,7 @@ mod tests {
         ));
     }
 
-    fn dashboard(argv: &[&str]) -> DashboardArgs {
+    fn dashboard(argv: &[&str]) -> dashboard_cmd::Args {
         let mut full = vec!["muxa", "dashboard"];
         full.extend_from_slice(argv);
         let Some(Cmd::Dashboard(parsed)) = Args::try_parse_from(full).unwrap().cmd else {
@@ -5316,12 +5265,11 @@ mod tests {
     #[test]
     fn dashboard_flags_carry_over_to_the_work_board() {
         let defaults = dashboard(&[]);
-        assert!(!defaults.legacy);
         assert_eq!(
-            defaults.args.board_sort().unwrap(),
+            defaults.board_sort().unwrap(),
             muxa::config::WatchBoardSort::Attention
         );
-        assert_eq!(defaults.args.board_since().unwrap(), "today");
+        assert_eq!(defaults.board_since().unwrap(), "today");
         let chosen = dashboard(&[
             "--sort",
             "name",
@@ -5332,23 +5280,19 @@ mod tests {
             "mono",
         ]);
         assert_eq!(
-            chosen.args.board_sort().unwrap(),
+            chosen.board_sort().unwrap(),
             muxa::config::WatchBoardSort::Name
         );
-        assert_eq!(chosen.args.board_since().unwrap(), "7d");
-        assert!(chosen.args.include_paneless());
-        assert!(matches!(chosen.args.theme(), Some(ThemeArg::Mono)));
+        assert_eq!(chosen.board_since().unwrap(), "7d");
+        assert!(chosen.include_paneless());
+        assert!(matches!(chosen.theme(), Some(ThemeArg::Mono)));
         // Active time cannot be attributed per Work yet: refused, not remapped.
-        let active = dashboard(&["--sort", "active"])
-            .args
-            .board_sort()
-            .unwrap_err();
+        let active = dashboard(&["--sort", "active"]).board_sort().unwrap_err();
         assert!(active.to_string().contains("active time"), "{active}");
         assert!(dashboard(&["--since", "yesterdayish"])
-            .args
             .board_since()
             .is_err());
-        assert!(dashboard(&["--legacy"]).legacy);
+        assert!(Args::try_parse_from(["muxa", "dashboard", "--legacy"]).is_err());
     }
 
     #[test]
