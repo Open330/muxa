@@ -10667,10 +10667,10 @@ const BOARD_REFUSAL: &str = "not on the Work board yet — Alt-1 to act on the t
 /// Browsing keys whose handlers act on the topology cursor directly — open a
 /// form for it, or move it — before any `Action` exists for the outer gate to
 /// refuse. Typing into a filter is unaffected: these only apply while browsing.
-fn board_refuses_key(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> bool {
-    if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
-        return false;
-    }
+/// Modifiers do not matter: the shared branches match the bare key, so Ctrl-N
+/// would open the same form. Alt never gets here, and the board's own Ctrl
+/// bindings were consumed before this runs.
+fn board_refuses_key(code: KeyCode, app: &mut App) -> bool {
     let refused = match code {
         // Expand and collapse the hidden tree.
         KeyCode::Left | KeyCode::Right => return true,
@@ -10943,7 +10943,7 @@ fn handle_event_on_any_screen(ev: Event, app: &mut App) -> Action {
         if let Some(action) = handle_board_screen_key(code, modifiers, app) {
             return action;
         }
-        if board_refuses_key(code, modifiers, app) {
+        if board_refuses_key(code, app) {
             return Action::None;
         }
     }
@@ -29578,12 +29578,27 @@ sort = ["state"]
             );
             assert!(app.work_composer.is_none(), "{c} opened the work composer");
         }
-        for arrow in [KeyCode::Left, KeyCode::Right] {
-            let _ = handle_event(
-                Event::Key(KeyEvent::new(arrow, KeyModifiers::NONE)),
-                &mut app,
-            );
+        for modifiers in [KeyModifiers::NONE, KeyModifiers::CONTROL] {
+            for arrow in [KeyCode::Left, KeyCode::Right] {
+                let _ = handle_event(Event::Key(KeyEvent::new(arrow, modifiers)), &mut app);
+            }
+            for c in ['n', 'h', 'l', 'R'] {
+                let _ = handle_event(
+                    Event::Key(KeyEvent::new(KeyCode::Char(c), modifiers)),
+                    &mut app,
+                );
+                assert!(app.spawn.is_none(), "{modifiers:?}-{c} opened spawn");
+                assert!(app.rename.is_none(), "{modifiers:?}-{c} opened rename");
+            }
         }
+        // The board's own Ctrl bindings are consumed before the refusal.
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL)),
+                &mut app
+            ),
+            Action::Refresh
+        ));
         assert_eq!(
             app.selected_node_key(),
             selected,
