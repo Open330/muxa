@@ -455,6 +455,14 @@ pub trait PaneBackend: Send + Sync + 'static {
         PaneObservation::complete(self.list_panes())
     }
 
+    /// Panes with their `@muxa_*` Work marks, for building the Work
+    /// projection. `None` for backends that cannot carry those marks; their
+    /// panes then join the projection unmarked (never as a Work), rather than
+    /// having a Work inferred from ids an agent was stamped with.
+    fn work_panes(&self) -> Option<Vec<(PaneInfo, crate::tmux::scanner::MuxaPaneMetadata)>> {
+        None
+    }
+
     /// Look up a single pane by id. Returns `None` for unknown ids and
     /// for hosts that can't answer the query (rare).
     fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo>;

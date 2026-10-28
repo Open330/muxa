@@ -38,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Works on rmux (and other non-tmux backends) show up on the Work board.
   Their panes lost the `muxa work` marks on the way into the Work projection,
   so every such Work was counted as an unlinked execution; `muxa dashboard`
-  also scanned tmux only and showed no Work at all on an rmux host.
+  also scanned tmux only and showed no Work at all on an rmux host. rmux rows
+  are now read with their `@muxa_*` marks (Work and issue) like tmux rows, so
+  only windows explicitly marked as a Work become one.
 
 ## [0.9.3] - 2026-10-28
 

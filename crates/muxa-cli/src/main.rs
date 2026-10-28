@@ -3420,6 +3420,13 @@ pub(crate) async fn cmd_fleet_watch(
     if fleet_watch::uses_native_local_watch(&initial) {
         return cmd_watch(client, cfg, config_path, invocation.clone()).await;
     }
+    // The Work board reads this host's Work records and multiplexers; under
+    // a host header it would pass off one host's Works as the fleet's.
+    if matches!(invocation.screen, Some(WatchScreenArg::Board)) {
+        anyhow::bail!(
+            "the Work board is local to this host; run `muxa watch --screen board` without --fleet"
+        );
+    }
     fleet_watch::run(
         client.clone(),
         &cfg,

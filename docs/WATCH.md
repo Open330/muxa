@@ -284,8 +284,12 @@ are not rows here. Typing filters on title, workspace, Work id, goal, next
 action and issue key. `Enter` goes to the Run's pane — the agent waiting on you
 if there is one — on that exact server; a Work with no live Run says so. The
 cursor follows the Work, not the row, so a refresh that reorders the board does
-not move it. The board rescans every three seconds while it is on show and
-never otherwise.
+not move it. `o` previews that same pane. Actions that aim at a topology node —
+kill, abort, message, move, rename — are refused here rather than applied to
+whatever the hidden topology cursor last pointed at; `Alt-1` gets them back.
+The board rescans every three seconds while it is on show, in the background so
+a slow multiplexer never stalls the keyboard, and never otherwise. It is local
+to this host: `--fleet --screen board` is refused when other hosts are present.
 
 A row can only hold an excerpt, so the selected request also opens in a detail
 pane under the table: both ends with their rooms, the kind and delivery mode it

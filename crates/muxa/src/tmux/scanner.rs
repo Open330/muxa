@@ -409,39 +409,44 @@ fn parse_scanned_panes(stdout: &str, socket: &str) -> Vec<ScannedPane> {
         .zip(stdout.lines().filter(|line| line.split('\t').count() >= 7))
         .map(|(pane, line)| {
             let columns = line.split('\t').collect::<Vec<_>>();
-            let value = |index: usize| {
-                columns
-                    .get(index)
-                    .map(|value| value.trim())
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-            };
-            let workspace_id = value(22).or_else(|| value(12));
-            let work_id = value(23).or_else(|| value(15));
             ScannedPane {
                 pane,
-                muxa: MuxaPaneMetadata {
-                    managed_workspace: columns.get(14).is_some_and(|value| *value == "1"),
-                    managed_work: columns.get(17).is_some_and(|value| *value == "1"),
-                    managed_agent: columns.get(21).is_some_and(|value| *value == "1"),
-                    workspace_id,
-                    workspace_cwd: value(13),
-                    work_id,
-                    work_cwd: value(16),
-                    agent: value(18),
-                    role: value(19),
-                    task: value(20),
-                    external_source: value(24),
-                    external_scope: value(25),
-                    external_stable_id: value(26),
-                    external_key: value(27),
-                    external_title: value(28),
-                    external_url: value(29),
-                    external_status: value(30),
-                },
+                muxa: muxa_metadata_from_columns(&columns),
             }
         })
         .collect()
+}
+
+/// The `@muxa_*` marks of one [`crate::tmux::PANE_FMT`] row. Shared by every
+/// backend that lists panes in that format (tmux and rmux), so a Work is
+/// recognised by its explicit `@muxa_managed_work` mark on both.
+pub(crate) fn muxa_metadata_from_columns(columns: &[&str]) -> MuxaPaneMetadata {
+    let value = |index: usize| {
+        columns
+            .get(index)
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    MuxaPaneMetadata {
+        managed_workspace: columns.get(14).is_some_and(|value| *value == "1"),
+        managed_work: columns.get(17).is_some_and(|value| *value == "1"),
+        managed_agent: columns.get(21).is_some_and(|value| *value == "1"),
+        workspace_id: value(22).or_else(|| value(12)),
+        workspace_cwd: value(13),
+        work_id: value(23).or_else(|| value(15)),
+        work_cwd: value(16),
+        agent: value(18),
+        role: value(19),
+        task: value(20),
+        external_source: value(24),
+        external_scope: value(25),
+        external_stable_id: value(26),
+        external_key: value(27),
+        external_title: value(28),
+        external_url: value(29),
+        external_status: value(30),
+    }
 }
 
 fn is_no_server_running(stderr: &str) -> bool {

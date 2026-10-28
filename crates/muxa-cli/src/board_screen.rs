@@ -48,6 +48,17 @@ impl BoardScreen {
         let mut works = snapshot.works;
         works.sort_by_key(attention_order);
         self.works = works;
+        // Commit the Work the cursor shows, so the next reordering refresh
+        // keeps it: on first load, and when the selected Work is gone. A
+        // Work a filter merely hides keeps its identity for when the filter
+        // is cleared.
+        let present = self
+            .selected
+            .as_ref()
+            .is_some_and(|selected| self.works.iter().any(|work| &work.identity == selected));
+        if !present {
+            self.selected = self.works.first().map(|work| work.identity.clone());
+        }
         self.unlinked = snapshot.unlinked_executions.len();
         self.notes = notes;
         self.loaded = true;
@@ -116,6 +127,34 @@ impl BoardScreen {
             .visible(filter)
             .last()
             .map(|work| work.identity.clone());
+    }
+}
+
+/// Attach the issue marks found on a Work's panes that its record does not
+/// carry yet. Display only: the daemon is what persists them.
+pub(crate) fn attach_pane_issues(
+    snapshot: &mut WorkSnapshot,
+    panes: &[muxa::tmux::scanner::PaneSummary],
+    at: OffsetDateTime,
+) {
+    for pane in muxa::tmux::canonical_panes(panes) {
+        let Some((identity, item)) = muxa::work::external_item_for_pane(&pane, at) else {
+            continue;
+        };
+        let Some(work) = snapshot
+            .works
+            .iter_mut()
+            .find(|work| work.identity == identity)
+        else {
+            continue;
+        };
+        let known = work
+            .external_items
+            .iter()
+            .any(|known| known.source == item.source && known.display_key == item.display_key);
+        if !known {
+            work.external_items.push(item);
+        }
     }
 }
 
@@ -332,15 +371,14 @@ pub(crate) fn detail_lines<'a>(
     for run in &work.runs {
         lines.push(Line::from(Span::styled(
             format!(
-                "run {}:{}  {:?}{}",
+                "run {}:{}  {}{}",
                 run.session_name,
                 run.window_name,
-                run.state,
+                format!("{:?}", run.state).to_lowercase(),
                 run.cwd
                     .as_deref()
                     .map_or_else(String::new, |cwd| format!("  {cwd}"))
-            )
-            .to_lowercase(),
+            ),
             theme.dim_style(),
         )));
         for pane in &run.panes {
@@ -545,6 +583,79 @@ mod tests {
         );
         assert_eq!(board.selected_index(""), 0);
         assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-2");
+    }
+
+    #[test]
+    fn the_first_load_commits_the_cursor_so_a_reorder_does_not_move_it() {
+        let mut board = BoardScreen::default();
+        board.set_snapshot(
+            snapshot(vec![
+                work("CAL-1", BoardStage::InProgress, Vec::new(), 1),
+                work("CAL-2", BoardStage::InProgress, Vec::new(), 2),
+            ]),
+            Vec::new(),
+        );
+        // No navigation: the operator is looking at CAL-1.
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-1");
+        board.set_snapshot(
+            snapshot(vec![
+                work("CAL-1", BoardStage::InProgress, Vec::new(), 1),
+                work("CAL-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
+            ]),
+            Vec::new(),
+        );
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-1");
+        // The selected Work goes away: the cursor commits to the new first row.
+        board.set_snapshot(
+            snapshot(vec![
+                work("CAL-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
+                work("CAL-3", BoardStage::Queued, Vec::new(), 3),
+            ]),
+            Vec::new(),
+        );
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-2");
+        board.set_snapshot(
+            snapshot(vec![
+                work("CAL-3", BoardStage::Queued, vec![WorkSignal::Error], 3),
+                work("CAL-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
+            ]),
+            Vec::new(),
+        );
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-2");
+    }
+
+    #[test]
+    fn pane_issue_marks_show_on_their_work_once() {
+        let mut snap = snapshot(vec![work("CAL-1", BoardStage::Queued, Vec::new(), 1)]);
+        let pane = muxa::tmux::scanner::PaneSummary {
+            host: muxa::backend::HostKind::Rmux,
+            pane_id: "rmux:%1".into(),
+            session_id: "$1".into(),
+            session: "callabo".into(),
+            window_id: "@1".into(),
+            window_name: "CAL-1".into(),
+            window_index: "1".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: String::new(),
+            title: String::new(),
+            current_path: String::new(),
+            socket: "/tmp/rmux/default".into(),
+            muxa: muxa::tmux::scanner::MuxaPaneMetadata {
+                managed_work: true,
+                workspace_id: Some("callabo".into()),
+                work_id: Some("CAL-1".into()),
+                external_source: Some("linear".into()),
+                external_key: Some("CAL-1".into()),
+                ..Default::default()
+            },
+            attach_command: String::new(),
+        };
+        let panes = [pane.clone(), pane];
+        attach_pane_issues(&mut snap, &panes, OffsetDateTime::UNIX_EPOCH);
+        attach_pane_issues(&mut snap, &panes, OffsetDateTime::UNIX_EPOCH);
+        assert_eq!(snap.works[0].external_items.len(), 1);
+        assert_eq!(snap.works[0].external_items[0].display_key, "CAL-1");
     }
 
     #[test]

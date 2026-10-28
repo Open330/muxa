@@ -20,6 +20,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use super::{HostKind, PaneBackend, PaneObservation};
+use crate::tmux::scanner::MuxaPaneMetadata;
 use crate::tmux::{PaneInfo, PANE_FMT};
 
 /// Namespace prefix for rmux pane ids inside muxa.
@@ -145,6 +146,15 @@ impl RmuxBackend {
     }
 
     fn scan_panes(&self, target: Option<&str>) -> PaneObservation {
+        match self.list_panes_output(target) {
+            Some(stdout) => parse_pane_observation(&stdout, self.endpoint.as_deref()),
+            None => PaneObservation::incomplete(Vec::new()),
+        }
+    }
+
+    /// Raw `list-panes` rows in [`PANE_FMT`] plus the socket path, or `None`
+    /// when the server could not be asked.
+    fn list_panes_output(&self, target: Option<&str>) -> Option<String> {
         let format = format!("{PANE_FMT}\t#{{socket_path}}");
         let mut args = vec!["list-panes"];
         if let Some(target) = target {
@@ -153,15 +163,13 @@ impl RmuxBackend {
             args.push("-a");
         }
         args.extend(["-F", &format]);
-        let Ok(command) = self.control_command(&args) else {
-            return PaneObservation::incomplete(Vec::new());
-        };
+        let command = self.control_command(&args).ok()?;
 
         let output = match command_output(command, None) {
             Ok(output) => output,
             Err(error) => {
                 tracing::debug!(%error, "rmux pane observation failed");
-                return PaneObservation::incomplete(Vec::new());
+                return None;
             }
         };
         if !output.status.success() {
@@ -171,20 +179,19 @@ impl RmuxBackend {
             // servers it cannot enumerate. Without endpoint scope on an empty
             // response, treating this as globally complete would reap them.
             if stderr.starts_with("no server running on") {
-                return PaneObservation::incomplete(Vec::new());
+                return None;
             }
             tracing::debug!(%stderr, "rmux list-panes returned non-zero");
-            return PaneObservation::incomplete(Vec::new());
+            return None;
         }
 
-        let stdout = match String::from_utf8(output.stdout) {
-            Ok(stdout) => stdout,
+        match String::from_utf8(output.stdout) {
+            Ok(stdout) => Some(stdout),
             Err(error) => {
                 tracing::debug!(%error, "rmux list-panes returned non-UTF-8 output");
-                return PaneObservation::incomplete(Vec::new());
+                None
             }
-        };
-        parse_pane_observation(&stdout, self.endpoint.as_deref())
+        }
     }
 
     fn capture_on(&self, endpoint: Option<&str>, pane_id: &str) -> Option<String> {
@@ -269,6 +276,11 @@ impl PaneBackend for RmuxBackend {
 
     fn list_panes(&self) -> Vec<PaneInfo> {
         self.scan_panes(None).panes
+    }
+
+    fn work_panes(&self) -> Option<Vec<(PaneInfo, MuxaPaneMetadata)>> {
+        let stdout = self.list_panes_output(None)?;
+        Some(parse_work_panes(&stdout, self.endpoint.as_deref()))
     }
 
     fn observe_panes(&self) -> PaneObservation {
@@ -489,6 +501,28 @@ pub fn qualified_pane_target(session: &str, window: &str, pane: &str) -> Option<
         }
     }
     Some(format!("{session}:{window}.{pane}"))
+}
+
+/// Panes with their `@muxa_*` marks, read from the same rows as
+/// [`parse_pane_observation`].
+fn parse_work_panes(stdout: &str, endpoint: Option<&str>) -> Vec<(PaneInfo, MuxaPaneMetadata)> {
+    let width = PANE_FMT.split('\t').count();
+    let mut panes = Vec::new();
+    for line in stdout.lines().filter(|line| !line.is_empty()) {
+        let columns = line.split('\t').collect::<Vec<_>>();
+        let row_endpoint = endpoint.or_else(|| {
+            columns
+                .get(width)
+                .copied()
+                .filter(|value| !value.trim().is_empty())
+        });
+        let marks = crate::tmux::scanner::muxa_metadata_from_columns(&columns);
+        for mut pane in crate::tmux::parse_pane_lines_for_socket(line, row_endpoint) {
+            pane.pane_id = namespace_pane_id(&pane.pane_id);
+            panes.push((pane, marks.clone()));
+        }
+    }
+    panes
 }
 
 fn parse_pane_observation(stdout: &str, endpoint: Option<&str>) -> PaneObservation {
@@ -763,6 +797,25 @@ mod tests {
         assert_eq!(pane.pane_pid, 4242);
         assert_eq!(pane.agent_program.as_deref(), Some("codex"));
         assert_eq!(pane.socket.as_deref(), Some("/tmp/rmux.sock"));
+    }
+
+    #[test]
+    fn work_rows_keep_the_explicit_managed_work_mark_and_issue() {
+        let unmarked = full_row("/tmp/row.sock");
+        let mut cols: Vec<String> = unmarked.split('\t').map(str::to_string).collect();
+        cols[15] = "CAL-1".into();
+        cols[17] = "1".into();
+        cols[24] = "linear".into();
+        cols[27] = "CAL-1".into();
+        let marked = cols.join("\t");
+        let rows = parse_work_panes(&format!("{marked}\n{unmarked}\n"), None);
+        assert_eq!(rows.len(), 2);
+        let (pane, marks) = &rows[0];
+        assert_eq!(pane.pane_id, "rmux:%7");
+        assert!(marks.managed_work);
+        assert_eq!(marks.work_id.as_deref(), Some("CAL-1"));
+        assert_eq!(marks.external_key.as_deref(), Some("CAL-1"));
+        assert!(!rows[1].1.managed_work, "no mark, no Work");
     }
 
     #[test]

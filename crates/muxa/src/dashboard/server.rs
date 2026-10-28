@@ -312,14 +312,23 @@ pub async fn multi_host_pane_scan(backends: Arc<Vec<SharedBackend>>) -> scanner:
     let backend_scan = tokio::task::spawn_blocking(move || {
         non_tmux
             .into_iter()
-            .map(|backend| (backend.kind(), backend.list_panes()))
+            .map(|backend| {
+                let panes = backend.work_panes().unwrap_or_else(|| {
+                    backend
+                        .list_panes()
+                        .into_iter()
+                        .map(|pane| (pane, MuxaPaneMetadata::default()))
+                        .collect()
+                });
+                (backend.kind(), panes)
+            })
             .collect::<Vec<_>>()
     });
     let (mut scan, backend_rows) = tokio::join!(scanner::scan(), backend_scan);
     if let Ok(backend_rows) = backend_rows {
         for (kind, panes) in backend_rows {
             let additional = if kind == HostKind::Herdr {
-                scanner::herdr_scan_result(panes)
+                scanner::herdr_scan_result(panes.into_iter().map(|(pane, _)| pane).collect())
             } else {
                 backend_scan_result(kind, panes)
             };
@@ -332,10 +341,13 @@ pub async fn multi_host_pane_scan(backends: Arc<Vec<SharedBackend>>) -> scanner:
 /// Convert a non-tmux backend's common `PaneInfo` rows to the dashboard wire
 /// shape. rmux retains its full socket path; hosts without endpoint paths use
 /// a stable host label. Bare-terminal attach commands remain tmux-only.
-fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> scanner::ScanResult {
+fn backend_scan_result(
+    kind: HostKind,
+    panes: Vec<(crate::tmux::PaneInfo, MuxaPaneMetadata)>,
+) -> scanner::ScanResult {
     let panes = panes
         .into_iter()
-        .map(|pane| {
+        .map(|(pane, muxa)| {
             let socket = match kind {
                 HostKind::Rmux | HostKind::Cmux => pane
                     .socket
@@ -347,18 +359,6 @@ fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> sca
                     .socket
                     .as_deref()
                     .map_or_else(|| PathBuf::from("tmux"), PathBuf::from),
-            };
-            // Only the Work marks survive a non-tmux listing. Both halves are
-            // stamped together by `muxa work`, so a pane carrying both is a
-            // managed Work pane; dropping them left every rmux Work unlinked.
-            let muxa = MuxaPaneMetadata {
-                managed_work: pane.workspace_id.is_some() && pane.work_id.is_some(),
-                workspace_id: pane.workspace_id.clone(),
-                work_id: pane.work_id.clone(),
-                role: pane.agent_role.clone(),
-                agent: pane.agent_program.clone(),
-                managed_agent: pane.agent_program.is_some(),
-                ..MuxaPaneMetadata::default()
             };
             PaneSummary {
                 host: kind,
@@ -3662,28 +3662,31 @@ mod tests {
     fn rmux_dashboard_rows_preserve_full_endpoint() {
         let scan = backend_scan_result(
             HostKind::Rmux,
-            vec![crate::tmux::PaneInfo {
-                session_group: None,
-                agent_program: None,
-                worker_launch_id: None,
-                agent_role: None,
-                agent_alias: None,
-                workspace_id: None,
-                work_id: None,
-                socket: Some("/tmp/rmux-user/default".into()),
-                pane_id: "rmux:%4".into(),
-                session_id: "$1".into(),
-                session: "work".into(),
-                window_id: "@2".into(),
-                window_name: "editor".into(),
-                window_index: "0".into(),
-                pane_index: "0".into(),
-                tty: "/dev/pts/4".into(),
-                current_command: "zsh".into(),
-                title: "work".into(),
-                pane_pid: 42,
-                current_path: "/tmp/project".into(),
-            }],
+            vec![(
+                crate::tmux::PaneInfo {
+                    session_group: None,
+                    agent_program: None,
+                    worker_launch_id: None,
+                    agent_role: None,
+                    agent_alias: None,
+                    workspace_id: None,
+                    work_id: None,
+                    socket: Some("/tmp/rmux-user/default".into()),
+                    pane_id: "rmux:%4".into(),
+                    session_id: "$1".into(),
+                    session: "work".into(),
+                    window_id: "@2".into(),
+                    window_name: "editor".into(),
+                    window_index: "0".into(),
+                    pane_index: "0".into(),
+                    tty: "/dev/pts/4".into(),
+                    current_command: "zsh".into(),
+                    title: "work".into(),
+                    pane_pid: 42,
+                    current_path: "/tmp/project".into(),
+                },
+                MuxaPaneMetadata::default(),
+            )],
         );
         assert_eq!(scan.panes.len(), 1);
         assert_eq!(scan.panes[0].pane_id, "rmux:%4");
@@ -3695,15 +3698,17 @@ mod tests {
     }
 
     #[test]
-    fn rmux_rows_keep_their_work_marks_so_the_work_is_linked() {
-        let pane = |id: &str, window: &str, work: Option<&str>| crate::tmux::PaneInfo {
+    fn non_tmux_rows_become_a_work_only_by_their_managed_work_mark() {
+        let pane = |id: &str, window: &str| crate::tmux::PaneInfo {
             session_group: None,
             agent_program: Some("codex".into()),
             worker_launch_id: None,
             agent_role: Some("reviewer".into()),
             agent_alias: None,
-            workspace_id: work.map(|_| "callabo".into()),
-            work_id: work.map(Into::into),
+            // An agent stamped for CAL-1: the ids alone must not make its
+            // window a Work.
+            workspace_id: Some("callabo".into()),
+            work_id: Some("CAL-1".into()),
             socket: Some("/tmp/rmux-user/default".into()),
             pane_id: id.into(),
             session_id: "$1".into(),
@@ -3718,31 +3723,43 @@ mod tests {
             pane_pid: 42,
             current_path: "/tmp/project".into(),
         };
+        let marked = MuxaPaneMetadata {
+            managed_work: true,
+            workspace_id: Some("callabo".into()),
+            work_id: Some("CAL-1".into()),
+            external_source: Some("linear".into()),
+            external_key: Some("CAL-1".into()),
+            ..MuxaPaneMetadata::default()
+        };
+        let unmarked = MuxaPaneMetadata {
+            workspace_id: Some("callabo".into()),
+            work_id: Some("CAL-1".into()),
+            ..MuxaPaneMetadata::default()
+        };
         let scan = backend_scan_result(
             HostKind::Rmux,
             vec![
-                pane("rmux:%4", "@2", Some("CAL-1")),
-                pane("rmux:%5", "@3", None),
+                (pane("rmux:%4", "@2"), marked),
+                (pane("rmux:%5", "@3"), unmarked),
             ],
         );
-        assert_eq!(scan.panes[0].muxa.role.as_deref(), Some("reviewer"));
         let snapshot = work::build_snapshot(&scan.panes, &[], &[], OffsetDateTime::now_utc());
         let works: Vec<_> = snapshot
             .works
             .iter()
-            .map(|work| {
-                (
-                    work.identity.workspace_id.as_str(),
-                    work.identity.work_id.as_str(),
-                )
-            })
+            .map(|work| (work.identity.work_id.as_str(), work.runs.len()))
             .collect();
-        assert_eq!(works, [("callabo", "CAL-1")]);
         assert_eq!(
-            snapshot.unlinked_executions.len(),
-            1,
-            "the unmarked window stays unlinked"
+            works,
+            [("CAL-1", 1)],
+            "only the marked window is the Work's Run"
         );
+        // The issue mark travels too; the daemon persists it from here.
+        assert!(scan
+            .panes
+            .iter()
+            .any(|pane| work::external_item_for_pane(pane, scan.fetched_at).is_some()));
+        assert_eq!(snapshot.unlinked_executions.len(), 1);
     }
 
     #[tokio::test]
