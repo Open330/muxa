@@ -14,12 +14,28 @@ mod overview;
 pub use overview::{
     CollaborationEndpoint, CollaborationLink, CollaborationLocation, CollaborationOverview,
 };
+mod spawn_coordination;
+use spawn_coordination::{load_spawns, WorkerSpawnRecord};
+pub use spawn_coordination::{
+    WorkerSpawnAcquisition, WorkerSpawnAction, WorkerSpawnPhase, WorkerSpawnSpec,
+    WorkerSpawnTicket, WorkerSpawnView, WORKER_SPAWN_CAPABILITY, WORKER_SPAWN_RELEASE_CAPABILITY,
+};
 mod purpose;
+mod worker_drain;
+mod worker_inventory;
+pub use purpose::ProcessFence;
 use purpose::{load_purposes, PurposeGrant};
 pub use purpose::{
     LaunchPurpose, HUMAN_PRIORITY_CAPABILITY, PIPELINE_PURPOSE_CAPABILITY,
     PURPOSE_PROMOTE_CAPABILITY,
 };
+use worker_drain::{load_drains, WorkerActionGates, WorkerDrainRecord};
+pub use worker_drain::{
+    WorkerAutomationReservation, WorkerDrainAcquire, WorkerDrainCandidate, WorkerDrainFinish,
+    WorkerDrainPhase, WorkerDrainPlan, WorkerDrainPolicy, WorkerDrainStop, WorkerDrainStopOutcome,
+    WorkerDrainTarget, WorkerDrainToken, WorkerDrainView, WORKER_DRAIN_CAPABILITY,
+};
+pub use worker_inventory::{ObservedIdle, WorkerEntry, WorkerFlag, WorkerInventory};
 
 use crate::event::{AgentKind, AgentState};
 use crate::state::Agent;
@@ -434,6 +450,8 @@ pub struct Participant {
     /// Unknown and human-facing sessions are protected from inbound peer work.
     #[serde(default)]
     pub launch_purpose: LaunchPurpose,
+    #[serde(default)]
+    pub draining: bool,
     pub agent_kind: AgentKind,
     pub agent_session_id: String,
     pub pane: String,
@@ -471,6 +489,7 @@ impl Participant {
     pub fn console(room: RoomId) -> Self {
         Self {
             launch_purpose: LaunchPurpose::Primary,
+            draining: false,
             agent_kind: AgentKind::Unknown,
             agent_session_id: CONSOLE_SESSION_ID.to_string(),
             pane: CONSOLE_PANE.to_string(),
@@ -488,7 +507,7 @@ impl Participant {
     }
 
     pub fn accepts_peer_work(&self) -> bool {
-        self.console || self.launch_purpose == LaunchPurpose::Worker
+        self.console || self.launch_purpose == LaunchPurpose::Worker && !self.draining
     }
 
     pub fn label(&self) -> String {
@@ -1521,6 +1540,11 @@ pub enum CollaborationError {
     AmbiguousTarget(String),
     #[error("target {0:?} is not a peer in this tmux window")]
     UnknownTarget(String),
+    /// A worker launch reservation refused or not found.
+    #[error("worker launch: {0}")]
+    WorkerLaunch(String),
+    #[error("worker drain: {0}")]
+    WorkerDrain(String),
     #[error("message is empty")]
     EmptyMessage,
     #[error("message exceeds the configured {0}-byte limit")]
@@ -1750,6 +1774,8 @@ fn open_database(path: &Path) -> Result<Connection, CollaborationError> {
              identity_key TEXT PRIMARY KEY,
              payload TEXT NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS collaboration_worker_drains (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
+         CREATE TABLE IF NOT EXISTS collaboration_worker_spawns (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS collaboration_purposes (id TEXT PRIMARY KEY, payload TEXT NOT NULL);
          CREATE TABLE IF NOT EXISTS collaboration_metadata (
              key TEXT PRIMARY KEY,
@@ -2603,6 +2629,10 @@ pub struct CollaborationStore {
     requests: RwLock<HashMap<String, CollaborationRequest>>,
     identities: RwLock<Vec<CollaborationIdentity>>,
     purposes: RwLock<Vec<PurposeGrant>>,
+    worker_spawns: Mutex<Vec<WorkerSpawnRecord>>,
+    worker_drains: Mutex<Vec<WorkerDrainRecord>>,
+    worker_action_gates: WorkerActionGates,
+    worker_automation: RwLock<HashMap<String, usize>>,
     /// Serializes each in-memory mutation with its durable row update. Wake
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
@@ -2646,6 +2676,10 @@ impl CollaborationStore {
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
             purposes: RwLock::new(Vec::new()),
+            worker_spawns: Mutex::new(Vec::new()),
+            worker_drains: Mutex::new(Vec::new()),
+            worker_action_gates: Mutex::new(HashMap::new()),
+            worker_automation: RwLock::new(HashMap::new()),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             reply_wake_tokens: AtomicU64::new(1),
@@ -2712,6 +2746,8 @@ impl CollaborationStore {
         }
         let (changes, _) = watch::channel(0);
         let purposes = load_purposes(database_path.as_deref())?;
+        let worker_spawns = load_spawns(database_path.as_deref())?;
+        let worker_drains = load_drains(database_path.as_deref())?;
         let store = Arc::new(Self {
             opts: options,
             initialization_error: None,
@@ -2719,6 +2755,10 @@ impl CollaborationStore {
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
             purposes: RwLock::new(purposes),
+            worker_spawns: Mutex::new(worker_spawns),
+            worker_drains: Mutex::new(worker_drains),
+            worker_action_gates: Mutex::new(HashMap::new()),
+            worker_automation: RwLock::new(HashMap::new()),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
             reply_wake_tokens: AtomicU64::new(1),
@@ -3064,6 +3104,8 @@ impl CollaborationStore {
                 .ok_or_else(|| CollaborationError::NotFound(old_id.clone()))?;
             contract::validate_supersession(old, &from, &input)?;
         }
+        self.admit_worker_work(&to).await?;
+        self.admit_worker_work(&from).await?;
         let withdrawals = normalize_withdrawals(&input.withdraw_reply_wakes);
         self.validate_reply_wake_withdrawals(&from, &withdrawals)
             .await?;
@@ -3329,6 +3371,11 @@ impl CollaborationStore {
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
+        if self.worker_claim_blocked(caller).await {
+            return Err(CollaborationError::WorkerDrain(
+                "worker_draining: inbox claims are paused".into(),
+            ));
+        }
         let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
         let mut changed = false;
@@ -3394,6 +3441,9 @@ impl CollaborationStore {
     ) -> Result<Option<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
+        if self.worker_claim_blocked(caller).await {
+            return Ok(None);
+        }
         let previous = self.requests.read().await.clone();
         let prepared = {
             let mut requests = self.requests.write().await;
@@ -4067,6 +4117,7 @@ impl CollaborationStore {
         to: Participant,
     ) -> Result<Option<CollaborationRequest>, CollaborationError> {
         let _transaction = self.transaction_lock.lock().await;
+        self.admit_worker_work(&to).await?;
         let previous = self.requests.read().await.clone();
         let rebound = {
             let mut requests = self.requests.write().await;
@@ -4123,6 +4174,9 @@ impl CollaborationStore {
         sender: &Participant,
     ) -> Result<Option<ReplyWakeBatch>, CollaborationError> {
         let _transaction = self.transaction_lock.lock().await;
+        if self.worker_claim_blocked(sender).await {
+            return Ok(None);
+        }
         let previous = self.requests.read().await.clone();
         let batch = {
             let mut requests = self.requests.write().await;
@@ -4438,6 +4492,7 @@ pub fn participants_from(agents: &[Agent], panes: &[PaneInfo]) -> Vec<Participan
         let socket = pane.socket.clone().or(agent_socket);
         let participant = Participant {
             launch_purpose: LaunchPurpose::Primary,
+            draining: false,
             agent_kind: agent.kind,
             agent_session_id: agent.session_id.clone(),
             pane: pane_id.clone(),
@@ -4878,7 +4933,7 @@ fn same_pane_seen_twice<'a>(candidates: &[&'a PaneInfo]) -> Option<&'a PaneInfo>
 
 /// The one pane with this id, disambiguated by control endpoint the same way
 /// [`participants_from`] does — pane ids repeat across tmux servers.
-fn unique_pane<'a>(
+pub(crate) fn unique_pane<'a>(
     pane_id: &str,
     socket: Option<&str>,
     panes: &'a [PaneInfo],
@@ -4944,6 +4999,7 @@ fn muxa_launched_agent_pane(pane: &PaneInfo, row: Option<&Agent>) -> bool {
 fn pane_participant(pane: &PaneInfo, socket: Option<String>, row: Option<&Agent>) -> Participant {
     Participant {
         launch_purpose: LaunchPurpose::Primary,
+        draining: false,
         agent_kind: row.map_or_else(
             || {
                 pane.agent_program
@@ -5888,6 +5944,7 @@ mod tests {
     fn participant(pane: &str, session: &str) -> Participant {
         Participant {
             launch_purpose: LaunchPurpose::Worker,
+            draining: false,
             agent_kind: AgentKind::Codex,
             agent_session_id: session.into(),
             pane: pane.into(),
@@ -5941,6 +5998,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,
@@ -5990,6 +6048,7 @@ mod tests {
     fn managed_pane(pane_id: &str, role: &str, alias: &str) -> PaneInfo {
         PaneInfo {
             agent_program: None,
+            worker_launch_id: None,
             agent_role: Some(role.into()),
             agent_alias: Some(alias.into()),
             ..pane_info(pane_id)

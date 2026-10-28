@@ -18,7 +18,78 @@ using configured provider permissions, without injected bypass flags. Set
 call with `spawn_if_missing`. Explicit `worker_bypass_permissions=true` enables
 bypass flags for these workers. Work pipeline agents that have a `role` launch
 as workers; set `purpose = "primary"` on one to keep it protected. General
-`start` and role-less pipeline agents remain primary. There is no worker pool.
+`start` and role-less pipeline agents remain primary.
+
+Automatic creation requires the daemon capability
+`collaboration_worker_spawn_v1`. muxad reserves creation capacity for the observed
+room, provider and compatible role before the CLI creates a pane. Concurrent
+provider and matching role calls share the pending launch. Busy workers remain
+reusable; this does not add caller affinity or change logical-recipient routing.
+Older daemons without this capability refuse automatic creation. Upgrade/restart
+muxad and run `muxa doctor`; existing eligible workers can still be reused.
+
+The launch UUID is persisted before creation, stamped on the new pane, and reused
+for the process-fenced worker grant. A renewable lease covers startup. Expiry
+after creation has been authorized is uncertain, not permission to spawn again.
+A call that cannot resolve that launch returns `sent=false`,
+`reason="launch_pending"`, its launch UUID, and any known endpoint. No message
+request has been created in that result. Retry the call after reconciling the
+existing launch; do not create an additional worker to bypass uncertainty.
+A committed grant can be recovered after a daemon restart. A crash before the
+pane stamp or before its grant commits remains uncertain and requires operator
+investigation. Explicit recovery uses the audited
+`collaboration_worker_spawn_release` IPC with a console origin, launch UUID and
+reason, or the owner's `Release` action. First verify that the old launcher has
+stopped: release abandons its reservation and never stops a process. An active
+launch or a fenced worker still occupying its original location blocks release;
+a verified process move releases the original room's capacity automatically.
+The read-only `collaboration_worker_spawns` IPC returns phases, endpoints,
+lease deadlines and failure/release details. These recovery APIs require
+`collaboration_worker_spawn_release_v1`.
+
+A failure before Begin or a completed, unsuccessful create command without a
+pane ID closes the reservation as Failed; `worker_spawn_failed` permits a retry
+after correcting the error. Missing replies or partial creation remain uncertain.
+Failed records expire after seven days on load/acquisition; uncertain records and
+purpose-grant history are not automatically removed.
+Pane marks alone never establish worker purpose. A consumed grant
+cannot bootstrap another conversation in the same CLI (including `/new`).
+
+Worker retirement is daemon coordinated under capability
+`collaboration_worker_drain_v1`. The console-only, audited IPC operations are
+`worker_drain_plan`, `worker_drain_acquire`, `worker_drain_renew`,
+`worker_drain_stop`, `worker_drain_finish`, and read-only `worker_drains`.
+Plan reports **observed** idle age, not proof of continuous inactivity. Primary,
+pending, busy, recently observed, child-work, unfinished launches (including a
+worker’s own pending launches), automation, open-request and owed
+reply-wake exclusions are checked again before stopping. Only an exact registered
+worker with an observable provider process can acquire a drain.
+
+Acquire returns a generation-bearing token containing the exact provider session,
+room, pane, socket, process PID and process birth identity. Its 30-second renewable
+pre-stop lease (`draining`) pauses claims, capacity reuse and managed terminal
+input. New exact-session work or automation vetoes this pre-stop reservation.
+Once `worker_drain_stop` commits its caller-supplied UUID operation ID,
+`stop_requested` has no expiring lease: new exact-session sends return retryable
+`worker_retiring`, and generic capacity requests return `worker_draining` instead
+of launching around it. Replaying the operation never types quit twice.
+
+The daemon owns the stop even if the client disconnects. It waits for existing
+managed pane IO, rechecks session, purpose, state, work and process identity, then
+requires a positively empty recognized Claude/Codex composer. It types `/exit`
+or `/quit` once, with no draft clearing, dialog answers, interrupt or signal
+escalation. A direct-exec pane is preserved with `remain-on-exit`; refusals restore
+its exact previous local override. It waits up to ten seconds for positive process
+exit evidence. Unknown screens, unobservable processes and unsupported providers
+refuse safely. Human input outside Muxa remains outside this gate.
+
+`exited` closes only the matching fenced launch and observed registry row; grant
+history remains intact. A refusal before input becomes `aborted`. A partially
+sent quit or still-running process becomes `uncertain` and stays unavailable.
+Restart recovers a committed stop as uncertain, never as permission to retry.
+An operator can finish a pre-stop drain as aborted, or finish a committed/uncertain
+drain as exited only with positive evidence that its original process is gone.
+This recovery never kills a process or releases uncertainty merely on timeout.
 
 Use `muxa start --agent claude --purpose worker` to launch a worker, or
 `muxa identity purpose worker` inside an existing dedicated worker session.

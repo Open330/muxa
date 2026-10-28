@@ -19,6 +19,8 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
+#[path = "worker_drain_control.rs"]
+mod worker_drain_control;
 use crate::ask::{
     AskConversation, AskCredential, AskEntry, AskProviderAdd, AskProviderEdit, AskProviderInfo,
     AskStore,
@@ -83,6 +85,15 @@ const MAX_IPC_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// time out client-side instead of consuming another daemon fd.
 const MAX_INFLIGHT_HANDLERS: usize = 256;
 
+/// How often the server confirms its socket file is still the one it bound.
+/// Anything that unlinks `/tmp/muxa-<uid>.sock` (a tmp cleaner, a stray
+/// script) otherwise leaves the daemon running but unreachable until restart.
+const ENDPOINT_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+
+/// How long a starting server waits for another holder to release the
+/// endpoint claim before deciding a daemon already owns it.
+const CLAIM_WAIT: Duration = Duration::from_secs(2);
+
 /// How long a connection may sit between requests without sending a complete
 /// line before the handler closes it. Generous enough that a legitimately
 /// idle persistent client is never dropped mid-session, tight enough that a
@@ -111,6 +122,13 @@ const fn mux_snapshot_only_missing() -> bool {
 /// hello + write + read). No caller should ever block forever against a
 /// wedged or half-dead daemon.
 const CLIENT_CALL_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Default observed-idle time past which a worker is flagged as long idle.
+pub const DEFAULT_WORKER_IDLE_SECS: u64 = 24 * 60 * 60;
+
+fn default_worker_idle_secs() -> u64 {
+    DEFAULT_WORKER_IDLE_SECS
+}
 /// Backoff between attempts of a collaboration wait interrupted by a
 /// daemon restart, doubling up to the cap.
 const WAIT_RETRY_INITIAL: Duration = Duration::from_millis(200);
@@ -619,6 +637,50 @@ enum RequestBody {
         session_ids: Vec<String>,
         purpose: collaboration::LaunchPurpose,
     },
+    /// Daemon-owned worker capacity. Kept separate from inventory reads.
+    /// Operator recovery; the supplied origin must resolve to the console.
+    CollaborationWorkerSpawnRelease {
+        origin: CollaborationOrigin,
+        launch_id: String,
+        reason: String,
+    },
+    /// Body-free launch lifecycle records, with the same trust model as snapshot.
+    WorkerDrainPlan {
+        origin: CollaborationOrigin,
+        policy: collaboration::WorkerDrainPolicy,
+    },
+    WorkerDrainAcquire {
+        origin: CollaborationOrigin,
+        target: collaboration::WorkerDrainTarget,
+        policy: collaboration::WorkerDrainPolicy,
+    },
+    WorkerDrainRenew {
+        origin: CollaborationOrigin,
+        token: collaboration::WorkerDrainToken,
+    },
+    WorkerDrainStop {
+        origin: CollaborationOrigin,
+        token: collaboration::WorkerDrainToken,
+        operation_id: String,
+    },
+    WorkerDrainFinish {
+        origin: CollaborationOrigin,
+        token: collaboration::WorkerDrainToken,
+        outcome: collaboration::WorkerDrainFinish,
+        detail: String,
+    },
+    WorkerDrains {
+        origin: CollaborationOrigin,
+    },
+    CollaborationWorkerSpawns,
+    CollaborationWorkerAcquire {
+        origin: CollaborationOrigin,
+        spec: collaboration::WorkerSpawnSpec,
+    },
+    CollaborationWorkerSpawn {
+        ticket: collaboration::WorkerSpawnTicket,
+        action: collaboration::WorkerSpawnAction,
+    },
     CollaborationWorkerLaunch {
         pane: String,
         socket: Option<String>,
@@ -631,6 +693,13 @@ enum RequestBody {
     CollaborationSubscribe,
     CollaborationOverview {
         origin: CollaborationOrigin,
+    },
+    /// Every worker muxa launched that is still live, host-wide. Read-only,
+    /// like `snapshot`: it names agents and counts open requests without
+    /// reading any body, and changes nothing.
+    CollaborationWorkers {
+        #[serde(default = "default_worker_idle_secs")]
+        idle_threshold_secs: u64,
     },
     CollaborationList {
         origin: CollaborationOrigin,
@@ -851,6 +920,9 @@ const CAPABILITIES: &[&str] = &[
     "rate_limited",
     "collaboration_mailbox",
     collaboration::HUMAN_PRIORITY_CAPABILITY,
+    collaboration::WORKER_SPAWN_CAPABILITY,
+    collaboration::WORKER_DRAIN_CAPABILITY,
+    collaboration::WORKER_SPAWN_RELEASE_CAPABILITY,
     "collaboration_overview_v1",
     "collaboration_expire_v1",
     "collaboration_lifecycle",
@@ -998,6 +1070,24 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_overview: Option<collaboration::CollaborationOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_plan: Option<collaboration::WorkerDrainPlan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_acquire: Option<collaboration::WorkerDrainAcquire>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_token: Option<collaboration::WorkerDrainToken>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain_stop: Option<collaboration::WorkerDrainStop>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drain: Option<collaboration::WorkerDrainView>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_drains: Option<Vec<collaboration::WorkerDrainView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_spawn: Option<collaboration::WorkerSpawnAcquisition>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_spawns: Option<Vec<collaboration::WorkerSpawnView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_inventory: Option<collaboration::WorkerInventory>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_request: Option<CollaborationRequest>,
     /// Set on the answer to a long poll that muxad cut short to restart:
     /// nothing changed, and the same request may be asked again.
@@ -1100,6 +1190,15 @@ impl Response {
             handle: None,
             collaboration_requests: None,
             collaboration_overview: None,
+            worker_drain_plan: None,
+            worker_drain_acquire: None,
+            worker_drain_token: None,
+            worker_drain_stop: None,
+            worker_drain: None,
+            worker_drains: None,
+            worker_spawn: None,
+            worker_spawns: None,
+            worker_inventory: None,
             collaboration_request: None,
             restarting: None,
             ask_entries: None,
@@ -1788,6 +1887,7 @@ pub struct Server {
     /// whole. `None` when muxad was started without one.
     config_path: Option<PathBuf>,
     handler_limit: usize,
+    endpoint_check: Duration,
 }
 
 impl Server {
@@ -1813,6 +1913,7 @@ impl Server {
             mux_snapshots,
             config_path: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
+            endpoint_check: ENDPOINT_CHECK_INTERVAL,
         }
     }
 
@@ -1936,6 +2037,13 @@ impl Server {
         self
     }
 
+    #[cfg(test)]
+    #[must_use]
+    fn with_endpoint_check(mut self, interval: Duration) -> Self {
+        self.endpoint_check = interval;
+        self
+    }
+
     /// Run until `shutdown` fires or an I/O error occurs.
     ///
     /// In-flight connection handlers are tracked on a `JoinSet` so a
@@ -1946,9 +2054,15 @@ impl Server {
     /// a bounded timeout so a hung handler can't block daemon exit.
     #[allow(clippy::too_many_lines)] // accept loop plus bounded drain and socket cleanup
     pub async fn run(self, mut shutdown: broadcast::Receiver<()>) -> Result<(), RuntimeError> {
+        // Held until `run` returns, so a second daemon can never clear this
+        // one's socket.
+        let _claim = self.claim_endpoint().await?;
         self.bind_with_perms()?;
-        let listener = Listener::bind(&self.socket_path)?;
+        let mut listener = Listener::bind(&self.socket_path)?;
+        let mut bound = transport::endpoint_identity(&self.socket_path);
         tracing::info!(socket = %self.socket_path.display(), "listening");
+        let mut endpoint_check = tokio::time::interval(self.endpoint_check);
+        endpoint_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         let mut handlers: JoinSet<()> = JoinSet::new();
         // Sticky signal: a handler entering push mode after shutdown still
@@ -1967,6 +2081,10 @@ impl Server {
                 _ = shutdown.recv() => {
                     tracing::info!("shutdown signal received; closing listener");
                     break;
+                }
+                _ = endpoint_check.tick() => {
+                    self.restore_endpoint(&mut listener, &mut bound);
+                    continue;
                 }
                 joined = handlers.join_next(), if !handlers.is_empty() => {
                     if let Some(Err(e)) = joined {
@@ -1987,6 +2105,10 @@ impl Server {
                     drop(permit);
                     tracing::info!("shutdown signal received; closing listener");
                     break;
+                }
+                _ = endpoint_check.tick() => {
+                    drop(permit);
+                    self.restore_endpoint(&mut listener, &mut bound);
                 }
                 accept = listener.accept() => {
                     let stream = match accept {
@@ -2095,9 +2217,60 @@ impl Server {
             );
         }
 
-        // Remove our own socket file so next startup is clean.
-        transport::remove_endpoint(&self.socket_path);
+        // Remove our own socket file so next startup is clean — but only
+        // ours: a file someone else put there since is not ours to delete.
+        if transport::endpoint_identity(&self.socket_path) == bound {
+            transport::remove_endpoint(&self.socket_path);
+        }
         Ok(())
+    }
+
+    /// Take the endpoint claim, waiting out a brief hold. A child forked
+    /// a moment ago keeps a copy of the lock until it execs, so the daemon
+    /// that just released the claim — or this same daemon, re-executed —
+    /// can find it held for a few milliseconds by no daemon at all.
+    async fn claim_endpoint(&self) -> Result<transport::EndpointClaim, RuntimeError> {
+        let deadline = Instant::now() + CLAIM_WAIT;
+        loop {
+            if let Some(claim) = transport::claim_endpoint(&self.socket_path)? {
+                return Ok(claim);
+            }
+            if Instant::now() >= deadline {
+                return Err(RuntimeError::SocketInUse(self.socket_path.clone()));
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Bind the socket path again if it no longer holds the file this server
+    /// bound. The claim proves no other daemon owns the path, so whatever is
+    /// there now (nothing, or a stray file) is safe to replace. Connections
+    /// already accepted are unaffected.
+    fn restore_endpoint(
+        &self,
+        listener: &mut Listener,
+        bound: &mut Option<transport::EndpointIdentity>,
+    ) {
+        if bound.is_none() || transport::endpoint_identity(&self.socket_path) == *bound {
+            return;
+        }
+        tracing::warn!(
+            socket = %self.socket_path.display(),
+            "IPC socket file was removed or replaced; binding it again",
+        );
+        let rebound = transport::clear_endpoint(&self.socket_path)
+            .and_then(|()| Listener::bind(&self.socket_path));
+        match rebound {
+            Ok(fresh) => {
+                *listener = fresh;
+                *bound = transport::endpoint_identity(&self.socket_path);
+            }
+            Err(error) => tracing::error!(
+                socket = %self.socket_path.display(),
+                %error,
+                "could not bind the IPC socket again; retrying",
+            ),
+        }
     }
 
     /// Pre-bind sequence: if a stale socket exists, remove it; then the
@@ -2838,6 +3011,7 @@ async fn collaboration_participants(
     collaboration
         .enrich_launch_purposes(&mut participants, &panes)
         .await;
+    collaboration.enrich_worker_drains(&mut participants).await;
     CollaborationTopology {
         participants,
         panes,
@@ -4009,49 +4183,65 @@ async fn handle(
                             match unique_pane_endpoint(&pane, &agents) {
                                 Err(error) => Response::err(error),
                                 Ok(socket) => {
-                                    // `send_text_on` is a blocking shell-out /
-                                    // socket call, so run it off the async worker.
-                                    // Text and submit CR are TWO non-atomic
-                                    // injections; report the outcomes separately.
-                                    let observer = crate::prompt_delivery::SubmissionObserver::new(
-                                        &store,
-                                        &agents,
-                                        socket.as_deref(),
-                                        &text,
-                                    );
-                                    let (sent, submitted) =
-                                        tokio::task::spawn_blocking(move || {
-                                            let s = socket.as_deref();
-                                            let sent = target.send_prompt_text_on(s, &pane, &text);
-                                            let submitted = if sent && submit {
-                                                if !text.is_empty() {
-                                                    std::thread::sleep(
-                                                        crate::backend::prompt_submit_grace(&pane),
-                                                    );
-                                                }
-                                                target.send_text_on(s, &pane, "\r")
-                                            } else {
-                                                false
-                                            };
-                                            (sent, submitted)
-                                        })
+                                    let action_guard =
+                                        collaboration.worker_action_guard(&pane).await;
+                                    if collaboration
+                                        .worker_input_blocked(&pane, socket.as_deref())
                                         .await
-                                        .unwrap_or((false, false));
-                                    if sent {
-                                        tracing::debug!(submit, submitted, "send_prompt");
-                                        let mut response =
-                                            Response::with_send_result(sent, submitted);
-                                        if submitted {
-                                            response.submission_confirmed =
-                                                observer.confirm().await;
-                                        }
-                                        response
-                                    } else {
-                                        // Nothing landed — safe for the caller to
-                                        // retry the whole send.
+                                    {
                                         Response::err(
-                                            "send_text failed: pane gone or host unreachable",
+                                            "worker_draining: managed terminal input is paused",
                                         )
+                                    } else {
+                                        // `send_text_on` is a blocking shell-out /
+                                        // socket call, so run it off the async worker.
+                                        // Text and submit CR are TWO non-atomic
+                                        // injections; report the outcomes separately.
+                                        let observer =
+                                            crate::prompt_delivery::SubmissionObserver::new(
+                                                &store,
+                                                &agents,
+                                                socket.as_deref(),
+                                                &text,
+                                            );
+                                        let (sent, submitted) =
+                                            tokio::task::spawn_blocking(move || {
+                                                let _action = action_guard;
+                                                let s = socket.as_deref();
+                                                let sent =
+                                                    target.send_prompt_text_on(s, &pane, &text);
+                                                let submitted = if sent && submit {
+                                                    if !text.is_empty() {
+                                                        std::thread::sleep(
+                                                            crate::backend::prompt_submit_grace(
+                                                                &pane,
+                                                            ),
+                                                        );
+                                                    }
+                                                    target.send_text_on(s, &pane, "\r")
+                                                } else {
+                                                    false
+                                                };
+                                                (sent, submitted)
+                                            })
+                                            .await
+                                            .unwrap_or((false, false));
+                                        if sent {
+                                            tracing::debug!(submit, submitted, "send_prompt");
+                                            let mut response =
+                                                Response::with_send_result(sent, submitted);
+                                            if submitted {
+                                                response.submission_confirmed =
+                                                    observer.confirm().await;
+                                            }
+                                            response
+                                        } else {
+                                            // Nothing landed — safe for the caller to
+                                            // retry the whole send.
+                                            Response::err(
+                                                "send_text failed: pane gone or host unreachable",
+                                            )
+                                        }
                                     }
                                 }
                             }
@@ -4670,6 +4860,312 @@ async fn handle(
                     ));
                     response
                 }
+                drain_request @ (RequestBody::WorkerDrainPlan { .. }
+                | RequestBody::WorkerDrainAcquire { .. }
+                | RequestBody::WorkerDrainRenew { .. }
+                | RequestBody::WorkerDrainStop { .. }
+                | RequestBody::WorkerDrainFinish { .. }
+                | RequestBody::WorkerDrains { .. }) => {
+                    let (origin, operation, target, guard_pane) = match &drain_request {
+                        RequestBody::WorkerDrainPlan { origin, .. } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainPlan,
+                            None,
+                            None,
+                        ),
+                        RequestBody::WorkerDrainAcquire { origin, target, .. } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainAcquire,
+                            Some(serde_json::to_string(target).unwrap_or_default()),
+                            Some(target.pane.clone()),
+                        ),
+                        RequestBody::WorkerDrainRenew { origin, token } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainRenew,
+                            Some(serde_json::to_string(token).unwrap_or_default()),
+                            None,
+                        ),
+                        RequestBody::WorkerDrainStop {
+                            origin,
+                            token,
+                            operation_id,
+                        } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainStop,
+                            Some(
+                                serde_json::json!({"token":token,"operation_id":operation_id})
+                                    .to_string(),
+                            ),
+                            None,
+                        ),
+                        RequestBody::WorkerDrainFinish { origin, token, .. } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrainFinish,
+                            Some(serde_json::to_string(token).unwrap_or_default()),
+                            Some(token.target.pane.clone()),
+                        ),
+                        RequestBody::WorkerDrains { origin } => (
+                            origin,
+                            CollaborationAuditOperation::WorkerDrains,
+                            None,
+                            None,
+                        ),
+                        _ => unreachable!(),
+                    };
+                    kind = match operation {
+                        CollaborationAuditOperation::WorkerDrainPlan => "worker_drain_plan",
+                        CollaborationAuditOperation::WorkerDrainAcquire => "worker_drain_acquire",
+                        CollaborationAuditOperation::WorkerDrainRenew => "worker_drain_renew",
+                        CollaborationAuditOperation::WorkerDrainStop => "worker_drain_stop",
+                        CollaborationAuditOperation::WorkerDrainFinish => "worker_drain_finish",
+                        _ => "worker_drains",
+                    };
+                    let origin = origin.clone();
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context =
+                        CollaborationAuditContext::new(operation, origin.clone());
+                    audit_context.target = target;
+                    let _gate = if let Some(pane) = guard_pane {
+                        Some(collaboration.worker_action_guard(&pane).await)
+                    } else {
+                        None
+                    };
+                    // The acquire/finish gate precedes this scan; cached caller
+                    // provenance must never become stop authority.
+                    let topology =
+                        collaboration_participants(&store, &backends, &collaboration, None, None)
+                            .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(caller) if caller.console => {
+                            let result: Result<Response, String> = async {
+                                let mut response = Response::ok();
+                                match drain_request {
+                                    RequestBody::WorkerDrainPlan { policy, .. } => {
+                                        response.worker_drain_plan = Some(
+                                            collaboration
+                                                .worker_drain_plan(
+                                                    &topology.participants,
+                                                    &topology.agents,
+                                                    &policy,
+                                                )
+                                                .await,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainAcquire { target, policy, .. } => {
+                                        response.worker_drain_acquire = Some(
+                                            collaboration
+                                                .worker_drain_acquire(
+                                                    &target,
+                                                    policy,
+                                                    &topology.participants,
+                                                    &topology.agents,
+                                                    &topology.panes,
+                                                )
+                                                .await
+                                                .map_err(|e| e.to_string())?,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainRenew { token, .. } => {
+                                        response.worker_drain_token = Some(
+                                            collaboration
+                                                .worker_drain_renew(&token)
+                                                .await
+                                                .map_err(|e| e.to_string())?,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainStop {
+                                        token,
+                                        operation_id,
+                                        ..
+                                    } => {
+                                        response.worker_drain_stop = Some(
+                                            worker_drain_control::stop(
+                                                store.clone(),
+                                                collaboration.clone(),
+                                                backends.clone(),
+                                                token,
+                                                operation_id,
+                                            )
+                                            .await?,
+                                        );
+                                    }
+                                    RequestBody::WorkerDrainFinish {
+                                        token,
+                                        outcome,
+                                        detail,
+                                        ..
+                                    } => {
+                                        let view = collaboration
+                                            .worker_drain_finish(&token, outcome, &detail)
+                                            .await
+                                            .map_err(|e| e.to_string())?;
+                                        if view.phase == collaboration::WorkerDrainPhase::Exited {
+                                            worker_drain_control::settle_row(
+                                                &store, &backends, &token,
+                                            )
+                                            .await;
+                                        }
+                                        response.worker_drain = Some(view);
+                                    }
+                                    RequestBody::WorkerDrains { .. } => {
+                                        response.worker_drains =
+                                            Some(collaboration.worker_drains().await);
+                                    }
+                                    _ => unreachable!(),
+                                }
+                                Ok(response)
+                            }
+                            .await;
+                            result.unwrap_or_else(Response::err)
+                        }
+                        Ok(_) => Response::err("worker drain requires a console origin"),
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    audit_context.release_reason = response
+                        .worker_drain_stop
+                        .as_ref()
+                        .map(|s| s.drain.detail.clone())
+                        .or_else(|| {
+                            response
+                                .worker_drain_acquire
+                                .as_ref()
+                                .and_then(|a| match a {
+                                    collaboration::WorkerDrainAcquire::Skipped { reason } => {
+                                        Some(reason.clone())
+                                    }
+                                    collaboration::WorkerDrainAcquire::Acquired { .. } => None,
+                                })
+                        });
+                    if let Some(view) = &response.worker_drain {
+                        audit_context.release_reason = Some(view.detail.clone());
+                    }
+                    pending_audit = Some(collaboration_audit_entry(
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    ));
+                    response
+                }
+                RequestBody::CollaborationWorkerSpawns => {
+                    kind = "collaboration_worker_spawns";
+                    let mut response = Response::ok();
+                    response.worker_spawns = Some(collaboration.worker_spawn_records().await);
+                    response
+                }
+                RequestBody::CollaborationWorkerSpawnRelease {
+                    origin,
+                    launch_id,
+                    reason,
+                } => {
+                    kind = "collaboration_worker_spawn_release";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::WorkerSpawnRelease,
+                        origin.clone(),
+                    );
+                    audit_context.target = Some(launch_id.clone());
+                    audit_context.release_reason = Some(reason.chars().take(512).collect());
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(caller) if caller.console => match collaboration.release_worker_spawn(&caller, &launch_id, &reason, &topology.panes).await {
+                            Ok(()) => Response::ok(),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Ok(_) => Response::err("operator release requires a console origin; owners use the Release action"),
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    pending_audit = Some(collaboration_audit_entry(
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    ));
+                    response
+                }
+                RequestBody::CollaborationWorkerAcquire { origin, spec } => {
+                    kind = "collaboration_worker_acquire";
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    match topology.resolve_origin(&origin) {
+                        Ok(caller) => match collaboration
+                            .acquire_worker_spawn(
+                                &caller,
+                                origin,
+                                spec,
+                                &topology.participants,
+                                &topology.panes,
+                            )
+                            .await
+                        {
+                            Ok(acquisition) => {
+                                let mut response = Response::ok();
+                                response.worker_spawn = Some(acquisition);
+                                response
+                            }
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
+                RequestBody::CollaborationWorkerSpawn { ticket, action } => {
+                    kind = "collaboration_worker_spawn";
+                    let audit_context =
+                        if let collaboration::WorkerSpawnAction::Release { reason } = &action {
+                            collaboration_actor.observe_pane(&backends).await;
+                            let mut context = CollaborationAuditContext::new(
+                                CollaborationAuditOperation::WorkerSpawnRelease,
+                                ticket.origin.clone(),
+                            );
+                            context.target = Some(ticket.launch_id.clone());
+                            context.release_reason = Some(reason.chars().take(512).collect());
+                            Some(context)
+                        } else {
+                            None
+                        };
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        ticket.origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&ticket.origin) {
+                        Ok(caller) => match collaboration
+                            .update_worker_spawn(
+                                &caller,
+                                &ticket.launch_id,
+                                action,
+                                &topology.panes,
+                            )
+                            .await
+                        {
+                            Ok(()) => Response::ok(),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    if let Some(context) = audit_context {
+                        pending_audit = Some(collaboration_audit_entry(
+                            &collaboration_actor,
+                            context,
+                            &response,
+                        ));
+                    }
+                    response
+                }
                 RequestBody::CollaborationWorkerLaunch {
                     pane,
                     socket,
@@ -4733,6 +5229,30 @@ async fn handle(
                     )
                     .await
                     .unwrap_or(Ok(()));
+                }
+                RequestBody::CollaborationWorkers {
+                    idle_threshold_secs,
+                } => {
+                    kind = "collaboration_workers";
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        None,
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    let mut response = Response::ok();
+                    response.worker_inventory = Some(
+                        collaboration
+                            .worker_inventory(
+                                &topology.participants,
+                                &topology.agents,
+                                idle_threshold_secs,
+                            )
+                            .await,
+                    );
+                    response
                 }
                 RequestBody::CollaborationOverview { origin } => {
                     kind = "collaboration_overview";
@@ -6372,6 +6892,114 @@ impl Client {
         Ok(resp["capture"].as_str().map(str::to_owned))
     }
 
+    pub async fn worker_drain_plan(
+        &self,
+        origin: &CollaborationOrigin,
+        policy: &collaboration::WorkerDrainPolicy,
+    ) -> Result<collaboration::WorkerDrainPlan, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_plan","origin":origin,"policy":policy}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_plan"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_acquire(
+        &self,
+        origin: &CollaborationOrigin,
+        target: &collaboration::WorkerDrainTarget,
+        policy: &collaboration::WorkerDrainPolicy,
+    ) -> Result<collaboration::WorkerDrainAcquire, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_acquire","origin":origin,"target":target,"policy":policy}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_acquire"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_renew(
+        &self,
+        origin: &CollaborationOrigin,
+        token: &collaboration::WorkerDrainToken,
+    ) -> Result<collaboration::WorkerDrainToken, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_renew","origin":origin,"token":token}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_token"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_stop(
+        &self,
+        origin: &CollaborationOrigin,
+        token: &collaboration::WorkerDrainToken,
+        operation_id: &str,
+    ) -> Result<collaboration::WorkerDrainStop, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_stop","origin":origin,"token":token,"operation_id":operation_id}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain_stop"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drain_finish(
+        &self,
+        origin: &CollaborationOrigin,
+        token: &collaboration::WorkerDrainToken,
+        outcome: collaboration::WorkerDrainFinish,
+        detail: &str,
+    ) -> Result<collaboration::WorkerDrainView, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drain_finish","origin":origin,"token":token,"outcome":outcome,"detail":detail}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drain"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn worker_drains(
+        &self,
+        origin: &CollaborationOrigin,
+    ) -> Result<Vec<collaboration::WorkerDrainView>, RuntimeError> {
+        let response=self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"worker_drains","origin":origin}),std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
+        serde_json::from_value(response["worker_drains"].clone()).map_err(RuntimeError::Json)
+    }
+    pub async fn collaboration_worker_spawns(
+        &self,
+    ) -> Result<Vec<collaboration::WorkerSpawnView>, RuntimeError> {
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawns"})).await?;
+        serde_json::from_value(response["worker_spawns"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_worker_spawn_release(
+        &self,
+        origin: &CollaborationOrigin,
+        launch_id: &str,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawn_release", "origin":origin, "launch_id":launch_id, "reason":reason})).await?;
+        Ok(())
+    }
+
+    pub async fn collaboration_worker_acquire(
+        &self,
+        origin: &CollaborationOrigin,
+        spec: &collaboration::WorkerSpawnSpec,
+    ) -> Result<collaboration::WorkerSpawnAcquisition, RuntimeError> {
+        let response = self.call_checked(&serde_json::json!({
+            "protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_acquire", "origin":origin, "spec":spec,
+        })).await?;
+        serde_json::from_value(response["worker_spawn"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_worker_spawn(
+        &self,
+        ticket: &collaboration::WorkerSpawnTicket,
+        action: &collaboration::WorkerSpawnAction,
+    ) -> Result<(), RuntimeError> {
+        self.call_checked(&serde_json::json!({
+            "protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawn", "ticket":ticket, "action":action,
+        })).await?;
+        Ok(())
+    }
+
     pub async fn collaboration_context(
         &self,
         origin: &CollaborationOrigin,
@@ -6897,6 +7525,21 @@ impl Client {
     }
 
     /// Body-free room relationship data for an operator surface.
+    /// Every live worker muxa launched, host-wide. Read-only.
+    pub async fn collaboration_workers(
+        &self,
+        idle_threshold_secs: u64,
+    ) -> Result<collaboration::WorkerInventory, RuntimeError> {
+        let response = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION,
+                "kind": "collaboration_workers",
+                "idle_threshold_secs": idle_threshold_secs,
+            }))
+            .await?;
+        serde_json::from_value(response["worker_inventory"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn collaboration_overview(
         &self,
         origin: &CollaborationOrigin,
@@ -7971,6 +8614,7 @@ mod tests {
                     roles: Vec::new(),
                     console: false,
                     launch_purpose: collaboration::LaunchPurpose::Primary,
+                    draining: false,
                 })
                 .collect(),
             panes: Vec::new(),
@@ -8836,6 +9480,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: Some("callabo".into()),
@@ -10518,6 +11163,70 @@ mod tests {
         let _ = sessions.terminate(&session.id);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_second_server_leaves_a_running_daemons_socket_alone() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-claimed.sock");
+        let server = Server::new(sock.clone(), Store::shared());
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let bound = transport::endpoint_identity(&sock);
+
+        // However the probe reads the first daemon — a full backlog refuses
+        // like an orphan on macOS — its claim keeps the second one out.
+        let (_tx2, rx2) = broadcast::channel(1);
+        let second = Server::new(sock.clone(), Store::shared()).run(rx2).await;
+        assert!(matches!(second, Err(RuntimeError::SocketInUse(_))));
+        assert_eq!(transport::endpoint_identity(&sock), bound);
+        Client::new(sock.clone())
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+        assert!(!sock.exists(), "the daemon removes the socket it bound");
+        assert!(
+            !dir.path().join("muxa-claimed.sock.lock").exists(),
+            "and its claim"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_removed_socket_file_is_bound_again() {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-unlinked.sock");
+        let server = Server::new(sock.clone(), Store::shared())
+            .with_endpoint_check(Duration::from_millis(20));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+
+        std::fs::remove_file(&sock).unwrap();
+        wait_for_socket(&sock).await;
+        Client::new(sock.clone())
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        // A file someone else put at the path is not the daemon's to delete.
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+        let server =
+            Server::new(sock.clone(), Store::shared()).with_endpoint_check(Duration::from_secs(60));
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        std::fs::remove_file(&sock).unwrap();
+        std::fs::write(&sock, b"not a socket").unwrap();
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+        assert_eq!(std::fs::read(&sock).unwrap(), b"not a socket");
+    }
+
     #[tokio::test]
     async fn handler_budget_is_reserved_before_accepting_connections() {
         let dir = tempdir().unwrap();
@@ -10601,6 +11310,223 @@ mod tests {
             console: false,
             agent_session_id: None,
         }
+    }
+
+    #[tokio::test]
+    async fn worker_spawn_release_is_console_scoped_and_audits_owner_and_operator_attempts() {
+        use collaboration::{
+            WorkerSpawnAcquisition, WorkerSpawnAction, WorkerSpawnPhase, WorkerSpawnSpec,
+        };
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("worker-release.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "owner", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%2", "other", AgentKind::ClaudeCode).await;
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
+        let backend: SharedBackend = Arc::new(CollaborationTestBackend {
+            panes: vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        });
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox)
+            .with_collaboration_audit(audit.clone());
+        let (stop, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let spec = WorkerSpawnSpec {
+            agent_kind: AgentKind::Codex,
+            role: None,
+            launch_role: "reviewer".into(),
+        };
+        let mut console = pane_origin("%2");
+        console.console = true;
+        for owner_release in [true, false] {
+            let WorkerSpawnAcquisition::LaunchToken { ticket } = client
+                .collaboration_worker_acquire(&pane_origin("%1"), &spec)
+                .await
+                .unwrap()
+            else {
+                panic!("capacity not released")
+            };
+            client
+                .collaboration_worker_spawn(&ticket, &WorkerSpawnAction::Begin)
+                .await
+                .unwrap();
+            client
+                .collaboration_worker_spawn(
+                    &ticket,
+                    &WorkerSpawnAction::Uncertain {
+                        detail: "create result unknown".into(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(client
+                .collaboration_worker_spawn_release(
+                    &pane_origin("%2"),
+                    &ticket.launch_id,
+                    "not a console"
+                )
+                .await
+                .is_err());
+            if owner_release {
+                client
+                    .collaboration_worker_spawn(
+                        &ticket,
+                        &WorkerSpawnAction::Release {
+                            reason: "owner verified no effects and stopped launcher".into(),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                client
+                    .collaboration_worker_spawn_release(
+                        &console,
+                        &ticket.launch_id,
+                        "operator verified no effects and stopped launcher",
+                    )
+                    .await
+                    .unwrap();
+            }
+            assert!(client
+                .collaboration_worker_spawns()
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.launch_id == ticket.launch_id && r.phase == WorkerSpawnPhase::Failed));
+        }
+        let entries = audit.entries().await;
+        let releases: Vec<_> = entries
+            .iter()
+            .filter(|e| e.operation == CollaborationAuditOperation::WorkerSpawnRelease)
+            .collect();
+        assert_eq!(releases.len(), 4);
+        assert_eq!(releases.iter().filter(|e| e.ok).count(), 2);
+        assert!(releases
+            .iter()
+            .all(|e| e.target.is_some() && e.release_reason.is_some()));
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn worker_capacity_is_shared_by_independent_ipc_clients() {
+        use collaboration::{WorkerSpawnAcquisition, WorkerSpawnAction, WorkerSpawnSpec};
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("worker-capacity.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "first-caller", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%2", "second-caller", AgentKind::ClaudeCode).await;
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+        // Distinct clients/connections model two separate MCP server processes;
+        // neither can rely on a local mutex or the other's cached room view.
+        let first = Client::new(socket.clone());
+        let second = Client::new(socket);
+        assert!(first
+            .hello(Duration::from_secs(2))
+            .await
+            .unwrap()
+            .capabilities
+            .iter()
+            .any(|c| c == collaboration::WORKER_SPAWN_CAPABILITY));
+        let provider = WorkerSpawnSpec {
+            agent_kind: AgentKind::Codex,
+            role: None,
+            launch_role: "reviewer".into(),
+        };
+        let role = WorkerSpawnSpec {
+            role: Some("reviewer".into()),
+            ..provider.clone()
+        };
+        let first_origin = pane_origin("%1");
+        let mut second_origin = pane_origin("%2");
+        second_origin.socket = Some("/tmp/tmux-1000/default".into());
+        let (a, b) = tokio::join!(
+            first.collaboration_worker_acquire(&first_origin, &provider),
+            second.collaboration_worker_acquire(&second_origin, &role),
+        );
+        let outcomes = [a.unwrap(), b.unwrap()];
+        let tickets = outcomes
+            .iter()
+            .filter_map(|o| match o {
+                WorkerSpawnAcquisition::LaunchToken { ticket } => Some(ticket),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(tickets.len(), 1);
+        let pending = outcomes
+            .iter()
+            .find_map(|o| match o {
+                WorkerSpawnAcquisition::Pending { launch_id, .. } => Some(launch_id),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(pending, &tickets[0].launch_id);
+        first
+            .collaboration_worker_spawn(tickets[0], &WorkerSpawnAction::Begin)
+            .await
+            .unwrap();
+        assert!(second
+            .collaboration_worker_spawn(tickets[0], &WorkerSpawnAction::Begin)
+            .await
+            .is_err());
+        first
+            .collaboration_worker_spawn(tickets[0], &WorkerSpawnAction::Renew)
+            .await
+            .unwrap();
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_worker_inventory_lists_only_sessions_that_are_workers() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("workers.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "primary", AgentKind::ClaudeCode).await;
+        add_collaboration_agent(&store, "%2", "worker", AgentKind::Codex).await;
+        let mailbox = collaboration::CollaborationStore::in_memory(
+            collaboration::CollaborationOptions::default(),
+        );
+        let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+        let client = Client::new(socket.clone());
+        assert!(client
+            .collaboration_workers(3600)
+            .await
+            .unwrap()
+            .workers
+            .is_empty());
+
+        client
+            .collaboration_purpose(&pane_origin("%2"), collaboration::LaunchPurpose::Worker)
+            .await
+            .unwrap();
+        client
+            .collaboration_send(
+                &pane_origin("%1"),
+                "pane:%2",
+                &NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let inventory = client.collaboration_workers(3600).await.unwrap();
+        assert_eq!(inventory.workers.len(), 1, "{inventory:?}");
+        let worker = &inventory.workers[0];
+        assert_eq!(worker.agent_session_id, "worker");
+        assert_eq!(worker.queued_requests, 1);
+        assert_eq!(inventory.idle_threshold_secs, 3600);
+        stop.send(()).unwrap();
+        serving.await.unwrap();
     }
 
     #[tokio::test]
@@ -12366,6 +13292,7 @@ mod tests {
         let pane = PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

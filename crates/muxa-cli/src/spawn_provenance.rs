@@ -36,7 +36,7 @@ pub(crate) fn resolve_creator(socket: &Path) -> Option<CollaborationEndpoint> {
     (!room.current.console).then(|| (&room.current).into())
 }
 
-pub(crate) fn record(request: &crate::agent_launch::StartRequest, pane: &str) {
+pub(crate) fn record(request: &crate::agent_launch::StartRequest, pane: &str, launch_id: &str) {
     let Some(creator) = request.creator.clone() else {
         return;
     };
@@ -52,7 +52,7 @@ pub(crate) fn record(request: &crate::agent_launch::StartRequest, pane: &str) {
         return;
     };
     let provenance = SpawnProvenance {
-        launch_id: uuid::Uuid::new_v4().to_string(),
+        launch_id: launch_id.to_owned(),
         created_at: time::OffsetDateTime::now_utc().to_string(),
         creator,
         child_pane: child.pane_id,

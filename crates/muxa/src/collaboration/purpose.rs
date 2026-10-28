@@ -39,13 +39,49 @@ impl std::str::FromStr for LaunchPurpose {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct ProcessFence {
-    pid: u32,
-    birth: String,
+pub struct ProcessFence {
+    pub pid: u32,
+    pub birth: String,
 }
 
 impl ProcessFence {
-    fn observe(pane: &PaneInfo, kind: AgentKind) -> Option<Self> {
+    pub(crate) fn exited_status(&self) -> Option<bool> {
+        if let Some(birth) = process_birth(self.pid) {
+            Some(birth != self.birth)
+        } else if self.definitely_exited() {
+            Some(true)
+        } else {
+            None
+        }
+    }
+
+    /// Missing birth data alone can mean an observation failure, not exit.
+    pub(crate) fn definitely_exited(&self) -> bool {
+        if let Some(birth) = process_birth(self.pid) {
+            return birth != self.birth;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            matches!(
+                std::path::Path::new(&format!("/proc/{}", self.pid)).try_exists(),
+                Ok(false)
+            )
+        }
+        #[cfg(all(unix, not(target_os = "linux")))]
+        {
+            false
+        } // No authoritative negative process observation on this path.
+        #[cfg(windows)]
+        {
+            !crate::process_snapshot::pid_exists(self.pid)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            false
+        }
+    }
+
+    pub(crate) fn observe(pane: &PaneInfo, kind: AgentKind) -> Option<Self> {
         #[cfg(target_os = "linux")]
         let root = crate::process_tree::read_proc(pane.pane_pid, 0);
         #[cfg(not(target_os = "linux"))]
@@ -177,6 +213,33 @@ fn verify_pending_grants(
 }
 
 impl CollaborationStore {
+    pub(crate) async fn effective_worker(&self, participant: &Participant) -> bool {
+        self.purposes
+            .read()
+            .await
+            .iter()
+            .rev()
+            .find(|g| g.owns_session(participant))
+            .is_some_and(|g| g.purpose == LaunchPurpose::Worker)
+    }
+    pub(super) async fn worker_launch_binding(&self, id: &str) -> Option<String> {
+        self.purposes
+            .read()
+            .await
+            .iter()
+            .find(|g| g.id == id)
+            .and_then(|g| g.consumed_by.clone())
+    }
+
+    pub(super) async fn worker_launch_fence(&self, id: &str) -> Option<ProcessFence> {
+        self.purposes
+            .read()
+            .await
+            .iter()
+            .find(|g| g.id == id)
+            .and_then(|g| g.fence.clone())
+    }
+
     fn persist_purposes(
         &self,
         grants: &[PurposeGrant],
@@ -298,6 +361,13 @@ impl CollaborationStore {
             .any(|session| session.console || is_pending_session(&session.agent_session_id))
         {
             return Err(CollaborationError::ConsoleIdentity);
+        }
+        let mut panes = sessions.iter().map(|p| p.pane.clone()).collect::<Vec<_>>();
+        panes.sort();
+        panes.dedup();
+        let mut action_guards = Vec::new();
+        for pane in panes {
+            action_guards.push(self.worker_action_guard(&pane).await);
         }
         let _transaction = self.transaction_lock.lock().await;
         let mut grants = self.purposes.write().await;

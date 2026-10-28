@@ -55,6 +55,7 @@ mod work_init;
 mod work_options;
 mod work_pipeline;
 mod work_up;
+mod worker_cmd;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -202,6 +203,9 @@ enum Cmd {
     /// Read and replace the daemon's config.toml, the same way Muxa.app's
     /// Advanced settings does.
     Config(config_cmd::Args),
+    /// Worker agents muxa launched for peer work, across every room: state,
+    /// observed idle time, open requests, and what is left behind.
+    Workers(worker_cmd::Args),
     /// Former name of `muxa fleet host`. Muxa.app still invokes it, and an
     /// app may run against an older or newer CLI, so keep this alias.
     #[command(hide = true)]
@@ -1610,6 +1614,7 @@ async fn main() -> Result<()> {
         Cmd::Skill(a) => message_skill::run(a, &cfg.message, skill_path.as_deref()),
         Cmd::Automation(a) => automation::run(a, &client).await,
         Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
+        Cmd::Workers(a) => worker_cmd::run(a, &Client::new(socket.clone())).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => {
             Box::pin(fleet_cli::run_fleet(
@@ -5988,6 +5993,7 @@ mod tests {
     fn collaboration_participant(pane: &str, window: &str) -> Participant {
         Participant {
             launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
+            draining: false,
             agent_kind: AgentKind::Codex,
             agent_session_id: format!("agent-{pane}"),
             pane: pane.to_string(),
@@ -6335,6 +6341,7 @@ mod tests {
         muxa::tmux::PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

@@ -64,7 +64,7 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
             None,
             check_synthetic_agents(&snapshot),
         );
-        if let Some(result) = check_stale_requests(&socket).await {
+        for result in check_collaboration(&socket).await {
             add(&mut report, "muxad", None, result);
         }
     }
@@ -271,11 +271,7 @@ async fn check_muxad(socket: &Path) -> CheckResult {
         )
         .await
         {
-            Ok(Ok(hello)) if hello.collaboration_error.is_some() => CheckResult::Fail(format!("muxad responding; collaboration unavailable: {} — repair the mailbox and restart muxad",hello.collaboration_error.as_deref().unwrap_or_default())),
-            Ok(Ok(hello)) => hello.version_skew().map_or_else(
-                || CheckResult::Ok(format!("muxad responding at {}", socket.display())),
-                |skew| CheckResult::Warn(skew.to_string()),
-            ),
+            Ok(Ok(hello)) => muxad_hello_verdict(&hello, socket),
             _ => CheckResult::Ok(format!("muxad responding at {}", socket.display())),
         },
         // The inner error already carries the failure mode — including
@@ -300,6 +296,23 @@ async fn check_muxad(socket: &Path) -> CheckResult {
             socket.display()
         )),
     }
+}
+
+fn muxad_hello_verdict(hello: &muxa::ipc::Hello, socket: &Path) -> CheckResult {
+    if let Some(error) = &hello.collaboration_error {
+        return CheckResult::Fail(format!("muxad responding; collaboration unavailable: {error} — repair the mailbox and restart muxad"));
+    }
+    if let Some(skew) = hello.version_skew() {
+        return CheckResult::Warn(skew.to_string());
+    }
+    if !hello
+        .capabilities
+        .iter()
+        .any(|cap| cap == muxa::collaboration::WORKER_SPAWN_CAPABILITY)
+    {
+        return CheckResult::Warn("muxad lacks collaboration_worker_spawn_v1; automatic worker creation is disabled — upgrade/restart muxad".into());
+    }
+    CheckResult::Ok(format!("muxad responding at {}", socket.display()))
 }
 
 /// One-shot snapshot fetch shared by the post-IPC checks. Returns
@@ -334,6 +347,82 @@ async fn check_stale_requests(socket: &Path) -> Option<CheckResult> {
     .ok()?
     .ok()?;
     Some(stale_requests_verdict(&stale))
+}
+
+/// The mailbox and the workers muxa launched, when the daemon answers.
+async fn check_collaboration(socket: &Path) -> Vec<CheckResult> {
+    [
+        check_stale_requests(socket).await,
+        check_workers(socket).await,
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Workers muxa launched that are in error or long idle. `None` when the
+/// daemon does not answer or predates the inventory.
+async fn check_workers(socket: &Path) -> Option<CheckResult> {
+    let client = Client::new(socket.to_path_buf());
+    let inventory = timeout(
+        Duration::from_millis(1500),
+        client.collaboration_workers(muxa::ipc::DEFAULT_WORKER_IDLE_SECS),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    Some(workers_verdict(&inventory))
+}
+
+fn workers_verdict(inventory: &muxa::collaboration::WorkerInventory) -> CheckResult {
+    use muxa::collaboration::WorkerFlag;
+    let panes = |flag: WorkerFlag| -> Vec<&str> {
+        inventory
+            .workers
+            .iter()
+            .filter(|worker| worker.flags.contains(&flag))
+            .map(|worker| worker.pane.as_str())
+            .collect()
+    };
+    let error = panes(WorkerFlag::Error);
+    let idle = panes(WorkerFlag::LongIdle);
+    let overlap = panes(WorkerFlag::PossibleOverlap);
+    let total = inventory.workers.len();
+    let overlap_note = if overlap.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} possibly overlapping ({}), which can be deliberate",
+            overlap.len(),
+            overlap.join(", ")
+        )
+    };
+    if error.is_empty() && idle.is_empty() {
+        return CheckResult::Ok(format!(
+            "{total} live worker(s), none in error or idle over {}h{overlap_note}",
+            inventory.idle_threshold_secs / 3600
+        ));
+    }
+    let mut parts = Vec::new();
+    if !error.is_empty() {
+        parts.push(format!(
+            "{} in error ({}) — never reused, so a new worker may be spawned beside it",
+            error.len(),
+            error.join(", ")
+        ));
+    }
+    if !idle.is_empty() {
+        parts.push(format!(
+            "{} observed idle over {}h ({})",
+            idle.len(),
+            inventory.idle_threshold_secs / 3600,
+            idle.join(", ")
+        ));
+    }
+    CheckResult::Warn(format!(
+        "{total} live worker(s): {}{overlap_note}. Review with `muxa workers`",
+        parts.join("; ")
+    ))
 }
 
 fn stale_requests_verdict(stale: &[muxa::collaboration::CollaborationRequest]) -> CheckResult {
@@ -1216,6 +1305,87 @@ fn uid_string() -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn same_version_daemon_without_spawn_coordination_still_warns() {
+        let mut hello = muxa::ipc::Hello {
+            collaboration_error: None,
+            capabilities: Vec::new(),
+            generation: None,
+            protocol: muxa::event::PROTOCOL_VERSION,
+            version: Some(env!("CARGO_PKG_VERSION").into()),
+        };
+        let CheckResult::Warn(message) = muxad_hello_verdict(&hello, Path::new("/tmp/test-muxad"))
+        else {
+            panic!("missing capability must not look healthy")
+        };
+        assert!(message.contains("automatic worker creation is disabled"));
+        assert!(message.contains("upgrade/restart muxad"));
+        hello
+            .capabilities
+            .push(muxa::collaboration::WORKER_SPAWN_CAPABILITY.into());
+        assert!(matches!(
+            muxad_hello_verdict(&hello, Path::new("/tmp/test-muxad")),
+            CheckResult::Ok(_)
+        ));
+    }
+
+    fn worker(
+        pane: &str,
+        flags: Vec<muxa::collaboration::WorkerFlag>,
+    ) -> muxa::collaboration::WorkerEntry {
+        muxa::collaboration::WorkerEntry {
+            pane: pane.into(),
+            agent_kind: muxa::event::AgentKind::Codex,
+            agent_session_id: "s".into(),
+            room: muxa::collaboration::RoomId {
+                host: "rmux".into(),
+                socket: None,
+                window_id: "@1".into(),
+            },
+            tmux_session_name: None,
+            window_name: None,
+            roles: Vec::new(),
+            alias: None,
+            state: muxa::event::AgentState::Idle,
+            pending: false,
+            draining: false,
+            observed_idle: None,
+            queued_requests: 0,
+            claimed_requests: 0,
+            flags,
+        }
+    }
+
+    #[test]
+    fn workers_warn_on_error_and_long_idle_but_not_on_overlap_alone() {
+        use muxa::collaboration::{WorkerFlag, WorkerInventory};
+        let inventory = |workers| WorkerInventory {
+            workers,
+            idle_threshold_secs: 24 * 3600,
+            recorded_grants: 0,
+        };
+        let CheckResult::Warn(message) = workers_verdict(&inventory(vec![
+            worker("rmux:%304", vec![WorkerFlag::Error]),
+            worker("rmux:%11", vec![WorkerFlag::LongIdle]),
+            worker("rmux:%9", vec![]),
+        ])) else {
+            panic!("error and idle workers warn");
+        };
+        assert!(message.contains("1 in error (rmux:%304)"), "{message}");
+        assert!(
+            message.contains("1 observed idle over 24h (rmux:%11)"),
+            "{message}"
+        );
+        assert!(message.contains("muxa workers"), "{message}");
+        let CheckResult::Ok(message) = workers_verdict(&inventory(vec![
+            worker("rmux:%1", vec![WorkerFlag::PossibleOverlap]),
+            worker("rmux:%2", vec![WorkerFlag::PossibleOverlap]),
+        ])) else {
+            panic!("overlap alone is informational");
+        };
+        assert!(message.contains("can be deliberate"), "{message}");
+    }
+
     /// A shell rc autostart is the supported setup without systemd.
     #[test]
     fn a_shellrc_autostart_is_healthy_without_systemd() {
@@ -1234,6 +1404,7 @@ mod tests {
     fn test_participant(pane: &str, session: &str) -> muxa::collaboration::Participant {
         muxa::collaboration::Participant {
             launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
+            draining: false,
             agent_kind: muxa::AgentKind::Codex,
             agent_session_id: session.into(),
             pane: pane.into(),

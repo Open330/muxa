@@ -483,6 +483,7 @@ pub(crate) async fn reconcile_run(
                         })?;
                     crate::agent_launch::start(StartRequest {
                         creator: None,
+                        worker_spawn: None,
                         bypass_permissions: true,
                         purpose: claim.agent.purpose,
                         socket: client.socket().to_path_buf(),
@@ -1272,6 +1273,7 @@ fn launch(
         .map_err(|error| anyhow::anyhow!("pipeline agent {:?}: {error}", agent.alias))?;
     let result = crate::agent_launch::start(StartRequest {
         creator: None,
+        worker_spawn: None,
         bypass_permissions: true,
         purpose: agent.purpose,
         socket: socket.to_path_buf(),

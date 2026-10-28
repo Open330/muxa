@@ -7,6 +7,7 @@ fn pane(id: &str, window: &str, work: Option<&str>, role: Option<&str>) -> PaneI
     PaneInfo {
         session_group: None,
         agent_program: None,
+        worker_launch_id: None,
         agent_role: role.map(str::to_string),
         agent_alias: None,
         workspace_id: work.map(|_| "callabo".to_string()),
@@ -47,6 +48,7 @@ fn agent(pane: &PaneInfo, session: &str, purpose: LaunchPurpose) -> Participant 
         roles: pane.agent_role.iter().cloned().collect(),
         console: false,
         launch_purpose: purpose,
+        draining: false,
     }
 }
 

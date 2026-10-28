@@ -562,6 +562,23 @@ pub trait PaneBackend: Send + Sync + 'static {
         BackendCaps::default()
     }
 
+    /// Exact pane-local override, excluding inherited window/global settings.
+    fn remain_on_exit_override(
+        &self,
+        _socket: Option<&str>,
+        _pane: &str,
+    ) -> Result<Option<String>, String> {
+        Err("remain-on-exit observation unsupported".into())
+    }
+    fn restore_remain_on_exit(
+        &self,
+        _socket: Option<&str>,
+        _pane: &str,
+        _value: Option<&str>,
+    ) -> bool {
+        false
+    }
+
     /// Keep `pane_id` open (dead) after its process exits, or drop that
     /// pane-level setting again (back to the window's or the global one).
     /// `false` when the backend has no such option; a pane that runs its
@@ -639,6 +656,21 @@ impl<T: PaneBackend + ?Sized> PaneBackend for Arc<T> {
     }
     fn send_prompt_text_on(&self, socket: Option<&str>, pane_id: &str, text: &str) -> bool {
         (**self).send_prompt_text_on(socket, pane_id, text)
+    }
+    fn remain_on_exit_override(
+        &self,
+        socket: Option<&str>,
+        pane: &str,
+    ) -> Result<Option<String>, String> {
+        (**self).remain_on_exit_override(socket, pane)
+    }
+    fn restore_remain_on_exit(
+        &self,
+        socket: Option<&str>,
+        pane: &str,
+        value: Option<&str>,
+    ) -> bool {
+        (**self).restore_remain_on_exit(socket, pane, value)
     }
     fn set_remain_on_exit_on(&self, socket: Option<&str>, pane_id: &str, on: bool) -> bool {
         (**self).set_remain_on_exit_on(socket, pane_id, on)
@@ -1180,6 +1212,7 @@ mod tests {
         PaneInfo {
             session_group: None,
             agent_program: None,
+            worker_launch_id: None,
             agent_role: None,
             agent_alias: None,
             workspace_id: None,

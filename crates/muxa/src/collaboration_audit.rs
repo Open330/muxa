@@ -38,6 +38,13 @@ pub enum CollaborationAuditOperation {
     Wait,
     Cancel,
     PromotePurpose,
+    WorkerSpawnRelease,
+    WorkerDrainPlan,
+    WorkerDrainAcquire,
+    WorkerDrainRenew,
+    WorkerDrainStop,
+    WorkerDrainFinish,
+    WorkerDrains,
     WithdrawReplyWakes,
 }
 
@@ -79,6 +86,8 @@ pub struct CollaborationAuditEntry {
     /// The purpose an operator purpose change asked for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<crate::collaboration::LaunchPurpose>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub release_reason: Option<String>,
     /// Encoded daemon IPC response size, including its newline; not model tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<usize>,
@@ -102,6 +111,7 @@ pub struct CollaborationAuditContext {
     pub message_bytes: Option<usize>,
     pub target_sessions: Vec<String>,
     pub purpose: Option<crate::collaboration::LaunchPurpose>,
+    pub release_reason: Option<String>,
 }
 
 impl CollaborationAuditContext {
@@ -120,6 +130,7 @@ impl CollaborationAuditContext {
             message_bytes: None,
             target_sessions: Vec::new(),
             purpose: None,
+            release_reason: None,
         }
     }
 
@@ -150,6 +161,7 @@ impl CollaborationAuditContext {
             result_count,
             target_sessions: self.target_sessions,
             purpose: self.purpose,
+            release_reason: self.release_reason,
             response_bytes: None,
             elapsed_us: None,
             ok: error.is_none(),

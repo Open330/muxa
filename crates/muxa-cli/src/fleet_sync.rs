@@ -567,7 +567,8 @@ mod persistence_tests {
         };
         assert!(persist(&client, &transfer).await.is_err());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 2);
+        // No backup: only the config and the daemon's socket and its claim.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
         transfer.expected_text = before.into();
         let (backup, next) = persist(&client, &transfer).await.unwrap().unwrap();
         assert_eq!(std::fs::read_to_string(&backup).unwrap(), before);
