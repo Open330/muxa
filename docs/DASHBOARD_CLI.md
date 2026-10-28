@@ -52,4 +52,4 @@ and saves the order (`[watch] board_sort`).
   sessions in the `--since` window.
 - **Muxa-owned PTY sessions** are not Work and do not appear; `muxa watch`
   lists them.
-- `muxa dashboard --legacy` opens the previous console for one release.
+- The previous card console has been removed.

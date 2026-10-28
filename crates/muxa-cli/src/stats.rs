@@ -620,7 +620,6 @@ pub(crate) struct ActiveDuration {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SessionActiveStats {
     pub totals: ActiveDuration,
-    pub by_session: BTreeMap<String, ActiveDuration>,
 }
 
 #[derive(Debug, Clone)]
@@ -732,7 +731,7 @@ pub(crate) async fn session_active_stats(
             total
         });
 
-    Ok(SessionActiveStats { totals, by_session })
+    Ok(SessionActiveStats { totals })
 }
 
 /// Convert a config `u64` seconds value into a `time::Duration`, clamping the
