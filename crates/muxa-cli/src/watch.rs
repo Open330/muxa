@@ -10544,6 +10544,11 @@ fn command_suggestions(input: &str) -> Vec<CommandSpec> {
 fn execute_palette_command(app: &mut App, input: &str) -> Action {
     let normalized = input.split_whitespace().collect::<Vec<_>>().join(" ");
     let command = normalized.to_lowercase();
+    // Refused before any command opens a form for the hidden topology node.
+    if app.watch_cfg.screen == WatchScreen::Board && !board_palette_allows(&command) {
+        app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
+        return Action::None;
+    }
     match command.as_str() {
         "q" | "quit" => Action::Quit,
         "r" | "refresh" => Action::Refresh,
@@ -10651,13 +10656,64 @@ fn gate_board_action(app: &mut App, action: Action) -> Action {
             }
         },
         _ => {
-            app.set_hint(
-                "not on the Work board yet — Alt-1 to act on the topology",
-                HintLevel::Warn,
-            );
+            app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
             Action::None
         }
     }
+}
+
+const BOARD_REFUSAL: &str = "not on the Work board yet — Alt-1 to act on the topology";
+
+/// Browsing keys whose handlers act on the topology cursor directly — open a
+/// form for it, or move it — before any `Action` exists for the outer gate to
+/// refuse. Typing into a filter is unaffected: these only apply while browsing.
+fn board_refuses_key(code: KeyCode, modifiers: KeyModifiers, app: &mut App) -> bool {
+    if !modifiers.difference(KeyModifiers::SHIFT).is_empty() {
+        return false;
+    }
+    let refused = match code {
+        // Expand and collapse the hidden tree.
+        KeyCode::Left | KeyCode::Right => return true,
+        KeyCode::Char(c) => {
+            app.browse_keys_active()
+                && matches!(
+                    c,
+                    'm' | ' ' | 'n' | 'C' | '|' | 'a' | 'A' | 'w' | 'R' | 'h' | 'l' | 'd'
+                )
+        }
+        _ => false,
+    };
+    if refused {
+        app.set_hint(BOARD_REFUSAL, HintLevel::Warn);
+    }
+    refused
+}
+
+/// Palette commands that mean the same on the board: navigation between
+/// screens and presentations, global panels, and leaving.
+fn board_palette_allows(command: &str) -> bool {
+    matches!(
+        command,
+        "" | "q"
+            | "quit"
+            | "r"
+            | "refresh"
+            | "o"
+            | "open"
+            | "preview"
+            | "help"
+            | "?"
+            | "topology"
+            | "collab"
+            | "board"
+            | "attention"
+            | "events"
+            | "inspector"
+            | "split"
+            | "daemon restart"
+    ) || ["screen ", "view ", "layout ", "sort "]
+        .iter()
+        .any(|prefix| command.starts_with(prefix))
 }
 
 #[allow(clippy::too_many_lines)] // one ordered input-mode dispatcher keeps modal precedence explicit
@@ -10886,6 +10942,9 @@ fn handle_event_on_any_screen(ev: Event, app: &mut App) -> Action {
     if app.watch_cfg.screen == WatchScreen::Board {
         if let Some(action) = handle_board_screen_key(code, modifiers, app) {
             return action;
+        }
+        if board_refuses_key(code, modifiers, app) {
+            return Action::None;
         }
     }
 
@@ -29499,6 +29558,57 @@ sort = ["state"]
             ),
             Action::SetScreen(WatchScreen::Topology)
         ));
+    }
+
+    #[test]
+    fn board_never_opens_a_form_for_the_hidden_topology_node() {
+        let key = |c: char| Event::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+        let (mut app, _) = board_on_b_topology_on_a();
+        let selected = app.selected_node_key();
+        for c in ['R', 'n', 'm', 'w', 'C', 'h', 'l'] {
+            let _ = handle_event(key(c), &mut app);
+            assert!(
+                app.rename.is_none(),
+                "{c} opened rename for the hidden node"
+            );
+            assert!(app.spawn.is_none(), "{c} opened spawn for the hidden node");
+            assert!(
+                app.collaboration_composer.is_none(),
+                "{c} opened a composer"
+            );
+            assert!(app.work_composer.is_none(), "{c} opened the work composer");
+        }
+        for arrow in [KeyCode::Left, KeyCode::Right] {
+            let _ = handle_event(
+                Event::Key(KeyEvent::new(arrow, KeyModifiers::NONE)),
+                &mut app,
+            );
+        }
+        assert_eq!(
+            app.selected_node_key(),
+            selected,
+            "the hidden cursor never moved"
+        );
+        // The real palette route: `:` then typing, then Enter.
+        for command in ["rename", "kill", "message", "move"] {
+            let _ = handle_event(key(':'), &mut app);
+            for c in command.chars() {
+                let _ = handle_event(key(c), &mut app);
+            }
+            let action = handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app,
+            );
+            assert!(
+                matches!(action, Action::None),
+                ":{command} returned an action"
+            );
+            assert!(app.rename.is_none(), ":{command} opened rename");
+        }
+        // Typing a filter still works on the board.
+        app.arm_explicit_search();
+        let _ = handle_event(key('R'), &mut app);
+        assert_eq!(app.search_query, "R");
     }
 
     #[test]

@@ -3422,7 +3422,10 @@ pub(crate) async fn cmd_fleet_watch(
     }
     // The Work board reads this host's Work records and multiplexers; under
     // a host header it would pass off one host's Works as the fleet's.
-    if matches!(invocation.screen, Some(WatchScreenArg::Board)) {
+    let screen = invocation
+        .screen
+        .map_or(cfg.watch.screen, muxa::config::WatchScreen::from);
+    if screen == muxa::config::WatchScreen::Board {
         anyhow::bail!(
             "the Work board is local to this host; run `muxa watch --screen board` without --fleet"
         );
