@@ -1367,7 +1367,10 @@ async fn load_dashboard_data(
     // resolve when the dashboard is opened from outside the agents' host.
     let panes = crate::all_panes().await;
     let mut notes = Vec::new();
-    let scan = muxa::tmux::scanner::scan().await;
+    // Every backend, not only tmux: a host whose panes live on rmux would
+    // otherwise show an empty board.
+    let scan =
+        muxa::dashboard::multi_host_pane_scan(std::sync::Arc::new(muxa::active_backends())).await;
     notes.extend(
         scan.errors
             .iter()

@@ -293,15 +293,17 @@ impl AppState {
     async fn refresh_pane_scan(&self) -> scanner::ScanResult {
         let backends = self.backends.clone();
         self.pane_cache
-            .get_or_refresh(|| refresh_pane_scan(backends))
+            .get_or_refresh(|| multi_host_pane_scan(backends))
             .await
     }
 }
 
-/// Pull one multi-host inventory for the pane cache. The tmux scanner and
-/// non-tmux backend calls run concurrently; each backend is sync-blocking, so
-/// the latter stay on Tokio's blocking pool.
-async fn refresh_pane_scan(backends: Arc<Vec<SharedBackend>>) -> scanner::ScanResult {
+/// Pull one multi-host inventory: the tmux scanner plus every other active
+/// backend (rmux, zellij, …), which a tmux scan alone never sees. The two run
+/// concurrently; each backend is sync-blocking, so those calls stay on
+/// Tokio's blocking pool. Work projections must be built from this, or a
+/// host whose panes live on rmux shows no Work at all.
+pub async fn multi_host_pane_scan(backends: Arc<Vec<SharedBackend>>) -> scanner::ScanResult {
     let non_tmux = backends
         .iter()
         .filter(|backend| backend.kind() != HostKind::Tmux)
@@ -346,6 +348,18 @@ fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> sca
                     .as_deref()
                     .map_or_else(|| PathBuf::from("tmux"), PathBuf::from),
             };
+            // Only the Work marks survive a non-tmux listing. Both halves are
+            // stamped together by `muxa work`, so a pane carrying both is a
+            // managed Work pane; dropping them left every rmux Work unlinked.
+            let muxa = MuxaPaneMetadata {
+                managed_work: pane.workspace_id.is_some() && pane.work_id.is_some(),
+                workspace_id: pane.workspace_id.clone(),
+                work_id: pane.work_id.clone(),
+                role: pane.agent_role.clone(),
+                agent: pane.agent_program.clone(),
+                managed_agent: pane.agent_program.is_some(),
+                ..MuxaPaneMetadata::default()
+            };
             PaneSummary {
                 host: kind,
                 pane_id: pane.pane_id,
@@ -360,7 +374,7 @@ fn backend_scan_result(kind: HostKind, panes: Vec<crate::tmux::PaneInfo>) -> sca
                 title: pane.title,
                 current_path: pane.current_path,
                 socket,
-                muxa: MuxaPaneMetadata::default(),
+                muxa,
                 attach_command: String::new(),
             }
         })
@@ -3680,6 +3694,57 @@ mod tests {
         assert!(scan.panes[0].attach_command.is_empty());
     }
 
+    #[test]
+    fn rmux_rows_keep_their_work_marks_so_the_work_is_linked() {
+        let pane = |id: &str, window: &str, work: Option<&str>| crate::tmux::PaneInfo {
+            session_group: None,
+            agent_program: Some("codex".into()),
+            worker_launch_id: None,
+            agent_role: Some("reviewer".into()),
+            agent_alias: None,
+            workspace_id: work.map(|_| "callabo".into()),
+            work_id: work.map(Into::into),
+            socket: Some("/tmp/rmux-user/default".into()),
+            pane_id: id.into(),
+            session_id: "$1".into(),
+            session: "callabo".into(),
+            window_id: window.into(),
+            window_name: "CAL-1".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: "/dev/pts/4".into(),
+            current_command: "codex".into(),
+            title: "codex".into(),
+            pane_pid: 42,
+            current_path: "/tmp/project".into(),
+        };
+        let scan = backend_scan_result(
+            HostKind::Rmux,
+            vec![
+                pane("rmux:%4", "@2", Some("CAL-1")),
+                pane("rmux:%5", "@3", None),
+            ],
+        );
+        assert_eq!(scan.panes[0].muxa.role.as_deref(), Some("reviewer"));
+        let snapshot = work::build_snapshot(&scan.panes, &[], &[], OffsetDateTime::now_utc());
+        let works: Vec<_> = snapshot
+            .works
+            .iter()
+            .map(|work| {
+                (
+                    work.identity.workspace_id.as_str(),
+                    work.identity.work_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(works, [("callabo", "CAL-1")]);
+        assert_eq!(
+            snapshot.unlinked_executions.len(),
+            1,
+            "the unmarked window stays unlinked"
+        );
+    }
+
     #[tokio::test]
     async fn dashboard_scan_includes_non_primary_rmux_backend() {
         let rmux: SharedBackend = Arc::new(InventoryBackend {
@@ -3708,7 +3773,7 @@ mod tests {
             }],
         });
 
-        let scan = refresh_pane_scan(Arc::new(vec![rmux.clone()])).await;
+        let scan = multi_host_pane_scan(Arc::new(vec![rmux.clone()])).await;
         let pane = scan
             .panes
             .iter()
