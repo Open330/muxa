@@ -318,8 +318,9 @@ seconds while the board shows (it never claims anything), and says
 `unavailable` rather than zero when the listing fails. A `workers` line counts
 the Work's agents that muxa launched for peer work, matched by agent session,
 and how many are long idle (over 24h), in error, or possibly overlapping; it is
-read-only and points at `muxa workers prune`, which dry-runs before it retires
-anything. `b` (or `M`) opens that agent's
+read-only and points at `muxa workers prune`, which plans host-wide, dry-runs
+by default, skips workers with open work, and takes errored ones only with
+`--error`. `b` (or `M`) opens that agent's
 mailbox, read-only until you act; `i` claims its queued requests and `e`
 replies, both as that agent, never as the console. In any mailbox, `x` on the
 Sent tab withdraws a request this console sent that is still queued, after a

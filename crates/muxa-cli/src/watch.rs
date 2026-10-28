@@ -9467,7 +9467,10 @@ impl BoardWorkers {
             line.push_str(&flags.join(" · "));
         }
         if summary.long_idle > 0 || summary.error > 0 {
-            line.push_str(" — `muxa workers prune` retires them");
+            // A pointer, not a promise: prune plans host-wide, dry-runs first,
+            // skips workers with open work, and takes errored ones only with
+            // --error.
+            line.push_str(" — review candidates with `muxa workers prune` (--error for errored)");
         }
         line
     }
@@ -31193,7 +31196,7 @@ sort = ["state"]
         ])));
         assert_eq!(
             board_workers.line(&work),
-            "workers  2 · 1 long idle · 1 in error · 1 possibly overlapping — `muxa workers prune` retires them"
+            "workers  2 · 1 long idle · 1 in error · 1 possibly overlapping — review candidates with `muxa workers prune` (--error for errored)"
         );
     }
 
