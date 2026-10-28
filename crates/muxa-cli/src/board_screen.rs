@@ -235,6 +235,9 @@ impl BoardScreen {
         let next = usize::try_from((current + delta).rem_euclid(count_i)).unwrap_or(0);
         let agents = live_agents(work);
         self.agent = agents.get(next).map(|(run, pane)| AgentRef::of(run, pane));
+        // Choosing an agent chooses its Work, even one shown only because a
+        // filter hides the committed Work: the next refresh must keep both.
+        self.selected = Some(identity.clone());
         self.agent_work = Some(identity);
     }
 
@@ -1010,6 +1013,28 @@ mod tests {
         reordered.runs[0].panes.reverse();
         board.set_snapshot(snapshot(vec![reordered]), Vec::new());
         assert_eq!(cursor(&board), "%0");
+    }
+
+    #[test]
+    fn choosing_an_agent_in_a_filtered_work_survives_a_refresh() {
+        let a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut b = work("CAL-2", BoardStage::InProgress, Vec::new(), 2);
+        b.runs = vec![run(
+            "/a",
+            vec![
+                ("%5", Some(AgentState::Idle)),
+                ("%6", Some(AgentState::Idle)),
+            ],
+        )];
+        let snap = || snapshot(vec![a.clone(), b.clone()]);
+        let mut board = BoardScreen::default();
+        board.set_snapshot(snap(), Vec::new());
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-1");
+        board.cycle_agent(1, "cal-2");
+        board.set_snapshot(snap(), Vec::new());
+        let work = board.selected_work("cal-2").unwrap();
+        let (_, pane) = live_agents(work)[board.selected_agent_index("cal-2")];
+        assert_eq!(pane.pane_id, "%6");
     }
 
     #[test]
