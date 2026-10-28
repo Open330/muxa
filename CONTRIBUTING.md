@@ -159,6 +159,27 @@ than after.
    version and DMG checksum separately, or repair the secret and rerun the
    `tap-bump` workflow for the published tag.
 
+### Without the release workflow
+
+When the `release` workflow is disabled, steps 1–3 stay the same and the
+archives are built on your own machines instead (the tag push starts
+nothing). Keep `[skip ci]` out of the release commit's whole message either
+way: a tag on that commit does not start the workflow when it is enabled.
+
+```sh
+scripts/release-local.sh build v0.9.3 x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu  # on Linux
+scripts/release-local.sh build v0.9.3 aarch64-apple-darwin x86_64-apple-darwin            # on a Mac
+scripts/release-local.sh publish v0.9.3   # once all four are attached
+scripts/bump-tap.sh v0.9.3
+```
+
+`build` creates the draft if needed and attaches each archive with its
+checksum, in the workflow's layout. Linux targets go through cargo-zigbuild
+against glibc 2.17 (a native build would require the build host's glibc).
+`publish` refuses until all four targets are attached, then uses the tag's
+`CHANGELOG.md` section as the notes. The Mac app DMG is separate
+(`apps/muxa-macos/Scripts/package-dmg.sh`).
+
 ## Project layout
 
 - `crates/muxa` — shared library: state, config, IPC, backends, agent adapters,
