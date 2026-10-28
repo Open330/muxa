@@ -723,6 +723,7 @@ async fn attach_collaboration(client: &Client, cells: &mut [PeekCell]) {
         return;
     };
     let origin = muxa::collaboration::CollaborationOrigin {
+        exact_session: false,
         pane,
         socket: agent.tmux_socket.clone(),
         console: true,

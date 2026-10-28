@@ -335,7 +335,20 @@ pub struct CollaborationOrigin {
     /// with this session wins over a pane match; without one, `pane` decides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_id: Option<String>,
+    /// Act only as exactly `agent_session_id`, in `pane` when one is given.
+    ///
+    /// For an operator acting on an agent's behalf (claiming its inbox,
+    /// replying as it): when that session is gone, the ordinary fallback to
+    /// whoever occupies the pane would act as a replacement agent instead.
+    /// With this set, a missing session is an error. Advertised as
+    /// [`EXACT_SESSION_CAPABILITY`]; an older daemon ignores the field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub exact_session: bool,
 }
+
+/// The daemon honours [`CollaborationOrigin::exact_session`] and resolves
+/// `session:<agent session id>` targets.
+pub const EXACT_SESSION_CAPABILITY: &str = "collaboration_exact_session_v1";
 
 /// Local IPC surface that initiated a collaboration call. This describes the
 /// transport actor, not the agent session represented by `from`.
@@ -4637,6 +4650,36 @@ pub fn resolve_origin(
     if origin.console {
         return console_participant(origin, panes);
     }
+    if origin.exact_session {
+        let Some(session) = origin.agent_session_id.as_deref() else {
+            return Err(CollaborationError::UnknownOrigin(
+                "an exact-session origin needs an agent session id".into(),
+            ));
+        };
+        return participants
+            .iter()
+            .find(|participant| {
+                participant.agent_session_id == session
+                    && (origin.pane.is_empty()
+                        || (participant.pane == origin.pane
+                            && origin.socket.as_deref().is_none_or(|socket| {
+                                participant.socket.as_deref().is_some_and(|candidate| {
+                                    crate::backend::pane_endpoints_match(
+                                        Some(&origin.pane),
+                                        candidate,
+                                        socket,
+                                    )
+                                })
+                            })))
+            })
+            .cloned()
+            .ok_or_else(|| {
+                CollaborationError::UnknownOrigin(format!(
+                    "agent session {session} is no longer running in {}",
+                    origin.pane
+                ))
+            });
+    }
     if let Some(session) = origin.agent_session_id.as_deref() {
         if let Some(participant) = participants
             .iter()
@@ -4682,6 +4725,21 @@ pub fn resolve_target(
     // and `role:` remain room concepts: aliases are unique only in one room.
     if selector == "human" {
         return Ok(Participant::console(sender.room.clone()));
+    }
+    // One exact agent session, wherever it now runs: the recipient an
+    // operator chose, never a successor in the same pane or a same-id pane on
+    // another server. Room-limited unless host scope.
+    if let Some(session) = selector.strip_prefix("session:") {
+        return participants
+            .iter()
+            .find(|candidate| {
+                candidate.agent_session_id == session
+                    && !candidate.same_endpoint(sender)
+                    && (scope == crate::config::CollaborationScope::Host
+                        || candidate.room == sender.room)
+            })
+            .cloned()
+            .ok_or_else(|| CollaborationError::UnknownTarget(selector.to_string()));
     }
     if scope == crate::config::CollaborationScope::Host {
         let pane = selector.strip_prefix("pane:").unwrap_or(selector);
@@ -5978,6 +6036,7 @@ mod tests {
             participant("%24", "thread-b"),
         ];
         let origin = |pane: &str, session: Option<&str>| CollaborationOrigin {
+            exact_session: false,
             pane: pane.into(),
             socket: Some("default".into()),
             console: false,
@@ -5992,6 +6051,85 @@ mod tests {
         assert_eq!(by_pane.agent_session_id, "junia");
         let unbound = resolve_origin(&origin("", Some("fresh")), &peers, &[]).unwrap_err();
         assert!(unbound.to_string().contains("not bound"), "{unbound}");
+    }
+
+    /// An operator acting as an agent must reach exactly that agent: when
+    /// its session is gone, the replacement in the same pane is not it.
+    #[test]
+    fn an_exact_session_origin_never_falls_back_to_the_pane() {
+        let peers = [participant("%9", "successor")];
+        let exact = |session: &str| CollaborationOrigin {
+            exact_session: true,
+            pane: "%9".into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: Some(session.into()),
+        };
+        let gone = resolve_origin(&exact("original"), &peers, &[]).unwrap_err();
+        assert!(gone.to_string().contains("no longer running"), "{gone}");
+        assert_eq!(
+            resolve_origin(&exact("successor"), &peers, &[])
+                .unwrap()
+                .agent_session_id,
+            "successor"
+        );
+        // The session elsewhere is not the agent in this pane either.
+        let moved = [participant("%10", "original")];
+        assert!(resolve_origin(&exact("original"), &moved, &[]).is_err());
+        let no_session = CollaborationOrigin {
+            agent_session_id: None,
+            ..exact("x")
+        };
+        assert!(resolve_origin(&no_session, &peers, &[]).is_err());
+    }
+
+    /// A `session:` target names one agent session: not a successor in its
+    /// pane, not a same-id pane on another server, and inside the room
+    /// unless host scope.
+    #[test]
+    fn a_session_target_reaches_only_that_session() {
+        let sender = participant("%1", "sender");
+        let mut elsewhere = participant("%2", "other-server");
+        elsewhere.socket = Some("b".into());
+        elsewhere.room.socket = Some("b".into());
+        let mut outside = participant("%5", "outside");
+        outside.room.window_id = "@9".into();
+        let peers = [
+            sender.clone(),
+            participant("%2", "successor"),
+            elsewhere,
+            outside,
+        ];
+        for gone in ["session:original", "session:"] {
+            assert!(matches!(
+                resolve_target(&sender, gone, &peers, CollaborationScope::Host),
+                Err(CollaborationError::UnknownTarget(_))
+            ));
+        }
+        let found = resolve_target(
+            &sender,
+            "session:successor",
+            &peers,
+            CollaborationScope::Window,
+        )
+        .unwrap();
+        assert_eq!(
+            (found.pane.as_str(), found.agent_session_id.as_str()),
+            ("%2", "successor")
+        );
+        assert!(resolve_target(
+            &sender,
+            "session:outside",
+            &peers,
+            CollaborationScope::Window
+        )
+        .is_err());
+        assert!(
+            resolve_target(&sender, "session:outside", &peers, CollaborationScope::Host).is_ok()
+        );
+        assert!(
+            resolve_target(&sender, "session:sender", &peers, CollaborationScope::Host).is_err()
+        );
     }
 
     fn pane_info(pane_id: &str) -> PaneInfo {
@@ -6539,6 +6677,7 @@ mod tests {
         view.session_group = Some("muxa".into());
 
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
@@ -6560,6 +6699,7 @@ mod tests {
         elsewhere.window_id = "@7".into();
 
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: None,
             console: true,
@@ -7954,6 +8094,7 @@ mod tests {
         let launch = participant("%1", "the-agent-under-the-cursor");
         let peers = vec![launch.clone(), participant("%2", "s2")];
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: true,
@@ -7995,6 +8136,7 @@ mod tests {
 
         let shell = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%77".into(),
                 socket: None,
                 console: true,
@@ -8014,6 +8156,7 @@ mod tests {
 
         let unlisted = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: String::new(),
                 socket: None,
                 console: true,
@@ -8042,6 +8185,7 @@ mod tests {
 
         let ambiguous = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: None,
                 console: true,
@@ -8057,6 +8201,7 @@ mod tests {
 
         let resolved = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: Some("/tmp/tmux-1000/default".into()),
                 console: true,
@@ -8075,6 +8220,7 @@ mod tests {
         let agent = participant("%1", "sender");
         let resolved = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: Some("/tmp/tmux-1000/default".into()),
                 console: false,
@@ -8095,6 +8241,7 @@ mod tests {
         let recipient = participant("%2", "recipient");
         let from_here = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: None,
                 console: true,
@@ -8108,6 +8255,7 @@ mod tests {
         elsewhere.window_id = "@other".into();
         let other_window = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%9".into(),
                 socket: None,
                 console: true,
@@ -8169,6 +8317,7 @@ mod tests {
         let recipient = participant("%2", "recipient");
         let console = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: None,
                 console: true,
@@ -8229,6 +8378,7 @@ mod tests {
         let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
         let console = resolve_origin(
             &CollaborationOrigin {
+                exact_session: false,
                 pane: "%1".into(),
                 socket: None,
                 console: true,

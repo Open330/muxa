@@ -616,6 +616,7 @@ mod tests {
         }
         let client = Client::new(socket);
         let console = CollaborationOrigin {
+            exact_session: false,
             pane: "%2".into(),
             socket: Some("default".into()),
             console: true,
@@ -806,6 +807,7 @@ mod tests {
             .find(|p| p.agent_session_id == "worker")
             .unwrap();
         let origin = CollaborationOrigin {
+            exact_session: false,
             pane: worker.pane.clone(),
             socket: worker.socket.clone(),
             console: false,

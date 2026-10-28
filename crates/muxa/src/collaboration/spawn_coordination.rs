@@ -858,6 +858,7 @@ mod tests {
 
     fn origin() -> CollaborationOrigin {
         CollaborationOrigin {
+            exact_session: false,
             pane: "%1".into(),
             socket: Some("default".into()),
             console: false,

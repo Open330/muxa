@@ -246,7 +246,16 @@ board_since`, 기본 `today`) 동안 **모든 세션**의 ACT·WACT 합계입니
 아니고 필터를 따르지 않으며, 읽을 수 없으면 0 대신 `unavailable`이라고
 표시합니다.
 
-kill, message, move, rename처럼 topology 노드를
+board의 협업도 같은 agent 커서를 따릅니다. `m`은 그 agent에게 메시지를 보냅니다.
+누른 순간 pane과 agent 세션이 고정되고, 그사이 그 pane에서 다른 agent가 시작됐으면
+보내지 않습니다. window scope에서는 이 room에 있는 agent여야 하고, `[collaboration]
+scope = "host"`이면 어떤 pane이든 닿으며, 서버 사이에 겹치는 id는 추측하지 않고
+거부합니다. topology 표시(`Space`)는 여기 적용되지 않습니다. `b`(또는 `M`)는 그
+agent의 메일함을 행동하기 전까지 읽기 전용으로 열고, `i`는 대기 중인 요청을 claim,
+`e`는 답장하며 둘 다 console이 아니라 그 agent로서 동작합니다. 어느 메일함에서든
+Sent 탭의 `x`는 이 console이 보냈고 아직 대기 중인 요청을 확인 뒤 철회합니다.
+
+kill, move, rename처럼 topology 노드를
 겨누는 동작은 숨은 topology 커서가 가리키던 대상에 실행되지 않도록 여기서는
 거부되며 `Alt-1`로 돌아가면 쓸 수 있습니다. board는 화면에 떠 있는 동안에만
 3초마다, 키 입력을 막지 않도록 백그라운드에서 다시 스캔합니다. 이 호스트 전용이라

@@ -348,6 +348,13 @@ Keep the backend prefix returned by Muxa. Requests are also pinned to the
 target's current agent session, so a new process reusing that pane cannot
 inherit old work.
 
+`session:<agent session id>` addresses one exact agent session wherever it
+runs (in this room, or any room with `scope = "host"`). If that session is gone
+the send fails rather than reaching whoever holds its pane now. An origin may
+likewise set `exact_session` to act only as its `agent_session_id`, never
+falling back to the pane's current occupant. Daemons that support both
+advertise `collaboration_exact_session_v1`; the watch Work board requires it.
+
 To address whoever holds a role in a work rather than one pane, use a path:
 `workspace/work/role`, `workspace/work/role@alias` or `workspace/work/@alias`,
 for example `muxa msg send callabo/CAL-8111/implementer "status?"`. It must

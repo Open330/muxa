@@ -109,6 +109,7 @@ async fn worker_drain_availability_and_capacity_do_not_spawn_around_a_drain() {
     assert!(!participants[0].accepts_peer_work());
     let from = sender();
     let origin = CollaborationOrigin {
+        exact_session: false,
         pane: from.pane.clone(),
         socket: from.socket.clone(),
         console: false,

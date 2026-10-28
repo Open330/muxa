@@ -591,6 +591,7 @@ async fn handle_request(
 fn collaboration_origin(pane: &PaneKey, console: bool) -> CollaborationOrigin {
     let endpoint = &pane.window.session.endpoint;
     CollaborationOrigin {
+        exact_session: false,
         pane: pane.pane_id.clone(),
         socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
             .then(|| endpoint.socket.clone()),

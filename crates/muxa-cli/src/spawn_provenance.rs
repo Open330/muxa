@@ -12,6 +12,7 @@ pub(crate) fn resolve_creator(socket: &Path) -> Option<CollaborationEndpoint> {
             return None;
         }
         muxa::collaboration::CollaborationOrigin {
+            exact_session: false,
             pane: String::new(),
             socket: None,
             console: false,

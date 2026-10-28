@@ -193,6 +193,12 @@ argument로 발신 pane을 임의 지정하지 않습니다.
   같은 room 안에서만 찾으며, 다른 서버에 같은 pane ID가 있으면 모호한 대상으로 거부합니다.
 - 요청은 pane뿐 아니라 현재 agent session에도 고정됩니다. pane을 새 agent가
   재사용해도 이전 요청을 받지 않습니다.
+- `session:<agent session id>`는 정확히 그 agent session을 지정합니다(이 room,
+  또는 `scope = "host"`면 어느 room이든). 그 session이 없으면 지금 그 pane을 가진
+  agent에게 보내지 않고 실패합니다. origin의 `exact_session`도 마찬가지로
+  `agent_session_id` 그대로만 동작하고 pane 점유자로 대체하지 않습니다. 둘을
+  지원하는 daemon은 `collaboration_exact_session_v1`을 알리며, watch Work board는
+  이를 요구합니다.
 - pane이 아니라 "이 작업의 이 역할"에게 보내려면 경로를 씁니다:
   `workspace/work/role`, `workspace/work/role@alias`, `workspace/work/@alias`
   (예: `muxa msg send callabo/CAL-8111/implementer "진행 상황?"`). 살아 있는 agent
