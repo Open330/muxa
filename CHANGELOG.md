@@ -35,7 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this console sent. Collaboration targets accept `session:<agent session
   id>` and origins accept `exact_session`, both refusing rather than falling
   back to a pane's new occupant (`collaboration_exact_session_v1`). The board
-  detail counts each Work's open requests to and from its agents.
+  detail counts each Work's open requests to and from its agents, and its
+  workers with their long-idle, error and overlap flags.
 
 - Opt-in versioned collaboration task contracts bind requests to daemon-created
   attempt IDs, exact basis commits and structured reported evidence. Read-only

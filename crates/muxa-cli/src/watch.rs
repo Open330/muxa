@@ -3322,6 +3322,7 @@ pub(crate) struct App {
     pending_outcomes: Vec<(Vec<PaneKey>, tokio::sync::oneshot::Receiver<ActionOutcome>)>,
     board_stats: BoardStats,
     board_collab: BoardCollab,
+    board_workers: BoardWorkers,
     /// The daemon resolves exact agent sessions (`session:` targets and
     /// exact-session origins). Board collaboration acts for one exact agent,
     /// so it is refused without this rather than risk a pane fallback.
@@ -3674,6 +3675,7 @@ impl App {
             board_pending: None,
             board_stats: BoardStats::default(),
             board_collab: BoardCollab::default(),
+            board_workers: BoardWorkers::default(),
             exact_session_supported: false,
             pending_outcomes: Vec::new(),
             collaboration_composer: None,
@@ -8840,10 +8842,22 @@ pub async fn run(
             apply_outcome_to_app(&mut app, outcome);
             needs_render = true;
         }
-        if app.board_stats.poll() | app.board_collab.poll() {
+        if app.board_stats.poll() | app.board_collab.poll() | app.board_workers.poll() {
             needs_render = true;
         }
-        if app.watch_cfg.screen == WatchScreen::Board && app.board_collab.due() {
+        if app.watch_cfg.screen == WatchScreen::Board
+            && app.board_workers.due(BOARD_WORKERS_INTERVAL)
+        {
+            let client = client.clone();
+            app.board_workers.start(async move {
+                client
+                    .collaboration_workers(BOARD_WORKER_IDLE_SECS)
+                    .await
+                    .map_err(|error| error.to_string())
+            });
+        }
+        if app.watch_cfg.screen == WatchScreen::Board && app.board_collab.due(BOARD_COLLAB_INTERVAL)
+        {
             if let Some(origin) = app.collaboration.origin.clone() {
                 let client = client.clone();
                 let origin = CollaborationOrigin {
@@ -8854,7 +8868,7 @@ pub async fn run(
                     .start(async move { read_watch_history(&client, &origin, false).await });
             }
         }
-        if app.watch_cfg.screen == WatchScreen::Board && app.board_stats.due() {
+        if app.watch_cfg.screen == WatchScreen::Board && app.board_stats.due(BOARD_STATS_INTERVAL) {
             let client = client.clone();
             let config = sort_persist_path
                 .clone()
@@ -9314,34 +9328,38 @@ fn take_finished_quick(app: &mut App) -> Vec<ActionOutcome> {
     finished
 }
 
-/// The board's ACT/WACT summary: all sessions in a window, fetched in the
-/// background at most every [`BOARD_STATS_INTERVAL`] while the board shows.
-#[derive(Debug, Default)]
-pub(crate) struct BoardStats {
-    /// `None` until the first fetch returns; an error is kept apart from a
-    /// window with no activity.
-    value: Option<std::result::Result<crate::stats::ActiveDuration, String>>,
-    in_flight: Option<
-        tokio::sync::oneshot::Receiver<std::result::Result<crate::stats::ActiveDuration, String>>,
-    >,
+/// A value the board fetches in the background: at most one fetch in
+/// flight, polled without blocking, repeated no more often than the caller's
+/// interval. `None` until the first fetch returns; a failure is kept apart
+/// from an empty answer.
+#[derive(Debug)]
+pub(crate) struct Background<T> {
+    value: Option<std::result::Result<T, String>>,
+    in_flight: Option<tokio::sync::oneshot::Receiver<std::result::Result<T, String>>>,
     started: Option<std::time::Instant>,
 }
 
-const BOARD_STATS_INTERVAL: Duration = Duration::from_secs(30);
+impl<T> Default for Background<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            in_flight: None,
+            started: None,
+        }
+    }
+}
 
-impl BoardStats {
-    fn due(&self) -> bool {
+impl<T: Send + 'static> Background<T> {
+    fn due(&self, interval: Duration) -> bool {
         self.in_flight.is_none()
             && self
                 .started
-                .is_none_or(|started| started.elapsed() >= BOARD_STATS_INTERVAL)
+                .is_none_or(|started| started.elapsed() >= interval)
     }
 
     fn start(
         &mut self,
-        fetch: impl std::future::Future<Output = std::result::Result<crate::stats::ActiveDuration, String>>
-            + Send
-            + 'static,
+        fetch: impl std::future::Future<Output = std::result::Result<T, String>> + Send + 'static,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
@@ -9364,13 +9382,19 @@ impl BoardStats {
             }
             Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
             Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                self.value = Some(Err("stats task failed".into()));
+                self.value = Some(Err("background task failed".into()));
                 self.in_flight = None;
                 true
             }
         }
     }
+}
 
+/// The board's ACT/WACT summary: all sessions in a window.
+pub(crate) type BoardStats = Background<crate::stats::ActiveDuration>;
+const BOARD_STATS_INTERVAL: Duration = Duration::from_secs(30);
+
+impl BoardStats {
     /// `all sessions · today · ACT 3h · WACT 2h`, or why there is none.
     fn label(&self, window: &str) -> String {
         let figures = match &self.value {
@@ -9386,61 +9410,12 @@ impl BoardStats {
     }
 }
 
-/// Collaboration history behind the board's per-Work summary: one console
-/// listing (previews, never claims), fetched in the background at most every
-/// [`BOARD_COLLAB_INTERVAL`] while the board shows.
-#[derive(Debug, Default)]
-pub(crate) struct BoardCollab {
-    value: Option<std::result::Result<Vec<CollaborationRequest>, String>>,
-    in_flight: Option<
-        tokio::sync::oneshot::Receiver<std::result::Result<Vec<CollaborationRequest>, String>>,
-    >,
-    started: Option<std::time::Instant>,
-}
-
+/// Collaboration history behind the per-Work summary: one console listing
+/// (previews, never claims).
+pub(crate) type BoardCollab = Background<Vec<CollaborationRequest>>;
 const BOARD_COLLAB_INTERVAL: Duration = Duration::from_secs(15);
 
 impl BoardCollab {
-    fn due(&self) -> bool {
-        self.in_flight.is_none()
-            && self
-                .started
-                .is_none_or(|started| started.elapsed() >= BOARD_COLLAB_INTERVAL)
-    }
-
-    fn start(
-        &mut self,
-        fetch: impl std::future::Future<Output = std::result::Result<Vec<CollaborationRequest>, String>>
-            + Send
-            + 'static,
-    ) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let _ = tx.send(fetch.await);
-        });
-        self.in_flight = Some(rx);
-        self.started = Some(std::time::Instant::now());
-    }
-
-    fn poll(&mut self) -> bool {
-        let Some(rx) = self.in_flight.as_mut() else {
-            return false;
-        };
-        match rx.try_recv() {
-            Ok(value) => {
-                self.value = Some(value);
-                self.in_flight = None;
-                true
-            }
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => false,
-            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-                self.value = Some(Err("history task failed".into()));
-                self.in_flight = None;
-                true
-            }
-        }
-    }
-
     /// The detail line for one Work: counts, still loading, or why not.
     fn line(&self, work: &muxa::work::WorkSnapshotItem) -> String {
         match &self.value {
@@ -9454,6 +9429,47 @@ impl BoardCollab {
                 )
             }
         }
+    }
+}
+
+/// The daemon's worker inventory, for the per-Work worker line. Read-only:
+/// retiring workers stays with `muxa workers prune`, which dry-runs first.
+pub(crate) type BoardWorkers = Background<muxa::collaboration::WorkerInventory>;
+const BOARD_WORKERS_INTERVAL: Duration = Duration::from_secs(30);
+/// Idle time past which the board flags a worker, as `muxa workers` does.
+const BOARD_WORKER_IDLE_SECS: u64 = 24 * 3600;
+
+impl BoardWorkers {
+    /// The detail line for one Work: its workers and what is wrong with
+    /// them, by exact agent session.
+    fn line(&self, work: &muxa::work::WorkSnapshotItem) -> String {
+        let inventory = match &self.value {
+            None => return "workers  …".into(),
+            Some(Err(_)) => return "workers  unavailable".into(),
+            Some(Ok(inventory)) => inventory,
+        };
+        let summary = board_screen::worker_summary(work, &inventory.workers);
+        if summary.workers == 0 {
+            return "workers  none".into();
+        }
+        let mut line = format!("workers  {}", summary.workers);
+        let flags: Vec<String> = [
+            (summary.long_idle, "long idle"),
+            (summary.error, "in error"),
+            (summary.overlap, "possibly overlapping"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect();
+        if !flags.is_empty() {
+            line.push_str(" · ");
+            line.push_str(&flags.join(" · "));
+        }
+        if summary.long_idle > 0 || summary.error > 0 {
+            line.push_str(" — `muxa workers prune` retires them");
+        }
+        line
     }
 }
 
@@ -16291,8 +16307,16 @@ fn board_detail(
     let agents = board_screen::live_agents(work);
     let selected = agents.get(app.board.selected_agent_index(filter)).copied();
     let mut lines = board_screen::detail_lines(work, now, theme, selected);
+    let at = 1.min(lines.len());
     lines.insert(
-        1.min(lines.len()),
+        at,
+        Line::from(Span::styled(
+            app.board_workers.line(work),
+            theme.dim_style(),
+        )),
+    );
+    lines.insert(
+        at,
         Line::from(Span::styled(app.board_collab.line(work), theme.dim_style())),
     );
     lines
@@ -31122,6 +31146,55 @@ sort = ["state"]
             ))),
         });
         assert!(matches!(gate_board_action(&mut app, later), Action::None));
+    }
+
+    #[test]
+    fn the_board_lists_a_works_workers_by_agent_session_and_points_at_prune() {
+        use muxa::collaboration::{WorkerEntry, WorkerFlag, WorkerInventory};
+        let (app, _) = board_with_agents();
+        let work = app.board.selected_work("").unwrap().clone();
+        let worker = |session: &str, flags: Vec<WorkerFlag>| WorkerEntry {
+            pane: "%1".into(),
+            agent_kind: AgentKind::Codex,
+            agent_session_id: session.into(),
+            room: muxa::collaboration::RoomId {
+                host: "tmux".into(),
+                socket: Some("a".into()),
+                window_id: "@4".into(),
+            },
+            tmux_session_name: None,
+            window_name: None,
+            roles: Vec::new(),
+            alias: None,
+            state: AgentState::Idle,
+            pending: false,
+            draining: false,
+            observed_idle: None,
+            queued_requests: 0,
+            claimed_requests: 0,
+            flags,
+        };
+        let inventory = |workers| WorkerInventory {
+            workers,
+            idle_threshold_secs: BOARD_WORKER_IDLE_SECS,
+            recorded_grants: 0,
+        };
+        let mut board_workers = BoardWorkers::default();
+        assert_eq!(board_workers.line(&work), "workers  …");
+        board_workers.value = Some(Err("old daemon".into()));
+        assert_eq!(board_workers.line(&work), "workers  unavailable");
+        board_workers.value = Some(Ok(inventory(vec![worker("elsewhere", Vec::new())])));
+        assert_eq!(board_workers.line(&work), "workers  none");
+        board_workers.value = Some(Ok(inventory(vec![
+            worker("%1", vec![WorkerFlag::LongIdle]),
+            worker("%1", vec![WorkerFlag::LongIdle]),
+            worker("%3", vec![WorkerFlag::Error, WorkerFlag::PossibleOverlap]),
+            worker("elsewhere", vec![WorkerFlag::Error]),
+        ])));
+        assert_eq!(
+            board_workers.line(&work),
+            "workers  2 · 1 long idle · 1 in error · 1 possibly overlapping — `muxa workers prune` retires them"
+        );
     }
 
     #[test]
