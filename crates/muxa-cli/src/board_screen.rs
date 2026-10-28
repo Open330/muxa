@@ -56,6 +56,7 @@ pub(crate) struct BoardScreen {
 /// One agent pane, exactly: server, session, window and pane.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentRef {
+    host: muxa::backend::HostKind,
     socket: String,
     session_id: String,
     window_id: String,
@@ -65,6 +66,7 @@ pub(crate) struct AgentRef {
 impl AgentRef {
     fn of(run: &RunSnapshot, pane: &RunPaneSnapshot) -> Self {
         Self {
+            host: run.execution.host,
             socket: run.execution.socket.clone(),
             session_id: run.execution.session_id.clone(),
             window_id: run.execution.window_id.clone(),
@@ -88,6 +90,7 @@ impl BoardScreen {
         if !present {
             self.selected = self.works.first().map(|work| work.identity.clone());
         }
+        self.reconcile_agent();
         self.unlinked = snapshot.unlinked_executions.len();
         self.notes = notes;
         self.loaded = true;
@@ -165,9 +168,41 @@ impl BoardScreen {
             current.saturating_sub(delta.unsigned_abs())
         };
         self.selected = Some(visible[next].identity.clone());
+        self.reconcile_agent();
     }
 
-    /// Index of the agent cursor among the selected Work's live agents.
+    /// Commit the agent cursor to an exact agent of the committed Work: kept
+    /// while that agent is still live in it, else the Work's first live
+    /// agent. Run whenever the snapshot or the selected Work changes, so the
+    /// agent an action addresses is the one the detail shows, never whoever
+    /// a refresh moved into first place.
+    fn reconcile_agent(&mut self) {
+        let Some(work) = self
+            .selected
+            .as_ref()
+            .and_then(|selected| self.works.iter().find(|work| &work.identity == selected))
+        else {
+            self.agent = None;
+            self.agent_work = None;
+            return;
+        };
+        let agents = live_agents(work);
+        let same_work = self.agent_work.as_ref() == Some(&work.identity);
+        let kept = same_work
+            && self.agent.as_ref().is_some_and(|agent| {
+                agents
+                    .iter()
+                    .any(|(run, pane)| &AgentRef::of(run, pane) == agent)
+            });
+        if !kept {
+            self.agent = agents.first().map(|(run, pane)| AgentRef::of(run, pane));
+        }
+        self.agent_work = Some(work.identity.clone());
+    }
+
+    /// Index of the agent cursor among the selected Work's live agents. A
+    /// Work shown only because the filter hides the committed one starts at
+    /// its first agent until the cursor moves onto it.
     pub(crate) fn selected_agent_index(&self, filter: &str) -> usize {
         let Some(work) = self.selected_work(filter) else {
             return 0;
@@ -208,6 +243,7 @@ impl BoardScreen {
             .visible(filter)
             .first()
             .map(|work| work.identity.clone());
+        self.reconcile_agent();
     }
 
     pub(crate) fn select_last(&mut self, filter: &str) {
@@ -215,6 +251,7 @@ impl BoardScreen {
             .visible(filter)
             .last()
             .map(|work| work.identity.clone());
+        self.reconcile_agent();
     }
 }
 
@@ -932,6 +969,69 @@ mod tests {
         );
         board.cycle_agent(1, "");
         assert_eq!(selected(&board), ("/a".to_string(), "%1".to_string()));
+    }
+
+    fn cursor(board: &BoardScreen) -> String {
+        let work = board.selected_work("").unwrap();
+        let (_, pane) = live_agents(work)[board.selected_agent_index("")];
+        pane.pane_id.clone()
+    }
+
+    #[test]
+    fn the_agent_cursor_is_committed_without_navigation_and_survives_reorders() {
+        let mut item = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        item.runs = vec![run(
+            "/a",
+            vec![
+                ("%1", Some(AgentState::Idle)),
+                ("%2", Some(AgentState::Idle)),
+            ],
+        )];
+        let mut board = BoardScreen::default();
+        board.set_snapshot(snapshot(vec![item.clone()]), Vec::new());
+        assert_eq!(cursor(&board), "%1");
+        // A newcomer lands first: the operator was looking at %1.
+        let mut reordered = item.clone();
+        let newcomer = reordered.runs[0].panes[0].clone();
+        reordered.runs[0].panes.insert(
+            0,
+            RunPaneSnapshot {
+                pane_id: "%0".into(),
+                ..newcomer
+            },
+        );
+        board.set_snapshot(snapshot(vec![reordered.clone()]), Vec::new());
+        assert_eq!(cursor(&board), "%1");
+        // %1 goes away: the cursor commits to the first live agent, and stays
+        // there through the next reorder.
+        reordered.runs[0].panes.retain(|pane| pane.pane_id != "%1");
+        board.set_snapshot(snapshot(vec![reordered.clone()]), Vec::new());
+        assert_eq!(cursor(&board), "%0");
+        reordered.runs[0].panes.reverse();
+        board.set_snapshot(snapshot(vec![reordered]), Vec::new());
+        assert_eq!(cursor(&board), "%0");
+    }
+
+    #[test]
+    fn leaving_a_work_resets_its_agent_cursor() {
+        let mut a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        a.runs = vec![run(
+            "/a",
+            vec![
+                ("%1", Some(AgentState::Idle)),
+                ("%2", Some(AgentState::Idle)),
+            ],
+        )];
+        let mut b = work("CAL-2", BoardStage::InProgress, Vec::new(), 2);
+        b.runs = vec![run("/a", vec![("%5", Some(AgentState::Idle))])];
+        let mut board = BoardScreen::default();
+        board.set_snapshot(snapshot(vec![a, b]), Vec::new());
+        board.cycle_agent(1, "");
+        assert_eq!(cursor(&board), "%2");
+        board.move_selection(1, "");
+        assert_eq!(cursor(&board), "%5");
+        board.move_selection(-1, "");
+        assert_eq!(cursor(&board), "%1", "back on CAL-1 the cursor starts over");
     }
 
     #[test]

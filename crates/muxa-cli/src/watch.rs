@@ -3296,12 +3296,15 @@ pub(crate) struct App {
     /// it scans every multiplexer and reads the Work records.
     pub(crate) board: BoardScreen,
     board_refresher: BoardRefresher,
-    /// Panes a board composer or confirmation was opened for. Its eventual
-    /// action may touch exactly these, whatever the board shows by then.
-    board_frozen: Vec<PaneKey>,
+    /// The board operation in progress, with its targets frozen when its
+    /// composer or confirmation opened. Only that operation's own submission
+    /// or confirmation passes the board gate, once; cancelling, confirming or
+    /// leaving the board ends it.
+    board_pending: Option<BoardPending>,
+    /// Background many-pane actions still running, with the panes each is
+    /// writing to: no other action may write to those panes meanwhile.
+    pending_outcomes: Vec<(Vec<PaneKey>, tokio::sync::oneshot::Receiver<ActionOutcome>)>,
     board_stats: BoardStats,
-    /// Background many-pane actions still running.
-    pending_outcomes: Vec<tokio::sync::oneshot::Receiver<ActionOutcome>>,
     collaboration_composer: Option<CollaborationComposer>,
     /// Agents the operator marked with `Space`, to be addressed together.
     ///
@@ -3647,7 +3650,7 @@ impl App {
             collab,
             board,
             board_refresher: BoardRefresher::default(),
-            board_frozen: Vec::new(),
+            board_pending: None,
             board_stats: BoardStats::default(),
             pending_outcomes: Vec::new(),
             collaboration_composer: None,
@@ -8492,6 +8495,7 @@ pub async fn run(
                 Action::ConfirmYes => {
                     if let Some(popup) = app.confirm.take() {
                         match popup.on_confirm {
+                            ConfirmAction::Quick(action) if refuse_busy(&mut app, &action) => {}
                             ConfirmAction::Quick(action) if is_many_pane(&action) => {
                                 start_quick_in_background(&mut app, action);
                             }
@@ -8578,6 +8582,7 @@ pub async fn run(
                 Action::Quick(qa) => {
                     if matches!(qa, QuickAction::ShowHelp) {
                         app.help_open = !app.help_open;
+                    } else if refuse_busy(&mut app, &qa) {
                     } else if is_many_pane(&qa) {
                         start_quick_in_background(&mut app, qa);
                     } else {
@@ -9174,28 +9179,63 @@ fn is_many_pane(action: &QuickAction) -> bool {
 }
 
 fn start_quick_in_background(app: &mut App, action: QuickAction) {
+    start_quick_with(app, action, |action| {
+        let mut fx = RealEffects;
+        dispatch_quick_action(action, &mut fx)
+    });
+}
+
+/// Run `action` off the input loop, owning its panes until it finishes.
+fn start_quick_with(
+    app: &mut App,
+    action: QuickAction,
+    run: impl FnOnce(QuickAction) -> ActionOutcome + Send + 'static,
+) {
+    let panes: Vec<PaneKey> = board_quick_panes(&action)
+        .unwrap_or_default()
+        .into_iter()
+        .cloned()
+        .collect();
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::task::spawn_blocking(move || {
-        let mut fx = RealEffects;
-        let _ = tx.send(dispatch_quick_action(action, &mut fx));
+        let _ = tx.send(run(action));
     });
-    app.pending_outcomes.push(rx);
+    app.pending_outcomes.push((panes, rx));
     app.set_hint("sending to the Work's agents…", HintLevel::Ok);
+}
+
+/// Refuse an action that would write to a pane a background action still
+/// owns: two writers interleave text and Enter, and an interrupt would race
+/// prompts still being typed.
+fn refuse_busy(app: &mut App, action: &QuickAction) -> bool {
+    let panes: Vec<PaneKey> = board_quick_panes(action)
+        .unwrap_or_default()
+        .into_iter()
+        .cloned()
+        .collect();
+    match busy_target(app, &panes) {
+        Some(pane) => {
+            app.set_hint(still_sending(&pane), HintLevel::Warn);
+            true
+        }
+        None => false,
+    }
 }
 
 fn take_finished_quick(app: &mut App) -> Vec<ActionOutcome> {
     let mut finished = Vec::new();
-    app.pending_outcomes.retain_mut(|rx| match rx.try_recv() {
-        Ok(outcome) => {
-            finished.push(outcome);
-            false
-        }
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
-        Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
-            finished.push(ActionOutcome::Err("✗ action task failed".into()));
-            false
-        }
-    });
+    app.pending_outcomes
+        .retain_mut(|(_, rx)| match rx.try_recv() {
+            Ok(outcome) => {
+                finished.push(outcome);
+                false
+            }
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => true,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                finished.push(ActionOutcome::Err("✗ action task failed".into()));
+                false
+            }
+        });
     finished
 }
 
@@ -10925,22 +10965,25 @@ fn gate_board_action(app: &mut App, action: Action) -> Action {
         | Action::SetLayout(_)
         | Action::SetCollabLayout(_)
         | Action::SetBoardSort(_)
-        | Action::SetScreen(_)
         | Action::InspectorSplitChanged
         | Action::DismissBroadcastReport
-        | Action::ConfirmCancel
+        | Action::Quick(QuickAction::ShowHelp) => action,
+        // Ending the pending operation, either way, ends its authority.
+        Action::ConfirmCancel
         | Action::CancelCollaborationComposer
-        | Action::Quick(QuickAction::ShowHelp)
-        | Action::ConfirmYes => action,
-        // Board actions, and their confirmation and submission, carry exact
-        // keys; they pass only while those keys are the selected Work's.
-        Action::AskConfirm(ConfirmPopup {
-            on_confirm: ConfirmAction::Quick(ref quick),
-            ..
-        })
-        | Action::Quick(ref quick)
-            if board_quick_panes(quick).is_some_and(|panes| board_owns_panes(app, &panes)) =>
-        {
+        | Action::ConfirmYes
+        | Action::SetScreen(_) => {
+            app.board_pending = None;
+            action
+        }
+        // The pending operation's own confirmation, which stays pending
+        // until answered.
+        Action::AskConfirm(_) if board_pending_matches(app.board_pending.as_ref(), &action) => {
+            action
+        }
+        // Its composer's submission, which uses the authority up.
+        Action::Quick(_) if board_pending_matches(app.board_pending.as_ref(), &action) => {
+            app.board_pending = None;
             action
         }
         Action::OpenPreview => match board_selected_pane(app) {
@@ -11874,6 +11917,15 @@ fn open_preview_for(app: &mut App, key: PaneKey) {
     });
 }
 
+/// A board operation awaiting its submission or confirmation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BoardPending {
+    /// A prompt composer for exactly these panes.
+    Compose(Vec<PaneKey>),
+    /// A confirmation for exactly this action.
+    Confirm(QuickAction),
+}
+
 /// What a board action addresses, frozen when its composer or confirmation
 /// opens: the exact panes, the intended agents that no longer resolve, and a
 /// label naming them.
@@ -11950,7 +12002,11 @@ fn board_prompt_action(app: &mut App, all: bool) -> Action {
             unavailable,
             label,
         }) => {
-            app.board_frozen.clone_from(&panes);
+            if let Some(busy) = busy_target(app, &panes) {
+                app.set_hint(still_sending(&busy), HintLevel::Warn);
+                return Action::None;
+            }
+            app.board_pending = Some(BoardPending::Compose(panes.clone()));
             let target = if all {
                 CollaborationComposeTarget::PromptPanes { panes, unavailable }
             } else {
@@ -11977,14 +12033,19 @@ fn board_abort_action(app: &mut App, all: bool) -> Action {
             unavailable,
             label,
         }) => {
-            app.board_frozen.clone_from(&panes);
+            if let Some(busy) = busy_target(app, &panes) {
+                app.set_hint(still_sending(&busy), HintLevel::Warn);
+                return Action::None;
+            }
+            let quick = if all {
+                QuickAction::InterruptPanes { panes, unavailable }
+            } else {
+                QuickAction::InterruptPane(panes.remove(0))
+            };
+            app.board_pending = Some(BoardPending::Confirm(quick.clone()));
             Action::AskConfirm(ConfirmPopup {
                 message: format!("Interrupt {label}?"),
-                on_confirm: ConfirmAction::Quick(if all {
-                    QuickAction::InterruptPanes { panes, unavailable }
-                } else {
-                    QuickAction::InterruptPane(panes.remove(0))
-                }),
+                on_confirm: ConfirmAction::Quick(quick),
             })
         }
         Err(hint) => {
@@ -11994,11 +12055,48 @@ fn board_abort_action(app: &mut App, all: bool) -> Action {
     }
 }
 
-/// Whether every pane an action names was frozen by a board composer or
-/// confirmation — the only panes board actions may touch. A refresh in the
-/// meantime cannot retarget them.
-fn board_owns_panes(app: &App, panes: &[&PaneKey]) -> bool {
-    !panes.is_empty() && panes.iter().all(|pane| app.board_frozen.contains(pane))
+/// Whether `action` is exactly what the pending board operation was opened
+/// for: its confirmation, or its composer's submission to the frozen panes.
+/// Anything else — a topology action that happens to name one of those panes
+/// included — is not the board's.
+fn board_pending_matches(pending: Option<&BoardPending>, action: &Action) -> bool {
+    match (pending, action) {
+        (
+            Some(BoardPending::Confirm(frozen)),
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::Quick(quick),
+                ..
+            }),
+        ) => quick == frozen,
+        (
+            Some(BoardPending::Compose(frozen)),
+            Action::Quick(QuickAction::SendPromptTo { pane, .. }),
+        ) => frozen.as_slice() == std::slice::from_ref(pane),
+        (
+            Some(BoardPending::Compose(frozen)),
+            Action::Quick(QuickAction::SendPromptToMany { panes, .. }),
+        ) => frozen == panes,
+        _ => false,
+    }
+}
+
+/// A target pane that a background action is still writing to.
+fn busy_target(app: &App, panes: &[PaneKey]) -> Option<PaneKey> {
+    panes
+        .iter()
+        .find(|pane| {
+            app.pending_outcomes
+                .iter()
+                .any(|(busy, _)| busy.contains(pane))
+        })
+        .cloned()
+}
+
+fn still_sending(pane: &PaneKey) -> String {
+    format!(
+        "still sending to {} — try again when it finishes",
+        pane_target_label(pane)
+    )
 }
 
 /// Resolve `Enter` on the Work board to the exact pane of one of its Runs.
@@ -30017,36 +30115,127 @@ sort = ["state"]
         ));
     }
 
-    #[test]
-    fn board_gate_lets_through_only_the_selected_works_panes() {
+    /// The board with agents, plus the topology tracking the agent on %1 so
+    /// a topology interrupt has a real target.
+    fn board_with_tracked_topology_agent() -> (App, Vec<PaneKey>) {
         let (mut app, keys) = board_with_agents();
-        // Nothing passes before a board composer or confirmation froze it.
+        let panes: Vec<PaneInfo> = ["%1", "%2", "%3"]
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| {
+                fake_topology_pane(
+                    "/tmp/a",
+                    "$1",
+                    "callabo",
+                    "@4",
+                    "CAL-1",
+                    1,
+                    pane,
+                    u32::try_from(index).unwrap(),
+                )
+            })
+            .collect();
+        app.set_data(
+            vec![topology_agent("s1", "%1", "a", AgentState::Working, "", 0)],
+            panes,
+        );
+        (app, keys)
+    }
+
+    #[test]
+    fn board_authority_ends_with_its_operation() {
+        let (mut app, keys) = board_with_tracked_topology_agent();
+        let topology_interrupt = || {
+            Action::AskConfirm(ConfirmPopup {
+                message: "Interrupt %1?".into(),
+                on_confirm: ConfirmAction::Quick(QuickAction::InterruptPane(keys[0].clone())),
+            })
+        };
+        // Nothing is authorised before a board operation opens.
         assert!(matches!(
-            gate_board_action(
-                &mut app,
-                Action::Quick(QuickAction::InterruptPane(keys[0].clone()))
-            ),
+            gate_board_action(&mut app, topology_interrupt()),
             Action::None
         ));
-        let _ = press_key(&mut app, KeyCode::Char('A'));
-        let mut elsewhere = keys[0].clone();
-        elsewhere.pane_id = "%9".into();
-        for (pane, allowed) in [
-            (keys[0].clone(), true),
-            (keys[2].clone(), false),
-            (elsewhere, false),
-        ] {
-            let action = gate_board_action(
-                &mut app,
-                Action::Quick(QuickAction::InterruptPane(pane.clone())),
-            );
-            assert_eq!(
-                matches!(action, Action::Quick(_)),
-                allowed,
-                "{} allowed={allowed}",
-                pane.pane_id
-            );
+        // Open the board's own interrupt, then cancel it.
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('R')),
+            Action::AskConfirm(_)
+        ));
+        let _ = gate_board_action(&mut app, Action::ConfirmCancel);
+        assert!(
+            matches!(
+                gate_board_action(&mut app, topology_interrupt()),
+                Action::None
+            ),
+            "a cancelled board interrupt must not authorise a later one"
+        );
+        // A composer submitted once uses its authority up.
+        let _ = press_key(&mut app, KeyCode::Char('p'));
+        let _ = press_key(&mut app, KeyCode::Char('x'));
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Enter),
+            Action::Quick(QuickAction::SendPromptTo { .. })
+        ));
+        let again = Action::Quick(QuickAction::SendPromptTo {
+            pane: keys[0].clone(),
+            text: "x".into(),
+        });
+        assert!(matches!(gate_board_action(&mut app, again), Action::None));
+        assert!(matches!(
+            gate_board_action(&mut app, topology_interrupt()),
+            Action::None
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pane_being_written_cannot_be_written_again_until_it_finishes() {
+        let (mut app, keys) = board_with_agents();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        start_quick_with(
+            &mut app,
+            QuickAction::SendPromptToMany {
+                panes: keys[..2].to_vec(),
+                unavailable: Vec::new(),
+                text: "first".into(),
+            },
+            move |_| {
+                let _ = gate.recv();
+                ActionOutcome::Ok("done".into())
+            },
+        );
+        // The board refuses to open anything for a busy pane…
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('P')),
+            Action::None
+        ));
+        assert!(app.collaboration_composer.is_none());
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("still sending to a:%1")));
+        // …and the run loop refuses any action that reaches one anyway.
+        assert!(refuse_busy(
+            &mut app,
+            &QuickAction::InterruptPane(keys[1].clone())
+        ));
+        assert!(!refuse_busy(
+            &mut app,
+            &QuickAction::InterruptPane(keys[2].clone())
+        ));
+        release.send(()).unwrap();
+        let mut finished = Vec::new();
+        for _ in 0..200 {
+            finished = take_finished_quick(&mut app);
+            if !finished.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert_eq!(finished.len(), 1);
+        assert!(!refuse_busy(
+            &mut app,
+            &QuickAction::InterruptPane(keys[1].clone())
+        ));
     }
 
     #[test]
