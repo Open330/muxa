@@ -47,7 +47,8 @@ tagged_version=$(git show "$tag:Cargo.toml" \
 notes() {
   git show "$tag:CHANGELOG.md" | awk -v want="## [$version]" '
     index($0, want) == 1 { inside = 1; next }
-    inside && /^## \[/    { exit }
+    # Consume the full input: exiting early can SIGPIPE git show under pipefail.
+    inside && /^## \[/    { inside = 0 }
     inside                { print }
   '
 }
