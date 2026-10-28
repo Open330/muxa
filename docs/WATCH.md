@@ -228,7 +228,7 @@ Press `:` while browsing to open the command palette. Type a command and press
 commands include `refresh`, `preview`, `copy`, `attention`, `events`,
 `inspector`, `sort latest|duration|session|state`, `view pane|session|swarm`,
 `layout tree|swarm|work`, `layout table|sequence`,
-`screen topology|collab`, `help`, and `quit`. The table/sequence commands only
+`screen topology|collab|board`, `help`, and `quit`. The table/sequence commands only
 change the collaboration screen; topology keeps its own layout. `kill` and
 `abort` still open the normal confirmation popup.
 Runtime `view` changes use the cached snapshot immediately and remain active
@@ -252,8 +252,9 @@ since a flat table shows no ancestry to move within.
 
 ## Screens
 
-`muxa watch` shows one of two lists, chosen with `Alt-1` / `Alt-2`, the
-`screen topology|collab` palette command, `--screen`, or `[watch] screen`.
+`muxa watch` shows one of three lists, chosen with `Alt-1` / `Alt-2` /
+`Alt-3`, the `screen topology|collab|board` palette command, `--screen`, or
+`[watch] screen`.
 
 `topology` is the session → window → pane tree, and everything `view` and
 `layout` describe applies to it. `collab` lists collaboration *requests*
@@ -267,6 +268,24 @@ it was raised in, so a listing at any grouping says where the work happened.
 Typing filters on either end's alias, its `session:window`, the message, the
 kind, and the status. `Enter` attaches to the peer's pane — requests outlive
 panes, so a request whose peer is gone says so rather than doing nothing.
+
+`board` lists Works: persisted Work records joined with the windows scanned for
+them — the same projection `muxa dashboard` and the web dashboard read. A Work
+keeps its row while it has no live Run, and one Work can have several Runs,
+which is why this is a screen and not `layout work` (whose rows are windows).
+Works that need you — a signal on the Work, or an agent in it waiting for input,
+a choice, or failing — come first, then by stage (in progress, review, queued,
+done) and recency. Each row shows the stage, `workspace/work`, title, linked
+issue, Run count, and one state glyph per agent. The selected Work opens below
+the list (beside it from 140 columns): goal, next action, issues, and every Run
+with its agents and their last prompts. The title counts the Works on screen and
+how many need you; executions no Work claims are counted separately, since they
+are not rows here. Typing filters on title, workspace, Work id, goal, next
+action and issue key. `Enter` goes to the Run's pane — the agent waiting on you
+if there is one — on that exact server; a Work with no live Run says so. The
+cursor follows the Work, not the row, so a refresh that reorders the board does
+not move it. The board rescans every three seconds while it is on show and
+never otherwise.
 
 A row can only hold an excerpt, so the selected request also opens in a detail
 pane under the table: both ends with their rooms, the kind and delivery mode it

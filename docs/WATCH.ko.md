@@ -175,7 +175,7 @@ inbox를 열면 확인 처리됩니다.
 `Tab`은 첫 번째 일치 항목을 완성하고 `Esc`는 취소합니다. `refresh`, `preview`,
 `copy`, `attention`, `events`, `inspector`, `sort latest|duration|session|state`,
 `view pane|session|swarm`, `layout tree|swarm|work`, `layout table|sequence`,
-`screen topology|collab`, `help`, `quit`를 지원합니다. table/sequence 명령은
+`screen topology|collab|board`, `help`, `quit`를 지원합니다. table/sequence 명령은
 collaboration 화면만 바꾸고 topology layout은 그대로 둡니다. `kill`과 `abort`는 기존과
 동일하게 확인 popup을 거칩니다. `view` 변경은 cached snapshot에 즉시 반영되며
 현재 watch process의 이후 refresh에도 유지됩니다.
@@ -197,8 +197,9 @@ pane들은 alias 상태로 요약되기 때문입니다. 이동은 트리의 형
 
 ## 화면(Screen)
 
-`muxa watch`는 두 가지 목록 중 하나를 보여주며 `Alt-1` / `Alt-2`, 팔레트의
-`screen topology|collab`, `--screen`, `[watch] screen`으로 전환합니다.
+`muxa watch`는 세 가지 목록 중 하나를 보여주며 `Alt-1` / `Alt-2` / `Alt-3`,
+팔레트의 `screen topology|collab|board`, `--screen`, `[watch] screen`으로
+전환합니다.
 
 `topology`는 session → window → pane 트리이고 `view`·`layout`이 설명하는 모든
 것이 여기 적용됩니다. `collab`은 대신 협업 *request*를 나열합니다 — 커서가 놓인
@@ -211,6 +212,22 @@ pane들은 alias 상태로 요약되기 때문입니다. 이동은 트리의 형
 `session:window`, 메시지, kind, status를 대상으로 필터링합니다. `Enter`는 상대
 pane으로 이동합니다 — request는 pane보다 오래 남으므로 상대 pane이 사라졌으면
 아무 일도 안 하는 대신 그 사실을 알려줍니다.
+
+`board`는 Work를 나열합니다. 저장된 Work 기록에 그 Work의 window 스캔 결과를
+붙인 것으로, `muxa dashboard`와 웹 대시보드가 읽는 것과 같은 projection입니다.
+live Run이 없어도 Work 행은 남고 한 Work에 Run이 여러 개일 수 있어서, 행이
+window인 `layout work`가 아니라 별도 화면입니다. 손이 필요한 Work(Work에
+signal이 있거나, 안의 agent가 입력·선택을 기다리거나 실패한 경우)가 먼저
+오고, 그다음 단계(진행 중, 리뷰, 대기, 완료)와 최근 순입니다. 각 행에는 단계,
+`workspace/work`, 제목, 연결된 이슈, Run 수, agent별 상태 기호가 나옵니다.
+선택한 Work는 목록 아래(140칸 이상이면 옆)에 목표, 다음 할 일, 이슈, Run별
+agent와 마지막 프롬프트로 펼쳐집니다. 제목줄은 화면에 있는 Work 수와 손이 필요한
+수를 세고, 어느 Work에도 속하지 않은 실행은 행이 아니므로 따로 셉니다. 타이핑하면
+제목, workspace, Work id, 목표, 다음 할 일, 이슈 키로 필터링합니다. `Enter`는
+그 Run의 pane — 기다리는 agent가 있으면 그 pane — 으로, 정확히 그 서버에서
+이동합니다. live Run이 없는 Work는 그렇다고 알려줍니다. 커서는 행이 아니라
+Work를 따라가므로 새로고침으로 순서가 바뀌어도 움직이지 않습니다. board는
+화면에 떠 있는 동안에만 3초마다 다시 스캔합니다.
 
 행에는 발췌만 들어가므로 선택된 request는 표 아래 detail pane에도 펼쳐집니다 —
 양쪽 끝과 각자의 room, 어떤 kind·전달 모드로 보냈는지, 본문 전문, 그리고 답장이

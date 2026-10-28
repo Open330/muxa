@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa watch` has a Work board screen (`Alt-3`, `:screen board`,
+  `--screen board`, `[watch] screen = "board"`): Works from the same projection
+  as `muxa dashboard`, those that need you first, with goal, issue and every
+  Run's agents for the selected one, and `Enter` to the exact pane of its Run.
+  `muxa dashboard` is unchanged for now.
+
 - Opt-in versioned collaboration task contracts bind requests to daemon-created
   attempt IDs, exact basis commits and structured reported evidence. Read-only
   supersession retains late replies as history without completing newer work.
@@ -26,6 +32,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Korean/English query expansion, event-time filters, source-attributed context,
   and paired tool results. A private resumable index reports partial coverage,
   parse gaps and truncation; transcript files remain unchanged.
+
+### Fixed
+
+- Works on rmux (and other non-tmux backends) show up on the Work board.
+  Their panes lost the `muxa work` marks on the way into the Work projection,
+  so every such Work was counted as an unlinked execution; `muxa dashboard`
+  also scanned tmux only and showed no Work at all on an rmux host.
 
 ## [0.9.3] - 2026-10-28
 

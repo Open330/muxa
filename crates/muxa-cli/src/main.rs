@@ -7,6 +7,7 @@ mod agent_records;
 mod ask_progress;
 mod attend;
 mod automation;
+mod board_screen;
 mod collab_screen;
 mod collaboration_output;
 mod config_cmd;
@@ -1045,6 +1046,7 @@ pub(crate) enum WatchLayoutArg {
 pub(crate) enum WatchScreenArg {
     Topology,
     Collab,
+    Board,
 }
 
 impl From<WatchScreenArg> for muxa::config::WatchScreen {
@@ -1052,6 +1054,7 @@ impl From<WatchScreenArg> for muxa::config::WatchScreen {
         match value {
             WatchScreenArg::Topology => Self::Topology,
             WatchScreenArg::Collab => Self::Collab,
+            WatchScreenArg::Board => Self::Board,
         }
     }
 }

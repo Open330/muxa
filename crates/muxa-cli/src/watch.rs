@@ -74,6 +74,7 @@ use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio::time::MissedTickBehavior;
 
+use crate::board_screen::{self, BoardScreen};
 pub use crate::collab_screen::CollabLayout;
 use crate::collab_screen::{self, CollabRow, CollabScreen, SequenceRow};
 use crate::message_skill::{
@@ -1927,7 +1928,7 @@ pub(crate) fn help_overlay_text() -> Vec<&'static str> {
         "  [/] · f/c      (in preview) agent / geometry / content",
         "  Enter          (in preview) jump to pinned pane",
         "  m / M / Alt-M  message / mailbox / move pane or window; Space marks",
-        "  Alt-1/2 · W    screen topology / collab · W is the work table",
+        "  Alt-1/2/3 · W  screen topology / collab / board · W is the work table",
         "  v              (in collab) toggle table / sequence history",
         "  i / e          (in mailbox) claim inbox / reply",
         "Sorting",
@@ -3210,6 +3211,9 @@ pub(crate) struct App {
     /// the one on show — an operator surface has no business polling every
     /// room in the daemon to render a topology tree.
     pub(crate) collab: CollabScreen,
+    /// The Work board, populated only while its screen is on show: building
+    /// it scans every multiplexer and reads the Work records.
+    pub(crate) board: BoardScreen,
     collaboration_composer: Option<CollaborationComposer>,
     /// Agents the operator marked with `Space`, to be addressed together.
     ///
@@ -3551,6 +3555,7 @@ impl App {
             collaboration_mailbox: CollaborationMailboxState::default(),
             previous_layout: WatchLayout::Tree,
             collab,
+            board: BoardScreen::default(),
             collaboration_composer: None,
             collaboration_marks: std::collections::HashSet::new(),
             broadcast_report: None,
@@ -3895,6 +3900,52 @@ impl App {
                     })
             })
             .map(|pane| pane.key.clone())
+    }
+
+    /// The topology key for a pane of a Work's Run, when it is on screen.
+    ///
+    /// The Work projection and the topology spell a server differently (a
+    /// tmux socket's file name in one, possibly its path in the other), so
+    /// the server is compared by the last path component as well as exactly.
+    /// Session, window and pane must all agree, and a match that is only
+    /// loose is refused when more than one pane fits it.
+    pub(crate) fn board_pane_key(
+        &self,
+        run: &muxa::work::RunSnapshot,
+        pane_id: &str,
+    ) -> Option<PaneKey> {
+        let last = |socket: &str| {
+            std::path::Path::new(socket)
+                .file_name()
+                .map(std::ffi::OsStr::to_os_string)
+        };
+        let wanted = &run.execution;
+        let candidates: Vec<&PaneKey> = self
+            .topology
+            .sessions
+            .iter()
+            .flat_map(|session| session.windows.iter())
+            .flat_map(|window| window.panes.iter())
+            .map(|pane| &pane.key)
+            .filter(|key| {
+                key.pane_id == pane_id
+                    && key.window.window_id == wanted.window_id
+                    && key.window.session.session_id == wanted.session_id
+                    && last(&key.window.session.endpoint.socket) == last(&wanted.socket)
+            })
+            .collect();
+        let exact = candidates.iter().find(|key| {
+            muxa::backend::pane_endpoints_match(
+                Some(pane_id),
+                &key.window.session.endpoint.socket,
+                &wanted.socket,
+            )
+        });
+        match (exact, candidates.as_slice()) {
+            (Some(key), _) => Some((*key).clone()),
+            (None, [only]) => Some((*only).clone()),
+            (None, _) => None,
+        }
     }
 
     /// What `W` would switch to from here, without switching.
@@ -7790,6 +7841,7 @@ pub async fn run(
     let mut needs_render = true;
     let mut last_render = std::time::Instant::now();
     let mut last_mailbox_refresh = std::time::Instant::now();
+    let mut last_board_refresh = std::time::Instant::now();
 
     loop {
         // Animate on a fast cadence only while there's something to move:
@@ -8049,8 +8101,13 @@ pub async fn run(
                     let label = match screen {
                         WatchScreen::Topology => "topology",
                         WatchScreen::Collab => "collab",
+                        WatchScreen::Board => "board",
                     };
                     app.set_hint(format!("screen: {label}"), HintLevel::Ok);
+                    if screen == WatchScreen::Board {
+                        refresh_board(&mut app).await;
+                        last_board_refresh = std::time::Instant::now();
+                    }
                     // Arriving at an empty list and waiting out a poll tick
                     // would read as "nothing is happening" on a busy fleet.
                     refresh_fleet_collaboration(client, &mut app).await;
@@ -8604,6 +8661,13 @@ pub async fn run(
             .as_ref()
             .is_some_and(|changes| changes.has_changed().unwrap_or(false))
             && app.collaboration.unavailable.is_none();
+        if app.watch_cfg.screen == WatchScreen::Board
+            && (last_board_refresh.elapsed() >= BOARD_REFRESH_INTERVAL || !app.board.loaded)
+        {
+            refresh_board(&mut app).await;
+            last_board_refresh = std::time::Instant::now();
+            needs_render = true;
+        }
         if (app.collaboration_mailbox.open || matches!(app.watch_cfg.screen, WatchScreen::Collab))
             && (last_mailbox_refresh.elapsed() >= Duration::from_secs(2)
                 || (mailbox_changed
@@ -8956,6 +9020,26 @@ async fn refresh_selected_collaboration_detail(client: &Client, app: &mut App) {
             );
         }
     }
+}
+
+/// How often an open Work board rescans; Works change on human timescales.
+const BOARD_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Rebuild the Work board from the same projection `muxa dashboard` and the
+/// web dashboard use: Work records joined with every multiplexer's windows.
+async fn refresh_board(app: &mut App) {
+    let now = OffsetDateTime::now_utc();
+    let backends = std::sync::Arc::new(muxa::active_backends());
+    let scan = muxa::dashboard::multi_host_pane_scan(backends).await;
+    let notes = scan
+        .errors
+        .iter()
+        .map(|error| format!("scan {}: {}", error.socket.display(), error.message))
+        .collect();
+    let records = muxa::dashboard::load_work_records(muxa::paths::default_dashboard_work_file());
+    let agents = app.current_agents();
+    let snapshot = muxa::work::build_snapshot(&scan.panes, &agents, &records, now);
+    app.board.set_snapshot(snapshot, notes);
 }
 
 fn sync_collab_screen_from_cache(app: &mut App) {
@@ -10370,6 +10454,10 @@ const COMMAND_SPECS: &[CommandSpec] = &[
         description: "show collaboration across every room",
     },
     CommandSpec {
+        command: "screen board",
+        description: "show Works and their Runs",
+    },
+    CommandSpec {
         command: "kill",
         description: "close selected session/window/pane (confirm)",
     },
@@ -10453,6 +10541,7 @@ fn execute_palette_command(app: &mut App, input: &str) -> Action {
         "view pane" | "view panes" => Action::SetView(WatchView::Pane),
         "screen topology" | "topology" => Action::SetScreen(WatchScreen::Topology),
         "screen collab" | "collab" => Action::SetScreen(WatchScreen::Collab),
+        "screen board" | "board" => Action::SetScreen(WatchScreen::Board),
         "layout work" | "work" => Action::SetLayout(WatchLayout::Work),
         "layout tree" => Action::SetLayout(WatchLayout::Tree),
         "layout swarm" => Action::SetLayout(WatchLayout::Swarm),
@@ -10678,6 +10767,7 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
             // having is already spoken for.
             KeyCode::Char('1') => Action::SetScreen(WatchScreen::Topology),
             KeyCode::Char('2') => Action::SetScreen(WatchScreen::Collab),
+            KeyCode::Char('3') => Action::SetScreen(WatchScreen::Board),
             KeyCode::Char('?') => Action::Quick(QuickAction::ShowHelp),
             _ => Action::None,
         };
@@ -10688,6 +10778,11 @@ fn handle_event(ev: Event, app: &mut App) -> Action {
     // filter typing, `:`, `/`, `r`, `?`, `q` — falls through unchanged.
     if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
         if let Some(action) = handle_collab_screen_key(code, modifiers, app) {
+            return action;
+        }
+    }
+    if app.watch_cfg.screen == WatchScreen::Board {
+        if let Some(action) = handle_board_screen_key(code, modifiers, app) {
             return action;
         }
     }
@@ -11250,6 +11345,71 @@ fn handle_collab_screen_key(
         _ => return None,
     }
     Some(Action::None)
+}
+
+/// Keys the Work board claims. Like the collab screen, everything else —
+/// filter typing, `:`, `/`, `?`, `q` — falls through to watch.
+fn handle_board_screen_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    app: &mut App,
+) -> Option<Action> {
+    let filter = app.search_query.clone();
+    let page = isize::try_from(app.table_page_rows.max(1)).unwrap_or(isize::MAX);
+    let browsing = app.browse_keys_active();
+    match code {
+        KeyCode::Down => app.board.move_selection(1, &filter),
+        KeyCode::Up => app.board.move_selection(-1, &filter),
+        KeyCode::Char('j') if browsing => app.board.move_selection(1, &filter),
+        KeyCode::Char('k') if browsing => app.board.move_selection(-1, &filter),
+        KeyCode::PageDown => app.board.move_selection(page, &filter),
+        KeyCode::PageUp => app.board.move_selection(-page, &filter),
+        KeyCode::Char('d') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.board.move_selection(page / 2, &filter);
+        }
+        KeyCode::Char('u') if modifiers.contains(KeyModifiers::CONTROL) => {
+            app.board.move_selection(-(page / 2), &filter);
+        }
+        KeyCode::Home => app.board.select_first(&filter),
+        KeyCode::End => app.board.select_last(&filter),
+        KeyCode::Char('G') if browsing => app.board.select_last(&filter),
+        KeyCode::Char('g') if browsing => {
+            if app.pending_g {
+                app.pending_g = false;
+                app.board.select_first(&filter);
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Enter => return Some(board_attach_action(app, &filter)),
+        _ => return None,
+    }
+    Some(Action::None)
+}
+
+/// Resolve `Enter` on the Work board to the exact pane of one of its Runs.
+/// The key carries the Run's socket, so the same pane id on another server
+/// is never the one attached.
+fn board_attach_action(app: &mut App, filter: &str) -> Action {
+    let target = app.board.selected_work(filter).map(|work| {
+        let label = format!("{}/{}", work.identity.workspace_id, work.identity.work_id);
+        let key =
+            board_screen::jump_target(work).map(|(run, pane_id)| app.board_pane_key(run, pane_id));
+        (label, key)
+    });
+    let Some((label, key)) = target else {
+        return Action::None;
+    };
+    let Some(key) = key else {
+        app.set_hint(format!("{label} has no live Run"), HintLevel::Warn);
+        return Action::None;
+    };
+    if let Some(key) = key {
+        return Action::AttachTopologyPane(key);
+    }
+    // The board refreshes on its own clock; the window may have closed since.
+    app.set_hint(format!("{label}'s Run is no longer open"), HintLevel::Warn);
+    Action::None
 }
 
 /// Resolve `Enter` on the collaboration screen to a pane to attach to.
@@ -14763,6 +14923,128 @@ const COLLAB_DETAIL_HEIGHT: u16 = 9;
 /// one `M` away instead of leaving three rows of listing.
 const COLLAB_DETAIL_MIN_HEIGHT: u16 = 16;
 
+fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
+    use std::fmt::Write as _;
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let filter = app.search_query.clone();
+    let visible = app.board.visible(&filter);
+    let waiting = visible
+        .iter()
+        .filter(|work| board_screen::needs_operator(work))
+        .count();
+    let mut title = format!(" Board · {} Works · {waiting} need you ", visible.len());
+    // Totals describe the rows on screen; executions no Work claims are said
+    // apart so the board never reads as everything that is running.
+    if app.board.unlinked() > 0 {
+        let _ = write!(
+            title,
+            "· {} unlinked Run(s) in topology ",
+            app.board.unlinked()
+        );
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(theme.border_style())
+        .border_type(theme.border_type)
+        .title(title);
+
+    if visible.is_empty() {
+        let hint = if !app.board.loaded {
+            "loading Works…"
+        } else if app.board.is_empty() {
+            "no Work yet — `muxa work start` or `muxa work up` creates one"
+        } else {
+            "no Work matches this filter"
+        };
+        f.render_widget(
+            Paragraph::new(hint)
+                .style(theme.dim_style())
+                .block(block)
+                .alignment(Alignment::Center),
+            area,
+        );
+        return;
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let selected = app.board.selected_index(&filter);
+    let detail = app
+        .board
+        .selected_work(&filter)
+        .map(|work| board_screen::detail_lines(work, now, theme))
+        .unwrap_or_default();
+    let notes = app.board.notes.clone();
+    // The detail sits below the list on narrow terminals and beside it on
+    // wide ones, sized to what it has to say.
+    let detail_height = u16::try_from(detail.len() + notes.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(area.height / 2);
+    let (list_area, detail_area) = if area.width >= 140 {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+            .split(area);
+        (columns[0], Some(columns[1]))
+    } else if area.height >= 14 {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(5), Constraint::Length(detail_height.max(4))])
+            .split(area);
+        (rows[0], Some(rows[1]))
+    } else {
+        (area, None)
+    };
+    let rows: Vec<Row> = visible
+        .iter()
+        .enumerate()
+        .map(|(index, work)| board_screen::row(work, now, theme, index == selected))
+        .collect();
+    let header = Row::new(
+        board_screen::HEADERS
+            .iter()
+            .map(|header| Cell::from(*header).style(theme.table_header_style())),
+    )
+    .height(1);
+    let table = Table::new(rows, board_screen::COLUMNS)
+        .header(header)
+        .block(block)
+        .highlight_symbol("> ")
+        .highlight_spacing(HighlightSpacing::Always);
+    let mut state = TableState::default();
+    state.select(Some(selected));
+    f.render_stateful_widget(table, list_area, &mut state);
+
+    if let Some(detail_area) = detail_area {
+        render_board_detail(f, detail_area, detail, notes, theme);
+    }
+}
+
+fn render_board_detail(
+    f: &mut Frame,
+    area: Rect,
+    mut lines: Vec<Line<'static>>,
+    notes: Vec<String>,
+    theme: WatchThemeSpec,
+) {
+    lines.extend(
+        notes
+            .into_iter()
+            .map(|note| Line::from(Span::styled(note, theme.dim_style()))),
+    );
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(theme.border_style())
+                    .border_type(theme.border_type)
+                    .title(" Work "),
+            )
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 #[allow(clippy::too_many_lines)] // table and sequence share selection and detail-pane state
 fn render_collab_screen(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
@@ -15443,7 +15725,7 @@ fn render_body(f: &mut Frame, area: Rect, app: &mut App, tree_targets: Option<&[
         // The inspector describes the selected *pane*, and the collab screen's
         // cursor is on a request. Halving the table to show an unrelated pane
         // costs the two columns that identify both ends of a message.
-        && !matches!(app.watch_cfg.screen, WatchScreen::Collab)
+        && !matches!(app.watch_cfg.screen, WatchScreen::Collab | WatchScreen::Board)
         && area.width >= 120
         && if app.uses_tree() {
             selected_tree_target_from(app, tree_targets.unwrap_or_default()).is_some()
@@ -15503,6 +15785,10 @@ fn render_primary_body(
     app.table_page_rows = usize::from(area.height.saturating_sub(3).max(1));
     if matches!(app.watch_cfg.screen, WatchScreen::Collab) {
         render_collab_screen(f, area, app);
+        return;
+    }
+    if app.watch_cfg.screen == WatchScreen::Board {
+        render_board_screen(f, area, app);
         return;
     }
     if app.legacy_flat_table {
@@ -18702,6 +18988,26 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
                 Span::raw(" topology  "),
                 Span::styled(" m ", theme.action_badge()),
                 Span::raw(" message  "),
+                Span::styled(" ? ", theme.key_badge()),
+                Span::raw(" help"),
+            ])),
+            area,
+        );
+        return true;
+    }
+    if app.watch_cfg.screen == WatchScreen::Board {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled(" j/k ", theme.key_badge()),
+                Span::raw(" move  "),
+                Span::styled(" / ", theme.action_badge()),
+                Span::raw(" filter  "),
+                Span::styled(" : ", theme.action_badge()),
+                Span::raw(" commands  "),
+                Span::styled(" ⏎ ", theme.action_badge()),
+                Span::raw(" go to Run  "),
+                Span::styled(" Alt-1 ", theme.key_badge()),
+                Span::raw(" topology  "),
                 Span::styled(" ? ", theme.key_badge()),
                 Span::raw(" help"),
             ])),
@@ -28865,6 +29171,211 @@ sort = ["state"]
             alt_key_action(&mut app, '1'),
             Action::SetScreen(WatchScreen::Topology)
         ));
+    }
+
+    fn board_work(id: &str, key: Option<&PaneKey>) -> muxa::work::WorkSnapshotItem {
+        let at = OffsetDateTime::now_utc();
+        muxa::work::WorkSnapshotItem {
+            identity: muxa::work::WorkIdentity {
+                workspace_id: "callabo".into(),
+                work_id: id.into(),
+            },
+            title: format!("work {id}"),
+            goal: Some("ship it".into()),
+            next_action: None,
+            stage: muxa::work::BoardStage::InProgress,
+            signals: Vec::new(),
+            external_items: Vec::new(),
+            runs: key
+                .map(|key| muxa::work::RunSnapshot {
+                    id: "run".into(),
+                    state: muxa::work::RunState::Running,
+                    linked: true,
+                    work: None,
+                    execution: muxa::work::ExecutionIdentity {
+                        host: key.window.session.endpoint.host,
+                        socket: key.window.session.endpoint.socket.clone(),
+                        session_id: key.window.session.session_id.clone(),
+                        window_id: key.window.window_id.clone(),
+                    },
+                    session_name: "callabo".into(),
+                    window_name: id.into(),
+                    window_index: "1".into(),
+                    cwd: None,
+                    panes: vec![muxa::work::RunPaneSnapshot {
+                        pane_id: key.pane_id.clone(),
+                        pane_index: "0".into(),
+                        current_command: "codex".into(),
+                        title: String::new(),
+                        current_path: String::new(),
+                        attach_command: String::new(),
+                        role: None,
+                        task: None,
+                        agent: None,
+                    }],
+                    latest_at: None,
+                })
+                .into_iter()
+                .collect(),
+            participants: 0,
+            latest_at: Some(at),
+            source: muxa::work::WorkSource::Persisted,
+            metadata: muxa::work::WorkMetadata {
+                title: None,
+                goal: None,
+                next_action: None,
+                stage: muxa::work::WorkStage::default(),
+                updated_at: at,
+            },
+        }
+    }
+
+    fn board_snapshot(works: Vec<muxa::work::WorkSnapshotItem>) -> muxa::work::WorkSnapshot {
+        muxa::work::WorkSnapshot {
+            schema_version: 1,
+            generated_at: OffsetDateTime::now_utc(),
+            workspaces: Vec::new(),
+            works,
+            unlinked_executions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn alt_3_and_the_palette_reach_the_board() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        assert!(matches!(
+            alt_key_action(&mut app, '3'),
+            Action::SetScreen(WatchScreen::Board)
+        ));
+        assert!(matches!(
+            execute_palette_command(&mut app, "screen board"),
+            Action::SetScreen(WatchScreen::Board)
+        ));
+        assert!(matches!(
+            execute_palette_command(&mut app, "board"),
+            Action::SetScreen(WatchScreen::Board)
+        ));
+    }
+
+    #[test]
+    fn board_enter_attaches_the_runs_exact_pane_not_a_same_id_pane_elsewhere() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.set_data(
+            Vec::new(),
+            vec![
+                fake_topology_pane("/tmp/a", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0),
+                fake_topology_pane("/tmp/b", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0),
+            ],
+        );
+        let on_b = app.pane_key_for("%2", Some("b")).expect("pane on b");
+        // The Work projection may name the server by its path where the
+        // topology uses its short name. Either way it must resolve to b.
+        let mut spelled_as_path = on_b.clone();
+        spelled_as_path.window.session.endpoint.socket = "/tmp/b".into();
+        app.board.set_snapshot(
+            board_snapshot(vec![board_work("CAL-1", Some(&spelled_as_path))]),
+            Vec::new(),
+        );
+        app.apply_screen(WatchScreen::Board);
+        match handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            &mut app,
+        ) {
+            Action::AttachTopologyPane(key) => assert_eq!(key, on_b),
+            _ => panic!("Enter should attach the Run's pane"),
+        }
+    }
+
+    #[test]
+    fn board_enter_never_substitutes_the_same_pane_id_on_another_server() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.set_data(
+            Vec::new(),
+            vec![fake_topology_pane(
+                "/tmp/a", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0,
+            )],
+        );
+        let mut elsewhere = app.pane_key_for("%2", Some("a")).expect("pane on a");
+        elsewhere.window.session.endpoint.socket = "/tmp/c".into();
+        app.board.set_snapshot(
+            board_snapshot(vec![board_work("CAL-1", Some(&elsewhere))]),
+            Vec::new(),
+        );
+        app.apply_screen(WatchScreen::Board);
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::None
+        ));
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("no longer open")));
+    }
+
+    #[test]
+    fn board_enter_on_a_work_without_a_live_run_says_so() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        app.board
+            .set_snapshot(board_snapshot(vec![board_work("CAL-1", None)]), Vec::new());
+        app.apply_screen(WatchScreen::Board);
+        assert!(matches!(
+            handle_event(
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &mut app
+            ),
+            Action::None
+        ));
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("no live Run")));
+    }
+
+    #[test]
+    fn board_renders_works_with_their_detail_and_moves_with_j() {
+        let mut app = App::with_legacy_config(WatchConfig::default());
+        let mut snap = board_snapshot(vec![board_work("CAL-1", None), board_work("CAL-2", None)]);
+        snap.unlinked_executions = Vec::new();
+        app.board.set_snapshot(snap, Vec::new());
+        app.apply_screen(WatchScreen::Board);
+        let draw = |app: &mut App, width: u16| {
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| render(frame, app)).unwrap();
+            (0..terminal.backend().buffer().area().height)
+                .map(|y| row_text(terminal.backend().buffer(), y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let screen = draw(&mut app, 110);
+        assert!(screen.contains("Board · 2 Works · 0 need you"), "{screen}");
+        assert!(screen.contains("callabo/CAL-1"), "{screen}");
+        assert!(screen.contains("goal  ship it"), "{screen}");
+        assert!(screen.contains("go to Run"), "{screen}");
+        let first = app
+            .board
+            .selected_work("")
+            .unwrap()
+            .identity
+            .work_id
+            .clone();
+        let _ = handle_event(
+            Event::Key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)),
+            &mut app,
+        );
+        let second = app
+            .board
+            .selected_work("")
+            .unwrap()
+            .identity
+            .work_id
+            .clone();
+        assert_ne!(first, second);
+        // Wide terminals put the detail beside the list.
+        let wide = draw(&mut app, 160);
+        assert!(wide.contains(&format!("work {second}")), "{wide}");
     }
 
     #[test]
