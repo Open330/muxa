@@ -304,7 +304,18 @@ sessions** in a window (`--since`, `[watch] board_since`, default `today`); it
 is not per Work and does not follow the filter, and says `unavailable` rather
 than showing zero when the figures cannot be read.
 
-Actions that aim at a topology node — kill, message, move, rename — are refused
+Collaboration on the board follows the same agent cursor. `m` messages that
+agent: its pane and agent session are fixed when you press it, and the message
+is not sent if a different agent has started in that pane meanwhile. In window
+scope the agent must be in this room; `[collaboration] scope = "host"` reaches
+any pane, and an id that repeats across servers is refused rather than guessed.
+Topology marks (`Space`) do not apply here. `b` (or `M`) opens that agent's
+mailbox, read-only until you act; `i` claims its queued requests and `e`
+replies, both as that agent, never as the console. In any mailbox, `x` on the
+Sent tab withdraws a request this console sent that is still queued, after a
+confirmation.
+
+Actions that aim at a topology node — kill, move, rename — are refused
 here rather than applied to whatever the hidden topology cursor last pointed
 at; `Alt-1` gets them back.
 The board rescans every three seconds while it is on show, in the background so

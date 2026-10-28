@@ -1152,6 +1152,11 @@ pub(crate) enum QuickAction {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ConfirmAction {
     Quick(QuickAction),
+    /// Withdraw a request this console sent that nobody has claimed yet.
+    CancelCollaboration {
+        origin: CollaborationOrigin,
+        request_id: String,
+    },
     DeleteAskHistory(String),
     ClearAskHistory,
     DeleteMessageSkill(String),
@@ -8399,6 +8404,14 @@ pub async fn run(
                     clamp_collaboration_mailbox(&mut app);
                 }
                 Action::SubmitCollaboration => {
+                    if let Some(reason) = board_message_stale(&app) {
+                        // The draft stays: the operator may retarget it.
+                        app.set_hint(reason, HintLevel::Err);
+                        continue;
+                    }
+                    if matches!(app.board_pending, Some(BoardPending::Message { .. })) {
+                        app.board_pending = None;
+                    }
                     if let Some(composer) = app.collaboration_composer.take() {
                         let (outcome, report) =
                             run_watch_collaboration_composer(client, composer).await;
@@ -8464,6 +8477,20 @@ pub async fn run(
                             HintLevel::Warn,
                         );
                     }
+                }
+                Action::ClaimBoardInbox { origin, label } => {
+                    let outcome = match client.collaboration_inbox(&origin).await {
+                        Ok(requests) if requests.is_empty() => {
+                            ActionOutcome::Ok(format!("{label}'s collaboration inbox is empty"))
+                        }
+                        Ok(requests) => ActionOutcome::Ok(format!(
+                            "claimed {} collaboration request{} for {label}",
+                            requests.len(),
+                            if requests.len() == 1 { "" } else { "s" },
+                        )),
+                        Err(error) => ActionOutcome::Err(format!("inbox failed: {error}")),
+                    };
+                    apply_outcome_to_app(&mut app, outcome);
                 }
                 Action::ClaimCollaborationInbox => {
                     // Claiming is the recipient's move, so `i` acts for the
@@ -8549,6 +8576,21 @@ pub async fn run(
                                         HintLevel::Err,
                                     ),
                                 }
+                            }
+                            ConfirmAction::CancelCollaboration { origin, request_id } => {
+                                let outcome =
+                                    match client.collaboration_cancel(&origin, &request_id).await {
+                                        Ok(request) => ActionOutcome::Ok(format!(
+                                            "cancelled {}",
+                                            short_collaboration_request_id(&request.id)
+                                        )),
+                                        Err(error) => ActionOutcome::Err(format!(
+                                            "collaboration cancel failed: {error}"
+                                        )),
+                                    };
+                                apply_outcome_to_app(&mut app, outcome);
+                                refresh_watch_collaboration(client, &mut app).await;
+                                clamp_collaboration_mailbox(&mut app);
                             }
                             ConfirmAction::DeleteMessageSkill(name) => {
                                 let Some(path) = sort_persist_path.as_deref() else {
@@ -9527,6 +9569,9 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
 /// not collapsed to their active panes: their whole durable history is the
 /// reason hierarchy-aware mailbox browsing exists.
 fn mailbox_history_scope(app: &App) -> Option<MailboxHistoryScope> {
+    if app.watch_cfg.screen == WatchScreen::Board {
+        return board_mailbox_anchor(app).map(MailboxHistoryScope::Pane);
+    }
     if app.uses_tree() {
         return match app.selected_node()? {
             TopologyNodeRef::Session(session) => Some(MailboxHistoryScope::Session {
@@ -9975,6 +10020,9 @@ fn ask_revision_updates(client: Client) -> tokio::sync::watch::Receiver<u64> {
 fn collaboration_target_at_cursor(
     app: &App,
 ) -> Result<(String, String, Option<PaneKey>, Option<String>), String> {
+    if app.watch_cfg.screen == WatchScreen::Board {
+        return board_collaboration_target(app);
+    }
     let same_room = match app.collaboration.room.as_ref() {
         None => Err(app
             .collaboration
@@ -10047,6 +10095,42 @@ fn collaboration_target_at_cursor(
     }
 }
 
+/// The board's message recipient: the frozen agent `m` was pressed on. In
+/// window scope it must be a peer in this room (pane and agent session);
+/// host scope addresses it by its exact pane, which the daemon refuses if
+/// that pane id is ambiguous across servers.
+fn board_collaboration_target(
+    app: &App,
+) -> Result<(String, String, Option<PaneKey>, Option<String>), String> {
+    let Some(BoardPending::Message { pane, session }) = app.board_pending.as_ref() else {
+        return Err("press m on the board to message the selected agent".into());
+    };
+    let (key, agent) = board_cursor_agent(app)?;
+    if &key != pane || &agent.session_id != session {
+        return Err("the selected agent changed — press m again".into());
+    }
+    if app.collaboration_scope != muxa::config::CollaborationScope::Host {
+        let in_room = app.collaboration.room.as_ref().is_some_and(|room| {
+            room.peers
+                .iter()
+                .any(|peer| peer.pane == key.pane_id && &peer.agent_session_id == session)
+        });
+        if !in_room {
+            return Err(format!(
+                "{}@{} is not in this room; [collaboration] scope = \"host\" reaches it",
+                agent.kind, key.pane_id
+            ));
+        }
+    }
+    let label = format!(
+        "{}@{} · {}",
+        agent.kind,
+        key.pane_id,
+        topology_key_label(&TopologyNodeKey::Pane(key.clone()))
+    );
+    Ok((key.pane_id.clone(), label, Some(key), Some(session.clone())))
+}
+
 /// `Space`: mark or unmark the agent under the cursor.
 ///
 /// Deliberately the same resolution `m` uses, so what you mark is what you
@@ -10110,7 +10194,14 @@ fn stale_mark_count(app: &App) -> usize {
 }
 
 fn open_watch_collaboration_composer(app: &mut App) {
-    let marked = resolved_marks(app);
+    // Marks are made on the topology; the board messages its own cursor's
+    // agent and nothing else.
+    let on_board = app.watch_cfg.screen == WatchScreen::Board;
+    let marked = if on_board {
+        Vec::new()
+    } else {
+        resolved_marks(app)
+    };
     if !marked.is_empty() {
         let Some(origin) = app.collaboration.origin.clone() else {
             app.set_hint(collaboration_open_hint(), HintLevel::Err);
@@ -10143,6 +10234,13 @@ fn open_watch_collaboration_composer(app: &mut App) {
     }
     let (peer_pane, peer_label, pane_key, _) = match collaboration_target_at_cursor(app) {
         Ok(target) => target,
+        // The keystrokes fallback types into the topology selection, which
+        // is not what the board shows; `p` is the board's keystrokes path.
+        Err(reason) if on_board => {
+            app.board_pending = None;
+            app.set_hint(reason, HintLevel::Warn);
+            return;
+        }
         Err(reason) => {
             open_prompt_only_composer(app, reason);
             return;
@@ -10681,6 +10779,12 @@ pub(crate) enum Action {
     InspectorSplitChanged,
     /// Atomically claim the current agent's pending inbox.
     ClaimCollaborationInbox,
+    /// Claim the queued requests of an agent chosen on the board, acting as
+    /// that agent. The origin is frozen when the key is pressed.
+    ClaimBoardInbox {
+        origin: CollaborationOrigin,
+        label: String,
+    },
     /// Open a confirm popup for a destructive action. The popup itself is
     /// interpreted by the input loop; the action only dispatches when the
     /// user answers `y`.
@@ -10965,6 +11069,18 @@ fn gate_board_action(app: &mut App, action: Action) -> Action {
         | Action::SetLayout(_)
         | Action::SetCollabLayout(_)
         | Action::SetBoardSort(_)
+        // Collaboration on the board resolves its target from the board's
+        // own cursor (see `board_collaboration_target`), never the topology.
+        | Action::OpenCollaborationMailbox
+        | Action::SubmitCollaboration
+        | Action::ClaimCollaborationInbox
+        | Action::ClaimBoardInbox { .. }
+        | Action::CollaborationDefaultsChanged
+        // Withdrawing a request this console sent concerns no topology node.
+        | Action::AskConfirm(ConfirmPopup {
+            on_confirm: ConfirmAction::CancelCollaboration { .. },
+            ..
+        })
         | Action::InspectorSplitChanged
         | Action::DismissBroadcastReport
         | Action::Quick(QuickAction::ShowHelp) => action,
@@ -10975,6 +11091,15 @@ fn gate_board_action(app: &mut App, action: Action) -> Action {
         | Action::SetScreen(_) => {
             app.board_pending = None;
             action
+        }
+        // `m` from the board itself froze its recipient first; `m` from the
+        // mailbox (open on the board's agent) freezes it now.
+        Action::OpenCollaborationMessage => {
+            if matches!(app.board_pending, Some(BoardPending::Message { .. })) {
+                action
+            } else {
+                board_message_action(app)
+            }
         }
         // The pending operation's own confirmation, which stays pending
         // until answered.
@@ -11902,6 +12027,9 @@ fn handle_board_screen_key(
         KeyCode::Char('P') if browsing => return Some(board_prompt_action(app, true)),
         KeyCode::Char('R') if browsing => return Some(board_abort_action(app, false)),
         KeyCode::Char('A') if browsing => return Some(board_abort_action(app, true)),
+        KeyCode::Char('m') if browsing => return Some(board_message_action(app)),
+        KeyCode::Char('b' | 'M') if browsing => return Some(Action::OpenCollaborationMailbox),
+        KeyCode::Char('i') if browsing => return Some(board_claim_action(app)),
         _ => return None,
     }
     Some(Action::None)
@@ -11924,6 +12052,10 @@ enum BoardPending {
     Compose(Vec<PaneKey>),
     /// A confirmation for exactly this action.
     Confirm(QuickAction),
+    /// A collaboration message to exactly this agent: its pane and the
+    /// session running in it, so a replacement agent in a reused pane is
+    /// never the one that receives it.
+    Message { pane: PaneKey, session: String },
 }
 
 /// What a board action addresses, frozen when its composer or confirmation
@@ -12077,6 +12209,108 @@ fn board_pending_matches(pending: Option<&BoardPending>, action: &Action) -> boo
             Action::Quick(QuickAction::SendPromptToMany { panes, .. }),
         ) => frozen == panes,
         _ => false,
+    }
+}
+
+/// The agent under the board's cursor, exactly: its topology pane and the
+/// agent record, or why there is none.
+fn board_cursor_agent(app: &App) -> Result<(PaneKey, Agent), String> {
+    let filter = &app.search_query;
+    let Some(work) = app.board.selected_work(filter) else {
+        return Err("no Work selected".into());
+    };
+    let label = format!("{}/{}", work.identity.workspace_id, work.identity.work_id);
+    let agents = board_screen::live_agents(work);
+    let Some((run, pane)) = agents.get(app.board.selected_agent_index(filter)).copied() else {
+        return Err(format!("{label} has no live agent"));
+    };
+    let Some(agent) = pane.agent.clone() else {
+        return Err(format!("{label} has no live agent"));
+    };
+    let Some(key) = app.board_pane_key(run, &pane.pane_id) else {
+        return Err(format!("{label}'s agent is no longer open"));
+    };
+    Ok((key, agent))
+}
+
+/// Whose mailbox the board shows: the agent under its cursor, by pane and
+/// agent session, so a different agent later started in that pane is not it.
+fn board_mailbox_anchor(app: &App) -> Option<MailboxAnchor> {
+    let (key, agent) = board_cursor_agent(app).ok()?;
+    let endpoint = &key.window.session.endpoint;
+    Some(MailboxAnchor {
+        origin: CollaborationOrigin {
+            pane: key.pane_id.clone(),
+            socket: matches!(endpoint.host, muxa::HostKind::Tmux | muxa::HostKind::Rmux)
+                .then(|| endpoint.socket.clone()),
+            console: false,
+            agent_session_id: Some(agent.session_id.clone()),
+        },
+        label: format!("{}@{}", agent.kind, key.pane_id),
+    })
+}
+
+/// `m` on the board: message the agent under the cursor. Its identity is
+/// frozen now; the composer opens for exactly that agent, and the message
+/// is sent only if the same agent session still runs in that pane.
+fn board_message_action(app: &mut App) -> Action {
+    match board_cursor_agent(app) {
+        Ok((pane, agent)) => {
+            app.board_pending = Some(BoardPending::Message {
+                pane,
+                session: agent.session_id,
+            });
+            Action::OpenCollaborationMessage
+        }
+        Err(hint) => {
+            app.set_hint(hint, HintLevel::Warn);
+            Action::None
+        }
+    }
+}
+
+/// `i` on the board: claim the cursor agent's queued requests, acting as
+/// that agent — the recipient — never as the console.
+fn board_claim_action(app: &mut App) -> Action {
+    if let Some(anchor) = board_mailbox_anchor(app) {
+        Action::ClaimBoardInbox {
+            origin: anchor.origin,
+            label: anchor.label,
+        }
+    } else {
+        app.set_hint(
+            board_cursor_agent(app).err().unwrap_or_default(),
+            HintLevel::Warn,
+        );
+        Action::None
+    }
+}
+
+/// Why a board message composed for one agent must not be sent now: the
+/// agent session in that pane changed, or the pane is gone.
+fn board_message_stale(app: &App) -> Option<String> {
+    let Some(BoardPending::Message { pane, session }) = app.board_pending.as_ref() else {
+        return None;
+    };
+    let current = app
+        .topology
+        .sessions
+        .iter()
+        .flat_map(|s| s.windows.iter())
+        .flat_map(|w| w.panes.iter())
+        .find(|node| &node.key == pane)
+        .and_then(|node| node.agent.as_ref())
+        .map(|agent| agent.session_id.clone());
+    match current {
+        Some(current) if &current == session => None,
+        Some(_) => Some(format!(
+            "the agent in {} changed since you started writing — not sent",
+            pane_target_label(pane)
+        )),
+        None => Some(format!(
+            "{} is no longer open — not sent",
+            pane_target_label(pane)
+        )),
     }
 }
 
@@ -13178,8 +13412,45 @@ fn handle_collaboration_mailbox_event(code: KeyCode, app: &mut App) -> Action {
             Action::None
         }
         KeyCode::Char('r') => Action::OpenCollaborationMailbox,
+        KeyCode::Char('x') => confirm_collaboration_cancel(app),
         _ => Action::None,
     }
+}
+
+/// `x` in the mailbox: withdraw a request this console sent, while it is
+/// still queued. It is the console's own request, so the console cancels it.
+fn confirm_collaboration_cancel(app: &mut App) -> Action {
+    if app.collaboration_mailbox.tab != CollaborationMailboxTab::Sent {
+        app.set_hint("switch to sent requests to cancel", HintLevel::Warn);
+        return Action::None;
+    }
+    let Some(origin) = app.collaboration.origin.clone() else {
+        app.set_hint(collaboration_open_hint(), HintLevel::Err);
+        return Action::None;
+    };
+    let Some(request) = selected_collaboration_request(app) else {
+        app.set_hint("no sent request selected", HintLevel::Warn);
+        return Action::None;
+    };
+    if request.status != RequestStatus::Queued {
+        app.set_hint("only queued requests can be cancelled", HintLevel::Warn);
+        return Action::None;
+    }
+    let request_id = request.id.clone();
+    Action::AskConfirm(ConfirmPopup {
+        message: format!(
+            "Cancel {} to {}?",
+            short_collaboration_request_id(&request_id),
+            request.to.label()
+        ),
+        on_confirm: ConfirmAction::CancelCollaboration {
+            origin: CollaborationOrigin {
+                console: true,
+                ..origin
+            },
+            request_id,
+        },
+    })
 }
 
 fn open_watch_collaboration_reply_composer(app: &mut App) {
@@ -28717,6 +28988,8 @@ sort = ["state"]
             // encounter here is treated as "no-op" for the existing
             // preview-suite assertions.
             Action::None
+            // The real handler calls the daemon; the harness stops here.
+            | Action::ClaimBoardInbox { .. }
             | Action::OpenAgentMove
             | Action::SubmitAgentMove(_)
             | Action::Quit
@@ -30136,7 +30409,7 @@ sort = ["state"]
             })
             .collect();
         app.set_data(
-            vec![topology_agent("s1", "%1", "a", AgentState::Working, "", 0)],
+            vec![topology_agent("%1", "%1", "a", AgentState::Working, "", 0)],
             panes,
         );
         (app, keys)
@@ -30183,6 +30456,159 @@ sort = ["state"]
         assert!(matches!(gate_board_action(&mut app, again), Action::None));
         assert!(matches!(
             gate_board_action(&mut app, topology_interrupt()),
+            Action::None
+        ));
+    }
+
+    fn board_ready_to_message() -> (App, Vec<PaneKey>) {
+        let (mut app, keys) = board_with_tracked_topology_agent();
+        app.collaboration_scope = muxa::config::CollaborationScope::Host;
+        app.collaboration.origin = Some(watch_collaboration_origin(Some("%99".into())));
+        (app, keys)
+    }
+
+    #[test]
+    fn board_m_messages_exactly_the_cursor_agent_and_ignores_topology_marks() {
+        let (mut app, keys) = board_ready_to_message();
+        let marked_peer = collab_participant("%3", "callabo", "CAL-1");
+        app.collaboration.room = Some(RoomContext {
+            current: marked_peer.clone(),
+            peers: vec![marked_peer],
+            unread: 0,
+            unread_replies: 0,
+        });
+        app.collaboration_marks.insert(CollaborationMark {
+            pane: "%3".into(),
+            agent_session_id: None,
+        });
+        assert_eq!(resolved_marks(&app).len(), 1, "the topology mark is live");
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('m')),
+            Action::OpenCollaborationMessage
+        ));
+        open_watch_collaboration_composer(&mut app);
+        match app.collaboration_composer.as_ref().map(|c| &c.target) {
+            Some(CollaborationComposeTarget::Send {
+                target, pane_key, ..
+            }) => {
+                assert_eq!(target, "pane:%1");
+                assert_eq!(pane_key.as_ref(), Some(&keys[0]));
+            }
+            other => panic!("expected a message to %1, got {other:?}"),
+        }
+        assert!(board_message_stale(&app).is_none());
+    }
+
+    #[test]
+    fn board_m_is_not_sent_to_a_replacement_agent_in_the_same_pane() {
+        let (mut app, _) = board_ready_to_message();
+        let _ = press_key(&mut app, KeyCode::Char('m'));
+        open_watch_collaboration_composer(&mut app);
+        // A new agent session starts in %1 while the message is being written.
+        let panes: Vec<PaneInfo> = ["%1", "%2", "%3"]
+            .iter()
+            .enumerate()
+            .map(|(index, pane)| {
+                fake_topology_pane(
+                    "/tmp/a",
+                    "$1",
+                    "callabo",
+                    "@4",
+                    "CAL-1",
+                    1,
+                    pane,
+                    u32::try_from(index).unwrap(),
+                )
+            })
+            .collect();
+        app.set_data(
+            vec![topology_agent(
+                "other",
+                "%1",
+                "a",
+                AgentState::Working,
+                "",
+                0,
+            )],
+            panes,
+        );
+        assert!(board_message_stale(&app).is_some_and(|reason| reason.contains("changed")));
+        // Cancelling ends the board's authority over that recipient.
+        let _ = gate_board_action(&mut app, Action::CancelCollaborationComposer);
+        assert!(app.board_pending.is_none());
+    }
+
+    #[test]
+    fn board_m_in_window_scope_refuses_an_agent_outside_the_room() {
+        let (mut app, _) = board_ready_to_message();
+        app.collaboration_scope = muxa::config::CollaborationScope::Window;
+        let _ = press_key(&mut app, KeyCode::Char('m'));
+        open_watch_collaboration_composer(&mut app);
+        assert!(
+            app.collaboration_composer.is_none(),
+            "no keystrokes fallback either"
+        );
+        assert!(app.board_pending.is_none());
+        assert!(app
+            .footer_hint
+            .as_ref()
+            .is_some_and(|hint| hint.message.contains("not in this room")));
+    }
+
+    #[test]
+    fn board_mailbox_and_claim_act_as_the_cursor_agent() {
+        let (mut app, _) = board_ready_to_message();
+        let _ = press_key(&mut app, KeyCode::Tab);
+        match mailbox_history_scope(&app) {
+            Some(MailboxHistoryScope::Pane(anchor)) => {
+                assert_eq!(anchor.origin.pane, "%2");
+                assert!(!anchor.origin.console);
+                assert_eq!(anchor.origin.agent_session_id.as_deref(), Some("%2"));
+            }
+            other => panic!("the board mailbox is the cursor agent's: {other:?}"),
+        }
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('b')),
+            Action::OpenCollaborationMailbox
+        ));
+        match press_key(&mut app, KeyCode::Char('i')) {
+            Action::ClaimBoardInbox { origin, .. } => {
+                assert_eq!(origin.pane, "%2");
+                assert!(!origin.console, "claiming is the recipient's move");
+            }
+            _ => panic!("i should claim for the cursor agent"),
+        }
+    }
+
+    #[test]
+    fn mailbox_x_cancels_only_a_queued_request_this_console_sent() {
+        let (mut app, _) = board_ready_to_message();
+        let mut queued = collab_request("%1");
+        queued.status = RequestStatus::Queued;
+        let mut claimed = collab_request("%2");
+        claimed.id = "req_2".into();
+        claimed.status = RequestStatus::Claimed;
+        app.collaboration.sent = vec![queued, claimed];
+        app.collaboration_mailbox.open = true;
+        app.collaboration_mailbox.tab = CollaborationMailboxTab::Sent;
+        let action = press_key(&mut app, KeyCode::Char('x'));
+        match &action {
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm: ConfirmAction::CancelCollaboration { origin, request_id },
+                ..
+            }) => {
+                assert_eq!(request_id, "req_1");
+                assert!(origin.console);
+            }
+            _ => panic!("x should confirm cancelling the queued request"),
+        }
+        assert!(matches!(
+            gate_board_action(&mut app, action),
+            Action::AskConfirm(_)
+        ));
+        app.collaboration_mailbox.selected = 1;
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('x')),
             Action::None
         ));
     }

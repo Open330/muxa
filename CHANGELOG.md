@@ -18,7 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   interrupt them, with targets fixed when the prompt or confirmation opens and
   results that count unreachable agents; `:sort attention|activity|busy|name`
   (`--board-sort`) orders it apart from the topology sort; and the corner shows
-  ACT/WACT for all sessions in `--since` (default today).
+  ACT/WACT for all sessions in `--since` (default today). `m` messages the
+  agent under the cursor (recipient pane and session fixed when pressed; not
+  sent to a replacement agent), `b` opens its mailbox and `i`/`e` claim and
+  reply as that agent. The watch mailbox gains `x` to withdraw a queued request
+  this console sent.
 
 - Opt-in versioned collaboration task contracts bind requests to daemon-created
   attempt IDs, exact basis commits and structured reported evidence. Read-only
