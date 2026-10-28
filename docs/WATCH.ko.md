@@ -231,6 +231,8 @@ pane을 미리 봅니다.
 
 `Tab` / `]`와 `Shift-Tab` / `[`는 선택한 Work의 live agent(모든 Run, detail에
 `▸` 표시) 사이에서 agent 커서를 옮기며, 새로고침 뒤에도 그 pane을 따라갑니다.
+`Enter`와 `o`는 그 agent의 pane으로 가고(live agent가 없는 Work는 Run으로),
+`c`는 마지막 프롬프트를 복사하며, `K`는 확인 뒤 그 pane을 닫습니다.
 `p`는 그 agent에, `P`는 Work의 모든 live agent에 프롬프트를 입력하고, `R`은 그
 agent를, `A`는 모두를 대상 이름을 보여주는 확인 뒤에 중단합니다. 대상은 입력창이나
 확인창이 열릴 때 고정되므로 그사이 새로고침이 대상을 바꾸지 못하고, 각 대상에

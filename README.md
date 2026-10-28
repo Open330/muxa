@@ -108,7 +108,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa peek` | `prefix + q` overlay: each pane's live screen dimmed under a box with its handle (`@claude`) and tmux pane id, its agent's state, summary, and latest prompt/response; a separate Links panel below shows roles, primary/worker purpose and request/reply state, with full pane IDs and connecting arrows following the real pane layout — including how long ago you last prompted it and which pane was prompted most recently; press a digit to jump, or `|` for a scrollable reader (`Tab` toggles terminal history). |
 | `muxa sidebar show` | Persistent left/right agent explorer, with matching pane colors and sidebar-aware focus zoom. [Usage](docs/SIDEBAR.md). |
 | `muxa watch` | Main TUI for agents, prompts, live previews, hierarchy-aware mailbox history, and table/sequence collaboration. |
-| `muxa dashboard` | Work-first TUI console; `P` prompts and `A` aborts every live agent in the selected Work. |
+| `muxa dashboard` | `muxa watch` on its Work board: Works first, `P` prompts and `A` interrupts every live agent of the selected Work. |
 | `muxa attend` | Jump to the agent blocked on input/choice/error longest. |
 | `muxa stats` / `muxa stats report` | Local analytics for prompt history, agent state duration, tmux foreground time, and human thinking time. |
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
@@ -370,7 +370,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | --- | --- |
 | `muxa status [--flat\|--json]` | Agents as a session / window / pane tree (`--flat`: one row per agent), or a versioned JSON snapshot for desktop integrations. |
 | `muxa watch [--view session\|window\|pane]` | Live workspace → work → agent TUI picker/dashboard. |
-| `muxa dashboard [--since today]` | Work-card TUI with Run capture, per-agent and Work-wide prompt/abort actions, ACT/WACT totals, and collaboration controls. |
+| `muxa dashboard [--since today]` | The watch Work board: per-agent and Work-wide prompt/interrupt, messages and mailbox as an agent, collaboration counts, and an ACT/WACT summary. |
 | `muxa graph [--limit 200]` | Interactive terminal collaboration graph with session/window groups, spring motion, zoom, and message inspection. |
 | `muxa attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `muxa status-line [--pane %N]` | tmux status-line output. |

@@ -245,8 +245,9 @@ enum Cmd {
     Report(stats::ReportInvocation),
     /// Explore agent work/wait/error intervals as an interactive timeline.
     Timeline(timeline::Args),
-    /// Work-board TUI for tracking Work, Runs, external issues, and agents.
-    Dashboard(dashboard_tui::Args),
+    /// The Work board: `muxa watch` opened on its board screen, tracking Work,
+    /// Runs, external issues, agents and their collaboration.
+    Dashboard(DashboardArgs),
     /// Explore session/window/pane message connections in an interactive terminal graph.
     Graph(graph::Args),
     /// Former name of `muxa stats activity`.
@@ -1647,7 +1648,13 @@ async fn main() -> Result<()> {
         Cmd::Stats(stats_command) => stats::run_command(&client, &cfg, stats_command).await,
         Cmd::Report(report) => stats::run_report(&client, &cfg, &report.window, report.args).await,
         Cmd::Timeline(timeline_args) => timeline::run(&client, &cfg, timeline_args).await,
-        Cmd::Dashboard(dashboard_args) => cmd_dashboard(&client, &cfg, dashboard_args).await,
+        Cmd::Dashboard(DashboardArgs { legacy: true, args }) => {
+            cmd_dashboard(&client, &cfg, args).await
+        }
+        Cmd::Dashboard(DashboardArgs {
+            legacy: false,
+            args,
+        }) => cmd_dashboard_board(&client, cfg.clone(), config_path.clone(), &args).await,
         Cmd::Graph(args) => graph::run(&cfg, args).await,
         Cmd::Activity(activity) => activity_query::run(&cfg, &activity.window, activity.args).await,
         Cmd::Hook { which } => handle_hook(&client, which).await,
@@ -3556,6 +3563,43 @@ pub(crate) async fn cmd_watch(
     Ok(())
 }
 
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct DashboardArgs {
+    /// Open the previous dashboard instead of the Work board. Kept for one
+    /// release while the board replaces it.
+    #[arg(long, hide = true)]
+    legacy: bool,
+    #[command(flatten)]
+    args: dashboard_tui::Args,
+}
+
+/// `muxa dashboard`: `muxa watch` on its Work board screen, with the
+/// dashboard's flags carried over for this run only.
+async fn cmd_dashboard_board(
+    client: &Client,
+    mut cfg: Config,
+    config_path: Option<PathBuf>,
+    args: &dashboard_tui::Args,
+) -> Result<()> {
+    cfg.watch.board_sort = args.board_sort()?;
+    cfg.watch.board_since = Some(args.board_since()?);
+    cmd_watch(
+        client,
+        cfg,
+        config_path,
+        WatchInvocation {
+            include_paneless: args.include_paneless(),
+            view: None,
+            layout: None,
+            screen: Some(WatchScreenArg::Board),
+            sort: None,
+            theme: args.theme(),
+            caller_pane: None,
+        },
+    )
+    .await
+}
+
 async fn cmd_dashboard(client: &Client, cfg: &Config, args: dashboard_tui::Args) -> Result<()> {
     let activity_path = cfg
         .activity
@@ -5258,6 +5302,53 @@ mod tests {
             &origin,
             &RuntimeError::Timeout(std::time::Duration::from_secs(1))
         ));
+    }
+
+    fn dashboard(argv: &[&str]) -> DashboardArgs {
+        let mut full = vec!["muxa", "dashboard"];
+        full.extend_from_slice(argv);
+        let Some(Cmd::Dashboard(parsed)) = Args::try_parse_from(full).unwrap().cmd else {
+            panic!("not a dashboard invocation")
+        };
+        parsed
+    }
+
+    #[test]
+    fn dashboard_flags_carry_over_to_the_work_board() {
+        let defaults = dashboard(&[]);
+        assert!(!defaults.legacy);
+        assert_eq!(
+            defaults.args.board_sort().unwrap(),
+            muxa::config::WatchBoardSort::Attention
+        );
+        assert_eq!(defaults.args.board_since().unwrap(), "today");
+        let chosen = dashboard(&[
+            "--sort",
+            "name",
+            "--since",
+            "7d",
+            "--include-paneless",
+            "--theme",
+            "mono",
+        ]);
+        assert_eq!(
+            chosen.args.board_sort().unwrap(),
+            muxa::config::WatchBoardSort::Name
+        );
+        assert_eq!(chosen.args.board_since().unwrap(), "7d");
+        assert!(chosen.args.include_paneless());
+        assert!(matches!(chosen.args.theme(), Some(ThemeArg::Mono)));
+        // Active time cannot be attributed per Work yet: refused, not remapped.
+        let active = dashboard(&["--sort", "active"])
+            .args
+            .board_sort()
+            .unwrap_err();
+        assert!(active.to_string().contains("active time"), "{active}");
+        assert!(dashboard(&["--since", "yesterdayish"])
+            .args
+            .board_since()
+            .is_err());
+        assert!(dashboard(&["--legacy"]).legacy);
     }
 
     #[test]

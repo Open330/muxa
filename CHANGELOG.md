@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `muxa dashboard` opens `muxa watch` on its Work board, which now covers what
+  the card console did: `Enter`/`o` follow the `▸` agent, and `c` copies and
+  `K` closes it. `--since`, `--sort attention|activity|name`,
+  `--include-paneless` and `--theme` carry over for the run; `--sort active` is
+  refused (active time cannot be attributed per Work yet) and per-card
+  ACT/WACT gives way to an all-sessions summary. `--legacy` opens the old
+  console for one release. See docs/DASHBOARD_CLI.md.
+
 ### Added
 
 - `muxa watch` has a Work board screen (`Alt-3`, `:screen board`,

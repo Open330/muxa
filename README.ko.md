@@ -103,7 +103,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa status-line` | active pane 기준 tmux `status-right` 한 줄 요약. |
 | `muxa peek` | `prefix + q` 오버레이: 각 pane의 실제 화면을 dim 배경으로 깔고 그 위에 handle(`@claude`)·tmux pane id와 agent의 상태·요약·최근 프롬프트/응답과 마지막 프롬프트 시각을 얹으며, 가장 최근에 프롬프트를 보낸 pane은 따로 표시함. 숫자 키로 이동. `|`로 확대하고 `Tab`으로 저장된 텍스트/터미널 원문을 전환. |
 | `muxa watch` | agent/pane 관측, prompt, live preview, hierarchy-aware mailbox와 table/sequence 협업을 제공하는 기본 TUI. |
-| `muxa dashboard` | Work 중심 TUI. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
+| `muxa dashboard` | `muxa watch`의 Work board. `P`는 선택 Work의 모든 live agent에 prompt를 보내고 `A`는 모두 중단. |
 | `muxa attend` | input/choice/error로 가장 오래 막힌 agent로 점프. |
 | `muxa stats` / `muxa stats report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `muxa timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
@@ -317,7 +317,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 | --- | --- |
 | `muxa status [--flat\|--json]` | 추적 중인 agent를 session / window / pane 트리로 보여 줌(`--flat`: agent당 한 줄), 또는 desktop integration용 versioned JSON snapshot. |
 | `muxa watch [--view session\|window\|pane]` | workspace → work → agent live TUI picker/dashboard. |
-| `muxa dashboard [--since today]` | Run capture와 agent별/Work 일괄 prompt·abort, ACT/WACT total을 보여주는 Work-card TUI. |
+| `muxa dashboard [--since today]` | watch Work board: agent별/Work 일괄 prompt·중단, agent로서 메시지·메일함, 협업 수, ACT/WACT 요약. |
 | `muxa graph` | [터미널 인터랙티브 그래프](docs/GRAPH.ko.md)에서 session/window/pane 연결·협업 메시지 탐색. |
 | `muxa attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |
 | `muxa status-line [--pane %N]` | tmux status-line 출력. |

@@ -11226,6 +11226,16 @@ fn gate_board_action(app: &mut App, action: Action) -> Action {
         Action::AskConfirm(_) if board_pending_matches(app.board_pending.as_ref(), &action) => {
             action
         }
+        // Copying is harmless, but only the cursor agent's prompt is the
+        // board's: Alt-C would copy the hidden topology selection's.
+        Action::Quick(QuickAction::CopyPrompt(ref prompt))
+            if board_cursor_agent(app)
+                .ok()
+                .and_then(|(_, agent)| agent.last_prompt)
+                .is_some_and(|own| &own == prompt) =>
+        {
+            action
+        }
         // Its composer's submission, which uses the authority up.
         Action::Quick(_) if board_pending_matches(app.board_pending.as_ref(), &action) => {
             app.board_pending = None;
@@ -11254,6 +11264,7 @@ fn board_quick_panes(quick: &QuickAction) -> Option<Vec<&PaneKey>> {
         QuickAction::InterruptPanes { panes, .. } | QuickAction::SendPromptToMany { panes, .. } => {
             Some(panes.iter().collect())
         }
+        QuickAction::TerminateNode(TopologyNodeKey::Pane(pane)) => Some(vec![pane]),
         _ => None,
     }
 }
@@ -12155,6 +12166,8 @@ fn handle_board_screen_key(
             return Some(Action::OpenCollaborationMailbox);
         }
         KeyCode::Char('i') if browsing => return Some(board_claim_action(app)),
+        KeyCode::Char('c') if browsing => return Some(board_copy_action(app)),
+        KeyCode::Char('K') if browsing => return Some(board_kill_action(app)),
         _ => return None,
     }
     Some(Action::None)
@@ -12310,6 +12323,49 @@ fn board_abort_action(app: &mut App, all: bool) -> Action {
             Action::None
         }
     }
+}
+
+/// `c` on the board: copy the cursor agent's last prompt.
+fn board_copy_action(app: &mut App) -> Action {
+    match board_cursor_agent(app) {
+        Ok((_, agent)) => {
+            if let Some(prompt) = agent.last_prompt.filter(|prompt| !prompt.is_empty()) {
+                Action::Quick(QuickAction::CopyPrompt(prompt))
+            } else {
+                app.set_hint("the selected agent has no prompt to copy", HintLevel::Warn);
+                Action::None
+            }
+        }
+        Err(hint) => {
+            app.set_hint(hint, HintLevel::Warn);
+            Action::None
+        }
+    }
+}
+
+/// `K` on the board: close the cursor agent's pane after a confirmation
+/// naming it. Unlike `R`, this ends the process, not just its turn.
+fn board_kill_action(app: &mut App) -> Action {
+    let key = match board_cursor_agent(app) {
+        Ok((key, _)) => key,
+        Err(hint) => {
+            app.set_hint(hint, HintLevel::Warn);
+            return Action::None;
+        }
+    };
+    if busy_target(app, std::slice::from_ref(&key)).is_some() {
+        app.set_hint(still_sending(&key), HintLevel::Warn);
+        return Action::None;
+    }
+    let quick = QuickAction::TerminateNode(TopologyNodeKey::Pane(key.clone()));
+    app.board_pending = Some(BoardPending::Confirm(quick.clone()));
+    Action::AskConfirm(ConfirmPopup {
+        message: format!(
+            "Close {} and end its agent?",
+            topology_key_label(&TopologyNodeKey::Pane(key))
+        ),
+        on_confirm: ConfirmAction::Quick(quick),
+    })
 }
 
 /// Whether `action` is exactly what the pending board operation was opened
@@ -12518,7 +12574,14 @@ fn board_selected_pane(app: &App) -> Result<PaneKey, String> {
         return Err("no Work selected".into());
     };
     let label = format!("{}/{}", work.identity.workspace_id, work.identity.work_id);
-    let Some((run, pane_id)) = board_screen::jump_target(work) else {
+    // The agent the detail marks with ▸ is where Enter and `o` go, on
+    // whichever Run it is; a Work with no live agent falls back to its Run.
+    let agents = board_screen::live_agents(work);
+    let target = agents
+        .get(app.board.selected_agent_index(filter))
+        .map(|(run, pane)| (*run, pane.pane_id.as_str()))
+        .or_else(|| board_screen::jump_target(work));
+    let Some((run, pane_id)) = target else {
         return Err(format!("{label} has no live Run"));
     };
     // The board refreshes on its own clock; the window may have closed since.
@@ -20228,6 +20291,8 @@ fn render_contextual_footer(f: &mut Frame, area: Rect, app: &App, theme: WatchTh
                 Span::raw(" prompt one/all  "),
                 Span::styled(" R/A ", theme.action_badge()),
                 Span::raw(" interrupt one/all  "),
+                Span::styled(" m/b ", theme.action_badge()),
+                Span::raw(" message/mailbox  "),
                 Span::styled(" Alt-1 ", theme.key_badge()),
                 Span::raw(" topology  "),
                 Span::styled(" ? ", theme.key_badge()),
@@ -30990,6 +31055,73 @@ sort = ["state"]
             collab.line(&work),
             "collab  2 open to its agents · 2 open from them"
         );
+    }
+
+    #[test]
+    fn enter_and_preview_follow_the_agent_the_detail_marks() {
+        // The ▸ agent is %1 (working); %2 is the one waiting on you, which
+        // is where Enter used to go regardless of the cursor.
+        let (mut app, keys) = board_with_agents();
+        match press_key(&mut app, KeyCode::Enter) {
+            Action::AttachTopologyPane(key) => assert_eq!(key, keys[0]),
+            _ => panic!("Enter goes to the ▸ agent"),
+        }
+        match press_key(&mut app, KeyCode::Char('o')) {
+            Action::OpenPreviewFor(key) => assert_eq!(key, keys[0]),
+            _ => panic!("o previews the ▸ agent"),
+        }
+    }
+
+    #[test]
+    fn board_c_copies_the_cursor_agents_prompt_and_nothing_else() {
+        let (mut app, _) = board_with_agents();
+        let mut work = app.board.selected_work("").unwrap().clone();
+        work.runs[0].panes[0].agent.as_mut().unwrap().last_prompt = Some("ship it".into());
+        app.board
+            .set_snapshot(board_snapshot(vec![work]), Vec::new());
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('c')),
+            Action::Quick(QuickAction::CopyPrompt(ref prompt)) if prompt == "ship it"
+        ));
+        // A copy aimed at the hidden topology selection's prompt is refused.
+        assert!(matches!(
+            gate_board_action(
+                &mut app,
+                Action::Quick(QuickAction::CopyPrompt("other".into()))
+            ),
+            Action::None
+        ));
+        let _ = press_key(&mut app, KeyCode::Tab);
+        assert!(matches!(
+            press_key(&mut app, KeyCode::Char('c')),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn board_k_confirms_closing_exactly_the_cursor_agents_pane() {
+        let (mut app, keys) = board_with_agents();
+        let _ = press_key(&mut app, KeyCode::Tab);
+        match press_key(&mut app, KeyCode::Char('K')) {
+            Action::AskConfirm(ConfirmPopup {
+                on_confirm:
+                    ConfirmAction::Quick(QuickAction::TerminateNode(TopologyNodeKey::Pane(key))),
+                message,
+            }) => {
+                assert_eq!(key, keys[1]);
+                assert!(message.contains("end its agent"), "{message}");
+            }
+            _ => panic!("K should confirm closing the ▸ agent's pane"),
+        }
+        // Cancelled, it authorises nothing later.
+        let _ = gate_board_action(&mut app, Action::ConfirmCancel);
+        let later = Action::AskConfirm(ConfirmPopup {
+            message: "Close?".into(),
+            on_confirm: ConfirmAction::Quick(QuickAction::TerminateNode(TopologyNodeKey::Pane(
+                keys[1].clone(),
+            ))),
+        });
+        assert!(matches!(gate_board_action(&mut app, later), Action::None));
     }
 
     #[test]
