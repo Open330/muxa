@@ -123,7 +123,13 @@ to send the text to every swapped agent, idle ones included; it now keeps the
 `continue_when` policy and prints a notice. The MCP tool takes
 `continue_text` and `continue_when`, with `continue` kept as the same alias.
 A Fleet host running an older `muxa` refuses the new options rather than
-reading the old meaning.
+reading the old meaning. A blank `--continue-text ""` sends nothing, here and
+on a host alike.
+
+Each planned follow-up names why the agent is due one — `rate_limited`, then
+`cut_off`, then `always`, the first that applies — in the dry-run note and as
+`continue_reason` in `--json`. It records eligibility when the plan is made,
+not that the prompt was delivered or acted on.
 
 ## On a Fleet host
 

@@ -42,7 +42,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `--continue-text` and prints a notice; the MCP `muxa_swap_account` tool
   gains `continue_text` / `continue_when` with `continue` as the same alias.
   Remote `--host` runs pass the new options, which an older host refuses
-  instead of waking every agent.
+  instead of waking every agent; a blank wording sends nothing there too.
+  Each planned follow-up records why in `continue_reason` (`rate_limited`,
+  `cut_off`, `always`) — eligibility, not proof of delivery.
 
 - Starting watch on the Work board or a topology screen loads only open-request
   metadata for hidden mailbox badges; completed-history previews wait until the

@@ -196,6 +196,23 @@ pub struct SwapOutcome {
     pub command: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// Why this agent was planned a follow-up — its eligibility under the
+    /// policy, set when the plan is made. Not evidence that the prompt was
+    /// sent or that the agent acted on it; a failed swap keeps it too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_reason: Option<ContinueReason>,
+}
+
+/// Why a swapped agent is due a follow-up. When more than one applies, the
+/// first listed wins: a usage cap, then a turn the swap cut off, then a
+/// policy that sends it to everyone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ContinueReason {
+    RateLimited,
+    CutOff,
+    Always,
 }
 
 impl SwapOutcome {
@@ -209,6 +226,7 @@ impl SwapOutcome {
             status,
             command: None,
             note: note.into(),
+            continue_reason: None,
         }
     }
 }
@@ -235,9 +253,16 @@ pub fn provider_name(kind: AgentKind) -> Option<&'static str> {
 /// to continue, and one waiting on the user's answer or choice is waiting
 /// for the user, not for a prompt. Recent activity only keeps an agent out
 /// of a non-forced swap; it is not a cut-off turn.
-fn follow_up<'a>(request: &'a SwapRequest, agent: &Agent) -> Option<&'a str> {
-    let cut_off = is_rate_limited(agent) || agent.state == AgentState::Working;
-    request.continue_for(cut_off)
+fn follow_up<'a>(request: &'a SwapRequest, agent: &Agent) -> Option<(&'a str, ContinueReason)> {
+    let cut_off = if is_rate_limited(agent) {
+        Some(ContinueReason::RateLimited)
+    } else if agent.state == AgentState::Working {
+        Some(ContinueReason::CutOff)
+    } else {
+        None
+    };
+    let text = request.continue_for(cut_off.is_some())?;
+    Some((text, cut_off.unwrap_or(ContinueReason::Always)))
 }
 
 /// Stopped by a usage cap: the same predicate the `rate_limited`
@@ -1116,11 +1141,13 @@ fn swap_one(
         }
     };
     outcome.command = Some(command.clone());
-    let follow_up = follow_up(request, agent);
+    let planned = follow_up(request, agent);
+    outcome.continue_reason = planned.map(|(_, reason)| reason);
+    let follow_up = planned.map(|(text, _)| text);
     if request.dry_run {
         outcome.status = SwapStatus::Planned;
-        if let Some(text) = follow_up {
-            outcome.note = format!("then send {text:?}");
+        if let Some((text, reason)) = planned {
+            outcome.note = format!("then send {text:?} ({reason})");
         }
         return outcome;
     }
@@ -2838,10 +2865,16 @@ mod tests {
                 agent.state
             );
         }
+        let reason = |req: &SwapRequest, agent: &Agent| follow_up(req, agent).map(|(_, r)| r);
+        assert_eq!(reason(&req, &cases[0].0), Some(ContinueReason::CutOff));
+        assert_eq!(reason(&req, &cases[1].0), Some(ContinueReason::RateLimited));
         req.continue_when = ContinueWhen::Always;
         assert!(cases
             .iter()
             .all(|(agent, _)| follow_up(&req, agent).is_some()));
+        // A cap or a cut-off turn is still named as such under `always`.
+        assert_eq!(reason(&req, &cases[1].0), Some(ContinueReason::RateLimited));
+        assert_eq!(reason(&req, &cases[2].0), Some(ContinueReason::Always));
         req.continue_when = ContinueWhen::Never;
         assert!(cases
             .iter()

@@ -70,14 +70,10 @@ pub struct Args {
         conflicts_with_all = ["no_continue", "continue_legacy"]
     )]
     continue_text: Option<String>,
-    /// Deprecated spelling of `--continue-text`. It used to send the prompt
-    /// to every swapped agent; it now keeps the `--continue-when` policy.
-    #[arg(
-        long = "continue",
-        value_name = "TEXT",
-        hide = true,
-        conflicts_with = "no_continue"
-    )]
+    /// Deprecated: use `--continue-text`. Sets the wording only — it no
+    /// longer sends to every swapped agent; add `--continue-when always` for
+    /// that.
+    #[arg(long = "continue", value_name = "TEXT", conflicts_with = "no_continue")]
     continue_legacy: Option<String>,
     /// Which swapped agents get the follow-up: `limited` (their turn was cut
     /// off by a usage cap or by this swap), `always`, or `never`. Default
@@ -258,10 +254,18 @@ fn remote_argv(args: &Args) -> Vec<String> {
     }
     // The new spellings only: a host too old to know them refuses the run
     // rather than reading `--continue` as "send to every agent".
-    if let Some(text) = args.follow_up_text() {
+    // A blank wording sends nothing here, so it is `--no-continue` there:
+    // the allowlist takes no empty values, and the host's own default text
+    // must not stand in for one the caller cleared.
+    let blank = args
+        .follow_up_text()
+        .is_some_and(|text| text.trim().is_empty());
+    if blank && !args.no_continue {
+        words.push("--no-continue".to_owned());
+    } else if let Some(text) = args.follow_up_text() {
         words.push(format!("--continue-text={text}"));
     }
-    if let Some(when) = args.continue_when {
+    if let Some(when) = args.continue_when.filter(|_| !blank) {
         words.push(format!(
             "--continue-when={}",
             match when {
@@ -470,6 +474,14 @@ mod tests {
             request_from(&cli.args, &config).continue_when,
             ContinueWhen::Never
         );
+        let config = SwapConfig {
+            continue_when: ContinueWhen::Always,
+            ..SwapConfig::default()
+        };
+        assert_eq!(
+            request_from(&cli.args, &config).continue_when,
+            ContinueWhen::Always
+        );
     }
 
     /// The old spelling is the wording only now, and a remote run carries
@@ -496,6 +508,31 @@ mod tests {
         ]))
         .unwrap();
         muxa::work_control::validate_swap_argv(&argv).unwrap();
+        // No policy named: none is sent, so the host keeps its own default.
+        assert!(!checked_argv(&words(&["--continue-text", "go"]))
+            .unwrap()
+            .iter()
+            .any(|word| word.starts_with("--continue-when")));
+    }
+
+    /// A blank wording sends nothing, here and on a Fleet host alike.
+    #[test]
+    fn a_blank_wording_sends_nothing_here_or_on_a_host() {
+        assert_eq!(parse(&["--continue-text", " "]).continue_text, None);
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        for blank in [
+            words(&["--continue-text", " "]),
+            words(&["--continue", ""]),
+            words(&["--continue-text", "", "--continue-when", "always"]),
+        ] {
+            let argv = checked_argv(&blank).unwrap();
+            assert!(argv.contains(&"--no-continue".to_owned()), "{argv:?}");
+            assert!(
+                !argv.iter().any(|w| w.starts_with("--continue")),
+                "{argv:?}"
+            );
+            muxa::work_control::validate_swap_argv(&argv).unwrap();
+        }
     }
 
     #[test]
@@ -509,6 +546,7 @@ mod tests {
             status: SwapStatus::Planned,
             command: Some("aas e jelly@claude --resume sid".into()),
             note: String::new(),
+            continue_reason: None,
         }]);
         assert!(
             rendered.contains("e-ed@claude -> jelly@claude"),
