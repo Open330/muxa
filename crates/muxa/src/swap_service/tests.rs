@@ -948,22 +948,61 @@ fn a_job_wakes_its_waiters_however_it_ends() {
     assert!(panicking.service.status(&JobRef::Id(job)).is_ok());
 }
 
-/// Draining refuses new work and waits for running work, interrupting
-/// nothing.
+/// Opens a gate when dropped, panic or not.
+struct OpenOnDrop(Arc<Gate>);
+
+impl Drop for OpenOnDrop {
+    fn drop(&mut self) {
+        self.0.open();
+    }
+}
+
+fn runtime() -> tokio::runtime::Runtime {
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_time()
+        .build()
+        .unwrap()
+}
+
+/// Draining waits for a submission already past the gate — here held in
+/// planning — to register its job, then for that job, and takes no new
+/// one; nothing is interrupted.
 #[test]
-fn draining_waits_for_running_jobs_and_takes_no_new_ones() {
-    let gate = Arc::new(Gate::default());
-    let held = Arc::clone(&gate);
+fn draining_waits_for_submissions_in_flight_and_their_jobs() {
+    let planning = Arc::new(Gate::default());
+    let held = Arc::clone(&planning);
     let h = harness(Box::new(move || {
-        vec![EngineStep::Run(FakeTarget {
-            identity: identity("%1", "/tmp/tmux-1/default"),
-            gate: Some(Arc::clone(&held)),
-        })]
+        held.wait();
+        vec![run("%1")]
     }));
-    let accepted =
-        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
-    drop(accepted);
-    h.service.draining.store(true, Ordering::SeqCst);
+    // Declared before the release below, so on a failed assertion the gate
+    // opens first and the runtime's blocked barrier can then finish.
+    let rt = runtime();
+    // However this test ends, the planning submission is let go, so a
+    // failing assertion cannot leave a thread blocked forever.
+    let _release = OpenOnDrop(Arc::clone(&planning));
+    let service = Arc::clone(&h.service);
+    let submitting = std::thread::spawn(move || {
+        Service::submit(&service, "key", &overrides(&["%1"]), Origin::Public, None)
+    });
+    // Let the submission pass the gate and block in planning.
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !rt.block_on(Service::drain(
+            Arc::clone(&h.service),
+            Duration::from_millis(100)
+        )),
+        "a submission still planning keeps the drain from finishing"
+    );
+    planning.open();
+    let accepted = submitting.join().unwrap().unwrap();
+    assert!(rt.block_on(Service::drain(
+        Arc::clone(&h.service),
+        Duration::from_secs(10)
+    )));
+    assert_eq!(settled(&h.service, &accepted.job_id).state, "done");
+    assert_eq!(*h.executed.lock().unwrap(), ["%1"]);
     assert!(Service::submit(
         &h.service,
         "next",
@@ -973,28 +1012,35 @@ fn draining_waits_for_running_jobs_and_takes_no_new_ones() {
     )
     .unwrap_err()
     .contains("shutting down"));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
+}
+
+/// `wait` reads a finished job within its bound, and a status read that
+/// cannot finish in time is reported as such, not as a running job.
+#[test]
+fn waiting_covers_reading_the_result() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let accepted =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
+    let rt = runtime();
+    let view = rt
+        .block_on(Service::wait(
+            Arc::clone(&h.service),
+            &accepted.job_id,
+            Duration::from_secs(10),
+        ))
         .unwrap();
-    let waiting = h.service.receivers();
-    assert_eq!(waiting.len(), 1);
-    let opener = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(50));
-        gate.open();
-    });
-    let drained = runtime.block_on(async move {
-        tokio::time::timeout(Duration::from_secs(10), async move {
-            for mut done in waiting {
-                let _ = done.wait_for(|ended| *ended).await;
-            }
-        })
-        .await
-        .is_ok()
-    });
-    opener.join().unwrap();
-    assert!(drained);
-    assert_eq!(*h.executed.lock().unwrap(), ["%1"]);
+    assert_eq!(view.state, "done");
+
+    let held = h.service.store.hold();
+    let late = rt
+        .block_on(Service::wait(
+            Arc::clone(&h.service),
+            &accepted.job_id,
+            Duration::from_millis(100),
+        ))
+        .unwrap_err();
+    drop(held);
+    assert!(late.contains("has ended"), "{late}");
 }
 
 #[test]

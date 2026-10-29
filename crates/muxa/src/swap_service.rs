@@ -401,37 +401,17 @@ impl SwapService {
         )
     }
 
-    /// Wait for a job to end, up to `timeout`. A timeout is only the wait
-    /// giving up: the job runs on, and its status says where it is.
+    /// Wait for a job to end and read it, all within `timeout`. A timeout
+    /// only ends the wait: the job runs on, and its status says where it is.
     pub async fn wait(&self, job: &str, timeout: std::time::Duration) -> Result<JobView, String> {
-        if let Some(mut done) = self.inner.receiver(job) {
-            let ended = tokio::time::timeout(timeout, done.wait_for(|ended| *ended)).await;
-            if ended.is_err() {
-                return Err(format!(
-                    "job {job} is still running after {}s",
-                    timeout.as_secs()
-                ));
-            }
-        }
-        let inner = Arc::clone(&self.inner);
-        let job = JobRef::Id(job.to_owned());
-        tokio::task::spawn_blocking(move || inner.status(&job))
-            .await
-            .map_err(|error| error.to_string())?
+        Service::wait(Arc::clone(&self.inner), job, timeout).await
     }
 
-    /// Stop taking new jobs and wait, up to `timeout`, for running ones to
-    /// reach their end. Nothing running is interrupted.
+    /// Stop taking new jobs and wait, within `timeout`, for every submission
+    /// already past the gate and every running job to end. Nothing running
+    /// is interrupted. `false` if the deadline came first.
     pub async fn drain(&self, timeout: std::time::Duration) -> bool {
-        self.inner.draining.store(true, Ordering::SeqCst);
-        let waiting = self.inner.receivers();
-        tokio::time::timeout(timeout, async move {
-            for mut done in waiting {
-                let _ = done.wait_for(|ended| *ended).await;
-            }
-        })
-        .await
-        .is_ok()
+        Service::drain(Arc::clone(&self.inner), timeout).await
     }
 }
 
@@ -649,6 +629,61 @@ impl<E: Engine> Service<E> {
             .map_err(|error| format!("swap jobs are unavailable: {error}"))
     }
 
+    pub(crate) async fn wait(
+        this: Arc<Self>,
+        job: &str,
+        timeout: std::time::Duration,
+    ) -> Result<JobView, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let ended = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&ended);
+        let job_ref = JobRef::Id(job.to_owned());
+        let read = tokio::time::timeout_at(deadline, async move {
+            if let Some(mut done) = this.receiver(job) {
+                let _ = done.wait_for(|ended| *ended).await;
+            }
+            seen.store(true, Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || this.status(&job_ref))
+                .await
+                .map_err(|error| error.to_string())?
+        })
+        .await;
+        match read {
+            Ok(view) => view,
+            Err(_) if ended.load(Ordering::SeqCst) => Err(format!(
+                "job {job} has ended, but its status could not be read within {}s",
+                timeout.as_secs()
+            )),
+            Err(_) => Err(format!(
+                "job {job} is still running after {}s",
+                timeout.as_secs()
+            )),
+        }
+    }
+
+    pub(crate) async fn drain(this: Arc<Self>, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        this.draining.store(true, Ordering::SeqCst);
+        // A submission holds the submit lock from its gate to its worker's
+        // registration; taking the lock once means every one that passed the
+        // gate before the flag has registered or given up.
+        let gate = Arc::clone(&this);
+        let barrier = tokio::task::spawn_blocking(move || {
+            drop(gate.submit.lock());
+        });
+        if tokio::time::timeout_at(deadline, barrier).await.is_err() {
+            return false;
+        }
+        let waiting = this.receivers();
+        tokio::time::timeout_at(deadline, async move {
+            for mut done in waiting {
+                let _ = done.wait_for(|ended| *ended).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
     /// A watch on a running job's end; `None` once it has ended or was
     /// never run here.
     pub(crate) fn receiver(&self, job: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
@@ -720,6 +755,7 @@ impl<E: Engine> Service<E> {
         let snapshot = self.snapshot_for(overrides)?;
         let mut request = overrides.resolve(&snapshot.config)?;
         request.dry_run = true;
+        request.allow_direct_respawn = origin == Origin::Automation;
         let (resolved, steps) = self.engine.prepare(&request, &snapshot);
         // Plan-only whatever was asked: the dry run returns before any effect.
         let mut resolved = resolved;
@@ -773,7 +809,8 @@ impl<E: Engine> Service<E> {
             });
         }
         let snapshot = this.snapshot_for(overrides)?;
-        let request = overrides.resolve(&snapshot.config)?;
+        let mut request = overrides.resolve(&snapshot.config)?;
+        request.allow_direct_respawn = origin == Origin::Automation;
         let (resolved, steps) = this.engine.prepare(&request, &snapshot);
 
         let (settled, notes, runs, taken) = this.split(request_key, steps, origin);

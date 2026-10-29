@@ -819,6 +819,12 @@ impl SwapJobStore {
         })
     }
 
+    /// Hold the connection, so every other use of the store waits.
+    #[cfg(test)]
+    pub(crate) fn hold(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.connection.lock().unwrap()
+    }
+
     /// This manager still owns a store whose file is still its own.
     pub(crate) fn check(&self, lease: &Lease) -> Result<(), JobError> {
         self.with(|connection| {

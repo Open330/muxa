@@ -146,6 +146,11 @@ pub struct SwapRequest {
     pub dry_run: bool,
     /// Panes left alone whatever the scope: the caller's own, for one.
     pub exclude: Vec<String>,
+    /// Whether a pane that runs its agent directly may be respawned. The
+    /// daemon's own automation may, as it always has; a request routed
+    /// through the daemon from elsewhere may not, nor a pane whose layout
+    /// cannot be read.
+    pub allow_direct_respawn: bool,
 }
 
 impl SwapRequest {
@@ -162,6 +167,7 @@ impl SwapRequest {
             continue_when: config.continue_when,
             dry_run: false,
             exclude: Vec::new(),
+            allow_direct_respawn: true,
         }
     }
 
@@ -1126,13 +1132,38 @@ impl PreparedTarget {
                 planned.launch.line.account().map(str::to_owned)
             },
             assigned_account: self.account.clone().ok(),
-            direct: !shell_above(
+            direct: classify_direct(shell_above(
                 &pane_processes(planned.pane.pane_pid),
                 planned.launch.agent_pid,
                 planned.pane.pane_pid,
-            )
-            .unwrap_or(true),
+            )),
         }
+    }
+}
+
+/// Whether a pane counts as running its agent directly, given
+/// [`shell_above`]: a layout that cannot be read counts as direct, so a
+/// refusal of direct panes is never bypassed by a failed read.
+fn classify_direct(shell: Option<bool>) -> bool {
+    shell.is_none_or(|shell| !shell)
+}
+
+/// Whether to respawn the pane directly, read right before acting. A
+/// request that may not respawn is refused here, with nothing done yet, if
+/// the pane is direct now or its layout cannot be read — whatever it looked
+/// like when planned. One that may keeps today's reading.
+fn direct_now(shell: Option<bool>, allow_direct: bool) -> Result<bool, String> {
+    match (shell, allow_direct) {
+        (Some(shell), true) => Ok(!shell),
+        // A shell is there, or (for automation) the layout cannot be read
+        // and today's reading types into the pane.
+        (None, true) | (Some(true), false) => Ok(false),
+        (Some(false), false) => Err(
+            "this pane runs its agent directly; swaps through the daemon do not respawn such \
+             panes yet; left alone"
+                .into(),
+        ),
+        (None, false) => Err("cannot tell how this pane runs its agent; left alone".into()),
     }
 }
 
@@ -1480,16 +1511,25 @@ fn swap_one(
         outcome.note = note;
         return outcome;
     }
+    let direct = match direct_now(
+        shell_above(
+            &pane_processes(pane.pane_pid),
+            launch.agent_pid,
+            pane.pane_pid,
+        ),
+        request.allow_direct_respawn,
+    ) {
+        Ok(direct) => direct,
+        Err(note) => {
+            outcome.note = note;
+            return outcome;
+        }
+    };
     let target = Target {
         socket: target_socket(pane, agent),
         pane: pane.pane_id.clone(),
         pane_pid: std::cell::Cell::new(pane.pane_pid),
-        direct: !shell_above(
-            &pane_processes(pane.pane_pid),
-            launch.agent_pid,
-            pane.pane_pid,
-        )
-        .unwrap_or(true),
+        direct,
         cwd: agent
             .cwd
             .clone()
@@ -3853,6 +3893,22 @@ mod tests {
             endpoint_key("%1", Some("/tmp/tmux-1/work")),
             endpoint_key("%1", Some("default"))
         );
+    }
+
+    /// A pane whose layout cannot be read counts as direct for a refusal,
+    /// and a request that may not respawn is refused at execution if the
+    /// pane is direct then — or unreadable — whatever planning saw.
+    #[test]
+    fn an_unreadable_layout_never_passes_for_a_shell() {
+        assert!(classify_direct(None));
+        assert!(classify_direct(Some(false)));
+        assert!(!classify_direct(Some(true)));
+        assert_eq!(direct_now(Some(true), false), Ok(false));
+        assert!(direct_now(Some(false), false).is_err());
+        assert!(direct_now(None, false).is_err());
+        // Automation keeps today's reading.
+        assert_eq!(direct_now(Some(false), true), Ok(true));
+        assert_eq!(direct_now(None, true), Ok(false));
     }
 
     /// A bare `%7` that is both a tmux pane and `rmux:%7` is ambiguous; it
