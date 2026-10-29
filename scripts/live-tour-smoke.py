@@ -181,17 +181,41 @@ def title_text() -> str:
     return tmux("show", "-g", "status-format[2]").stdout
 
 
-def sandbox_env() -> dict[str, str]:
-    """The environment a pane inside the tour runs with. PATH keeps only the
-    sandbox prefix, so a lookup here proves what the *learner* would resolve."""
-    env = dict(os.environ)
+# The sandbox's exports, kept from the first time it answered. Once the tour
+# has ended (or failed) the sandbox is down and `env` prints nothing; without
+# these, a probe would inherit the caller's own MUXA_SOCKET/XDG_DATA_HOME and
+# read the operator's real daemon — a failure dump showing someone else's
+# mailbox as if it were the tour's.
+SANDBOX_EXPORTS: dict[str, str] = {}
+# Where a probe points when the sandbox never came up: nowhere, so it fails.
+SEALED = {
+    "MUXA_SOCKET": "/nonexistent/muxa-live-tour.sock",
+    "MUXA_CONFIG": "/nonexistent/muxa-live-tour.toml",
+    "XDG_DATA_HOME": "/nonexistent/muxa-live-tour-data",
+}
+
+
+def sandbox_exports() -> dict[str, str]:
+    exports = {}
     for line in subprocess.run(
         ["bash", "scripts/muxa-sandbox.sh", "env", "--name", SANDBOX],
         capture_output=True, text=True,
     ).stdout.splitlines():
         if line.startswith("export ") and "=" in line:
             key, _, value = line[len("export "):].partition("=")
-            env[key] = value.split(':"$PATH"')[0].strip("'")
+            exports[key] = value.split(':"$PATH"')[0].strip("'")
+    if "MUXA_SOCKET" in exports:
+        SANDBOX_EXPORTS.clear()
+        SANDBOX_EXPORTS.update(exports)
+    return dict(SANDBOX_EXPORTS) or dict(SEALED)
+
+
+def sandbox_env() -> dict[str, str]:
+    """The environment a pane inside the tour runs with. PATH keeps only the
+    sandbox prefix, so a lookup here proves what the *learner* would resolve.
+    It never falls back to the caller's own daemon."""
+    env = dict(os.environ)
+    env.update(sandbox_exports())
     env["TMUX"] = env.get("MUXA_SANDBOX_TMUX_ENV", "")
     env["TMUX_PANE"] = tmux("display-message", "-p", "#{pane_id}").stdout.strip()
     return env
