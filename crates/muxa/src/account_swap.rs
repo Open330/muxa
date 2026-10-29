@@ -1053,6 +1053,61 @@ pub(crate) struct PreparedTarget {
     profile_from: Option<String>,
 }
 
+/// Where a prepared target is and what it was found to be: the identity a
+/// swap job records before acting on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TargetIdentity {
+    pub(crate) pane: String,
+    pub(crate) socket: Option<String>,
+    /// The pane on its server, socket spellings normalized: two names for
+    /// one pane are one endpoint.
+    pub(crate) endpoint: String,
+    pub(crate) provider: String,
+    pub(crate) conversation_id: String,
+    pub(crate) session_id_source: SessionIdSource,
+    pub(crate) conversation_verified: bool,
+    pub(crate) process_pid: u32,
+    pub(crate) process_start: Option<String>,
+    pub(crate) from_account: Option<String>,
+    pub(crate) assigned_account: Option<String>,
+}
+
+/// The canonical endpoint of `pane` on `socket`.
+#[must_use]
+pub(crate) fn endpoint_key(pane: &str, socket: Option<&str>) -> String {
+    let server = socket.map_or_else(String::new, |socket| {
+        crate::backend::pane_endpoint_identity(Some(pane), socket)
+    });
+    format!("{pane}@{server}")
+}
+
+impl PreparedTarget {
+    pub(crate) fn identity(&self) -> TargetIdentity {
+        let planned = &self.planned;
+        let pane = planned.agent.pane.clone().unwrap_or_default();
+        let socket = planned.agent.tmux_socket.clone();
+        TargetIdentity {
+            endpoint: endpoint_key(&pane, socket.as_deref()),
+            pane,
+            socket,
+            provider: provider_name(planned.agent.kind)
+                .unwrap_or_default()
+                .to_owned(),
+            conversation_id: planned.session_id.clone(),
+            session_id_source: planned.source,
+            conversation_verified: planned.verified,
+            process_pid: planned.launch.agent_pid,
+            process_start: planned.process_start.clone(),
+            from_account: if self.profiles.is_some() {
+                self.profile_from.clone()
+            } else {
+                planned.launch.line.account().map(str::to_owned)
+            },
+            assigned_account: self.account.clone().ok(),
+        }
+    }
+}
+
 /// Plan a swap without touching anything: resolve the request, choose and
 /// locate the agents, settle which conversation each resumes and which
 /// account each moves to. Returns the request as resolved and the steps.

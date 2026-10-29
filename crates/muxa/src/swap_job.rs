@@ -160,6 +160,10 @@ pub(crate) struct Lease {
 /// what it was assigned. Fixed before the first effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PlannedTarget {
+    /// Where this target sits among everything the request reported.
+    pub(crate) report_index: usize,
+    /// The canonical endpoint (pane on its server).
+    pub(crate) endpoint: String,
     pub(crate) host: String,
     pub(crate) socket: Option<String>,
     pub(crate) pane: String,
@@ -170,7 +174,18 @@ pub(crate) struct PlannedTarget {
     pub(crate) process_pid: u32,
     pub(crate) process_start: Option<String>,
     pub(crate) from_account: Option<String>,
-    pub(crate) assigned_account: String,
+    pub(crate) assigned_account: Option<String>,
+}
+
+/// An entry settled while planning — skipped, refused, busy — recorded with
+/// the plan so the whole report survives a restart in its order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct SettledEntry {
+    pub(crate) report_index: usize,
+    pub(crate) pane: Option<String>,
+    pub(crate) agent_session_id: String,
+    pub(crate) disposition: Disposition,
+    pub(crate) reason: String,
 }
 
 /// The follow-up as stored: never the text itself.
@@ -195,7 +210,9 @@ pub(crate) struct AcceptedPlan {
     pub(crate) node_id: String,
     pub(crate) continue_when: String,
     pub(crate) continue_text: Option<TextRef>,
+    /// Targets to run, in run order; `target_id` is the index here.
     pub(crate) targets: Vec<PlannedTarget>,
+    pub(crate) settled: Vec<SettledEntry>,
 }
 
 /// A digest of the request exactly as the caller made it — its typed
@@ -299,6 +316,8 @@ pub(crate) enum Readiness {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct JobStatus {
     pub(crate) job_id: String,
+    pub(crate) node_id: String,
+    pub(crate) revision: u64,
     pub(crate) state: String,
     pub(crate) reason: Option<String>,
     pub(crate) targets: Vec<TargetStatus>,
@@ -753,14 +772,15 @@ impl SwapJobStore {
     /// A job and its targets, read back.
     pub(crate) fn status(&self, job: &str) -> Result<JobStatus, JobError> {
         self.with(|connection| {
-            let (state, reason): (String, Option<String>) = connection
-                .query_row(
-                    "SELECT state, reason FROM jobs WHERE job_id = ?1",
-                    [job],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
-                )
-                .optional()?
-                .ok_or_else(|| JobError::NotFound(job.to_owned()))?;
+            let (state, reason, node_id, revision): (String, Option<String>, String, u64) =
+                connection
+                    .query_row(
+                        "SELECT state, reason, node_id, revision FROM jobs WHERE job_id = ?1",
+                        [job],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                    )
+                    .optional()?
+                    .ok_or_else(|| JobError::NotFound(job.to_owned()))?;
             let mut statement = connection.prepare(
                 "SELECT t.target_id, t.attempt, t.phase, t.disposition, t.reason,
                         (SELECT COUNT(*) FROM effects e WHERE e.job_id = t.job_id
@@ -785,10 +805,21 @@ impl SwapJobStore {
                 .collect::<Result<_, _>>()?;
             Ok(JobStatus {
                 job_id: job.to_owned(),
+                node_id,
+                revision,
                 state,
                 reason,
                 targets,
             })
+        })
+    }
+
+    /// This manager still owns a store whose file is still its own.
+    pub(crate) fn check(&self, lease: &Lease) -> Result<(), JobError> {
+        self.with(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Deferred)?;
+            fence(&tx, lease)?;
+            Ok(())
         })
     }
 
@@ -807,6 +838,8 @@ impl SwapJobStore {
             target,
             attempt,
             pending: None,
+            failed: false,
+            effects: 0,
         }
     }
 
@@ -844,6 +877,27 @@ pub(crate) struct Journal<'a> {
     attempt: u32,
     /// The intent written by the last `before`, awaiting its `after`.
     pending: Option<Pending>,
+    /// A write to the store failed: the job cannot go on.
+    failed: bool,
+    /// Intents written through this journal.
+    effects: u32,
+}
+
+impl Journal<'_> {
+    /// An effect was started whose result is not recorded.
+    pub(crate) fn uncertain(&self) -> bool {
+        self.pending.is_some()
+    }
+
+    /// The store refused a write at some point.
+    pub(crate) fn failed(&self) -> bool {
+        self.failed
+    }
+
+    /// How many effects were started through this journal.
+    pub(crate) fn effects(&self) -> u32 {
+        self.effects
+    }
 }
 
 /// An intent awaiting its result: which row, and which effect it was for.
@@ -861,50 +915,52 @@ impl EffectObserver for Journal<'_> {
             ));
         }
         let nonce = uuid::Uuid::new_v4().to_string();
-        let seq = self
-            .store
-            .with(|connection| {
-                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                fence(&tx, self.lease)?;
-                owned_running(&tx, self.lease, &self.job)?;
-                open_attempt(&tx, &self.job, self.target, self.attempt)?;
-                // Held in the file, not in this adapter: another journal for
-                // the same attempt, or one made after a restart, sees it too.
-                if open_intents(&tx, &self.job, self.target, self.attempt)? > 0 {
-                    return Err(JobError::Invalid {
-                        job: self.job.clone(),
-                        why: format!(
-                            "target {} has an effect with no recorded result",
-                            self.target
-                        ),
-                    });
-                }
-                let seq: u32 = tx.query_row(
-                    "SELECT COALESCE(MAX(seq), 0) + 1 FROM effects
+        let written = self.store.with(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            fence(&tx, self.lease)?;
+            owned_running(&tx, self.lease, &self.job)?;
+            open_attempt(&tx, &self.job, self.target, self.attempt)?;
+            // Held in the file, not in this adapter: another journal for
+            // the same attempt, or one made after a restart, sees it too.
+            if open_intents(&tx, &self.job, self.target, self.attempt)? > 0 {
+                return Err(JobError::Invalid {
+                    job: self.job.clone(),
+                    why: format!(
+                        "target {} has an effect with no recorded result",
+                        self.target
+                    ),
+                });
+            }
+            let seq: u32 = tx.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM effects
                      WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3",
-                    params![self.job, self.target, self.attempt],
-                    |row| row.get(0),
-                )?;
-                tx.execute(
-                    "INSERT INTO effects (job_id, target_id, attempt, seq, nonce, grp, purpose,
+                params![self.job, self.target, self.attempt],
+                |row| row.get(0),
+            )?;
+            tx.execute(
+                "INSERT INTO effects (job_id, target_id, attempt, seq, nonce, grp, purpose,
                                           op_json, state, intent_at)
                      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'intent', ?9)",
-                    params![
-                        self.job,
-                        self.target,
-                        self.attempt,
-                        seq,
-                        nonce,
-                        effect.group,
-                        purpose_name(effect.purpose),
-                        op_json(&effect.op),
-                        now()
-                    ],
-                )?;
-                tx.commit()?;
-                Ok(seq)
-            })
-            .map_err(|error| ObserverError(error.to_string()))?;
+                params![
+                    self.job,
+                    self.target,
+                    self.attempt,
+                    seq,
+                    nonce,
+                    effect.group,
+                    purpose_name(effect.purpose),
+                    op_json(&effect.op),
+                    now()
+                ],
+            )?;
+            tx.commit()?;
+            Ok(seq)
+        });
+        let seq = written.map_err(|error| {
+            self.failed = true;
+            ObserverError(error.to_string())
+        })?;
+        self.effects += 1;
         self.pending = Some(Pending {
             seq,
             nonce,
@@ -934,34 +990,36 @@ impl EffectObserver for Journal<'_> {
             Transport::Unconfirmed => "unconfirmed",
         };
         let (seq, nonce) = (pending.seq, pending.nonce.clone());
-        self.store
-            .with(|connection| {
-                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-                fence(&tx, self.lease)?;
-                let changed = tx.execute(
-                    "UPDATE effects SET state = ?6, result_at = ?7
+        let settled = self.store.with(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            fence(&tx, self.lease)?;
+            let changed = tx.execute(
+                "UPDATE effects SET state = ?6, result_at = ?7
                      WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND seq = ?4
                        AND nonce = ?5 AND state = 'intent'",
-                    params![
-                        self.job,
-                        self.target,
-                        self.attempt,
-                        seq,
-                        nonce,
-                        state,
-                        now()
-                    ],
-                )?;
-                if changed != 1 {
-                    return Err(JobError::Invalid {
-                        job: self.job.clone(),
-                        why: format!("effect {seq} has no open intent"),
-                    });
-                }
-                tx.commit()?;
-                Ok(())
-            })
-            .map_err(|error| ObserverError(error.to_string()))?;
+                params![
+                    self.job,
+                    self.target,
+                    self.attempt,
+                    seq,
+                    nonce,
+                    state,
+                    now()
+                ],
+            )?;
+            if changed != 1 {
+                return Err(JobError::Invalid {
+                    job: self.job.clone(),
+                    why: format!("effect {seq} has no open intent"),
+                });
+            }
+            tx.commit()?;
+            Ok(())
+        });
+        settled.map_err(|error| {
+            self.failed = true;
+            ObserverError(error.to_string())
+        })?;
         self.pending = None;
         Ok(())
     }

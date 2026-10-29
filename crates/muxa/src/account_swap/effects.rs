@@ -118,7 +118,7 @@ pub(crate) trait EffectObserver {
 }
 
 /// Records nothing.
-pub(super) struct NoObserver;
+pub(crate) struct NoObserver;
 
 impl EffectObserver for NoObserver {
     fn before(&mut self, _: &Effect) -> Result<(), ObserverError> {
