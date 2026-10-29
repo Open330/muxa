@@ -13,7 +13,7 @@
 //! that signals processes and types into panes. `muxa swap` and the
 //! `swap_account` automation action both go through [`run`].
 
-mod effects;
+pub(crate) mod effects;
 #[cfg(test)]
 mod executor_tests;
 mod io;

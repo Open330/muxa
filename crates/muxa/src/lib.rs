@@ -89,6 +89,7 @@ pub mod shell;
 pub mod sinks;
 pub mod snapshot;
 pub mod state;
+pub(crate) mod swap_job;
 pub mod timeline;
 pub mod tmux;
 pub mod topology;
