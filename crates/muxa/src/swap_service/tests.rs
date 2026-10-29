@@ -613,8 +613,24 @@ fn one_live_manager_holds_the_store_until_it_is_gone() {
         .contains("another live manager"));
     assert!(first.active().is_ok());
     drop(first);
-    let second = SwapService::open(Some(&path), provider()).unwrap();
+    let second = open_when_free(&path, provider);
     assert!(second.active().is_ok());
+}
+
+/// Open the store once its lock is free. A process another test forks at
+/// the wrong moment holds an inherited copy of the lock until it execs, so
+/// release can lag a drop by a moment.
+fn open_when_free(path: &Path, provider: impl Fn() -> Arc<dyn ContextProvider>) -> SwapService {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match SwapService::open(Some(path), provider()) {
+            Ok(service) => return service,
+            Err(error) if Instant::now() < deadline && error.contains("another live manager") => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
 }
 
 /// A planning note can quote an external tool; only a code goes to disk.
@@ -808,7 +824,7 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
     drop(first);
     assert!(SwapService::open(Some(&path), provider()).is_err());
     drop(worker);
-    drop(SwapService::open(Some(&path), provider()).unwrap());
+    drop(open_when_free(&path, provider));
 
     // A job held mid-target keeps it too, until it finishes.
     let gate = Arc::new(Gate::default());

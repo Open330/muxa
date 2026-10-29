@@ -236,6 +236,21 @@ enum RequestBody {
     /// Run one allowlisted `muxa work options|preset|pipeline|route …` argv
     /// on the local host or a Fleet host and return its exit code and
     /// streams. Bounded to 30 s and 1 MiB of output.
+    /// `swap_jobs_v1`: accept a swap as a daemon-owned job, or return the
+    /// job its request key already made.
+    SwapJobStart {
+        request_key: String,
+        overrides: crate::swap_service::SwapOverrides,
+    },
+    /// `swap_jobs_v1`: a job by id or request key, readable even while the
+    /// service is halted.
+    SwapJobStatus {
+        job: crate::swap_service::JobRef,
+    },
+    /// `swap_plan_v1`: what a start would do, doing none of it.
+    SwapPlan {
+        overrides: crate::swap_service::SwapOverrides,
+    },
     WorkCommand {
         #[serde(default)]
         host: Option<String>,
@@ -1159,6 +1174,9 @@ pub struct Response {
     pub work_operation: Option<WorkUpOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_command: Option<WorkCommandOutput>,
+    /// `swap_jobs_v1` / `swap_plan_v1`: the job, accepted job or plan.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap: Option<serde_json::Value>,
     /// `agent_start_v1`: the started agent's surface. WS-B: new agent.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_start: Option<crate::agent_control::AgentStartResult>,
@@ -1254,6 +1272,7 @@ impl Response {
             pipeline_claims: None,
             work_operation: None,
             work_command: None,
+            swap: None,
             agent_start: None,
             mux_snapshot: None,
             mux_snapshot_operation: None,
@@ -1305,6 +1324,11 @@ impl Response {
     fn with_work_operation(operation: WorkUpOperation) -> Self {
         let mut response = Self::ok();
         response.work_operation = Some(operation);
+        response
+    }
+    fn with_swap(value: serde_json::Value) -> Self {
+        let mut response = Self::ok();
+        response.swap = Some(value);
         response
     }
     fn with_work_command(output: WorkCommandOutput) -> Self {
@@ -1951,6 +1975,9 @@ pub struct Server {
     /// The daemon's `config.toml`, for the requests that read and replace it
     /// whole. `None` when muxad was started without one.
     config_path: Option<PathBuf>,
+    /// Daemon-owned swap jobs; `None` when the daemon could not take its
+    /// job store, in which case every swap request is refused.
+    swap: Option<Arc<dyn crate::swap_service::SwapJobs>>,
     handler_limit: usize,
     endpoint_check: Duration,
 }
@@ -1980,6 +2007,7 @@ impl Server {
             work_up,
             mux_snapshots,
             config_path: None,
+            swap: None,
             handler_limit: MAX_INFLIGHT_HANDLERS,
             endpoint_check: ENDPOINT_CHECK_INTERVAL,
         }
@@ -2008,6 +2036,13 @@ impl Server {
         if !backends.is_empty() {
             self.backends = backends;
         }
+        self
+    }
+
+    /// Serve swap jobs from `swap`.
+    #[must_use]
+    pub fn with_swap(mut self, swap: Option<Arc<dyn crate::swap_service::SwapJobs>>) -> Self {
+        self.swap = swap;
         self
     }
 
@@ -2231,6 +2266,7 @@ impl Server {
                     let work_up = self.work_up.clone();
                     let mux_snapshots = self.mux_snapshots.clone();
                     let config_path = self.config_path.clone();
+                    let swap = self.swap.clone();
                     let stopping = stopping_rx.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
@@ -2253,6 +2289,7 @@ impl Server {
                                 work_up,
                                 mux_snapshots,
                                 config_path,
+                                swap,
                                 stopping,
                             ))
                             .await
@@ -3539,6 +3576,54 @@ fn orchestration_config_response(
     }
 }
 
+/// A swap request returns once its job is accepted, not when it ends; the
+/// bound covers planning (process scans, `aas candidates`).
+const SWAP_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// `swap_jobs_v1`: `swap_job_start` and `swap_job_status`, exactly.
+pub const SWAP_JOBS_CAPABILITY: &str = "swap_jobs_v1";
+/// `swap_plan_v1`: `swap_plan`.
+pub const SWAP_PLAN_CAPABILITY: &str = "swap_plan_v1";
+
+/// How long `hello` waits to learn whether swap jobs can be taken.
+const SWAP_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Whether the swap service would take a job now. Its check reads the job
+/// store, so it runs off the reactor, and a slow answer counts as no.
+async fn swap_healthy(swap: Option<&Arc<dyn crate::swap_service::SwapJobs>>) -> bool {
+    let Some(swap) = swap.cloned() else {
+        return false;
+    };
+    let check = tokio::task::spawn_blocking(move || swap.active().is_ok());
+    matches!(
+        tokio::time::timeout(SWAP_HEALTH_TIMEOUT, check).await,
+        Ok(Ok(true))
+    )
+}
+
+/// Run a swap request against the service off the reactor. No service is a
+/// refusal: there is no other path a swap could take.
+async fn swap_call(
+    swap: Option<&Arc<dyn crate::swap_service::SwapJobs>>,
+    call: impl FnOnce(&dyn crate::swap_service::SwapJobs) -> Result<serde_json::Value, String>
+        + Send
+        + 'static,
+) -> Response {
+    let Some(swap) = swap.cloned() else {
+        return Response::err("swap jobs are unavailable on this daemon".to_owned());
+    };
+    match tokio::task::spawn_blocking(move || call(swap.as_ref())).await {
+        Ok(Ok(value)) => Response::with_swap(value),
+        Ok(Err(error)) => Response::err(error),
+        Err(error) => Response::err(format!("swap request failed: {error}")),
+    }
+}
+
+fn to_swap_value(value: &impl serde::Serialize) -> Result<serde_json::Value, String> {
+    serde_json::to_value(value).map_err(|error| error.to_string())
+}
+
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
 #[tracing::instrument(
     level = "debug",
     skip(
@@ -3556,10 +3641,10 @@ fn orchestration_config_response(
         fleet,
         pipeline_runs,
         work_up,
-        mux_snapshots
+        mux_snapshots,
+        swap
     )
 )]
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // IPC dispatch table and its shared daemon state
 async fn handle(
     stream: Stream,
     store: SharedStore,
@@ -3577,6 +3662,7 @@ async fn handle(
     work_up: Arc<WorkUpManager>,
     mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     config_path: Option<PathBuf>,
+    swap: Option<Arc<dyn crate::swap_service::SwapJobs>>,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);
@@ -3755,6 +3841,14 @@ async fn handle(
                         r.collaboration_error =
                             collaboration.initialization_error().map(str::to_owned);
                         r.protocol = requested;
+                        // Only a service that would take a job now is
+                        // advertised; status stays served regardless.
+                        if swap_healthy(swap.as_ref()).await {
+                            if let Some(capabilities) = r.capabilities.as_mut() {
+                                capabilities.push(SWAP_JOBS_CAPABILITY);
+                                capabilities.push(SWAP_PLAN_CAPABILITY);
+                            }
+                        }
                         r
                     } else {
                         Response::err(format!(
@@ -3922,6 +4016,31 @@ async fn handle(
                             Response::err(format!("Work operation {operation_id:?} was not found"))
                         }
                     }
+                }
+                RequestBody::SwapJobStart {
+                    request_key,
+                    overrides,
+                } => {
+                    kind = "swap_job_start";
+                    swap_call(swap.as_ref(), move |swap| {
+                        swap.submit(&request_key, &overrides)
+                            .and_then(|accepted| to_swap_value(&accepted))
+                    })
+                    .await
+                }
+                RequestBody::SwapJobStatus { job } => {
+                    kind = "swap_job_status";
+                    swap_call(swap.as_ref(), move |swap| {
+                        swap.status(&job).and_then(|view| to_swap_value(&view))
+                    })
+                    .await
+                }
+                RequestBody::SwapPlan { overrides } => {
+                    kind = "swap_plan";
+                    swap_call(swap.as_ref(), move |swap| {
+                        swap.plan(&overrides).and_then(|plan| to_swap_value(&plan))
+                    })
+                    .await
                 }
                 RequestBody::WorkCommand { host, args, stdin } => {
                     kind = "work_command";
@@ -6869,6 +6988,64 @@ impl Client {
             )));
         }
         serde_json::from_value(response["work_command"].clone()).map_err(RuntimeError::Json)
+    }
+
+    /// `swap_jobs_v1`: accept a swap under `request_key`, or get the job it
+    /// already made.
+    pub async fn swap_job_start(
+        &self,
+        request_key: &str,
+        overrides: &crate::swap_service::SwapOverrides,
+    ) -> Result<crate::swap_service::Accepted, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "swap_job_start",
+            "request_key": request_key,
+            "overrides": overrides,
+        });
+        self.swap_request(&req).await
+    }
+
+    /// `swap_jobs_v1`: a job by id or request key.
+    pub async fn swap_job_status(
+        &self,
+        job: &crate::swap_service::JobRef,
+    ) -> Result<crate::swap_service::JobView, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "swap_job_status",
+            "job": job,
+        });
+        self.swap_request(&req).await
+    }
+
+    /// `swap_plan_v1`: what a start would do.
+    pub async fn swap_plan(
+        &self,
+        overrides: &crate::swap_service::SwapOverrides,
+    ) -> Result<crate::swap_service::PlanView, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "swap_plan",
+            "overrides": overrides,
+        });
+        self.swap_request(&req).await
+    }
+
+    async fn swap_request<T: serde::de::DeserializeOwned>(
+        &self,
+        req: &serde_json::Value,
+    ) -> Result<T, RuntimeError> {
+        let response = self.call_with_timeout(req, SWAP_CLIENT_TIMEOUT).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(RuntimeError::Json(serde::de::Error::custom(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("swap request failed")
+                    .to_string(),
+            )));
+        }
+        serde_json::from_value(response["swap"].clone()).map_err(RuntimeError::Json)
     }
 
     // WS-B: new agent
@@ -11730,6 +11907,7 @@ mod tests {
                 "/tmp/muxa-disconnect-test.sock",
             )),
             None,
+            None,
             stopping_rx,
         ));
 
@@ -12541,6 +12719,228 @@ mod tests {
         assert!(!caps.contains(&STOP_CAPABILITY));
         assert!(resp["generation"].is_null());
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A stand-in swap service: answers from memory, and records which
+    /// thread each call ran on.
+    struct FakeSwap {
+        healthy: std::sync::atomic::AtomicBool,
+        slow_health: bool,
+        jobs: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    impl FakeSwap {
+        fn new(healthy: bool) -> Arc<Self> {
+            Arc::new(Self {
+                healthy: std::sync::atomic::AtomicBool::new(healthy),
+                slow_health: false,
+                jobs: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        fn view(job: &str) -> crate::swap_service::JobView {
+            crate::swap_service::JobView {
+                job_id: job.to_owned(),
+                node_id: "node".into(),
+                state: "running".into(),
+                revision: 1,
+                reason: None,
+                entries: Vec::new(),
+                fault: None,
+            }
+        }
+
+        /// Fails if called on a runtime worker: blocking here would.
+        fn on_blocking_thread() {
+            tokio::runtime::Handle::current().block_on(async {});
+        }
+    }
+
+    impl crate::swap_service::SwapJobs for FakeSwap {
+        fn active(&self) -> Result<(), String> {
+            if self.slow_health {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            if self.healthy.load(std::sync::atomic::Ordering::SeqCst) {
+                Ok(())
+            } else {
+                Err("swap jobs are halted".into())
+            }
+        }
+
+        fn plan(
+            &self,
+            _: &crate::swap_service::SwapOverrides,
+        ) -> Result<crate::swap_service::PlanView, String> {
+            Self::on_blocking_thread();
+            Ok(crate::swap_service::PlanView {
+                outcomes: Vec::new(),
+                executable: self.active().is_ok(),
+                unavailable: self.active().err(),
+            })
+        }
+
+        fn submit(
+            &self,
+            key: &str,
+            _: &crate::swap_service::SwapOverrides,
+        ) -> Result<crate::swap_service::Accepted, String> {
+            Self::on_blocking_thread();
+            self.active()?;
+            let mut jobs = self.jobs.lock().unwrap();
+            if let Some((_, job)) = jobs.iter().find(|(k, _)| k == key) {
+                return Ok(crate::swap_service::Accepted {
+                    job_id: job.clone(),
+                    existing: true,
+                    view: Self::view(job),
+                });
+            }
+            let job = format!("swap-{}", jobs.len());
+            jobs.push((key.to_owned(), job.clone()));
+            Ok(crate::swap_service::Accepted {
+                job_id: job.clone(),
+                existing: false,
+                view: Self::view(&job),
+            })
+        }
+
+        fn status(
+            &self,
+            job: &crate::swap_service::JobRef,
+        ) -> Result<crate::swap_service::JobView, String> {
+            Self::on_blocking_thread();
+            let jobs = self.jobs.lock().unwrap();
+            let found = jobs.iter().find(|(key, id)| match job {
+                crate::swap_service::JobRef::Id(wanted) => id == wanted,
+                crate::swap_service::JobRef::Key(wanted) => key == wanted,
+            });
+            found
+                .map(|(_, id)| Self::view(id))
+                .ok_or_else(|| "swap job not found".into())
+        }
+    }
+
+    async fn swap_server(
+        swap: Option<Arc<dyn crate::swap_service::SwapJobs>>,
+    ) -> (
+        tempfile::TempDir,
+        Client,
+        broadcast::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("muxa-swap.sock");
+        let server = Server::new(sock.clone(), Store::shared()).with_swap(swap);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        (dir, Client::new(sock), tx, handle)
+    }
+
+    fn advertises_swap(hello: &Hello) -> bool {
+        hello.capabilities.iter().any(|c| c == SWAP_JOBS_CAPABILITY)
+            && hello.capabilities.iter().any(|c| c == SWAP_PLAN_CAPABILITY)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swap_requests_go_to_the_service_off_the_reactor() {
+        let swap = FakeSwap::new(true);
+        let (_dir, client, tx, handle) = swap_server(Some(
+            Arc::clone(&swap) as Arc<dyn crate::swap_service::SwapJobs>
+        ))
+        .await;
+        assert!(advertises_swap(
+            &client.hello(Duration::from_secs(2)).await.unwrap()
+        ));
+
+        let overrides = crate::swap_service::SwapOverrides::default();
+        let first = client.swap_job_start("key-1", &overrides).await.unwrap();
+        assert!(!first.existing);
+        // A lost acknowledgement: the same key again, or a status by key,
+        // finds the same job.
+        let again = client.swap_job_start("key-1", &overrides).await.unwrap();
+        assert_eq!(
+            (again.job_id.as_str(), again.existing),
+            (first.job_id.as_str(), true)
+        );
+        let by_key = client
+            .swap_job_status(&crate::swap_service::JobRef::Key("key-1".into()))
+            .await
+            .unwrap();
+        assert_eq!(by_key.job_id, first.job_id);
+        assert!(client.swap_plan(&overrides).await.unwrap().executable);
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A halted service is not advertised and takes no job, yet its jobs
+    /// stay readable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_halted_swap_service_still_answers_status() {
+        let swap = FakeSwap::new(true);
+        let (_dir, client, tx, handle) = swap_server(Some(
+            Arc::clone(&swap) as Arc<dyn crate::swap_service::SwapJobs>
+        ))
+        .await;
+        let overrides = crate::swap_service::SwapOverrides::default();
+        let accepted = client.swap_job_start("key", &overrides).await.unwrap();
+        swap.healthy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+
+        assert!(!advertises_swap(
+            &client.hello(Duration::from_secs(2)).await.unwrap()
+        ));
+        assert!(client.swap_job_start("next", &overrides).await.is_err());
+        let status = client
+            .swap_job_status(&crate::swap_service::JobRef::Id(accepted.job_id.clone()))
+            .await
+            .unwrap();
+        assert_eq!(status.job_id, accepted.job_id);
+        let plan = client.swap_plan(&overrides).await.unwrap();
+        assert!(!plan.executable);
+        assert!(plan.unavailable.is_some());
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// No service: nothing advertised, every swap request refused — no
+    /// other path is taken.
+    #[tokio::test]
+    async fn without_a_swap_service_every_swap_request_is_refused() {
+        let (_dir, client, tx, handle) = swap_server(None).await;
+        assert!(!advertises_swap(
+            &client.hello(Duration::from_secs(2)).await.unwrap()
+        ));
+        let overrides = crate::swap_service::SwapOverrides::default();
+        let refused = client.swap_job_start("key", &overrides).await.unwrap_err();
+        assert!(refused.to_string().contains("unavailable"), "{refused}");
+        assert!(client
+            .swap_job_status(&crate::swap_service::JobRef::Key("key".into()))
+            .await
+            .is_err());
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// A health check that cannot answer in time is not advertised, and
+    /// `hello` does not wait for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_slow_swap_health_check_is_not_advertised() {
+        let swap = Arc::new(FakeSwap {
+            healthy: std::sync::atomic::AtomicBool::new(true),
+            slow_health: true,
+            jobs: std::sync::Mutex::new(Vec::new()),
+        });
+        let (_dir, client, tx, handle) =
+            swap_server(Some(swap as Arc<dyn crate::swap_service::SwapJobs>)).await;
+        let started = std::time::Instant::now();
+        let hello = client.hello(Duration::from_secs(5)).await.unwrap();
+        assert!(!advertises_swap(&hello));
+        assert!(started.elapsed() < Duration::from_millis(1500));
         tx.send(()).unwrap();
         handle.await.unwrap();
     }
