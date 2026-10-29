@@ -47,7 +47,21 @@ pub(crate) fn is_unplaced_codex(agent: &Agent) -> bool {
         && agent.pane.is_none()
         && agent.surface.is_none()
         && agent.pid.is_none()
+        && agent.ask_origin.is_none()
         && !agent.session_id.starts_with("synthetic-")
+}
+
+pub(crate) fn is_prompt_binding_candidate(agent: &Agent) -> bool {
+    is_unplaced_codex(agent)
+        || (agent.kind == AgentKind::Codex
+            && agent.state != crate::AgentState::Stopped
+            && agent.pane.is_none()
+            && agent.surface.is_none()
+            && agent.pid.is_none()
+            && agent
+                .ask_origin
+                .as_ref()
+                .is_some_and(|o| o.awaiting_interactive_binding))
 }
 
 /// Run every binding strategy once over `panes` (listed from `backends` when
@@ -98,26 +112,43 @@ async fn prompt_pass(
     contested: Vec<PaneInfo>,
 ) -> usize {
     let capturers = backends.to_vec();
-    let screens = tokio::task::spawn_blocking(move || {
-        contested
-            .into_iter()
-            .filter_map(|pane| {
-                let host = crate::backend::pane_id_host_kind(&pane.pane_id)?;
-                let backend = capturers.iter().find(|b| b.kind() == host)?;
-                // Scrollback too: by a thread's first collaboration call its
-                // prompt has often scrolled off the visible screen.
-                let text = backend.capture_pane_history_on(
-                    pane.socket.as_deref(),
-                    &pane.pane_id,
-                    SCREEN_HISTORY_LINES,
-                )?;
-                Some((pane, text))
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .unwrap_or_default();
+    let screens =
+        tokio::task::spawn_blocking(move || capture_prompt_screens(&capturers, contested))
+            .await
+            .unwrap_or_default();
     store.correlate_paneless_codex_by_prompt(&screens).await
+}
+
+fn capture_prompt_screens(
+    capturers: &[SharedBackend],
+    contested: Vec<PaneInfo>,
+) -> Vec<(PaneInfo, String)> {
+    contested
+        .into_iter()
+        .filter_map(|pane| {
+            let host = crate::backend::pane_id_host_kind(&pane.pane_id)?;
+            let backend = capturers.iter().find(|b| b.kind() == host)?;
+            // rmux repeats bare pane targets across grouped views. Pin
+            // the canonical session/window as well as the server socket.
+            let target = if host == crate::HostKind::Rmux {
+                crate::backend::rmux::qualified_pane_target(
+                    &pane.session_id,
+                    &pane.window_id,
+                    &pane.pane_id,
+                )?
+            } else {
+                pane.pane_id.clone()
+            };
+            // Scrollback too: by a thread's first collaboration call its
+            // prompt has often scrolled off the visible screen.
+            let text = backend.capture_pane_history_on(
+                pane.socket.as_deref(),
+                &target,
+                SCREEN_HISTORY_LINES,
+            )?;
+            Some((pane, text))
+        })
+        .collect()
 }
 
 /// Coalesces hook-triggered binding passes: a burst of hooks runs one pass,
@@ -241,6 +272,56 @@ mod tests {
         .unwrap();
         pane.current_path = cwd.into();
         pane
+    }
+
+    #[test]
+    fn prompt_capture_pins_grouped_rmux_identity_before_binding() {
+        struct Grouped;
+        impl crate::PaneBackend for Grouped {
+            fn kind(&self) -> crate::HostKind {
+                crate::HostKind::Rmux
+            }
+            fn list_panes(&self) -> Vec<PaneInfo> {
+                panic!("inventory already supplied")
+            }
+            fn resolve_pane(&self, _: &str) -> Option<PaneInfo> {
+                None
+            }
+            fn capture_pane(&self, _: &str) -> Option<String> {
+                None
+            }
+            fn pane_pid_map(&self) -> HashMap<u32, String> {
+                HashMap::new()
+            }
+            fn current_pane(&self) -> Option<String> {
+                None
+            }
+            fn focus_pane(&self, _: &str) -> bool {
+                false
+            }
+            fn capture_pane_history_on(
+                &self,
+                socket: Option<&str>,
+                target: &str,
+                _: usize,
+            ) -> Option<String> {
+                // A bare %2 is ambiguous across the two grouped views.
+                (socket == Some("default") && target == "$1:@9.%2")
+                    .then(|| "Review the uniquely identified new pane now".into())
+            }
+        }
+        let mut host = pane("rmux:%2", "/repo");
+        host.session_id = "$1".into();
+        host.window_id = "@9".into();
+        let screens = capture_prompt_screens(&[std::sync::Arc::new(Grouped)], vec![host]);
+        let rows = vec![(
+            "new-thread".into(),
+            "/repo".into(),
+            prompt_needle("Review the uniquely identified new pane now").unwrap(),
+        )];
+        let pairs = prompt_pairs(&rows, &screens);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(pairs[0].1.pane_id, "rmux:%2");
     }
 
     #[test]

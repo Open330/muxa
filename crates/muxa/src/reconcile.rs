@@ -167,6 +167,7 @@ pub struct Reconciler<L: LivenessSource> {
     /// has to stay unanswered for the whole inactivity window — one timed-out
     /// `tmux list-panes` under load must not stop every long-idle tmux agent.
     last_protected: std::sync::Mutex<HashMap<HostKind, Instant>>,
+    agent_directory: Option<Arc<crate::agent_directory::AgentDirectory>>,
 }
 
 impl<L: LivenessSource> Reconciler<L> {
@@ -194,6 +195,7 @@ impl<L: LivenessSource> Reconciler<L> {
             sources: sources.into_iter().map(Arc::new).collect(),
             interval,
             metrics: None,
+            agent_directory: None,
             stuck_working_timeout: Duration::ZERO,
             stuck_waiting_timeout: Duration::ZERO,
             paneless_stale_timeout: Duration::ZERO,
@@ -208,6 +210,15 @@ impl<L: LivenessSource> Reconciler<L> {
                     .collect(),
             ),
         }
+    }
+
+    #[must_use]
+    pub fn with_agent_directory(
+        mut self,
+        directory: Arc<crate::agent_directory::AgentDirectory>,
+    ) -> Self {
+        self.agent_directory = Some(directory);
+        self
     }
 
     /// Attach a runtime [`Metrics`] handle so the reconciler bumps
@@ -542,6 +553,7 @@ impl<L: LivenessSource> Reconciler<L> {
         // must not serialize behind the tmux scan (and vice versa), keeping the
         // tick budget flat as backends are added.
         let list_started = Instant::now();
+        let inventory_observed_at = time::OffsetDateTime::now_utc();
         let handles: Vec<(HostKind, tokio::task::JoinHandle<PaneObservation>)> = self
             .sources
             .iter()
@@ -818,6 +830,9 @@ impl<L: LivenessSource> Reconciler<L> {
                 workload_changed,
                 "reconciler.tick",
             );
+        }
+        if let Some(directory) = &self.agent_directory {
+            directory.publish(observations, list_started, inventory_observed_at);
         }
         report
     }
@@ -1535,6 +1550,7 @@ mod tests {
         let t0 = datetime!(2026-04-24 12:00:00 UTC);
 
         let mk = |sid: &str, state: AgentState| Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: AgentKind::ClaudeCode,

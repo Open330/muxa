@@ -5,6 +5,7 @@
 //! pane never inherits stale work.
 
 mod contract;
+pub mod instruction;
 pub(crate) use contract::deserialize_report_input;
 pub use contract::{
     task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,
@@ -349,6 +350,8 @@ pub struct CollaborationOrigin {
 /// The daemon honours [`CollaborationOrigin::exact_session`] and resolves
 /// `session:<agent session id>` targets.
 pub const EXACT_SESSION_CAPABILITY: &str = "collaboration_exact_session_v1";
+/// The daemon atomically claims at most the requested inbox batch size.
+pub const INBOX_LIMIT_CAPABILITY: &str = "collaboration_inbox_limit_v1";
 
 /// Local IPC surface that initiated a collaboration call. This describes the
 /// transport actor, not the agent session represented by `from`.
@@ -3099,7 +3102,6 @@ impl CollaborationStore {
         validate_air_artifact_references(&input.air_artifacts)?;
         reject_blank_withdrawals(&input.withdraw_reply_wakes)?;
         let _transaction = self.transaction_lock.lock().await;
-        let previous = self.requests.read().await.clone();
         let now = OffsetDateTime::now_utc();
         let id = dispatch_request_id(&input, now)?;
         if let Some(existing) = self.requests.read().await.get(&id) {
@@ -3220,10 +3222,16 @@ impl CollaborationStore {
             reply_wake: None,
             reply: None,
         };
+        let mut stage_ids = request
+            .withdrew_reply_wakes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        stage_ids.extend(request.supersedes_request_id.as_deref());
+        let mut staged = self.stage_request_rows(&stage_ids).await;
         let changed = {
-            let mut requests = self.requests.write().await;
-            let mut changed =
-                withdraw_reply_wakes_in(&mut requests, &request.withdrew_reply_wakes, now);
+            let requests = &mut staged;
+            let mut changed = withdraw_reply_wakes_in(requests, &request.withdrew_reply_wakes, now);
             if let Some(old_id) = &request.supersedes_request_id {
                 // Supersession changes result relevance, never execution authority.
                 // Only read-only requests can reach this path; preserve late replies.
@@ -3270,10 +3278,7 @@ impl CollaborationStore {
             changed.push(request.clone());
             changed
         };
-        if let Err(error) = self.persist_requests(&changed) {
-            *self.requests.write().await = previous;
-            return Err(error);
-        }
+        self.commit_request_rows(&changed).await?;
         self.publish_change();
         Ok(request)
     }
@@ -3328,10 +3333,11 @@ impl CollaborationStore {
         }
         let _transaction = self.transaction_lock.lock().await;
         self.validate_reply_wake_withdrawals(caller, &ids).await?;
-        let previous = self.requests.read().await.clone();
+        let stage_ids = ids.iter().map(String::as_str).collect::<Vec<_>>();
+        let mut staged = self.stage_request_rows(&stage_ids).await;
         let (changed, result) = {
-            let mut requests = self.requests.write().await;
-            let changed = withdraw_reply_wakes_in(&mut requests, &ids, OffsetDateTime::now_utc());
+            let requests = &mut staged;
+            let changed = withdraw_reply_wakes_in(requests, &ids, OffsetDateTime::now_utc());
             let result: Vec<_> = ids
                 .iter()
                 .filter_map(|id| requests.get(id).cloned())
@@ -3339,10 +3345,7 @@ impl CollaborationStore {
             (changed, result)
         };
         if !changed.is_empty() {
-            if let Err(error) = self.persist_requests(&changed) {
-                *self.requests.write().await = previous;
-                return Err(error);
-            }
+            self.commit_request_rows(&changed).await?;
             self.publish_change();
         }
         Ok(result)
@@ -3352,7 +3355,22 @@ impl CollaborationStore {
         &self,
         caller: &Participant,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
-        self.claim_selected(caller, None).await
+        self.claim_selected(caller, None, None).await
+    }
+
+    /// Bound a transport batch before changing request state. Prefer queued
+    /// work so another batch can progress without consuming unseen requests.
+    pub async fn claim_for_limit(
+        &self,
+        caller: &Participant,
+        limit: usize,
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.ensure_enabled()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.claim_selected(caller, None, Some(limit.min(MAX_QUERY_LIMIT)))
+            .await
     }
 
     pub async fn claim_by_id(
@@ -3361,7 +3379,7 @@ impl CollaborationStore {
         request_id: &str,
     ) -> Result<CollaborationRequest, CollaborationError> {
         if let Some(request) = self
-            .claim_selected(caller, Some(request_id))
+            .claim_selected(caller, Some(request_id), None)
             .await?
             .into_iter()
             .next()
@@ -3381,6 +3399,7 @@ impl CollaborationStore {
         &self,
         caller: &Participant,
         selected: Option<&str>,
+        limit: Option<usize>,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
@@ -3389,12 +3408,34 @@ impl CollaborationStore {
                 "worker_draining: inbox claims are paused".into(),
             ));
         }
-        let previous = self.requests.read().await.clone();
+        let mut staged: HashMap<_, _> = {
+            let requests = self.requests.read().await;
+            let mut eligible: Vec<_> = requests
+                .values()
+                .filter(|r| {
+                    addresses(&r.to, caller)
+                        && selected.is_none_or(|id| r.id == id)
+                        && (selected.is_some()
+                            || r.from.console
+                            || caller.accepts_peer_work()
+                            || r.status == RequestStatus::Claimed)
+                        && matches!(r.status, RequestStatus::Queued | RequestStatus::Claimed)
+                })
+                .collect();
+            if limit.is_some() {
+                eligible.sort_by_key(|r| (r.status != RequestStatus::Queued, r.created_at, &r.id));
+            }
+            eligible
+                .into_iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|r| (r.id.clone(), r.clone()))
+                .collect()
+        };
         let now = OffsetDateTime::now_utc();
         let mut changed = false;
         let mut inbox = Vec::new();
         {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             for request in requests.values_mut() {
                 if addresses(&request.to, caller)
                     && selected.is_none_or(|id| request.id == id)
@@ -3435,10 +3476,7 @@ impl CollaborationStore {
         }
         inbox.sort_by_key(|request| request.created_at);
         if changed {
-            if let Err(error) = self.persist_requests(&inbox) {
-                *self.requests.write().await = previous;
-                return Err(error);
-            }
+            self.commit_request_rows(&inbox).await?;
             self.publish_change();
         }
         Ok(inbox)
@@ -3457,9 +3495,9 @@ impl CollaborationStore {
         if self.worker_claim_blocked(caller).await {
             return Ok(None);
         }
-        let previous = self.requests.read().await.clone();
+        let mut staged = self.stage_request_rows(&[request_id]).await;
         let prepared = {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             let Some(request) = requests.get_mut(request_id) else {
                 return Err(CollaborationError::NotFound(request_id.to_string()));
             };
@@ -3480,10 +3518,7 @@ impl CollaborationStore {
             }
         };
         if prepared.is_some() {
-            if let Err(error) = self.persist_requests(prepared.as_slice()) {
-                *self.requests.write().await = previous;
-                return Err(error);
-            }
+            self.commit_request_rows(prepared.as_slice()).await?;
             self.publish_change();
         }
         Ok(prepared)
@@ -3640,9 +3675,26 @@ impl CollaborationStore {
         }
         validate_air_artifact_references(&air_artifacts)?;
         let _transaction = self.transaction_lock.lock().await;
-        let previous = self.requests.read().await.clone();
+        let mut staged = self.stage_request_rows(&[request_id]).await;
+        if staged
+            .get(request_id)
+            .is_some_and(|r| r.superseded_by.is_some())
+        {
+            staged.extend(
+                self.requests
+                    .read()
+                    .await
+                    .values()
+                    .filter(|r| {
+                        r.kind == RequestKind::Notice
+                            && r.parent_request_id.as_deref() == Some(request_id)
+                            && r.status == RequestStatus::Queued
+                    })
+                    .map(|r| (r.id.clone(), r.clone())),
+            );
+        }
         let updated = {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
@@ -3656,7 +3708,7 @@ impl CollaborationStore {
                     && previous.air_artifacts == air_artifacts
                     && previous.report == report
             };
-            if report.is_some() && request.reply.as_ref().is_some_and(identical) {
+            if request.reply.as_ref().is_some_and(identical) {
                 return Ok(request.clone());
             }
             if request.superseded_by.is_some() && request.late_replies.iter().any(identical) {
@@ -3707,7 +3759,7 @@ impl CollaborationStore {
         };
         let mut changed = vec![updated.clone()];
         if updated.superseded_by.is_some() && !updated.late_replies.is_empty() {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             for notice in requests.values_mut().filter(|n| {
                 n.kind == RequestKind::Notice
                     && n.parent_request_id.as_deref() == Some(updated.id.as_str())
@@ -3729,10 +3781,7 @@ impl CollaborationStore {
                 }
             }
         }
-        if let Err(error) = self.persist_requests(&changed) {
-            *self.requests.write().await = previous;
-            return Err(error);
-        }
+        self.commit_request_rows(&changed).await?;
         self.publish_change();
         Ok(updated)
     }
@@ -3984,9 +4033,16 @@ impl CollaborationStore {
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
-        let previous = self.requests.read().await.clone();
+        let mut staged: HashMap<_, _> = self
+            .requests
+            .read()
+            .await
+            .values()
+            .filter(|r| r.status == RequestStatus::Queued && r.created_at < cutoff)
+            .map(|r| (r.id.clone(), r.clone()))
+            .collect();
         let mut expired: Vec<CollaborationRequest> = {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             requests
                 .values_mut()
                 .filter(|request| {
@@ -4004,10 +4060,7 @@ impl CollaborationStore {
         if dry_run || expired.is_empty() {
             return Ok(expired);
         }
-        if let Err(error) = self.persist_requests(&expired) {
-            *self.requests.write().await = previous;
-            return Err(error);
-        }
+        self.commit_request_rows(&expired).await?;
         self.publish_change();
         Ok(expired)
     }
@@ -4019,9 +4072,9 @@ impl CollaborationStore {
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
-        let previous = self.requests.read().await.clone();
+        let mut staged = self.stage_request_rows(&[request_id]).await;
         let cancelled = {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             let request = requests
                 .get_mut(request_id)
                 .ok_or_else(|| CollaborationError::NotFound(request_id.to_string()))?;
@@ -4037,10 +4090,8 @@ impl CollaborationStore {
             }
             request.clone()
         };
-        if let Err(error) = self.persist_requests(std::slice::from_ref(&cancelled)) {
-            *self.requests.write().await = previous;
-            return Err(error);
-        }
+        self.commit_request_rows(std::slice::from_ref(&cancelled))
+            .await?;
         self.publish_change();
         Ok(cancelled)
     }
@@ -4131,9 +4182,9 @@ impl CollaborationStore {
     ) -> Result<Option<CollaborationRequest>, CollaborationError> {
         let _transaction = self.transaction_lock.lock().await;
         self.admit_worker_work(&to).await?;
-        let previous = self.requests.read().await.clone();
+        let mut staged = self.stage_request_rows(&[request_id]).await;
         let rebound = {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             let Some(request) = requests.get_mut(request_id) else {
                 return Ok(None);
             };
@@ -4150,10 +4201,8 @@ impl CollaborationStore {
             request.rebound_from.push(old.agent_session_id);
             request.clone()
         };
-        if let Err(error) = self.persist_requests(std::slice::from_ref(&rebound)) {
-            *self.requests.write().await = previous;
-            return Err(error);
-        }
+        self.commit_request_rows(std::slice::from_ref(&rebound))
+            .await?;
         self.publish_change();
         Ok(Some(rebound))
     }
@@ -4190,9 +4239,20 @@ impl CollaborationStore {
         if self.worker_claim_blocked(sender).await {
             return Ok(None);
         }
-        let previous = self.requests.read().await.clone();
+        let mut staged: HashMap<_, _> = self
+            .requests
+            .read()
+            .await
+            .values()
+            .filter(|r| {
+                r.from.same_session(sender)
+                    && (r.reply_wake_owed()
+                        || matches!(r.reply_wake, Some(ReplyWake::Reserved { .. })))
+            })
+            .map(|r| (r.id.clone(), r.clone()))
+            .collect();
         let batch = {
-            let mut requests = self.requests.write().await;
+            let requests = &mut staged;
             let mine = |request: &CollaborationRequest| request.from.same_session(sender);
             if requests.values().any(|request| {
                 mine(request) && matches!(request.reply_wake, Some(ReplyWake::Reserved { .. }))
@@ -4230,10 +4290,7 @@ impl CollaborationStore {
                 remaining,
             }
         };
-        if let Err(error) = self.persist_requests(&batch.requests) {
-            *self.requests.write().await = previous;
-            return Err(error);
-        }
+        self.commit_request_rows(&batch.requests).await?;
         // Deliberately unpublished: a reservation is the waker's own
         // bookkeeping, and the waker rescans on every published change. If it
         // were published, a pane that keeps refusing input would be reserved,
@@ -4371,6 +4428,30 @@ impl CollaborationStore {
         } else {
             Err(CollaborationError::Disabled)
         }
+    }
+
+    /// Caller holds `transaction_lock`. Copy only exact rows that may change.
+    async fn stage_request_rows(&self, ids: &[&str]) -> HashMap<String, CollaborationRequest> {
+        let requests = self.requests.read().await;
+        ids.iter()
+            .filter_map(|id| requests.get(*id).map(|r| (r.id.clone(), r.clone())))
+            .collect()
+    }
+
+    /// Publish durable rows to memory only after their transaction commits.
+    /// Notification methods with irreversible terminal side effects keep their
+    /// separate install-on-failure semantics. This helper deliberately does not
+    /// publish a revision: wake reservations must remain quiet.
+    async fn commit_request_rows(
+        &self,
+        rows: &[CollaborationRequest],
+    ) -> Result<(), CollaborationError> {
+        self.persist_requests(rows)?;
+        let mut requests = self.requests.write().await;
+        for row in rows {
+            requests.insert(row.id.clone(), row.clone());
+        }
+        Ok(())
     }
 
     /// Upsert only requests changed by the current transaction. History
@@ -4674,10 +4755,12 @@ pub fn resolve_origin(
             })
             .cloned()
             .ok_or_else(|| {
-                CollaborationError::UnknownOrigin(format!(
-                    "agent session {session} is no longer running in {}",
-                    origin.pane
-                ))
+                let detail = if origin.pane.is_empty() {
+                    format!("agent session {session} is not bound to a live pane yet; submit a prompt so its hooks register it, then retry")
+                } else {
+                    format!("agent session {session} is no longer running in {}", origin.pane)
+                };
+                CollaborationError::UnknownOrigin(detail)
             });
     }
     if let Some(session) = origin.agent_session_id.as_deref() {
@@ -6977,6 +7060,386 @@ mod tests {
                 "{status:?} with no body should be refused, got {refused:?}",
             );
         }
+    }
+
+    #[tokio::test]
+    async fn limited_inbox_batches_preserve_primary_protection_and_progress() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut recipient = participant("%2", "primary");
+        recipient.launch_purpose = LaunchPurpose::Primary;
+        let blocked = mailbox
+            .create(
+                participant("%1", "sender"),
+                recipient.clone(),
+                NewRequest {
+                    body: "protected peer request".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for index in 0..3 {
+            mailbox
+                .create(
+                    Participant::console(recipient.room.clone()),
+                    recipient.clone(),
+                    NewRequest {
+                        body: format!("operator request {index}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert!(mailbox
+            .claim_for_limit(&recipient, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        let first = mailbox.claim_for_limit(&recipient, 2).await.unwrap();
+        let second = mailbox.claim_for_limit(&recipient, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        let ids: HashSet<_> = first.iter().chain(&second).map(|r| &r.id).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "new queued work must precede already claimed rereads"
+        );
+        assert!(first.iter().chain(&second).all(|r| r.from.console));
+        assert_eq!(
+            mailbox
+                .peek_for(&recipient, &blocked.id)
+                .await
+                .unwrap()
+                .status,
+            RequestStatus::Queued
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one persistence-failure matrix with shared setup and assertions
+    async fn staged_mutations_preserve_all_rows_and_revision_on_persistence_failure() {
+        for operation in [
+            "create",
+            "claim",
+            "claim_limited",
+            "prepare",
+            "reply",
+            "cancel",
+            "expire",
+            "rebind",
+            "reserve",
+            "withdraw",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let parent = dir.path().join("mailbox");
+            let path = parent.join("collaboration.json");
+            let mailbox = CollaborationStore::load(CollaborationOptions {
+                path: Some(path.clone()),
+                ..CollaborationOptions::default()
+            })
+            .await
+            .unwrap();
+            let sender = participant("%1", "sender");
+            let recipient = participant("%2", "recipient");
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "target".into(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox
+                .create(
+                    participant("%9", "unrelated"),
+                    participant("%8", "other"),
+                    NewRequest {
+                        body: "unrelated history must survive".into(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            if operation == "reserve" {
+                mailbox
+                    .reply(
+                        &recipient,
+                        &request.id,
+                        RequestStatus::Completed,
+                        "done".into(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let before = mailbox.requests.read().await.clone();
+            let changes = mailbox.subscribe();
+            remove_database_files(&path);
+            std::fs::remove_dir(&parent).unwrap();
+            std::fs::write(&parent, b"blocks persistence").unwrap();
+            let result = match operation {
+                "create" => mailbox
+                    .create(
+                        sender.clone(),
+                        recipient.clone(),
+                        NewRequest {
+                            body: "new row".into(),
+                            ..NewRequest::default()
+                        },
+                    )
+                    .await
+                    .map(|_| ()),
+                "claim" => mailbox
+                    .claim_by_id(&recipient, &request.id)
+                    .await
+                    .map(|_| ()),
+                "prepare" => mailbox
+                    .prepare_direct_wake(&recipient, &request.id)
+                    .await
+                    .map(|_| ()),
+                "claim_limited" => mailbox.claim_for_limit(&recipient, 1).await.map(|_| ()),
+                "reply" => mailbox
+                    .reply(
+                        &recipient,
+                        &request.id,
+                        RequestStatus::Completed,
+                        "done".into(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await
+                    .map(|_| ()),
+                "cancel" => mailbox.cancel_for(&sender, &request.id).await.map(|_| ()),
+                "expire" => mailbox
+                    .expire_queued_before(
+                        OffsetDateTime::now_utc() + time::Duration::minutes(1),
+                        false,
+                    )
+                    .await
+                    .map(|_| ()),
+                "rebind" => mailbox
+                    .rebind_recipient(&request.id, &recipient, participant("%3", "replacement"))
+                    .await
+                    .map(|_| ()),
+                "reserve" => mailbox.reserve_reply_wakes(&sender).await.map(|_| ()),
+                "withdraw" => mailbox
+                    .withdraw_reply_wakes(&sender, std::slice::from_ref(&request.id))
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            assert!(
+                matches!(result, Err(CollaborationError::Persistence(_))),
+                "{operation}: {result:?}"
+            );
+            assert_eq!(*mailbox.requests.read().await, before, "{operation}");
+            assert!(
+                !changes.has_changed().unwrap(),
+                "{operation} published an uncommitted state"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_plain_reply_retries_commit_once_and_do_not_revive_read_wakes() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("mailbox.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "retry after lost acknowledgement".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let changes = mailbox.subscribe();
+        let revision = *changes.borrow();
+        let mut tasks = Vec::new();
+        for _ in 0..32 {
+            let (mailbox, recipient, id) = (mailbox.clone(), recipient.clone(), request.id.clone());
+            tasks.push(tokio::spawn(async move {
+                mailbox
+                    .reply(
+                        &recipient,
+                        &id,
+                        RequestStatus::Completed,
+                        "done".into(),
+                        Vec::new(),
+                        Vec::new(),
+                    )
+                    .await
+                    .unwrap()
+            }));
+        }
+        let mut results = Vec::new();
+        for task in tasks {
+            results.push(task.await.unwrap());
+        }
+        assert!(results.iter().all(|row| row == &results[0]));
+        assert_eq!(*changes.borrow(), revision + 1);
+        let read = mailbox.get_for(&sender, &request.id).await.unwrap();
+        let revision = *changes.borrow();
+        let retried = mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(read, retried);
+        assert_eq!(*changes.borrow(), revision);
+        assert!(mailbox.pending_reply_unnotified().await.is_empty());
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        assert_eq!(
+            reloaded.peek_for(&sender, &request.id).await.unwrap(),
+            retried
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_reply_retry_is_idempotent_without_republishing() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let request = mailbox
+            .create(
+                sender,
+                recipient.clone(),
+                NewRequest {
+                    body: "verify retry".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let first = mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let changes = mailbox.subscribe();
+        let again = mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, again);
+        assert!(!changes.has_changed().unwrap());
+        assert!(mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "changed".into(),
+                Vec::new(),
+                Vec::new()
+            )
+            .await
+            .is_err());
+        assert!(mailbox
+            .reply(
+                &participant("%3", "stranger"),
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                Vec::new(),
+                Vec::new()
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    #[ignore = "opt-in history scaling measurement, not a timing assertion"]
+    async fn collaboration_history_scaling_probe() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("%1", "sender");
+        let recipient = participant("%2", "recipient");
+        let template = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "old history".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        {
+            let mut requests = mailbox.requests.write().await;
+            for index in 0..2000 {
+                let mut record = template.clone();
+                record.id = format!("history-{index}");
+                record.body = "h".repeat(8192);
+                record.status = RequestStatus::Completed;
+                requests.insert(record.id.clone(), record);
+            }
+        }
+        let begin = std::time::Instant::now();
+        for _ in 0..60 {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "small check".into(),
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox.claim_by_id(&recipient, &request.id).await.unwrap();
+            mailbox
+                .reply(
+                    &recipient,
+                    &request.id,
+                    RequestStatus::Completed,
+                    "done".into(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+                .unwrap();
+        }
+        let result = serde_json::json!({"history_records":2000,"history_body_bytes":2000*8192,
+            "iterations":60,"operations_per_iteration":3,"elapsed_us":begin.elapsed().as_micros(),
+            "scope":"in-memory create/exact claim/reply; no disk, IPC, model latency or billing"});
+        if let Ok(path) = std::env::var("MUXA_HISTORY_SCALING_REPORT") {
+            std::fs::write(path, serde_json::to_string_pretty(&result).unwrap()).unwrap();
+        }
+        eprintln!("{result}");
     }
 
     #[tokio::test]

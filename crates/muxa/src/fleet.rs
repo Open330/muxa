@@ -866,6 +866,13 @@ impl FleetCommandResult {
         mut incoming: Vec<CollaborationRequest>,
         mut sent: Vec<CollaborationRequest>,
     ) -> Self {
+        // Incoming combines the agent and human mailboxes. Limiting before
+        // merging their chronology lets a busy agent hide newer human requests.
+        let newest_first = |left: &CollaborationRequest, right: &CollaborationRequest| {
+            (right.created_at, &right.id).cmp(&(left.created_at, &left.id))
+        };
+        incoming.sort_by(newest_first);
+        sent.sort_by(newest_first);
         incoming.truncate(FLEET_MAILBOX_REQUEST_LIMIT);
         sent.truncate(FLEET_MAILBOX_REQUEST_LIMIT);
         Self {
@@ -1543,6 +1550,41 @@ mod tests {
             raw.as_bytes()
         );
         assert!(sanitize_raw_capture_base64("not-base64".into()).is_none());
+    }
+
+    #[test]
+    fn merged_fleet_mailboxes_keep_newer_human_requests_before_limiting() {
+        let endpoint = serde_json::json!({"agent_kind":"codex","agent_session_id":"agent",
+            "pane":"%1","room":{"host":"rmux","window_id":"@1"},"state":"idle"});
+        let template: CollaborationRequest = serde_json::from_value(serde_json::json!({
+            "id":"base","from":endpoint,"to":endpoint,"kind":"question",
+            "work_mode":"read_only","body":"full instructions","expects_reply":true,
+            "status":"queued","created_at":"2026-10-29T00:00:00Z"
+        }))
+        .unwrap();
+        let mut incoming: Vec<_> = (0..FLEET_MAILBOX_REQUEST_LIMIT)
+            .map(|index| {
+                let mut row = template.clone();
+                row.id = format!("agent-{index:02}");
+                row.created_at += time::Duration::seconds(i64::try_from(index).unwrap());
+                row
+            })
+            .collect();
+        let mut human = template;
+        human.id = "new-human-request".into();
+        human.to.console = true;
+        human.created_at += time::Duration::hours(1);
+        incoming.push(human.clone());
+        let result = FleetCommandResult::collaboration_mailbox(incoming, Vec::new());
+        assert_eq!(
+            result.collaboration_incoming.len(),
+            FLEET_MAILBOX_REQUEST_LIMIT
+        );
+        assert_eq!(result.collaboration_incoming[0], human);
+        assert!(result
+            .collaboration_incoming
+            .iter()
+            .all(|r| r.id != "agent-00"));
     }
 
     #[test]

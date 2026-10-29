@@ -116,7 +116,10 @@ pub async fn run(client: Client, config: muxa::config::Config) -> Result<()> {
 }
 
 /// How often an idle server checks whether its binary was upgraded.
+#[cfg(not(test))]
 const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const UPGRADE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Set on a server re-executed by [`UpgradeWatch`].
 const REEXEC_ENV: &str = "MUXA_MCP_REEXEC";
@@ -154,6 +157,7 @@ struct UpgradeWatch {
     /// build it resolved to: that is what an upgrade repoints.
     path: std::path::PathBuf,
     started: BinaryStamp,
+    rejected: Option<muxa::binary_upgrade::LaunchStamp>,
     reexec: Box<dyn FnMut(&std::path::Path) + Send>,
 }
 
@@ -161,10 +165,24 @@ impl UpgradeWatch {
     #[cfg(unix)]
     fn for_this_process() -> Option<Self> {
         let path = launch_path()?;
-        let started = BinaryStamp::of(&path)?;
+        #[cfg(target_os = "linux")]
+        let started = {
+            let image = std::path::Path::new("/proc/self/exe");
+            let metadata = std::fs::metadata(image).ok()?;
+            BinaryStamp {
+                target: std::fs::read_link(image).ok()?,
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let started = std::env::current_exe()
+            .ok()
+            .and_then(|image| BinaryStamp::of(&image))?;
         Some(Self {
             path,
             started,
+            rejected: None,
             reexec: Box::new(reexec_in_place),
         })
     }
@@ -200,6 +218,11 @@ fn launch_path() -> Option<std::path::PathBuf> {
 fn reexec_in_place(path: &std::path::Path) {
     use std::os::unix::process::CommandExt as _;
     let error = std::process::Command::new(path)
+        .arg0(
+            std::env::args_os()
+                .next()
+                .unwrap_or_else(|| path.as_os_str().to_owned()),
+        )
         .args(std::env::args_os().skip(1))
         .env(REEXEC_ENV, "1")
         .exec();
@@ -271,10 +294,17 @@ where
                 // unparsed, every response already flushed.
                 let idle = tasks.is_empty() && lines.get_ref().buffer().is_empty();
                 if let Some(watch) = upgrade.as_mut().filter(|watch| idle && watch.replaced()) {
-                    let path = watch.path.clone();
-                    (watch.reexec)(&path);
-                    // Still here: the exec failed (or a test hook returned).
-                    upgrade = None;
+                    let check=muxa::binary_upgrade::UpgradeCheck::new(watch.path.clone(),std::env::args_os().skip(1).collect());
+                    let stamp=check.stamp().ok();
+                    if stamp.is_some() && stamp == watch.rejected {continue;}
+                    watch.rejected=stamp;
+                    match check.validate().await {
+                        Ok(checked) if checked.unchanged()=>(watch.reexec)(&checked.target),
+                        Ok(_)=>tracing::warn!("mcp: replacement changed after validation; keeping the live process"),
+                        Err(reason)=>tracing::warn!(%reason,"mcp: upgrade blocked; keeping the live transport"),
+                    }
+                    // A returning exec failed or a test hook returned. Keep
+                    // watching, but don't probe this binary/config pair again.
                 }
                 continue;
             }
@@ -562,6 +592,21 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
     );
     let mut tools = vec![
         json!({
+            "name": "muxa_agent_find",
+            "description": "Find where agents working on a task are currently located on this daemon's local observed panes. Start here for agent-location questions instead of reading full topology or transcripts. Extract a few task keywords/identifiers from prose; all whitespace-separated keywords must match (case-insensitive) across workspace, window, cwd, alias, titles, recap and latest prompt/response. Returns ranked candidates with exact host/socket/session/window/pane identity and up to three short evidence excerpts. Matches do not prove task ownership or completion. Exclude your investigating session when known. No match: try alternate keywords, then muxa_agent_search for historical evidence; historical sessions do not establish a current pane. Remote Fleet hosts require a separate Fleet query.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Task identifier or a few keywords, not a full question." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Default 10." },
+                    "refresh": { "type": "boolean", "description": "Re-observe inventory now. Default false reuses the daemon's shared inventory; freshness reports its observation age and configured maximum." },
+                    "exclude_sessions": { "type": "array", "items": { "type": "string" }, "description": "Agent session IDs to exclude." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "muxa_status",
             "description": "Focused observation of muxa agents. With no arguments, \
                 return a compact fleet summary; set full=true only when the complete managed \
@@ -798,7 +843,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
                     "execute": { "type": "boolean", "description": "Default false. Requires intent=task, explicit user authorization, and a control-mode host." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
-                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
+                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true. For a quick check with no independent local work, this avoids a separate send receipt and later wait. Use false while doing independent work." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id." },
                     "parent_request_id": { "type": "string", "description": "Exact prior request that caused this follow-up." },
@@ -895,7 +940,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
                     "execute": { "type": "boolean", "description": "Default false. Requires intent=task and explicit user authorization." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
-                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
+                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true. For a quick check with no independent local work, this avoids a separate send receipt and later wait. Use false while doing independent work." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "spawn_if_missing": { "type": "boolean", "description": "Override collaboration.auto_spawn_workers (default true). Reuse an existing worker first; new peers use configured provider permissions unless worker_bypass_permissions is explicitly enabled." },
                     "context_bound": {"type":"boolean","description":"Default false routes generic work to a dedicated worker, including when an exact target is primary. True requires that exact session's conversation and keeps primary requests queued for acceptance."},
@@ -999,7 +1044,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         json!({
             "name": "muxa_inbox",
             "description": "Read worker inbox requests, or explicitly accept one request_id on a protected primary session. Primary sessions do not auto-claim queued peer work. Instructions are included; full=true is for diagnostics. Honor kind/work_mode/paths; reply only when requested.",
-            "inputSchema": { "type": "object", "properties": {"request_id":{"type":"string","description":"Explicitly accept this one inbound request, including on a protected primary. Omit for normal worker inbox."},"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
+            "inputSchema": { "type": "object", "properties": {"request_id":{"type":"string","description":"Explicitly accept this one inbound request, including on a protected primary. Use the ID from a wake to avoid rereading other open requests."},"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
         }),
         json!({
             "name": "muxa_list_messages",
@@ -1102,6 +1147,28 @@ async fn call_tool(
     params: Option<&Value>,
     config: &muxa::config::Config,
 ) -> Result<Value> {
+    let name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
+    let mutates = matches!(name, Some("muxa_start_agent" | "muxa_start_work"))
+        || (name == Some("muxa_manage_tmux")
+            && params
+                .and_then(|p| p.pointer("/arguments/action"))
+                .and_then(Value::as_str)
+                .is_some_and(|action| {
+                    matches!(action, "terminate_agent" | "close_work" | "close_workspace")
+                }));
+    let result = call_tool_inner(client, params, config).await;
+    if mutates {
+        let _ = client.invalidate_agent_directory().await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)] // one explicit MCP tool dispatch table
+async fn call_tool_inner(
+    client: &Client,
+    params: Option<&Value>,
+    config: &muxa::config::Config,
+) -> Result<Value> {
     let params = params.ok_or_else(|| anyhow::anyhow!("missing params"))?;
     let name = params
         .get("name")
@@ -1131,6 +1198,43 @@ async fn call_tool(
     };
 
     match name {
+        "muxa_agent_find" => {
+            let Some(query) = args.get("query").and_then(Value::as_str) else {
+                return Ok(error_result("query is required"));
+            };
+            let limit = match args.get("limit") {
+                None => 10,
+                Some(value) => match value.as_u64().filter(|n| (1..=50).contains(n)) {
+                    Some(value) => usize::try_from(value).expect("limit is at most 50"),
+                    None => return Ok(error_result("limit must be between 1 and 50")),
+                },
+            };
+            let exclude: Vec<String> = match args.get("exclude_sessions") {
+                None => Vec::new(),
+                Some(Value::Array(values)) if values.iter().all(Value::is_string) => values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                Some(_) => return Ok(error_result("exclude_sessions must be an array of strings")),
+            };
+            Ok(
+                match crate::agent_find::lookup(
+                    client,
+                    query,
+                    limit,
+                    &exclude,
+                    args.get("refresh")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+                .await
+                {
+                    Ok(result) => json_result(&serde_json::to_value(result)?),
+                    Err(error) => error_result(&error.to_string()),
+                },
+            )
+        }
         "muxa_agent_search" | "muxa_agent_read" => {
             Ok(match crate::agent_records::call(name, args).await {
                 Ok(result) => json_result(&result),
@@ -1717,10 +1821,9 @@ async fn call_tool(
                 client.collaboration_inbox(&origin).await
             };
             Ok(match inbox {
-                Ok(requests) => json_result(&json!({ "requests": requests.iter().map(|request| {
-                    if args.get("full").and_then(Value::as_bool).unwrap_or(false) { json!(request) }
-                    else { crate::collaboration_output::message(request, true) }
-                }).collect::<Vec<_>>() })),
+                Ok(requests) => json_result(
+                    &json!({ "requests": crate::collaboration_output::inbox(&requests,args.get("full").and_then(Value::as_bool).unwrap_or(false)) }),
+                ),
                 Err(error) => error_result(&format!("inbox failed: {error}")),
             })
         }
@@ -1983,10 +2086,22 @@ async fn lifecycle_target(
     client: &Client,
     target: Option<&str>,
 ) -> Result<(Option<muxa::BackendEndpoint>, Option<String>), String> {
-    let resolved_origin = resolve_collaboration_origin(client).await;
+    let mut resolved_origin = resolve_collaboration_origin(client).await;
     if target.is_none_or(|t| muxa::backend::pane_id_host_kind(t).is_none())
         && pane_env_is_borrowed()
     {
+        let origin = resolved_origin.as_ref().map_err(Clone::clone)?;
+        let room = client
+            .collaboration_context(origin)
+            .await
+            .map_err(|error| error.to_string())?;
+        resolved_origin = Ok(CollaborationOrigin {
+            exact_session: true,
+            pane: room.current.pane,
+            socket: room.current.socket,
+            console: room.current.console,
+            agent_session_id: Some(room.current.agent_session_id),
+        });
         let origin = resolved_origin.as_ref().map_err(Clone::clone)?;
         if origin.pane.is_empty() || origin.socket.is_none() {
             return Err("lifecycle caller is not bound to a server yet; refresh room context before retrying".into());
@@ -2826,6 +2941,9 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         return json_result(&payload);
     }
 
+    let compact_short_reply = config.collaboration.wake_payload
+        == muxa::config::CollaborationWakePayload::Adaptive
+        && muxa::collaboration::instruction::short_inline_prompt(&sent).is_some();
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
@@ -2838,6 +2956,9 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
                 .as_object_mut()
                 .unwrap()
                 .extend(request_outcome(&request).as_object().unwrap().clone());
+            if compact_short_reply && request.status.is_terminal() && request.reply.is_some() {
+                payload = crate::collaboration_output::short_call_outcome(payload, &request);
+            }
             json_result(&payload)
         }
         Ok(None) => {
@@ -3802,6 +3923,7 @@ async fn acquire_peer_capacity(
     }
 }
 
+#[allow(clippy::too_many_lines)] // reservation, launch and registration form one worker lifecycle
 async fn spawn_peer(
     client: &Client,
     room: &RoomContext,
@@ -3874,6 +3996,7 @@ async fn spawn_peer(
             }
         }
     };
+    let _ = client.invalidate_agent_directory().await;
     if host == muxa::HostKind::Rmux {
         started.pane = format!("rmux:{}", started.pane);
     }
@@ -4056,22 +4179,13 @@ pub(crate) fn pane_env_is_borrowed() -> bool {
     })
 }
 
-/// How long a session-id resolution is reused. Short enough that a binding
-/// the reconciler repairs (a pane claimed before the fix, a late cwd match)
-/// takes effect promptly; long enough that a burst of calls costs one lookup.
-const SESSION_ORIGIN_TTL: Duration = Duration::from_secs(30);
-
-/// The origin this MCP call or CLI invocation speaks for.
-///
-/// Normally the pane env names the caller ([`current_collaboration_origin`]).
-/// Under a shared Codex app-server it names whichever pane started that
-/// server, so the caller is identified by its Codex session id instead — the
-/// MCP `_meta` thread id, or `$CODEX_THREAD_ID` for a shell command — and
-/// mapped to the pane the registry bound that session to. A wrong identity is
-/// worse than none: when the session is unknown or not yet bound to a pane,
-/// this fails rather than borrowing the server's pane.
+/// Resolve collaboration identity at the daemon, where the current session
+/// binding is authoritative. Shared app-server pane variables belong to another
+/// conversation: never copy them, cache a physical pane, or transfer a full
+/// registry snapshot merely to identify the calling thread.
+#[allow(clippy::unused_async)] // common async API; shared identity needs no IPC
 pub(crate) async fn resolve_collaboration_origin(
-    client: &Client,
+    _client: &Client,
 ) -> std::result::Result<CollaborationOrigin, String> {
     let session = CALLER_SESSION
         .try_with(Clone::clone)
@@ -4083,80 +4197,24 @@ pub(crate) async fn resolve_collaboration_origin(
                 .filter(|id| !id.trim().is_empty())
         });
     if !pane_env_is_borrowed() {
-        // The pane env is trustworthy, but a pane can still carry more than
-        // one registry row; the session id lets the daemon pick the caller's.
         let mut origin = current_collaboration_origin()?;
         origin.agent_session_id = session;
         return Ok(origin);
     }
     let session = session.ok_or_else(|| {
-        "collaboration cannot identify this Codex thread: it runs under the shared \
-             Codex app-server, whose pane variables belong to another pane, and the \
-             call carried no thread id. Upgrade Codex, or start it with `codex --no-daemon`"
-            .to_string()
+        "collaboration cannot identify this Codex thread: shared app-server pane variables belong to another pane and no thread id was supplied".to_owned()
     })?;
-    session_origin(client, &session).await
+    Ok(shared_session_origin(session))
 }
 
-async fn session_origin(
-    client: &Client,
-    session: &str,
-) -> std::result::Result<CollaborationOrigin, String> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, (std::time::Instant, CollaborationOrigin)>>,
-    > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some((at, origin)) = cache
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(session).cloned())
-    {
-        if at.elapsed() < SESSION_ORIGIN_TTL {
-            return Ok(origin);
-        }
-    }
-    let agents = client
-        .snapshot()
-        .await
-        .map_err(|error| format!("collaboration origin lookup failed: {error}"))?;
-    let origin = origin_for_session(&agents, session)?;
-    // An unbound origin is resolved by the daemon, which binds the session on
-    // demand; ask it again next time instead of caching the empty pane.
-    if !origin.pane.is_empty() {
-        if let Ok(mut cache) = cache.lock() {
-            cache.insert(
-                session.to_owned(),
-                (std::time::Instant::now(), origin.clone()),
-            );
-        }
-    }
-    Ok(origin)
-}
-
-fn origin_for_session(
-    agents: &[Agent],
-    session: &str,
-) -> std::result::Result<CollaborationOrigin, String> {
-    let agent = agents
-        .iter()
-        .find(|agent| agent.session_id == session)
-        .ok_or_else(|| {
-            format!(
-                "collaboration origin: Codex thread {session} is not tracked yet; \
-                 submit a prompt so its hooks register it, then retry"
-            )
-        })?;
-    // Not bound yet: send the session alone. The daemon binds it from live
-    // process evidence before resolving; an empty pane can never fall back
-    // onto another agent's pane.
-    let pane = agent.pane.clone().unwrap_or_default();
-    Ok(CollaborationOrigin {
-        exact_session: false,
-        pane,
-        socket: agent.tmux_socket.clone(),
+fn shared_session_origin(session: String) -> CollaborationOrigin {
+    CollaborationOrigin {
+        exact_session: true,
+        pane: String::new(),
+        socket: None,
         console: false,
-        agent_session_id: Some(session.to_owned()),
-    })
+        agent_session_id: Some(session),
+    }
 }
 
 pub(crate) fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
@@ -5230,40 +5288,35 @@ mod tests {
         assert_eq!(caller_session_hint(None), None);
     }
 
-    fn tracked(session: &str, pane: Option<&str>) -> Agent {
-        let mut agent: Agent = serde_json::from_value(json!({
-            "kind": "codex",
-            "session_id": session,
-            "state": "idle",
-            "started_at": "2026-10-02T00:00:00Z",
-            "last_activity_at": "2026-10-02T00:00:00Z",
-            "state_entered_at": "2026-10-02T00:00:00Z"
-        }))
-        .expect("minimal agent");
-        agent.pane = pane.map(str::to_owned);
-        agent.tmux_socket = pane.map(|_| "default".to_owned());
-        agent
-    }
-
-    /// Three Codex threads share one app-server whose env says `%9`; each
-    /// must resolve to the pane the registry bound *its* session to.
+    /// Shared-host identity follows the conversation at the daemon and cannot
+    /// fall back to a cached pane after that conversation has gone away.
     #[test]
-    fn session_origin_uses_the_threads_own_binding() {
-        let agents = [
-            tracked("thread-junia", Some("rmux:%9")),
-            tracked("thread-a", Some("rmux:%137")),
-            tracked("thread-b", None),
-        ];
-        let origin = origin_for_session(&agents, "thread-a").unwrap();
-        assert_eq!(origin.pane, "rmux:%137");
-        assert_eq!(origin.socket.as_deref(), Some("default"));
-        assert!(!origin.console);
+    fn shared_origin_has_no_physical_fallback_or_snapshot_dependency() {
+        let origin = shared_session_origin("thread-a".into());
         assert_eq!(origin.agent_session_id.as_deref(), Some("thread-a"));
-        let unbound = origin_for_session(&agents, "thread-b").unwrap();
-        assert_eq!(unbound.pane, "", "an unbound session never borrows a pane");
-        assert_eq!(unbound.agent_session_id.as_deref(), Some("thread-b"));
-        let unknown = origin_for_session(&agents, "thread-c").unwrap_err();
-        assert!(unknown.contains("not tracked"), "{unknown}");
+        assert!(origin.exact_session);
+        assert!(origin.pane.is_empty());
+        assert!(origin.socket.is_none());
+        assert!(!origin.console);
+        let mut caller = crate::collaboration_output::fixture().from;
+        caller.agent_session_id = "thread-a".into();
+        caller.pane = "rmux:%1".into();
+        assert_eq!(
+            muxa::collaboration::resolve_origin(&origin, &[caller.clone()], &[])
+                .unwrap()
+                .pane,
+            "rmux:%1"
+        );
+        caller.pane = "rmux:%2".into();
+        assert_eq!(
+            muxa::collaboration::resolve_origin(&origin, &[caller.clone()], &[])
+                .unwrap()
+                .pane,
+            "rmux:%2"
+        );
+        caller.agent_session_id = "successor".into();
+        caller.pane = "rmux:%1".into();
+        assert!(muxa::collaboration::resolve_origin(&origin, &[caller], &[]).is_err());
     }
     use muxa::backend::{BackendCaps, HostKind, PaneBackend, SharedBackend};
     use muxa::event::AgentEvent;
@@ -6216,6 +6269,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "muxa_agent_find",
                 "muxa_status",
                 "muxa_recent_prompts",
                 "muxa_guide",
@@ -6287,6 +6341,12 @@ mod tests {
     #[test]
     fn status_and_wait_tool_definitions_bound_context() {
         let tools = tool_definitions(&muxa::config::Config::default());
+        let find = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_agent_find")
+            .unwrap();
+        assert_eq!(find["inputSchema"]["required"], json!(["query"]));
+        assert_eq!(find["inputSchema"]["properties"]["limit"]["maximum"], 50);
         let status = tools
             .iter()
             .find(|tool| tool["name"] == "muxa_status")
@@ -7408,10 +7468,70 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adaptive_reply_cost_matrix() {
+        use muxa::collaboration::instruction::short_inline_prompt;
+        let participant = json!({"agent_kind":"codex",
+            "agent_session_id":"01a1820e-a385-79d0-acfd-8ebda41e2d5b",
+            "pane":"rmux:%1","room":{"host":"rmux","window_id":"@1"},
+            "state":"idle","launch_purpose":"worker"});
+        let mut rows = Vec::new();
+        for (language, unit) in [("ascii", "a"), ("korean", "한"), ("escaped", "\"\n")] {
+            for target in [16, 40, 160, 480, 512, 513, 640, 768, 769, 1024] {
+                let body = unit.repeat(target / unit.len()) + &"a".repeat(target % unit.len());
+                assert_eq!(body.len(), target);
+                let mut request: CollaborationRequest = serde_json::from_value(json!({
+                    "id":"req_0123456789abcdef_1","from":participant,"to":participant,
+                    "kind":"review","work_mode":"read_only","body":body,
+                    "expects_reply":true,"status":"claimed",
+                    "created_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap()
+                })).unwrap();
+                let inline = short_inline_prompt(&request).is_some();
+                request.status = muxa::collaboration::RequestStatus::Completed;
+                request.reply = Some(
+                    serde_json::from_value(json!({"status":"completed",
+                    "body":"확인했습니다.","artifacts":[],"at":"2026-10-29T00:00:00Z"}))
+                    .unwrap(),
+                );
+                let mut full = json!({"sent":true,"selected_peer":request.to,
+                    "selection_reason":"explicit","expanded_skill":null,"spawned":null,
+                    "thread_id":null,"parent_request_id":null,"workspace_id":null,
+                    "work_id":null,"run_id":null,"kind":"review","work_mode":"read_only"});
+                full.as_object_mut()
+                    .unwrap()
+                    .extend(request_outcome(&request).as_object().unwrap().clone());
+                let compact =
+                    crate::collaboration_output::short_call_outcome(full.clone(), &request);
+                assert_eq!(compact["reply"], full["reply"]);
+                let bytes =
+                    |v: &Value| json_result(v)["content"][0]["text"].as_str().unwrap().len();
+                let before_compact = inline && body.len() <= 512;
+                rows.push(json!({"language":language,"target_bytes":target,
+                    "body_bytes":body.len(),"reply_body_bytes":"확인했습니다.".len(),
+                    "before_sender_result_bytes":bytes(if before_compact {&compact} else {&full}),
+                    "sender_result_bytes":bytes(if inline {&compact} else {&full}),
+                    "reply_receipt_bytes":bytes(&crate::collaboration_output::mutation_receipt(&request))}));
+            }
+        }
+        if let Ok(path) = std::env::var("MUXA_REPLY_MATRIX_REPORT") {
+            std::fs::write(path, serde_json::to_string_pretty(&json!({
+                "scope":"MCP result content text using production projections; fixed completed Korean reply; no live model latency or billing measurement",
+                "rows":rows
+            })).unwrap()).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn record_tools_validate_arguments_without_a_daemon() {
         let client = Client::new(std::path::PathBuf::from("/missing/muxa-record-test.sock"));
         for (name, args) in [
+            ("muxa_agent_find", json!({})),
+            ("muxa_agent_find", json!({"query":"task","limit":0})),
+            ("muxa_agent_find", json!({"query":" ","limit":1})),
+            (
+                "muxa_agent_find",
+                json!({"query":"task","exclude_sessions":[1]}),
+            ),
             (
                 "muxa_agent_search",
                 json!({"providers":["unknown"],"query":"bucket"}),
@@ -7550,17 +7670,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn an_idle_server_reexecs_only_after_its_binary_is_replaced() {
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("muxa");
-        std::fs::write(&binary, b"build one").unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&calls);
         let watch = UpgradeWatch {
             path: binary.clone(),
             started: BinaryStamp::of(&binary).unwrap(),
+            rejected: None,
             reexec: Box::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
             }),
@@ -7588,8 +7711,29 @@ mod tests {
         client_out.read_line(&mut line).await.unwrap();
         assert!(line.contains("\"id\":1"));
 
+        // A config-incompatible install cannot take down this live pipe,
+        // and the same rejected binary/config pair is probed only once.
+        let probes = dir.path().join("probes");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf p >> '{}'\nexit 1\n", probes.display()),
+        )
+        .unwrap();
+        tokio::time::sleep(UPGRADE_POLL_INTERVAL * 6).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&probes).unwrap(), "p");
+        tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
+        assert_eq!(std::fs::read_to_string(&probes).unwrap(), "p");
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        line.clear();
+        client_out.read_line(&mut line).await.unwrap();
+        assert!(line.contains("\"id\":2"));
+
         // Replaced: the next idle poll hands over to the new binary once.
-        std::fs::write(&binary, b"build two, longer").unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\n# validated new build\nexit 0\n").unwrap();
         tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 

@@ -20,6 +20,23 @@ pub fn prompt_headline(prompt: &str) -> Cow<'_, str> {
             return Cow::Owned(headline);
         }
     }
+    if trimmed.starts_with("[muxa] Claimed;") {
+        if let Some(record) = trimmed
+            .split_once("--- peer request ---\n")
+            .and_then(|(_, rest)| rest.split_once("\n--- end peer request ---"))
+            .and_then(|(record, _)| serde_json::from_str::<serde_json::Value>(record).ok())
+        {
+            if let (Some(kind), Some(author)) =
+                (record["kind"].as_str(), record["from"]["label"].as_str())
+            {
+                return Cow::Owned(format!(
+                    "↳ {} request from {}",
+                    one_line(kind),
+                    one_line(author)
+                ));
+            }
+        }
+    }
     Cow::Borrowed(prompt)
 }
 

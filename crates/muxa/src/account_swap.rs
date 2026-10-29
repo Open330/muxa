@@ -2743,6 +2743,7 @@ mod tests {
     fn agent(pane: &str, sid: &str, kind: AgentKind, state: AgentState) -> Agent {
         let at = time::macros::datetime!(2026-10-15 12:00:00 UTC);
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind,

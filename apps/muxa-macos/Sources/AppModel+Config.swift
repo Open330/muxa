@@ -367,6 +367,7 @@ enum MuxaCollaborationWake: String, CaseIterable, Hashable, Sendable, Identifiab
 enum MuxaCollaborationWakePayload: String, CaseIterable, Hashable, Sendable, Identifiable {
     case notice
     case operatorFull = "operator_full"
+    case adaptive
     case full
 
     var id: String { rawValue }

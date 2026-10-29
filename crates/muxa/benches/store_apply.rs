@@ -48,6 +48,7 @@ fn make_realistic_agent() -> Agent {
     let prompt = "x".repeat(4096);
     let response = "y".repeat(4096);
     Agent {
+        ask_origin: None,
         tmux_socket: None,
         tmux_session: None,
         kind: AgentKind::ClaudeCode,

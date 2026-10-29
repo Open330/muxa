@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already carries any mark of its kind is left alone, a restored alias is
   dropped if a live peer holds it in that server's room, and worker grants,
   launch and pipeline-attempt markers are never restored.
+- Fleet inbox claims now atomically change only the requests the capped response
+  can return. Unseen requests stay queued; primary protection is applied before
+  the limit. Older daemons are rejected before claiming instead of silently
+  falling back to an unbounded mutation.
 
 - `muxa workers prune --execute` refused every Codex worker with "no Codex
   composer on screen": it read the pane with its colour escapes, which hid an
@@ -28,6 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   known placeholder; typed text is never taken for one).
 
 ### Changed
+
+- Starting watch on the Work board or a topology screen loads only open-request
+  metadata for hidden mailbox badges; completed-history previews wait until the
+  operator opens the mailbox or collaboration screen.
+
+- Collaboration writes stage only affected rows instead of copying full history;
+  identical plain replies are safe to retry without repeating wakes. The Work
+  board reuses mailbox revisions and fetches only open-request metadata, while
+  Fleet mailbox reads enforce their existing 32-record limit before IPC transfer.
+  Shared Codex origins resolve by exact session at the daemon without snapshot
+  lookups, and `reload mcp --all --reconnect` includes current-image shared hosts.
+
+- Adaptive short requests carry their request ID once in the shared JSON record;
+  the reply hint refers to that ID. The body cap is now 768 UTF-8 bytes, still
+  bounded by the complete 1024-byte instruction limit. Renderer cost matrices
+  cover ASCII, Korean and escaped text, including sender results and reply receipts.
+
+- Resolved Claude auto-mode setup dialogs no longer leave an indefinitely waiting
+  agent: two positive idle-composer observations can repair the exact unchanged
+  row, while current permission/selection UI and newer hooks retain priority.
 
 - `muxa dashboard` opens `muxa watch` on its Work board, which now covers what
   the card console did: `Enter`/`o` follow the `▸` agent, and `c` copies and
@@ -40,6 +64,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   card console is removed. See docs/DASHBOARD_CLI.md.
 
 ### Added
+
+- Replacement binaries are configuration-probed before MCP handoff or daemon
+  restart; rejected binary/config pairs retain the live service. Explicit
+  `reload mcp --reconnect` rebuilds closed cached clients without restarting
+  agents, and reports transport health separately from cached revision data.
+- Caller provenance canonicalizes pane evidence from the existing inventory,
+  avoiding false rmux origin mismatches without extra discovery scans.
+
+- Opt-in `collaboration.wake_payload = "adaptive"` delivers bounded read-only
+  peer checks inline to idle workers using the shared inbox instruction JSON,
+  removing the initial inbox read while retaining primary protection, quiet
+  notices, explicit permissions, and persisted delivery recovery.
+
+- `muxa agent find` and MCP `muxa_agent_find` locate current agents from a
+  shared daemon inventory and bounded search index. Layout changes invalidate
+  the inventory, concurrent refreshes share a scan, and session-ID lookups
+  ignore mentions in other conversations. Ask execution ownership persists
+  independently of Ask history and can be promoted by interactive evidence.
 
 - `muxa watch` has a Work board screen (`Alt-3`, `:screen board`,
   `--screen board`, `[watch] screen = "board"`): Works from the same projection
@@ -80,12 +122,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Codex Ask continuation places parent `exec` options before `resume`, so
+  configured additional directories and sandbox controls work on later turns.
+  CLI argument errors retain the actual error instead of only the help footer.
+
 - Works on rmux (and other non-tmux backends) show up on the Work board.
   Their panes lost the `muxa work` marks on the way into the Work projection,
   so every such Work was counted as an unlinked execution; `muxa dashboard`
   also scanned tmux only and showed no Work at all on an rmux host. rmux rows
   are now read with their `@muxa_*` marks (Work and issue) like tmux rows, so
   only windows explicitly marked as a Work become one.
+
 
 ## [0.9.3] - 2026-10-28
 
@@ -138,6 +185,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   changed hosts. Target-only rules, pauses, and unrelated settings remain local.
 
 ### Changed
+
+- Agent request notifications direct recipients to read one request with
+  `muxa_inbox(request_id=ID)` or `muxa msg accept ID --json`. CLI
+  `muxa msg inbox --json` now returns the compact MCP message projection;
+  scripts that need legacy full records must use `--json --full`. Progress
+  authors retain stable identity without repeating room/socket metadata.
+  Inbox instructions now omit the redundant recipient, routing/status fields,
+  empty attachments and repeated revision aliases, while preserving explicit
+  permission/paths, contracts, amendments and provenance signals. Fixed-byte
+  regression budgets measure raw-body extra, escaping and reference wake
+  separately; `--full` remains the audit compatibility path. CLI send/reply/
+  cancel/attention acknowledgements no longer echo supplied bodies; use
+  `--json --full` for their legacy full records. Reply IPC reads metadata by
+  default.
 
 - Watch loads preview history in 500-row pages. Full-body history widens its
   conservative page size only after the daemon acknowledges a payload budget,

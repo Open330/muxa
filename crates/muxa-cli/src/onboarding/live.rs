@@ -452,7 +452,8 @@ impl Sandbox {
         let id = requests
             .as_array()
             .and_then(|items| items.first())
-            .and_then(|item| item.get("id"))
+            // The compact inbox names it `request_id`; `--full` records `id`.
+            .and_then(|item| item.get("request_id").or_else(|| item.get("id")))
             .and_then(serde_json::Value::as_str)
             .context("claude's live-tour inbox had no request to answer")?;
         let body = tr(

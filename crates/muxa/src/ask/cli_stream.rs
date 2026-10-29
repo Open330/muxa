@@ -20,6 +20,7 @@ pub(super) async fn run(
     program: &str,
     timeout: Duration,
     progress: Option<watch::Sender<String>>,
+    observer: Option<&super::ExecutionObserver>,
 ) -> Result<AskAnswer, String> {
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command
@@ -36,6 +37,7 @@ pub(super) async fn run(
             let mut raw = String::new();
             let mut visible = String::new();
             let mut last_result = None;
+            let mut last_session = None;
             while let Some(line) = lines.next_line().await.map_err(|error| error.to_string())? {
                 if raw.len() + line.len() + 1 > OUTPUT_LIMIT {
                     return Err("ask CLI output exceeded 32 MiB".to_string());
@@ -43,6 +45,23 @@ pub(super) async fn run(
                 raw.push_str(&line);
                 raw.push('\n');
                 if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                    let session = match engine {
+                        AskEngine::Codex if event["type"] == "thread.started" => {
+                            event["thread_id"].as_str()
+                        }
+                        AskEngine::Claude
+                            if event["type"] == "system" || event["type"] == "result" =>
+                        {
+                            event["session_id"].as_str()
+                        }
+                        _ => None,
+                    };
+                    if let (Some(observer), Some(session)) = (observer, session) {
+                        if last_session.as_deref() != Some(session) {
+                            observer.session(session).await;
+                            last_session = Some(session.to_owned());
+                        }
+                    }
                     if engine == AskEngine::Claude && event["type"] == "result" {
                         last_result = Some(line.clone());
                     }
@@ -206,6 +225,8 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"D
             ..Default::default()
         })
         .await;
+        let registry = crate::Store::shared();
+        store.attach_registry(registry.clone());
         let mut revisions = store.subscribe();
         let pending = store.ask("hello").await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -215,6 +236,11 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"D
                 let entry = entries.iter().find(|entry| entry.id == pending.id).unwrap();
                 if entry.answer == "Checking" {
                     assert_eq!(entry.status, AskStatus::Running);
+                    assert_eq!(entry.agent_session_id.as_deref(), Some("store-session"));
+                    let source = registry.snapshot().await.remove(0);
+                    assert!(source.pane.is_none());
+                    assert!(source.ask_origin.is_some());
+                    assert!(registry.directory_snapshot().await.is_empty());
                     assert!(entry.answered_at.is_none());
                     assert_eq!(entry.prompt, "hello");
                     assert!(super::super::replay_history(
@@ -246,6 +272,11 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"agent_message","text":"D
         })
         .await
         .unwrap();
+        assert_eq!(store.clear_history().await, 1);
+        assert!(registry.directory_snapshot().await.is_empty());
+        let source = registry.snapshot().await.remove(0);
+        assert!(source.ask_origin.is_some());
+        assert_eq!(source.state, crate::AgentState::Stopped);
     }
 
     #[cfg(unix)]
@@ -266,6 +297,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"command_execution","text
             "fake-codex",
             Duration::from_secs(5),
             Some(sender),
+            None,
         );
         tokio::pin!(execution);
         tokio::select! {
@@ -294,6 +326,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"command_execution","text
             "fake-codex",
             Duration::from_secs(5),
             None,
+            None,
         )
         .await
         .unwrap_err();
@@ -317,6 +350,7 @@ printf '%s\n' '{"type":"item.completed","item":{"type":"command_execution","text
                 AskEngine::Claude,
                 "fake-claude",
                 Duration::from_secs(5),
+                None,
                 None,
             )
             .await;

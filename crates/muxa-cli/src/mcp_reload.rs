@@ -13,13 +13,17 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{tungstenite::Message, WebSocketStream};
 
 #[derive(Debug, Args)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI switches
 pub struct McpReloadArgs {
     /// Codex profile to refresh. Defaults to explicit `CODEX_HOME`; otherwise pass this flag.
     #[arg(long, conflicts_with = "all")]
     codex_home: Option<PathBuf>,
-    /// Discover stale owners, refresh shared Codex profiles, and explain standalone clients needing reconnect.
+    /// Discover stale owners (all shared owners with --reconnect), refresh their Codex profiles, and explain standalone clients needing reconnect.
     #[arg(long)]
     all: bool,
+    /// Rebuild cached Muxa clients even when the binary is unchanged; agent sessions stay running, but in-flight Muxa tool calls can be interrupted.
+    #[arg(long)]
+    reconnect: bool,
     /// Print the selected scope without sending a reload request.
     #[arg(long)]
     dry_run: bool,
@@ -39,9 +43,11 @@ struct HostResult {
     stale_muxa_processes_before: usize,
     stale_muxa_processes_after: Option<usize>,
     binary_revision_update: bool,
+    reconnect_requested: bool,
     config_backup: Option<PathBuf>,
     muxa_connections: Option<usize>,
     current_revision_connections: Option<usize>,
+    transport_connected: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -184,9 +190,11 @@ fn plan(
                     stale_muxa_processes_before: stale_count(&socket, stale),
                     stale_muxa_processes_after: None,
                     binary_revision_update: false,
+                    reconnect_requested: args.reconnect,
                     config_backup: None,
                     muxa_connections: None,
                     current_revision_connections: None,
+                    transport_connected: None,
                     control_socket: socket,
                     codex_home,
                     state: "planned",
@@ -200,22 +208,44 @@ fn plan(
     })
 }
 
+fn plan_inventory(
+    args: &McpReloadArgs,
+    owners: &crate::stale_agents::McpOwnerInventory,
+    sessions: &Sessions,
+) -> Result<Report> {
+    let mut selected = owners.stale.clone();
+    if args.all && args.reconnect {
+        // A live executable revision says nothing about a host's cached
+        // transport. Do not require an old image before selecting its host.
+        selected.shared_codex.clone_from(&owners.all.shared_codex);
+    }
+    let mut report = plan(args, &selected, sessions)?;
+    for host in &mut report.hosts {
+        host.stale_muxa_processes_before = stale_count(&host.control_socket, &owners.stale);
+    }
+    Ok(report)
+}
+
 async fn refresh_host(
     mut host: HostResult,
     binary: &std::path::Path,
     revision: &str,
     args: &McpReloadArgs,
 ) -> HostResult {
-    let update =
-        match crate::mcp_revision::RevisionPlan::prepare(&host.codex_home, binary, revision) {
-            Ok(update) => update,
-            Err(error) => {
-                host.state = "unavailable";
-                host.detail = error.to_string();
-                return host;
-            }
-        };
-    host.binary_revision_update = update.is_some();
+    let update = match crate::mcp_revision::RevisionPlan::prepare_refresh(
+        &host.codex_home,
+        binary,
+        revision,
+        args.reconnect,
+    ) {
+        Ok(update) => update,
+        Err(error) => {
+            host.state = "unavailable";
+            host.detail = error.to_string();
+            return host;
+        }
+    };
+    host.binary_revision_update = update.as_ref().is_some_and(|plan| plan.revision_changed);
     if args.dry_run {
         return host;
     }
@@ -238,8 +268,9 @@ async fn refresh_host(
         )
         .await
         {
-            Ok((total, current)) => {
+            Ok((total, connected, current)) => {
                 host.muxa_connections = Some(total);
+                host.transport_connected = Some(connected);
                 host.current_revision_connections = Some(current);
                 if total > 0 && current == total {
                     host.state = "reloaded";
@@ -247,7 +278,7 @@ async fn refresh_host(
                         "{current} loaded Muxa connection(s) report the installed binary revision"
                     );
                 } else if total > current {
-                    host.detail = format!("refresh accepted; {current}/{total} loaded Muxa connection(s) report the current revision; finish active steps or reconnect in the client");
+                    host.detail = format!("refresh accepted; transport connected {connected}/{total}, host-cached revision current {current}/{total}. Cached handshake data can lag a live process upgrade; use --reconnect for closed/stale cached clients without restarting agent sessions");
                 }
             }
             Err(_) => {
@@ -292,13 +323,13 @@ async fn refresh_hosts(
 pub async fn run(client: &muxa::ipc::Client, args: McpReloadArgs) -> Result<()> {
     let binary = crate::stale_agents::installed_muxa()
         .context("cannot locate installed muxa to discover stale owners")?;
-    let owners = crate::stale_agents::scan(&binary);
+    let owners = crate::stale_agents::scan_inventory(&binary);
     let sessions = if args.all {
-        standalone_sessions(client, &owners).await
+        standalone_sessions(client, &owners.stale).await
     } else {
         Sessions::new()
     };
-    let mut report = plan(&args, &owners, &sessions)?;
+    let mut report = plan_inventory(&args, &owners, &sessions)?;
     let revision = crate::mcp_revision::binary_revision(&binary)?;
     report.hosts = refresh_hosts(report.hosts, &binary, &revision, &args).await;
     if !args.dry_run {
@@ -522,8 +553,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         *backup = Some(revision.backup()?);
         *submitted = true;
         send(connection, json!({"id":3,"method":"config/value/write","params":{
-            "keyPath":format!("mcp_servers.muxa.env.{}", crate::mcp_revision::ENV_KEY),
-            "value":revision.revision,"mergeStrategy":"upsert","filePath":revision.path,"expectedVersion":expected
+            "keyPath":if revision.environment.is_some() {"mcp_servers.muxa.env".to_owned()} else {format!("mcp_servers.muxa.env.{}", crate::mcp_revision::ENV_KEY)},
+            "value":revision.environment.clone().unwrap_or_else(||json!(revision.revision)),"mergeStrategy":"upsert","filePath":revision.path,"expectedVersion":expected
         }})).await?;
         let written = response(connection, 3).await?;
         if written["status"] != "ok" {
@@ -553,7 +584,7 @@ async fn verify_host(
     socket: &std::path::Path,
     revision: &str,
     timeout: Duration,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     let mut observed = None;
     let outcome = tokio::time::timeout(timeout, async {
         let stream = tokio::net::UnixStream::connect(socket).await?;
@@ -566,7 +597,7 @@ async fn verify_host(
         let suffix = format!("+{tag}");
         let mut id = 2;
         loop {
-        let (mut total, mut current) = (0, 0);
+        let (mut total, mut connected, mut current) = (0, 0, 0);
         let mut cursor = Value::Null;
         loop {
             send(&mut connection, json!({"id":id,"method":"thread/loaded/list","params":{"limit":100,"cursor":cursor}})).await?;
@@ -581,6 +612,7 @@ async fn verify_host(
                 for server in status.get("data").and_then(Value::as_array).context("Codex did not return MCP status data")? {
                     if server["name"] != "muxa" || server["runtimeStatus"] == "disabled" { continue; }
                     total += 1;
+                    if server["runtimeStatus"]=="connected" {connected+=1;}
                     if server["runtimeStatus"] == "connected"
                         && server.pointer("/serverInfo/version").and_then(Value::as_str).is_some_and(|version| version.ends_with(&suffix))
                         && server.pointer("/tools/muxa_peer_report/inputSchema/properties/full").is_some() { current += 1; }
@@ -589,8 +621,8 @@ async fn verify_host(
             cursor = page.get("nextCursor").cloned().unwrap_or(Value::Null);
             if cursor.is_null() { break; }
         }
-        observed = Some((total, current));
-        if current == total { return Ok::<_, anyhow::Error>((total, current)); }
+        observed = Some((total, connected, current));
+        if current == total { return Ok::<_, anyhow::Error>((total, connected, current)); }
         tokio::time::sleep(Duration::from_millis(250)).await;
         }
     }).await;
@@ -608,7 +640,7 @@ async fn verify_host(
     _socket: &std::path::Path,
     _revision: &str,
     _timeout: Duration,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, usize)> {
     bail!("MCP connection verification requires a Unix control socket")
 }
 
@@ -620,10 +652,41 @@ mod tests {
         McpReloadArgs {
             codex_home: Some("/profiles/current".into()),
             all: false,
+            reconnect: false,
             dry_run: true,
             timeout_secs: 2,
             json: true,
         }
+    }
+
+    #[test]
+    fn reconnect_all_selects_current_shared_owners_without_calling_them_stale() {
+        let mut all = crate::stale_agents::StaleReport::default();
+        all.shared_codex
+            .insert((42, Some("/profiles/current".into())), 3);
+        all.panes.insert("current Claude".into(), 1);
+        let owners = crate::stale_agents::McpOwnerInventory {
+            stale: crate::stale_agents::StaleReport::default(),
+            all,
+        };
+        let mut options = McpReloadArgs {
+            all: true,
+            codex_home: None,
+            ..args()
+        };
+        assert!(plan_inventory(&options, &owners, &Sessions::new())
+            .unwrap()
+            .hosts
+            .is_empty());
+        options.reconnect = true;
+        let report = plan_inventory(&options, &owners, &Sessions::new()).unwrap();
+        assert_eq!(report.hosts.len(), 1);
+        assert_eq!(report.hosts[0].stale_muxa_processes_before, 0);
+        assert!(report.hosts[0].reconnect_requested);
+        assert!(
+            report.manual_reconnect.is_empty(),
+            "current non-shared owners are not falsely marked stale"
+        );
     }
 
     #[test]
@@ -956,7 +1019,7 @@ mod tests {
             verify_host(&socket, &revision, Duration::from_secs(2))
                 .await
                 .unwrap(),
-            (2, 1)
+            (2, 2, 1)
         );
         server.await.unwrap();
         let mut report = plan(

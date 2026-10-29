@@ -896,6 +896,7 @@ mod tests {
     fn agent(state: AgentState) -> Agent {
         let now = OffsetDateTime::UNIX_EPOCH;
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: muxa::event::AgentKind::Codex,

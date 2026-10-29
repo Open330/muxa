@@ -374,6 +374,7 @@ mod tests {
     fn row(pane: &str, session: &str, state: AgentState, hours_ago: i64) -> Agent {
         let at = now() - time::Duration::hours(hours_ago);
         Agent {
+            ask_origin: None,
             tmux_socket: Some("/tmp/rmux".into()),
             tmux_session: None,
             kind: AgentKind::Codex,

@@ -50,7 +50,7 @@ use crate::config::{AskPermissionMode, AskProviderConfig, Config, DEFAULT_ASK_TI
 
 mod cli_stream;
 
-const FIRST_TURN_GUIDANCE: &str = "Global Ask: keep preparation proportional to the request. Answer simple questions directly. For work, locate the relevant project and follow its instructions and any explicitly requested skill. Read only the necessary instruction sections, once per conversation; reuse what you have already learned. Discover exact tools when needed instead of printing broad tool catalogs. Keep tool output bounded and summarize progress briefly. Preserve the user's scope, permissions, and explicit instructions.\n\n";
+const FIRST_TURN_GUIDANCE: &str = "Global Ask: keep preparation proportional to the request. Answer simple questions directly. To locate an agent working on a task, first use `muxa agent find 'TASK_KEYWORDS' --json` (or MCP muxa_agent_find): extract a few keywords/identifiers, inspect the bounded evidence, and report workspace/window/pane plus socket. Exclude your own investigating agent session when known. Try alternate keywords on no match; use `muxa agent search` only for historical evidence and verify any current location separately. A keyword match is a candidate, not proof of ownership or completion. Reuse a returned agent_session_id for follow-up lookup instead of repeating discovery. Cached inventory has an explicit age; use --refresh and verify the session identity before acting on a pane. Lookup alone does not authorize messages, navigation, or changes. Avoid full topology/transcript dumps for this lookup; remote Fleet hosts require a separate Fleet query. For work, locate the relevant project and follow its instructions and any explicitly requested skill. Read only the necessary instruction sections, once per conversation; reuse what you have already learned. Discover exact tools when needed instead of printing broad tool catalogs. Keep tool output bounded and summarize progress briefly. Preserve the user's scope, permissions, and explicit instructions.\n\n";
 
 /// How many entries the store keeps. Old answers are worth re-reading;
 /// unbounded growth is not.
@@ -362,6 +362,7 @@ impl AskSnapshot {
 
 /// Durable ask history plus the id of the conversation still in progress.
 pub struct AskStore {
+    registry: std::sync::RwLock<Option<crate::state::SharedStore>>,
     opts: AskOptions,
     entries: RwLock<Vec<AskEntry>>,
     conversations: RwLock<Vec<AskConversation>>,
@@ -381,7 +382,38 @@ pub struct AskStore {
     changes: watch::Sender<u64>,
 }
 
+struct ExecutionObserver {
+    registry: crate::state::SharedStore,
+    ask: Arc<AskStore>,
+    entry_id: String,
+    kind: crate::AgentKind,
+    cwd: String,
+}
+
+impl ExecutionObserver {
+    async fn session(&self, session: &str) {
+        self.registry
+            .mark_ask_owned(session, &self.entry_id, self.kind, &self.cwd)
+            .await;
+        if let Some(entry) = self
+            .ask
+            .entries
+            .write()
+            .await
+            .iter_mut()
+            .find(|e| e.id == self.entry_id)
+        {
+            entry.agent_session_id = Some(session.to_owned());
+        }
+        self.ask.publish_change();
+    }
+}
+
 impl AskStore {
+    pub fn attach_registry(&self, registry: crate::state::SharedStore) {
+        *self.registry.write().unwrap() = Some(registry);
+    }
+
     #[must_use]
     pub fn in_memory(opts: AskOptions) -> Arc<Self> {
         let agent = opts.agent.clone();
@@ -395,6 +427,7 @@ impl AskStore {
             threads: RwLock::new(std::collections::HashMap::new()),
             agent: RwLock::new(agent),
             providers: RwLock::new(providers),
+            registry: std::sync::RwLock::new(None),
             write_lock: Mutex::new(()),
             changes,
         })
@@ -434,6 +467,7 @@ impl AskStore {
             threads: RwLock::new(snapshot.threads),
             agent: RwLock::new(agent),
             providers: RwLock::new(providers),
+            registry: std::sync::RwLock::new(None),
             write_lock: Mutex::new(()),
             changes,
         });
@@ -909,6 +943,36 @@ impl AskStore {
         {
             prompt = format!("Fleet work: delegate authorized execution using muxa_dispatch_work, or `muxa work dispatch --from-json -`. Supply a UUID dispatch_id, workspace, work, full commit and body; reuse the ID on uncertain delivery. Muxa resolves placement and paths. Use --plan for a preview. Report artifacts and blockers, not routine polling. A launched pipeline is not completed work.\n\n{prompt}");
         }
+        let registry = self.registry.read().unwrap().clone();
+        let observer = if let Some(registry) = registry {
+            let kind = match engine {
+                AskEngine::Codex => Some(crate::AgentKind::Codex),
+                AskEngine::Claude => Some(crate::AgentKind::ClaudeCode),
+                AskEngine::Gemini => Some(crate::AgentKind::GeminiCli),
+                _ => None,
+            };
+            if let Some(kind) = kind {
+                registry
+                    .begin_ask_execution(
+                        &id,
+                        kind,
+                        &self.opts.cwd.to_string_lossy(),
+                        resume.as_deref(),
+                    )
+                    .await;
+                Some(ExecutionObserver {
+                    registry,
+                    ask: Arc::clone(self),
+                    entry_id: id.clone(),
+                    kind,
+                    cwd: self.opts.cwd.to_string_lossy().into_owned(),
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         tokio::spawn(async move {
             let api_key =
                 resolve_api_key(&provider, credential_key, |name| std::env::var(name).ok());
@@ -929,7 +993,7 @@ impl AskStore {
                     config: store.opts.config_path.as_deref(),
                 }),
             };
-            let execution = engine.run_observed(turn, Some(progress));
+            let execution = engine.run_observed(turn, Some(progress), observer.as_ref());
             tokio::pin!(execution);
             let mut tick = tokio::time::interval(Duration::from_millis(250));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -951,6 +1015,9 @@ impl AskStore {
                     }
                 }
             };
+            if let Some(observer) = &observer {
+                observer.registry.end_ask_execution(&id).await;
+            }
             store.finish(&id, outcome).await;
         });
 
@@ -1900,10 +1967,6 @@ impl AskEngine {
                 // `exec` is codex's print mode; `exec resume <id>` continues
                 // one. Both take the prompt as a trailing argument.
                 let mut args = vec!["exec".to_string()];
-                if let Some(id) = resume {
-                    args.push("resume".into());
-                    args.push(id.to_string());
-                }
                 match permission_mode {
                     AskPermissionMode::Default => {}
                     AskPermissionMode::Plan => args.push("--sandbox=read-only".into()),
@@ -1925,6 +1988,12 @@ impl AskEngine {
                     args.push(model.to_string());
                 }
                 args.push("--json".into());
+                // Sandbox and additional directories belong to `exec`, not
+                // its `resume` subcommand. Keep parent options before it.
+                if let Some(id) = resume {
+                    args.push("resume".into());
+                    args.push(id.to_string());
+                }
                 args.push(prompt.to_string());
                 ("codex", args)
             }
@@ -1972,16 +2041,19 @@ impl AskEngine {
     }
 
     async fn run(self, turn: Turn<'_>) -> Result<AskAnswer, String> {
-        self.run_observed(turn, None).await
+        self.run_observed(turn, None, None).await
     }
 
     async fn run_observed(
         self,
         turn: Turn<'_>,
         progress: Option<watch::Sender<String>>,
+        observer: Option<&ExecutionObserver>,
     ) -> Result<AskAnswer, String> {
         match self {
-            Self::Claude | Self::Codex | Self::Gemini => self.run_cli(&turn, progress).await,
+            Self::Claude | Self::Codex | Self::Gemini => {
+                self.run_cli(&turn, progress, observer).await
+            }
             Self::Anthropic | Self::OpenAi => self.call_api(self.api_url(), &turn).await,
             Self::Apple => run_apple(&turn).await,
         }
@@ -1991,6 +2063,7 @@ impl AskEngine {
         self,
         turn: &Turn<'_>,
         progress: Option<watch::Sender<String>>,
+        observer: Option<&ExecutionObserver>,
     ) -> Result<AskAnswer, String> {
         let (default_bin, mut args) = self.argv(
             turn.prompt,
@@ -2028,8 +2101,11 @@ impl AskEngine {
         // Lets the user's own CLI hooks (prompt rewriters, coaches, loggers)
         // recognise a headless muxa turn and stay out of the answer.
         cmd.env(ASK_ENV_MARKER, "1");
+        if let Some(observer) = observer {
+            cmd.env("MUXA_ASK_ENTRY", &observer.entry_id);
+        }
         if streaming {
-            return cli_stream::run(cmd, self, bin, turn.timeout, progress).await;
+            return cli_stream::run(cmd, self, bin, turn.timeout, progress, observer).await;
         }
         let output = tokio::time::timeout(turn.timeout, cmd.output())
             .await
@@ -2041,13 +2117,17 @@ impl AskEngine {
             let detail = non_zero_detail(&stdout, &stderr);
             return Err(format!("{bin} exited non-zero: {detail}"));
         }
-        match self {
+        let answer = match self {
             Self::Claude => parse_claude_json(&stdout),
             Self::Codex => parse_codex_jsonl(&stdout),
             Self::Gemini => parse_gemini_json(&stdout),
             Self::Anthropic | Self::OpenAi => unreachable!("API providers do not spawn"),
             Self::Apple => unreachable!("the apple engine runs through run_apple"),
+        }?;
+        if let (Some(observer), Some(session)) = (observer, answer.session_id.as_deref()) {
+            observer.session(session).await;
         }
+        Ok(answer)
     }
 
     /// One HTTPS turn against `url` (a parameter so tests can point it at a
@@ -2624,6 +2704,12 @@ pub const ASK_ENV_MARKER: &str = "MUXA_ASK";
 /// failures as a JSON result on stdout with exit 1) the stdout result
 /// text, or failing that its last line, stands in. Only then "no output".
 fn non_zero_detail(stdout: &str, stderr: &str) -> String {
+    if let Some(line) = stderr
+        .lines()
+        .find(|line| line.trim_start().starts_with("error:"))
+    {
+        return line.trim().to_string();
+    }
     if let Some(line) = stderr.trim().lines().next_back() {
         return line.to_string();
     }
@@ -3052,6 +3138,34 @@ mod tests {
             AskEngine::Claude.argv("hi", Some("s-9"), AskPermissionMode::Default, &[], None);
         let at = resumed.iter().position(|a| a == "--resume").unwrap();
         assert_eq!(resumed[at + 1], "s-9");
+    }
+
+    #[test]
+    fn codex_resume_keeps_exec_options_on_the_parent_command() {
+        for mode in [
+            AskPermissionMode::Default,
+            AskPermissionMode::Plan,
+            AskPermissionMode::Edit,
+            AskPermissionMode::Bypass,
+        ] {
+            let (_, args) = AskEngine::Codex.argv(
+                "follow up",
+                Some("session-123"),
+                mode,
+                &[PathBuf::from("/extra")],
+                Some("model"),
+            );
+            let resume = args.iter().position(|arg| arg == "resume").unwrap();
+            assert!(
+                args.iter()
+                    .position(|arg| arg.starts_with("--add-dir="))
+                    .unwrap()
+                    < resume
+            );
+            assert!(args.iter().position(|arg| arg == "--json").unwrap() < resume);
+            assert_eq!(&args[resume..], &["resume", "session-123", "follow up"]);
+        }
+        assert_eq!(non_zero_detail("","error: unexpected argument '--add-dir' found\n\nUsage: codex exec resume [OPTIONS]\n\nFor more information, try '--help'."),"error: unexpected argument '--add-dir' found");
     }
 
     #[test]
@@ -4443,6 +4557,53 @@ mod tests {
             error.ends_with("exited non-zero: Invalid API key"),
             "{error}"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn location_lookup_guidance_reaches_a_fresh_cli_turn_without_replaying_on_resume() {
+        let directory = tempdir().unwrap();
+        let fake = directory.path().join("claude-locator");
+        crate::test_support::write_executable(
+            &fake,
+            "#!/bin/sh\nif [ -f first-args ]; then out=second-args; else out=first-args; fi\nprintf '%s\\n' \"$@\" > \"$out\"\nprintf '%s' '{\"type\":\"result\",\"is_error\":false,\"result\":\"located\",\"session_id\":\"locator-session\"}'\n",
+            0o755,
+        );
+        let store = AskStore::in_memory(AskOptions {
+            enabled: true,
+            cwd: directory.path().to_path_buf(),
+            providers: BTreeMap::from([(
+                "claude".into(),
+                AskProviderConfig {
+                    executable: Some(fake.display().to_string()),
+                    ..AskProviderConfig::default()
+                },
+            )]),
+            ..AskOptions::default()
+        });
+        for prompt in ["CAL-8226 작업 에이전트 위치", "다시 확인"] {
+            let pending = store.ask(prompt).await.unwrap();
+            assert_eq!(pending.prompt, prompt);
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let entries = store.list().await;
+                    let entry = entries.iter().find(|entry| entry.id == pending.id).unwrap();
+                    if entry.status != AskStatus::Running {
+                        assert_eq!(entry.status, AskStatus::Answered, "{:?}", entry.error);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let first = std::fs::read_to_string(directory.path().join("first-args")).unwrap();
+        assert!(first.contains("muxa agent find"));
+        assert!(first.contains("CAL-8226 작업 에이전트 위치"));
+        let second = std::fs::read_to_string(directory.path().join("second-args")).unwrap();
+        assert!(second.contains("locator-session"));
+        assert!(!second.contains("Global Ask:"));
     }
 
     #[cfg(unix)]

@@ -809,7 +809,9 @@ fn matching_agent(
         .iter()
         .enumerate()
         .filter(|(index, agent)| {
-            !claimed.contains(index) && agent.pane.as_deref() == Some(&pane.pane_id)
+            !claimed.contains(index)
+                && agent.ask_origin.is_none()
+                && agent.pane.as_deref() == Some(&pane.pane_id)
         })
         .filter(|_| pane_id_host_kind(&pane.pane_id).is_none_or(|kind| kind == host))
         .filter(|(_, agent)| match agent.tmux_socket.as_deref() {
@@ -872,6 +874,7 @@ mod tests {
     fn agent(agent_session_id: &str, socket: Option<&str>) -> Agent {
         let now = OffsetDateTime::UNIX_EPOCH;
         Agent {
+            ask_origin: None,
             kind: AgentKind::Codex,
             session_id: agent_session_id.into(),
             surface: None,

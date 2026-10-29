@@ -30,7 +30,7 @@ struct Proc {
 }
 
 /// Stale `muxa mcp` servers grouped by what has to restart to replace them.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StaleReport {
     /// Codex shared app-servers: `(server pid, CODEX_HOME if readable)` →
     /// number of stale per-thread servers.
@@ -41,6 +41,13 @@ pub struct StaleReport {
     pub standalone_codex: BTreeSet<String>,
     /// Stale servers whose owner could not be placed.
     pub other: usize,
+}
+
+/// One process/backend observation, classified both for upgrades and explicit
+/// reconnects. A current image can still have a closed cached host transport.
+pub struct McpOwnerInventory {
+    pub stale: StaleReport,
+    pub all: StaleReport,
 }
 
 impl StaleReport {
@@ -134,18 +141,28 @@ pub fn installed_muxa() -> Option<std::path::PathBuf> {
 /// that are not already running it. A server that re-executed itself after
 /// the upgrade keeps its old start time, so its age alone would misreport it.
 pub fn scan(binary: &Path) -> StaleReport {
+    scan_inventory(binary).stale
+}
+
+pub fn scan_inventory(binary: &Path) -> McpOwnerInventory {
     let Some(installed) = std::fs::metadata(binary)
         .and_then(|meta| meta.modified())
         .ok()
     else {
-        return StaleReport::default();
+        return McpOwnerInventory {
+            stale: StaleReport::default(),
+            all: StaleReport::default(),
+        };
     };
     let age_of_binary = SystemTime::now()
         .duration_since(installed)
         .unwrap_or_default();
     let procs = read_processes();
     if procs.is_empty() {
-        return StaleReport::default();
+        return McpOwnerInventory {
+            stale: StaleReport::default(),
+            all: StaleReport::default(),
+        };
     }
     let panes: Vec<muxa::tmux::PaneInfo> = muxa::active_backends()
         .into_iter()
@@ -159,7 +176,10 @@ pub fn scan(binary: &Path) -> StaleReport {
     let images = running_images(&candidates);
     let installed = file_id(binary);
     let runs_installed = |pid: u32| installed.is_some() && images.get(&pid).copied() == installed;
-    classify(&procs, age_of_binary, &panes, codex_home_of, runs_installed)
+    McpOwnerInventory {
+        stale: classify(&procs, age_of_binary, &panes, codex_home_of, runs_installed),
+        all: classify_matching(&procs, &panes, codex_home_of, |_| true),
+    }
 }
 
 fn classify(
@@ -168,6 +188,17 @@ fn classify(
     panes: &[muxa::tmux::PaneInfo],
     codex_home: impl Fn(u32) -> Option<String>,
     runs_installed: impl Fn(u32) -> bool,
+) -> StaleReport {
+    classify_matching(procs, panes, codex_home, |proc| {
+        proc.age > age_of_binary + START_SLACK && !runs_installed(proc.pid)
+    })
+}
+
+fn classify_matching(
+    procs: &[Proc],
+    panes: &[muxa::tmux::PaneInfo],
+    codex_home: impl Fn(u32) -> Option<String>,
+    include: impl Fn(&Proc) -> bool,
 ) -> StaleReport {
     let by_pid: HashMap<u32, &Proc> = procs.iter().map(|p| (p.pid, p)).collect();
     // A pane in a grouped session is listed once per `~view~` client
@@ -180,10 +211,7 @@ fn classify(
         .collect();
     let mut report = StaleReport::default();
     for proc in procs {
-        if !is_muxa_mcp(&proc.args)
-            || proc.age <= age_of_binary + START_SLACK
-            || runs_installed(proc.pid)
-        {
+        if !is_muxa_mcp(&proc.args) || !include(proc) {
             continue;
         }
         let mut cur = proc.parent_pid;
@@ -446,6 +474,25 @@ mod tests {
             Some(Duration::from_secs(2 * 86_400 + 3 * 3600 + 1))
         );
         assert_eq!(parse_etime("bogus"), None);
+    }
+
+    #[test]
+    fn reconnect_inventory_includes_fresh_and_reexecuted_shared_servers() {
+        let procs = [
+            proc(100, 1, 9000, "/x/codex app-server --managed-daemon"),
+            proc(101, 100, 9000, "muxa mcp"),
+            proc(102, 100, 1, "muxa mcp"),
+        ];
+        let stale = classify(
+            &procs,
+            Duration::from_secs(60),
+            &[],
+            |_| Some("/profile".into()),
+            |_| true,
+        );
+        assert_eq!(stale.total(), 0);
+        let all = classify_matching(&procs, &[], |_| Some("/profile".into()), |_| true);
+        assert_eq!(all.shared_codex[&(100, Some("/profile".into()))], 2);
     }
 
     #[test]

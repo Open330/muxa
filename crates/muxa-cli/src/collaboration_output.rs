@@ -124,6 +124,76 @@ pub(crate) fn outcome(request: &CollaborationRequest) -> Value {
     value
 }
 
+/// A completed synchronous short call needs its result and actual recipient,
+/// rather than three copies of physical routing and the caller's own identity.
+/// Preserve reply data and all transport/lineage warnings from the full outcome.
+pub(crate) fn short_call_outcome(mut value: Value, request: &CollaborationRequest) -> Value {
+    let object = value.as_object_mut().expect("call outcome is an object");
+    object.remove("from");
+    object.remove("to");
+    if let Some(original) = object
+        .get("selected_peer")
+        .filter(|p| {
+            p.get("agent_session_id").and_then(Value::as_str)
+                != Some(request.to.agent_session_id.as_str())
+        })
+        .cloned()
+    {
+        let mut previous = json!({});
+        for key in ["agent_session_id", "pane", "agent_kind", "alias", "roles"] {
+            if let Some(field) = original.get(key).filter(|v| !v.is_null()) {
+                previous[key] = field.clone();
+            }
+        }
+        object.insert("original_selected_peer".into(), previous);
+    }
+    let mut recipient = json!({"agent_session_id":request.to.agent_session_id,
+        "pane":request.to.pane,"agent_kind":request.to.agent_kind});
+    if let Some(alias) = &request.to.alias {
+        recipient["alias"] = json!(alias);
+    }
+    if !request.to.roles.is_empty() {
+        recipient["roles"] = json!(request.to.roles);
+    }
+    object.insert("selected_peer".into(), recipient);
+    if !request.rebound_from.is_empty() {
+        object.insert("rebound_from".into(), json!(request.rebound_from));
+    }
+    for key in [
+        "expanded_skill",
+        "spawned",
+        "parent_request_id",
+        "workspace_id",
+        "work_id",
+        "run_id",
+    ] {
+        if object.get(key).is_some_and(Value::is_null) {
+            object.remove(key);
+        }
+    }
+    if object.get("thread_id").and_then(Value::as_str) == Some(request.id.as_str()) {
+        object.remove("thread_id");
+    }
+    value
+}
+
+/// CLI mutation acknowledgement: initial routing, then correlation only.
+/// Bodies already supplied by the caller are never echoed by default.
+pub(crate) fn acknowledgement(request: &CollaborationRequest, full: bool) -> Value {
+    if full {
+        json!(request)
+    } else if request.reply.is_some()
+        || matches!(
+            request.status,
+            RequestStatus::Cancelled | RequestStatus::Expired
+        )
+    {
+        mutation_receipt(request)
+    } else {
+        receipt(request)
+    }
+}
+
 /// Preserve all instructions and artifacts needed to act, without audit metadata.
 pub(crate) fn message(request: &CollaborationRequest, include_body: bool) -> Value {
     let mut value = receipt(request);
@@ -152,6 +222,22 @@ pub(crate) fn message(request: &CollaborationRequest, include_body: bool) -> Val
     value
 }
 
+pub(crate) use muxa::collaboration::instruction::inbox_instruction;
+
+/// Shared CLI/MCP inbox projection. Full records remain opt-in for diagnostics.
+pub(crate) fn inbox(requests: &[CollaborationRequest], full: bool) -> Value {
+    json!(requests
+        .iter()
+        .map(|request| {
+            if full {
+                json!(request)
+            } else {
+                inbox_instruction(request)
+            }
+        })
+        .collect::<Vec<_>>())
+}
+
 /// Progress reads never repeat routing, instructions, or a potentially large reply.
 pub(crate) fn progress(request: &CollaborationRequest, after: u64) -> Value {
     let mut value = mutation_receipt(request);
@@ -165,7 +251,7 @@ pub(crate) fn updates(request: &CollaborationRequest, after: u64) -> Value {
         .updates
         .iter()
         .filter(|u| u.sequence > after)
-        .map(|u| { json!({"sequence":u.sequence, "author":endpoint(&u.author), "body":u.body}) })
+        .map(|u| { json!({"sequence":u.sequence, "author":{"label":u.author.label(), "agent_session_id":u.author.agent_session_id,"pane":u.author.pane,"agent_kind":u.author.agent_kind}, "body":u.body}) })
         .collect::<Vec<_>>())
 }
 
@@ -407,5 +493,305 @@ mod tests {
         assert!(mutation_receipt(&request)
             .get("report_basis_matched")
             .is_none());
+    }
+    #[test]
+    fn compact_inbox_preserves_instructions_and_stable_authors_with_full_record_opt_in() {
+        let mut request = fixture();
+        request.from.cwd = Some("/private/project".into());
+        request.updates = vec![CollaborationUpdate {
+            sequence: 1,
+            author: request.from.clone(),
+            body: "required follow-up".into(),
+            at: OffsetDateTime::UNIX_EPOCH,
+        }];
+        let records = vec![request.clone()];
+        let compact = inbox(&records, false);
+        for field in ["kind", "work_mode", "paths", "body", "expects_reply"] {
+            assert_eq!(compact[0][field], json!(request)[field]);
+        }
+        assert_eq!(compact[0]["request_id"], request.id);
+        assert_eq!(
+            compact[0]["updates"][0]["author"]["agent_session_id"],
+            json!(request.from.agent_session_id)
+        );
+        assert!(compact[0]["updates"][0]["author"].get("room").is_none());
+        assert!(!compact.to_string().contains("/private/project"));
+        assert!(compact[0].get("provenance").is_none());
+        let full = inbox(&records, true);
+        let restored: Vec<CollaborationRequest> = serde_json::from_value(full.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), full);
+        assert_eq!(full[0], json!(request));
+        assert!(compact.to_string().len() < full.to_string().len());
+    }
+    fn overhead_case(body: String) -> CollaborationRequest {
+        let mut request = fixture();
+        request.id = "req_0123456789abcdef_1".into();
+        request.from.agent_session_id = "01a1820e-a385-79d0-acfd-8ebda41e2d5b".into();
+        request.from.pane = "rmux:%290".into();
+        request.from.cwd = Some("unused-audit".repeat(500));
+        request.created_at = OffsetDateTime::now_utc();
+        request.body = body;
+        request.paths.clear();
+        request.artifacts.clear();
+        request.links.clear();
+        request
+    }
+
+    fn overhead_measurement(name: &str, request: &CollaborationRequest) -> Value {
+        let data = inbox(std::slice::from_ref(request), false);
+        let cli = data.to_string().len() + 1;
+        let mcp = json!({"requests":data}).to_string();
+        let escaped = json!(request.body).to_string().len() - 2;
+        let body = request.body.len();
+        let mut payload = escaped + json!(request.paths).to_string().len();
+        for key in [
+            "task_contract",
+            "attempt",
+            "artifacts",
+            "links",
+            "air_artifacts",
+        ] {
+            if let Some(value) = data[0].get(key) {
+                payload += value.to_string().len();
+            }
+        }
+        payload += request
+            .updates
+            .iter()
+            .map(|update| json!(update.body).to_string().len() - 2)
+            .sum::<usize>();
+        // MCP text payload and JSON wire bytes are different measurements.
+        let wire = json!({"content":[{"type":"text","text":mcp}]})
+            .to_string()
+            .len();
+        json!({"case":name,"body_utf8_bytes":body,"escaped_body_bytes":escaped,
+            "json_escape_bytes":escaped-body,"cli_stdout_bytes":cli,
+            "extra_over_raw_body_bytes":cli-body,"extra_over_raw_body_pct":f64::from(u32::try_from(cli-body).unwrap())/f64::from(u32::try_from(body).unwrap())*100.0,
+            "instruction_value_bytes":payload,"structural_extra_bytes":cli-payload,
+            "mcp_text_bytes":mcp.len(),"serialized_mcp_result_bytes":wire, "sender_routing_receipt_bytes":acknowledgement(request,false).to_string().len()+1, "legacy_sender_full_record_bytes":serde_json::to_string_pretty(request).unwrap().len()+1})
+    }
+
+    #[test]
+    fn inbox_overhead_is_bounded_above_body_and_required_payload_values() {
+        let mut cases = vec![
+            ("ascii_100", overhead_case("x".repeat(100))),
+            (
+                "korean_4k",
+                overhead_case(format!("{}x", "한".repeat(1365))),
+            ),
+            (
+                "escaped",
+                overhead_case(
+                    [
+                        char::from(34),
+                        char::from(92),
+                        char::from(10),
+                        char::from(9),
+                    ]
+                    .iter()
+                    .collect::<String>()
+                    .repeat(128),
+                ),
+            ),
+        ];
+        let mut contracted = overhead_case("review this revision".into());
+        let mut value = json!(contracted);
+        value["task_contract"] = json!({"version":1,"task_id":"review","objective":"Review this revision","acceptance_criteria":["check compatibility"],"basis_revision":"a".repeat(40)});
+        value["attempt"] =
+            json!({"id":"attempt-test","task_id":"review","basis_revision":"a".repeat(40)});
+        contracted = serde_json::from_value(value).unwrap();
+        cases.push(("contract", contracted));
+        let mut amended = overhead_case("original instructions".into());
+        amended.updates = (1..=3)
+            .map(|sequence| CollaborationUpdate {
+                sequence,
+                author: amended.from.clone(),
+                body: format!("required guidance {sequence}"),
+                at: OffsetDateTime::UNIX_EPOCH,
+            })
+            .collect();
+        cases.push(("three_updates", amended));
+        let mut report = Vec::new();
+        for (name, request) in &cases {
+            let measured = overhead_measurement(name, request);
+            let budget = 240 + request.updates.len() * 140;
+            assert!(
+                measured["structural_extra_bytes"].as_u64().unwrap() <= budget as u64,
+                "{measured}; budget={budget}"
+            );
+            let data = inbox_instruction(request);
+            for field in ["body", "kind", "work_mode", "expects_reply"] {
+                assert_eq!(data[field], json!(request)[field]);
+            }
+            assert_eq!(data["paths"], json!(request.paths));
+            assert!(data.get("to").is_none());
+            assert!(data.get("run_id").is_none());
+            assert!(data.get("final_reply_received").is_none());
+            assert!(data.get("delivery_state").is_none());
+            assert!(data["from"].get("room").is_none());
+            assert!(data.get("requested_basis_revision").is_none());
+            if let Some(contract) = &request.task_contract {
+                assert_eq!(data["task_contract"], json!(contract));
+                assert_eq!(data["attempt"], json!(request.attempt));
+            }
+            if !request.updates.is_empty() {
+                assert_eq!(
+                    data["updates"].as_array().unwrap().len(),
+                    request.updates.len()
+                );
+                assert_eq!(data["updates"][0]["body"], request.updates[0].body);
+                assert_eq!(data["next_after_update"], 3);
+                assert_eq!(data["first_retained_sequence"], 1);
+            }
+            report.push(measured);
+        }
+        // A regression to the old physical sender endpoint must exceed the
+        // base budget, even though all functional instruction fields remain.
+        let mut bloated = inbox_instruction(&cases[0].1);
+        bloated["from"] = endpoint(&cases[0].1.from);
+        assert!(json!([bloated]).to_string().len() + 1 - cases[0].1.body.len() > 240);
+        assert_eq!(
+            report[0]["structural_extra_bytes"],
+            report[1]["structural_extra_bytes"]
+        );
+        assert_eq!(
+            report[1]["structural_extra_bytes"],
+            report[2]["structural_extra_bytes"]
+        );
+        if let Ok(path) = std::env::var("MUXA_OVERHEAD_REPORT") {
+            if let Ok(source) = std::env::var("MUXA_OVERHEAD_REQUEST") {
+                let requests: Vec<CollaborationRequest> =
+                    serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+                report.push(overhead_measurement("previous_live_body", &requests[0]));
+            }
+            std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn instruction_projection_retains_authority_context_and_omits_only_unneeded_routing() {
+        let mut request = overhead_case("note".into());
+        request.from.console = true;
+        request.expects_reply = false;
+        request.thread_id = Some(request.id.clone());
+        request.parent_request_id = Some("parent".into());
+        request.superseded_by = Some("replacement".into());
+        let value = inbox_instruction(&request);
+        assert_eq!(value["from"]["console"], true);
+        assert_eq!(value["expects_reply"], false);
+        assert_eq!(value["paths"], json!([]));
+        assert_eq!(value["superseded_by"], "replacement");
+        assert_eq!(value["parent_request_id"], "parent");
+        assert!(value.get("thread_id").is_none());
+        let mut raw = json!(request);
+        raw["provenance"] =
+            json!({"client_kind":"watch","origin_match":"mismatched","caller_pid":42});
+        raw["to_slot"] = json!({"room":{"host":"local","window_id":"@1"},"role":"reviewer"});
+        let request: CollaborationRequest = serde_json::from_value(raw).unwrap();
+        let value = inbox_instruction(&request);
+        assert_eq!(value["provenance"]["origin_match"], "mismatched");
+        assert!(value["provenance"].get("caller_pid").is_none());
+        assert_eq!(value["to_slot"]["role"], "reviewer");
+        let mut stale = request.clone();
+        stale.created_at = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        assert!(
+            inbox_instruction(&stale)["request_age_minutes"]
+                .as_i64()
+                .unwrap()
+                >= 120
+        );
+        assert!(inbox_instruction(&request)
+            .get("request_age_minutes")
+            .is_none());
+        assert_eq!(
+            inbox(std::slice::from_ref(&request), true)[0],
+            json!(request)
+        );
+    }
+    #[test]
+    fn acknowledgements_do_not_repeat_supplied_bodies_and_full_remains_lossless() {
+        let mut request = fixture();
+        request.body = "original-body-marker".repeat(512);
+        let first = acknowledgement(&request, false);
+        assert!(first.get("body").is_none());
+        assert!(first.get("to").is_some());
+        request.reply = Some(CollaborationReply {
+            status: RequestStatus::Completed,
+            body: "reply-body-marker".repeat(512),
+            artifacts: vec![],
+            air_artifacts: vec![],
+            at: OffsetDateTime::UNIX_EPOCH,
+            report: None,
+        });
+        request.status = RequestStatus::Completed;
+        let ack = acknowledgement(&request, false);
+        assert_eq!(ack["reported_status"], "completed");
+        assert_eq!(ack["final_reply_received"], true);
+        assert!(ack.to_string().len() < 220);
+        assert!(ack.get("from").is_none());
+        assert!(ack.get("reply").is_none());
+        assert_eq!(acknowledgement(&request, true), json!(request));
+        request.reply = None;
+        request.status = RequestStatus::Cancelled;
+        assert_eq!(
+            acknowledgement(&request, false)["delivery_state"],
+            "cancelled"
+        );
+    }
+}
+
+#[cfg(test)]
+mod short_call_tests {
+    use super::*;
+    #[test]
+    fn short_result_retains_reply_warnings_lineage_and_real_recipient() {
+        let mut request = fixture();
+        request.to.alias = Some("reviewer".into());
+        request.to.roles = vec!["reviewer".into()];
+        request.rebound_from = vec!["previous-worker".into()];
+        for status in ["completed", "blocked", "declined", "failed"] {
+            let original = json!({"request_id":request.id,"thread_id":request.id,
+                "from":request.from,"to":request.to,"selected_peer":{"agent_session_id":"stale-selection"},
+                "sent":true,"final_reply_received":true,"reported_status":status,
+                "reply":{"body":"complete original reply","status":status,"artifacts":["proof"]},
+                "selection_reason":"explicit","expanded_skill":null,"spawned":null,
+                "parent_request_id":null,"workspace_id":null,"work_id":null,"run_id":null,
+                "result_applicability":"superseded","superseded_by":"next-request"});
+            let compact = short_call_outcome(original.clone(), &request);
+            assert_eq!(compact["reply"], original["reply"]);
+            assert_eq!(compact["selected_peer"]["alias"], "reviewer");
+            assert_eq!(compact["selected_peer"]["roles"], json!(["reviewer"]));
+            assert_eq!(
+                compact["original_selected_peer"]["agent_session_id"],
+                "stale-selection"
+            );
+            assert_eq!(compact["rebound_from"], json!(["previous-worker"]));
+            assert_eq!(compact["reported_status"], status);
+            assert_eq!(compact["result_applicability"], "superseded");
+            assert_eq!(compact["superseded_by"], "next-request");
+            assert_eq!(
+                compact["selected_peer"]["agent_session_id"],
+                request.to.agent_session_id
+            );
+            assert!(compact.get("from").is_none() && compact.get("to").is_none());
+            assert!(compact.get("thread_id").is_none() && compact.get("spawned").is_none());
+            assert!(compact.to_string().len() < original.to_string().len());
+            let mut threaded = original;
+            threaded["thread_id"] = json!("parent-thread");
+            threaded["parent_request_id"] = json!("parent");
+            threaded["spawned"] = json!({"pane":"%2"});
+            threaded["work_id"] = json!("work");
+            threaded["expanded_skill"] = json!("review");
+            let compact = short_call_outcome(threaded.clone(), &request);
+            for key in [
+                "thread_id",
+                "parent_request_id",
+                "spawned",
+                "work_id",
+                "expanded_skill",
+            ] {
+                assert_eq!(compact[key], threaded[key]);
+            }
+        }
     }
 }

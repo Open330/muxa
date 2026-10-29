@@ -5103,6 +5103,7 @@ mod tests {
         let mut stream = BroadcastStream::new(rx);
 
         let agent = Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: AgentKind::ClaudeCode,
@@ -5214,6 +5215,7 @@ mod tests {
         // Fill + overflow the buffer. Capacity is 2; we send 5 so the
         // receiver is now 3 messages behind.
         let agent = Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: AgentKind::ClaudeCode,

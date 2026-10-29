@@ -113,7 +113,7 @@ returns historical evidence. Recovery escalations close when their parent ends.
 ```sh
 muxa msg send role:reviewer 'Review the submitted change' --kind review \
   --task-contract contract.json --json
-muxa msg inbox --json
+muxa msg accept REQUEST_ID --json
 muxa msg reply REQUEST_ID 'Findings and evidence' --report report.json --json
 
 # New revision; use a fresh dispatch and the actual old request ID.

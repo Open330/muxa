@@ -51,7 +51,7 @@ const EXTERNAL_TITLE_OPTION: &str = "@muxa_external_title";
 const EXTERNAL_URL_OPTION: &str = "@muxa_external_url";
 const EXTERNAL_STATUS_OPTION: &str = "@muxa_external_status";
 
-const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}";
+const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@muxa_workspace_id}\t#{@muxa_workspace_cwd}\t#{@muxa_managed_workspace}\t#{session_attached}\t#{session_windows}\t#{session_group}";
 const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@muxa_work_id}\t#{@muxa_work_cwd}\t#{@muxa_managed_work}\t#{@muxa_external_source}\t#{@muxa_external_scope}\t#{@muxa_external_stable_id}\t#{@muxa_external_key}\t#{@muxa_external_title}\t#{@muxa_external_url}\t#{@muxa_external_status}";
 const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@muxa_agent}\t#{@muxa_agent_role}\t#{@muxa_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@muxa_managed_agent}\t#{@muxa_agent_workspace_id}\t#{@muxa_agent_work_id}\t#{@muxa_agent_alias}";
 const WINDOW_IDENTITY_FORMAT: &str =
@@ -2496,11 +2496,31 @@ fn external_option_value(raw: Option<&str>, max: usize) -> String {
 
 fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<WorkspaceInfo> {
     let mut workspaces = Vec::new();
-    for line in sessions.lines() {
-        let fields: Vec<&str> = line.split('\t').collect();
+    let rows: Vec<Vec<&str>> = sessions
+        .lines()
+        .map(|line| line.split('\t').collect())
+        .collect();
+    let mut canonical = std::collections::HashMap::<&str, &str>::new();
+    for fields in &rows {
+        if fields.len() >= 8 && !fields[2].trim().is_empty() && !fields[7].is_empty() {
+            canonical
+                .entry(fields[7])
+                .and_modify(|id| {
+                    if tmux_session_id_cmp(fields[1], id).is_lt() {
+                        *id = fields[1];
+                    }
+                })
+                .or_insert(fields[1]);
+        }
+    }
+    for fields in &rows {
         // A workspace id is enough to be findable; `managed` decides what
         // muxa may do to the session, not whether it can see it.
         if fields.len() < 7 || fields[2].trim().is_empty() {
+            continue;
+        }
+        let group = fields.get(7).copied().filter(|group| !group.is_empty());
+        if group.is_some_and(|group| canonical.get(group).is_some_and(|id| *id != fields[1])) {
             continue;
         }
         let session = fields[0].to_string();
@@ -2518,7 +2538,15 @@ fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<Workspace
             session_id: session_id_owned,
             managed: fields[4] == "1",
             cwd: PathBuf::from(fields[3]),
-            attached_clients: fields[5].parse().unwrap_or(0),
+            attached_clients: group.map_or_else(
+                || fields[5].parse().unwrap_or(0),
+                |group| {
+                    rows.iter()
+                        .filter(|row| row.get(7) == Some(&group))
+                        .map(|row| row[5].parse::<u32>().unwrap_or(0))
+                        .fold(0_u32, u32::saturating_add)
+                },
+            ),
             windows: fields[6].parse().unwrap_or(0),
             works,
         });
@@ -2543,9 +2571,11 @@ fn parse_work_window(
     }
     let work = fields[5].trim().to_ascii_uppercase();
     let window = fields[2].to_string();
+    let mut seen = std::collections::HashSet::new();
     let agents = panes
         .lines()
         .filter_map(|line| parse_agent_pane(line, &window, workspace, &work))
+        .filter(|agent| seen.insert(agent.pane.clone()))
         .collect();
     Some(WorkInfo {
         work,
@@ -3063,6 +3093,30 @@ mod tests {
         // for the pipeline diff to claim it by.
         assert_eq!(workspaces[0].works[0].agents[1].pane, "%4");
         assert!(workspaces[0].works[0].agents[1].alias.is_none());
+    }
+
+    #[test]
+    fn grouped_workspaces_use_the_oldest_session_and_deduplicate_agents() {
+        let sessions="base~view~test\t$107\tproject\t/repo\t1\t1\t1\tbase\nrenamed\t$99\tproject\t/repo\t1\t1\t1\tbase\n";
+        let windows="base~view~test\t$107\t@7\t0\tTASK\tTASK\t/repo\t1\nrenamed\t$99\t@7\t0\tTASK\tTASK\t/repo\t1\n";
+        let panes="renamed\t@7\t%1\tcodex\tfixture\tcheck\tcodex\t/repo\t1\tproject\tTASK\ta\nbase~view~test\t@7\t%1\tcodex\tfixture\tcheck\tcodex\t/repo\t1\tproject\tTASK\ta\n";
+        let workspaces = parse_workspaces(sessions, windows, panes);
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].session_id, "$99");
+        assert_eq!(workspaces[0].session, "renamed");
+        assert_eq!(workspaces[0].attached_clients, 2);
+        assert_eq!(workspaces[0].works.len(), 1);
+        assert_eq!(workspaces[0].works[0].agents.len(), 1);
+        let distinct = parse_workspaces(
+            "a\t$1\tproject\t/repo\t1\t0\t1\t\nb\t$2\tproject\t/repo\t1\t0\t1\t\n",
+            "",
+            "",
+        );
+        assert_eq!(
+            distinct.len(),
+            2,
+            "independent claims remain visible for anomaly detection"
+        );
     }
 
     fn work_at(workspace: &str, work: &str) -> WorkInfo {

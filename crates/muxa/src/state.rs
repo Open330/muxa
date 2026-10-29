@@ -165,8 +165,18 @@ pub struct Subagent {
     pub started_at: OffsetDateTime,
 }
 
+/// Explicit execution ownership, persisted independently of Ask history.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AskOrigin {
+    pub execution_id: String,
+    #[serde(default)]
+    pub awaiting_interactive_binding: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Agent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ask_origin: Option<AskOrigin>,
     pub kind: AgentKind,
     /// Agent-runtime session identity (Claude/Codex/etc.). The Rust field name
     /// remains temporarily source-compatible, while every serialized public
@@ -350,6 +360,7 @@ impl Agent {
         at: OffsetDateTime,
     ) -> Self {
         Self {
+            ask_origin: None,
             kind,
             session_id,
             surface,
@@ -440,7 +451,14 @@ pub struct PromptRecord {
     pub model: Option<String>,
 }
 
+struct AskExecutionScope {
+    kind: AgentKind,
+    cwd: String,
+    session: Option<String>,
+}
+
 pub struct Store {
+    ask_executions: std::sync::Mutex<HashMap<String, AskExecutionScope>>,
     /// Registry of live agents, keyed by session id.
     ///
     /// **Invariant — never hold this write guard across an `.await`.** Every
@@ -513,6 +531,7 @@ impl Store {
         let (tx, _) = broadcast::channel(TRANSITION_CHANNEL_CAPACITY);
         let (prompts_tx, _) = broadcast::channel(PROMPT_CHANNEL_CAPACITY);
         Self {
+            ask_executions: std::sync::Mutex::new(HashMap::new()),
             agents: RwLock::default(),
             transitions: tx,
             changes: watch::channel(()).0,
@@ -1317,8 +1336,118 @@ impl Store {
         self.prompts.subscribe()
     }
 
-    #[tracing::instrument(level = "debug", skip(self, ev), fields(event_type))]
+    pub async fn begin_ask_execution(
+        &self,
+        run: &str,
+        kind: AgentKind,
+        cwd: &str,
+        resume: Option<&str>,
+    ) {
+        self.ask_executions.lock().unwrap().insert(
+            run.into(),
+            AskExecutionScope {
+                kind,
+                cwd: cwd.into(),
+                session: resume.map(str::to_owned),
+            },
+        );
+        if let Some(session) = resume {
+            self.mark_ask_owned(session, run, kind, cwd).await;
+        }
+        self.changes.send_replace(());
+    }
+
+    pub async fn mark_ask_owned(&self, session: &str, run: &str, kind: AgentKind, cwd: &str) {
+        // Keep the unknown-session gate in place until the row is tagged.
+        let mut agents = self.agents.write().await;
+        let row = agents.entry(session.into()).or_insert_with(|| {
+            Agent::new(
+                kind,
+                session.into(),
+                None,
+                None,
+                Some(cwd.into()),
+                OffsetDateTime::now_utc(),
+            )
+        });
+        // A conversation may have been opened interactively since the last
+        // Ask turn. Headless reuse must preserve its trusted live binding.
+        let interactive = row.ask_origin.is_none() && (row.pane.is_some() || row.surface.is_some());
+        if !interactive {
+            row.ask_origin = Some(AskOrigin {
+                execution_id: run.into(),
+                awaiting_interactive_binding: false,
+            });
+            row.pane = None;
+            row.surface = None;
+            row.tmux_socket = None;
+            row.tmux_session = None;
+        }
+        drop(agents);
+        if let Some(scope) = self.ask_executions.lock().unwrap().get_mut(run) {
+            scope.session = Some(session.into());
+        }
+        self.dirty.notify_one();
+        self.changes.send_replace(());
+    }
+
+    pub async fn end_ask_execution(&self, run: &str) {
+        // Retire the owned child, including one that never emitted hooks.
+        let mut agents = self.agents.write().await;
+        for row in agents.values_mut().filter(|row| {
+            row.ask_origin
+                .as_ref()
+                .is_some_and(|o| o.execution_id == run)
+        }) {
+            row.state = AgentState::Stopped;
+            row.state_entered_at = OffsetDateTime::now_utc();
+        }
+        drop(agents);
+        self.ask_executions.lock().unwrap().remove(run);
+        self.dirty.notify_one();
+        self.changes.send_replace(());
+    }
+
+    fn ask_is_active(&self, row: &Agent) -> bool {
+        self.ask_executions
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(run, scope)| {
+                row.ask_origin
+                    .as_ref()
+                    .is_some_and(|origin| &origin.execution_id == run)
+                    || scope.session.as_deref() == Some(&row.session_id)
+            })
+    }
+
+    fn ask_session_pending(&self, row: &Agent) -> bool {
+        row.pane.is_none()
+            && row.surface.is_none()
+            && row.pid.is_none()
+            && self.ask_executions.lock().unwrap().values().any(|scope| {
+                scope.session.is_none()
+                    && scope.kind == row.kind
+                    && row.cwd.as_deref() == Some(scope.cwd.as_str())
+            })
+    }
+
     pub async fn apply(&self, ev: &AgentEvent) {
+        self.apply_with_ask(ev, None).await;
+    }
+
+    #[allow(clippy::too_many_lines)] // one event transaction, with provenance checked before pane reconciliation
+    #[tracing::instrument(level = "debug", skip(self, ev), fields(event_type))]
+    pub async fn apply_with_ask(&self, ev: &AgentEvent, ask_entry: Option<&str>) {
+        let mut sanitized;
+        let ev = if ask_entry.is_some() {
+            sanitized = ev.clone();
+            sanitized.id_mut().pane = None;
+            sanitized.id_mut().surface = None;
+            &sanitized
+        } else {
+            ev
+        };
         // Wall-clock start of the apply, used for the elapsed-time
         // emit at the bottom. Cheap monotonic clock read; no syscall on
         // Linux, just a `vDSO` call.
@@ -1329,6 +1458,26 @@ impl Store {
         self.metrics.record_event();
         let mut agents = self.agents.write().await;
         let id = ev.id();
+        if agents.get(&id.session_id).is_some_and(|row| {
+            row.ask_origin.is_none()
+                && (row.pane.is_some() || row.surface.is_some())
+                && (ask_entry.is_some()
+                    || (id.pane.is_none() && id.surface.is_none() && self.ask_is_active(row)))
+        }) {
+            return;
+        }
+        // Shared provider servers may deliver trailing hooks after their
+        // headless child has exited. They cannot resurrect that child.
+        if agents.get(&id.session_id).is_some_and(|row| {
+            row.ask_origin.is_some()
+                && row.state == AgentState::Stopped
+                && !self.ask_is_active(row)
+                && id.pane.is_none()
+                && id.surface.is_none()
+                && !matches!(ev, AgentEvent::PromptSubmitted { .. })
+        }) {
+            return;
+        }
         let at = ev.at();
         // Tag the span with a stable string identifier for the variant
         // so trace consumers can group without leaking large fields
@@ -1392,6 +1541,25 @@ impl Store {
             )
         });
 
+        if let Some(run) = ask_entry {
+            agent.ask_origin = Some(AskOrigin {
+                execution_id: run.into(),
+                awaiting_interactive_binding: false,
+            });
+        }
+        if ask_entry.is_none() && agent.ask_origin.is_some() && !self.ask_is_active(agent) {
+            if id.pane.is_some() || id.surface.is_some() {
+                agent.ask_origin = None;
+            } else if let AgentEvent::PromptSubmitted { prompt, .. } = ev {
+                if agent.last_prompt.as_deref() != Some(prompt.as_str()) {
+                    agent
+                        .ask_origin
+                        .as_mut()
+                        .unwrap()
+                        .awaiting_interactive_binding = true;
+                }
+            }
+        }
         // Keep identity fields fresh — adapters may re-send with more info.
         refresh_pane(agent, id, new_agent);
         refresh_endpoint(agent, id);
@@ -1405,12 +1573,26 @@ impl Store {
                 existing.workspace.clone_from(&incoming.workspace);
             }
         }
+        if agent.ask_origin.is_some() {
+            agent.pane = None;
+            agent.surface = None;
+            agent.tmux_socket = None;
+            agent.tmux_session = None;
+        }
         if agent.cwd.is_none() {
             agent.cwd.clone_from(&id.cwd);
         }
         let metrics_changed = heartbeat_changes_metrics(agent, ev);
         let prev_state = agent.state;
         let (prompt_record, history_entry, touches_activity) = mutate_for_event(agent, ev, id, at);
+        // Unobserved one-shot CLI executions still carry the hook marker.
+        if agent.ask_origin.is_some()
+            && !self.ask_is_active(agent)
+            && matches!(ev, AgentEvent::TurnStopped { .. })
+        {
+            agent.state = AgentState::Stopped;
+            agent.state_entered_at = at;
+        }
         if touches_activity {
             agent.last_activity_at = at;
         }
@@ -1495,6 +1677,14 @@ impl Store {
         self.dirty.notify_one();
         self.changes.send_replace(());
     }
+    pub async fn directory_snapshot(&self) -> Vec<Agent> {
+        self.snapshot()
+            .await
+            .into_iter()
+            .filter(|a| a.ask_origin.is_none() && !self.ask_session_pending(a))
+            .collect()
+    }
+
     pub async fn snapshot(&self) -> Vec<Agent> {
         self.agents.read().await.values().cloned().collect()
     }
@@ -1754,6 +1944,48 @@ impl Store {
             self.changes.send_replace(());
         }
         flipped
+    }
+
+    /// A screen observer may clear a resolved Claude dialog only if no hook,
+    /// move or process replacement changed the exact row during capture.
+    /// This is state evidence, not new model activity.
+    pub async fn recover_claude_wait_from_screen(
+        &self,
+        expected: &Agent,
+        at: OffsetDateTime,
+    ) -> bool {
+        let mut agents = self.agents.write().await;
+        let Some(agent) = agents.get_mut(&expected.session_id) else {
+            return false;
+        };
+        if agent.kind != AgentKind::ClaudeCode
+            || !matches!(
+                agent.state,
+                AgentState::WaitingInput | AgentState::WaitingChoice
+            )
+            || agent.state != expected.state
+            || agent.last_activity_at != expected.last_activity_at
+            || agent.state_entered_at != expected.state_entered_at
+            || agent.pane != expected.pane
+            || agent.tmux_socket != expected.tmux_socket
+            || agent.workload.primary_pid != expected.workload.primary_pid
+            || agent.rate_limit_scope.is_some()
+        {
+            return false;
+        }
+        let from = agent.state;
+        agent.state = AgentState::Idle;
+        agent.state_entered_at = at;
+        agent.last_notification = None;
+        let _ = self.transitions.send(Transition {
+            from,
+            to: agent.state,
+            agent: Arc::new(agent.clone()),
+        });
+        drop(agents);
+        self.dirty.notify_one();
+        self.changes.send_replace(());
+        true
     }
 
     /// Flip agent rows to `Stopped` whose pane has run no agent process for
@@ -2196,6 +2428,7 @@ impl Store {
         agents: &mut HashMap<String, Agent>,
         panes_by_id: &HashMap<&str, Vec<&PaneInfo>>,
         codex_hosts: &[PaneInfo],
+        pending: &[(AgentKind, String)],
     ) -> usize {
         // A pane's cwd, resolved the same way `backfill_tmux_names` picks the
         // right candidate when a pane id repeats across tmux servers.
@@ -2266,6 +2499,10 @@ impl Store {
                 || is_synthetic(sid)
                 || a.pane.is_some()
                 || a.pid.is_some()
+                || a.ask_origin.is_some()
+                || pending
+                    .iter()
+                    .any(|(kind, cwd)| *kind == a.kind && a.cwd.as_ref() == Some(cwd))
             {
                 continue;
             }
@@ -2398,12 +2635,21 @@ impl Store {
             };
             if !matches!(agent.kind, AgentKind::Codex | AgentKind::ClaudeCode)
                 || agent.surface.is_some()
+                || self.ask_is_active(agent)
             {
                 continue;
             }
-            if agent.pane.as_deref() == Some(&pane.pane_id) && agent.tmux_socket == pane.socket {
+            if agent.ask_origin.is_none()
+                && agent.pane.as_deref() == Some(&pane.pane_id)
+                && agent.tmux_socket == pane.socket
+            {
                 continue;
             }
+            if agent.ask_origin.is_some() && agent.state == AgentState::Stopped {
+                agent.state = AgentState::Starting;
+                agent.state_entered_at = OffsetDateTime::now_utc();
+            }
+            agent.ask_origin = None;
             agent.pane = Some(pane.pane_id.clone());
             agent.tmux_socket.clone_from(&pane.socket);
             agent.tmux_session = Some(pane.session.clone());
@@ -2488,7 +2734,19 @@ impl Store {
         for p in live_panes {
             panes_by_id.entry(p.pane_id.as_str()).or_default().push(p);
         }
-        let adopted = Self::correlate_paneless_codex(&mut agents, &panes_by_id, codex_hosts);
+        let adopted = Self::correlate_paneless_codex(
+            &mut agents,
+            &panes_by_id,
+            codex_hosts,
+            &self
+                .ask_executions
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|scope| scope.session.is_none())
+                .map(|scope| (scope.kind, scope.cwd.clone()))
+                .collect::<Vec<_>>(),
+        );
         if adopted > 0 {
             drop(agents);
             self.dirty.notify_one();
@@ -2499,11 +2757,9 @@ impl Store {
 
     /// Whether `session_id` is a real Codex thread still waiting for a pane.
     pub(crate) async fn is_unplaced_codex(&self, session_id: &str) -> bool {
-        self.agents
-            .read()
-            .await
-            .get(session_id)
-            .is_some_and(crate::codex_binding::is_unplaced_codex)
+        self.agents.read().await.get(session_id).is_some_and(|a| {
+            crate::codex_binding::is_prompt_binding_candidate(a) && !self.ask_session_pending(a)
+        })
     }
 
     /// Live Codex hosts at the cwd of a still-unbound Codex thread that no
@@ -2513,7 +2769,10 @@ impl Store {
         let agents = self.agents.read().await;
         let unbound_cwds: HashSet<&str> = agents
             .values()
-            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter(|agent| {
+                crate::codex_binding::is_prompt_binding_candidate(agent)
+                    && !self.ask_session_pending(agent)
+            })
             .filter_map(|agent| agent.cwd.as_deref().map(str::trim))
             .filter(|cwd| !cwd.is_empty())
             .collect();
@@ -2542,7 +2801,10 @@ impl Store {
         let mut agents = self.agents.write().await;
         let rows: Vec<(String, String, String)> = agents
             .values()
-            .filter(|agent| crate::codex_binding::is_unplaced_codex(agent))
+            .filter(|agent| {
+                crate::codex_binding::is_prompt_binding_candidate(agent)
+                    && !self.ask_session_pending(agent)
+            })
             .filter_map(|agent| {
                 let cwd = agent.cwd.as_deref()?.trim();
                 let needle = crate::codex_binding::prompt_needle(agent.last_prompt.as_deref()?)?;
@@ -2581,6 +2843,7 @@ impl Store {
                 }
             }
             if let Some(agent) = agents.get_mut(&session) {
+                agent.ask_origin = None;
                 agent.pane = Some(pane.pane_id.clone());
                 agent.tmux_socket.clone_from(&pane.socket);
                 bound += 1;
@@ -2798,6 +3061,7 @@ mod tests {
     ) -> Agent {
         let at = datetime!(2026-05-05 12:00:00 UTC);
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind,
@@ -6472,6 +6736,7 @@ mod tests {
             agents.insert(
                 "real-old".into(),
                 Agent {
+                    ask_origin: None,
                     tmux_socket: None,
                     tmux_session: None,
                     kind: AgentKind::ClaudeCode,
@@ -6507,6 +6772,7 @@ mod tests {
             agents.insert(
                 "real-new".into(),
                 Agent {
+                    ask_origin: None,
                     tmux_socket: None,
                     tmux_session: None,
                     kind: AgentKind::ClaudeCode,
@@ -6571,6 +6837,7 @@ mod tests {
                 agents.insert(
                     sid.into(),
                     Agent {
+                        ask_origin: None,
                         tmux_socket: None,
                         tmux_session: None,
                         kind: AgentKind::ClaudeCode,
@@ -6640,6 +6907,7 @@ mod tests {
         // Two candidates: "live" already exists (must skip),
         // "fresh" is new (must insert).
         let mk = |sid: &str, pane: &str, prompt: &str| Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: AgentKind::ClaudeCode,
@@ -6820,5 +7088,150 @@ mod tests {
         let r2 = store.reconcile(&[pane("%1")]).await;
         assert!(r1.is_noop() && r2.is_noop());
         assert_eq!(store.snapshot().await.len(), 1);
+    }
+    #[tokio::test]
+    async fn ask_provenance_prevents_cwd_and_prompt_adoption_and_survives_snapshot() {
+        let store = Store::shared();
+        let mut identity = id("ask-source");
+        identity.kind = AgentKind::Codex;
+        identity.pane = None;
+        identity.cwd = Some("/repo".into());
+        let event = AgentEvent::PromptSubmitted {
+            id: identity.clone(),
+            prompt: "locate the very unique task".into(),
+            at: OffsetDateTime::now_utc(),
+        };
+        let mut host = pane("%1");
+        host.current_path = "/repo".into();
+        store
+            .begin_ask_execution("run", AgentKind::Codex, "/repo", None)
+            .await;
+        store.apply(&event).await;
+        assert_eq!(
+            store
+                .correlate_paneless_codex_union(&[host.clone()], &[host.clone()])
+                .await,
+            0
+        );
+        assert!(store.directory_snapshot().await.is_empty());
+        store
+            .mark_ask_owned("ask-source", "run", AgentKind::Codex, "/repo")
+            .await;
+        store.apply(&event).await;
+        store.end_ask_execution("run").await;
+        assert_eq!(store.snapshot().await[0].state, AgentState::Stopped);
+        store
+            .apply(&AgentEvent::TurnStopped {
+                id: identity,
+                response: None,
+                recap: None,
+                ai_title: None,
+                idle_confirmed: false,
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        assert_eq!(store.snapshot().await[0].state, AgentState::Stopped);
+        let serialized = serde_json::to_vec(&store.snapshot().await).unwrap();
+        let reloaded = Store::shared();
+        reloaded
+            .hydrate(serde_json::from_slice(&serialized).unwrap())
+            .await;
+        assert!(reloaded.directory_snapshot().await.is_empty());
+        assert_eq!(
+            reloaded
+                .correlate_paneless_codex_union(&[host.clone()], &[host.clone()])
+                .await,
+            0
+        );
+        assert_eq!(
+            reloaded
+                .correlate_paneless_codex_by_prompt(&[(
+                    host.clone(),
+                    "locate the very unique task".into()
+                )])
+                .await,
+            0
+        );
+        // Only explicit interactive process evidence promotes the saved source.
+        assert_eq!(
+            reloaded
+                .rebind_resumes(&[crate::process_tree::ResumeBinding {
+                    session_id: "ask-source".into(),
+                    kind: AgentKind::Codex,
+                    pane: host
+                }])
+                .await,
+            1
+        );
+        let promoted = reloaded.directory_snapshot().await;
+        assert_eq!(promoted[0].pane.as_deref(), Some("%1"));
+        assert!(promoted[0].ask_origin.is_none());
+        assert_ne!(promoted[0].state, AgentState::Stopped);
+    }
+
+    #[tokio::test]
+    async fn ask_hooks_drop_inherited_panes_and_active_resumes_cannot_promote() {
+        let store = Store::shared();
+        let event = AgentEvent::Started {
+            id: id("source"),
+            at: OffsetDateTime::now_utc(),
+        };
+        store
+            .begin_ask_execution("run", AgentKind::ClaudeCode, "/repo", Some("source"))
+            .await;
+        store.apply_with_ask(&event, Some("run")).await;
+        let row = store.snapshot().await.remove(0);
+        assert!(row.pane.is_none());
+        assert!(row.ask_origin.is_some());
+        assert_eq!(
+            store
+                .rebind_resumes(&[crate::process_tree::ResumeBinding {
+                    session_id: "source".into(),
+                    kind: AgentKind::ClaudeCode,
+                    pane: pane("%1")
+                }])
+                .await,
+            0
+        );
+        store.end_ask_execution("run").await;
+        store.apply(&event).await;
+        assert!(store.snapshot().await[0].ask_origin.is_none());
+        assert!(store.snapshot().await[0].pane.is_some());
+    }
+
+    #[tokio::test]
+    async fn pending_and_resumed_ask_preserve_existing_interactive_binding() {
+        let store = Store::shared();
+        let event = AgentEvent::Started {
+            id: id("interactive"),
+            at: OffsetDateTime::now_utc(),
+        };
+        store.apply(&event).await;
+        let before = store.snapshot().await[0].clone();
+        store
+            .begin_ask_execution(
+                "pending",
+                before.kind,
+                before.cwd.as_deref().unwrap_or(""),
+                None,
+            )
+            .await;
+        assert_eq!(store.directory_snapshot().await.len(), 1);
+        store.end_ask_execution("pending").await;
+        store
+            .begin_ask_execution(
+                "resume",
+                before.kind,
+                before.cwd.as_deref().unwrap_or(""),
+                Some("interactive"),
+            )
+            .await;
+        store.apply_with_ask(&event, Some("resume")).await;
+        assert_eq!(store.directory_snapshot().await[0].pane, before.pane);
+        store.end_ask_execution("resume").await;
+        let after = store.directory_snapshot().await.remove(0);
+        assert_eq!(after.pane, before.pane);
+        assert_eq!(after.state, before.state);
+        assert!(after.ask_origin.is_none());
     }
 }

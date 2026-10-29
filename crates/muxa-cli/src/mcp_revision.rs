@@ -7,6 +7,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub(crate) const ENV_KEY: &str = "MUXA_MCP_BINARY_REVISION";
+pub(crate) const RECONNECT_ENV_KEY: &str = "MUXA_MCP_RECONNECT";
 
 pub(crate) fn binary_revision(binary: &Path) -> Result<String> {
     let mut file = std::fs::File::open(binary).context("read installed Muxa binary revision")?;
@@ -56,12 +57,23 @@ pub(crate) fn server_version() -> String {
 pub(crate) struct RevisionPlan {
     pub path: PathBuf,
     pub revision: String,
+    pub environment: Option<Value>,
+    pub revision_changed: bool,
     before: String,
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
 impl RevisionPlan {
+    #[cfg(test)]
     pub fn prepare(home: &Path, binary: &Path, revision: &str) -> Result<Option<Self>> {
+        Self::prepare_refresh(home, binary, revision, false)
+    }
+    pub fn prepare_refresh(
+        home: &Path,
+        binary: &Path,
+        revision: &str,
+        reconnect: bool,
+    ) -> Result<Option<Self>> {
         let path = home.join("config.toml");
         let before = match std::fs::read_to_string(&path) {
             Ok(before) => before,
@@ -107,17 +119,39 @@ impl RevisionPlan {
         if !managed_command || !stdio {
             return Ok(None);
         }
-        if server
-            .get("env")
-            .and_then(|env| env.get(ENV_KEY))
-            .and_then(toml::Value::as_str)
-            == Some(revision)
+        if !reconnect
+            && server
+                .get("env")
+                .and_then(|env| env.get(ENV_KEY))
+                .and_then(toml::Value::as_str)
+                == Some(revision)
         {
             return Ok(None);
         }
+        let environment = if reconnect {
+            let mut env = server
+                .get("env")
+                .map(serde_json::to_value)
+                .transpose()?
+                .unwrap_or_else(|| serde_json::json!({}));
+            env[ENV_KEY] = serde_json::json!(revision);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_nanos();
+            env[RECONNECT_ENV_KEY] = serde_json::json!(format!("{}-{stamp}", std::process::id()));
+            Some(env)
+        } else {
+            None
+        };
         Ok(Some(Self {
             path: path.canonicalize()?,
             revision: revision.into(),
+            environment,
+            revision_changed: server
+                .get("env")
+                .and_then(|env| env.get(ENV_KEY))
+                .and_then(toml::Value::as_str)
+                != Some(revision),
             before,
         }))
     }
@@ -189,6 +223,7 @@ pub(crate) fn entries_equal(a: Option<&Value>, b: Option<&Value>) -> bool {
         let mut value = value.clone();
         if let Some(env) = value.get_mut("env").and_then(Value::as_object_mut) {
             env.remove(ENV_KEY);
+            env.remove(RECONNECT_ENV_KEY);
             if env.is_empty() {
                 value
                     .as_object_mut()
@@ -326,5 +361,36 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("changed while planning"));
+    }
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+    #[test]
+    fn explicit_reconnect_changes_client_key_without_losing_user_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = dir.path().join("muxa");
+        std::fs::write(&binary, "binary").unwrap();
+        let revision = binary_revision(&binary).unwrap();
+        std::fs::write(dir.path().join("config.toml"),format!("[mcp_servers.muxa]\ncommand='muxa'\nargs=['mcp']\n[mcp_servers.muxa.env]\nKEEP='value'\n{ENV_KEY}='{revision}'\n")).unwrap();
+        assert!(RevisionPlan::prepare(dir.path(), &binary, &revision)
+            .unwrap()
+            .is_none());
+        let first = RevisionPlan::prepare_refresh(dir.path(), &binary, &revision, true)
+            .unwrap()
+            .unwrap();
+        let second = RevisionPlan::prepare_refresh(dir.path(), &binary, &revision, true)
+            .unwrap()
+            .unwrap();
+        let a = first.environment.unwrap();
+        let b = second.environment.unwrap();
+        assert_eq!(a["KEEP"], "value");
+        assert_eq!(a[ENV_KEY], revision);
+        assert_ne!(a[RECONNECT_ENV_KEY], b[RECONNECT_ENV_KEY]);
+        assert!(entries_equal(
+            Some(&serde_json::json!({"env":a})),
+            Some(&serde_json::json!({"env":{"KEEP":"value"}}))
+        ));
     }
 }

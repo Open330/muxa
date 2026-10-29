@@ -57,6 +57,13 @@ use crate::synthetic::{self, SyntheticState};
 /// bounds regex work.
 const CAPTURE_TAIL_LINES: usize = 40;
 
+// Selection marker only: hook-owned Claude rows use the strict composer
+// predicate, never synthetic manifest state or inferred attention.
+static CLAUDE_WAIT_RECOVERY: std::sync::LazyLock<AgentManifest> = std::sync::LazyLock::new(|| {
+    muxa::screen::parse_manifest("[agent]\nname='claude-wait-recovery'\ncommand=['claude']\n")
+        .expect("constant recovery marker")
+});
+
 /// The backends screen detection may run on: **non-herdr** (herdr panes are
 /// covered by the herdr bridge) and able to **capture panes**
 /// (`caps().capture_pane`). Zellij without its plugin reports
@@ -89,6 +96,30 @@ fn selecting_kind(registry: Option<AgentKind>, discovered: Option<AgentKind>) ->
     registry
         .filter(|kind| *kind != AgentKind::Unknown)
         .or(discovered)
+}
+
+fn claude_dialog_recovery_candidate(agent: &muxa::Agent) -> bool {
+    agent.kind == AgentKind::ClaudeCode
+        && matches!(
+            agent.state,
+            AgentState::WaitingInput | AgentState::WaitingChoice
+        )
+        && agent.last_notification.as_deref()
+            == Some("Auto-mode setup proposal is ready for review")
+}
+fn observable_hook_owners(occupants: &[muxa::Agent]) -> (Option<muxa::Agent>, Option<muxa::Agent>) {
+    let owner = |kind| {
+        occupants
+            .iter()
+            .filter(|a| {
+                a.kind == kind
+                    && synthetic::occupant_is_authoritative(a)
+                    && (kind != AgentKind::ClaudeCode || claude_dialog_recovery_candidate(a))
+            })
+            .max_by_key(|a| a.last_activity_at)
+            .cloned()
+    };
+    (owner(AgentKind::Codex), owner(AgentKind::ClaudeCode))
 }
 
 /// Whether a synthetic row on the pane already shows `screen`. `last_state`
@@ -162,6 +193,7 @@ struct ScreenDetector {
     /// its synthetic row is stopped so it doesn't freeze.
     tracked: HashSet<String>,
     recap_probes: HashMap<(String, Option<String>), RecapProbe>,
+    claude_idle: HashMap<(String, Option<String>), (String, OffsetDateTime)>,
 }
 
 struct RecapProbe {
@@ -240,6 +272,11 @@ impl ScreenDetector {
         self.last_state
             .retain(|pane_id, _| current.contains(pane_id));
 
+        self.claude_idle.retain(|(id, socket), _| {
+            candidates
+                .iter()
+                .any(|(_, pane, _)| &pane.pane_id == id && &pane.socket == socket)
+        });
         let mut changes = 0;
         for (backend_idx, pane, manifest) in candidates {
             if self.process_candidate(backend_idx, &pane, &manifest).await {
@@ -263,12 +300,15 @@ impl ScreenDetector {
         // so command-only selection skipped those panes entirely and their
         // startup gate was never seen. Stopped rows are tombstones, not
         // occupants.
-        let by_pane: HashMap<String, AgentKind> = self
-            .store
-            .snapshot()
-            .await
+        let snapshot = self.store.snapshot().await;
+        let waiting_claude: HashSet<_> = snapshot
+            .iter()
+            .filter(|a| claude_dialog_recovery_candidate(a))
+            .filter_map(|a| a.pane.clone())
+            .collect();
+        let by_pane: HashMap<String, AgentKind> = snapshot
             .into_iter()
-            .filter(|a| a.state != muxa::AgentState::Stopped)
+            .filter(|a| a.state != AgentState::Stopped)
             .filter_map(|a| a.pane.clone().map(|pane| (pane, a.kind)))
             .collect();
 
@@ -302,6 +342,10 @@ impl ScreenDetector {
         panes
             .into_iter()
             .filter_map(|(i, p, discovered)| {
+                if waiting_claude.contains(&p.pane_id) && discovered == Some(AgentKind::ClaudeCode)
+                {
+                    return Some((i, p, CLAUDE_WAIT_RECOVERY.clone()));
+                }
                 let direct = self.manifests.manifest_for_command(&p.current_command);
                 let registry_kind = by_pane.get(&p.pane_id).copied();
                 // The registry knows which agent muxa put on the pane; the
@@ -347,13 +391,7 @@ impl ScreenDetector {
             .into_iter()
             .filter(|agent| same_pane_endpoint(agent, pane))
             .collect();
-        let codex_owner = occupants
-            .iter()
-            .filter(|agent| {
-                agent.kind == AgentKind::Codex && synthetic::occupant_is_authoritative(agent)
-            })
-            .max_by_key(|agent| agent.last_activity_at)
-            .cloned();
+        let (codex_owner, claude_owner) = observable_hook_owners(&occupants);
         let ownership = synthetic::pane_ownership(&occupants, OffsetDateTime::now_utc());
         let hook_owned = matches!(&ownership, synthetic::PaneOwnership::Hooked);
         if hook_owned {
@@ -364,18 +402,20 @@ impl ScreenDetector {
             // Other hook-driven agents expose all metadata muxa consumes via
             // hooks/transcripts. Codex alone needs one capture for its opaque
             // compaction recap.
-            if codex_owner.is_none() {
+            if codex_owner.is_none() && claude_owner.is_none() {
                 return false;
             }
         }
 
         let probe_key = (pane_id.clone(), pane.socket.clone());
-        if let Some(owner) = codex_owner.as_ref().filter(|_| hook_owned) {
-            if self
-                .recap_probes
-                .get(&probe_key)
-                .is_some_and(|probe| !probe.due(owner, Instant::now()))
-            {
+        if let Some(owner) = codex_owner
+            .as_ref()
+            .or(claude_owner.as_ref())
+            .filter(|_| hook_owned)
+        {
+            if self.recap_probes.get(&probe_key).is_some_and(|probe| {
+                !probe.due(owner, Instant::now()) && !self.claude_idle.contains_key(&probe_key)
+            }) {
                 return false;
             }
         }
@@ -383,8 +423,15 @@ impl ScreenDetector {
         let Some(raw) = self.capture(backend_idx, pane).await else {
             return false;
         };
-        if let Some(owner) = codex_owner.as_ref().filter(|_| hook_owned) {
-            self.record_recap_probe(probe_key, owner);
+        if let Some(owner) = codex_owner
+            .as_ref()
+            .or(claude_owner.as_ref())
+            .filter(|_| hook_owned)
+        {
+            self.record_recap_probe(probe_key.clone(), owner);
+        }
+        if let Some(owner) = claude_owner.filter(|_| hook_owned) {
+            return self.observe_claude_idle(owner, probe_key, &raw).await;
         }
         let recap_changed = if let Some(owner) = codex_owner {
             self.observe_recap(&owner, &raw).await
@@ -466,6 +513,28 @@ impl ScreenDetector {
         self.last_state.get(pane_id) == Some(&state)
             && (matches!(ownership, synthetic::PaneOwnership::AttentionBlind { .. })
                 || synthetic_row_shows(occupants, state))
+    }
+
+    async fn observe_claude_idle(
+        &mut self,
+        owner: muxa::Agent,
+        probe_key: (String, Option<String>),
+        raw: &str,
+    ) -> bool {
+        let at = OffsetDateTime::now_utc();
+        if muxa::adapters::claude::idle_composer_from_capture(raw)
+            && at - owner.last_activity_at >= time::Duration::seconds(2)
+        {
+            let identity = (owner.session_id.clone(), owner.last_activity_at);
+            if self.claude_idle.get(&probe_key) == Some(&identity) {
+                self.claude_idle.remove(&probe_key);
+                return self.store.recover_claude_wait_from_screen(&owner, at).await;
+            }
+            self.claude_idle.insert(probe_key, identity);
+        } else {
+            self.claude_idle.remove(&probe_key);
+        }
+        false
     }
 
     fn record_recap_probe(&mut self, key: (String, Option<String>), owner: &muxa::Agent) {
@@ -560,6 +629,7 @@ pub fn spawn_screen_detect_task(
         last_state: HashMap::new(),
         tracked: HashSet::new(),
         recap_probes: HashMap::new(),
+        claude_idle: HashMap::new(),
     };
     Some(tokio::spawn(detector.run(shutdown_tx.subscribe())))
 }
@@ -598,11 +668,11 @@ mod tests {
         assert_eq!(selecting_kind(Some(AgentKind::Unknown), None), None);
     }
 
-    const AT: OffsetDateTime = datetime!(2026-07-20 12:00:00 UTC);
+    pub(super) const AT: OffsetDateTime = datetime!(2026-07-20 12:00:00 UTC);
 
     /// A fake backend: a fixed pane inventory plus a pane-id → capture-text map
     /// that tests mutate between ticks to simulate the screen changing.
-    struct FakeBackend {
+    pub(super) struct FakeBackend {
         kind: HostKind,
         caps: BackendCaps,
         panes: Vec<PaneInfo>,
@@ -610,7 +680,10 @@ mod tests {
     }
 
     impl FakeBackend {
-        fn tmux(panes: Vec<PaneInfo>, captures: Arc<Mutex<HashMap<String, String>>>) -> Self {
+        pub(super) fn tmux(
+            panes: Vec<PaneInfo>,
+            captures: Arc<Mutex<HashMap<String, String>>>,
+        ) -> Self {
             Self {
                 kind: HostKind::Tmux,
                 caps: BackendCaps::default(),
@@ -650,7 +723,7 @@ mod tests {
         }
     }
 
-    fn pane(pane_id: &str, command: &str) -> PaneInfo {
+    pub(super) fn pane(pane_id: &str, command: &str) -> PaneInfo {
         PaneInfo {
             session_group: None,
             agent_program: None,
@@ -675,7 +748,7 @@ mod tests {
         }
     }
 
-    fn detector(backends: Vec<SharedBackend>, store: SharedStore) -> ScreenDetector {
+    pub(super) fn detector(backends: Vec<SharedBackend>, store: SharedStore) -> ScreenDetector {
         ScreenDetector {
             backends,
             store,
@@ -684,6 +757,7 @@ mod tests {
             last_state: HashMap::new(),
             tracked: HashSet::new(),
             recap_probes: HashMap::new(),
+            claude_idle: HashMap::new(),
         }
     }
 
@@ -1233,6 +1307,116 @@ mod tests {
             store.by_pane("%1").await[0].state,
             AgentState::Stopped,
             "row driven to Stopped when the agent leaves the pane",
+        );
+    }
+}
+
+#[cfg(test)]
+mod claude_recovery_tests {
+    use super::*;
+    use crate::screen_detect::tests::{detector, pane, FakeBackend, AT};
+    use muxa::event::{AgentEvent, NotificationLevel};
+    use std::sync::{Arc, Mutex};
+    #[tokio::test]
+    async fn resolved_dialog_needs_two_observations_and_new_hooks_or_modals_win() {
+        let store = muxa::Store::shared();
+        let id = AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: "claude-dialog".into(),
+            pane: Some("%1".into()),
+            tmux_socket: None,
+            surface: None,
+            cwd: None,
+        };
+        store
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: AT,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id.clone(),
+                level: NotificationLevel::NeedsInput,
+                message: "Auto-mode setup proposal is ready for review".into(),
+                at: AT,
+            })
+            .await;
+        let idle="Saved to settings.json\n──────────────────\n❯ \n──────────────────\n⏵⏵ auto mode on (shift+tab to cycle)";
+        let captures = Arc::new(Mutex::new(HashMap::from([("%1".into(), idle.into())])));
+        let backend: SharedBackend = Arc::new(FakeBackend::tmux(
+            vec![pane("%1", "claude")],
+            captures.clone(),
+        ));
+        let mut d = detector(vec![backend], store.clone());
+        assert_eq!(d.run_tick().await, 0);
+        assert_eq!(
+            store.by_session(&id.session_id).await.unwrap().state,
+            AgentState::WaitingInput
+        );
+        captures.lock().unwrap().insert(
+            "%1".into(),
+            "Permission request\n❯ 1. Yes\nEnter to confirm".into(),
+        );
+        assert_eq!(d.run_tick().await, 0);
+        assert!(d.claude_idle.is_empty());
+        captures.lock().unwrap().insert("%1".into(), idle.into());
+        d.recap_probes.clear();
+        assert_eq!(d.run_tick().await, 0);
+        let observed = store.by_session(&id.session_id).await.unwrap();
+        let mut wrong_process = observed.clone();
+        wrong_process.workload.primary_pid = Some(999);
+        assert!(
+            !store
+                .recover_claude_wait_from_screen(&wrong_process, OffsetDateTime::now_utc())
+                .await
+        );
+
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: id.clone(),
+                tool: "Bash".into(),
+                subagent: None,
+                at: AT + time::Duration::seconds(1),
+            })
+            .await;
+        assert!(
+            !store
+                .recover_claude_wait_from_screen(&observed, OffsetDateTime::now_utc())
+                .await
+        );
+        assert_eq!(
+            store.by_session(&id.session_id).await.unwrap().state,
+            AgentState::Working
+        );
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id.clone(),
+                level: NotificationLevel::NeedsInput,
+                message: "Auto-mode setup proposal is ready for review".into(),
+                at: AT + time::Duration::seconds(2),
+            })
+            .await;
+        assert_eq!(d.run_tick().await, 0);
+        assert_eq!(d.run_tick().await, 1);
+        let repaired = store.by_session(&id.session_id).await.unwrap();
+        assert_eq!(repaired.state, AgentState::Idle);
+        assert!(repaired.last_notification.is_none());
+        assert_eq!(repaired.last_activity_at, AT + time::Duration::seconds(2));
+        assert!(d.tracked.is_empty());
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: id.clone(),
+                level: NotificationLevel::NeedsInput,
+                message: "A message from another session needs your approval".into(),
+                at: AT + time::Duration::seconds(3),
+            })
+            .await;
+        assert_eq!(d.run_tick().await, 0);
+        assert_eq!(d.run_tick().await, 0);
+        assert_eq!(
+            store.by_session(&id.session_id).await.unwrap().state,
+            AgentState::WaitingInput
         );
     }
 }
