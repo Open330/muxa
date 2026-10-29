@@ -7,8 +7,9 @@ use super::effects::{
     Effect, EffectObserver, Key, NoObserver, ObserverError, Op, Purpose, Runner, Transport,
 };
 use super::io::{Clock, SwapIo};
-use super::{execute, LaunchLine, PaneLaunch, Refusal, Target};
+use super::{execute, AccountVerdict, LaunchLine, PaneLaunch, Refusal, Target};
 use crate::event::AgentKind;
+use crate::swap_job::{AccountCheck, Observation, Phase, Readiness};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -217,7 +218,14 @@ fn run(
     observer: &mut dyn EffectObserver,
 ) -> Ran {
     let runner = Runner::new(io, observer);
-    let verified = |_: &Target| Ok(String::new());
+    let verified = |_: &Target| {
+        Ok(AccountVerdict {
+            check: AccountCheck::Matched,
+            observed: Some("b".into()),
+            source: "test",
+            note: String::new(),
+        })
+    };
     let result = execute(&runner, target, launch, "RELAUNCH", follow_up, &verified);
     (result, runner.log(), runner.halted())
 }
@@ -450,6 +458,28 @@ struct Failing {
     seen: usize,
 }
 
+/// Fails the observation of entering `phase`.
+struct FailsAt(Phase);
+
+impl EffectObserver for FailsAt {
+    fn before(&mut self, _: &Effect) -> Result<(), ObserverError> {
+        Ok(())
+    }
+
+    fn after(&mut self, _: &Effect, _: Transport) -> Result<(), ObserverError> {
+        Ok(())
+    }
+
+    fn observe(&mut self, observation: &Observation) -> Result<(), ObserverError> {
+        match observation {
+            Observation::Phase { phase } if *phase == self.0 => {
+                Err(ObserverError("journal full".into()))
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
 impl EffectObserver for Failing {
     fn before(&mut self, _: &Effect) -> Result<(), ObserverError> {
         if self.before_at == Some(self.seen) {
@@ -511,4 +541,115 @@ fn an_unrecorded_result_is_done_once_and_stops_the_run() {
     assert!(halted
         .unwrap()
         .contains("attempted but its result could not be recorded"));
+}
+
+/// Every phase, the readiness seen and the account found are reported, in
+/// the order they happen.
+#[test]
+fn a_swap_reports_what_it_saw_in_order() {
+    let io = FakeIo::new(CODEX_IDLE, codex_agent());
+    let mut observer = NoObserver;
+    let runner = Runner::new(&io, &mut observer);
+    let verified = |_: &Target| {
+        Ok(AccountVerdict {
+            check: AccountCheck::Matched,
+            observed: Some("b".into()),
+            source: "test",
+            note: String::new(),
+        })
+    };
+    execute(
+        &runner,
+        &target(AgentKind::Codex, false, false),
+        &launch(),
+        "RELAUNCH",
+        Some("continue"),
+        &verified,
+    )
+    .unwrap();
+    assert_eq!(
+        runner.observations(),
+        [
+            Observation::Phase {
+                phase: Phase::Stopping
+            },
+            Observation::Phase {
+                phase: Phase::Launching
+            },
+            Observation::Phase {
+                phase: Phase::Readiness
+            },
+            Observation::Readiness {
+                result: Readiness::Ready
+            },
+            Observation::Phase {
+                phase: Phase::Verifying
+            },
+            Observation::AccountCheck {
+                result: AccountCheck::Matched,
+                observed: Some("b".into()),
+                source: "test".into(),
+            },
+            Observation::Phase {
+                phase: Phase::FollowThrough
+            },
+        ]
+    );
+}
+
+/// A phase that cannot be recorded stops the run before its first effect:
+/// the agent was stopped, the relaunch is never typed.
+#[test]
+fn an_unrecorded_phase_stops_the_run_before_its_effects() {
+    let io = FakeIo::new(CODEX_IDLE, codex_agent());
+    let (result, _, halted) = run(
+        &io,
+        &target(AgentKind::Codex, false, false),
+        &launch(),
+        Some("continue"),
+        &mut FailsAt(Phase::Launching),
+    );
+    assert!(result.is_err());
+    assert!(halted
+        .unwrap()
+        .contains("observation could not be recorded"));
+    assert_eq!(io.sent(), ["signal TERM [10]"]);
+}
+
+/// A mismatched account is reported as such, with the account found, and
+/// refuses the follow-up.
+#[test]
+fn a_mismatched_account_is_reported_with_what_was_found() {
+    let io = FakeIo::new(CODEX_IDLE, codex_agent());
+    let mut observer = NoObserver;
+    let runner = Runner::new(&io, &mut observer);
+    let wrong = |_: &Target| {
+        Err(AccountVerdict {
+            check: AccountCheck::Mismatched,
+            observed: Some("c".into()),
+            source: "test",
+            note: "the resumed agent runs on c".into(),
+        })
+    };
+    let result = execute(
+        &runner,
+        &target(AgentKind::Codex, false, false),
+        &launch(),
+        "RELAUNCH",
+        Some("continue"),
+        &wrong,
+    );
+    let Err(Refusal::Failed(note)) = result else {
+        panic!("a mismatched account must refuse");
+    };
+    assert_eq!(
+        note,
+        "relaunched, but the resumed agent runs on c; nothing was sent to the pane"
+    );
+    assert!(runner.observations().contains(&Observation::AccountCheck {
+        result: AccountCheck::Mismatched,
+        observed: Some("c".into()),
+        source: "test".into(),
+    }));
+    assert!(!io.sent().iter().any(|line| line.contains("continue")));
 }

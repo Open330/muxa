@@ -284,6 +284,8 @@ pub(crate) enum Observation {
     /// The account the relaunched process actually runs on.
     AccountCheck {
         result: AccountCheck,
+        /// The account the process was found on, when it was found.
+        observed: Option<String>,
         source: String,
     },
     Readiness {
@@ -297,6 +299,9 @@ pub(crate) enum Observation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum AccountCheck {
+    /// Nothing was checked: `aas`-launched agents have no configured
+    /// profile to recognise the process by.
+    Unchecked,
     Matched,
     Mismatched,
     Unreadable,
@@ -908,6 +913,21 @@ struct Pending {
 }
 
 impl EffectObserver for Journal<'_> {
+    fn observe(&mut self, observation: &Observation) -> Result<(), ObserverError> {
+        self.store
+            .observe(
+                self.lease,
+                &self.job,
+                self.target,
+                self.attempt,
+                observation,
+            )
+            .map_err(|error| {
+                self.failed = true;
+                ObserverError(error.to_string())
+            })
+    }
+
     fn before(&mut self, effect: &Effect) -> Result<(), ObserverError> {
         if self.pending.is_some() {
             return Err(ObserverError(
