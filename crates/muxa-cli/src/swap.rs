@@ -280,6 +280,18 @@ fn remote_argv(args: &Args) -> Vec<String> {
     words
 }
 
+/// What Ctrl-C does to a swap on a Fleet host: the host's own `muxa swap`
+/// runs on in its daemon, and this client only stops waiting for it. Which
+/// of the two happens depends on how the wait ends (relay, SSH, timeout), so
+/// the notice claims neither.
+fn remote_wait_notice(host: &str) -> String {
+    format!(
+        "swapping on {host}: Ctrl-C stops this client from waiting; it does not reliably \
+         cancel the swap on {host}, which may still be stopping and relaunching agents. \
+         Check {host} (`muxa fleet status`) before retrying."
+    )
+}
+
 #[derive(clap::Parser)]
 #[command(name = "swap")]
 struct SwapCli {
@@ -308,6 +320,9 @@ pub(crate) fn checked_argv(words: &[String]) -> std::result::Result<Vec<String>,
 /// `muxa swap --host`: the host's own `muxa swap` does the work, through
 /// the Fleet transport, and its report is printed here.
 async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
+    if !args.dry_run {
+        eprintln!("{}", remote_wait_notice(host));
+    }
     let output = client
         .work_command(Some(host), &remote_argv(args), None)
         .await
@@ -410,6 +425,15 @@ mod tests {
             ]
         );
         muxa::work_control::validate_swap_argv(&argv).unwrap();
+    }
+
+    /// The notice names the host and promises neither outcome.
+    #[test]
+    fn a_remote_swap_says_ctrl_c_only_stops_the_wait() {
+        let notice = remote_wait_notice("rtzr");
+        assert!(notice.contains("rtzr"), "{notice}");
+        assert!(notice.contains("does not reliably cancel"), "{notice}");
+        assert!(!notice.contains("cancelled"), "{notice}");
     }
 
     #[test]
