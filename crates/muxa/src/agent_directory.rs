@@ -14,6 +14,23 @@ use crate::{HostKind, SharedBackend, SharedStore, TopologyInput, TopologySnapsho
 pub const CAPABILITY: &str = "agent_directory_v1";
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyntheticBucket {
+    pub count: usize,
+    pub examples: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SyntheticDiagnostics {
+    pub inventory_age_ms: Option<u64>,
+    pub max_inventory_age_ms: u64,
+    pub inventory_invalidated: bool,
+    pub unbound_hooks: SyntheticBucket,
+    pub unobserved_backend: SyntheticBucket,
+    pub unseen_panes: SyntheticBucket,
+    pub unknown: SyntheticBucket,
+}
+
 pub struct AgentDirectory {
     state: Mutex<Option<CachedDirectory>>,
     inventory: watch::Sender<Option<Arc<ObservedInventory>>>,
@@ -27,6 +44,7 @@ struct ObservedInventory {
     at: Instant,
     observed_at: time::OffsetDateTime,
     warnings: Vec<String>,
+    complete_kinds: Vec<HostKind>,
 }
 
 struct CachedDirectory {
@@ -72,7 +90,9 @@ impl AgentDirectory {
         observed_at: time::OffsetDateTime,
     ) {
         let mut warnings = Vec::new();
+        let mut complete_kinds = Vec::new();
         let inputs = observations.into_iter().map(|(host, observation)| {
+            if observation.is_complete() { complete_kinds.push(host); }
             if !observation.is_complete() {
                 warnings.push(format!("{host} pane inventory is incomplete; absence is not proof that an agent has no location."));
             }
@@ -83,6 +103,7 @@ impl AgentDirectory {
             at,
             observed_at,
             warnings,
+            complete_kinds,
         });
         // A slow reconcile started before a demand refresh must not replace
         // that newer observation when it eventually finishes.
@@ -93,6 +114,90 @@ impl AgentDirectory {
             *slot = Some(next);
             true
         });
+    }
+
+    /// Reuse published evidence without starting a backend discovery scan.
+    pub fn synthetic_diagnostics<'a>(
+        &self,
+        agents: impl Iterator<Item = &'a crate::Agent>,
+        configured: &[HostKind],
+    ) -> SyntheticDiagnostics {
+        let inventory = self.inventory.borrow().clone();
+        let floor = *self
+            .invalidated_at
+            .lock()
+            .expect("inventory invalidation lock poisoned");
+        let invalidated = inventory
+            .as_ref()
+            .is_some_and(|i| floor.is_some_and(|f| i.at < f));
+        let valid = inventory
+            .as_ref()
+            .filter(|i| i.at.elapsed() < self.max_inventory_age && !invalidated);
+        let mut result = SyntheticDiagnostics {
+            inventory_age_ms: inventory
+                .as_ref()
+                .map(|i| u64::try_from(i.at.elapsed().as_millis()).unwrap_or(u64::MAX)),
+            max_inventory_age_ms: u64::try_from(self.max_inventory_age.as_millis())
+                .unwrap_or(u64::MAX),
+            inventory_invalidated: invalidated,
+            ..Default::default()
+        };
+        for agent in agents.filter(|a| {
+            a.state != crate::AgentState::Stopped
+                && a.session_id
+                    .starts_with(crate::state::SYNTHETIC_SESSION_PREFIX)
+        }) {
+            let pane = agent.pane.as_deref();
+            let host = pane.and_then(crate::backend::pane_id_host_kind);
+            let bucket = match host {
+                Some(host) if !configured.contains(&host) => &mut result.unobserved_backend,
+                Some(host) => match valid.filter(|i| i.complete_kinds.contains(&host)) {
+                    Some(i) => {
+                        let candidates = i
+                            .inputs
+                            .iter()
+                            .filter(|input| input.host == host)
+                            .flat_map(|input| &input.panes)
+                            .filter(|p| Some(p.pane_id.as_str()) == pane)
+                            .collect::<Vec<_>>();
+                        let present = if let Some(socket) = &agent.tmux_socket {
+                            candidates.iter().any(|p| {
+                                p.socket.as_ref().is_some_and(|observed| {
+                                    crate::backend::pane_endpoints_match(pane, socket, observed)
+                                })
+                            })
+                        } else {
+                            candidates.len() == 1
+                        };
+                        if agent.tmux_socket.is_none() && candidates.len() > 1 {
+                            &mut result.unknown
+                        } else if present {
+                            &mut result.unbound_hooks
+                        } else {
+                            &mut result.unseen_panes
+                        }
+                    }
+                    None => &mut result.unknown,
+                },
+                None => &mut result.unknown,
+            };
+            bucket.count += 1;
+            bucket.examples.push(
+                agent
+                    .tmux_socket
+                    .as_deref()
+                    .unwrap_or("?")
+                    .chars()
+                    .chain(std::iter::once(':'))
+                    .chain(pane.unwrap_or("?").chars())
+                    .take(120)
+                    .collect(),
+            );
+            bucket.examples.sort_unstable();
+            bucket.examples.dedup();
+            bucket.examples.truncate(3);
+        }
+        result
     }
 
     async fn observe(&self, backends: &[SharedBackend]) -> Result<(), String> {
@@ -351,6 +456,82 @@ mod tests {
     }
     fn ask() -> Arc<AskStore> {
         AskStore::in_memory(crate::ask::AskOptions::default())
+    }
+
+    #[tokio::test]
+    async fn synthetic_health_uses_daemon_scope_and_complete_fresh_endpoint_evidence() {
+        let store = crate::Store::shared();
+        prompt(&store, "%1", "private prompt").await;
+        let mut agent = store.snapshot().await.remove(0);
+        agent.session_id = format!("{}test:%1", crate::state::SYNTHETIC_SESSION_PREFIX);
+        let directory = AgentDirectory::default();
+        let pane = pane("test", "workspace", "task");
+        let publish = |observation| {
+            directory.publish(
+                vec![(HostKind::Tmux, observation)],
+                Instant::now(),
+                time::OffsetDateTime::now_utc(),
+            );
+        };
+        publish(PaneObservation::complete(vec![pane.clone()]));
+        let diagnose = |configured: &[HostKind]| {
+            directory.synthetic_diagnostics(std::iter::once(&agent), configured)
+        };
+        assert_eq!(diagnose(&[HostKind::Tmux]).unbound_hooks.count, 1);
+        assert_eq!(
+            diagnose(&[HostKind::Rmux]).unobserved_backend.count,
+            1,
+            "the CLI environment must not turn an unobserved tmux row into hook advice"
+        );
+        let mut other_socket = pane.clone();
+        other_socket.socket = Some("other-server".into());
+        publish(PaneObservation::complete(vec![other_socket]));
+        assert_eq!(diagnose(&[HostKind::Tmux]).unseen_panes.count, 1);
+        publish(PaneObservation::incomplete(vec![pane.clone()]));
+        assert_eq!(diagnose(&[HostKind::Tmux]).unknown.count, 1);
+        publish(PaneObservation::complete(vec![pane.clone()]));
+        let mut socketless = agent.clone();
+        socketless.tmux_socket = None;
+        assert_eq!(
+            directory
+                .synthetic_diagnostics(std::iter::once(&socketless), &[HostKind::Tmux])
+                .unbound_hooks
+                .count,
+            1
+        );
+        let mut duplicate = pane.clone();
+        duplicate.socket = Some("second".into());
+        publish(PaneObservation::complete(vec![pane.clone(), duplicate]));
+        assert_eq!(
+            directory
+                .synthetic_diagnostics(std::iter::once(&socketless), &[HostKind::Tmux])
+                .unknown
+                .count,
+            1
+        );
+        publish(PaneObservation::complete(vec![pane.clone()]));
+        directory.invalidate();
+        assert_eq!(diagnose(&[HostKind::Tmux]).unknown.count, 1);
+        let stale = AgentDirectory::default();
+        stale.publish(
+            vec![(HostKind::Tmux, PaneObservation::complete(vec![pane]))],
+            Instant::now().checked_sub(Duration::from_secs(30)).unwrap(),
+            time::OffsetDateTime::now_utc(),
+        );
+        assert_eq!(
+            stale
+                .synthetic_diagnostics(std::iter::once(&agent), &[HostKind::Tmux])
+                .unknown
+                .count,
+            1
+        );
+        assert_eq!(
+            stale
+                .synthetic_diagnostics(std::iter::once(&agent), &[HostKind::Rmux])
+                .unobserved_backend
+                .count,
+            1
+        );
     }
 
     #[tokio::test]

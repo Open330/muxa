@@ -11,7 +11,7 @@
 //! whereas doctor is invocable any time and covers the whole install
 //! surface — service manager, hooks, tmux, recent errors. Sharing the
 //! IPC ping is the only meaningful overlap and that's a single
-//! `Client::snapshot()` call.
+//! `Client::hello()` call.
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -19,9 +19,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use muxa::ipc::Client;
-use muxa::state::SYNTHETIC_SESSION_PREFIX;
 use muxa::tmux::layout::{self, ClientSurface};
-use muxa::Agent;
 use tokio::time::timeout;
 
 use crate::doctor_report::{tilde, Level, Report};
@@ -54,16 +52,12 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
     let mut report = Report::default();
 
     // muxad: reachable, every live agent correlated, how it is kept running.
-    add(&mut report, "muxad", None, check_muxad(&socket).await);
+    let daemon = check_muxad(&socket).await;
+    let reachable = !matches!(&daemon, CheckResult::Fail(_));
+    add(&mut report, "muxad", None, daemon);
     // Skipped silently when muxad is unreachable: `check_muxad` already
     // owns and reported that condition.
-    if let Some(snapshot) = fetch_snapshot(&socket).await {
-        add(
-            &mut report,
-            "muxad",
-            None,
-            check_synthetic_agents(&snapshot),
-        );
+    if reachable {
         for result in check_collaboration(&socket).await {
             add(&mut report, "muxad", None, result);
         }
@@ -260,20 +254,13 @@ impl CheckResult {
 /// is a real problem worth surfacing.
 async fn check_muxad(socket: &Path) -> CheckResult {
     let client = Client::new(socket.to_path_buf());
-    match timeout(Duration::from_millis(1500), client.snapshot()).await {
-        // Answering is not the same as being current. A daemon left running
-        // across an upgrade keeps serving correctly-shaped responses out of
-        // the old build for as long as the protocol number happens to agree,
-        // so a passing snapshot is exactly when this is worth saying.
-        Ok(Ok(_)) => match timeout(
-            Duration::from_millis(1500),
-            client.hello(Duration::from_millis(1500)),
-        )
-        .await
-        {
-            Ok(Ok(hello)) => muxad_hello_verdict(&hello, socket),
-            _ => CheckResult::Ok(format!("muxad responding at {}", socket.display())),
-        },
+    match timeout(
+        Duration::from_millis(1500),
+        client.hello(Duration::from_millis(1500)),
+    )
+    .await
+    {
+        Ok(Ok(hello)) => muxad_hello_verdict(&hello, socket),
         // The inner error already carries the failure mode — including
         // socket path, connection refused vs. RPC mismatch, etc. The
         // previous wording ("reachable but errored") was misleading when
@@ -322,42 +309,75 @@ fn muxad_hello_verdict(hello: &muxa::ipc::Hello, socket: &Path) -> CheckResult {
 /// sender is often an agent that has since exited, and one-way notices never
 /// wake their recipient, so these accumulate silently. `None` when the daemon
 /// predates `msg expire` or does not answer.
-async fn check_stale_requests(socket: &Path) -> Option<CheckResult> {
-    const DAY: u64 = 24 * 60 * 60;
+async fn check_collaboration(socket: &Path) -> Vec<CheckResult> {
     let client = Client::new(socket.to_path_buf());
-    let hello = timeout(
-        Duration::from_millis(1500),
-        client.hello(Duration::from_millis(1500)),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    if !hello
-        .capabilities
-        .iter()
-        .any(|c| c == "collaboration_expire_v1")
-    {
-        return None;
+    let diagnostics = async {
+        let hello = client.hello(Duration::from_millis(1500)).await?;
+        if !hello
+            .capabilities
+            .iter()
+            .any(|c| c == muxa::collaboration::COLLABORATION_HEALTH_CAPABILITY)
+        {
+            return Ok(vec![CheckResult::Warn("request recovery diagnostics unknown: muxad lacks collaboration_health_v1; upgrade muxad".into())]);
+        }
+        client
+            .collaboration_health()
+            .await
+            .map(|health| health_verdicts(&health))
+    };
+    let mut results = match timeout(Duration::from_millis(1500), diagnostics).await {
+        Ok(Ok(results)) => results,
+        Ok(Err(error)) => vec![CheckResult::Warn(format!(
+            "collaboration diagnostics unavailable: {error}"
+        ))],
+        Err(_) => vec![CheckResult::Warn(
+            "collaboration diagnostics timed out; request health is unknown".into(),
+        )],
+    };
+    if let Some(workers) = check_workers(socket).await {
+        results.push(workers);
     }
-    let stale = timeout(
-        Duration::from_millis(1500),
-        client.collaboration_expire(DAY, true),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    Some(stale_requests_verdict(&stale))
+    results
 }
 
-/// The mailbox and the workers muxa launched, when the daemon answers.
-async fn check_collaboration(socket: &Path) -> Vec<CheckResult> {
-    [
-        check_stale_requests(socket).await,
-        check_workers(socket).await,
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+fn health_verdicts(health: &muxa::collaboration::CollaborationHealth) -> Vec<CheckResult> {
+    let mut results = synthetic_verdicts(&health.synthetic_agents);
+    results.push(if health.interrupted_requests == 0 && health.pending_recovery_decisions == 0 {
+        CheckResult::Ok("no interrupted original collaboration requests".into())
+    } else {
+        CheckResult::Warn(format!("{} interrupted original request(s), {} with unavailable recipient bindings; {} pending recovery decision(s). Examples: {}. Inspect with `muxa msg list --request-id REQUEST --full`; check existing work before a safe handoff. Missing bindings do not establish process exit; do not blindly resend.",health.interrupted_requests,health.binding_unavailable,health.pending_recovery_decisions,health.example_request_ids.join(", ")))
+    });
+    results.push(if health.stale_queued == 0 {
+        CheckResult::Ok("no ordinary queued request has waited over 24h".into())
+    } else if health.stale_quiet_notices == 0 {
+        CheckResult::Warn(format!("{} ordinary queued request(s) older than 24h; none are quiet undelivered notices. Individual review is required; do not treat missing recipients or delivery evidence as task completion.",health.stale_queued))
+    } else {
+        CheckResult::Warn(format!("{} ordinary queued request(s) older than 24h; {} quiet undelivered notice(s) eligible for selective cleanup ({}). Preview with `muxa msg expire --older-than 24h --quiet-only --request-id REQUEST --dry-run`; remove `--dry-run` only after reviewing. Other requests require individual review.",health.stale_queued,health.stale_quiet_notices,health.example_quiet_notice_ids.join(", ")))
+    });
+    results
+}
+
+fn synthetic_verdicts(
+    diagnostics: &muxa::agent_directory::SyntheticDiagnostics,
+) -> Vec<CheckResult> {
+    let mut results = Vec::new();
+    for (bucket, explanation) in [
+        (&diagnostics.unbound_hooks,"pane observed but hook session not correlated; trigger an agent event and review hook configuration"),
+        (&diagnostics.unobserved_backend,"record(s) from a backend this daemon does not observe; review backend scope and orphan retention, not agent hooks"),
+        (&diagnostics.unseen_panes,"record(s) absent from a recent complete pane inventory; verify topology and allow reconciliation, not an agent restart"),
+        (&diagnostics.unknown,"record(s) with unavailable, stale or incomplete topology evidence; hook correlation is unknown"),
+    ] {
+        if bucket.count > 0 { results.push(CheckResult::Warn(format!("{} {explanation} ({})",bucket.count,bucket.examples.join(", ")))); }
+    }
+    if diagnostics.unknown.count > 0 {
+        results.push(CheckResult::Warn(format!("cached topology age: {:?} ms; freshness budget: {} ms; invalidated: {}. Recheck with an explicit agent lookup refresh when fresh evidence is needed",diagnostics.inventory_age_ms,diagnostics.max_inventory_age_ms,diagnostics.inventory_invalidated)));
+    }
+    if results.is_empty() {
+        results.push(CheckResult::Ok(
+            "no unresolved synthetic agent records".into(),
+        ));
+    }
+    results
 }
 
 /// Workers muxa launched that are in error or long idle. `None` when the
@@ -423,84 +443,6 @@ fn workers_verdict(inventory: &muxa::collaboration::WorkerInventory) -> CheckRes
         "{total} live worker(s): {}{overlap_note}. Review with `muxa workers`",
         parts.join("; ")
     ))
-}
-
-fn stale_requests_verdict(stale: &[muxa::collaboration::CollaborationRequest]) -> CheckResult {
-    if stale.is_empty() {
-        return CheckResult::Ok("no request has waited unclaimed over 24h".into());
-    }
-    let plural = |n: usize| if n == 1 { "" } else { "s" };
-    let quiet = stale
-        .iter()
-        .filter(|request| !request.should_notify())
-        .count();
-    let quiet = if quiet == 0 {
-        String::new()
-    } else {
-        format!(
-            " ({quiet} one-way notice{} that never wake their recipient)",
-            plural(quiet)
-        )
-    };
-    let oldest = stale
-        .iter()
-        .map(|request| request.created_at.date())
-        .min()
-        .map_or_else(String::new, |date| format!(", oldest from {date}"));
-    CheckResult::Warn(format!(
-        "{} request{} unclaimed for over 24h{quiet}{oldest}. Review with \
-         `muxa msg expire --older-than 24h --dry-run`; close with \
-         `muxa msg expire --older-than 24h`",
-        stale.len(),
-        plural(stale.len()),
-    ))
-}
-
-async fn fetch_snapshot(socket: &Path) -> Option<Vec<Agent>> {
-    let client = Client::new(socket.to_path_buf());
-    match timeout(Duration::from_millis(1500), client.snapshot()).await {
-        Ok(Ok(s)) => Some(s),
-        _ => None,
-    }
-}
-
-/// Flag agents that still exist as discovery placeholders. A `synthetic-*`
-/// session id means muxa saw an agent process in a pane but has not correlated
-/// a real hook session with that pane yet. The hook can be completely absent,
-/// or it can be arriving as a separate paneless row; the snapshot alone cannot
-/// safely distinguish those cases, so the guidance covers both without
-/// claiming that no hook events were received.
-fn check_synthetic_agents(snapshot: &[Agent]) -> CheckResult {
-    let panes = synthetic_panes(
-        snapshot
-            .iter()
-            .map(|a| (a.session_id.as_str(), a.pane.as_deref())),
-    );
-    if panes.is_empty() {
-        return CheckResult::Ok("Agent hooks — all tracked agents reporting".into());
-    }
-    CheckResult::Warn(format!(
-        "{} pane agent(s) not yet correlated with hook events ({}) — trigger a \
-         new agent event. If they still remain, use `muxa watch --include-paneless` \
-         to check for pane-correlation failure; otherwise restart the agent or \
-         review `/hooks` inside Codex.",
-        panes.len(),
-        panes.join(", ")
-    ))
-}
-
-/// Pure core of [`check_synthetic_agents`], split out so the
-/// classification is unit-testable without constructing the heavy
-/// `Agent` struct. Returns the sorted, de-duplicated panes whose only
-/// record is a synthetic discovery placeholder.
-fn synthetic_panes<'a>(agents: impl Iterator<Item = (&'a str, Option<&'a str>)>) -> Vec<&'a str> {
-    let mut panes: Vec<&str> = agents
-        .filter(|(sid, _)| sid.starts_with(SYNTHETIC_SESSION_PREFIX))
-        .map(|(_, pane)| pane.unwrap_or("?"))
-        .collect();
-    panes.sort_unstable();
-    panes.dedup();
-    panes
 }
 
 /// Branch on the host OS: launchd on macOS, systemd on Linux. Other
@@ -1401,67 +1343,74 @@ mod tests {
         );
     }
 
-    fn test_participant(pane: &str, session: &str) -> muxa::collaboration::Participant {
-        muxa::collaboration::Participant {
-            launch_purpose: muxa::collaboration::LaunchPurpose::Primary,
-            draining: false,
-            agent_kind: muxa::AgentKind::Codex,
-            agent_session_id: session.into(),
-            pane: pane.into(),
-            socket: None,
-            room: muxa::collaboration::RoomId {
-                host: "tmux".into(),
-                socket: None,
-                window_id: "@1".into(),
-            },
-            tmux_session_id: None,
-            tmux_session_name: None,
-            window_name: None,
-            state: muxa::AgentState::Idle,
-            cwd: None,
-            alias: None,
-            roles: Vec::new(),
-            console: false,
-        }
+    #[test]
+    fn health_verdicts_separate_recovery_scope_and_selective_housekeeping() {
+        let mut health = muxa::collaboration::CollaborationHealth::default();
+        assert!(health_verdicts(&health)
+            .iter()
+            .all(|r| matches!(r, CheckResult::Ok(_))));
+        health.interrupted_requests = 15;
+        health.binding_unavailable = 15;
+        health.pending_recovery_decisions = 11;
+        health.example_request_ids = vec!["original-request".into()];
+        health.stale_queued = 2;
+        health.stale_quiet_notices = 1;
+        health.example_quiet_notice_ids = vec!["quiet-notice".into()];
+        health.synthetic_agents.unobserved_backend.count = 2;
+        health.synthetic_agents.unobserved_backend.examples =
+            vec!["tmux.sock:%3".into(), "tmux.sock:%7".into()];
+        let results = health_verdicts(&health);
+        let lines = results.iter().map(message).collect::<Vec<_>>();
+        assert!(lines[0].contains("daemon does not observe"));
+        assert!(!lines[0].contains("trigger"));
+        assert!(lines[1].contains("15 interrupted original"));
+        assert!(lines[1].contains("11 pending recovery"));
+        assert!(lines[2].contains("--quiet-only --request-id REQUEST --dry-run"));
+        assert!(!lines[2].contains("close with"));
+        health.stale_quiet_notices = 0;
+        let next = health_verdicts(&health);
+        assert!(!message(next.last().unwrap()).contains("--quiet-only"));
+        let orphan = muxa::collaboration::CollaborationHealth {
+            pending_recovery_decisions: 1,
+            ..Default::default()
+        };
+        assert!(health_verdicts(&orphan).iter().any(
+            |r| matches!(r, CheckResult::Warn(_)) && message(r).contains("1 pending recovery")
+        ));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
-    async fn stale_requests_are_counted_with_their_quiet_notices() {
-        use muxa::collaboration::{
-            CollaborationOptions, CollaborationStore, NewRequest, RequestKind,
-        };
-        assert!(matches!(stale_requests_verdict(&[]), CheckResult::Ok(_)));
-
-        let store = CollaborationStore::in_memory(CollaborationOptions::default());
-        let (from, to) = (test_participant("%1", "a"), test_participant("%2", "b"));
-        for kind in [RequestKind::Question, RequestKind::Notice] {
-            store
-                .create(
-                    from.clone(),
-                    to.clone(),
-                    NewRequest {
-                        kind,
-                        body: "x".into(),
-                        expects_reply: kind != RequestKind::Notice,
-                        ..NewRequest::default()
-                    },
-                )
-                .await
-                .unwrap();
-        }
-        let cutoff = time::OffsetDateTime::now_utc() + time::Duration::seconds(1);
-        let stale = store.expire_queued_before(cutoff, true).await.unwrap();
-        let CheckResult::Warn(message) = stale_requests_verdict(&stale) else {
-            panic!("stale requests are a warning");
-        };
-        assert!(
-            message.starts_with("2 requests unclaimed for over 24h (1 one-way notice "),
-            "{message}"
-        );
-        assert!(
-            message.contains("muxa msg expire --older-than 24h --dry-run"),
-            "{message}"
-        );
+    async fn legacy_health_is_unknown_not_green() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy-health.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                    "hello"
+                );
+                reader
+                    .get_mut()
+                    .write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[]}\n")
+                    .await
+                    .unwrap();
+            }
+        });
+        let results = check_collaboration(&socket).await;
+        assert!(results
+            .iter()
+            .any(|r| matches!(r, CheckResult::Warn(_)) && message(r).contains("health_v1")));
+        assert!(!results
+            .iter()
+            .any(|r| message(r).contains("no interrupted")));
+        server.await.unwrap();
     }
 
     /// A server the user owns: their `~/.tmux.conf` was read, and a
@@ -1613,42 +1562,6 @@ mod tests {
             "{}",
             message(&result)
         );
-    }
-
-    #[test]
-    fn synthetic_panes_picks_only_synthetic_sorted_deduped() {
-        let rows = [
-            ("real-abc", Some("%1")),
-            ("synthetic-%4", Some("%4")),
-            ("synthetic-%2", Some("%2")),
-            ("real-def", Some("%3")),
-            // Duplicate synthetic for the same pane (re-sync) collapses.
-            ("synthetic-%2", Some("%2")),
-        ];
-        assert_eq!(
-            synthetic_panes(rows.iter().map(|&(s, p)| (s, p))),
-            vec!["%2", "%4"]
-        );
-    }
-
-    #[test]
-    fn synthetic_panes_empty_when_all_real() {
-        let rows = [("real-a", Some("%1")), ("real-b", Some("%2"))];
-        assert!(synthetic_panes(rows.iter().map(|&(s, p)| (s, p))).is_empty());
-    }
-
-    #[test]
-    fn synthetic_panes_handles_missing_pane() {
-        let rows = [("synthetic-x", None)];
-        assert_eq!(
-            synthetic_panes(rows.iter().map(|&(s, p)| (s, p))),
-            vec!["?"]
-        );
-    }
-
-    #[test]
-    fn check_synthetic_agents_ok_when_none() {
-        assert!(matches!(check_synthetic_agents(&[]), CheckResult::Ok(_)));
     }
 
     #[test]

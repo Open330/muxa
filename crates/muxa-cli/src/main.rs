@@ -741,6 +741,7 @@ enum MsgCmd {
     },
     /// Operator cleanup: expire every request nobody claimed within the
     /// given age, whoever sent it, including senders that no longer exist.
+    /// Human decision requests, including recovery questions, are protected.
     Expire {
         /// Age past which an unclaimed request expires (e.g. `24h`, `7d`).
         #[arg(long, value_name = "AGE")]
@@ -751,6 +752,12 @@ enum MsgCmd {
         /// Print the affected requests as JSON.
         #[arg(long)]
         json: bool,
+        /// Only quiet one-way notices with no delivery or claim evidence.
+        #[arg(long)]
+        quiet_only: bool,
+        /// Limit cleanup to one exact request, rechecking all other filters.
+        #[arg(long)]
+        request_id: Option<String>,
     },
 }
 
@@ -2258,9 +2265,19 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         older_than,
         dry_run,
         json,
+        quiet_only,
+        request_id,
     } = action
     {
-        return cmd_msg_expire(client, &older_than, dry_run, json).await;
+        return cmd_msg_expire(
+            client,
+            &older_than,
+            dry_run,
+            json,
+            quiet_only,
+            request_id.as_deref(),
+        )
+        .await;
     }
     let origin = collaboration_origin(client).await?;
     match action {
@@ -2575,18 +2592,26 @@ async fn cmd_msg_expire(
     older_than: &str,
     dry_run: bool,
     json: bool,
+    quiet_only: bool,
+    request_id: Option<&str>,
 ) -> Result<()> {
     require_capability(client, "collaboration_expire_v1", "msg expire").await?;
     let secs = parse_duration_secs(older_than)?;
     anyhow::ensure!(secs > 0, "--older-than must be greater than zero");
-    let requests = client.collaboration_expire(secs, dry_run).await?;
+    anyhow::ensure!(
+        request_id.is_none_or(|id| !id.trim().is_empty()),
+        "--request-id must not be blank"
+    );
+    let requests = client
+        .collaboration_expire_filtered(secs, dry_run, quiet_only, request_id)
+        .await?;
     if json {
         println!("{}", serde_json::to_string_pretty(&requests)?);
         return Ok(());
     }
     let verb = if dry_run { "would expire" } else { "expired" };
     if requests.is_empty() {
-        println!("nothing unclaimed is older than {older_than}");
+        println!("no eligible unclaimed requests match the age and cleanup filters ({older_than})");
         return Ok(());
     }
     for request in &requests {
