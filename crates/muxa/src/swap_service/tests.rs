@@ -703,3 +703,71 @@ fn a_panicking_executor_faults_the_service() {
     assert!(h.service.active().is_err());
     assert!(h.executed.lock().unwrap().is_empty());
 }
+
+/// The lock lives as long as anything still running under it: dropping the
+/// public handle while a job runs does not let another manager in.
+#[test]
+fn ownership_outlives_the_handle_while_a_job_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swap-jobs.sqlite3");
+    let provider = || {
+        Arc::new(FakeProvider {
+            config_path: None,
+            config: Mutex::new(SwapConfig::default()),
+            acquired: Mutex::new(Vec::new()),
+        }) as Arc<dyn ContextProvider>
+    };
+
+    // A worker's reference keeps the manager's lock.
+    let first = SwapService::open(Some(&path), provider()).unwrap();
+    let worker = Arc::clone(&first.inner);
+    drop(first);
+    assert!(SwapService::open(Some(&path), provider()).is_err());
+    drop(worker);
+    drop(SwapService::open(Some(&path), provider()).unwrap());
+
+    // A job held mid-target keeps it too, until it finishes.
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let lock = ownership_lock(&path).unwrap();
+    let service = Arc::new(
+        Service::open(
+            &path,
+            OwnerIdentity {
+                nonce: "running".into(),
+                pid: std::process::id(),
+                process_start: None,
+            },
+            &gone,
+            FakeEngine {
+                script: Box::new(move || {
+                    vec![EngineStep::Run(FakeTarget {
+                        identity: identity("%1", "/tmp/tmux-1/default"),
+                        gate: Some(Arc::clone(&held)),
+                    })]
+                }),
+                executed: Arc::new(Mutex::new(Vec::new())),
+                dry_runs: Arc::new(AtomicUsize::new(0)),
+            },
+            provider(),
+        )
+        .unwrap()
+        .holding(lock),
+    );
+    Service::submit(&service, "key", &overrides(&["%1"]), None).unwrap();
+    drop(service);
+    assert!(
+        ownership_lock(&path).is_err(),
+        "the running job still owns the store"
+    );
+    gate.open();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let freed = loop {
+        match ownership_lock(&path) {
+            Ok(lock) => break Some(lock),
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Err(_) => break None,
+        }
+    };
+    assert!(freed.is_some(), "released once the job ended");
+}

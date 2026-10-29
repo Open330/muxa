@@ -290,8 +290,6 @@ impl Engine for RealEngine {
 /// The daemon's handle.
 pub struct SwapService {
     inner: Arc<Service<RealEngine>>,
-    /// Held for as long as this service lives; see [`ownership_lock`].
-    _lock: std::fs::File,
 }
 
 impl SwapService {
@@ -316,10 +314,10 @@ impl SwapService {
             RealEngine,
             provider,
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| error.to_string())?
+        .holding(lock);
         Ok(Self {
             inner: Arc::new(inner),
-            _lock: lock,
         })
     }
 
@@ -439,6 +437,12 @@ pub(crate) struct Service<E: Engine> {
     live: Mutex<HashMap<String, LiveJob>>,
     fault: Mutex<Option<String>>,
     spawner: Spawner,
+    /// The ownership lock ([`ownership_lock`]). Owned here, where every
+    /// running job holds a reference, so it is released only once the
+    /// manager and its last executor are both gone — never while work
+    /// that was accepted under it still runs.
+    #[allow(dead_code)] // held for its lifetime, never read
+    ownership: Option<std::fs::File>,
 }
 
 impl<E: Engine> Service<E> {
@@ -462,7 +466,15 @@ impl<E: Engine> Service<E> {
             live: Mutex::new(HashMap::new()),
             fault: Mutex::new(None),
             spawner: thread_spawner(),
+            ownership: None,
         })
+    }
+
+    /// Keep `lock` for as long as this service, and any job running under
+    /// it, lives.
+    pub(crate) fn holding(mut self, lock: std::fs::File) -> Self {
+        self.ownership = Some(lock);
+        self
     }
 
     #[cfg(test)]
