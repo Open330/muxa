@@ -11,7 +11,7 @@ board 자체는 [WATCH.ko.md](WATCH.ko.md)를 보세요. 이 문서는 명령과
 ```bash
 muxa dashboard
 muxa dashboard --since 7d        # 요약의 ACT/WACT 기간
-muxa dashboard --sort activity   # attention(기본), activity, name
+muxa dashboard --sort active     # attention(기본), activity, active, name
 muxa dashboard --include-paneless
 muxa dashboard --theme mono
 ```
@@ -42,13 +42,11 @@ muxa dashboard --theme mono
 
 ## 이전 dashboard와 달라진 점
 
-- **`--sort active`는 거부됩니다.** 활동 시간으로 정렬했는데 그 시간을 tmux
-  session 이름 기준으로 나눴기 때문에 한 session의 Work가 모두 같은 값을
-  보였습니다. ACT/WACT를 Work별로 나눌 수 있을 때까지 board는 모든 세션 합계 하나를
-  보여주고, `active`는 다른 뜻으로 바뀌는 대신 오류를 냅니다. 작업 중인 agent 수
-  기준은 `:sort busy`로 쓸 수 있습니다.
-- 같은 이유로 **카드별 ACT/WACT는 없습니다.** 모서리에 `--since` 기간의 모든 세션
-  합계가 나옵니다.
+- **ACT/WACT는 pane 단위로 나눈 뒤 Work의 pane들을 합칩니다.** 이전 콘솔은
+  tmux session 이름으로 나눠서 한 session의 Work가 모두 같은 값을 보였습니다. 각
+  행에 `ACT` 열이, detail에 ACT·WACT가, 모서리에 모든 세션 합계가 나오며
+  `--sort active`로 그 순서로 정렬합니다. 작업 중인 agent 수 기준은 `:sort busy`로
+  쓸 수 있습니다.
 - **muxa가 소유한 PTY session**은 Work가 아니어서 나오지 않습니다. `muxa watch`가
   보여줍니다.
 - 이전 카드 콘솔은 제거되었습니다.

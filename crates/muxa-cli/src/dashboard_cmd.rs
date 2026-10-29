@@ -19,7 +19,7 @@ pub struct Args {
     #[arg(long, default_value = "today")]
     since: String,
 
-    /// Work order: attention (default), activity or name.
+    /// Work order: attention (default), activity, active (ACT) or name.
     #[arg(long, value_enum, default_value_t = DashboardSort::Attention)]
     sort: DashboardSort,
 
@@ -32,27 +32,19 @@ pub struct Args {
 enum DashboardSort {
     Attention,
     Activity,
-    /// Kept so the old spelling gets an explanation rather than a parse
-    /// error; see [`Args::board_sort`].
     Active,
     Name,
 }
 
 impl Args {
-    /// The Work board's order for this invocation. `active` ordered cards by
-    /// active time, which the board cannot attribute per Work yet; it is
-    /// refused rather than quietly mapped to something else.
-    pub(crate) fn board_sort(&self) -> Result<WatchBoardSort> {
-        Ok(match self.sort {
+    /// The Work board's order for this invocation.
+    pub(crate) fn board_sort(&self) -> WatchBoardSort {
+        match self.sort {
             DashboardSort::Attention => WatchBoardSort::Attention,
             DashboardSort::Activity => WatchBoardSort::Activity,
+            DashboardSort::Active => WatchBoardSort::Active,
             DashboardSort::Name => WatchBoardSort::Name,
-            DashboardSort::Active => anyhow::bail!(
-                "`--sort active` ordered Works by active time, which the Work board cannot \
-                 attribute per Work yet; use --sort attention, activity or name (or `busy` \
-                 in the board for agents at work)"
-            ),
-        })
+        }
     }
 
     /// The ACT/WACT window, checked the way `muxa stats --since` checks it.

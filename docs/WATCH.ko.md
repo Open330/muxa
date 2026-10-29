@@ -241,12 +241,13 @@ agent를, `A`는 모두를 대상 이름을 보여주는 확인 뒤에 중단합
 open`), 실패는 pane과 함께 서버를 밝힙니다. Work 전체 프롬프트는 항상 키 입력이며
 협업 요청으로 바뀌지 않습니다.
 
-`:sort attention|activity|busy|name`(또는 `--board-sort`, `[watch] board_sort`)는
-topology 정렬을 건드리지 않고 board 순서를 바꿉니다. `busy`는 작업 중이거나
-시작 중인 agent 수입니다. board 오른쪽 위는 기간(`--since`, `[watch]
-board_since`, 기본 `today`) 동안 **모든 세션**의 ACT·WACT 합계입니다. Work별이
-아니고 필터를 따르지 않으며, 읽을 수 없으면 0 대신 `unavailable`이라고
-표시합니다.
+`:sort attention|activity|busy|active|name`(또는 `--board-sort`, `[watch]
+board_sort`)는 topology 정렬을 건드리지 않고 board 순서를 바꿉니다. `busy`는 작업
+중이거나 시작 중인 agent 수, `active`는 ACT 순입니다. ACT·WACT는 기간(`--since`,
+`[watch] board_since`, 기본 `today`) 동안 각 초가 일어난 정확한 pane에 나눠
+붙이며(last touch라 한 초를 두 번 세지 않음), 각 행의 `ACT` 열과 detail은 그 Work의
+pane을 합합니다. 오른쪽 위는 모든 세션 합계로 필터를 따르지 않고, 폭이 모자라면
+줄이거나 생략합니다. 아직 모르면 `…`, 읽을 수 없으면 0 대신 `unavailable`입니다.
 
 board의 협업도 같은 agent 커서를 따릅니다. `m`은 그 agent에게 메시지를 보냅니다.
 누른 순간 pane과 agent 세션이 고정되고, 그사이 그 pane에서 다른 agent가 시작됐으면

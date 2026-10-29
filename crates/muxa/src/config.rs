@@ -2081,6 +2081,8 @@ pub enum WatchBoardSort {
     Activity,
     /// Most agents working or starting first.
     Busy,
+    /// Most active (ACT) time in the board's window first.
+    Active,
     /// By workspace, then Work id.
     Name,
 }

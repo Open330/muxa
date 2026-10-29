@@ -12,6 +12,8 @@ use std::cmp::Reverse;
 use std::fmt::Write as _;
 
 use muxa::config::WatchBoardSort;
+
+use crate::stats::ActiveDuration;
 use muxa::event::AgentState;
 use muxa::state::Agent;
 use muxa::work::WorkSnapshotItem;
@@ -51,6 +53,9 @@ pub(crate) struct BoardScreen {
     agent: Option<AgentRef>,
     agent_work: Option<WorkIdentity>,
     sort: WatchBoardSort,
+    /// ACT/WACT per exact pane over the board's window, when known; what the
+    /// `active` order and each row's ACT column read.
+    activity: Option<std::collections::BTreeMap<String, ActiveDuration>>,
 }
 
 /// One agent pane, exactly: server, session, window and pane.
@@ -116,7 +121,34 @@ impl BoardScreen {
                 .works
                 .sort_by_key(|work| (Reverse(busy_agents(work)), attention_order(work))),
             WatchBoardSort::Name => self.works.sort_by(|a, b| a.identity.cmp(&b.identity)),
+            WatchBoardSort::Active => {
+                let activity = self.activity.as_ref();
+                self.works.sort_by_key(|work| {
+                    let active =
+                        activity.map_or(0, |by_pane| work_active(work, by_pane).active_secs);
+                    (Reverse(active), attention_order(work))
+                });
+            }
         }
+    }
+
+    /// Per-pane activity arrived: it feeds the ACT column and, under the
+    /// `active` order, the order itself. The cursor stays on its Work.
+    pub(crate) fn set_activity(
+        &mut self,
+        activity: Option<std::collections::BTreeMap<String, ActiveDuration>>,
+    ) {
+        self.activity = activity;
+        if self.sort == WatchBoardSort::Active {
+            self.sort_works();
+        }
+    }
+
+    /// The Work's ACT/WACT, or `None` until per-pane activity is known.
+    pub(crate) fn active_of(&self, work: &WorkSnapshotItem) -> Option<ActiveDuration> {
+        self.activity
+            .as_ref()
+            .map(|by_pane| work_active(work, by_pane))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -375,6 +407,29 @@ pub(crate) fn worker_summary(
     summary
 }
 
+/// A Work's ACT/WACT: the sum over every pane of every Run, each pane once.
+/// The per-pane figures are last-touch attributed, so the sum never counts
+/// one second twice.
+pub(crate) fn work_active(
+    work: &WorkSnapshotItem,
+    by_pane: &std::collections::BTreeMap<String, ActiveDuration>,
+) -> ActiveDuration {
+    let mut seen = std::collections::HashSet::new();
+    let mut total = ActiveDuration::default();
+    for pane in work.runs.iter().flat_map(|run| run.panes.iter()) {
+        if !seen.insert(pane.pane_id.as_str()) {
+            continue;
+        }
+        if let Some(active) = by_pane.get(&pane.pane_id) {
+            total.active_secs = total.active_secs.saturating_add(active.active_secs);
+            total.work_active_secs = total
+                .work_active_secs
+                .saturating_add(active.work_active_secs);
+        }
+    }
+    total
+}
+
 /// Agents of the Work that are working or starting.
 pub(crate) fn busy_agents(work: &WorkSnapshotItem) -> usize {
     agents(work)
@@ -399,6 +454,7 @@ pub(crate) fn sort_label(sort: WatchBoardSort) -> &'static str {
         WatchBoardSort::Activity => "activity",
         WatchBoardSort::Busy => "busy",
         WatchBoardSort::Name => "name",
+        WatchBoardSort::Active => "active",
     }
 }
 
@@ -408,6 +464,7 @@ pub(crate) fn parse_sort(value: &str) -> Option<WatchBoardSort> {
         "activity" | "latest" | "recent" => Some(WatchBoardSort::Activity),
         "busy" | "working" => Some(WatchBoardSort::Busy),
         "name" | "id" => Some(WatchBoardSort::Name),
+        "active" | "act" => Some(WatchBoardSort::Active),
         _ => None,
     }
 }
@@ -484,17 +541,20 @@ pub(crate) fn jump_target(work: &WorkSnapshotItem) -> Option<(&RunSnapshot, &str
         .map(|(run, pane)| (run, pane.pane_id.as_str()))
 }
 
-pub(crate) const COLUMNS: [Constraint; 7] = [
+pub(crate) const COLUMNS: [Constraint; 8] = [
     Constraint::Length(11),
-    Constraint::Percentage(26),
-    Constraint::Min(18),
+    Constraint::Percentage(24),
+    Constraint::Min(16),
     Constraint::Length(12),
     Constraint::Length(4),
     Constraint::Length(9),
+    Constraint::Length(6),
     Constraint::Length(5),
 ];
 
-pub(crate) const HEADERS: [&str; 7] = ["STAGE", "WORK", "TITLE", "ISSUE", "RUNS", "AGENTS", "AGE"];
+pub(crate) const HEADERS: [&str; 8] = [
+    "STAGE", "WORK", "TITLE", "ISSUE", "RUNS", "AGENTS", "ACT", "AGE",
+];
 
 pub(crate) fn stage_label(stage: BoardStage) -> &'static str {
     match stage {
@@ -534,6 +594,7 @@ pub(crate) fn row<'a>(
     now: OffsetDateTime,
     theme: WatchThemeSpec,
     selected: bool,
+    active: Option<ActiveDuration>,
 ) -> Row<'a> {
     let stage = if needs_operator(work) {
         Span::styled(
@@ -563,6 +624,7 @@ pub(crate) fn row<'a>(
         Cell::from(issue),
         Cell::from(work.runs.len().to_string()),
         Cell::from(agent_glyphs(work, theme)),
+        Cell::from(active.map_or_else(|| "…".into(), |active| active_label(active.active_secs))),
         Cell::from(work.latest_at.map_or_else(|| "-".into(), |at| age(now, at))),
     ];
     let row = Row::new(cells);
@@ -1010,7 +1072,11 @@ mod tests {
         assert_eq!(order(&board), ["CAL-1", "CAL-2", "CAL-3"]);
         assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-3");
         assert_eq!(parse_sort("working"), Some(WatchBoardSort::Busy));
-        assert_eq!(parse_sort("active"), None, "active means time, not a count");
+        assert_eq!(
+            parse_sort("active"),
+            Some(WatchBoardSort::Active),
+            "active means time"
+        );
     }
 
     #[test]

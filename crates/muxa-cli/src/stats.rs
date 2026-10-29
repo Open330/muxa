@@ -270,6 +270,11 @@ enum GroupBy {
     Project,
     Agent,
     Session,
+    /// The exact pane each interval happened in. Internal: the Work board
+    /// sums its Works' panes from this, since one tmux session can hold many
+    /// Works and session attribution cannot tell them apart.
+    #[value(skip)]
+    Pane,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -303,6 +308,7 @@ impl GroupBy {
             Self::Project => "project",
             Self::Agent => "agent",
             Self::Session => "session",
+            Self::Pane => "pane",
         }
     }
 
@@ -312,6 +318,7 @@ impl GroupBy {
             Self::Project => "Project",
             Self::Agent => "Agent",
             Self::Session => "Session",
+            Self::Pane => "Pane",
         }
     }
 }
@@ -617,11 +624,6 @@ pub(crate) struct ActiveDuration {
     pub work_active_secs: u64,
 }
 
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SessionActiveStats {
-    pub totals: ActiveDuration,
-}
-
 #[derive(Debug, Clone)]
 struct ScopedInterval {
     started_at: OffsetDateTime,
@@ -706,32 +708,24 @@ async fn load_data(
     Ok(data)
 }
 
-pub(crate) async fn session_active_stats(
+/// ACT/WACT per exact pane id over `since`, with the same last-touch
+/// de-duplication as the totals: each wall-clock second goes to one pane, so
+/// a set of panes can be summed without double counting.
+pub(crate) async fn pane_active_stats(
     client: &Client,
     cfg: &Config,
     since: &str,
-    exclusions: &ScopeExclusions,
-) -> Result<SessionActiveStats> {
-    let data = load_data(client, cfg, since, exclusions).await?;
-    let attribution = last_touch_attribution(&active_windows(&data, GroupBy::Session));
-    let mut by_session = BTreeMap::<String, ActiveDuration>::new();
-
-    for (session, secs) in attribution.active {
-        by_session.entry(session).or_default().active_secs = secs;
+) -> Result<BTreeMap<String, ActiveDuration>> {
+    let data = load_data(client, cfg, since, &ScopeExclusions::default()).await?;
+    let attribution = last_touch_attribution(&active_windows(&data, GroupBy::Pane));
+    let mut by_pane = BTreeMap::<String, ActiveDuration>::new();
+    for (pane, secs) in attribution.active {
+        by_pane.entry(pane).or_default().active_secs = secs;
     }
-    for (session, secs) in attribution.work_active {
-        by_session.entry(session).or_default().work_active_secs = secs;
+    for (pane, secs) in attribution.work_active {
+        by_pane.entry(pane).or_default().work_active_secs = secs;
     }
-
-    let totals = by_session
-        .values()
-        .fold(ActiveDuration::default(), |mut total, row| {
-            total.active_secs = total.active_secs.saturating_add(row.active_secs);
-            total.work_active_secs = total.work_active_secs.saturating_add(row.work_active_secs);
-            total
-        });
-
-    Ok(SessionActiveStats { totals })
+    Ok(by_pane)
 }
 
 /// Convert a config `u64` seconds value into a `time::Duration`, clamping the
@@ -1882,6 +1876,7 @@ fn prompt_group_key(data: &StatsData, prompt: &HistoryEntry, group_by: GroupBy) 
             .or_else(|| data.project_by_pane.get(&prompt.pane).cloned())
             .unwrap_or_else(|| "unknown".to_string()),
         GroupBy::Agent => prompt.kind.to_string(),
+        GroupBy::Pane => prompt.pane.clone(),
         GroupBy::Session => prompt
             .tmux_session
             .clone()
@@ -1900,6 +1895,10 @@ fn agent_group_key(data: &StatsData, agent: &Agent, group_by: GroupBy) -> String
             project_from_cwd(agent.cwd.as_deref()).unwrap_or_else(|| "unknown".to_string())
         }
         GroupBy::Agent => agent.kind.to_string(),
+        GroupBy::Pane => agent
+            .pane
+            .clone()
+            .unwrap_or_else(|| agent.session_id.clone()),
         GroupBy::Session => agent
             .pane
             .as_ref()
@@ -1936,6 +1935,10 @@ fn state_transition_group_key(
             })
             .unwrap_or_else(|| "unknown".to_string()),
         GroupBy::Agent => entry.kind.to_string(),
+        GroupBy::Pane => entry
+            .pane
+            .clone()
+            .unwrap_or_else(|| entry.session_id.clone()),
         GroupBy::Session => entry
             .session_name
             .clone()
@@ -1960,7 +1963,7 @@ fn session_foreground_group_key(
     match group_by {
         GroupBy::Day => Some(format_day(entry.ended_at)),
         GroupBy::Session => Some(stats_session_name(&entry.session_name).to_owned()),
-        GroupBy::Project | GroupBy::Agent => None,
+        GroupBy::Project | GroupBy::Agent | GroupBy::Pane => None,
     }
 }
 fn add_open_session_foreground_rows(
@@ -1988,7 +1991,7 @@ fn add_open_session_foreground_rows(
         let key = match group_by {
             GroupBy::Day => format_day(data.now),
             GroupBy::Session => stats_session_name(&activity.name).to_owned(),
-            GroupBy::Project | GroupBy::Agent => unreachable!(),
+            GroupBy::Project | GroupBy::Agent | GroupBy::Pane => unreachable!(),
         };
         rows.entry(key).or_default().foreground_secs += secs;
     }
@@ -2146,6 +2149,7 @@ fn human_presence_group_key(
             .as_ref()
             .and_then(|pane| data.project_by_pane.get(pane))
             .cloned(),
+        GroupBy::Pane => interval.pane.clone(),
         GroupBy::Agent => None,
     }
 }
@@ -3798,6 +3802,60 @@ pub(crate) mod tests {
             assert_eq!(totals.active_secs, 0, "kind={kind:?}");
             assert_eq!(totals.work_active_secs, 0, "kind={kind:?}");
         }
+    }
+
+    /// Two Works in one tmux session: session attribution lumps them, pane
+    /// attribution keeps them apart, and the panes still sum to the total.
+    #[test]
+    fn pane_attribution_separates_works_that_share_a_session() {
+        let at = |minute: u8| {
+            datetime!(2026-05-30 10:00:00 UTC) + time::Duration::minutes(i64::from(minute))
+        };
+        let mut first = prompt(
+            AgentKind::Codex,
+            "a",
+            "rmux:%1",
+            Some("/w/a"),
+            "one",
+            at(10),
+        );
+        first.tmux_session = Some("callabo".into());
+        let mut second = prompt(
+            AgentKind::Codex,
+            "b",
+            "rmux:%2",
+            Some("/w/b"),
+            "two",
+            at(40),
+        );
+        second.tmux_session = Some("callabo".into());
+        let mut d = data(vec![first, second]);
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        // The operator had the session in front of them the whole time.
+        d.activity_entries = vec![ActivityEntry::SessionForeground(
+            SessionForegroundEntry::new(
+                "$1",
+                "callabo",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            ),
+        )];
+        let by_session = last_touch_attribution(&active_windows(&d, GroupBy::Session)).active;
+        assert_eq!(by_session.len(), 1, "one tmux session: {by_session:?}");
+        let by_pane = last_touch_attribution(&active_windows(&d, GroupBy::Pane)).active;
+        assert!(
+            by_pane["rmux:%1"] > 0 && by_pane["rmux:%2"] > 0,
+            "{by_pane:?}"
+        );
+        assert_eq!(
+            by_pane.values().sum::<u64>(),
+            by_session.values().sum::<u64>(),
+            "the same seconds, split by pane"
+        );
     }
 
     #[test]
