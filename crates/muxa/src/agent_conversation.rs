@@ -38,6 +38,10 @@ pub enum Conversation {
     Conflict(Vec<String>),
     /// Nothing ties a conversation to this process; the reason says why.
     Unknown(String),
+    /// The process was seen to change while it was being read. Unlike
+    /// [`Conversation::Unknown`] this is evidence against the plan, never a
+    /// reason to fall back to the registry.
+    Unstable(String),
 }
 
 /// Read a session file's identity fields. `None` for anything malformed.
@@ -167,7 +171,7 @@ pub fn claude_conversation(pid: u32) -> Conversation {
     let files = read_claude_sessions(pid, &claude_roots(pid));
     let answer = claude_conversation_from(pid, before.as_deref(), &files);
     if before.is_some() && process_start(pid) != before {
-        return Conversation::Unknown("the process changed while it was being read".into());
+        return Conversation::Unstable("the process changed while it was being read".into());
     }
     answer
 }

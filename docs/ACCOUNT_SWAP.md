@@ -101,8 +101,12 @@ start time (`conversation_verified: true`). A conversation muxa can verify
 this way can be swapped even without a hook-registered id. One that
 disagrees with the registry or the command line is reported as an identity
 conflict and left alone. The process is checked again right before it is
-stopped. Where it cannot be read (Codex, macOS), the registry and then the
-command line decide, as before.
+stopped, together with the pane's agent process and, when it was verified,
+the conversation. Where it cannot be read (Codex, macOS), the registry and
+then the command line decide, as before, and the outcome says why
+(`conversation_unverified_reason`). Not reconciled yet: a pane whose
+top-level agent is another provider than the row it is matched to (for
+example a Codex with a nested Claude child).
 
 ## Choosing the account
 

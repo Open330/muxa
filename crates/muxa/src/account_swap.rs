@@ -209,6 +209,10 @@ pub struct SwapOutcome {
     /// was taken on the registry's or command line's word.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_verified: Option<bool>,
+    /// Why it could not be verified: an unsupported provider or platform,
+    /// or no file naming the process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_unverified_reason: Option<String>,
     /// `false` for a row muxa only saw on screen, never from the agent's
     /// own hooks: its state is a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -255,6 +259,7 @@ impl SwapOutcome {
             continue_reason: None,
             session_id_source: None,
             conversation_verified: None,
+            conversation_unverified_reason: None,
             registered: Some(resumable_id(&agent.session_id)),
         }
     }
@@ -1077,7 +1082,12 @@ fn plan<'a>(
 ) -> Vec<Planned<'a>> {
     let mut planned: Vec<Planned> = Vec::new();
     for agent in chosen {
-        if planned.iter().any(|p| p.agent.pane == agent.pane) {
+        // The same pane id on two servers is two agents; one pane on one
+        // server is planned once.
+        if planned
+            .iter()
+            .any(|p| p.agent.pane == agent.pane && p.agent.tmux_socket == agent.tmux_socket)
+        {
             continue;
         }
         match locate(agent, backends) {
@@ -1108,6 +1118,10 @@ fn plan<'a>(
                         runtime,
                         crate::agent_conversation::Conversation::Verified(_)
                     ),
+                    unverified_reason: match &runtime {
+                        crate::agent_conversation::Conversation::Unknown(why) => Some(why.clone()),
+                        _ => None,
+                    },
                     process_start,
                     launch,
                     pane,
@@ -1237,7 +1251,8 @@ fn swap_one(
         session_id,
         source,
         verified,
-        process_start,
+        unverified_reason,
+        process_start: _,
         launch,
         pane,
         backend,
@@ -1246,6 +1261,9 @@ fn swap_one(
     outcome.agent_session_id.clone_from(session_id);
     outcome.session_id_source = Some(*source);
     outcome.conversation_verified = Some(*verified);
+    outcome
+        .conversation_unverified_reason
+        .clone_from(unverified_reason);
     outcome.from = launch.line.account().map(str::to_owned);
     let account = match account {
         Ok(account) => account,
@@ -1266,18 +1284,18 @@ fn swap_one(
         }
     };
     outcome.command = Some(command.clone());
-    let planned = follow_up(request, agent);
-    outcome.continue_reason = planned.map(|(_, reason)| reason);
-    let follow_up = planned.map(|(text, _)| text);
+    let due = follow_up(request, agent);
+    outcome.continue_reason = due.map(|(_, reason)| reason);
+    let follow_up = due.map(|(text, _)| text);
     if request.dry_run {
         outcome.status = SwapStatus::Planned;
-        if let Some((text, reason)) = planned {
+        if let Some((text, reason)) = due {
             outcome.note = format!("then send {text:?} ({reason})");
         }
         return outcome;
     }
-    if process_changed(launch.agent_pid, process_start.as_deref()) {
-        outcome.note = "the agent process changed since the swap was planned; left alone".into();
+    if let Err(note) = still_as_planned(planned) {
+        outcome.note = note;
         return outcome;
     }
     let target = Target {
@@ -1362,6 +1380,7 @@ struct Planned<'a> {
     session_id: String,
     source: SessionIdSource,
     verified: bool,
+    unverified_reason: Option<String>,
     /// The agent process's start time when planned; checked again right
     /// before it is stopped.
     process_start: Option<String>,
@@ -1408,6 +1427,7 @@ fn conversation_for(
             "identity conflict: session files for this process name {}; left alone",
             ids.join(" and ")
         )),
+        Conversation::Unstable(why) => Err(format!("{why}; left alone")),
         Conversation::Verified(id) => {
             if let Some(recorded) = registry.filter(|recorded| recorded != id) {
                 return Err(format!(
@@ -1432,11 +1452,67 @@ fn conversation_for(
     }
 }
 
-/// Whether the process read about when the swap was planned is no longer
-/// the one at `pid`: one that exited, or a pid since reused, is not stopped.
-fn process_changed(pid: u32, planned_start: Option<&str>) -> bool {
-    planned_start.is_some()
-        && crate::agent_conversation::process_start(pid).as_deref() != planned_start
+/// Read the planned agent again right before it is stopped: other targets
+/// were swapped in between, and this one may have moved on.
+fn still_as_planned(planned: &Planned) -> Result<(), String> {
+    let pid = planned.launch.agent_pid;
+    let owner = find_launch(
+        &pane_processes(planned.pane.pane_pid),
+        planned.pane.pane_pid,
+        planned.agent.kind,
+    )
+    .map(|launch| launch.agent_pid);
+    let now = planned
+        .verified
+        .then(|| crate::agent_conversation::claude_conversation(pid));
+    recheck(
+        &Expected {
+            pid,
+            start: planned.process_start.as_deref(),
+            conversation: planned.verified.then_some(planned.session_id.as_str()),
+        },
+        crate::agent_conversation::process_start(pid).as_deref(),
+        owner,
+        now.as_ref(),
+    )
+}
+
+/// What a planned agent was read to be.
+struct Expected<'a> {
+    pid: u32,
+    start: Option<&'a str>,
+    /// The conversation, when it was verified from the process itself.
+    conversation: Option<&'a str>,
+}
+
+/// [`still_as_planned`] given what was read: the same process, still the
+/// pane's agent, and — where the conversation was verified — still on it.
+fn recheck(
+    expected: &Expected,
+    start_now: Option<&str>,
+    owner_now: Option<u32>,
+    conversation_now: Option<&crate::agent_conversation::Conversation>,
+) -> Result<(), String> {
+    use crate::agent_conversation::Conversation;
+    if expected.start.is_some() && start_now != expected.start {
+        return Err("the agent process changed since the swap was planned; left alone".into());
+    }
+    if owner_now != Some(expected.pid) {
+        return Err("the pane no longer runs the planned agent process; left alone".into());
+    }
+    let Some(planned_id) = expected.conversation else {
+        return Ok(());
+    };
+    match conversation_now {
+        Some(Conversation::Verified(id)) if id == planned_id => Ok(()),
+        Some(Conversation::Verified(id)) => Err(format!(
+            "the agent moved to conversation {id} since the swap was planned; left alone"
+        )),
+        _ => Err(
+            "the planned conversation could not be confirmed again before stopping; left alone"
+                .into(),
+        ),
+    }
 }
 
 /// Every pane the active backends list now: `(pane id, socket)`.
@@ -1457,12 +1533,14 @@ fn matching_panes<'a>(
     target: &str,
     live: &'a [(String, Option<String>)],
 ) -> Vec<&'a (String, Option<String>)> {
-    let exact: Vec<_> = live.iter().filter(|(pane, _)| pane == target).collect();
-    if !exact.is_empty() || !target.starts_with('%') {
-        return exact;
-    }
+    // A bare `%N` may be a tmux pane and a namespaced one at once; every
+    // pane it can mean counts, so two of them are ambiguous rather than the
+    // unnamespaced one winning.
+    let bare = target.starts_with('%');
     live.iter()
-        .filter(|(pane, _)| pane.rsplit_once(':').is_some_and(|(_, id)| id == target))
+        .filter(|(pane, _)| {
+            pane == target || (bare && pane.rsplit_once(':').is_some_and(|(_, id)| id == target))
+        })
         .collect()
 }
 
@@ -1536,6 +1614,7 @@ fn unresolved(target: &str, note: &str) -> SwapOutcome {
         continue_reason: None,
         session_id_source: None,
         conversation_verified: None,
+        conversation_unverified_reason: None,
         registered: None,
     }
 }
@@ -3315,6 +3394,11 @@ mod tests {
             &Conversation::Conflict(vec![A.into(), B.into()])
         )
         .is_err());
+        // Seen to change while read: evidence against the plan, not a reason
+        // to fall back to the registry.
+        assert!(
+            conversation_for(Some(A), None, &Conversation::Unstable("changed".into())).is_err()
+        );
         // Unreadable process: the registry, then the command line, as before.
         assert_eq!(
             conversation_for(Some(A), Some(B), &unknown).unwrap(),
@@ -3371,6 +3455,68 @@ mod tests {
         assert_eq!(
             resolve_excludes(&names(&["%7", "%81"]), &live),
             names(&["%7", "%81", "rmux:%7", "rmux:%81"])
+        );
+    }
+
+    /// Right before the stop the agent must still be the process, the pane's
+    /// agent, and the verified conversation it was planned as.
+    #[test]
+    fn the_agent_is_read_again_before_it_is_stopped() {
+        use crate::agent_conversation::Conversation;
+        const A: &str = "96f5e88c-62df-42a7-914e-e206355969fb";
+        const B: &str = "01a18182-0bf0-7801-97bf-c91154132258";
+        let verified = Expected {
+            pid: 10,
+            start: Some("500"),
+            conversation: Some(A),
+        };
+        let on = |id: &str| Conversation::Verified(id.into());
+        assert!(recheck(&verified, Some("500"), Some(10), Some(&on(A))).is_ok());
+        // Same process, same start, but it moved to another conversation.
+        let moved = recheck(&verified, Some("500"), Some(10), Some(&on(B))).unwrap_err();
+        assert!(moved.contains(B), "{moved}");
+        // Its file can no longer be read: not taken on trust.
+        assert!(recheck(
+            &verified,
+            Some("500"),
+            Some(10),
+            Some(&Conversation::Unknown("gone".into()))
+        )
+        .is_err());
+        // Replaced process, and a pane whose agent is now another process.
+        assert!(recheck(&verified, Some("501"), Some(10), Some(&on(A))).is_err());
+        assert!(recheck(&verified, Some("500"), Some(11), Some(&on(A))).is_err());
+        assert!(recheck(&verified, Some("500"), None, Some(&on(A))).is_err());
+        // Not verified at planning: only the process is compared.
+        let unverified = Expected {
+            pid: 10,
+            start: None,
+            conversation: None,
+        };
+        assert!(recheck(&unverified, None, Some(10), None).is_ok());
+    }
+
+    /// A bare `%7` that is both a tmux pane and `rmux:%7` is ambiguous; it
+    /// does not quietly mean the tmux one.
+    #[test]
+    fn a_bare_pane_on_two_backends_is_ambiguous() {
+        let live = vec![
+            ("%7".to_owned(), Some("default".to_owned())),
+            ("rmux:%7".to_owned(), Some("/tmp/rmux-1/default".to_owned())),
+        ];
+        let (found, problems) = resolve_targets(&["%7".to_owned()], &live, &[]);
+        assert!(found.is_empty());
+        assert!(
+            problems[0].note.contains("more than one"),
+            "{}",
+            problems[0].note
+        );
+        // A fully qualified name still means exactly that pane.
+        let (found, _) = resolve_targets(&["rmux:%7".to_owned()], &live, &[]);
+        assert_eq!(found, ["rmux:%7"]);
+        assert_eq!(
+            resolve_excludes(&["%7".to_owned()], &live),
+            ["%7", "rmux:%7"]
         );
     }
 
