@@ -21,8 +21,9 @@ use super::io::SwapIo;
 use std::cell::{Cell, RefCell};
 
 /// Why the executor did this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Purpose {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Purpose {
     /// Keep a directly-run pane open across the agent's exit.
     KeepPaneOpen,
     /// Let a directly-run pane close with its agent again.
@@ -56,8 +57,9 @@ pub(super) enum Purpose {
 }
 
 /// A key the executor types, by name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Key {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Key {
     Esc,
     CtrlC,
     Enter,
@@ -65,8 +67,9 @@ pub(super) enum Key {
 }
 
 /// The physical operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Op {
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Op {
     Key(Key),
     /// Raw text of this many characters.
     Text {
@@ -87,25 +90,26 @@ pub(super) enum Op {
 /// One recorded effect. `group` ties together the operations of one act
 /// (a prompt and its Enter, the keys of one dialog answer).
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct Effect {
-    pub(super) group: u32,
-    pub(super) purpose: Purpose,
-    pub(super) op: Op,
+pub(crate) struct Effect {
+    pub(crate) group: u32,
+    pub(crate) purpose: Purpose,
+    pub(crate) op: Op,
 }
 
 /// What the transport said. Not proof of what the target did: a refused
 /// write may still have reached the pane, and a signal is never confirmed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Transport {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Transport {
     Accepted,
     Refused,
     Unconfirmed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct ObserverError(pub(super) String);
+pub(crate) struct ObserverError(pub(crate) String);
 
-pub(super) trait EffectObserver {
+pub(crate) trait EffectObserver {
     /// Called before the effect; an error means it must not happen.
     fn before(&mut self, effect: &Effect) -> Result<(), ObserverError>;
     /// Called after it; an error means it happened but its result is not
