@@ -382,7 +382,15 @@ const SWAP_SWITCHES: &[&str] = &[
 
 /// `muxa swap` options a remote run may pass, each as one non-empty
 /// `--flag=value`. Only `--exclude` may repeat.
-const SWAP_VALUE_FLAGS: &[&str] = &["--provider", "--to", "--bare", "--continue", "--exclude"];
+const SWAP_VALUE_FLAGS: &[&str] = &[
+    "--provider",
+    "--to",
+    "--bare",
+    "--continue",
+    "--continue-text",
+    "--continue-when",
+    "--exclude",
+];
 
 /// Check a `swap` argv: JSON output, only the allowlisted flags, and plain
 /// targets (`%5`, `rmux:%5`, session ids). The daemon-owned `--socket` /

@@ -106,14 +106,24 @@ aas = "aas"              # the aas binary; the daemon also looks in /opt/homebre
 | Flag | Overrides |
 | ---- | --------- |
 | `--bare skip\|wrap` | `bare`. `wrap` relaunches a bare `claude …` as `aas e <account> …`. |
-| `--continue "<text>"` | Sends this text to every swapped agent. |
-| `--no-continue` | Sends nothing. |
+| `--continue-text "<text>"` | `continue_text`: the wording only. Who gets it is still `continue_when`. |
+| `--continue-when limited\|always\|never` | `continue_when`: which swapped agents get the follow-up. |
+| `--no-continue` | Sends nothing (`--continue-when never`). |
 | `--dry-run` | Prints the plan and touches nothing. |
 | `--json` | Machine-readable report. |
 
 `continue_when = "limited"` sends the follow-up only to agents whose turn was
 cut off: by a usage cap, or by the swap itself when `--force` stopped them
-mid-turn. An idle agent moved with `--all` is only resumed.
+mid-turn. An idle or finished agent, and one waiting on your answer or choice,
+is only resumed — nothing is typed into it. Naming the wording with
+`--continue-text` does not change that; `--continue-when always` does.
+
+`--continue "<text>"` is the deprecated spelling of `--continue-text`. It used
+to send the text to every swapped agent, idle ones included; it now keeps the
+`continue_when` policy and prints a notice. The MCP tool takes
+`continue_text` and `continue_when`, with `continue` kept as the same alias.
+A Fleet host running an older `muxa` refuses the new options rather than
+reading the old meaning.
 
 ## On a Fleet host
 

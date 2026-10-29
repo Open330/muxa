@@ -227,6 +227,19 @@ pub fn provider_name(kind: AgentKind) -> Option<&'static str> {
     }
 }
 
+/// The follow-up `agent` gets after its relaunch, if any.
+///
+/// Only a turn that was actually cut off counts under
+/// [`ContinueWhen::Limited`]: one a usage cap stopped, or one in progress
+/// that the swap itself interrupted. An idle or finished agent has nothing
+/// to continue, and one waiting on the user's answer or choice is waiting
+/// for the user, not for a prompt. Recent activity only keeps an agent out
+/// of a non-forced swap; it is not a cut-off turn.
+fn follow_up<'a>(request: &'a SwapRequest, agent: &Agent) -> Option<&'a str> {
+    let cut_off = is_rate_limited(agent) || agent.state == AgentState::Working;
+    request.continue_for(cut_off)
+}
+
 /// Stopped by a usage cap: the same predicate the `rate_limited`
 /// automation event uses.
 #[must_use]
@@ -1103,12 +1116,7 @@ fn swap_one(
         }
     };
     outcome.command = Some(command.clone());
-    // The swap cuts a turn in progress off, so it gets the follow-up like a
-    // capped one.
-    // Recent activity only keeps an agent out of a non-forced swap; an idle
-    // agent that just finished a turn has nothing to continue.
-    let mid_turn = agent.state == AgentState::Working;
-    let follow_up = request.continue_for(is_rate_limited(agent) || mid_turn);
+    let follow_up = follow_up(request, agent);
     if request.dry_run {
         outcome.status = SwapStatus::Planned;
         if let Some(text) = follow_up {
@@ -1134,7 +1142,7 @@ fn swap_one(
             .unwrap_or_else(|| pane.current_path.clone()),
         kind: agent.kind,
         session_id: session_id.clone(),
-        busy: mid_turn,
+        busy: agent.state == AgentState::Working,
     };
     // The relaunch must land on the account it was meant for, checked before
     // any follow-up starts work on the wrong one.
@@ -2785,6 +2793,63 @@ mod tests {
 
     fn request(scope: SwapScope) -> SwapRequest {
         SwapRequest::new(scope, &SwapConfig::default())
+    }
+
+    /// Under the default policy only a cut-off turn is woken; naming the
+    /// wording never widens that, and only `always` reaches the rest.
+    #[test]
+    fn only_a_cut_off_turn_gets_the_follow_up_unless_asked_for_all() {
+        let mut req = request(SwapScope::All);
+        req.continue_text = Some("continue".into());
+        let cases = [
+            (
+                agent("%1", "a", AgentKind::ClaudeCode, AgentState::Working),
+                true,
+            ),
+            (limited("%2", "b"), true),
+            (
+                agent("%3", "c", AgentKind::ClaudeCode, AgentState::Idle),
+                false,
+            ),
+            (
+                agent("%4", "d", AgentKind::Codex, AgentState::WaitingInput),
+                false,
+            ),
+            (
+                agent("%5", "e", AgentKind::ClaudeCode, AgentState::WaitingChoice),
+                false,
+            ),
+            (
+                agent("%6", "f", AgentKind::Codex, AgentState::Stopped),
+                false,
+            ),
+            // An error that is not a usage cap has no turn to carry on.
+            (
+                agent("%7", "g", AgentKind::ClaudeCode, AgentState::Error),
+                false,
+            ),
+        ];
+        assert_eq!(req.continue_when, ContinueWhen::Limited);
+        for (agent, wakes) in &cases {
+            assert_eq!(
+                follow_up(&req, agent).is_some(),
+                *wakes,
+                "{:?}",
+                agent.state
+            );
+        }
+        req.continue_when = ContinueWhen::Always;
+        assert!(cases
+            .iter()
+            .all(|(agent, _)| follow_up(&req, agent).is_some()));
+        req.continue_when = ContinueWhen::Never;
+        assert!(cases
+            .iter()
+            .all(|(agent, _)| follow_up(&req, agent).is_none()));
+        // No wording, nothing to send whatever the policy.
+        req.continue_when = ContinueWhen::Always;
+        req.continue_text = None;
+        assert!(follow_up(&req, &cases[0].0).is_none());
     }
 
     fn proc(pid: u32, parent: u32, depth: u8, cmdline: &str) -> ProcessInfo {
