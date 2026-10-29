@@ -689,7 +689,7 @@ UTF-8 기준 `추가 바이트 = 수신 바이트 - body 원문 바이트`,
 
 `[collaboration]`의 `wake_payload = "adaptive"`는 선택 기능입니다. 운영자
 메시지는 기존 직접 전달을 유지하고, 에이전트의 읽기 전용 질문·검토·알림 중
-UTF-8 본문 512바이트 이하, 전체 지시 JSON 1024바이트 이하인 요청을 idle worker에
+UTF-8 본문 768바이트 이하, 전체 지시 JSON 1024바이트 이하인 요청을 idle worker에
 직접 전달합니다. 계약·실행 시도·첨부·업데이트·위임·사람 결정·터미널 제어 문자나
 더 큰 요청·실행 요청은 기존 참조 전달을 사용합니다. primary 보호와 조용한 알림
 정책은 유지되며 기본 설정은 `operator_full`입니다.
@@ -699,6 +699,20 @@ UTF-8 본문 512바이트 이하, 전체 지시 JSON 1024바이트 이하인 요
 컨텍스트 유실 뒤 재조회는 가능하며, 이후 변경은 합의한 체크포인트에서 증분
 조회합니다. 재시작 복구는 기존 prompt/Enter 단계를 재사용합니다. 본문 문구로
 요청 종류나 수정 권한을 추론하지 않습니다.
+
+요청 ID는 JSON 안에 한 번만 포함합니다. 응답 안내의 `ID`는 그 레코드의
+`request_id`로 바꿔 사용하는 자리 표시자입니다. 본문 상한 768바이트는 3바이트
+한글 최대 256자에 해당하지만, 추가 문맥이나 JSON escaping 때문에 전체 지시
+1024바이트 제한에 먼저 도달할 수 있습니다.
+
+재현 가능한 측정은 `muxad`의 `adaptive_delivery_cost_matrix` 테스트를 변경
+전후에 실행하고 `MUXA_DELIVERY_MATRIX_REPORT`로 각각 JSON을 저장합니다.
+`muxa-cli`의 `adaptive_reply_cost_matrix`는 `MUXA_REPLY_MATRIX_REPORT`로
+저장한 뒤 `python scripts/short-delivery-cost-report.py BEFORE AFTER REPLIES`로
+합산합니다. 최초 전달·발신 결과·응답 접수 결과의 수신 바이트와 원문 대비
+추가량을 측정하며, 모델 지연·과금 토큰·반복 컨텍스트 비용은 측정하지 않습니다.
+현재 전달 테스트에서 `MUXA_DELIVERY_BASELINE_REPORT`도 지정하면 `5470a27`의
+이전 안내 문구와 512바이트 제한을 적용한 비교 기준을 같은 입력으로 저장합니다.
 
 효율은 직전 대비 감소율뿐 아니라 `extra = 수신량 - 본문 원문 바이트`로
 측정합니다. JSON escaping, 각 수신 경로, 도구 호출 수와 지연도 함께 봅니다.

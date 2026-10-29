@@ -7526,6 +7526,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn adaptive_reply_cost_matrix() {
+        use muxa::collaboration::instruction::short_inline_prompt;
+        let participant = json!({"agent_kind":"codex",
+            "agent_session_id":"01a1820e-a385-79d0-acfd-8ebda41e2d5b",
+            "pane":"rmux:%1","room":{"host":"rmux","window_id":"@1"},
+            "state":"idle","launch_purpose":"worker"});
+        let mut rows = Vec::new();
+        for (language, unit) in [("ascii", "a"), ("korean", "한"), ("escaped", "\"\n")] {
+            for target in [16, 40, 160, 480, 512, 513, 640, 768, 769, 1024] {
+                let body = unit.repeat(target / unit.len()) + &"a".repeat(target % unit.len());
+                assert_eq!(body.len(), target);
+                let mut request: CollaborationRequest = serde_json::from_value(json!({
+                    "id":"req_0123456789abcdef_1","from":participant,"to":participant,
+                    "kind":"review","work_mode":"read_only","body":body,
+                    "expects_reply":true,"status":"claimed",
+                    "created_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap()
+                })).unwrap();
+                let inline = short_inline_prompt(&request).is_some();
+                request.status = muxa::collaboration::RequestStatus::Completed;
+                request.reply = Some(
+                    serde_json::from_value(json!({"status":"completed",
+                    "body":"확인했습니다.","artifacts":[],"at":"2026-10-29T00:00:00Z"}))
+                    .unwrap(),
+                );
+                let mut full = json!({"sent":true,"selected_peer":request.to,
+                    "selection_reason":"explicit","expanded_skill":null,"spawned":null,
+                    "thread_id":null,"parent_request_id":null,"workspace_id":null,
+                    "work_id":null,"run_id":null,"kind":"review","work_mode":"read_only"});
+                full.as_object_mut()
+                    .unwrap()
+                    .extend(request_outcome(&request).as_object().unwrap().clone());
+                let compact =
+                    crate::collaboration_output::short_call_outcome(full.clone(), &request);
+                assert_eq!(compact["reply"], full["reply"]);
+                let bytes =
+                    |v: &Value| json_result(v)["content"][0]["text"].as_str().unwrap().len();
+                let before_compact = inline && body.len() <= 512;
+                rows.push(json!({"language":language,"target_bytes":target,
+                    "body_bytes":body.len(),"reply_body_bytes":"확인했습니다.".len(),
+                    "before_sender_result_bytes":bytes(if before_compact {&compact} else {&full}),
+                    "sender_result_bytes":bytes(if inline {&compact} else {&full}),
+                    "reply_receipt_bytes":bytes(&crate::collaboration_output::mutation_receipt(&request))}));
+            }
+        }
+        if let Ok(path) = std::env::var("MUXA_REPLY_MATRIX_REPORT") {
+            std::fs::write(path, serde_json::to_string_pretty(&json!({
+                "scope":"MCP result content text using production projections; fixed completed Korean reply; no live model latency or billing measurement",
+                "rows":rows
+            })).unwrap()).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn record_tools_validate_arguments_without_a_daemon() {
         let client = Client::new(std::path::PathBuf::from("/missing/muxa-record-test.sock"));

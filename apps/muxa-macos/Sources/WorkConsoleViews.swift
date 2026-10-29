@@ -4129,6 +4129,9 @@ private struct FleetPaneInspector: View {
     }
 
     private func humanReadablePrompt(_ prompt: String) -> String {
+        if prompt.hasPrefix("[muxa] Claimed;") {
+            return String(localized: "A collaboration request is waiting for this agent.")
+        }
         if prompt.hasPrefix("[muxa:req_") {
             if prompt.contains("Completed reply") {
                 return String(localized: "A collaborator reply is ready for this agent.")

@@ -789,7 +789,7 @@ new task; updates are quiet and retain the original authority and paths.
 Opt in with `[collaboration] wake_payload = "adaptive"`. Operator messages keep
 the existing direct delivery. Agent-originated read-only questions, reviews and
 notices can be claimed and delivered inline to an idle worker when the original
-UTF-8 body is at most 512 bytes and its complete instruction JSON at most 1024
+UTF-8 body is at most 768 bytes and its complete instruction JSON at most 1024
 bytes. Contracts, attempts, attachments, updates, delegation, human actions,
 unsafe terminal controls and larger/execute requests retain reference delivery.
 Primary conversations remain protected, and quiet notices do not trigger a
@@ -801,6 +801,24 @@ inbox read is needed; rereading after context loss is allowed. Delivery uses
 the existing persisted prompt/Enter recovery phases. Later amendments still
 require incremental reads at agreed checkpoints. This policy does not infer
 request kind or editing permission from body wording.
+
+The request ID appears once in the JSON record. The reply hint's `ID` means
+that record's `request_id`; it is a placeholder, not a literal reply target.
+The 768-byte body cap accommodates up to 256 three-byte Korean characters;
+additional context or JSON escaping can still hit the 1024-byte document cap.
+
+For reproducible renderer measurements, run the `adaptive_delivery_cost_matrix`
+test in `muxad` on both revisions with `MUXA_DELIVERY_MATRIX_REPORT` pointing to
+separate JSON files. Run `adaptive_reply_cost_matrix` in `muxa-cli` with
+`MUXA_REPLY_MATRIX_REPORT` set. Combine them with
+`python scripts/short-delivery-cost-report.py BEFORE AFTER REPLIES`.
+For the frozen `5470a27` baseline, the current delivery test can also write
+`BEFORE` directly with `MUXA_DELIVERY_BASELINE_REPORT`; this uses the previous
+frame and 512-byte cap with the unchanged instruction document.
+This measures synchronous received text across initial delivery, the sender's
+result and the recipient's reply receipt, with extra bytes divided by the
+original request/reply body sizes. It includes ASCII, Korean and escaped text;
+it does not measure model latency, billing or repeated context tokens.
 
 Measure received bytes against the original body: `extra = received - body`,
 and report JSON escaping separately where useful. Include all receiving

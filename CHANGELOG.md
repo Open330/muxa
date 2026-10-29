@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Adaptive short requests carry their request ID once in the shared JSON record;
+  the reply hint refers to that ID. The body cap is now 768 UTF-8 bytes, still
+  bounded by the complete 1024-byte instruction limit. Renderer cost matrices
+  cover ASCII, Korean and escaped text, including sender results and reply receipts.
+
 - Resolved Claude auto-mode setup dialogs no longer leave an indefinitely waiting
   agent: two positive idle-composer observations can repair the exact unchanged
   row, while current permission/selection UI and newer hooks retain priority.

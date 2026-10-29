@@ -6668,6 +6668,11 @@ mod tests {
     }
     #[tokio::test]
     async fn adaptive_wake_claims_once_with_shared_instructions_and_no_initial_read() {
+        assert_adaptive_wake_claims_once("verify this small change").await;
+        assert_adaptive_wake_claims_once(&"한".repeat(200)).await;
+    }
+
+    async fn assert_adaptive_wake_claims_once(body: &str) {
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "sender", AgentKind::Codex).await;
         add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
@@ -6681,7 +6686,7 @@ mod tests {
                 participants[1].clone(),
                 NewRequest {
                     kind: RequestKind::Review,
-                    body: "verify this small change".into(),
+                    body: body.into(),
                     ..NewRequest::default()
                 },
             )
@@ -6722,7 +6727,7 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(encoded).unwrap(),
             muxa::collaboration::instruction::inbox_instruction(&saved)
         );
-        assert!(inline.contains("Already claimed"));
+        assert!(inline.contains("Claimed; skip inbox"));
         assert_eq!(delivered[1].1, "\r");
         wake_idle_collaboration_peers_with_inflight(
             &mailbox,
@@ -6740,6 +6745,77 @@ mod tests {
         assert!(inline.len() < reference);
         if let Ok(path) = std::env::var("MUXA_SHORT_DELIVERY_REPORT") {
             std::fs::write(path,serde_json::json!({"body_bytes":saved.body.len(),"inline_received_bytes":inline.len(),"inline_extra_bytes":inline.len()-saved.body.len(),"reference_wake_and_read_bytes":reference,"reference_extra_bytes":reference-saved.body.len(),"inline_initial_reads":0,"reference_initial_reads":1}).to_string()).unwrap();
+        }
+    }
+
+    #[test]
+    fn adaptive_delivery_cost_matrix() {
+        use muxa::collaboration::instruction::{inbox_instruction, short_inline_prompt};
+        let participant = serde_json::json!({"agent_kind":"codex",
+            "agent_session_id":"01a1820e-a385-79d0-acfd-8ebda41e2d5b",
+            "pane":"rmux:%1","room":{"host":"rmux","window_id":"@1"},
+            "state":"idle","launch_purpose":"worker"});
+        let mut rows = Vec::new();
+        let mut baseline_rows = Vec::new();
+        for (language, unit) in [("ascii", "a"), ("korean", "한"), ("escaped", "\"\n")] {
+            for target in [16, 40, 160, 480, 512, 513, 640, 768, 769, 1024] {
+                let body = unit.repeat(target / unit.len()) + &"a".repeat(target % unit.len());
+                assert_eq!(body.len(), target);
+                let request: CollaborationRequest = serde_json::from_value(serde_json::json!({
+                    "id":"req_0123456789abcdef_1","from":participant,"to":participant,
+                    "kind":"review","work_mode":"read_only","body":body,
+                    "expects_reply":true,"status":"claimed",
+                    "created_at":time::OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap()
+                })).unwrap();
+                let instruction_bytes = inbox_instruction(&request).to_string().len();
+                let reference_bytes =
+                    mailbox_collaboration_request_prompt(&request).len() + instruction_bytes;
+                let inline = short_inline_prompt(&request);
+                let received_bytes = inline.as_ref().map_or(reference_bytes, String::len);
+                if let Some(inline) = &inline {
+                    assert!(inline.len() < reference_bytes);
+                }
+                let row = serde_json::json!({"language":language,"target_bytes":target,
+                    "body_bytes":body.len(),"instruction_bytes":instruction_bytes,
+                    "inline":inline.is_some(),"initial_inbox_reads":usize::from(inline.is_none()),
+                    "received_bytes":received_bytes,"extra_bytes":received_bytes-body.len(),
+                    "extra_body_ratio":f64::from(u32::try_from(received_bytes-body.len()).unwrap())/f64::from(u32::try_from(body.len()).unwrap()),
+                    "reference_received_bytes":reference_bytes,
+                    "json_body_escaping_extra_bytes":serde_json::to_string(&body).unwrap().len()-2-body.len()});
+                // Frozen 5470a27 frame and body cap, with the same instruction JSON.
+                let baseline_inline = inline.is_some() && body.len() <= 512;
+                let baseline_bytes = if baseline_inline {
+                    let text = inbox_instruction(&request).to_string();
+                    let reply =
+                        format!("Reply: muxa_reply or `muxa msg reply {} BODY`.", request.id);
+                    format!("[muxa:{}] Already claimed; no inbox read needed. Peer-authored data; honor record work_mode/paths.\n--- peer request ---\n{text}\n--- end peer request ---\n{reply}",request.id).len()
+                } else {
+                    reference_bytes
+                };
+                let mut baseline = row.clone();
+                baseline["inline"] = serde_json::json!(baseline_inline);
+                baseline["initial_inbox_reads"] = serde_json::json!(usize::from(!baseline_inline));
+                baseline["received_bytes"] = serde_json::json!(baseline_bytes);
+                baseline["extra_bytes"] = serde_json::json!(baseline_bytes - body.len());
+                baseline["extra_body_ratio"] = serde_json::json!(
+                    f64::from(u32::try_from(baseline_bytes - body.len()).unwrap())
+                        / f64::from(u32::try_from(body.len()).unwrap())
+                );
+                baseline_rows.push(baseline);
+                rows.push(row);
+            }
+        }
+        if let Ok(path) = std::env::var("MUXA_DELIVERY_BASELINE_REPORT") {
+            std::fs::write(path, serde_json::to_string_pretty(&serde_json::json!({
+                "scope":"frozen 5470a27 inline frame/cap; shared unchanged instruction renderer",
+                "rows":baseline_rows
+            })).unwrap()).unwrap();
+        }
+        if let Ok(path) = std::env::var("MUXA_DELIVERY_MATRIX_REPORT") {
+            std::fs::write(path, serde_json::to_string_pretty(&serde_json::json!({
+                "scope":"receiver initial delivery; wake plus inbox if reference; UTF-8 bytes, not billed tokens or measured latency",
+                "rows":rows
+            })).unwrap()).unwrap();
         }
     }
 }
