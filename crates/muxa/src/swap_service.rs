@@ -31,6 +31,7 @@ use crate::swap_job::{
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// A swap request exactly as the caller made it: only what it set, nothing
@@ -137,8 +138,62 @@ impl SwapOverrides {
                 return Err(format!("unknown continue policy {when:?}"));
             }
         }
+        let names = |what: &str, names: &[String]| {
+            if names.len() > MAX_NAMES || names.iter().any(|name| name.len() > MAX_NAME) {
+                Err(format!(
+                    "{what}: at most {MAX_NAMES} names of up to {MAX_NAME} bytes"
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        names("targets", &self.targets)?;
+        names("exclude", &self.exclude)?;
+        for (what, value) in [
+            ("provider", self.provider.as_deref()),
+            ("to", self.to.as_deref()),
+            ("bare", self.bare.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.len() > MAX_NAME) {
+                return Err(format!("{what}: longer than {MAX_NAME} bytes"));
+            }
+        }
+        if self
+            .continue_text
+            .as_deref()
+            .is_some_and(|text| text.len() > MAX_TEXT)
+        {
+            return Err(format!("continue_text: longer than {MAX_TEXT} bytes"));
+        }
+        if self
+            .caller_config
+            .as_deref()
+            .is_some_and(|path| path.as_os_str().len() > MAX_PATH)
+        {
+            return Err(format!("caller_config: longer than {MAX_PATH} bytes"));
+        }
         Ok(())
     }
+}
+
+const MAX_NAMES: usize = 256;
+const MAX_NAME: usize = 256;
+const MAX_TEXT: usize = 4096;
+const MAX_PATH: usize = 4096;
+const MAX_KEY: usize = 128;
+
+/// A request key: what a lost acknowledgement is recovered by, so it is
+/// bounded and plain.
+fn validate_key(key: &str) -> Result<(), String> {
+    let plain = key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
+    if key.is_empty() || key.len() > MAX_KEY || !plain {
+        return Err(format!(
+            "a request key is 1-{MAX_KEY} characters of letters, digits and -_.:@"
+        ));
+    }
+    Ok(())
 }
 
 /// What the daemon knows right now, as one consistent snapshot.
@@ -327,25 +382,98 @@ impl SwapService {
         self.inner.active()
     }
 
-    pub fn plan(&self, overrides: &SwapOverrides) -> Result<PlanView, String> {
-        self.inner.plan(overrides)
-    }
-
-    /// Accept a request as a job, or return the job its key already made.
-    /// `guard` is one the caller already holds for its single target (an
-    /// automation firing); the job adopts it for that target only.
-    pub fn submit(
+    /// The daemon's own automation: a swap it decided on and already holds
+    /// the target's input guard for. Unlike [`SwapJobs::submit`] it may act
+    /// on a pane that runs its agent directly, exactly as automation always
+    /// has, since it runs in the daemon's own environment either way.
+    pub fn submit_automation(
         &self,
         request_key: &str,
         overrides: &SwapOverrides,
-        guard: Option<Box<dyn TargetGuard>>,
+        guard: Box<dyn TargetGuard>,
     ) -> Result<Accepted, String> {
-        Service::submit(&self.inner, request_key, overrides, guard)
+        Service::submit(
+            &self.inner,
+            request_key,
+            overrides,
+            Origin::Automation,
+            Some(guard),
+        )
     }
 
-    pub fn status(&self, job: &JobRef) -> Result<JobView, String> {
+    /// Wait for a job to end and read it, all within `timeout`. A timeout
+    /// only ends the wait: the job runs on, and its status says where it is.
+    pub async fn wait(&self, job: &str, timeout: std::time::Duration) -> Result<JobView, String> {
+        Service::wait(Arc::clone(&self.inner), job, timeout).await
+    }
+
+    /// Stop taking new jobs and wait, within `timeout`, for every submission
+    /// already past the gate and every running job to end. Nothing running
+    /// is interrupted. `false` if the deadline came first.
+    pub async fn drain(&self, timeout: std::time::Duration) -> bool {
+        Service::drain(Arc::clone(&self.inner), timeout).await
+    }
+}
+
+/// What an IPC caller may do with swap jobs. Every request through it is a
+/// public one: it can never claim the daemon's own automation privileges.
+pub trait SwapJobs: Send + Sync {
+    fn active(&self) -> Result<(), String>;
+    fn plan(&self, overrides: &SwapOverrides) -> Result<PlanView, String>;
+    fn submit(&self, request_key: &str, overrides: &SwapOverrides) -> Result<Accepted, String>;
+    /// Readable whatever state the service is in, so a halted or recovered
+    /// job can always be inspected.
+    fn status(&self, job: &JobRef) -> Result<JobView, String>;
+}
+
+impl SwapJobs for SwapService {
+    fn active(&self) -> Result<(), String> {
+        self.inner.active()
+    }
+
+    fn plan(&self, overrides: &SwapOverrides) -> Result<PlanView, String> {
+        self.inner.plan(overrides, Origin::Public)
+    }
+
+    fn submit(&self, request_key: &str, overrides: &SwapOverrides) -> Result<Accepted, String> {
+        Service::submit(&self.inner, request_key, overrides, Origin::Public, None)
+    }
+
+    fn status(&self, job: &JobRef) -> Result<JobView, String> {
         self.inner.status(job)
     }
+}
+
+/// Who asked for a swap. Minted by the daemon, never taken from a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Origin {
+    /// Anyone over IPC.
+    Public,
+    /// The daemon's own automation.
+    Automation,
+}
+
+/// The key one automation firing submits under: the same logical firing —
+/// its node, pane, conversation, rule and episode — is the same key however
+/// often it is delivered or re-armed, and a later episode is another.
+#[must_use]
+pub fn automation_request_key(
+    node_id: &str,
+    pane: &str,
+    socket: Option<&str>,
+    agent_session_id: &str,
+    rule: &str,
+    episode: &str,
+) -> String {
+    let identity = serde_json::json!([
+        node_id,
+        account_swap::endpoint_key(pane, socket),
+        agent_session_id,
+        rule,
+        episode,
+    ]);
+    let digest = crate::swap_job::request_digest(&identity);
+    format!("automation-{}", &digest[..32])
 }
 
 /// This process's start identity, recorded with its ownership for the
@@ -443,6 +571,10 @@ pub(crate) struct Service<E: Engine> {
     /// that was accepted under it still runs.
     #[allow(dead_code)] // held for its lifetime, never read
     ownership: Option<std::fs::File>,
+    /// Per running job: flips to `true` when it ends, however it ends.
+    done: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
+    /// Shutting down: no new job is taken.
+    draining: AtomicBool,
 }
 
 impl<E: Engine> Service<E> {
@@ -467,6 +599,8 @@ impl<E: Engine> Service<E> {
             fault: Mutex::new(None),
             spawner: thread_spawner(),
             ownership: None,
+            done: Mutex::new(HashMap::new()),
+            draining: AtomicBool::new(false),
         })
     }
 
@@ -484,12 +618,99 @@ impl<E: Engine> Service<E> {
     }
 
     pub(crate) fn active(&self) -> Result<(), String> {
+        if self.draining.load(Ordering::SeqCst) {
+            return Err("swap jobs are shutting down".into());
+        }
         if let Some(fault) = self.fault() {
             return Err(format!("swap jobs are halted: {fault}"));
         }
         self.store
             .check(&self.lease)
             .map_err(|error| format!("swap jobs are unavailable: {error}"))
+    }
+
+    pub(crate) async fn wait(
+        this: Arc<Self>,
+        job: &str,
+        timeout: std::time::Duration,
+    ) -> Result<JobView, String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let ended = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&ended);
+        let job_ref = JobRef::Id(job.to_owned());
+        let read = tokio::time::timeout_at(deadline, async move {
+            if let Some(mut done) = this.receiver(job) {
+                let _ = done.wait_for(|ended| *ended).await;
+            }
+            seen.store(true, Ordering::SeqCst);
+            tokio::task::spawn_blocking(move || this.status(&job_ref))
+                .await
+                .map_err(|error| error.to_string())?
+        })
+        .await;
+        match read {
+            Ok(view) => view,
+            Err(_) if ended.load(Ordering::SeqCst) => Err(format!(
+                "job {job} has ended, but its status could not be read within {}s",
+                timeout.as_secs()
+            )),
+            Err(_) => Err(format!(
+                "job {job} is still running after {}s",
+                timeout.as_secs()
+            )),
+        }
+    }
+
+    pub(crate) async fn drain(this: Arc<Self>, timeout: std::time::Duration) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        this.draining.store(true, Ordering::SeqCst);
+        // A submission holds the submit lock from its gate to its worker's
+        // registration; taking the lock once means every one that passed the
+        // gate before the flag has registered or given up.
+        let gate = Arc::clone(&this);
+        let barrier = tokio::task::spawn_blocking(move || {
+            drop(gate.submit.lock());
+        });
+        if tokio::time::timeout_at(deadline, barrier).await.is_err() {
+            return false;
+        }
+        let waiting = this.receivers();
+        tokio::time::timeout_at(deadline, async move {
+            for mut done in waiting {
+                let _ = done.wait_for(|ended| *ended).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// A watch on a running job's end; `None` once it has ended or was
+    /// never run here.
+    pub(crate) fn receiver(&self, job: &str) -> Option<tokio::sync::watch::Receiver<bool>> {
+        self.done
+            .lock()
+            .ok()
+            .and_then(|done| done.get(job).map(tokio::sync::watch::Sender::subscribe))
+    }
+
+    fn receivers(&self) -> Vec<tokio::sync::watch::Receiver<bool>> {
+        self.done.lock().map_or_else(
+            |_| Vec::new(),
+            |done| {
+                done.values()
+                    .map(tokio::sync::watch::Sender::subscribe)
+                    .collect()
+            },
+        )
+    }
+
+    /// The job ended, however it ended: wake whoever waits on it.
+    fn ended(&self, job: &str) {
+        if let Ok(mut done) = self.done.lock() {
+            if let Some(sender) = done.remove(job) {
+                let _ = sender.send(true);
+            }
+        }
     }
 
     fn fault(&self) -> Option<String> {
@@ -526,10 +747,15 @@ impl<E: Engine> Service<E> {
     }
 
     /// What a submit would do, without doing any of it.
-    pub(crate) fn plan(&self, overrides: &SwapOverrides) -> Result<PlanView, String> {
+    pub(crate) fn plan(
+        &self,
+        overrides: &SwapOverrides,
+        origin: Origin,
+    ) -> Result<PlanView, String> {
         let snapshot = self.snapshot_for(overrides)?;
         let mut request = overrides.resolve(&snapshot.config)?;
         request.dry_run = true;
+        request.allow_direct_respawn = origin == Origin::Automation;
         let (resolved, steps) = self.engine.prepare(&request, &snapshot);
         // Plan-only whatever was asked: the dry run returns before any effect.
         let mut resolved = resolved;
@@ -538,7 +764,13 @@ impl<E: Engine> Service<E> {
             .into_iter()
             .map(|step| match step {
                 EngineStep::Done(outcome) => outcome,
-                EngineStep::Run(target) => self.engine.execute(&resolved, &target, &mut NoObserver),
+                EngineStep::Run(target) => {
+                    let identity = self.engine.identity(&target);
+                    match refusal(&identity, origin) {
+                        Some((_, note)) => skipped_outcome(&identity, note),
+                        None => self.engine.execute(&resolved, &target, &mut NoObserver),
+                    }
+                }
             })
             .collect();
         let unavailable = self.active().err();
@@ -553,8 +785,11 @@ impl<E: Engine> Service<E> {
         this: &Arc<Self>,
         request_key: &str,
         overrides: &SwapOverrides,
+        origin: Origin,
         guard: Option<Box<dyn TargetGuard>>,
     ) -> Result<Accepted, String> {
+        validate_key(request_key)?;
+        overrides.validate()?;
         let digest = request_digest(overrides);
         let _one_at_a_time = this
             .submit
@@ -574,10 +809,24 @@ impl<E: Engine> Service<E> {
             });
         }
         let snapshot = this.snapshot_for(overrides)?;
-        let request = overrides.resolve(&snapshot.config)?;
+        let mut request = overrides.resolve(&snapshot.config)?;
+        request.allow_direct_respawn = origin == Origin::Automation;
         let (resolved, steps) = this.engine.prepare(&request, &snapshot);
 
-        let (settled, notes, runs, taken) = this.split(request_key, steps);
+        let (settled, notes, runs, taken) = this.split(request_key, steps, origin);
+        // An adopted guard is for one pane: a job it does not cover exactly
+        // would have to take that pane's guard again while holding it.
+        if let Some(guard) = &guard {
+            let covered =
+                matches!(runs.as_slice(), [(_, identity, _)] if guard.covers(&identity.endpoint));
+            if !covered {
+                this.release_all(&taken);
+                return Err(
+                    "the input guard held for this request does not cover its one target pane"
+                        .into(),
+                );
+            }
+        }
         let plan = AcceptedPlan {
             node_id: snapshot.node_id.clone(),
             continue_when: resolved.continue_when.to_string(),
@@ -614,6 +863,9 @@ impl<E: Engine> Service<E> {
             this.set_fault(format!("could not start job {job}: {error}"));
             return Err(error.to_string());
         }
+        if let Ok(mut done) = this.done.lock() {
+            done.insert(job.clone(), tokio::sync::watch::channel(false).0);
+        }
         if let Ok(mut live) = this.live.lock() {
             live.insert(
                 job.clone(),
@@ -649,6 +901,7 @@ impl<E: Engine> Service<E> {
         &self,
         owner: &str,
         steps: Vec<EngineStep<E::Target>>,
+        origin: Origin,
     ) -> (
         Vec<SettledEntry>,
         Vec<(usize, SwapOutcome)>,
@@ -667,8 +920,8 @@ impl<E: Engine> Service<E> {
                 }
                 EngineStep::Run(target) => {
                     let identity = self.engine.identity(&target);
-                    let refused = if identity.socket.is_none() {
-                        Some(("unknown_server", "cannot tell which server this pane is on"))
+                    let refused = if let Some(refused) = refusal(&identity, origin) {
+                        Some(refused)
                     } else if self.reserve(&identity.endpoint, owner) {
                         None
                     } else {
@@ -717,6 +970,8 @@ impl<E: Engine> Service<E> {
                     "job {worker_job}: the swap executor panicked; no further target is started"
                 ));
             }
+            // Ended — finished, halted or panicked — whoever waits is woken.
+            worker.ended(&worker_job);
         });
         let name = format!("swap-{}", &job[..job.len().min(13)]);
         if let Err(error) = (this.spawner)(name, work) {
@@ -740,6 +995,7 @@ impl<E: Engine> Service<E> {
                     "job {job}: the executor could not start and its end could not be recorded: {store}"
                 )),
             }
+            this.ended(job);
             return Err(format!("the swap executor could not start: {error}"));
         }
         Ok(())
@@ -950,6 +1206,24 @@ impl<E: Engine> Service<E> {
             fault: self.fault(),
         })
     }
+}
+
+/// Why a target is refused before anything is reserved: a server that
+/// cannot be told, or — for a public request — a pane running its agent
+/// directly, whose respawn would run in the daemon's environment instead of
+/// the shell the caller had.
+fn refusal(identity: &TargetIdentity, origin: Origin) -> Option<(&'static str, &'static str)> {
+    if identity.socket.is_none() {
+        return Some(("unknown_server", "cannot tell which server this pane is on"));
+    }
+    if identity.direct && origin == Origin::Public {
+        return Some((
+            "direct_pane_unsupported",
+            "this pane runs its agent directly; swaps through the daemon do not respawn such \
+             panes yet",
+        ));
+    }
+    None
 }
 
 fn settled_entry(report_index: usize, outcome: &SwapOutcome) -> SettledEntry {
