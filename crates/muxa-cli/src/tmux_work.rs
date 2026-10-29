@@ -2051,6 +2051,7 @@ pub fn mark_agent(
             } else {
                 pane.to_string()
             },
+            None,
             &alias,
             RESERVE_TIMEOUT,
         )

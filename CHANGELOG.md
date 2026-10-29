@@ -13,10 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   window comes back as its Work (and its issue), its session as its workspace,
   and each pane with its role, task and alias, so agents relaunched into it
   are recognised from their first hook instead of appearing as anonymous
-  panes in unmanaged windows. Only windows the restore creates are marked, by
-  id once the layout settles; a target that already carries any mark of its
-  kind is left alone, a restored alias is dropped if a live peer holds it,
-  and worker grants, launch and pipeline-attempt markers are never restored.
+  panes in unmanaged windows. Only sessions and windows the restore creates
+  are marked, by id once the layout settles — an existing same-named session
+  never becomes a managed workspace, and a new window that would inherit a
+  different workspace than it was saved under is left unmarked. A target that
+  already carries any mark of its kind is left alone, a restored alias is
+  dropped if a live peer holds it in that server's room, and worker grants,
+  launch and pipeline-attempt markers are never restored.
 
 - `muxa workers prune --execute` refused every Codex worker with "no Codex
   composer on screen": it read the pane with its colour escapes, which hid an

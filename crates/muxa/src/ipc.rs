@@ -2724,17 +2724,28 @@ impl CollaborationTopology {
     /// The room a pane belongs to, whether or not it hosts a tracked agent.
     /// A handle is allocated at session start, which is exactly when the pane
     /// may not be a participant yet.
+    ///
+    /// Pane ids are unique per server only, so a caller that names its server
+    /// gets the pane on that server — or no room — never the first `%1` the
+    /// scan happens to list from another one.
     fn room_of(&self, pane: &str, socket: Option<&str>) -> Option<collaboration::RoomId> {
         self.panes
             .iter()
-            .find(|info| info.pane_id == pane)
+            .find(|info| {
+                info.pane_id == pane
+                    && socket.is_none_or(|socket| {
+                        info.socket.as_deref().is_some_and(|candidate| {
+                            crate::backend::pane_endpoints_match(Some(pane), candidate, socket)
+                        })
+                    })
+            })
             .map(|info| {
                 collaboration::room_of_pane(
                     pane,
                     info,
-                    socket
-                        .map(ToString::to_string)
-                        .or_else(|| info.socket.clone()),
+                    info.socket
+                        .clone()
+                        .or_else(|| socket.map(ToString::to_string)),
                 )
             })
     }
@@ -5979,6 +5990,7 @@ pub fn blocking_call(
 pub fn blocking_reserve_handle(
     socket_path: &Path,
     pane: &str,
+    mux_socket: Option<&str>,
     handle: &str,
     deadline: Duration,
 ) -> Result<(), String> {
@@ -5986,6 +5998,7 @@ pub fn blocking_reserve_handle(
         "protocol": PROTOCOL_VERSION,
         "kind": "collaboration_issue_handle",
         "pane": pane,
+        "socket": mux_socket,
         "request": { "reserve": { "handle": handle } },
     });
     let Some(resp) = blocking_call(socket_path, &req, deadline) else {
@@ -9480,6 +9493,32 @@ mod tests {
         // A connection observes its caller once; later requests scan afresh.
         actor.observe_pane(&[backend]).await;
         assert!(actor.take_request_panes().is_none());
+    }
+
+    /// Two tmux servers each have a `%1`. A caller naming its server gets
+    /// that server's room, and one naming a server the scan does not cover
+    /// gets none — not the other server's room by pane id alone.
+    #[test]
+    fn a_named_server_picks_its_own_pane_from_equal_ids() {
+        let mut other = collaboration_test_pane("%1", "0");
+        other.socket = Some("other".into());
+        other.window_id = "@9".into();
+        let mut own = collaboration_test_pane("%1", "0");
+        own.socket = Some("restore".into());
+        own.window_id = "@2".into();
+        let mut topology = promote_topology(&[]);
+        topology.panes = vec![other, own];
+
+        let room = topology
+            .room_of("%1", Some("/tmp/tmux-1000/restore"))
+            .expect("the named server has a %1");
+        assert_eq!(room.window_id, "@2");
+        assert_eq!(room.socket.as_deref(), Some("restore"));
+        assert!(topology
+            .room_of("%1", Some("/tmp/tmux-1000/elsewhere"))
+            .is_none());
+        // Callers that name no server keep the old first-match behaviour.
+        assert_eq!(topology.room_of("%1", None).unwrap().window_id, "@9");
     }
 
     fn collaboration_test_pane(pane_id: &str, pane_index: &str) -> PaneInfo {

@@ -559,14 +559,12 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-pub fn restore(args: RestoreArgs) -> Result<()> {
+/// `daemon` is the caller's muxad, which referees restored aliases.
+pub fn restore(daemon: &Path, args: RestoreArgs) -> Result<()> {
     if args.boot {
-        return restore_at_boot(args);
+        return restore_at_boot(daemon, args);
     }
-    let path = match args.snapshot {
-        Some(path) => path,
-        None => newest_snapshot()?,
-    };
+    let path = args.snapshot.map_or_else(newest_snapshot, Ok)?;
     let snapshot = read_snapshot(&path)?;
     let endpoint = match args.mux_socket {
         Some(socket) => endpoint_for(&snapshot.host, socket)?,
@@ -653,6 +651,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         apply(
             &endpoint,
             &target,
+            daemon,
             args.layout_only,
             args.continue_text.as_deref(),
             &mut report,
@@ -673,7 +672,7 @@ const BOOT_PLACEHOLDER: &str = "__muxa_boot";
 /// `restore --boot`. A server that already has sessions — the hook firing a
 /// second time, or a user quicker than it — is left exactly as it is, and
 /// having no snapshot yet is a fresh install, not a failure.
-fn restore_at_boot(mut args: RestoreArgs) -> Result<()> {
+fn restore_at_boot(daemon: &Path, mut args: RestoreArgs) -> Result<()> {
     let path = match args.snapshot.take() {
         Some(path) => path,
         None => match newest_snapshot() {
@@ -698,7 +697,7 @@ fn restore_at_boot(mut args: RestoreArgs) -> Result<()> {
     args.snapshot = Some(path);
     args.run = true;
     args.boot = false;
-    let restored = restore(args);
+    let restored = restore(daemon, args);
     if placeholder {
         // Its own `=name` target: an unanchored one could match a
         // restored session whose name merely begins the same way.
@@ -849,6 +848,7 @@ async fn reload_multiplexer(client: &Client, args: MultiplexerReloadArgs) -> Res
     apply(
         &endpoint,
         &snapshot,
+        client.socket(),
         args.layout_only,
         follow_up,
         &mut RestoreReport::new(true),
@@ -1155,6 +1155,7 @@ fn agents_by_pane(agents: &[muxa::Agent], socket: &str) -> HashMap<String, Agent
 fn apply(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
+    daemon: &Path,
     layout_only: bool,
     follow_up: Option<&str>,
     report: &mut RestoreReport,
@@ -1162,12 +1163,7 @@ fn apply(
     let fresh = rebuild_shape(endpoint, snapshot, report)?;
     // Before any agent relaunches, so its first hook already finds the pane
     // it lands in marked with its role and Work.
-    restore_marks(
-        endpoint,
-        snapshot,
-        &fresh,
-        Some(&muxa::paths::default_socket()),
-    );
+    restore_marks(endpoint, snapshot, &fresh, Some(daemon), report);
     if layout_only {
         return Ok(());
     }
@@ -1181,18 +1177,23 @@ fn apply(
 /// Put muxa's marks back on what this restore built, by stable id once the
 /// layout has settled.
 ///
-/// Only windows the restore created (`fresh`) and their panes are marked:
-/// a window that was already there, and whatever runs in it, belongs to
-/// someone else. A target is written only when it carries none of the marks
-/// of its kind already — filling the gaps of an identity it already has
-/// would mix two Works into one. A restored alias is reserved with muxad for
-/// the rebuilt pane first, and dropped if muxad says a live peer holds it.
-/// Anything that cannot be written is skipped: the layout already stands.
+/// Only sessions and windows the restore created (`fresh`) and the panes in
+/// those windows are marked: one that was already there, and whatever runs
+/// in it, belongs to someone else — a session marked a managed workspace is
+/// one `work close` may close whole. A target is written only when it carries
+/// none of the marks of its kind already — filling the gaps of an identity it
+/// already has would mix two Works into one. A window that inherits its
+/// workspace is left unmarked, panes included, when the session it landed in
+/// is not the workspace it was saved under, for the same reason one level
+/// up. A restored alias is reserved with muxad for the rebuilt pane on this
+/// server first, and dropped if muxad says a live peer holds it. Anything
+/// that cannot be written is skipped: the layout already stands.
 fn restore_marks(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
-    fresh: &BTreeSet<String>,
+    fresh: &Fresh,
     daemon: Option<&Path>,
+    report: &mut RestoreReport,
 ) {
     let listing = |args: &[&str]| -> Vec<(String, String)> {
         mux_control::capture(endpoint, args)
@@ -1222,6 +1223,9 @@ fn restore_marks(
         }
     };
     for session in &snapshot.sessions {
+        if !fresh.sessions.contains(&session.session) {
+            continue;
+        }
         if let Some(id) = session_ids.get(&session.session) {
             write(None, id, &session.marks, &SESSION_MARKS);
         }
@@ -1231,7 +1235,19 @@ fn restore_marks(
         let Some(session_id) = session_ids.get(&window.session) else {
             continue;
         };
-        if !fresh.contains(&key) {
+        if !fresh.windows.contains(&key) {
+            continue;
+        }
+        let saved = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session == window.session)
+            .map_or(&[][..], |session| session.marks.as_slice());
+        let live = own_marks(endpoint, None, session_id);
+        if !same_parent(&window.marks, saved, live.as_deref()) {
+            report.say(&format!(
+                "  {key}: its session is not the workspace it was saved under; left unmarked"
+            ));
             continue;
         }
         let window_ids: BTreeMap<String, String> = listing(&[
@@ -1264,7 +1280,12 @@ fn restore_marks(
             let Some(pane_id) = pane_ids.get(&pane.pane_index) else {
                 continue;
             };
-            let marks = reserve_alias(&pane.marks, &namespaced(endpoint.host, pane_id), daemon);
+            let marks = reserve_alias(
+                &pane.marks,
+                &namespaced(endpoint.host, pane_id),
+                &endpoint.socket,
+                daemon,
+            );
             write(Some("-p"), pane_id, &marks, &PANE_MARKS);
         }
     }
@@ -1273,18 +1294,61 @@ fn restore_marks(
 /// Whether `id` already carries any of `known` at its own scope (not one it
 /// inherits, which `show-options` without `-A` leaves out).
 fn has_any_mark(endpoint: &BackendEndpoint, scope: Option<&str>, id: &str, known: &[&str]) -> bool {
+    // Unreadable: assume marked, so nothing is mixed in.
+    own_marks(endpoint, scope, id).is_none_or(|marks| {
+        marks
+            .iter()
+            .any(|(option, _)| known.contains(&option.as_str()))
+    })
+}
+
+/// The user options `id` sets at its own scope; `None` when unreadable.
+fn own_marks(
+    endpoint: &BackendEndpoint,
+    scope: Option<&str>,
+    id: &str,
+) -> Option<Vec<(String, String)>> {
     let mut args = vec!["show-options"];
     args.extend(scope);
     args.extend(["-t", id]);
-    let Ok(out) = mux_control::capture(endpoint, &args) else {
-        // Unreadable: assume marked, so nothing is mixed in.
-        return true;
+    let out = mux_control::capture(endpoint, &args).ok()?;
+    Some(read_shown_options(&out))
+}
+
+/// `show-options` lines as `(name, value)`, a quoted value unquoted.
+fn read_shown_options(out: &str) -> Vec<(String, String)> {
+    out.lines()
+        .map(|line| {
+            let (option, value) = line.split_once(' ').unwrap_or((line, ""));
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            (option.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
+/// Whether a window saved with `window` marks, under a session saved with
+/// `saved`, keeps its saved workspace in a session whose own marks are
+/// `live` (`None`: unreadable). A window that pins its own workspace does
+/// not care; one that inherits it must land under the same one, or its Work
+/// would be filed under another workspace.
+fn same_parent(
+    window: &[(String, String)],
+    saved: &[(String, String)],
+    live: Option<&[(String, String)]>,
+) -> bool {
+    let workspace = |marks: &[(String, String)]| {
+        marks
+            .iter()
+            .find(|(option, _)| option == "@muxa_workspace_id")
+            .map(|(_, value)| value.clone())
     };
-    out.lines().any(|line| {
-        line.split_whitespace()
-            .next()
-            .is_some_and(|option| known.contains(&option))
-    })
+    if workspace(window).is_some() {
+        return true;
+    }
+    live.is_some_and(|live| workspace(live) == workspace(saved))
 }
 
 /// `marks` without its alias when muxad says a live peer already holds that
@@ -1293,6 +1357,7 @@ fn has_any_mark(endpoint: &BackendEndpoint, scope: Option<&str>, id: &str, known
 fn reserve_alias(
     marks: &[(String, String)],
     pane: &str,
+    mux_socket: &str,
     daemon: Option<&Path>,
 ) -> Vec<(String, String)> {
     let Some(daemon) = daemon else {
@@ -1302,8 +1367,14 @@ fn reserve_alias(
         .iter()
         .filter(|(option, alias)| {
             option != "@muxa_agent_alias"
-                || muxa::ipc::blocking_reserve_handle(daemon, pane, alias, Duration::from_secs(2))
-                    .is_ok()
+                || muxa::ipc::blocking_reserve_handle(
+                    daemon,
+                    pane,
+                    Some(mux_socket),
+                    alias,
+                    Duration::from_secs(2),
+                )
+                .is_ok()
         })
         .cloned()
         .collect()
@@ -1388,21 +1459,34 @@ fn screen_settled(endpoint: &BackendEndpoint, target: &str) -> bool {
     false
 }
 
+/// What one restore built itself, as opposed to found already there.
+#[derive(Debug, Default)]
+struct Fresh {
+    /// Session names.
+    sessions: BTreeSet<String>,
+    /// `session:index`.
+    windows: BTreeSet<String>,
+}
+
 /// Sessions, windows, panes, geometry, working directories.
-/// Returns the windows (`session:index`) this restore created.
+/// Returns what this restore created.
 fn rebuild_shape(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
     report: &mut RestoreReport,
-) -> Result<BTreeSet<String>> {
+) -> Result<Fresh> {
     let mut created = 0_usize;
-    let mut fresh: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut built = Fresh::default();
+    let fresh = &mut built.windows;
     for window in &snapshot.windows {
         match ensure_window(endpoint, snapshot, window) {
-            Ok(count) => {
+            Ok((count, made_session)) => {
                 created += count;
                 if count > 0 {
                     fresh.insert(format!("{}:{}", window.session, window.index));
+                }
+                if made_session {
+                    built.sessions.insert(window.session.clone());
                 }
                 report.reached.insert(window.session.clone());
             }
@@ -1494,7 +1578,7 @@ fn rebuild_shape(
     for (target, error) in split_failures {
         report.say(&plan::split_failure_line(&target, &error));
     }
-    Ok(fresh)
+    Ok(built)
 }
 
 /// The `columns x rows` a window had, from its layout string
@@ -1507,11 +1591,13 @@ fn layout_size(layout: &str) -> Option<(u32, u32)> {
 
 /// Create `window` — and its session, if that is missing too — at the size
 /// it was recorded with. Returns how many sessions/windows it created.
+/// Returns how many sessions and windows it created, and whether the session
+/// was one of them.
 fn ensure_window(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
     window: &WindowShape,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
     let mut created = 0_usize;
     let first = snapshot
         .panes
@@ -1548,6 +1634,7 @@ fn ensure_window(
             .with_context(|| format!("creating session {}", window.session))?;
         created += 1;
     }
+    let made_session = created > 0;
     // `has-session` resolves only the session half of a target, so it
     // answers yes for a window that does not exist. The window list is the
     // only honest answer — and the session's own first window does not
@@ -1588,7 +1675,7 @@ fn ensure_window(
             ],
         );
     }
-    Ok(created)
+    Ok((created, made_session))
 }
 
 /// How many panes a window has right now; `None` when the server could not
@@ -2462,6 +2549,47 @@ mod tests {
         assert_eq!(
             read_marks(&PANE_MARKS, &["reviewer", "", "rev", "", ""]).len(),
             2
+        );
+    }
+
+    /// A window that inherits its workspace is marked only under the
+    /// workspace it was saved under; one that pins its own does not care.
+    #[test]
+    fn an_inherited_workspace_must_match_the_session_it_lands_in() {
+        let marks = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(option, value)| ((*option).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        let work = marks(&[("@muxa_work_id", "CAL-1")]);
+        let saved_a = marks(&[("@muxa_workspace_id", "A")]);
+        let live_b = marks(&[("@muxa_workspace_id", "B")]);
+        let live_none = marks(&[("@other", "x")]);
+
+        assert!(same_parent(&work, &saved_a, Some(&saved_a)));
+        // Saved under A, landing under B: B/CAL-1 is a Work nobody had.
+        assert!(!same_parent(&work, &saved_a, Some(&live_b)));
+        // Saved under no workspace, landing under B: the same mix.
+        assert!(!same_parent(&work, &[], Some(&live_b)));
+        assert!(same_parent(&work, &[], Some(&live_none)));
+        // A session that cannot be read is not assumed to match.
+        assert!(!same_parent(&work, &saved_a, None));
+        let pinned = marks(&[("@muxa_workspace_id", "A"), ("@muxa_work_id", "CAL-1")]);
+        assert!(same_parent(&pinned, &[], Some(&live_b)));
+    }
+
+    #[test]
+    fn shown_options_are_read_with_quotes_removed() {
+        let shown =
+            read_shown_options("@muxa_workspace_id demo\n@muxa_work_cwd \"/a b\"\nstatus on\n");
+        assert_eq!(
+            shown,
+            vec![
+                ("@muxa_workspace_id".to_owned(), "demo".to_owned()),
+                ("@muxa_work_cwd".to_owned(), "/a b".to_owned()),
+                ("status".to_owned(), "on".to_owned()),
+            ]
         );
     }
 
