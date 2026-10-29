@@ -1212,22 +1212,15 @@ fn restore_marks(
             .into_iter()
             .collect();
     let write = |scope: Option<&str>, id: &str, marks: &[(String, String)], known: &[&str]| {
-        if marks.is_empty() || has_any_mark(endpoint, scope, id, known) {
-            return;
-        }
-        for (option, value) in marks {
-            let mut args = vec!["set-option"];
-            args.extend(scope);
-            args.extend(["-t", id, option.as_str(), value.as_str()]);
-            let _ = mux_control::run(endpoint, &args);
-        }
+        write_marks(endpoint, scope, id, marks, known)
     };
     for session in &snapshot.sessions {
         if !fresh.sessions.contains(&session.session) {
             continue;
         }
         if let Some(id) = session_ids.get(&session.session) {
-            write(None, id, &session.marks, &SESSION_MARKS);
+            // Its windows are checked against what it ended up with below.
+            let _ = write(None, id, &session.marks, &SESSION_MARKS);
         }
     }
     for window in &snapshot.windows {
@@ -1262,7 +1255,14 @@ fn restore_marks(
         let Some(window_id) = window_ids.get(&window.index) else {
             continue;
         };
-        write(Some("-w"), window_id, &window.marks, &WINDOW_MARKS);
+        // Panes are filed under their window: one that is not the saved
+        // Work would get panes claiming a Work it is not.
+        if !write(Some("-w"), window_id, &window.marks, &WINDOW_MARKS) {
+            report.say(&format!(
+                "  {key}: the window is not the Work it was saved as; left unmarked"
+            ));
+            continue;
+        }
         let pane_ids: BTreeMap<String, String> = listing(&[
             "list-panes",
             "-t",
@@ -1277,18 +1277,61 @@ fn restore_marks(
             .iter()
             .filter(|pane| pane.session == window.session && pane.window_index == window.index)
         {
-            let Some(pane_id) = pane_ids.get(&pane.pane_index) else {
-                continue;
-            };
-            let marks = reserve_alias(
-                &pane.marks,
-                &namespaced(endpoint.host, pane_id),
-                &endpoint.socket,
-                daemon,
-            );
-            write(Some("-p"), pane_id, &marks, &PANE_MARKS);
+            if let Some(pane_id) = pane_ids.get(&pane.pane_index) {
+                restore_pane_marks(endpoint, pane, pane_id, daemon, report);
+            }
         }
     }
+}
+
+/// One rebuilt pane's role, task, alias and Work, under a window already
+/// verified to be the saved one.
+fn restore_pane_marks(
+    endpoint: &BackendEndpoint,
+    pane: &PaneShape,
+    pane_id: &str,
+    daemon: Option<&Path>,
+    report: &mut RestoreReport,
+) {
+    // Checked before reserving, so a pane that keeps its own marks does not
+    // hold an alias it never receives.
+    if pane.marks.is_empty() || has_any_mark(endpoint, Some("-p"), pane_id, &PANE_MARKS) {
+        return;
+    }
+    let marks = reserve_alias(
+        &pane.marks,
+        &namespaced(endpoint.host, pane_id),
+        &endpoint.socket,
+        daemon,
+    );
+    if marks.len() < pane.marks.len() {
+        report.say(&format!(
+            "  {}: alias already used by a live peer; restored without it",
+            pane_target(pane)
+        ));
+    }
+    let _ = write_marks(endpoint, Some("-p"), pane_id, &marks, &PANE_MARKS);
+}
+
+/// Write `marks` onto a target that carries none of `known` yet, and say
+/// whether it ends up carrying exactly them — read back, so a hook that
+/// stamped it first, or a write that failed, is seen.
+fn write_marks(
+    endpoint: &BackendEndpoint,
+    scope: Option<&str>,
+    id: &str,
+    marks: &[(String, String)],
+    known: &[&str],
+) -> bool {
+    if !marks.is_empty() && !has_any_mark(endpoint, scope, id, known) {
+        for (option, value) in marks {
+            let mut args = vec!["set-option"];
+            args.extend(scope);
+            args.extend(["-t", id, option.as_str(), value.as_str()]);
+            let _ = mux_control::run(endpoint, &args);
+        }
+    }
+    own_marks(endpoint, scope, id).is_some_and(|now| carries_exactly(&now, known, marks))
 }
 
 /// Whether `id` already carries any of `known` at its own scope (not one it
@@ -1300,6 +1343,18 @@ fn has_any_mark(endpoint: &BackendEndpoint, scope: Option<&str>, id: &str, known
             .iter()
             .any(|(option, _)| known.contains(&option.as_str()))
     })
+}
+
+/// Whether the `known` options among `now` are exactly `saved`.
+fn carries_exactly(now: &[(String, String)], known: &[&str], saved: &[(String, String)]) -> bool {
+    let mut now: Vec<_> = now
+        .iter()
+        .filter(|(option, _)| known.contains(&option.as_str()))
+        .collect();
+    let mut saved: Vec<_> = saved.iter().collect();
+    now.sort();
+    saved.sort();
+    now == saved
 }
 
 /// The user options `id` sets at its own scope; `None` when unreadable.
@@ -2577,6 +2632,37 @@ mod tests {
         assert!(!same_parent(&work, &saved_a, None));
         let pinned = marks(&[("@muxa_workspace_id", "A"), ("@muxa_work_id", "CAL-1")]);
         assert!(same_parent(&pinned, &[], Some(&live_b)));
+    }
+
+    /// A window's children are restored only under the bundle it was
+    /// saved with: a hook's stamp, a partial write or a stray extra mark is
+    /// another identity.
+    #[test]
+    fn a_window_carries_its_saved_bundle_exactly_or_not_at_all() {
+        let marks = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(option, value)| ((*option).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        let saved = marks(&[("@muxa_work_id", "A"), ("@muxa_managed_work", "1")]);
+        let written = marks(&[
+            ("@muxa_managed_work", "1"),
+            ("@muxa_work_id", "A"),
+            ("status", "on"),
+        ]);
+        assert!(carries_exactly(&written, &WINDOW_MARKS, &saved));
+        let stamped = marks(&[("@muxa_work_id", "B"), ("@muxa_managed_work", "1")]);
+        assert!(!carries_exactly(&stamped, &WINDOW_MARKS, &saved));
+        let partial = marks(&[("@muxa_work_id", "A")]);
+        assert!(!carries_exactly(&partial, &WINDOW_MARKS, &saved));
+        // Nothing saved: only a window nothing stamped either qualifies.
+        assert!(carries_exactly(
+            &marks(&[("status", "on")]),
+            &WINDOW_MARKS,
+            &[]
+        ));
+        assert!(!carries_exactly(&stamped, &WINDOW_MARKS, &[]));
     }
 
     #[test]
