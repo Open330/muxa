@@ -704,7 +704,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
             "name": "muxa_swap_account",
             "description": "Move Claude/Codex agents onto another account and resume each conversation in its own pane: \
                 stop the agent, relaunch it on the account with the same session, answer startup dialogs, and send a \
-                follow-up so a cut-off turn carries on. Default targets are agents stopped by a usage cap. Accounts come \
+                follow-up only to agents whose turn was cut off (continue_when=limited, the default). Default targets are agents stopped by a usage cap. Accounts come \
                 from [[accounts.<provider>]] on that host, or aas. Run on this host or a control-mode Fleet host. \
                 Use dry_run=true to see the plan first. CLI equivalent: `muxa swap`.",
             "inputSchema": {
@@ -717,7 +717,9 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "to": { "type": "string", "description": "Account name, or auto (default)." },
                     "spread": { "type": "boolean", "description": "Round-robin agents over every account with quota left." },
                     "force": { "type": "boolean", "description": "Also stop agents that are mid-turn." },
-                    "continue": { "type": "string", "description": "Follow-up prompt for every swapped agent." },
+                    "continue_text": { "type": "string", "description": "Follow-up prompt wording. Who gets it is continue_when; naming it does not widen it." },
+                    "continue_when": { "type": "string", "enum": ["limited", "always", "never"], "description": "Which swapped agents get the follow-up: limited (cut off by a usage cap or by this swap; idle, finished and waiting-for-you agents are never woken), always, or never. Defaults to [swap] continue_when." },
+                    "continue": { "type": "string", "description": "Deprecated alias of continue_text; no longer sends to every agent." },
                     "no_continue": { "type": "boolean", "description": "Send no follow-up prompt." },
                     "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." }
                 },
@@ -5088,6 +5090,8 @@ async fn swap_account(client: &Client, args: &Value) -> Value {
     for (name, option) in [
         ("provider", "--provider"),
         ("to", "--to"),
+        ("continue_text", "--continue-text"),
+        ("continue_when", "--continue-when"),
         ("continue", "--continue"),
     ] {
         if let Some(value) = text(name) {

@@ -62,11 +62,25 @@ pub struct Args {
     /// under it (`wrap`). Default from `[swap] bare`.
     #[arg(long, value_enum)]
     bare: Option<Bare>,
-    /// Follow-up prompt typed after the resume. Default from
-    /// `[swap] continue_text`, sent per `[swap] continue_when`.
-    #[arg(long = "continue", value_name = "TEXT", conflicts_with = "no_continue")]
+    /// Follow-up prompt typed after the resume — the wording only; who gets
+    /// it is `--continue-when`. Default from `[swap] continue_text`.
+    #[arg(
+        long = "continue-text",
+        value_name = "TEXT",
+        conflicts_with_all = ["no_continue", "continue_legacy"]
+    )]
     continue_text: Option<String>,
-    /// Send no follow-up prompt.
+    /// Deprecated: use `--continue-text`. Sets the wording only — it no
+    /// longer sends to every swapped agent; add `--continue-when always` for
+    /// that.
+    #[arg(long = "continue", value_name = "TEXT", conflicts_with = "no_continue")]
+    continue_legacy: Option<String>,
+    /// Which swapped agents get the follow-up: `limited` (their turn was cut
+    /// off by a usage cap or by this swap), `always`, or `never`. Default
+    /// from `[swap] continue_when`.
+    #[arg(long = "continue-when", value_enum, conflicts_with = "no_continue")]
+    continue_when: Option<When>,
+    /// Send no follow-up prompt (`--continue-when never`).
     #[arg(long)]
     no_continue: bool,
     /// Print the plan without stopping or typing anything.
@@ -95,6 +109,38 @@ enum Bare {
     Wrap,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum When {
+    Limited,
+    Always,
+    Never,
+}
+
+impl From<When> for ContinueWhen {
+    fn from(when: When) -> Self {
+        match when {
+            When::Limited => Self::Limited,
+            When::Always => Self::Always,
+            When::Never => Self::Never,
+        }
+    }
+}
+
+impl Args {
+    /// The follow-up wording from either spelling.
+    fn follow_up_text(&self) -> Option<&String> {
+        self.continue_text
+            .as_ref()
+            .or(self.continue_legacy.as_ref())
+    }
+}
+
+/// Printed when the deprecated spelling is used: it no longer means "send
+/// to every agent", and a caller relying on that should say so.
+const CONTINUE_DEPRECATED: &str = "muxa swap: --continue is deprecated; use --continue-text. \
+     It now keeps the configured continue_when policy (only agents whose turn was cut off); \
+     add --continue-when always to send it to every swapped agent";
+
 fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
     let scope = if !args.targets.is_empty() {
         SwapScope::Targets(args.targets.clone())
@@ -120,13 +166,15 @@ fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
             Bare::Wrap => BareMode::Wrap,
         };
     }
+    // The wording and who gets it are separate: naming the prompt does not
+    // widen it to agents that had nothing cut off.
+    if let Some(text) = args.follow_up_text() {
+        request.continue_text = Some(text.clone()).filter(|text| !text.trim().is_empty());
+    }
     if args.no_continue {
         request.continue_when = ContinueWhen::Never;
-    } else if let Some(text) = &args.continue_text {
-        // An explicit prompt is a request to send it, whatever the config
-        // says about who gets one.
-        request.continue_text = Some(text.clone()).filter(|text| !text.trim().is_empty());
-        request.continue_when = ContinueWhen::Always;
+    } else if let Some(when) = args.continue_when {
+        request.continue_when = when.into();
     }
     request.dry_run = args.dry_run;
     request.exclude.clone_from(&args.exclude);
@@ -139,6 +187,9 @@ pub(crate) async fn run(
     config: &SwapConfig,
     accounts: &muxa::accounts::AccountsConfig,
 ) -> Result<()> {
+    if args.continue_legacy.is_some() {
+        eprintln!("{CONTINUE_DEPRECATED}");
+    }
     if let Some(host) = muxa::work_control::remote_host_alias(args.host.as_deref()) {
         return run_remote(client, &args, host).await;
     }
@@ -201,8 +252,28 @@ fn remote_argv(args: &Args) -> Vec<String> {
             }
         ));
     }
-    if let Some(text) = &args.continue_text {
-        words.push(format!("--continue={text}"));
+    // The new spellings only: a host too old to know them refuses the run
+    // rather than reading `--continue` as "send to every agent".
+    // A blank wording sends nothing here, so it is `--no-continue` there:
+    // the allowlist takes no empty values, and the host's own default text
+    // must not stand in for one the caller cleared.
+    let blank = args
+        .follow_up_text()
+        .is_some_and(|text| text.trim().is_empty());
+    if blank && !args.no_continue {
+        words.push("--no-continue".to_owned());
+    } else if let Some(text) = args.follow_up_text() {
+        words.push(format!("--continue-text={text}"));
+    }
+    if let Some(when) = args.continue_when.filter(|_| !blank) {
+        words.push(format!(
+            "--continue-when={}",
+            match when {
+                When::Limited => "limited",
+                When::Always => "always",
+                When::Never => "never",
+            }
+        ));
     }
     words.extend(args.exclude.iter().map(|pane| format!("--exclude={pane}")));
     words.push("--json".to_owned());
@@ -303,6 +374,10 @@ mod tests {
         request(&cli.args, &SwapConfig::default())
     }
 
+    fn request_from(args: &Args, config: &SwapConfig) -> SwapRequest {
+        request(args, config)
+    }
+
     #[test]
     fn host_runs_the_same_swap_there_as_one_word_per_value() {
         let cli = Cli::parse_from([
@@ -313,8 +388,10 @@ mod tests {
             "claude",
             "--to",
             "work@claude",
-            "--continue",
+            "--continue-text",
             "keep going",
+            "--continue-when",
+            "always",
             "--host",
             "rtzr",
         ]);
@@ -327,7 +404,8 @@ mod tests {
                 "--force",
                 "--provider=claude",
                 "--to=work@claude",
-                "--continue=keep going",
+                "--continue-text=keep going",
+                "--continue-when=always",
                 "--json"
             ]
         );
@@ -367,12 +445,94 @@ mod tests {
         assert_eq!(request.provider, Some(AgentKind::Codex));
     }
 
+    /// Naming the wording keeps the configured policy: it used to switch it
+    /// to `always`, which woke every idle agent a swap touched.
     #[test]
-    fn continue_flags_override_the_config() {
+    fn the_wording_and_who_gets_it_are_set_separately() {
+        let request = parse(&["--continue-text", "keep going"]);
+        assert_eq!(request.continue_text.as_deref(), Some("keep going"));
+        assert_eq!(request.continue_when, ContinueWhen::Limited);
+
+        let request = parse(&["--continue-when", "always"]);
+        assert_eq!(
+            request.continue_text,
+            SwapRequest::new(SwapScope::Limited, &SwapConfig::default()).continue_text
+        );
+        assert_eq!(request.continue_when, ContinueWhen::Always);
+
+        let request = parse(&["--continue-text", "go", "--continue-when", "never"]);
+        assert_eq!(request.continue_when, ContinueWhen::Never);
+        assert_eq!(parse(&["--no-continue"]).continue_when, ContinueWhen::Never);
+
+        // A configured policy survives a wording-only override.
+        let config = SwapConfig {
+            continue_when: ContinueWhen::Never,
+            ..SwapConfig::default()
+        };
+        let cli = Cli::parse_from(["swap", "--continue-text", "go"]);
+        assert_eq!(
+            request_from(&cli.args, &config).continue_when,
+            ContinueWhen::Never
+        );
+        let config = SwapConfig {
+            continue_when: ContinueWhen::Always,
+            ..SwapConfig::default()
+        };
+        assert_eq!(
+            request_from(&cli.args, &config).continue_when,
+            ContinueWhen::Always
+        );
+    }
+
+    /// The old spelling is the wording only now, and a remote run carries
+    /// the new spellings a host too old to know them refuses.
+    #[test]
+    fn the_deprecated_continue_no_longer_means_every_agent() {
         let request = parse(&["--continue", "keep going"]);
         assert_eq!(request.continue_text.as_deref(), Some("keep going"));
-        assert_eq!(request.continue_when, ContinueWhen::Always);
-        assert_eq!(parse(&["--no-continue"]).continue_when, ContinueWhen::Never);
+        assert_eq!(request.continue_when, ContinueWhen::Limited);
+
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        assert_eq!(
+            checked_argv(&words(&["--continue", "go"])).unwrap(),
+            ["swap", "--to=auto", "--continue-text=go", "--json"]
+        );
+        assert!(checked_argv(&words(&["--continue", "a", "--continue-text", "b"])).is_err());
+        assert!(checked_argv(&words(&["--no-continue", "--continue-when", "always"])).is_err());
+        assert!(checked_argv(&words(&["--continue-when", "sometimes"])).is_err());
+        let argv = checked_argv(&words(&[
+            "--continue-text",
+            "go",
+            "--continue-when",
+            "limited",
+        ]))
+        .unwrap();
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+        // No policy named: none is sent, so the host keeps its own default.
+        assert!(!checked_argv(&words(&["--continue-text", "go"]))
+            .unwrap()
+            .iter()
+            .any(|word| word.starts_with("--continue-when")));
+    }
+
+    /// A blank wording sends nothing, here and on a Fleet host alike.
+    #[test]
+    fn a_blank_wording_sends_nothing_here_or_on_a_host() {
+        assert_eq!(parse(&["--continue-text", " "]).continue_text, None);
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        for blank in [
+            words(&["--continue-text", " "]),
+            words(&["--continue", ""]),
+            words(&["--continue-text", "", "--continue-when", "always"]),
+        ] {
+            let argv = checked_argv(&blank).unwrap();
+            assert!(argv.contains(&"--no-continue".to_owned()), "{argv:?}");
+            assert!(
+                !argv.iter().any(|w| w.starts_with("--continue")),
+                "{argv:?}"
+            );
+            muxa::work_control::validate_swap_argv(&argv).unwrap();
+        }
     }
 
     #[test]
@@ -386,6 +546,7 @@ mod tests {
             status: SwapStatus::Planned,
             command: Some("aas e jelly@claude --resume sid".into()),
             note: String::new(),
+            continue_reason: None,
         }]);
         assert!(
             rendered.contains("e-ed@claude -> jelly@claude"),
