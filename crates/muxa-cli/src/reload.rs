@@ -1236,7 +1236,7 @@ fn restore_marks(
             .iter()
             .find(|session| session.session == window.session)
             .map_or(&[][..], |session| session.marks.as_slice());
-        let live = own_marks(endpoint, None, session_id);
+        let live = own_marks(endpoint, None, session_id, &SESSION_MARKS);
         if !same_parent(&window.marks, saved, live.as_deref()) {
             report.say(&format!(
                 "  {key}: its session is not the workspace it was saved under; left unmarked"
@@ -1331,18 +1331,14 @@ fn write_marks(
             let _ = mux_control::run(endpoint, &args);
         }
     }
-    own_marks(endpoint, scope, id).is_some_and(|now| carries_exactly(&now, known, marks))
+    own_marks(endpoint, scope, id, known).is_some_and(|now| carries_exactly(&now, known, marks))
 }
 
 /// Whether `id` already carries any of `known` at its own scope (not one it
 /// inherits, which `show-options` without `-A` leaves out).
 fn has_any_mark(endpoint: &BackendEndpoint, scope: Option<&str>, id: &str, known: &[&str]) -> bool {
     // Unreadable: assume marked, so nothing is mixed in.
-    own_marks(endpoint, scope, id).is_none_or(|marks| {
-        marks
-            .iter()
-            .any(|(option, _)| known.contains(&option.as_str()))
-    })
+    own_marks(endpoint, scope, id, known).is_none_or(|marks| !marks.is_empty())
 }
 
 /// Whether the `known` options among `now` are exactly `saved`.
@@ -1357,31 +1353,36 @@ fn carries_exactly(now: &[(String, String)], known: &[&str], saved: &[(String, S
     now == saved
 }
 
-/// The user options `id` sets at its own scope; `None` when unreadable.
+/// Which of `known` `id` sets at its own scope, with their values; `None`
+/// when any cannot be read.
+///
+/// One `show-options -v` per option: the listing form quotes and escapes a
+/// value with a quote or backslash in it, so `Fix "bug"` would read back as
+/// something other than what was written. An empty value is no mark, as it
+/// is when the snapshot captures it.
 fn own_marks(
     endpoint: &BackendEndpoint,
     scope: Option<&str>,
     id: &str,
+    known: &[&str],
 ) -> Option<Vec<(String, String)>> {
-    let mut args = vec!["show-options"];
-    args.extend(scope);
-    args.extend(["-t", id]);
-    let out = mux_control::capture(endpoint, &args).ok()?;
-    Some(read_shown_options(&out))
+    let mut marks = Vec::new();
+    for option in known {
+        let mut args = vec!["show-options", "-v", "-q"];
+        args.extend(scope);
+        args.extend(["-t", id, option]);
+        let out = mux_control::capture(endpoint, &args).ok()?;
+        if let Some(value) = shown_value(&out) {
+            marks.push(((*option).to_owned(), value.to_owned()));
+        }
+    }
+    Some(marks)
 }
 
-/// `show-options` lines as `(name, value)`, a quoted value unquoted.
-fn read_shown_options(out: &str) -> Vec<(String, String)> {
-    out.lines()
-        .map(|line| {
-            let (option, value) = line.split_once(' ').unwrap_or((line, ""));
-            let value = value
-                .strip_prefix('"')
-                .and_then(|value| value.strip_suffix('"'))
-                .unwrap_or(value);
-            (option.to_owned(), value.to_owned())
-        })
-        .collect()
+/// A `show-options -v` value as written; `None` when unset or empty.
+fn shown_value(out: &str) -> Option<&str> {
+    let value = out.strip_suffix('\n').unwrap_or(out);
+    (!value.is_empty()).then_some(value)
 }
 
 /// Whether a window saved with `window` marks, under a session saved with
@@ -2665,18 +2666,27 @@ mod tests {
         assert!(!carries_exactly(&stamped, &WINDOW_MARKS, &[]));
     }
 
+    /// `show-options -v` prints a value as written — quotes, backslashes and
+    /// `$` included — so a window restored with one still matches its saved
+    /// bundle, and a different value still does not.
     #[test]
-    fn shown_options_are_read_with_quotes_removed() {
-        let shown =
-            read_shown_options("@muxa_workspace_id demo\n@muxa_work_cwd \"/a b\"\nstatus on\n");
-        assert_eq!(
-            shown,
-            vec![
-                ("@muxa_workspace_id".to_owned(), "demo".to_owned()),
-                ("@muxa_work_cwd".to_owned(), "/a b".to_owned()),
-                ("status".to_owned(), "on".to_owned()),
-            ]
-        );
+    fn a_shown_value_reads_back_as_written() {
+        let title = r#"Fix "bug" in C:\path $HOME"#;
+        assert_eq!(shown_value(&format!("{title}\n")), Some(title));
+        assert_eq!(shown_value(""), None);
+        assert_eq!(shown_value("\n"), None);
+
+        let saved = vec![("@muxa_external_title".to_owned(), title.to_owned())];
+        let now = vec![(
+            "@muxa_external_title".to_owned(),
+            shown_value(&format!("{title}\n")).unwrap().to_owned(),
+        )];
+        assert!(carries_exactly(&now, &WINDOW_MARKS, &saved));
+        let other = vec![(
+            "@muxa_external_title".to_owned(),
+            shown_value("Fix \"bug\" elsewhere\n").unwrap().to_owned(),
+        )];
+        assert!(!carries_exactly(&other, &WINDOW_MARKS, &saved));
     }
 
     #[test]
