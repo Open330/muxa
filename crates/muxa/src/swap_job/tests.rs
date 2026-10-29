@@ -424,3 +424,119 @@ fn measure_journal_cost() {
         total / rounds
     );
 }
+
+/// An intent committed after the database was renamed away would be one a
+/// restarted manager never sees: refused, and latched even once the path
+/// comes back.
+#[test]
+fn a_moved_or_replaced_database_takes_no_further_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("muxa/swap-jobs.sqlite3");
+    let store = SwapJobStore::open(&path).unwrap();
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 1);
+    let aside = dir.path().join("aside.sqlite3");
+    std::fs::rename(&path, &aside).unwrap();
+    let mut journal = store.journal(&lease, &job, 0, 1);
+    let esc = effect(Purpose::Interrupt, Op::Key(Key::Esc));
+    assert!(journal.before(&esc).is_err());
+    std::fs::rename(&aside, &path).unwrap();
+    assert!(
+        journal.before(&esc).is_err(),
+        "latched after the path came back"
+    );
+    assert!(store.status(&job).is_err());
+
+    // A file put in its place is not the store either.
+    let other_dir = tempfile::tempdir().unwrap();
+    let other_path = other_dir.path().join("swap-jobs.sqlite3");
+    let other = SwapJobStore::open(&other_path).unwrap();
+    let lease = other.acquire(&me("b", 2), &alive).unwrap();
+    std::fs::remove_file(&other_path).unwrap();
+    std::fs::write(&other_path, b"").unwrap();
+    assert!(other.create_job(&lease, "k", "f", &plan(1, None)).is_err());
+}
+
+/// A target that has ended takes no new effect or observation, even while
+/// another target of the job is still running.
+#[test]
+fn an_ended_target_takes_nothing_new() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 2);
+    store
+        .finish_target(&lease, &job, 0, 1, Disposition::Swapped)
+        .unwrap();
+    let mut journal = store.journal(&lease, &job, 0, 1);
+    assert!(journal
+        .before(&effect(Purpose::FollowUp, Op::Prompt { chars: 3 }))
+        .is_err());
+    assert!(store
+        .observe(
+            &lease,
+            &job,
+            0,
+            1,
+            &Observation::Phase {
+                phase: Phase::Stopping
+            }
+        )
+        .is_err());
+    assert_eq!(store.status(&job).unwrap().targets[0].phase, "finished");
+    // The other target is still open.
+    let mut journal = store.journal(&lease, &job, 1, 1);
+    journal
+        .before(&effect(Purpose::Interrupt, Op::Key(Key::Esc)))
+        .unwrap();
+}
+
+/// The open intent lives in the file: a second journal for the same attempt,
+/// or one made after reopening, cannot start another effect.
+#[test]
+fn an_open_intent_blocks_every_journal_for_that_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 1);
+    let stop = effect(
+        Purpose::Stop,
+        Op::Signal {
+            signal: "TERM".into(),
+            pids: vec![1000],
+        },
+    );
+    let mut first = store.journal(&lease, &job, 0, 1);
+    first.before(&stop).unwrap();
+    let mut second = store.journal(&lease, &job, 0, 1);
+    assert!(second
+        .before(&effect(Purpose::Relaunch, Op::Text { chars: 8 }))
+        .is_err());
+
+    // A result for another effect does not settle this one, and keeps it
+    // pending.
+    let other = effect(Purpose::FollowUp, Op::Prompt { chars: 8 });
+    assert!(first.after(&other, Transport::Accepted).is_err());
+    assert_eq!(store.status(&job).unwrap().targets[0].uncertain_effects, 1);
+    first.after(&stop, Transport::Unconfirmed).unwrap();
+    assert_eq!(store.status(&job).unwrap().targets[0].uncertain_effects, 0);
+
+    // Reopened with an intent left open: nothing new on that attempt.
+    first.before(&other).unwrap();
+    drop(first);
+    drop(second);
+    drop(store);
+    let reopened = open(&dir);
+    let lease = reopened.acquire(&me("a", 1), &alive).unwrap();
+    let mut journal = reopened.journal(&lease, &job, 0, 1);
+    assert!(journal
+        .before(&effect(Purpose::RestoreDraft, Op::Prompt { chars: 2 }))
+        .is_err());
+    // It can only end as needs_reconciliation.
+    assert!(reopened
+        .finish_target(&lease, &job, 0, 1, Disposition::Swapped)
+        .is_err());
+    reopened
+        .finish_target(&lease, &job, 0, 1, Disposition::NeedsReconciliation)
+        .unwrap();
+}

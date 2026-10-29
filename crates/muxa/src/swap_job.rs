@@ -33,6 +33,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// The schema this build writes and reads. Any other version is refused
@@ -319,7 +320,14 @@ pub(crate) struct Created {
 
 pub(crate) struct SwapJobStore {
     path: PathBuf,
+    /// The file opened, held so its identity can be compared with whatever
+    /// the path names now.
+    file: std::fs::File,
     connection: Mutex<Connection>,
+    /// Latched once the path stopped naming that file: an intent committed
+    /// to a renamed or replaced database is one a restarted manager would
+    /// never see, so nothing is written again, even if the path comes back.
+    invalid: AtomicBool,
 }
 
 fn now() -> String {
@@ -342,6 +350,7 @@ impl SwapJobStore {
             create_private_dir(parent)?;
         }
         prepare_file(path)?;
+        let file = std::fs::File::open(path)?;
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -360,10 +369,37 @@ impl SwapJobStore {
             found => return Err(JobError::UnsupportedSchema { found }),
         }
         secure_files(path)?;
-        Ok(Self {
+        let store = Self {
             path: path.to_path_buf(),
+            file,
             connection: Mutex::new(connection),
-        })
+            invalid: AtomicBool::new(false),
+        };
+        store.verify()?;
+        Ok(store)
+    }
+
+    /// The path still names the file this store opened.
+    fn verify(&self) -> Result<(), JobError> {
+        if self.invalid.load(Ordering::Acquire) {
+            return Err(self.replaced());
+        }
+        let same = self.file.metadata().and_then(|original| {
+            std::fs::metadata(&self.path).map(|current| same_file(&original, &current))
+        });
+        if matches!(same, Ok(true)) {
+            Ok(())
+        } else {
+            self.invalid.store(true, Ordering::Release);
+            Err(self.replaced())
+        }
+    }
+
+    fn replaced(&self) -> JobError {
+        JobError::Store(format!(
+            "the swap job database disappeared or was replaced: {}",
+            self.path.display()
+        ))
     }
 
     fn with<T>(
@@ -374,8 +410,12 @@ impl SwapJobStore {
             .connection
             .lock()
             .map_err(|_| JobError::Store("connection lock poisoned".into()))?;
-        let result = op(&mut connection);
+        self.verify()?;
         secure_files(&self.path)?;
+        let result = op(&mut connection);
+        // A rename or replacement racing the operation means what it wrote
+        // may not be where the next manager looks: never report it done.
+        self.verify()?;
         result
     }
 
@@ -561,6 +601,17 @@ impl SwapJobStore {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             fence(&tx, lease)?;
             owned_running(&tx, lease, job)?;
+            if disposition != Disposition::NeedsReconciliation
+                && open_intents(&tx, job, target, attempt)? > 0
+            {
+                return Err(JobError::Invalid {
+                    job: job.to_owned(),
+                    why: format!(
+                        "target {target} has an effect with no recorded result; \
+                         it can only end as needs_reconciliation"
+                    ),
+                });
+            }
             let changed = tx.execute(
                 "UPDATE targets SET disposition = ?4, phase = 'finished'
                  WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND disposition IS NULL",
@@ -616,6 +667,7 @@ impl SwapJobStore {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             fence(&tx, lease)?;
             owned_running(&tx, lease, job)?;
+            open_attempt(&tx, job, target, attempt)?;
             let seq: u32 = tx.query_row(
                 "SELECT COALESCE(MAX(seq), 0) + 1 FROM observations
                  WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3",
@@ -735,7 +787,14 @@ pub(crate) struct Journal<'a> {
     target: u32,
     attempt: u32,
     /// The intent written by the last `before`, awaiting its `after`.
-    pending: Option<u32>,
+    pending: Option<Pending>,
+}
+
+/// An intent awaiting its result: which row, and which effect it was for.
+struct Pending {
+    seq: u32,
+    nonce: String,
+    effect: Effect,
 }
 
 impl EffectObserver for Journal<'_> {
@@ -745,12 +804,25 @@ impl EffectObserver for Journal<'_> {
                 "an earlier effect has no recorded result".into(),
             ));
         }
+        let nonce = uuid::Uuid::new_v4().to_string();
         let seq = self
             .store
             .with(|connection| {
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 fence(&tx, self.lease)?;
                 owned_running(&tx, self.lease, &self.job)?;
+                open_attempt(&tx, &self.job, self.target, self.attempt)?;
+                // Held in the file, not in this adapter: another journal for
+                // the same attempt, or one made after a restart, sees it too.
+                if open_intents(&tx, &self.job, self.target, self.attempt)? > 0 {
+                    return Err(JobError::Invalid {
+                        job: self.job.clone(),
+                        why: format!(
+                            "target {} has an effect with no recorded result",
+                            self.target
+                        ),
+                    });
+                }
                 let seq: u32 = tx.query_row(
                     "SELECT COALESCE(MAX(seq), 0) + 1 FROM effects
                      WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3",
@@ -766,7 +838,7 @@ impl EffectObserver for Journal<'_> {
                         self.target,
                         self.attempt,
                         seq,
-                        uuid::Uuid::new_v4().to_string(),
+                        nonce,
                         effect.group,
                         purpose_name(effect.purpose),
                         op_json(&effect.op),
@@ -777,30 +849,52 @@ impl EffectObserver for Journal<'_> {
                 Ok(seq)
             })
             .map_err(|error| ObserverError(error.to_string()))?;
-        self.pending = Some(seq);
+        self.pending = Some(Pending {
+            seq,
+            nonce,
+            effect: effect.clone(),
+        });
         Ok(())
     }
 
-    fn after(&mut self, _effect: &Effect, transport: Transport) -> Result<(), ObserverError> {
-        let Some(seq) = self.pending.take() else {
+    /// Settle the pending intent, and only for the effect it was written
+    /// for. A mismatched or failed settlement keeps it pending, so nothing
+    /// further can be started on this attempt.
+    fn after(&mut self, effect: &Effect, transport: Transport) -> Result<(), ObserverError> {
+        let Some(pending) = &self.pending else {
             return Err(ObserverError(
                 "a result arrived with no recorded intent".into(),
             ));
         };
+        if pending.effect != *effect {
+            return Err(ObserverError(format!(
+                "a result for {:?} arrived while {:?} is pending",
+                effect.purpose, pending.effect.purpose
+            )));
+        }
         let state = match transport {
             Transport::Accepted => "accepted",
             Transport::Refused => "refused",
             Transport::Unconfirmed => "unconfirmed",
         };
+        let (seq, nonce) = (pending.seq, pending.nonce.clone());
         self.store
             .with(|connection| {
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
                 fence(&tx, self.lease)?;
                 let changed = tx.execute(
-                    "UPDATE effects SET state = ?5, result_at = ?6
+                    "UPDATE effects SET state = ?6, result_at = ?7
                      WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND seq = ?4
-                       AND state = 'intent'",
-                    params![self.job, self.target, self.attempt, seq, state, now()],
+                       AND nonce = ?5 AND state = 'intent'",
+                    params![
+                        self.job,
+                        self.target,
+                        self.attempt,
+                        seq,
+                        nonce,
+                        state,
+                        now()
+                    ],
                 )?;
                 if changed != 1 {
                     return Err(JobError::Invalid {
@@ -811,8 +905,66 @@ impl EffectObserver for Journal<'_> {
                 tx.commit()?;
                 Ok(())
             })
-            .map_err(|error| ObserverError(error.to_string()))
+            .map_err(|error| ObserverError(error.to_string()))?;
+        self.pending = None;
+        Ok(())
     }
+}
+
+/// The target's attempt has not ended: no new effect or observation is
+/// taken for one that has.
+fn open_attempt(
+    tx: &rusqlite::Transaction,
+    job: &str,
+    target: u32,
+    attempt: u32,
+) -> Result<(), JobError> {
+    let disposition: Option<Option<String>> = tx
+        .query_row(
+            "SELECT disposition FROM targets WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3",
+            params![job, target, attempt],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match disposition {
+        Some(None) => Ok(()),
+        Some(Some(ended)) => Err(JobError::Invalid {
+            job: job.to_owned(),
+            why: format!("target {target} attempt {attempt} already ended ({ended})"),
+        }),
+        None => Err(JobError::Invalid {
+            job: job.to_owned(),
+            why: format!("target {target} attempt {attempt} does not exist"),
+        }),
+    }
+}
+
+/// Effects of this attempt whose intent has no result.
+fn open_intents(
+    tx: &rusqlite::Transaction,
+    job: &str,
+    target: u32,
+    attempt: u32,
+) -> Result<u32, JobError> {
+    Ok(tx.query_row(
+        "SELECT COUNT(*) FROM effects WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3
+           AND state = 'intent'",
+        params![job, target, attempt],
+        |row| row.get(0),
+    )?)
+}
+
+#[cfg(unix)]
+fn same_file(original: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    original.dev() == current.dev() && original.ino() == current.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file(original: &std::fs::Metadata, current: &std::fs::Metadata) -> bool {
+    // Without a stable creation time there is no identity to compare: fail
+    // closed rather than assume the path still names the opened file.
+    matches!((original.created(), current.created()), (Ok(a), Ok(b)) if a == b)
 }
 
 fn purpose_name(purpose: Purpose) -> String {
