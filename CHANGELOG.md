@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `muxa workers prune --execute` refused every Codex worker with "no Codex
   composer on screen": it read the pane with its colour escapes, which hid an
-  empty prompt. It now reads plain text, on the pane's own server.
+  empty prompt. It now reads plain text, on the pane's own server, and also
+  recognises a placeholder a narrow pane cuts short (dim and the start of a
+  known placeholder; typed text is never taken for one).
 
 ### Changed
 
