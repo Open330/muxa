@@ -82,6 +82,28 @@ For each agent, muxa:
 
 `--provider claude|codex` narrows any of these to one provider.
 
+A named target is resolved to exactly one live pane first. A bare `%81`
+means `rmux:%81` when that is the only pane it can mean. A name that matches
+no live pane, or several (the same `%N` on two servers), is reported and
+swaps nothing. `--exclude` is resolved the same way, and an ambiguous
+exclude protects every pane it may mean. A live pane muxa has no agent row
+for is reported too, instead of silently missing.
+
+A row muxa only saw on screen, never from the agent's own hooks
+(`"registered": false`), has no trustworthy state. `--all` and `--limited`
+list it without touching it. Naming it swaps it only with `--force`, and it
+gets a follow-up only under `--continue-when always`.
+
+Before stopping an agent, the swap checks which conversation the running
+process is actually on. For Claude on Linux that is
+`<config dir>/sessions/<pid>.json`, matched on the pid and the process's
+start time (`conversation_verified: true`). A conversation muxa can verify
+this way can be swapped even without a hook-registered id. One that
+disagrees with the registry or the command line is reported as an identity
+conflict and left alone. The process is checked again right before it is
+stopped. Where it cannot be read (Codex, macOS), the registry and then the
+command line decide, as before.
+
 ## Choosing the account
 
 | Flag | Account |

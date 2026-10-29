@@ -201,6 +201,32 @@ pub struct SwapOutcome {
     /// sent or that the agent acted on it; a failed swap keeps it too.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_reason: Option<ContinueReason>,
+    /// Where the resumed conversation id came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id_source: Option<SessionIdSource>,
+    /// Whether the running process itself was read to be on that
+    /// conversation (Claude's session file on Linux). `false` means the id
+    /// was taken on the registry's or command line's word.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_verified: Option<bool>,
+    /// `false` for a row muxa only saw on screen, never from the agent's
+    /// own hooks: its state is a guess.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registered: Option<bool>,
+}
+
+/// The evidence a swap resumed a conversation by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SessionIdSource {
+    /// The agent's own hooks, confirmed by the running process where that
+    /// can be checked.
+    Registry,
+    /// `--resume <id>` / `resume <id>` on the agent's command line.
+    Argv,
+    /// Claude's `sessions/<pid>.json` for this exact process.
+    ClaudeSessionFile,
 }
 
 /// Why a swapped agent is due a follow-up. When more than one applies, the
@@ -227,6 +253,9 @@ impl SwapOutcome {
             command: None,
             note: note.into(),
             continue_reason: None,
+            session_id_source: None,
+            conversation_verified: None,
+            registered: Some(resumable_id(&agent.session_id)),
         }
     }
 }
@@ -254,7 +283,11 @@ pub fn provider_name(kind: AgentKind) -> Option<&'static str> {
 /// for the user, not for a prompt. Recent activity only keeps an agent out
 /// of a non-forced swap; it is not a cut-off turn.
 fn follow_up<'a>(request: &'a SwapRequest, agent: &Agent) -> Option<(&'a str, ContinueReason)> {
-    let cut_off = if is_rate_limited(agent) {
+    // A screen-detected row's state is a guess, so it is never evidence of a
+    // cut-off turn; only `always` reaches it.
+    let cut_off = if !resumable_id(&agent.session_id) {
+        None
+    } else if is_rate_limited(agent) {
         Some(ContinueReason::RateLimited)
     } else if agent.state == AgentState::Working {
         Some(ContinueReason::CutOff)
@@ -329,7 +362,17 @@ fn select_at<'a>(
             continue;
         }
         let skip = |note: &str| SwapOutcome::new(agent, SwapStatus::Skipped, note);
-        if provider_name(agent.kind).is_none() {
+        let registered = resumable_id(&agent.session_id);
+        let named = matches!(request.scope, SwapScope::Targets(_));
+        if !registered && !named {
+            skipped.push(skip(
+                "not registered by its own hooks (seen on screen only); name it as a target to swap it",
+            ));
+        } else if !registered && !request.force {
+            skipped.push(skip(
+                "not registered by its own hooks, so whether it is mid-turn is unknown; pass --force to stop it anyway",
+            ));
+        } else if provider_name(agent.kind).is_none() {
             skipped.push(skip("aas cannot switch this agent's provider"));
         } else if agent.pane.is_none() {
             skipped.push(skip("not in a multiplexer pane"));
@@ -963,10 +1006,75 @@ pub fn run(
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
 ) -> Vec<SwapOutcome> {
-    let (mut chosen, mut outcomes) = select(agents, request);
+    let (resolved, agents, mut outcomes) = scoped(request, agents, backends);
+    let request = &resolved;
+    let (mut chosen, skipped) = select(&agents, request);
+    outcomes.extend(skipped);
     // A pane can carry a hook-fed row and a screen-detected one; the
     // hook-fed row knows the session id, so it goes first and wins the pane.
     chosen.sort_by_key(|agent| !resumable_id(&agent.session_id));
+    let planned = plan(chosen, backends, &mut outcomes);
+    swap_planned(request, &planned, config, accounts, &mut outcomes);
+    outcomes
+}
+
+/// The request with its named targets and excludes resolved to live panes,
+/// the agents worth considering, and a report row for each name that
+/// matched nothing to act on.
+fn scoped(
+    request: &SwapRequest,
+    agents: &[Agent],
+    backends: &[SharedBackend],
+) -> (SwapRequest, Vec<Agent>, Vec<SwapOutcome>) {
+    let live = live_panes(backends);
+    let mut outcomes = Vec::new();
+    let mut resolved = request.clone();
+    if let SwapScope::Targets(targets) = &request.scope {
+        let (found, problems) = resolve_targets(targets, &live, agents);
+        resolved.scope = SwapScope::Targets(found);
+        outcomes.extend(problems);
+    }
+    resolved.exclude = resolve_excludes(&request.exclude, &live);
+    // A pane can carry a hook-fed row and a screen-detected one for the same
+    // agent; the screen-detected one is not a second agent to report.
+    let agents: Vec<Agent> = agents
+        .iter()
+        .filter(|agent| {
+            resumable_id(&agent.session_id)
+                || !agents.iter().any(|other| {
+                    resumable_id(&other.session_id)
+                        && other.pane.is_some()
+                        && other.pane == agent.pane
+                        && other.tmux_socket == agent.tmux_socket
+                })
+        })
+        .cloned()
+        .collect();
+    if let SwapScope::Targets(targets) = &resolved.scope {
+        // A live pane muxa has no agent row for is named in the report, not
+        // dropped: `muxa agent find` can say what runs there.
+        outcomes.extend(
+            targets
+                .iter()
+                .filter(|target| {
+                    !agents.iter().any(|agent| {
+                        agent.pane.as_deref() == Some(target.as_str())
+                            || agent.session_id == **target
+                    })
+                })
+                .map(|target| unresolved(target, "no agent muxa knows of runs in this pane")),
+        );
+    }
+    (resolved, agents, outcomes)
+}
+
+/// Locate each chosen agent and settle which conversation it resumes; the
+/// ones that cannot be are reported in `outcomes`.
+fn plan<'a>(
+    chosen: Vec<&'a Agent>,
+    backends: &[SharedBackend],
+    outcomes: &mut Vec<SwapOutcome>,
+) -> Vec<Planned<'a>> {
     let mut planned: Vec<Planned> = Vec::new();
     for agent in chosen {
         if planned.iter().any(|p| p.agent.pane == agent.pane) {
@@ -974,21 +1082,33 @@ pub fn run(
         }
         match locate(agent, backends) {
             Ok((launch, pane, backend)) => {
-                let session_id = if resumable_id(&agent.session_id) {
-                    agent.session_id.clone()
-                } else if let Some(id) = launch.resumed_id.clone() {
-                    id
-                } else {
-                    outcomes.push(SwapOutcome::new(
-                        agent,
-                        SwapStatus::Skipped,
-                        "no provider session id to resume",
-                    ));
-                    continue;
+                let process_start = crate::agent_conversation::process_start(launch.agent_pid);
+                let runtime = match agent.kind {
+                    AgentKind::ClaudeCode => {
+                        crate::agent_conversation::claude_conversation(launch.agent_pid)
+                    }
+                    _ => crate::agent_conversation::Conversation::Unknown(
+                        "not read for this provider".into(),
+                    ),
                 };
+                let registry = Some(agent.session_id.as_str()).filter(|id| resumable_id(id));
+                let (session_id, source) =
+                    match conversation_for(registry, launch.resumed_id.as_deref(), &runtime) {
+                        Ok(found) => found,
+                        Err(note) => {
+                            outcomes.push(SwapOutcome::new(agent, SwapStatus::Skipped, note));
+                            continue;
+                        }
+                    };
                 planned.push(Planned {
                     agent,
                     session_id,
+                    source,
+                    verified: matches!(
+                        runtime,
+                        crate::agent_conversation::Conversation::Verified(_)
+                    ),
+                    process_start,
                     launch,
                     pane,
                     backend,
@@ -997,10 +1117,21 @@ pub fn run(
             Err(note) => outcomes.push(SwapOutcome::new(agent, SwapStatus::Skipped, note)),
         }
     }
+    planned
+}
 
+/// Pick accounts for the planned agents and swap them, provider by
+/// provider.
+fn swap_planned(
+    request: &SwapRequest,
+    planned: &[Planned],
+    config: &SwapConfig,
+    accounts: &crate::accounts::AccountsConfig,
+    outcomes: &mut Vec<SwapOutcome>,
+) {
     // One `aas candidates` per provider, shared by that provider's targets.
     let mut by_provider: Vec<(&'static str, Result<Vec<Candidate>, String>)> = Vec::new();
-    for Planned { agent, .. } in &planned {
+    for Planned { agent, .. } in planned {
         let provider = provider_name(agent.kind).unwrap_or_default();
         if !by_provider.iter().any(|(name, _)| *name == provider) {
             let candidates = if accounts.for_provider(provider).is_empty() {
@@ -1045,7 +1176,6 @@ pub fn run(
             outcomes.push(swap_one(request, planned, account, candidates, None));
         }
     }
-    outcomes
 }
 
 /// [`run`] for a provider that lists `[[accounts]]`: accounts, identity and
@@ -1105,12 +1235,17 @@ fn swap_one(
     let Planned {
         agent,
         session_id,
+        source,
+        verified,
+        process_start,
         launch,
         pane,
         backend,
     } = planned;
     let mut outcome = SwapOutcome::new(agent, SwapStatus::Skipped, "");
     outcome.agent_session_id.clone_from(session_id);
+    outcome.session_id_source = Some(*source);
+    outcome.conversation_verified = Some(*verified);
     outcome.from = launch.line.account().map(str::to_owned);
     let account = match account {
         Ok(account) => account,
@@ -1123,17 +1258,7 @@ fn swap_one(
         }
     };
     outcome.to = Some(account.clone());
-    let provider = provider_name(agent.kind).unwrap_or_default();
-    let relaunched = match profiles {
-        Some((profiles, _)) => match crate::accounts::find_profile(profiles, provider, &account) {
-            Some(profile) => profile_relaunch_line(&launch.line, agent.kind, session_id, profile),
-            None => Err(format!(
-                "no account named {account} in [[accounts.{provider}]] (aas accounts are not used once a provider lists its own)"
-            )),
-        },
-        None => relaunch_line(&launch.line, agent.kind, session_id, &account, request.bare),
-    };
-    let command = match relaunched {
+    let command = match relaunch_command(request, planned, &account, profiles) {
         Ok(command) => command,
         Err(note) => {
             outcome.note = note;
@@ -1149,6 +1274,10 @@ fn swap_one(
         if let Some((text, reason)) = planned {
             outcome.note = format!("then send {text:?} ({reason})");
         }
+        return outcome;
+    }
+    if process_changed(launch.agent_pid, process_start.as_deref()) {
+        outcome.note = "the agent process changed since the swap was planned; left alone".into();
         return outcome;
     }
     let target = Target {
@@ -1198,10 +1327,44 @@ fn swap_one(
     outcome
 }
 
+/// The line that relaunches `planned` on `account`: from its configured
+/// profile when the provider lists `[[accounts]]`, through `aas` otherwise.
+fn relaunch_command(
+    request: &SwapRequest,
+    planned: &Planned,
+    account: &str,
+    profiles: Option<(
+        &[crate::accounts::AccountProfile],
+        &crate::accounts::ResolvedAccounts,
+    )>,
+) -> Result<String, String> {
+    let Planned {
+        agent,
+        session_id,
+        launch,
+        ..
+    } = planned;
+    let provider = provider_name(agent.kind).unwrap_or_default();
+    match profiles {
+        Some((profiles, _)) => match crate::accounts::find_profile(profiles, provider, account) {
+            Some(profile) => profile_relaunch_line(&launch.line, agent.kind, session_id, profile),
+            None => Err(format!(
+                "no account named {account} in [[accounts.{provider}]] (aas accounts are not used once a provider lists its own)"
+            )),
+        },
+        None => relaunch_line(&launch.line, agent.kind, session_id, account, request.bare),
+    }
+}
+
 struct Planned<'a> {
     agent: &'a Agent,
-    /// The registry's id, or the one recovered from the agent's argv.
+    /// The conversation to resume, and the evidence it came from.
     session_id: String,
+    source: SessionIdSource,
+    verified: bool,
+    /// The agent process's start time when planned; checked again right
+    /// before it is stopped.
+    process_start: Option<String>,
     launch: PaneLaunch,
     pane: crate::tmux::PaneInfo,
     backend: SharedBackend,
@@ -1224,6 +1387,157 @@ fn unavailable(candidates: &[Candidate]) -> String {
         })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The conversation to resume and where that id came from, given what the
+/// registry, the command line and the running process each say.
+///
+/// A conversation the running process is verifiably on outranks nothing: it
+/// has to agree with the registry and the command line where they name one,
+/// or the swap would resume something other than what is running. Where the
+/// process cannot be read, the registry and then the command line decide,
+/// as before.
+fn conversation_for(
+    registry: Option<&str>,
+    argv: Option<&str>,
+    runtime: &crate::agent_conversation::Conversation,
+) -> Result<(String, SessionIdSource), String> {
+    use crate::agent_conversation::Conversation;
+    match runtime {
+        Conversation::Conflict(ids) => Err(format!(
+            "identity conflict: session files for this process name {}; left alone",
+            ids.join(" and ")
+        )),
+        Conversation::Verified(id) => {
+            if let Some(recorded) = registry.filter(|recorded| recorded != id) {
+                return Err(format!(
+                    "identity conflict: muxa has {recorded} but the running process is on {id}; left alone"
+                ));
+            }
+            if registry.is_some() {
+                return Ok((id.clone(), SessionIdSource::Registry));
+            }
+            if let Some(launched) = argv.filter(|launched| launched != id) {
+                return Err(format!(
+                    "identity conflict: launched with {launched} but the running process is on {id}; left alone"
+                ));
+            }
+            Ok((id.clone(), SessionIdSource::ClaudeSessionFile))
+        }
+        Conversation::Unknown(_) => match (registry, argv) {
+            (Some(id), _) => Ok((id.to_owned(), SessionIdSource::Registry)),
+            (None, Some(id)) => Ok((id.to_owned(), SessionIdSource::Argv)),
+            (None, None) => Err("no provider session id to resume".into()),
+        },
+    }
+}
+
+/// Whether the process read about when the swap was planned is no longer
+/// the one at `pid`: one that exited, or a pid since reused, is not stopped.
+fn process_changed(pid: u32, planned_start: Option<&str>) -> bool {
+    planned_start.is_some()
+        && crate::agent_conversation::process_start(pid).as_deref() != planned_start
+}
+
+/// Every pane the active backends list now: `(pane id, socket)`.
+fn live_panes(backends: &[SharedBackend]) -> Vec<(String, Option<String>)> {
+    let mut panes: Vec<(String, Option<String>)> = backends
+        .iter()
+        .flat_map(|backend| backend.list_panes())
+        .map(|pane| (pane.pane_id, pane.socket))
+        .collect();
+    panes.sort();
+    panes.dedup();
+    panes
+}
+
+/// The live pane ids `target` may mean: itself, or for a bare `%N` the one
+/// `<host>:%N` it names on a namespaced backend.
+fn matching_panes<'a>(
+    target: &str,
+    live: &'a [(String, Option<String>)],
+) -> Vec<&'a (String, Option<String>)> {
+    let exact: Vec<_> = live.iter().filter(|(pane, _)| pane == target).collect();
+    if !exact.is_empty() || !target.starts_with('%') {
+        return exact;
+    }
+    live.iter()
+        .filter(|(pane, _)| pane.rsplit_once(':').is_some_and(|(_, id)| id == target))
+        .collect()
+}
+
+/// Each named target as the one live pane (or session id) it means. A name
+/// matching no live pane, or several (the same `%N` on two servers), is
+/// reported and swaps nothing; it never widens to a guess.
+fn resolve_targets(
+    targets: &[String],
+    live: &[(String, Option<String>)],
+    agents: &[Agent],
+) -> (Vec<String>, Vec<SwapOutcome>) {
+    let mut found = Vec::new();
+    let mut problems = Vec::new();
+    for target in targets {
+        if agents.iter().any(|agent| agent.session_id == *target) {
+            found.push(target.clone());
+            continue;
+        }
+        let matches = matching_panes(target, live);
+        match matches.as_slice() {
+            [(pane, _)] => found.push(pane.clone()),
+            [] => problems.push(unresolved(
+                target,
+                "no live pane or agent session has this name",
+            )),
+            many => problems.push(unresolved(
+                target,
+                &format!(
+                    "names more than one live pane ({}); left alone",
+                    many.iter()
+                        .map(|(pane, socket)| format!(
+                            "{pane} on {}",
+                            socket.as_deref().unwrap_or("?")
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )),
+        }
+    }
+    (found, problems)
+}
+
+/// Every live pane an `--exclude` may mean. An ambiguous name protects all
+/// of them rather than none.
+fn resolve_excludes(excludes: &[String], live: &[(String, Option<String>)]) -> Vec<String> {
+    let mut panes: Vec<String> = excludes.to_vec();
+    for exclude in excludes {
+        panes.extend(
+            matching_panes(exclude, live)
+                .into_iter()
+                .map(|(pane, _)| pane.clone()),
+        );
+    }
+    panes.sort();
+    panes.dedup();
+    panes
+}
+
+/// A report row for a named target that matched no agent to act on.
+fn unresolved(target: &str, note: &str) -> SwapOutcome {
+    SwapOutcome {
+        pane: Some(target.to_owned()),
+        agent_session_id: String::new(),
+        kind: AgentKind::Unknown,
+        from: None,
+        to: None,
+        status: SwapStatus::Skipped,
+        command: None,
+        note: note.to_owned(),
+        continue_reason: None,
+        session_id_source: None,
+        conversation_verified: None,
+        registered: None,
+    }
 }
 
 /// Find the agent's pane, and how it was launched there.
@@ -2951,11 +3265,152 @@ mod tests {
             agent("%3", "s3", AgentKind::Codex, AgentState::Idle),
         ];
         let scope = SwapScope::Targets(vec!["%2".into(), "s3".into()]);
-        let (chosen, skipped) = select(&agents, &request(scope));
-        // A screen-detected row is kept: its id may still be in the argv.
+        let (chosen, skipped) = select(&agents, &request(scope.clone()));
+        // A screen-detected row's state is a guess: named alone, it is
+        // reported rather than stopped.
+        assert_eq!(chosen.len(), 1);
+        assert_eq!(chosen[0].session_id, "s3");
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].note.contains("--force"), "{}", skipped[0].note);
+        assert_eq!(skipped[0].registered, Some(false));
+        // With --force it is kept: its id may still be in the argv or its
+        // session file.
+        let mut forced = request(scope);
+        forced.force = true;
+        let (chosen, skipped) = select(&agents, &forced);
         assert_eq!(chosen.len(), 2);
-        assert_eq!(chosen[1].session_id, "s3");
         assert!(skipped.is_empty());
+    }
+
+    /// The running process's conversation must agree with what the registry
+    /// and the command line name; a disagreement leaves the agent alone.
+    #[test]
+    fn a_swap_resumes_only_the_conversation_the_process_is_on() {
+        use crate::agent_conversation::Conversation;
+        const A: &str = "96f5e88c-62df-42a7-914e-e206355969fb";
+        const B: &str = "01a18182-0bf0-7801-97bf-c91154132258";
+        let verified = Conversation::Verified(A.into());
+        let unknown = Conversation::Unknown("unreadable".into());
+
+        assert_eq!(
+            conversation_for(Some(A), None, &verified).unwrap(),
+            (A.to_owned(), SessionIdSource::Registry)
+        );
+        // A stale row for the same provider in a reused pane, on another id.
+        assert!(conversation_for(Some(B), None, &verified)
+            .unwrap_err()
+            .contains("identity conflict"));
+        // No registry id: the session file names it, so it can be swapped.
+        assert_eq!(
+            conversation_for(None, None, &verified).unwrap(),
+            (A.to_owned(), SessionIdSource::ClaudeSessionFile)
+        );
+        // Launched on one conversation, now on another: not guessed.
+        assert!(conversation_for(None, Some(B), &verified).is_err());
+        // The registry agreeing with the process outranks a stale launch id.
+        assert_eq!(conversation_for(Some(A), Some(B), &verified).unwrap().0, A);
+        assert!(conversation_for(
+            Some(A),
+            None,
+            &Conversation::Conflict(vec![A.into(), B.into()])
+        )
+        .is_err());
+        // Unreadable process: the registry, then the command line, as before.
+        assert_eq!(
+            conversation_for(Some(A), Some(B), &unknown).unwrap(),
+            (A.to_owned(), SessionIdSource::Registry)
+        );
+        assert_eq!(
+            conversation_for(None, Some(B), &unknown).unwrap(),
+            (B.to_owned(), SessionIdSource::Argv)
+        );
+        assert!(conversation_for(None, None, &unknown).is_err());
+    }
+
+    /// A bare `%N` means the one live pane it names; the same `%N` on two
+    /// servers, or none, is reported and swaps nothing.
+    #[test]
+    fn named_targets_resolve_to_exactly_one_live_pane() {
+        let live = vec![
+            (
+                "rmux:%81".to_owned(),
+                Some("/tmp/rmux-1/default".to_owned()),
+            ),
+            ("rmux:%7".to_owned(), Some("/tmp/rmux-1/default".to_owned())),
+            ("rmux:%7".to_owned(), Some("/tmp/rmux-1/other".to_owned())),
+            ("%3".to_owned(), Some("default".to_owned())),
+        ];
+        let agents = vec![agent(
+            "rmux:%81",
+            "s81",
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+        )];
+        let names = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+
+        let (found, problems) = resolve_targets(&names(&["%81", "%3", "s81"]), &live, &agents);
+        assert_eq!(found, names(&["rmux:%81", "%3", "s81"]));
+        assert!(problems.is_empty());
+
+        let (found, problems) = resolve_targets(&names(&["%7", "%99"]), &live, &agents);
+        assert!(found.is_empty());
+        assert_eq!(problems.len(), 2);
+        assert!(
+            problems[0].note.contains("more than one live pane"),
+            "{}",
+            problems[0].note
+        );
+        assert!(
+            problems[1].note.contains("no live pane"),
+            "{}",
+            problems[1].note
+        );
+        assert!(problems.iter().all(|row| row.status == SwapStatus::Skipped));
+
+        // An exclude protects every pane it may mean.
+        assert_eq!(
+            resolve_excludes(&names(&["%7", "%81"]), &live),
+            names(&["%7", "%81", "rmux:%7", "rmux:%81"])
+        );
+    }
+
+    /// A screen-detected row's state is a guess, so it gets a follow-up only
+    /// when the policy sends one to everyone.
+    #[test]
+    fn a_screen_detected_row_gets_no_cut_off_follow_up() {
+        let mut req = request(SwapScope::All);
+        req.continue_text = Some("continue".into());
+        let working = agent("%1", "synthetic-1", AgentKind::Codex, AgentState::Working);
+        assert!(follow_up(&req, &working).is_none());
+        req.continue_when = ContinueWhen::Always;
+        assert_eq!(
+            follow_up(&req, &working).map(|(_, reason)| reason),
+            Some(ContinueReason::Always)
+        );
+    }
+
+    /// `--all` and `--limited` never act on a screen-detected row, but list
+    /// it so it is not silently missing from the report.
+    #[test]
+    fn a_screen_detected_row_is_listed_but_not_swapped_without_a_name() {
+        let mut capped = limited("%2", "synthetic-x");
+        capped.kind = AgentKind::Codex;
+        let agents = vec![
+            agent("%1", "s1", AgentKind::ClaudeCode, AgentState::Idle),
+            capped,
+        ];
+        for scope in [SwapScope::All, SwapScope::Limited] {
+            let mut req = request(scope);
+            req.force = true;
+            let (chosen, skipped) = select(&agents, &req);
+            assert!(chosen.iter().all(|agent| agent.session_id == "s1"));
+            assert_eq!(skipped.len(), 1);
+            assert!(
+                skipped[0].note.contains("name it as a target"),
+                "{}",
+                skipped[0].note
+            );
+        }
     }
 
     #[test]

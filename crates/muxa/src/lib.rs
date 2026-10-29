@@ -39,6 +39,7 @@ pub mod accounts;
 pub mod activity;
 pub mod adapters;
 pub mod agent_control;
+pub mod agent_conversation;
 pub mod agent_directory;
 pub mod agent_locator;
 pub mod agent_records;
