@@ -793,14 +793,22 @@ enum RequestBody {
         origin: CollaborationOrigin,
         request_ids: Vec<String>,
     },
-    /// Operator housekeeping: expire never-claimed requests older than
-    /// `older_than_secs`. Answers with the affected requests.
+    /// Body-free diagnostics over the daemon's cached projections.
     CollaborationHealth,
+    /// Legacy operator expiry. Human decisions are protected on this server.
     CollaborationExpire {
         older_than_secs: u64,
         #[serde(default)]
         quiet_only: bool,
         #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+    /// A separate operation prevents legacy parsers from ignoring filters.
+    CollaborationExpireFiltered {
+        older_than_secs: u64,
+        quiet_only: bool,
         request_id: Option<String>,
         #[serde(default)]
         dry_run: bool,
@@ -946,6 +954,7 @@ const CAPABILITIES: &[&str] = &[
     "collaboration_overview_v1",
     "collaboration_expire_v1",
     collaboration::COLLABORATION_HEALTH_CAPABILITY,
+    "collaboration_expire_filtered_v1",
     collaboration::FILTERED_EXPIRE_CAPABILITY,
     "collaboration_lifecycle",
     "collaboration_wait",
@@ -5755,6 +5764,12 @@ async fn handle(
                     dry_run,
                     quiet_only,
                     request_id,
+                }
+                | RequestBody::CollaborationExpireFiltered {
+                    older_than_secs,
+                    dry_run,
+                    quiet_only,
+                    request_id,
                 } => {
                     kind = "collaboration_expire";
                     let age =
@@ -8269,7 +8284,7 @@ impl Client {
         quiet_only: bool,
         request_id: Option<&str>,
     ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
-        if quiet_only || request_id.is_some() {
+        {
             let hello = self.hello(CLIENT_CALL_TIMEOUT).await?;
             if !hello
                 .capabilities
@@ -8277,11 +8292,11 @@ impl Client {
                 .any(|c| c == collaboration::FILTERED_EXPIRE_CAPABILITY)
             {
                 return Err(RuntimeError::Daemon(
-                    "daemon lacks filtered expiry; upgrade muxad before selective cleanup".into(),
+                    "daemon lacks filtered expiry v2; upgrade muxad before cleanup".into(),
                 ));
             }
         }
-        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_expire",
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_expire_filtered",
             "older_than_secs":older_than_secs,"dry_run":dry_run,"quiet_only":quiet_only,"request_id":request_id})).await?;
         serde_json::from_value(response["collaboration_requests"].clone())
             .map_err(RuntimeError::Json)
@@ -9233,8 +9248,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filtered_expiry_downgrade_between_connections_never_becomes_broad_expiry() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("expiry-downgrade.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut first = BufReader::new(stream);
+            for _ in 0..2 {
+                let mut line = String::new();
+                first.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                    "hello"
+                );
+                first.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_expire_filtered_v2\"]}\n").await.unwrap();
+            }
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut old = BufReader::new(stream);
+            let mut line = String::new();
+            old.read_line(&mut line).await.unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                "hello"
+            );
+            old.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_expire_v1\"]}\n").await.unwrap();
+            line.clear();
+            if old.read_line(&mut line).await.unwrap() == 0 {
+                return;
+            }
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(
+                request["kind"], "collaboration_expire_filtered",
+                "a legacy daemon must never receive its broad expiry operation"
+            );
+            old.get_mut()
+                .write_all(
+                    b"{\"ok\":false,\"error\":\"unknown variant collaboration_expire_filtered\"}\n",
+                )
+                .await
+                .unwrap();
+        });
+        let result = Client::new(socket)
+            .collaboration_expire_filtered(86400, false, true, Some("quiet-notice"))
+            .await;
+        assert!(result.is_err());
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn filtered_expiry_refuses_legacy_daemon_before_any_mutation() {
-        for dry_run in [true, false] {
+        for (dry_run, quiet_only, request_id) in [
+            (true, true, Some("notice")),
+            (false, true, Some("notice")),
+            (true, false, None),
+            (false, false, None),
+            (false, false, Some("notice")),
+        ] {
             let dir = tempdir().unwrap();
             let socket = dir.path().join("legacy-expiry.sock");
             let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -9248,7 +9318,7 @@ mod tests {
                         serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
                         "hello"
                     );
-                    reader.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_expire_v1\"]}\n").await.unwrap();
+                    reader.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_expire_v1\",\"collaboration_expire_filtered_v1\"]}\n").await.unwrap();
                 }
                 assert!(
                     tokio::time::timeout(Duration::from_millis(100), listener.accept())
@@ -9258,7 +9328,7 @@ mod tests {
                 );
             });
             let result = Client::new(socket)
-                .collaboration_expire_filtered(86400, dry_run, true, Some("notice"))
+                .collaboration_expire_filtered(86400, dry_run, quiet_only, request_id)
                 .await;
             assert!(result
                 .unwrap_err()
