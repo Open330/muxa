@@ -368,6 +368,12 @@ mod tests {
             (CODEX_DRAFT, AgentKind::Codex),
             (CODEX_TYPED_PREFIX, AgentKind::Codex),
             (CODEX_DIM_OTHER, AgentKind::Codex),
+            // A dim placeholder only overrides a draft reading, never a turn
+            // in progress.
+            (
+                "• Working (3s • esc to interrupt)\n\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mAsk Codex to\u{1b}[0m\n",
+                AgentKind::Codex,
+            ),
             (
                 "✻ Thinking… (12s · esc to interrupt)\n",
                 AgentKind::ClaudeCode,
