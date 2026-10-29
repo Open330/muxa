@@ -1082,6 +1082,9 @@ pub(crate) struct TargetIdentity {
     pub(crate) process_start: Option<String>,
     pub(crate) from_account: Option<String>,
     pub(crate) assigned_account: Option<String>,
+    /// The pane runs the agent directly, with no shell: a relaunch respawns
+    /// it through a login shell rather than typing into the pane's own.
+    pub(crate) direct: bool,
 }
 
 /// The server a located pane is on: the one the planner found it on, not
@@ -1123,6 +1126,12 @@ impl PreparedTarget {
                 planned.launch.line.account().map(str::to_owned)
             },
             assigned_account: self.account.clone().ok(),
+            direct: !shell_above(
+                &pane_processes(planned.pane.pane_pid),
+                planned.launch.agent_pid,
+                planned.pane.pane_pid,
+            )
+            .unwrap_or(true),
         }
     }
 }

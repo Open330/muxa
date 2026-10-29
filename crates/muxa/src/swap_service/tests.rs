@@ -126,6 +126,7 @@ fn identity(pane: &str, socket: &str) -> TargetIdentity {
         process_start: Some("1".into()),
         from_account: Some("a".into()),
         assigned_account: Some("b".into()),
+        direct: false,
     }
 }
 
@@ -253,8 +254,14 @@ fn a_job_runs_its_targets_and_reports_in_the_requested_order() {
             run("%3"),
         ]
     }));
-    let accepted =
-        Service::submit(&h.service, "key", &overrides(&["%1", "%2", "%3"]), None).unwrap();
+    let accepted = Service::submit(
+        &h.service,
+        "key",
+        &overrides(&["%1", "%2", "%3"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
     assert!(!accepted.existing);
     let view = settled(&h.service, &accepted.job_id);
     assert_eq!(view.state, "done");
@@ -286,15 +293,17 @@ fn a_job_runs_its_targets_and_reports_in_the_requested_order() {
 #[test]
 fn a_repeated_request_attaches_to_its_job() {
     let h = harness(Box::new(|| vec![run("%1")]));
-    let first = Service::submit(&h.service, "key", &overrides(&["%1"]), None).unwrap();
+    let first =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
     settled(&h.service, &first.job_id);
     h.provider.config.lock().unwrap().continue_text = "changed default".into();
-    let again = Service::submit(&h.service, "key", &overrides(&["%1"]), None).unwrap();
+    let again =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
     assert!(again.existing);
     assert_eq!(again.job_id, first.job_id);
     assert_eq!(h.executed.lock().unwrap().len(), 1);
     // The same key for a different request is refused.
-    assert!(Service::submit(&h.service, "key", &overrides(&["%9"]), None).is_err());
+    assert!(Service::submit(&h.service, "key", &overrides(&["%9"]), Origin::Public, None).is_err());
 }
 
 #[test]
@@ -304,7 +313,7 @@ fn concurrent_sends_of_one_request_make_one_executor() {
         .map(|_| {
             let service = Arc::clone(&h.service);
             std::thread::spawn(move || {
-                Service::submit(&service, "key", &overrides(&["%1"]), None)
+                Service::submit(&service, "key", &overrides(&["%1"]), Origin::Public, None)
                     .unwrap()
                     .job_id
             })
@@ -336,9 +345,11 @@ fn a_busy_pane_is_refused_and_a_job_outlives_its_caller() {
             gate: (call == 0).then(|| Arc::clone(&first_gate)),
         })]
     }));
-    let first = Service::submit(&h.service, "one", &overrides(&["%1"]), None).unwrap();
+    let first =
+        Service::submit(&h.service, "one", &overrides(&["%1"]), Origin::Public, None).unwrap();
     // `submit` returned while the target is still held: the caller is gone.
-    let second = Service::submit(&h.service, "two", &overrides(&["%1"]), None).unwrap();
+    let second =
+        Service::submit(&h.service, "two", &overrides(&["%1"]), Origin::Public, None).unwrap();
     let view = settled(&h.service, &second.job_id);
     assert_eq!(view.entries[0].disposition.as_deref(), Some("skipped"));
     assert_eq!(view.entries[0].reason.as_deref(), Some("busy"));
@@ -353,24 +364,51 @@ fn a_busy_pane_is_refused_and_a_job_outlives_its_caller() {
     assert_eq!(*h.executed.lock().unwrap(), ["%1"]);
 }
 
-/// An automation's guard covers its own pane only; other targets take the
-/// daemon's guard, and nothing waits on itself.
+/// An automation's guard is used for its one pane and no other guard is
+/// taken; a guard that does not cover the job's single target exactly is
+/// refused before anything is accepted, rather than waited on again.
 #[test]
-fn an_adopted_guard_covers_only_its_own_pane() {
-    let h = harness(Box::new(|| vec![run("%1"), run("%2")]));
+fn an_adopted_guard_must_cover_its_one_target() {
+    let h = harness(Box::new(|| vec![run("%1")]));
     let mine = endpoint_key("%1", Some("/tmp/tmux-1/default"));
     let accepted = Service::submit(
         &h.service,
         "key",
-        &overrides(&["%1", "%2"]),
+        &overrides(&["%1"]),
+        Origin::Automation,
         Some(Box::new(FakeGuard(mine))),
     )
     .unwrap();
     assert_eq!(settled(&h.service, &accepted.job_id).state, "done");
-    assert_eq!(
-        *h.provider.acquired.lock().unwrap(),
-        [endpoint_key("%2", Some("/tmp/tmux-1/default"))]
-    );
+    assert!(h.provider.acquired.lock().unwrap().is_empty());
+
+    let other = endpoint_key("%9", Some("/tmp/tmux-1/default"));
+    assert!(Service::submit(
+        &h.service,
+        "other",
+        &overrides(&["%1"]),
+        Origin::Automation,
+        Some(Box::new(FakeGuard(other))),
+    )
+    .unwrap_err()
+    .contains("does not cover"));
+    assert!(h.service.status(&JobRef::Key("other".into())).is_err());
+    assert!(h.service.reserved.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_adopted_guard_is_refused_for_more_than_one_target() {
+    let h = harness(Box::new(|| vec![run("%1"), run("%2")]));
+    let mine = endpoint_key("%1", Some("/tmp/tmux-1/default"));
+    assert!(Service::submit(
+        &h.service,
+        "key",
+        &overrides(&["%1", "%2"]),
+        Origin::Automation,
+        Some(Box::new(FakeGuard(mine))),
+    )
+    .is_err());
+    assert!(h.executed.lock().unwrap().is_empty());
 }
 
 /// A journal that stops accepting writes halts the whole job before its
@@ -388,7 +426,14 @@ fn a_journal_failure_halts_the_job_and_the_service() {
             run("%2"),
         ]
     }));
-    let accepted = Service::submit(&h.service, "key", &overrides(&["%1", "%2"]), None).unwrap();
+    let accepted = Service::submit(
+        &h.service,
+        "key",
+        &overrides(&["%1", "%2"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
     // Another manager takes the store while the first target is held.
     let usurper = SwapJobStore::open(&h.dir.path().join("swap-jobs.sqlite3")).unwrap();
     usurper
@@ -410,7 +455,14 @@ fn a_journal_failure_halts_the_job_and_the_service() {
         "the second target never ran"
     );
     assert!(h.service.active().is_err());
-    assert!(Service::submit(&h.service, "next", &overrides(&["%3"]), None).is_err());
+    assert!(Service::submit(
+        &h.service,
+        "next",
+        &overrides(&["%3"]),
+        Origin::Public,
+        None
+    )
+    .is_err());
 }
 
 #[test]
@@ -418,16 +470,18 @@ fn a_request_made_with_another_configuration_is_refused() {
     let h = harness(Box::new(|| vec![run("%1")]));
     let mut request = overrides(&["%1"]);
     request.caller_config = Some(h.dir.path().join("other.toml"));
-    assert!(Service::submit(&h.service, "key", &request, None)
-        .unwrap_err()
-        .contains("daemon's configuration"));
+    assert!(
+        Service::submit(&h.service, "key", &request, Origin::Public, None)
+            .unwrap_err()
+            .contains("daemon's configuration")
+    );
     // The daemon's file under another name is the same file.
     #[cfg(unix)]
     {
         let link = h.dir.path().join("link.toml");
         std::os::unix::fs::symlink(h.provider.config_path.as_ref().unwrap(), &link).unwrap();
         request.caller_config = Some(link);
-        Service::submit(&h.service, "key", &request, None).unwrap();
+        Service::submit(&h.service, "key", &request, Origin::Public, None).unwrap();
     }
     assert!(h.executed.lock().unwrap().len() <= 1);
 }
@@ -436,14 +490,24 @@ fn a_request_made_with_another_configuration_is_refused() {
 #[test]
 fn a_plan_writes_nothing() {
     let h = harness(Box::new(|| vec![run("%1"), run("%2")]));
-    let plan = h.service.plan(&overrides(&["%1", "%2"])).unwrap();
+    let plan = h
+        .service
+        .plan(&overrides(&["%1", "%2"]), Origin::Public)
+        .unwrap();
     assert_eq!(plan.outcomes.len(), 2);
     assert!(plan.executable);
     assert_eq!(h.dry_runs.load(Ordering::SeqCst), 2);
     assert!(h.executed.lock().unwrap().is_empty());
     assert!(h.service.status(&JobRef::Key("anything".into())).is_err());
     // Its pane is free for a real submit afterwards.
-    let accepted = Service::submit(&h.service, "key", &overrides(&["%1", "%2"]), None).unwrap();
+    let accepted = Service::submit(
+        &h.service,
+        "key",
+        &overrides(&["%1", "%2"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
     assert_eq!(settled(&h.service, &accepted.job_id).state, "done");
 }
 
@@ -461,7 +525,14 @@ fn a_restarted_service_reads_an_interrupted_job_back_in_order() {
             }),
         ]
     }));
-    let accepted = Service::submit(&h.service, "key", &overrides(&["%0", "%1"]), None).unwrap();
+    let accepted = Service::submit(
+        &h.service,
+        "key",
+        &overrides(&["%0", "%1"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
     // The daemon "restarts" while the target is held, before it runs.
     let restarted = Service::open(
         &h.dir.path().join("swap-jobs.sqlite3"),
@@ -556,7 +627,8 @@ fn a_settled_note_is_kept_in_memory_and_only_its_code_is_written() {
             "aas said: secret-marker token=abc",
         ))]
     }));
-    let accepted = Service::submit(&h.service, "key", &overrides(&["%1"]), None).unwrap();
+    let accepted =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
     let view = settled(&h.service, &accepted.job_id);
     assert_eq!(
         view.entries[0].reason.as_deref(),
@@ -607,9 +679,9 @@ fn conflicting_options_are_refused_before_planning() {
         },
     ];
     for (i, request) in cases.iter().enumerate() {
-        assert!(h.service.plan(request).is_err(), "case {i}");
+        assert!(h.service.plan(request, Origin::Public).is_err(), "case {i}");
         assert!(
-            Service::submit(&h.service, &format!("k{i}"), request, None).is_err(),
+            Service::submit(&h.service, &format!("k{i}"), request, Origin::Public, None).is_err(),
             "case {i}"
         );
         assert!(h.service.status(&JobRef::Key(format!("k{i}"))).is_err());
@@ -630,7 +702,8 @@ fn a_target_on_an_unknown_server_is_refused() {
             gate: None,
         })]
     }));
-    let accepted = Service::submit(&h.service, "key", &overrides(&["%1"]), None).unwrap();
+    let accepted =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
     let view = settled(&h.service, &accepted.job_id);
     assert_eq!(view.entries[0].reason.as_deref(), Some("unknown_server"));
     assert!(h.executed.lock().unwrap().is_empty());
@@ -669,11 +742,15 @@ fn an_executor_that_cannot_start_ends_the_job_without_effects() {
     .unwrap()
     .with_spawner(Box::new(|_, _| Err(std::io::Error::other("no threads"))));
     let service = Arc::new(service);
-    assert!(
-        Service::submit(&service, "key", &overrides(&["%1", "%2"]), None)
-            .unwrap_err()
-            .contains("could not start")
-    );
+    assert!(Service::submit(
+        &service,
+        "key",
+        &overrides(&["%1", "%2"]),
+        Origin::Public,
+        None
+    )
+    .unwrap_err()
+    .contains("could not start"));
     let view = service.status(&JobRef::Key("key".into())).unwrap();
     assert_eq!(view.state, "done");
     assert!(view
@@ -690,7 +767,14 @@ fn an_executor_that_cannot_start_ends_the_job_without_effects() {
 #[test]
 fn a_panicking_executor_faults_the_service() {
     let h = harness(Box::new(|| vec![run("%panic"), run("%2")]));
-    let accepted = Service::submit(&h.service, "key", &overrides(&["%panic", "%2"]), None).unwrap();
+    let accepted = Service::submit(
+        &h.service,
+        "key",
+        &overrides(&["%panic", "%2"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
     let view = settled(&h.service, &accepted.job_id);
     assert!(
         view.fault
@@ -754,7 +838,7 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
         .unwrap()
         .holding(lock),
     );
-    Service::submit(&service, "key", &overrides(&["%1"]), None).unwrap();
+    Service::submit(&service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
     drop(service);
     assert!(
         ownership_lock(&path).is_err(),
@@ -770,4 +854,182 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
         }
     };
     assert!(freed.is_some(), "released once the job ended");
+}
+
+fn direct(pane: &str) -> EngineStep<FakeTarget> {
+    let mut identity = identity(pane, "/tmp/tmux-1/default");
+    identity.direct = true;
+    EngineStep::Run(FakeTarget {
+        identity,
+        gate: None,
+    })
+}
+
+/// A public request does not respawn a pane that runs its agent directly —
+/// in plan and in submit alike — while the daemon's own automation still
+/// does, as it always has.
+#[test]
+fn a_direct_pane_is_refused_publicly_and_kept_for_automation() {
+    let h = harness(Box::new(|| vec![direct("%1")]));
+    let plan = h.service.plan(&overrides(&["%1"]), Origin::Public).unwrap();
+    assert!(plan.outcomes[0].note.contains("runs its agent directly"));
+    let public = Service::submit(
+        &h.service,
+        "public",
+        &overrides(&["%1"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
+    let view = settled(&h.service, &public.job_id);
+    assert_eq!(
+        view.entries[0].reason.as_deref(),
+        Some("direct_pane_unsupported")
+    );
+    assert!(h.executed.lock().unwrap().is_empty());
+
+    let mine = endpoint_key("%1", Some("/tmp/tmux-1/default"));
+    let automation = Service::submit(
+        &h.service,
+        "automation",
+        &overrides(&["%1"]),
+        Origin::Automation,
+        Some(Box::new(FakeGuard(mine))),
+    )
+    .unwrap();
+    assert_eq!(settled(&h.service, &automation.job_id).state, "done");
+    assert_eq!(*h.executed.lock().unwrap(), ["%1"]);
+}
+
+/// Whoever waits on a job is woken when it ends — finished, halted or
+/// panicked — and a job that already ended has nothing to wait on.
+#[test]
+fn a_job_wakes_its_waiters_however_it_ends() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let h = harness(Box::new(move || {
+        vec![EngineStep::Run(FakeTarget {
+            identity: identity("%1", "/tmp/tmux-1/default"),
+            gate: Some(Arc::clone(&held)),
+        })]
+    }));
+    let accepted =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
+    let done = h.service.receiver(&accepted.job_id).unwrap();
+    assert!(!*done.borrow());
+    gate.open();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !*done.borrow() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(*done.borrow());
+    assert!(h.service.receiver(&accepted.job_id).is_none());
+
+    let panicking = harness(Box::new(|| vec![run("%panic")]));
+    let job = Service::submit(
+        &panicking.service,
+        "key",
+        &overrides(&["%panic"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap()
+    .job_id;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while panicking.service.receiver(&job).is_some() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        panicking.service.receiver(&job).is_none(),
+        "a panic still wakes waiters"
+    );
+    // A halted service is still inspectable.
+    assert!(panicking.service.active().is_err());
+    assert!(panicking.service.status(&JobRef::Id(job)).is_ok());
+}
+
+/// Draining refuses new work and waits for running work, interrupting
+/// nothing.
+#[test]
+fn draining_waits_for_running_jobs_and_takes_no_new_ones() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let h = harness(Box::new(move || {
+        vec![EngineStep::Run(FakeTarget {
+            identity: identity("%1", "/tmp/tmux-1/default"),
+            gate: Some(Arc::clone(&held)),
+        })]
+    }));
+    let accepted =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
+    drop(accepted);
+    h.service.draining.store(true, Ordering::SeqCst);
+    assert!(Service::submit(
+        &h.service,
+        "next",
+        &overrides(&["%2"]),
+        Origin::Public,
+        None
+    )
+    .unwrap_err()
+    .contains("shutting down"));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    let waiting = h.service.receivers();
+    assert_eq!(waiting.len(), 1);
+    let opener = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(50));
+        gate.open();
+    });
+    let drained = runtime.block_on(async move {
+        tokio::time::timeout(Duration::from_secs(10), async move {
+            for mut done in waiting {
+                let _ = done.wait_for(|ended| *ended).await;
+            }
+        })
+        .await
+        .is_ok()
+    });
+    opener.join().unwrap();
+    assert!(drained);
+    assert_eq!(*h.executed.lock().unwrap(), ["%1"]);
+}
+
+#[test]
+fn oversized_requests_and_keys_are_refused() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let many = SwapOverrides {
+        targets: (0..300).map(|i| format!("%{i}")).collect(),
+        ..SwapOverrides::default()
+    };
+    assert!(Service::submit(&h.service, "key", &many, Origin::Public, None).is_err());
+    let long = SwapOverrides {
+        continue_text: Some("x".repeat(5000)),
+        ..SwapOverrides::default()
+    };
+    assert!(Service::submit(&h.service, "key", &long, Origin::Public, None).is_err());
+    for key in ["", "has space", &"k".repeat(200)] {
+        assert!(
+            Service::submit(&h.service, key, &overrides(&["%1"]), Origin::Public, None).is_err()
+        );
+    }
+    assert!(h.executed.lock().unwrap().is_empty());
+}
+
+/// One logical firing is one key, however it is delivered; a later episode
+/// is another; two spellings of the pane's server are the same firing.
+#[test]
+fn an_automation_firing_has_one_key_per_episode() {
+    let key = |socket: Option<&str>, episode: &str| {
+        automation_request_key("node", "%1", socket, "sid", "swap-on-limit", episode)
+    };
+    assert_eq!(key(Some("default"), "e1"), key(Some("default"), "e1"));
+    assert_eq!(
+        key(Some("/tmp/tmux-1/default"), "e1"),
+        key(Some("default"), "e1")
+    );
+    assert_ne!(key(Some("default"), "e1"), key(Some("default"), "e2"));
+    validate_key(&key(None, "e1")).unwrap();
 }
