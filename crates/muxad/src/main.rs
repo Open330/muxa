@@ -7054,25 +7054,27 @@ mod tests {
         assert!(sends.lock().unwrap().is_empty());
     }
 
-    /// A swap context that knows no agents, so every job settles without
-    /// an effect, and whose snapshot can be held shut to keep a job running.
-    struct HeldContext {
-        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
-        snapshots: Arc<std::sync::atomic::AtomicUsize>,
+    type Counter = Arc<std::sync::atomic::AtomicUsize>;
+
+    fn count(counter: &Counter) -> usize {
+        counter.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    impl muxa::swap_service::ContextProvider for HeldContext {
+    /// The daemon's agents as they were when the fixture was made; counts
+    /// what the service asks of it.
+    struct FixtureContext {
+        agents: Vec<muxa::Agent>,
+        snapshots: Counter,
+        guards: Counter,
+    }
+
+    impl muxa::swap_service::ContextProvider for FixtureContext {
         fn snapshot(&self) -> Result<muxa::swap_service::Snapshot, String> {
             self.snapshots
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let (open, turned) = &*self.gate;
-            let mut open = open.lock().unwrap();
-            while !*open {
-                open = turned.wait(open).unwrap();
-            }
             Ok(muxa::swap_service::Snapshot {
                 node_id: "node".into(),
-                agents: Vec::new(),
+                agents: self.agents.clone(),
                 backends: Vec::new(),
                 config: muxa::account_swap::SwapConfig::default(),
                 accounts: muxa::accounts::AccountsConfig::default(),
@@ -7085,17 +7087,26 @@ mod tests {
             _pane: &str,
             _socket: Option<&str>,
         ) -> Result<Box<dyn muxa::swap_service::TargetGuard>, String> {
+            self.guards
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Err("an automation swap must bring its own guard".into())
         }
     }
 
+    /// An automation engine with a swap rule over one capped agent, its
+    /// swaps run by a real job service whose engine touches nothing and
+    /// whose targets can be held mid-run.
     struct SwapFixture {
         engine: AutomationEngine,
         automation: Arc<AutomationStore>,
         collaboration: Arc<CollaborationStore>,
+        service: Arc<muxa::swap_service::SwapService>,
         sends: RecordedSends,
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
-        snapshots: Arc<std::sync::atomic::AtomicUsize>,
+        snapshots: Counter,
+        guards: Counter,
+        runs: Counter,
+        key: String,
         _dir: tempfile::TempDir,
     }
 
@@ -7103,6 +7114,8 @@ mod tests {
         async fn new() -> Self {
             let store = muxa::Store::shared();
             add_capped_agent(&store, "%1", "capped").await;
+            let agents = store.snapshot().await;
+            let episode = AutomationSubject::from_agent(&agents[0]).episode();
             let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
             let mut rule = AutomationRule::new(
                 "swap-on-limit",
@@ -7116,29 +7129,54 @@ mod tests {
             });
             let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
             let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
-            let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let (snapshots, guards, runs) =
+                (Counter::default(), Counter::default(), Counter::default());
             let dir = tempfile::tempdir().unwrap();
-            let service = muxa::swap_service::SwapService::open(
-                Some(&dir.path().join("swap-jobs.sqlite3")),
-                Arc::new(HeldContext {
-                    gate: Arc::clone(&gate),
-                    snapshots: Arc::clone(&snapshots),
-                }),
-            )
-            .unwrap();
+            let (held, ran) = (Arc::clone(&gate), Arc::clone(&runs));
+            let service = Arc::new(
+                muxa::swap_service::testing::open_inert(
+                    &dir.path().join("swap-jobs.sqlite3"),
+                    Arc::new(FixtureContext {
+                        agents,
+                        snapshots: Arc::clone(&snapshots),
+                        guards: Arc::clone(&guards),
+                    }),
+                    Arc::new(move || {
+                        ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (open, turned) = &*held;
+                        let mut open = open.lock().unwrap();
+                        while !*open {
+                            open = turned.wait(open).unwrap();
+                        }
+                    }),
+                )
+                .unwrap(),
+            );
             let mut engine = AutomationEngine::new(automation.clone(), store, backends);
             engine.collaboration = Some(Arc::clone(&collaboration));
             engine.swap_service = Some(Arc::new(DaemonSwap {
-                service: Arc::new(service),
+                service: Arc::clone(&service),
                 node_id: "node".into(),
             }));
+            let key = muxa::swap_service::automation_request_key(
+                "node",
+                "%1",
+                Some("default"),
+                "capped",
+                "swap-on-limit",
+                &episode,
+            );
             Self {
                 engine,
                 automation,
                 collaboration,
+                service,
                 sends,
                 gate,
                 snapshots,
+                guards,
+                runs,
+                key,
                 _dir: dir,
             }
         }
@@ -7158,6 +7196,13 @@ mod tests {
                     Vec::new(),
                 ),
             )
+        }
+
+        fn job(&self) -> muxa::swap_service::JobView {
+            use muxa::swap_service::SwapJobs as _;
+            self.service
+                .status(&muxa::swap_service::JobRef::Key(self.key.clone()))
+                .unwrap()
         }
 
         async fn pane_is_free(&self) -> bool {
@@ -7186,19 +7231,22 @@ mod tests {
         let mut engine = fixture.take_engine();
         let firing = tokio::spawn(async move { engine.fire_due().await });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while fixture.snapshots.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        while count(&fixture.runs) == 0 {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the swap never reached the service"
+                "the swap never started running"
             );
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        // Held by the job, not reacquired by it: busy, and still busy once
-        // the engine that submitted it is gone.
+        // An accepted, journalled job is running its one target.
+        assert_eq!(fixture.job().state, "running");
+        // The job holds the automation's own guard: busy, and still busy
+        // once the engine that submitted it is gone.
         assert!(!fixture.pane_is_free().await);
         firing.abort();
         let _ = firing.await;
         assert!(!fixture.pane_is_free().await);
+        assert_eq!(fixture.job().state, "running");
         fixture.hold(false);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !fixture.pane_is_free().await {
@@ -7207,6 +7255,16 @@ mod tests {
                 "the job never let the pane go"
             );
         }
+        let job = fixture.job();
+        assert_eq!(job.state, "done");
+        assert_eq!(job.entries.len(), 1);
+        assert_eq!(job.entries[0].disposition.as_deref(), Some("swapped"));
+        assert_eq!(count(&fixture.runs), 1);
+        assert_eq!(
+            count(&fixture.guards),
+            0,
+            "the job never takes the pane again"
+        );
         assert!(fixture.sends.lock().unwrap().is_empty());
     }
 
@@ -7229,10 +7287,11 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            fixture.snapshots.load(std::sync::atomic::Ordering::SeqCst),
+            count(&fixture.snapshots),
             0,
             "a stale firing must not reach the swap service"
         );
+        assert_eq!(count(&fixture.runs), 0);
         assert!(fixture.sends.lock().unwrap().is_empty());
     }
 
