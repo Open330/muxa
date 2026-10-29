@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `muxa workers prune --execute` refused every Codex worker with "no Codex
+  composer on screen": it read the pane with its colour escapes, which hid an
+  empty prompt. It now reads plain text, on the pane's own server.
+
 ### Changed
 
 - `muxa dashboard` opens `muxa watch` on its Work board, which now covers what

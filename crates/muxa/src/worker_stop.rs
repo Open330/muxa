@@ -130,7 +130,13 @@ pub fn graceful_stop(req: &StopRequest<'_>) -> StopOutcome {
         Some(false) => {}
         None => return StopOutcome::Refused("cannot observe the worker process".into()),
     }
-    let Some(screen) = req.backend.capture_pane(req.pane) else {
+    // Read the pane on its own server, as plain text: captures keep colour
+    // escapes, and a coloured `›` or `❯` would hide an empty prompt.
+    let Some(screen) = req
+        .backend
+        .capture_pane_on(req.socket, req.pane)
+        .map(|screen| crate::screen::strip_ansi(&screen))
+    else {
         return StopOutcome::Refused("could not read the pane".into());
     };
     match read_composer(&screen, req.kind) {
@@ -242,6 +248,9 @@ mod tests {
         "────────────────────────\n❯ please also fix\n────────────────────────\n";
     const CODEX_IDLE: &str = "• Done.\n\n› Ask Codex to do anything\n\n  gpt · ~/repo\n";
     const CODEX_DRAFT: &str = "• Done.\n\n› half a thought\n";
+    /// What a live Codex pane captures as: the prompt glyph and placeholder
+    /// are coloured.
+    const CODEX_IDLE_COLOURED: &str = "• Done.\n\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  gpt · ~/repo\n";
 
     fn stop(
         pane: &FakePane,
@@ -263,6 +272,7 @@ mod tests {
         for (screen, kind, quit) in [
             (CLAUDE_IDLE, AgentKind::ClaudeCode, "/exit"),
             (CODEX_IDLE, AgentKind::Codex, "/quit"),
+            (CODEX_IDLE_COLOURED, AgentKind::Codex, "/quit"),
         ] {
             let pane = FakePane::showing(screen);
             let probes = AtomicUsize::new(0);
