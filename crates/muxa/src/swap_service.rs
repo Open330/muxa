@@ -390,14 +390,14 @@ impl SwapService {
         &self,
         request_key: &str,
         overrides: &SwapOverrides,
-        guard: Box<dyn TargetGuard>,
+        guard: Option<Box<dyn TargetGuard>>,
     ) -> Result<Accepted, String> {
         Service::submit(
             &self.inner,
             request_key,
             overrides,
             Origin::Automation,
-            Some(guard),
+            guard,
         )
     }
 
@@ -451,6 +451,13 @@ pub(crate) enum Origin {
     Public,
     /// The daemon's own automation.
     Automation,
+}
+
+/// A pane on its server, socket spellings normalized: what a
+/// [`TargetGuard`] is asked to cover.
+#[must_use]
+pub fn endpoint(pane: &str, socket: Option<&str>) -> String {
+    account_swap::endpoint_key(pane, socket)
 }
 
 /// The key one automation firing submits under: the same logical firing —
