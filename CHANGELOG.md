@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Starting watch on the Work board or a topology screen loads only open-request
+  metadata for hidden mailbox badges; completed-history previews wait until the
+  operator opens the mailbox or collaboration screen.
+
 - Collaboration writes stage only affected rows instead of copying full history;
   identical plain replies are safe to retry without repeating wakes. The Work
   board reuses mailbox revisions and fetches only open-request metadata, while

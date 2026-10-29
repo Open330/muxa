@@ -8434,9 +8434,7 @@ pub async fn run(
                     app.broadcast_report = None;
                 }
                 Action::OpenCollaborationMailbox => {
-                    refresh_watch_collaboration(client, &mut app).await;
-                    app.collaboration_mailbox.open = true;
-                    clamp_collaboration_mailbox(&mut app);
+                    open_watch_collaboration_mailbox(client, &mut app).await;
                 }
                 Action::SubmitCollaboration => {
                     if let Some(reason) = board_message_stale(&app) {
@@ -9712,6 +9710,35 @@ async fn refresh_fleet_collaboration(client: &Client, app: &mut App) {
     }
 }
 
+async fn open_watch_collaboration_mailbox(client: &Client, app: &mut App) {
+    // Set visibility before refreshing: the first visible frame needs history,
+    // rather than the body-free badges used while the mailbox was hidden.
+    app.collaboration_mailbox.open = true;
+    refresh_watch_collaboration(client, app).await;
+    clamp_collaboration_mailbox(app);
+}
+
+async fn refresh_hidden_mailbox(
+    client: &Client,
+    app: &mut App,
+    room: RoomContext,
+    origin: &CollaborationOrigin,
+) {
+    app.collaboration.room = Some(room);
+    match read_board_open_requests(client, origin).await {
+        Ok(open) => {
+            app.collaboration.human = open
+                .into_iter()
+                .filter(CollaborationRequest::needs_human_response)
+                .collect();
+            app.collaboration.unavailable = None;
+        }
+        Err(error) => {
+            app.collaboration.unavailable = Some(format!("mailbox unavailable: {error}"));
+        }
+    }
+}
+
 async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
     let selected_request_id = selected_collaboration_request(app).map(|request| request.id.clone());
     let Some(origin) = app.collaboration.origin.clone() else {
@@ -9741,6 +9768,12 @@ async fn refresh_watch_collaboration(client: &Client, app: &mut App) {
         console: true,
         ..origin.clone()
     };
+    if !app.collaboration_mailbox.open && app.watch_cfg.screen != WatchScreen::Collab {
+        // Hidden mailboxes need live routing and human-action badges, not
+        // previews of every completed message in the daemon's history.
+        refresh_hidden_mailbox(client, app, room, &history_origin).await;
+        return;
+    }
     let history = watch_history(client, app, &history_origin).await;
     match history {
         Ok(requests) => {
@@ -30543,6 +30576,77 @@ sort = ["state"]
         assert_eq!(full.len(), 2);
         assert_eq!(full[0].updates[0].body, "new update");
         assert_eq!(full[1].body, COLLAB_FIXTURE_BODY);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hidden_mailbox_reads_open_badges_then_loads_history_only_when_opened() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hidden-mailbox.sock");
+        let mut human = collab_request("%2");
+        human.body = "Human needs a decision".into();
+        human.to = Participant::console(human.from.room.clone());
+        let room = RoomContext {
+            current: human.to.clone(),
+            peers: vec![human.from.clone()],
+            unread: 1,
+            unread_replies: 0,
+        };
+        let page = |requests: Vec<CollaborationRequest>| {
+            json!({"ok":true,"collaboration_scope":"all",
+            "collaboration_page":{"total":requests.len(),"requests":requests,"has_more":false}})
+        };
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![
+                (
+                    json!({"/kind":"collaboration_context"}),
+                    json!({"ok":true,"room":room}),
+                ),
+                (
+                    json!({"/view":"metadata","/query/status":"queued"}),
+                    page(vec![human.clone()]),
+                ),
+                (
+                    json!({"/view":"metadata","/query/status":"claimed"}),
+                    page(vec![]),
+                ),
+                (
+                    json!({"/kind":"collaboration_context"}),
+                    json!({"ok":true,"room":room}),
+                ),
+                (json!({"/view":"preview"}), page(vec![human.clone()])),
+            ],
+        );
+        let client = Client::new(socket);
+        let mut app = collab_app("%2");
+        app.apply_screen(WatchScreen::Board);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        });
+        let (_sender, changes) = tokio::sync::watch::channel(Some(9));
+        app.collaboration_history.changes = Some(changes);
+        refresh_watch_collaboration(&client, &mut app).await;
+        assert!(
+            app.collaboration.room.is_some(),
+            "quick-send routing must remain available"
+        );
+        assert_eq!(
+            app.collaboration.human.len(),
+            1,
+            "human-action badges must be preserved"
+        );
+        assert!(app.collaboration.human[0].body.is_empty());
+        assert!(app.collaboration_history.previews.is_empty());
+        open_watch_collaboration_mailbox(&client, &mut app).await;
+        assert_eq!(app.collaboration.human[0].body, human.body);
+        assert_eq!(app.collaboration_history.previews.len(), 1);
         server.await.unwrap();
     }
 
