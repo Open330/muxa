@@ -52,7 +52,8 @@ CREATE TABLE jobs (
     job_id TEXT PRIMARY KEY,
     node_id TEXT NOT NULL,
     request_key TEXT NOT NULL UNIQUE,
-    fingerprint TEXT NOT NULL,
+    request_digest TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
     owner_nonce TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN
         ('accepted', 'running', 'done', 'needs_reconciliation', 'abandoned')),
@@ -197,15 +198,21 @@ pub(crate) struct AcceptedPlan {
     pub(crate) targets: Vec<PlannedTarget>,
 }
 
-/// A digest of the full request, follow-up text included, so two requests
-/// that differ only in a same-length wording never dedupe as one.
+/// A digest of the request exactly as the caller made it — its typed
+/// options, the follow-up wording included — and nothing a live plan would
+/// add (pids, assignments, which agents exist now). The same request sent
+/// twice digests the same even after the first one changed the world;
+/// two requests that differ only in a same-length wording do not.
 #[must_use]
-pub(crate) fn fingerprint(plan: &AcceptedPlan, continue_text: Option<&str>) -> String {
-    let canonical = serde_json::json!({
-        "plan": plan,
-        "continue_text": continue_text,
-    });
+pub(crate) fn request_digest(request: &impl Serialize) -> String {
+    let canonical = serde_json::to_value(request).unwrap_or_default();
     hex_sha256(canonical.to_string().as_bytes())
+}
+
+/// A digest of the plan as accepted, kept for audit; never used to match a
+/// repeated request.
+fn plan_digest(plan: &AcceptedPlan) -> String {
+    hex_sha256(serde_json::to_string(plan).unwrap_or_default().as_bytes())
 }
 
 fn hex_sha256(bytes: &[u8]) -> String {
@@ -314,7 +321,7 @@ pub(crate) struct TargetStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Created {
     pub(crate) job_id: String,
-    /// The same request key and fingerprint were seen before: that job.
+    /// The same request key and digest were seen before: that job.
     pub(crate) existing: bool,
 }
 
@@ -515,14 +522,54 @@ impl SwapJobStore {
         })
     }
 
+    /// Whether `request_key` was used before: `Some(job)` for the same
+    /// request, an error for a different one, `None` if unseen. Checked
+    /// before any planning, so a repeated request is answered with the job
+    /// it made rather than planned again against a world it changed.
+    pub(crate) fn lookup(
+        &self,
+        request_key: &str,
+        request_digest: &str,
+    ) -> Result<Option<String>, JobError> {
+        self.with(|connection| {
+            let seen: Option<(String, String)> = connection
+                .query_row(
+                    "SELECT job_id, request_digest FROM jobs WHERE request_key = ?1",
+                    [request_key],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            match seen {
+                None => Ok(None),
+                Some((job, seen)) if seen == request_digest => Ok(Some(job)),
+                Some(_) => Err(JobError::KeyReused(request_key.to_owned())),
+            }
+        })
+    }
+
+    /// [`SwapJobStore::status`] of the job a request key made.
+    pub(crate) fn status_by_key(&self, request_key: &str) -> Result<JobStatus, JobError> {
+        let job: String = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT job_id FROM jobs WHERE request_key = ?1",
+                    [request_key],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| JobError::NotFound(request_key.to_owned()))
+        })?;
+        self.status(&job)
+    }
+
     /// Accept a plan, written whole before any effect. The same request key
-    /// with the same fingerprint returns the job it made before; with a
+    /// with the same request digest returns the job it made before; with a
     /// different one, it is refused.
     pub(crate) fn create_job(
         &self,
         lease: &Lease,
         request_key: &str,
-        fingerprint: &str,
+        request_digest: &str,
         plan: &AcceptedPlan,
     ) -> Result<Created, JobError> {
         self.with(|connection| {
@@ -530,13 +577,13 @@ impl SwapJobStore {
             fence(&tx, lease)?;
             let seen: Option<(String, String)> = tx
                 .query_row(
-                    "SELECT job_id, fingerprint FROM jobs WHERE request_key = ?1",
+                    "SELECT job_id, request_digest FROM jobs WHERE request_key = ?1",
                     [request_key],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
             if let Some((job_id, seen)) = seen {
-                return if seen == fingerprint {
+                return if seen == request_digest {
                     Ok(Created {
                         job_id,
                         existing: true,
@@ -550,10 +597,19 @@ impl SwapJobStore {
             let plan_json =
                 serde_json::to_string(plan).map_err(|error| JobError::Store(error.to_string()))?;
             tx.execute(
-                "INSERT INTO jobs (job_id, node_id, request_key, fingerprint, owner_nonce, state,
-                                   plan_json, revision, created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, 'accepted', ?6, 1, ?7, ?7)",
-                params![job_id, plan.node_id, request_key, fingerprint, lease.nonce, plan_json, at],
+                "INSERT INTO jobs (job_id, node_id, request_key, request_digest, plan_digest,
+                                   owner_nonce, state, plan_json, revision, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'accepted', ?7, 1, ?8, ?8)",
+                params![
+                    job_id,
+                    plan.node_id,
+                    request_key,
+                    request_digest,
+                    plan_digest(plan),
+                    lease.nonce,
+                    plan_json,
+                    at
+                ],
             )?;
             for index in 0..plan.targets.len() {
                 tx.execute(

@@ -56,7 +56,7 @@ fn open(dir: &tempfile::TempDir) -> SwapJobStore {
 fn running(store: &SwapJobStore, lease: &Lease, key: &str, targets: usize) -> String {
     let plan = plan(targets, Some("continue"));
     let job = store
-        .create_job(lease, key, &fingerprint(&plan, Some("continue")), &plan)
+        .create_job(lease, key, &digest(&[key], Some("continue")), &plan)
         .unwrap()
         .job_id;
     store.start(lease, &job).unwrap();
@@ -140,16 +140,43 @@ fn one_manager_owns_the_store_and_a_replaced_one_is_fenced() {
         .unwrap();
 }
 
+/// A request as a caller makes it, for digesting.
+#[derive(serde::Serialize)]
+struct Request<'a> {
+    targets: &'a [&'a str],
+    continue_text: Option<&'a str>,
+}
+
+fn digest(targets: &[&str], text: Option<&str>) -> String {
+    request_digest(&Request {
+        targets,
+        continue_text: text,
+    })
+}
+
 #[test]
 fn a_repeated_request_is_the_same_job_and_a_changed_one_is_refused() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(&dir);
     let lease = store.acquire(&me("a", 1), &alive).unwrap();
-    let request = plan(2, Some("continue"));
-    let print = fingerprint(&request, Some("continue"));
-    let first = store.create_job(&lease, "key", &print, &request).unwrap();
+    let request = digest(&["%1", "%2"], Some("continue"));
+    let accepted = plan(2, Some("continue"));
+    assert_eq!(store.lookup("key", &request).unwrap(), None);
+    let first = store
+        .create_job(&lease, "key", &request, &accepted)
+        .unwrap();
     assert!(!first.existing);
-    let again = store.create_job(&lease, "key", &print, &request).unwrap();
+
+    // Sent again after the first one moved the agents: the live plan would
+    // differ now (new pids, new accounts), the request does not.
+    assert_eq!(
+        store.lookup("key", &request).unwrap(),
+        Some(first.job_id.clone())
+    );
+    let mut moved = plan(2, Some("continue"));
+    moved.targets[0].process_pid = 4242;
+    moved.targets[0].assigned_account = "c@claude".into();
+    let again = store.create_job(&lease, "key", &request, &moved).unwrap();
     assert_eq!(
         again,
         Created {
@@ -157,36 +184,26 @@ fn a_repeated_request_is_the_same_job_and_a_changed_one_is_refused() {
             existing: true
         }
     );
+    assert_eq!(
+        store.plan(&first.job_id).unwrap(),
+        accepted,
+        "the first plan stands"
+    );
+    assert_eq!(store.status_by_key("key").unwrap().job_id, first.job_id);
 
     // Same length, different words: a different request.
-    let other = plan(2, Some("go on, ok"));
-    assert_eq!(other.continue_text.as_ref().unwrap().chars, 9);
-    let reworded = plan(2, Some("keep alive"));
-    assert_ne!(
-        fingerprint(&other, Some("go on, ok")),
-        fingerprint(&reworded, Some("keep alive"))
-    );
-    let same_length_a = plan(1, Some("abc"));
-    assert_ne!(
-        fingerprint(&same_length_a, Some("abc")),
-        fingerprint(&same_length_a, Some("xyz")),
-        "the digest covers the words, not only their length"
+    assert_ne!(digest(&["%1"], Some("abc")), digest(&["%1"], Some("xyz")));
+    let reworded = digest(&["%1", "%2"], Some("go on, ok"));
+    assert_eq!(
+        store.lookup("key", &reworded).err(),
+        Some(JobError::KeyReused("key".into()))
     );
     assert_eq!(
-        store
-            .create_job(
-                &lease,
-                "key",
-                &fingerprint(&other, Some("go on, ok")),
-                &other
-            )
-            .err(),
+        store.create_job(&lease, "key", &reworded, &accepted).err(),
         Some(JobError::KeyReused("key".into()))
     );
     // The plan is stored without the text.
-    let stored = store.plan(&first.job_id).unwrap();
-    assert_eq!(stored, request);
-    assert!(!serde_json::to_string(&stored)
+    assert!(!serde_json::to_string(&store.plan(&first.job_id).unwrap())
         .unwrap()
         .contains("continue\""));
 }

@@ -25,6 +25,7 @@ use crate::state::Agent;
 use effects::{Purpose, Runner};
 use io::Clock;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// How long a stopped agent gets to exit on `SIGTERM` before `SIGKILL`.
@@ -1018,16 +1019,86 @@ pub fn run(
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
 ) -> Vec<SwapOutcome> {
-    let (resolved, agents, mut outcomes) = scoped(request, agents, backends);
-    let request = &resolved;
-    let (mut chosen, skipped) = select(&agents, request);
-    outcomes.extend(skipped);
+    let (request, steps) = prepare(request, agents, backends, config, accounts);
+    steps
+        .into_iter()
+        .map(|step| match step {
+            Step::Done(outcome) => outcome,
+            Step::Run(target) => execute_target(&request, &target, &mut effects::NoObserver),
+        })
+        .collect()
+}
+
+/// One entry of a prepared swap, in report order: an outcome already
+/// settled while planning, or a target still to run.
+pub(crate) enum Step {
+    Done(SwapOutcome),
+    Run(Box<PreparedTarget>),
+}
+
+/// A target with everything it needs to run, owned, so it can run on its
+/// own thread after whatever planned it is gone.
+pub(crate) struct PreparedTarget {
+    pub(crate) planned: Planned,
+    account: Result<String, String>,
+    candidates: Arc<Vec<Candidate>>,
+    profiles: Option<
+        Arc<(
+            Vec<crate::accounts::AccountProfile>,
+            crate::accounts::ResolvedAccounts,
+        )>,
+    >,
+    /// The account the profiles identify it on; reported as `from` when it
+    /// moves between configured profiles.
+    profile_from: Option<String>,
+}
+
+/// Plan a swap without touching anything: resolve the request, choose and
+/// locate the agents, settle which conversation each resumes and which
+/// account each moves to. Returns the request as resolved and the steps.
+pub(crate) fn prepare(
+    request: &SwapRequest,
+    agents: &[Agent],
+    backends: &[SharedBackend],
+    config: &SwapConfig,
+    accounts: &crate::accounts::AccountsConfig,
+) -> (SwapRequest, Vec<Step>) {
+    let (resolved, agents, outcomes) = scoped(request, agents, backends);
+    let mut steps: Vec<Step> = outcomes.into_iter().map(Step::Done).collect();
+    let (mut chosen, skipped) = select(&agents, &resolved);
+    steps.extend(skipped.into_iter().map(Step::Done));
     // A pane can carry a hook-fed row and a screen-detected one; the
     // hook-fed row knows the session id, so it goes first and wins the pane.
     chosen.sort_by_key(|agent| !resumable_id(&agent.session_id));
+    let mut outcomes = Vec::new();
     let planned = plan(chosen, backends, &mut outcomes);
-    swap_planned(request, &planned, config, accounts, &mut outcomes);
-    outcomes
+    steps.extend(outcomes.into_iter().map(Step::Done));
+    steps.extend(assign_accounts(&resolved, planned, config, accounts));
+    (resolved, steps)
+}
+
+/// Run one prepared target, every effect offered to `observer`.
+pub(crate) fn execute_target(
+    request: &SwapRequest,
+    target: &PreparedTarget,
+    observer: &mut dyn effects::EffectObserver,
+) -> SwapOutcome {
+    let profiles = target
+        .profiles
+        .as_deref()
+        .map(|(profiles, resolved)| (profiles.as_slice(), resolved));
+    let mut outcome = swap_one(
+        request,
+        &target.planned,
+        target.account.clone(),
+        &target.candidates,
+        profiles,
+        observer,
+    );
+    if target.profiles.is_some() {
+        outcome.from.clone_from(&target.profile_from);
+    }
+    outcome
 }
 
 /// The request with its named targets and excludes resolved to live panes,
@@ -1082,11 +1153,11 @@ fn scoped(
 
 /// Locate each chosen agent and settle which conversation it resumes; the
 /// ones that cannot be are reported in `outcomes`.
-fn plan<'a>(
-    chosen: Vec<&'a Agent>,
+fn plan(
+    chosen: Vec<&Agent>,
     backends: &[SharedBackend],
     outcomes: &mut Vec<SwapOutcome>,
-) -> Vec<Planned<'a>> {
+) -> Vec<Planned> {
     let mut planned: Vec<Planned> = Vec::new();
     for agent in chosen {
         // The same pane id on two servers is two agents; one pane on one
@@ -1118,7 +1189,7 @@ fn plan<'a>(
                         }
                     };
                 planned.push(Planned {
-                    agent,
+                    agent: agent.clone(),
                     session_id,
                     source,
                     verified: matches!(
@@ -1141,18 +1212,17 @@ fn plan<'a>(
     planned
 }
 
-/// Pick accounts for the planned agents and swap them, provider by
-/// provider.
-fn swap_planned(
+/// Pick an account for each planned agent, provider by provider, in the
+/// order they were planned.
+fn assign_accounts(
     request: &SwapRequest,
-    planned: &[Planned],
+    planned: Vec<Planned>,
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
-    outcomes: &mut Vec<SwapOutcome>,
-) {
+) -> Vec<Step> {
     // One `aas candidates` per provider, shared by that provider's targets.
     let mut by_provider: Vec<(&'static str, Result<Vec<Candidate>, String>)> = Vec::new();
-    for Planned { agent, .. } in planned {
+    for Planned { agent, .. } in &planned {
         let provider = provider_name(agent.kind).unwrap_or_default();
         if !by_provider.iter().any(|(name, _)| *name == provider) {
             let candidates = if accounts.for_provider(provider).is_empty() {
@@ -1169,45 +1239,62 @@ fn swap_planned(
         }
     }
 
-    for (provider, candidates) in &by_provider {
-        let group: Vec<&Planned> = planned
-            .iter()
-            .filter(|p| provider_name(p.agent.kind) == Some(provider))
+    let mut remaining: Vec<Option<Planned>> = planned.into_iter().map(Some).collect();
+    let mut steps = Vec::new();
+    for (provider, candidates) in by_provider {
+        let group: Vec<Planned> = remaining
+            .iter_mut()
+            .filter(|slot| {
+                slot.as_ref()
+                    .is_some_and(|p| provider_name(p.agent.kind) == Some(provider))
+            })
+            .filter_map(Option::take)
             .collect();
         let candidates = match candidates {
             Ok(candidates) => candidates,
             Err(error) => {
-                for p in group {
-                    outcomes.push(SwapOutcome::new(p.agent, SwapStatus::Failed, error.clone()));
-                }
+                steps.extend(group.iter().map(|p| {
+                    Step::Done(SwapOutcome::new(
+                        &p.agent,
+                        SwapStatus::Failed,
+                        error.clone(),
+                    ))
+                }));
                 continue;
             }
         };
         let profiles = accounts.for_provider(provider);
         if !profiles.is_empty() {
-            outcomes.extend(swap_on_profiles(request, group, profiles, provider));
+            steps.extend(profile_steps(request, group, profiles, provider));
             continue;
         }
         let current: Vec<Option<String>> = group
             .iter()
-            .map(|p| current_account(&p.launch.line, candidates))
+            .map(|p| current_account(&p.launch.line, &candidates))
             .collect();
-        let accounts = assign(&current, candidates, &request.to);
-        for (planned, account) in group.into_iter().zip(accounts) {
-            outcomes.push(swap_one(request, planned, account, candidates, None));
+        let assigned = assign(&current, &candidates, &request.to);
+        let candidates = Arc::new(candidates);
+        for (planned, account) in group.into_iter().zip(assigned) {
+            steps.push(Step::Run(Box::new(PreparedTarget {
+                planned,
+                account,
+                candidates: Arc::clone(&candidates),
+                profiles: None,
+                profile_from: None,
+            })));
         }
     }
+    steps
 }
 
-/// [`run`] for a provider that lists `[[accounts]]`: accounts, identity and
-/// relaunch all come from config, never `aas`.
-fn swap_on_profiles(
+/// [`assign_accounts`] for a provider that lists `[[accounts]]`: accounts,
+/// identity and relaunch all come from config, never `aas`.
+fn profile_steps(
     request: &SwapRequest,
-    group: Vec<&Planned>,
+    group: Vec<Planned>,
     profiles: &[crate::accounts::AccountProfile],
     provider: &str,
-) -> Vec<SwapOutcome> {
-    let mut outcomes = Vec::new();
+) -> Vec<Step> {
     let resolved = crate::accounts::ResolvedAccounts::new(profiles);
     let current: Vec<Option<String>> = group
         .iter()
@@ -1217,7 +1304,7 @@ fn swap_on_profiles(
     let capped: Vec<&str> = group
         .iter()
         .zip(&current)
-        .filter(|(p, _)| is_rate_limited(p.agent))
+        .filter(|(p, _)| is_rate_limited(&p.agent))
         .filter_map(|(_, account)| account.as_deref())
         .collect();
     let ranked = profile_candidates(profiles, provider, &capped);
@@ -1228,18 +1315,22 @@ fn swap_on_profiles(
         other => other.clone(),
     };
     let chosen = assign(&current, &ranked, &choice);
-    for ((planned, account), from) in group.into_iter().zip(chosen).zip(current) {
-        let mut outcome = swap_one(
-            request,
-            planned,
-            account,
-            &ranked,
-            Some((profiles, &resolved)),
-        );
-        outcome.from = from;
-        outcomes.push(outcome);
-    }
-    outcomes
+    let ranked = Arc::new(ranked);
+    let shared = Arc::new((profiles.to_vec(), resolved));
+    group
+        .into_iter()
+        .zip(chosen)
+        .zip(current)
+        .map(|((planned, account), from)| {
+            Step::Run(Box::new(PreparedTarget {
+                planned,
+                account,
+                candidates: Arc::clone(&ranked),
+                profiles: Some(Arc::clone(&shared)),
+                profile_from: from,
+            }))
+        })
+        .collect()
 }
 
 /// Carry one planned target through to its outcome.
@@ -1252,6 +1343,7 @@ fn swap_one(
         &[crate::accounts::AccountProfile],
         &crate::accounts::ResolvedAccounts,
     )>,
+    observer: &mut dyn effects::EffectObserver,
 ) -> SwapOutcome {
     let Planned {
         agent,
@@ -1345,7 +1437,7 @@ fn swap_one(
         backend,
         target: &target,
     };
-    let (status, note) = run_live(&io, &target, launch, &command, follow_up, &verify);
+    let (status, note) = run_live(&io, &target, launch, &command, follow_up, &verify, observer);
     outcome.status = status;
     outcome.note = note;
     outcome
@@ -1359,9 +1451,9 @@ fn run_live(
     command: &str,
     follow_up: Option<&str>,
     verify: &dyn Fn(&Target) -> Result<String, String>,
+    observer: &mut dyn effects::EffectObserver,
 ) -> (SwapStatus, String) {
-    let mut observer = effects::NoObserver;
-    let runner = Runner::new(io, &mut observer);
+    let runner = Runner::new(io, observer);
     let executed = execute(&runner, target, launch, command, follow_up, verify);
     match (runner.halted(), executed) {
         // An observer that could not record an effect stopped the run; what
@@ -1402,8 +1494,8 @@ fn relaunch_command(
     }
 }
 
-struct Planned<'a> {
-    agent: &'a Agent,
+pub(crate) struct Planned {
+    agent: Agent,
     /// The conversation to resume, and the evidence it came from.
     session_id: String,
     source: SessionIdSource,
