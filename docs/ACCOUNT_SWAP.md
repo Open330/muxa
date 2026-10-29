@@ -139,9 +139,10 @@ the Fleet work-command transport, with the report printed here. Agents use
 the same thing through the `muxa_swap_account` MCP tool (`host` omitted for
 this host). The host's own `muxa` must be new enough to know `swap`.
 
-The swap runs in that host's daemon. Ctrl-C here only stops waiting for its
-report; it does not reliably cancel the swap there, which may still be
-stopping and relaunching agents. Check the host before running it again.
+The swap executes on the remote host through Fleet's work-command transport.
+Ctrl-C here only stops waiting for its report; it does not reliably cancel
+the swap there, which may still be stopping and relaunching agents. Check
+the host before running it again.
 
 ```console
 $ muxa swap --host rtzr --to work --dry-run

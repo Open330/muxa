@@ -281,9 +281,9 @@ fn remote_argv(args: &Args) -> Vec<String> {
 }
 
 /// What Ctrl-C does to a swap on a Fleet host: the host's own `muxa swap`
-/// runs on in its daemon, and this client only stops waiting for it. Which
-/// of the two happens depends on how the wait ends (relay, SSH, timeout), so
-/// the notice claims neither.
+/// executes there through Fleet's work-command transport, and this client
+/// only stops waiting for it. Whether that run stops too depends on how the
+/// wait ends (relay, SSH, timeout), so the notice claims neither.
 fn remote_wait_notice(host: &str) -> String {
     format!(
         "swapping on {host}: Ctrl-C stops this client from waiting; it does not reliably \
