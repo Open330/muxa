@@ -20455,10 +20455,17 @@ fn render_collaboration_composer_footer(
         )
         | None => {}
     }
-    if matches!(target, Some(CollaborationComposeTarget::Send { .. })) {
+    if let Some(CollaborationComposeTarget::Send { target, .. }) = target {
+        // A message to one exact agent session is always a request; Ctrl-E
+        // skips just-send there, so the footer does not offer it.
+        let modes = if is_session_target(target) {
+            "read-only/execute  "
+        } else {
+            "read-only/execute/just-send  "
+        };
         spans.extend([
             Span::styled(" Ctrl-E ", theme.key_badge()),
-            Span::raw("read-only/execute/just-send  "),
+            Span::raw(modes),
         ]);
     }
     spans.extend([
@@ -31059,6 +31066,21 @@ sort = ["state"]
             .footer_hint
             .as_ref()
             .is_some_and(|hint| hint.message.contains("exact agent session")));
+    }
+
+    #[test]
+    fn a_board_message_footer_does_not_offer_just_send() {
+        let (mut app, _) = board_ready_to_message();
+        let _ = press_key(&mut app, KeyCode::Char('m'));
+        open_watch_collaboration_composer(&mut app);
+        let mut terminal = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("read-only/execute"), "{screen}");
+        assert!(!screen.contains("just-send"), "{screen}");
     }
 
     #[test]
