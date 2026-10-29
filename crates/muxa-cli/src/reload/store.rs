@@ -144,12 +144,14 @@ mod tests {
 
     fn snapshot(origin: SnapshotOrigin) -> Snapshot {
         Snapshot {
+            sessions: Vec::new(),
             version: 1,
             taken_at: "2026-09-23T05:05:12Z".into(),
             origin,
             host: "tmux".into(),
             socket: "default".into(),
             windows: vec![WindowShape {
+                marks: Vec::new(),
                 session: "work".into(),
                 index: "0".into(),
                 name: "main".into(),
@@ -157,6 +159,7 @@ mod tests {
                 layout: "c3a1,80x24,0,0,5".into(),
             }],
             panes: vec![PaneShape {
+                marks: Vec::new(),
                 session: "work".into(),
                 window_index: "0".into(),
                 pane_index: "0".into(),
