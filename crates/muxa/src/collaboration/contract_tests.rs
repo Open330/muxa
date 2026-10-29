@@ -341,7 +341,7 @@ async fn failed_claimed_supersession_keeps_notices_withdrawals_and_old_attempt_a
         .unwrap();
     let before = store.requests.read().await.clone();
     let changes = store.subscribe();
-    let db = Connection::open(store.database_path.as_ref().unwrap()).unwrap();
+    let db = Connection::open(&store.database.as_ref().unwrap().path).unwrap();
     db.execute_batch("CREATE TRIGGER reject_staged BEFORE INSERT ON collaboration_requests BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
     let mut next = input();
     next.supersedes_request_id = Some(old.id.clone());
@@ -352,19 +352,20 @@ async fn failed_claimed_supersession_keeps_notices_withdrawals_and_old_attempt_a
         .is_err());
     assert_eq!(*store.requests.read().await, before);
     assert!(!changes.has_changed().unwrap());
-    let stored: HashMap<_, _> = query_database(
-        store.database_path.as_ref().unwrap(),
-        &Participant::console(old.from.room),
-        RequestMailbox::All,
-        MailboxScope::All,
-        &CollaborationQuery::default(),
-        0,
-    )
-    .unwrap()
-    .requests
-    .into_iter()
-    .map(|r| (r.id.clone(), r))
-    .collect();
+    let stored: HashMap<_, _> = store
+        .query_for_offset(
+            &Participant::console(old.from.room),
+            RequestMailbox::All,
+            MailboxScope::All,
+            &CollaborationQuery::default(),
+            0,
+        )
+        .await
+        .unwrap()
+        .requests
+        .into_iter()
+        .map(|r| (r.id.clone(), r))
+        .collect();
     assert_eq!(stored, before);
 }
 
@@ -377,7 +378,7 @@ async fn failed_supersession_persistence_rolls_back_the_old_request_and_new_atte
     };
     let store = CollaborationStore::load(options).await.unwrap();
     let old = create(&store).await;
-    let db = Connection::open(store.database_path.as_ref().unwrap()).unwrap();
+    let db = Connection::open(&store.database.as_ref().unwrap().path).unwrap();
     db.execute_batch("CREATE TRIGGER reject_supersession BEFORE INSERT ON collaboration_requests BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
     let mut next = input();
     next.supersedes_request_id = Some(old.id.clone());
@@ -553,7 +554,7 @@ async fn legacy_only_storage_remains_v1_and_contract_upgrade_is_transactional() 
         )
         .await
         .unwrap();
-    let db = Connection::open(store.database_path.as_ref().unwrap()).unwrap();
+    let db = Connection::open(&store.database.as_ref().unwrap().path).unwrap();
     assert_eq!(
         db.pragma_query_value(None, "user_version", |r| r.get::<_, u32>(0))
             .unwrap(),

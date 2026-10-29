@@ -1,12 +1,12 @@
 //! Explicit session purposes and single-use, process-fenced worker launches.
 use super::{
-    is_pending_session, open_database, pane_participant, pane_room, secure_database_files,
-    unique_pane, CollaborationError, CollaborationStore, Participant, RoomId,
+    is_pending_session, pane_participant, pane_room, unique_pane, CollaborationError,
+    CollaborationStore, Participant, RoomId,
 };
 use crate::{event::AgentKind, tmux::PaneInfo};
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, path::Path};
+use std::collections::HashSet;
 
 pub const HUMAN_PRIORITY_CAPABILITY: &str = "collaboration_human_priority_v1";
 
@@ -170,11 +170,9 @@ impl PurposeGrant {
     }
 }
 
-pub(super) fn load_purposes(path: Option<&Path>) -> Result<Vec<PurposeGrant>, CollaborationError> {
-    let Some(path) = path else {
-        return Ok(Vec::new());
-    };
-    let connection = open_database(path)?;
+pub(super) fn load_purposes(
+    connection: &Connection,
+) -> Result<Vec<PurposeGrant>, CollaborationError> {
     let mut statement =
         connection.prepare("SELECT payload FROM collaboration_purposes ORDER BY rowid")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -245,29 +243,29 @@ impl CollaborationStore {
         grants: &[PurposeGrant],
         previous: &[PurposeGrant],
     ) -> Result<(), CollaborationError> {
-        let Some(path) = &self.database_path else {
+        let Some(database) = &self.database else {
             return Ok(());
         };
-        let mut connection = open_database(path)?;
-        let tx = connection.transaction()?;
-        for old in previous
-            .iter()
-            .filter(|old| !grants.iter().any(|grant| grant.id == old.id))
-        {
-            tx.execute(
-                "DELETE FROM collaboration_purposes WHERE id = ?1",
-                [&old.id],
-            )?;
-        }
-        for grant in grants.iter().filter(|grant| !previous.contains(grant)) {
-            tx.execute(
-                "INSERT OR REPLACE INTO collaboration_purposes(id,payload) VALUES (?1,?2)",
-                params![grant.id, serde_json::to_string(grant)?],
-            )?;
-        }
-        tx.commit()?;
-        secure_database_files(path)?;
-        Ok(())
+        database.with_connection(|connection| {
+            let tx = connection.transaction()?;
+            for old in previous
+                .iter()
+                .filter(|old| !grants.iter().any(|grant| grant.id == old.id))
+            {
+                tx.execute(
+                    "DELETE FROM collaboration_purposes WHERE id = ?1",
+                    [&old.id],
+                )?;
+            }
+            for grant in grants.iter().filter(|grant| !previous.contains(grant)) {
+                tx.execute(
+                    "INSERT OR REPLACE INTO collaboration_purposes(id,payload) VALUES (?1,?2)",
+                    params![grant.id, serde_json::to_string(grant)?],
+                )?;
+            }
+            tx.commit()?;
+            Ok(())
+        })
     }
 
     /// Register an explicit worker launch, observing its actual CLI process.

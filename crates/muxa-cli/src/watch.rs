@@ -9152,7 +9152,13 @@ async fn watch_history(
         .as_ref()
         .is_none_or(|changes| changes.has_changed().is_err())
     {
-        app.collaboration_history.changes = Some(collaboration_revision_updates(client.clone()));
+        let mut changes = collaboration_revision_updates(client.clone());
+        // Establish the subscription before the first snapshot. Otherwise the
+        // later ACK changes None to Some(0) and repeats the entire history read.
+        // The client bounds the handshake; rejection closes this channel and
+        // retains the legacy polling fallback. Events racing the read stay dirty.
+        let _ = changes.changed().await;
+        app.collaboration_history.changes = Some(changes);
         app.collaboration_history.revision = None;
     }
     // Read the revision before the snapshot. A racing update remains dirty.
@@ -30786,6 +30792,101 @@ sort = ["state"]
         sender.send_replace(Some(8));
         let updated = watch_history(&client, &mut app, &origin).await.unwrap();
         assert_eq!(first, updated);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn first_history_snapshot_waits_for_subscription_and_keeps_racing_updates() {
+        use serde_json::json;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("first-history.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let (race, race_rx) = tokio::sync::oneshot::channel();
+        let (finish, finish_rx) = tokio::sync::oneshot::channel();
+        let row = collab_request("%2");
+        let server = tokio::spawn(async move {
+            let mut race_rx = Some(race_rx);
+            // The subscription must be acknowledged before the first list.
+            let (stream, _) = listener.accept().await.unwrap();
+            let (read, mut subscription) = stream.into_split();
+            let mut reader = BufReader::new(read);
+            for kind in ["hello", "collaboration_subscribe"] {
+                let mut line = String::new();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                    kind
+                );
+                subscription.write_all(b"{\"ok\":true}\n").await.unwrap();
+            }
+            // First snapshot, then a refresh whose read races an invalidation,
+            // then the necessary refresh of that dirty snapshot.
+            for index in 0..3 {
+                if index == 1 {
+                    race_rx.take().unwrap().await.unwrap();
+                    subscription.write_all(b"{\"revision\":1}\n").await.unwrap();
+                }
+                let (stream, _) = listener.accept().await.unwrap();
+                let (read, mut write) = stream.into_split();
+                let mut reader = BufReader::new(read);
+                for kind in ["hello", "collaboration_list"] {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                        kind
+                    );
+                    if kind == "hello" {
+                        write.write_all(b"{\"ok\":true}\n").await.unwrap();
+                    }
+                }
+                if index == 1 {
+                    subscription.write_all(b"{\"revision\":2}\n").await.unwrap();
+                }
+                let response = json!({"ok":true,"collaboration_scope":"all",
+                    "collaboration_page":{"requests":[row],"total":1,"has_more":false}});
+                write
+                    .write_all(format!("{response}\n").as_bytes())
+                    .await
+                    .unwrap();
+            }
+            tokio::select! {
+                extra = listener.accept() => panic!("unchanged history opened another connection: {extra:?}"),
+                _ = finish_rx => (),
+            }
+        });
+        let client = Client::new(socket);
+        let mut app = collab_app("%2");
+        let origin = CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        };
+        let first = watch_history(&client, &mut app, &origin).await.unwrap();
+        assert_eq!(app.collaboration_history.revision, Some(0));
+        assert_eq!(
+            watch_history(&client, &mut app, &origin).await.unwrap(),
+            first
+        );
+        race.send(()).unwrap();
+        let changes = app.collaboration_history.changes.as_mut().unwrap();
+        changes.changed().await.unwrap();
+        watch_history(&client, &mut app, &origin).await.unwrap();
+        let changes = app.collaboration_history.changes.as_mut().unwrap();
+        if *changes.borrow() != Some(2) {
+            changes.changed().await.unwrap();
+        }
+        watch_history(&client, &mut app, &origin).await.unwrap();
+        assert_eq!(app.collaboration_history.revision, Some(2));
+        assert_eq!(
+            watch_history(&client, &mut app, &origin).await.unwrap(),
+            first
+        );
+        finish.send(()).unwrap();
         server.await.unwrap();
     }
 
