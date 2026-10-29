@@ -66,7 +66,9 @@ where
     stdin.read_to_string(&mut buf)?;
     let input: A::Input = serde_json::from_str(&buf)?;
     let surface = muxa_session_env();
-    let pane = if surface.is_some()
+    let headless = std::env::var_os(crate::ask::ASK_ENV_MARKER).is_some();
+    let pane = if headless
+        || surface.is_some()
         || (A::KIND == AgentKind::Codex
             && crate::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id()))
     {
@@ -80,7 +82,7 @@ where
             .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()))
     };
     let mut ev = A::normalize(event, input, pane);
-    if let Some(surface) = surface {
+    if let Some(surface) = surface.filter(|_| !headless) {
         ev.id_mut().surface = Some(surface);
     } else if ev
         .id()

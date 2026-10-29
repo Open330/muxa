@@ -211,7 +211,7 @@ pub(super) fn validate_report(
     }
     let Some(report) = report else {
         return if status == RequestStatus::Completed {
-            Err(invalid("completed contracted work requires a task report; use a supporting CLI: muxa msg inbox --json, then muxa msg reply REQUEST_ID BODY --report FILE (or reload MCP)"))
+            Err(invalid(format!("completed contracted work requires a task report; read only this request with muxa msg accept {} --json if needed, then muxa msg reply {} BODY --report FILE (or reload MCP)",request.id,request.id)))
         } else {
             Ok(())
         };

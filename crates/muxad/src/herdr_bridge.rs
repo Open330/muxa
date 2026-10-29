@@ -1289,6 +1289,7 @@ mod tests {
     /// `last_notification`) carry meaning; the rest are inert.
     fn agent(kind: AgentKind, session_id: &str, pane: &str, state: AgentState) -> Agent {
         Agent {
+            ask_origin: None,
             kind,
             session_id: session_id.to_owned(),
             surface: None,

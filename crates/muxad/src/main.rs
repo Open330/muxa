@@ -76,8 +76,12 @@ const AUTOMATION_MAX_IDLE_SECONDS: u64 = 60;
 const AUTOMATION_PANE_CACHE_SECONDS: u64 = 10;
 
 #[derive(Debug, Parser)]
+#[allow(clippy::struct_excessive_bools)] // independent CLI switches
 #[command(name = "muxad", version, about = "muxa daemon")]
 struct Args {
+    /// Validate startup configuration and exit without side effects.
+    #[arg(long, hide = true)]
+    check_config: bool,
     /// Unix socket path. Overrides config and XDG default.
     #[arg(long, env = "MUXA_SOCKET")]
     socket: Option<PathBuf>,
@@ -126,6 +130,13 @@ struct Args {
 #[allow(clippy::too_many_lines)] // daemon bootstrap wires long-lived tasks in startup order
 async fn main() -> Result<()> {
     let args = Args::parse();
+    if args.check_config {
+        let path = args.config.clone().or_else(paths::default_config_file);
+        let cfg = Config::load_or_default(path.as_deref())?;
+        cfg.validate_for_daemon()?;
+        resolve_dashboard_config(&cfg, &args)?;
+        return Ok(());
+    }
 
     // Initialize tracing BEFORE loading config so any `tracing::warn!`
     // emitted by `Config::load` (unknown `[watch] columns` keys, unknown
@@ -218,10 +229,10 @@ async fn main() -> Result<()> {
     let (activity_transition_shutdown_tx, _) = broadcast::channel::<()>(1);
     let (writer_shutdown_tx, _) = broadcast::channel::<()>(1);
 
-    let restart = Arc::new(RestartController::new(
-        restart_generation(),
-        shutdown_tx.clone(),
-    ));
+    let restart = Arc::new(
+        RestartController::new(restart_generation(), shutdown_tx.clone())
+            .with_upgrade_check(muxa::binary_upgrade::UpgradeCheck::current()),
+    );
     install_shutdown_signal_handler(Arc::clone(&restart));
 
     // Prompt history must exist before the store: every PromptSubmitted
@@ -308,12 +319,21 @@ async fn main() -> Result<()> {
     )
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
+    let directory_max_age = if cfg.reconciler.enabled {
+        cfg.reconciler.interval_secs.saturating_add(2)
+    } else {
+        2
+    };
+    let agent_directory = Arc::new(muxa::agent_directory::AgentDirectory::with_max_age(
+        std::time::Duration::from_secs(directory_max_age),
+    ));
     let reconciler_handle = spawn_reconciler_task(
         &cfg,
         &store,
         &shutdown_tx,
         backends.clone(),
         sessions.clone(),
+        Arc::clone(&agent_directory),
     );
     let binary_watch_handle = spawn_binary_watch_task(&cfg, &shutdown_tx, Arc::clone(&restart));
     // herdr event bridge (Phase 2): spawned when herdr ∈ the observed set.
@@ -476,6 +496,7 @@ async fn main() -> Result<()> {
         .with_collaboration(collaboration)
         .with_collaboration_audit(collaboration_audit)
         .with_ask(ask)
+        .with_agent_directory(agent_directory)
         .with_automation(automation)
         .with_config_path(config_path.clone())
         .with_fleet(fleet_runtime)
@@ -557,7 +578,7 @@ async fn main() -> Result<()> {
     await_shutdown_task("state snapshotter", snap_handle).await;
     server_result??;
     if restart.restart_requested() {
-        return Err(reexec_self().into());
+        return Err(reexec_self(restart.validated_launch().await).into());
     }
     Ok(())
 }
@@ -578,7 +599,7 @@ fn restart_generation() -> u64 {
 /// Windows has no `exec`: the replacement is spawned as a new process and this
 /// one exits once the spawn succeeds. The IPC endpoint was already released by
 /// the drain above, so the successor can bind it; the pid changes.
-fn reexec_self() -> std::io::Error {
+fn reexec_self(approved: Option<muxa::binary_upgrade::ValidatedLaunch>) -> std::io::Error {
     #[cfg(unix)]
     use std::os::unix::process::CommandExt;
 
@@ -588,7 +609,16 @@ fn reexec_self() -> std::io::Error {
     };
     let next = restart_generation().saturating_add(1);
     tracing::info!(?program, generation = next, "restarting: re-executing self");
-    let mut command = std::process::Command::new(&program);
+    let target = match &approved {
+        Some(checked) => match checked.execution_path() {
+            Ok(path) => path,
+            Err(error) => return error,
+        },
+        None => PathBuf::from(&program),
+    };
+    let mut command = std::process::Command::new(&target);
+    #[cfg(unix)]
+    command.arg0(&program);
     command
         .args(argv)
         .env(RESTART_GENERATION_ENV, next.to_string());
@@ -1907,6 +1937,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
                 &request,
                 backends,
                 quiet,
+                wake_payload,
             )
             .await
             {
@@ -2146,6 +2177,7 @@ async fn deliver_full_collaboration_request(
     pending: &CollaborationRequest,
     backends: &[muxa::SharedBackend],
     quiet: usize,
+    wake_payload: CollaborationWakePayload,
 ) -> bool {
     let io_guard = Arc::new(collaboration.worker_action_guard(&recipient.pane).await);
     if collaboration
@@ -2179,7 +2211,14 @@ async fn deliver_full_collaboration_request(
         Some(WakeDeliveryState::Prepared) => {
             let prompt = with_quiet_notices(
                 if newly_prepared {
-                    full_collaboration_request_prompt(&request)
+                    if wake_payload == CollaborationWakePayload::Adaptive && !request.from.console {
+                        // Re-evaluate after the atomic claim: amendments may
+                        // have arrived since the waker selected this request.
+                        muxa::collaboration::instruction::short_inline_prompt(&request)
+                            .unwrap_or_else(|| mailbox_collaboration_request_prompt(&request))
+                    } else {
+                        full_collaboration_request_prompt(&request)
+                    }
                 } else {
                     interrupted_collaboration_request_prompt(&request)
                 },
@@ -2249,7 +2288,7 @@ async fn mark_collaboration_request_notified(collaboration: &CollaborationStore,
 
 fn collaboration_reply_instruction(request: &CollaborationRequest) -> String {
     if let (Some(contract), Some(attempt)) = (&request.task_contract, &request.attempt) {
-        return format!("Carries task contract {}, attempt {}. Completion requires a typed report. Use a supporting CLI: `muxa msg inbox --json`, then `muxa msg reply {} BODY --report FILE`; upgrade/reload an older MCP if it omits the contract/report fields. Follow the full contract and do not infer completion from prose.",contract.task_id,attempt.id,request.id);
+        return format!("Carries task contract {}, attempt {}. Completion requires a typed report. Use a supporting CLI: `muxa msg reply {} BODY --report FILE`; upgrade/reload an older MCP if it omits the contract/report fields. Follow the full contract and do not infer completion from prose.",contract.task_id,attempt.id,request.id);
     }
     if request.expects_reply {
         format!(
@@ -2262,13 +2301,36 @@ fn collaboration_reply_instruction(request: &CollaborationRequest) -> String {
 }
 
 fn mailbox_collaboration_request_prompt(request: &CollaborationRequest) -> String {
-    format!(
-        "[muxa:{}] New {:?} request {}. Claim/read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths. {}",
-        request.id,
-        request.kind,
-        collaboration_request_source(request),
-        collaboration_reply_instruction(request),
-    )
+    let represented = request.from.label();
+    let source = if request.provenance.as_ref().is_some_and(|p| {
+        matches!(
+            p.client_kind,
+            CollaborationClientKind::Watch | CollaborationClientKind::Dashboard
+        )
+    }) {
+        collaboration_request_source(request)
+    } else {
+        format!("from {represented}")
+    };
+    let mismatch = request
+        .provenance
+        .as_ref()
+        .map_or(String::new(), |p| match p.origin_match {
+            CollaborationOriginMatch::Matched => String::new(),
+            other => format!(" (origin {other})"),
+        });
+    let reply = if request.task_contract.is_some() {
+        collaboration_reply_instruction(request)
+    } else if request.expects_reply {
+        format!(
+            "Reply: `muxa msg reply {} BODY` (or muxa_reply).",
+            request.id
+        )
+    } else {
+        "No reply is expected.".into()
+    };
+    format!("[muxa:{}] {:?} {source}{mismatch}. Read one: muxa_inbox(request_id=\"{}\") or `muxa msg accept {} --json`. Honor kind/work_mode/paths. {reply}",
+        request.id,request.kind,request.id,request.id)
 }
 
 fn full_collaboration_request_prompt(request: &CollaborationRequest) -> String {
@@ -2309,7 +2371,7 @@ fn with_quiet_notices(mut prompt: String, quiet: usize) -> String {
         let _ = std::fmt::Write::write_fmt(
             &mut prompt,
             format_args!(
-            "\n[muxa] Also waiting: {quiet} one-way notice{} (no reply expected); read with muxa_inbox or `muxa msg inbox --json`.",
+            "\n[muxa] Also waiting: {quiet} one-way notice{} (no reply expected); read with muxa_inbox or `muxa msg inbox`.",
             if quiet == 1 { "" } else { "s" },
             ),
         );
@@ -2319,9 +2381,11 @@ fn with_quiet_notices(mut prompt: String, quiet: usize) -> String {
 
 fn interrupted_collaboration_request_prompt(request: &CollaborationRequest) -> String {
     format!(
-        "[muxa:{}] Direct {} request delivery was interrupted after it was claimed. Read it with muxa_inbox (MCP) or `muxa msg inbox --json`; honor kind/work_mode/paths. {}",
+        "[muxa:{}] Direct {} request delivery was interrupted after it was claimed. Read only this request with muxa_inbox(request_id=\"{}\") (MCP) or `muxa msg accept {} --json`; honor kind/work_mode/paths. {}",
         request.id,
         collaboration_request_kind(request.kind),
+        request.id,
+        request.id,
         collaboration_reply_instruction(request),
     )
 }
@@ -2343,8 +2407,7 @@ fn collaboration_work_mode(mode: muxa::collaboration::WorkMode) -> &'static str 
 }
 
 fn direct_wake_body_is_terminal_safe(body: &str) -> bool {
-    body.chars()
-        .all(|character| matches!(character, '\n' | '\t') || !character.is_control())
+    muxa::collaboration::instruction::terminal_safe(body)
 }
 
 fn collaboration_wake_includes_body(
@@ -2357,6 +2420,10 @@ fn collaboration_wake_includes_body(
     match wake_payload {
         CollaborationWakePayload::Notice => false,
         CollaborationWakePayload::OperatorFull => request.from.console,
+        CollaborationWakePayload::Adaptive => {
+            request.from.console
+                || muxa::collaboration::instruction::short_inline_prompt(request).is_some()
+        }
         CollaborationWakePayload::Full => true,
     }
 }
@@ -2982,6 +3049,7 @@ fn spawn_reconciler_task(
     shutdown_tx: &broadcast::Sender<()>,
     backends: Vec<muxa::SharedBackend>,
     sessions: muxa::session::SharedSessionBackend,
+    agent_directory: Arc<muxa::agent_directory::AgentDirectory>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     if !cfg.reconciler.enabled {
         tracing::info!("reconciler disabled by config");
@@ -3019,7 +3087,8 @@ fn spawn_reconciler_task(
         cfg.reconciler.paneless_stale_timeout_secs,
     ))
     .with_paneless_max_live(cfg.reconciler.paneless_max_live_rows)
-    .with_codex_sessions_root(codex_sessions_root.clone());
+    .with_codex_sessions_root(codex_sessions_root.clone())
+    .with_agent_directory(agent_directory);
     let shutdown_rx = shutdown_tx.subscribe();
     let handle = tokio::spawn(runner.run(shutdown_rx));
     tracing::info!(
@@ -3058,7 +3127,13 @@ fn spawn_binary_watch_task(
         tracing::warn!("cannot resolve the binary to watch; upgrades will not restart the daemon");
         return None;
     };
-    let Some(baseline) = binary_watch::BinaryIdentity::read(&path) else {
+    #[cfg(target_os = "linux")]
+    let running = binary_watch::BinaryIdentity::read(std::path::Path::new("/proc/self/exe"));
+    #[cfg(not(target_os = "linux"))]
+    let running = std::env::current_exe()
+        .ok()
+        .and_then(|image| binary_watch::BinaryIdentity::read(&image));
+    let Some(baseline) = running else {
         // Watching from no baseline would make the first successful read look
         // like an upgrade and restart a daemon that nothing had replaced.
         tracing::warn!(
@@ -3076,6 +3151,7 @@ fn spawn_binary_watch_task(
     );
     Some(tokio::spawn(async move {
         let mut watch = binary_watch::BinaryWatch::new(baseline);
+        let mut blocked = None;
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick of a tokio interval completes immediately, and the
@@ -3093,14 +3169,24 @@ fn spawn_binary_watch_task(
                 tokio::task::spawn_blocking(move || binary_watch::BinaryIdentity::read(&path))
                     .await
                     .unwrap_or(None);
-            if watch.observe(observed) {
-                if restart.request_self_restart() {
-                    tracing::info!("installed binary changed; restarting onto it");
-                } else {
-                    // An operator's stop has already won. Leave it stopping.
-                    tracing::debug!("installed binary changed during shutdown; not restarting");
+            if watch.observe(observed) || blocked.is_some() {
+                let stamp = restart.upgrade_stamp().ok().flatten();
+                if stamp.is_some() && stamp == blocked {
+                    continue;
                 }
-                return;
+                blocked = stamp;
+                match restart.request_checked_restart().await {
+                    Ok(true) => {
+                        tracing::info!(
+                            "installed binary changed; restarting onto validated target"
+                        );
+                        return;
+                    }
+                    Ok(false) => return,
+                    Err(reason) => {
+                        tracing::warn!(%reason,"upgrade blocked; daemon stays available");
+                    }
+                }
             }
         }
     }))
@@ -3319,6 +3405,7 @@ async fn enrich_from_history(
             continue;
         }
         candidates.push(muxa::Agent {
+            ask_origin: None,
             kind: entry.kind,
             session_id: entry.session_id,
             surface: None,
@@ -4098,6 +4185,7 @@ mod tests {
         for payload in [
             CollaborationWakePayload::Notice,
             CollaborationWakePayload::OperatorFull,
+            CollaborationWakePayload::Adaptive,
             CollaborationWakePayload::Full,
         ] {
             let store = muxa::Store::shared();
@@ -4379,6 +4467,7 @@ mod tests {
         for payload in [
             CollaborationWakePayload::Notice,
             CollaborationWakePayload::OperatorFull,
+            CollaborationWakePayload::Adaptive,
             CollaborationWakePayload::Full,
         ] {
             let store = muxa::Store::shared();
@@ -4899,7 +4988,13 @@ mod tests {
         {
             let delivered = sends.lock().unwrap();
             assert_eq!(delivered.len(), 2);
-            assert!(delivered[0].1.contains("muxa_inbox"));
+            assert!(delivered[0]
+                .1
+                .contains(&format!("muxa_inbox(request_id=\"{}\")", agent_request.id)));
+            assert!(delivered[0]
+                .1
+                .contains(&format!("muxa msg accept {} --json", agent_request.id)));
+            assert!(!delivered[0].1.contains("muxa msg inbox --json"));
             assert!(!delivered[0].1.contains("agent delegated body"));
         }
         let stored = mailbox
@@ -5012,118 +5107,132 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // explicit durable request/recovery fixtures
-    async fn full_wake_recovers_without_reinjecting_the_request_body() {
-        let store = muxa::Store::shared();
-        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
-        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
-        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
-        let participants = worker_participants(&store.snapshot().await, &panes);
-        let sender = participants
-            .iter()
-            .find(|participant| participant.pane == "%1")
-            .unwrap()
-            .clone();
-        let recipient = participants
-            .iter()
-            .find(|participant| participant.pane == "%2")
-            .unwrap()
-            .clone();
-        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
-        authorize_test_workers(&mailbox, &participants).await;
-        let request = mailbox
-            .create(
-                sender.clone(),
-                recipient.clone(),
-                NewRequest {
-                    human_action: None,
-                    initiator: None,
-                    kind: RequestKind::Task,
-                    body: "do not inject this twice".into(),
-                    work_mode: WorkMode::Execute,
-                    ..NewRequest::default()
-                },
-            )
-            .await
-            .unwrap();
-        mailbox
-            .prepare_direct_wake(&recipient, &request.id)
-            .await
-            .unwrap()
-            .unwrap();
-        let sends = Arc::new(Mutex::new(Vec::new()));
-        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
-            panes: panes.clone(),
-            sends: sends.clone(),
-        });
+    async fn direct_wake_recovers_without_reinjecting_the_request_body() {
+        for payload in [
+            CollaborationWakePayload::Full,
+            CollaborationWakePayload::Adaptive,
+        ] {
+            let store = muxa::Store::shared();
+            add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+            add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+            let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+            let participants = worker_participants(&store.snapshot().await, &panes);
+            let sender = participants
+                .iter()
+                .find(|participant| participant.pane == "%1")
+                .unwrap()
+                .clone();
+            let recipient = participants
+                .iter()
+                .find(|participant| participant.pane == "%2")
+                .unwrap()
+                .clone();
+            let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+            authorize_test_workers(&mailbox, &participants).await;
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        human_action: None,
+                        initiator: None,
+                        kind: RequestKind::Task,
+                        body: "do not inject this twice".into(),
+                        work_mode: WorkMode::Execute,
+                        ..NewRequest::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox
+                .prepare_direct_wake(&recipient, &request.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let sends = Arc::new(Mutex::new(Vec::new()));
+            let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+                panes: panes.clone(),
+                sends: sends.clone(),
+            });
 
-        wake_idle_collaboration_peers_with_full_payload(
-            &mailbox,
-            &store,
-            std::slice::from_ref(&backend),
-        )
-        .await;
-        {
-            let delivered = sends.lock().unwrap();
-            assert_eq!(delivered.len(), 2);
-            assert!(delivered[0].1.contains("delivery was interrupted"));
-            assert!(delivered[0].1.contains("muxa_inbox"));
-            assert!(!delivered[0].1.contains("do not inject this twice"));
-            assert_eq!(delivered[1], ("%2".into(), "\r".into()));
+            wake_idle_collaboration_peers_with_inflight(
+                &mailbox,
+                &store,
+                std::slice::from_ref(&backend),
+                payload,
+                &mut HashSet::new(),
+            )
+            .await;
+            {
+                let delivered = sends.lock().unwrap();
+                assert_eq!(delivered.len(), 2);
+                assert!(delivered[0].1.contains("delivery was interrupted"));
+                assert!(delivered[0].1.contains("muxa_inbox"));
+                assert!(!delivered[0].1.contains("do not inject this twice"));
+                assert_eq!(delivered[1], ("%2".into(), "\r".into()));
+            }
+            assert_eq!(
+                mailbox.pending_unnotified().await,
+                [] as [muxa::collaboration::CollaborationRequest; 0]
+            );
+
+            let second = mailbox
+                .create(
+                    sender,
+                    recipient.clone(),
+                    NewRequest {
+                        task_contract: None,
+                        supersedes_request_id: None,
+                        dispatch_id: None,
+                        source_node_id: None,
+                        delegation_parent: None,
+                        human_action: None,
+                        initiator: None,
+                        kind: RequestKind::Task,
+                        body: "the prompt text is already buffered".into(),
+                        expects_reply: true,
+                        notify: None,
+                        work_mode: WorkMode::Execute,
+                        thread_id: None,
+                        parent_request_id: None,
+                        workspace_id: None,
+                        work_id: None,
+                        run_id: None,
+                        paths: Vec::new(),
+                        artifacts: Vec::new(),
+                        links: Vec::new(),
+                        air_artifacts: Vec::new(),
+                        withdraw_reply_wakes: Vec::new(),
+                        recipient_slot: None,
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox
+                .prepare_direct_wake(&recipient, &second.id)
+                .await
+                .unwrap()
+                .unwrap();
+            mailbox.mark_wake_prompt_written(&second.id).await.unwrap();
+            sends.lock().unwrap().clear();
+
+            wake_idle_collaboration_peers_with_inflight(
+                &mailbox,
+                &store,
+                &[backend],
+                payload,
+                &mut HashSet::new(),
+            )
+            .await;
+            assert_eq!(
+                sends.lock().unwrap().as_slice(),
+                &[("%2".into(), "\r".into())]
+            );
+            assert_eq!(
+                mailbox.pending_unnotified().await,
+                [] as [muxa::collaboration::CollaborationRequest; 0]
+            );
         }
-        assert_eq!(
-            mailbox.pending_unnotified().await,
-            [] as [muxa::collaboration::CollaborationRequest; 0]
-        );
-
-        let second = mailbox
-            .create(
-                sender,
-                recipient.clone(),
-                NewRequest {
-                    task_contract: None,
-                    supersedes_request_id: None,
-                    dispatch_id: None,
-                    source_node_id: None,
-                    delegation_parent: None,
-                    human_action: None,
-                    initiator: None,
-                    kind: RequestKind::Task,
-                    body: "the prompt text is already buffered".into(),
-                    expects_reply: true,
-                    notify: None,
-                    work_mode: WorkMode::Execute,
-                    thread_id: None,
-                    parent_request_id: None,
-                    workspace_id: None,
-                    work_id: None,
-                    run_id: None,
-                    paths: Vec::new(),
-                    artifacts: Vec::new(),
-                    links: Vec::new(),
-                    air_artifacts: Vec::new(),
-                    withdraw_reply_wakes: Vec::new(),
-                    recipient_slot: None,
-                },
-            )
-            .await
-            .unwrap();
-        mailbox
-            .prepare_direct_wake(&recipient, &second.id)
-            .await
-            .unwrap()
-            .unwrap();
-        mailbox.mark_wake_prompt_written(&second.id).await.unwrap();
-        sends.lock().unwrap().clear();
-
-        wake_idle_collaboration_peers_with_full_payload(&mailbox, &store, &[backend]).await;
-        assert_eq!(
-            sends.lock().unwrap().as_slice(),
-            &[("%2".into(), "\r".into())]
-        );
-        assert_eq!(
-            mailbox.pending_unnotified().await,
-            [] as [muxa::collaboration::CollaborationRequest; 0]
-        );
     }
 
     /// Replies that piled up while the sender worked arrive as one prompt,
@@ -5549,7 +5658,9 @@ mod tests {
             assert_eq!(sends.len(), 2);
             assert_eq!(sends[0].0, "%2");
             assert!(sends[0].1.contains("muxa_inbox"));
-            assert!(sends[0].1.contains("muxa msg inbox --json"));
+            assert!(sends[0]
+                .1
+                .contains(&format!("muxa msg accept {} --json", request.id)));
             assert!(sends[0].1.contains("kind/work_mode/paths"));
             assert!(sends[0].1.contains("via muxa watch representing codex@%1"));
             assert!(sends[0].1.contains("caller %1, pid 4242"));
@@ -6329,7 +6440,14 @@ mod tests {
             assert!(prompt.contains(&request.attempt.as_ref().unwrap().id));
             assert!(prompt.contains("--report FILE"));
             assert!(prompt.contains("upgrade/reload"));
+            assert!(prompt.contains(&format!("muxa msg accept {} --json", request.id)));
         }
+        let full = full_collaboration_request_prompt(&request);
+        assert!(full.contains("already claimed"));
+        assert!(full.contains("--report FILE"));
+        assert!(full.contains("task_contract:"));
+        assert!(!full.contains("muxa msg inbox"));
+        assert!(!full.contains("muxa msg accept"));
     }
 
     #[tokio::test]
@@ -6424,6 +6542,7 @@ mod tests {
     }
     #[cfg(target_os = "linux")]
     #[tokio::test]
+    #[allow(clippy::too_many_lines)] // three persisted drain gates share one worker fixture
     async fn worker_drain_gates_ordinary_wakes_full_delivery_and_automation_io() {
         let child = Child(
             std::process::Command::new("bash")
@@ -6497,7 +6616,17 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(!deliver_full_collaboration_request(&c, p, &request, &backends, 0).await);
+        assert!(
+            !deliver_full_collaboration_request(
+                &c,
+                p,
+                &request,
+                &backends,
+                0,
+                CollaborationWakePayload::Full
+            )
+            .await
+        );
         let mut engine = AutomationEngine::new(
             AutomationStore::in_memory(resume_rule_config()),
             store,
@@ -6520,5 +6649,97 @@ mod tests {
         };
         assert!(!engine.perform(&firing).await);
         assert!(sends.lock().unwrap().is_empty());
+    }
+    #[test]
+    fn reference_wake_overhead_is_bounded_independently_of_body_size() {
+        let participant = serde_json::json!({"agent_kind":"codex","agent_session_id":"01a1820e-a385-79d0-acfd-8ebda41e2d5b","pane":"rmux:%290","room":{"host":"rmux","window_id":"@34"},"state":"idle"});
+        let mut request:CollaborationRequest=serde_json::from_value(serde_json::json!({"id":"req_0123456789abcdef_1","from":participant,"to":participant,"kind":"review","body":"short","expects_reply":true,"work_mode":"read_only","status":"queued","created_at":"2026-10-28T00:00:00Z"})).unwrap();
+        let short = mailbox_collaboration_request_prompt(&request);
+        request.body = "한글 장문 요청\n".repeat(4096);
+        let long = mailbox_collaboration_request_prompt(&request);
+        assert_eq!(short, long);
+        assert!(short.len() <= 320, "{} bytes: {short}", short.len());
+        assert!(short.contains("muxa msg accept"));
+        assert!(short.contains("muxa_inbox(request_id="));
+        assert!(!short.contains("장문"));
+        if let Ok(path) = std::env::var("MUXA_WAKE_OVERHEAD_REPORT") {
+            std::fs::write(path,serde_json::json!({"reference_wake_bytes":short.len(),"wake":short,"body_repetitions":0}).to_string()).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn adaptive_wake_claims_once_with_shared_instructions_and_no_initial_read() {
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+        add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let participants = worker_participants(&store.snapshot().await, &panes);
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
+        let request = mailbox
+            .create(
+                participants[0].clone(),
+                participants[1].clone(),
+                NewRequest {
+                    kind: RequestKind::Review,
+                    body: "verify this small change".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: muxa::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        wake_idle_collaboration_peers_with_inflight(
+            &mailbox,
+            &store,
+            std::slice::from_ref(&backend),
+            CollaborationWakePayload::Adaptive,
+            &mut HashSet::new(),
+        )
+        .await;
+        let saved = mailbox
+            .peek_for(&participants[1], &request.id)
+            .await
+            .unwrap();
+        assert_eq!(saved.status, RequestStatus::Claimed);
+        assert!(saved.claimed_at.is_some());
+        assert!(saved.notified_at.is_some());
+        assert!(saved.wake_delivery.is_none());
+        let delivered = sends.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 2);
+        let inline = &delivered[0].1;
+        let encoded = inline
+            .split("--- peer request ---\n")
+            .nth(1)
+            .unwrap()
+            .split("\n--- end peer request ---")
+            .next()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(encoded).unwrap(),
+            muxa::collaboration::instruction::inbox_instruction(&saved)
+        );
+        assert!(inline.contains("Already claimed"));
+        assert_eq!(delivered[1].1, "\r");
+        wake_idle_collaboration_peers_with_inflight(
+            &mailbox,
+            &store,
+            &[backend],
+            CollaborationWakePayload::Adaptive,
+            &mut HashSet::new(),
+        )
+        .await;
+        assert_eq!(sends.lock().unwrap().len(), 2);
+        let pull = muxa::collaboration::instruction::inbox_instruction(&saved)
+            .to_string()
+            .len();
+        let reference = mailbox_collaboration_request_prompt(&saved).len() + pull;
+        assert!(inline.len() < reference);
+        if let Ok(path) = std::env::var("MUXA_SHORT_DELIVERY_REPORT") {
+            std::fs::write(path,serde_json::json!({"body_bytes":saved.body.len(),"inline_received_bytes":inline.len(),"inline_extra_bytes":inline.len()-saved.body.len(),"reference_wake_and_read_bytes":reference,"reference_extra_bytes":reference-saved.body.len(),"inline_initial_reads":0,"reference_initial_reads":1}).to_string()).unwrap();
+        }
     }
 }

@@ -213,6 +213,7 @@ private func collaborationPayloadTitle(_ payload: MuxaCollaborationWakePayload) 
     switch payload {
     case .notice: String(localized: "A notice only")
     case .operatorFull: String(localized: "Your requests in full")
+    case .adaptive: String(localized: "Short worker requests inline")
     case .full: String(localized: "Every request in full")
     }
 }
@@ -223,6 +224,8 @@ private func collaborationPayloadDetail(_ payload: MuxaCollaborationWakePayload)
         String(localized: "The agent is told it has mail and fetches the request itself.")
     case .operatorFull:
         String(localized: "Requests you send are delivered as text; agent-to-agent requests stay in the mailbox.")
+    case .adaptive:
+        String(localized: "Small read-only worker requests arrive in one turn; other agent requests stay in the mailbox.")
     case .full:
         String(localized: "Every request is delivered as text, whoever sent it.")
     }

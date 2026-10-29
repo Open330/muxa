@@ -807,7 +807,8 @@ pub struct CollaborationConfig {
     /// `notice` injects only a mailbox notification. `operator_full` (the
     /// default) directly delivers requests sent by an operator console while
     /// keeping agent-originated requests in the mailbox. `full` directly
-    /// delivers every request.
+    /// delivers every request. `adaptive` also delivers bounded read-only
+    /// worker requests inline, avoiding their initial inbox read.
     pub wake_payload: CollaborationWakePayload,
     /// How far an explicit `pane:%N` target may reach. `window` (default)
     /// keeps requests inside the sender's tmux window — co-locating agents
@@ -863,6 +864,8 @@ pub enum CollaborationWakePayload {
     Notice,
     #[default]
     OperatorFull,
+    /// Inline bounded read-only worker requests; retain operator/full and reference fallbacks.
+    Adaptive,
     Full,
 }
 
@@ -3046,6 +3049,12 @@ knobs = ["a", "b"]
             CollaborationWakePayload::OperatorFull
         );
 
+        let adaptive: Config =
+            toml::from_str("[collaboration]\nwake_payload=\"adaptive\"\n").unwrap();
+        assert_eq!(
+            adaptive.collaboration.wake_payload,
+            CollaborationWakePayload::Adaptive
+        );
         let operator: Config =
             toml::from_str("[collaboration]\nwake_payload = \"operator_full\"\n").unwrap();
         assert_eq!(

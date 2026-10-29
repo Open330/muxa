@@ -5,6 +5,7 @@ mod parse;
 use index::{index_file, source_current};
 mod query;
 
+pub(crate) use parse::redact;
 pub use parse::Event;
 pub use query::QueryPlan;
 use rusqlite::{params, params_from_iter, Connection};

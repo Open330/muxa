@@ -819,6 +819,7 @@ mod tests {
     fn agent(pane: &str, state: AgentState) -> Agent {
         let now = OffsetDateTime::now_utc();
         Agent {
+            ask_origin: None,
             kind: AgentKind::Codex,
             session_id: format!("s-{pane}"),
             surface: None,

@@ -3112,6 +3112,7 @@ mod tests {
         let agent = |socket: Option<&str>| {
             let now = time::OffsetDateTime::now_utc();
             muxa::Agent {
+                ask_origin: None,
                 kind: AgentKind::ClaudeCode,
                 session_id: "abc-123".into(),
                 surface: None,

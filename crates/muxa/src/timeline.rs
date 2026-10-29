@@ -3356,6 +3356,7 @@ mod tests {
         last_activity_at: OffsetDateTime,
     ) -> Agent {
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: AgentKind::Codex,

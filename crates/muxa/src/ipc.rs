@@ -199,8 +199,19 @@ impl RuntimeError {
 enum RequestBody {
     Ingest {
         event: AgentEvent,
+        #[serde(default)]
+        ask_entry: Option<String>,
     },
     Snapshot,
+    InvalidateAgentDirectory,
+    AgentFind {
+        query: String,
+        limit: usize,
+        #[serde(default)]
+        exclude_sessions: Vec<String>,
+        #[serde(default)]
+        refresh: bool,
+    },
     /// Ask the room's namespace arbiter for a handle. The daemon is the only
     /// place that sees pane options, registered identities, and handles
     /// promised to callers that have not written them yet.
@@ -963,6 +974,7 @@ const CAPABILITIES: &[&str] = &[
     "ask_send_new_v1",
     "ask_subscribe",
     "ask_providers_v1",
+    crate::agent_directory::CAPABILITY,
     "ask_provider_default_v1",
     "work_compose_v1",
     "automation_v1",
@@ -991,6 +1003,8 @@ pub struct Response {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agents: Option<Vec<Agent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_locations: Option<crate::agent_locator::LocationResults>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub prompts: Option<Vec<crate::history::HistoryEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1167,6 +1181,7 @@ impl Response {
             protocol: PROTOCOL_VERSION,
             error: None,
             agents: None,
+            agent_locations: None,
             prompts: None,
             health: None,
             collaboration_error: None,
@@ -1479,6 +1494,8 @@ pub struct RestartController {
     generation: u64,
     state: AtomicU8,
     trigger: broadcast::Sender<()>,
+    upgrade_check: Option<crate::binary_upgrade::UpgradeCheck>,
+    approved: tokio::sync::Mutex<Option<crate::binary_upgrade::ValidatedLaunch>>,
 }
 
 impl RestartController {
@@ -1488,9 +1505,42 @@ impl RestartController {
             generation,
             state: AtomicU8::new(RESTART_RUNNING),
             trigger,
+            upgrade_check: None,
+            approved: tokio::sync::Mutex::new(None),
         }
     }
 
+    #[must_use]
+    pub fn with_upgrade_check(
+        mut self,
+        check: Option<crate::binary_upgrade::UpgradeCheck>,
+    ) -> Self {
+        self.upgrade_check = check;
+        self
+    }
+    pub fn upgrade_stamp(&self) -> Result<Option<crate::binary_upgrade::LaunchStamp>, String> {
+        self.upgrade_check
+            .as_ref()
+            .map(crate::binary_upgrade::UpgradeCheck::stamp)
+            .transpose()
+    }
+    pub async fn validated_launch(&self) -> Option<crate::binary_upgrade::ValidatedLaunch> {
+        self.approved.lock().await.clone()
+    }
+    /// Probe before broadcasting shutdown; refusal keeps IPC and writers alive.
+    pub async fn request_checked_restart(&self) -> Result<bool, String> {
+        let mut approved = self.approved.lock().await;
+        if self.restart_requested() {
+            return Ok(true);
+        }
+        if self.state.load(AtomicOrdering::SeqCst) == RESTART_STOPPING {
+            return Ok(false);
+        }
+        if let Some(check) = &self.upgrade_check {
+            *approved = Some(check.validate().await?);
+        }
+        Ok(self.request_restart())
+    }
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.generation
@@ -1506,15 +1556,6 @@ impl RestartController {
     #[must_use]
     pub fn restart_requested(&self) -> bool {
         self.state.load(AtomicOrdering::SeqCst) == RESTART_REQUESTED
-    }
-
-    /// Ask for a restart from inside the daemon itself, rather than over IPC.
-    ///
-    /// Same transition and the same refusal after a stop has won: a watcher
-    /// that notices a new binary mid-shutdown must not resurrect the process
-    /// the operator is deliberately stopping.
-    pub fn request_self_restart(&self) -> bool {
-        self.request_restart()
     }
 
     /// Returns false only after an explicit stop has won. Repeated restart
@@ -1878,6 +1919,7 @@ pub struct Server {
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    agent_directory: Arc<crate::agent_directory::AgentDirectory>,
     automation: Arc<AutomationStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
@@ -1897,6 +1939,8 @@ impl Server {
         let work_up = WorkUpManager::new(socket_path.clone());
         let mux_snapshots =
             crate::mux_snapshot_control::MuxSnapshotControl::new(socket_path.clone());
+        let ask = AskStore::in_memory(crate::ask::AskOptions::default());
+        ask.attach_registry(store.clone());
         Self {
             socket_path,
             store,
@@ -1905,7 +1949,8 @@ impl Server {
             sessions: PtySessionBackend::shared(),
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
             collaboration_audit: CollaborationAuditLog::in_memory(),
-            ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            ask,
+            agent_directory: Arc::default(),
             automation: AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
             restart: None,
             fleet: None,
@@ -1963,7 +2008,17 @@ impl Server {
 
     #[must_use]
     pub fn with_ask(mut self, ask: Arc<AskStore>) -> Self {
+        ask.attach_registry(self.store.clone());
         self.ask = ask;
+        self
+    }
+
+    #[must_use]
+    pub fn with_agent_directory(
+        mut self,
+        directory: Arc<crate::agent_directory::AgentDirectory>,
+    ) -> Self {
+        self.agent_directory = directory;
         self
     }
 
@@ -2146,6 +2201,7 @@ impl Server {
                     let collaboration = self.collaboration.clone();
                     let collaboration_audit = self.collaboration_audit.clone();
                     let ask = self.ask.clone();
+                    let agent_directory = self.agent_directory.clone();
                     let automation = self.automation.clone();
                     let restart = self.restart.clone();
                     let fleet = self.fleet.clone();
@@ -2167,6 +2223,7 @@ impl Server {
                                 collaboration,
                                 collaboration_audit,
                                 ask,
+                                agent_directory,
                                 automation,
                                 restart,
                                 fleet,
@@ -3172,24 +3229,34 @@ impl RequestPaneScan {
     /// [`PaneBackend::resolve_pane`] answered from the scan for hosts whose
     /// resolver is itself a lookup in that inventory (tmux exact id, rmux
     /// namespaced id). Other hosts keep their native resolver.
-    fn resolves(&self, backends: &[SharedBackend], pane: &str) -> bool {
-        backends
-            .iter()
-            .zip(&self.per_backend)
-            .any(|(backend, panes)| match backend.kind() {
-                HostKind::Tmux => panes.iter().any(|listed| listed.pane_id == pane),
-                HostKind::Rmux => {
-                    let namespaced = if pane.starts_with(crate::backend::rmux::PANE_ID_PREFIX) {
-                        pane.to_string()
-                    } else {
+    fn resolve_unique(&self, backends: &[SharedBackend], pane: &str) -> Option<String> {
+        let mut matches = std::collections::BTreeSet::new();
+        for (backend, panes) in backends.iter().zip(&self.per_backend) {
+            match backend.kind() {
+                HostKind::Tmux | HostKind::Rmux => {
+                    let id = if backend.kind() == HostKind::Rmux
+                        && !pane.starts_with(crate::backend::rmux::PANE_ID_PREFIX)
+                    {
                         format!("{}{pane}", crate::backend::rmux::PANE_ID_PREFIX)
+                    } else {
+                        pane.to_owned()
                     };
-                    panes.iter().any(|listed| listed.pane_id == namespaced)
+                    for found in panes.iter().filter(|found| found.pane_id == id) {
+                        matches.insert((found.pane_id.clone(), found.socket.clone()));
+                    }
                 }
                 HostKind::Cmux | HostKind::Zellij | HostKind::Herdr => {
-                    backend.resolve_pane(pane).is_some()
+                    if let Some(found) = backend.resolve_pane(pane) {
+                        matches.insert((found.pane_id, found.socket));
+                    }
                 }
-            })
+            }
+        }
+        if matches.len() == 1 {
+            matches.into_iter().next().map(|(pane, _)| pane)
+        } else {
+            None
+        }
     }
 
     /// [`PaneBackend::pane_pid_map`] derived from the scan for hosts whose map
@@ -3233,8 +3300,8 @@ fn observed_pane_in_scan(
     parent_pid: impl Fn(u32) -> Option<u32>,
 ) -> Option<(String, CollaborationPaneEvidence)> {
     if let Some(pane) = environment_pane {
-        if scan.resolves(backends, &pane) {
-            return Some((pane, CollaborationPaneEvidence::ProcessEnvironment));
+        if let Some(canonical) = scan.resolve_unique(backends, &pane) {
+            return Some((canonical, CollaborationPaneEvidence::ProcessEnvironment));
         }
     }
     let pane_pids = scan.pid_map(backends);
@@ -3461,6 +3528,7 @@ fn orchestration_config_response(
         collaboration,
         collaboration_audit,
         ask,
+        agent_directory,
         automation,
         restart,
         fleet,
@@ -3479,6 +3547,7 @@ async fn handle(
     collaboration: Arc<CollaborationStore>,
     collaboration_audit: Arc<CollaborationAuditLog>,
     ask: Arc<AskStore>,
+    agent_directory: Arc<crate::agent_directory::AgentDirectory>,
     automation: Arc<AutomationStore>,
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
@@ -3671,7 +3740,14 @@ async fn handle(
                         ))
                     }
                 }
-                RequestBody::Ingest { event } => {
+                RequestBody::Ingest {
+                    mut event,
+                    ask_entry,
+                } => {
+                    if ask_entry.is_some() {
+                        event.id_mut().pane = None;
+                        event.id_mut().surface = None;
+                    }
                     kind = "ingest";
                     // Drop only tmux events from servers outside the configured
                     // `MUXA_TMUX_SOCKET` scope. Namespaced non-tmux panes have
@@ -3690,9 +3766,12 @@ async fn handle(
                         );
                     if in_scope {
                         tracing::debug!(?event, "ingest");
-                        store.apply(&event).await;
-                        if let Err(error) = collaboration.observe_worker_hook(event.id()).await {
-                            tracing::warn!(%error, "worker hook binding failed; session stays protected");
+                        store.apply_with_ask(&event, ask_entry.as_deref()).await;
+                        if ask_entry.is_none() {
+                            if let Err(error) = collaboration.observe_worker_hook(event.id()).await
+                            {
+                                tracing::warn!(%error, "worker hook binding failed; session stays protected");
+                            }
                         }
                         // A Codex thread behind the shared app-server arrives
                         // paneless; bind it now, before a sibling started in
@@ -3751,6 +3830,38 @@ async fn handle(
                     let pruned = store.prune_orphans(cutoff).await;
                     tracing::debug!(pruned, max_age_secs, "prune orphans");
                     Response::with_pruned(pruned)
+                }
+                RequestBody::InvalidateAgentDirectory => {
+                    kind = "invalidate_agent_directory";
+                    agent_directory.invalidate();
+                    Response::ok()
+                }
+                RequestBody::AgentFind {
+                    query,
+                    limit,
+                    exclude_sessions,
+                    refresh,
+                } => {
+                    kind = "agent_find";
+                    match agent_directory
+                        .find(
+                            &store,
+                            &ask,
+                            &backends,
+                            &query,
+                            limit,
+                            &exclude_sessions,
+                            refresh,
+                        )
+                        .await
+                    {
+                        Ok(result) => {
+                            let mut response = Response::ok();
+                            response.agent_locations = Some(result);
+                            response
+                        }
+                        Err(error) => Response::err(error),
+                    }
                 }
                 RequestBody::Snapshot => {
                     kind = "snapshot";
@@ -4126,31 +4237,37 @@ async fn handle(
                 }
                 RequestBody::Restart => {
                     kind = "restart";
-                    match &restart {
-                        Some(controller) if controller.request_restart() => {
+                    match match &restart {
+                        Some(controller) => controller.request_checked_restart().await.map(Some),
+                        None => Ok(None),
+                    } {
+                        Ok(Some(true)) => {
                             tracing::info!(
-                                generation = controller.generation(),
+                                generation = restart.as_ref().unwrap().generation(),
                                 "restart requested over IPC",
                             );
                             Response::ok()
                         }
-                        Some(_) => {
+                        Ok(Some(false)) => {
                             Response::err("daemon is already stopping; restart request refused")
                         }
-                        None => Response::err(
+                        Ok(None) => Response::err(
                             "this server cannot restart itself (no restart controller installed)",
                         ),
+                        Err(reason) => Response::err(format!("restart refused: {reason}")),
                     }
                 }
                 RequestBody::BackendPaneSnapshot { panes } => {
                     kind = "backend_pane_snapshot";
                     let count = panes.len();
                     backend.ingest_pane_snapshot(panes);
+                    agent_directory.invalidate();
                     tracing::debug!(panes = count, "backend_pane_snapshot");
                     Response::ok()
                 }
                 RequestBody::RefreshPaneLocations { pane } => {
                     kind = "refresh_pane_locations";
+                    agent_directory.invalidate();
                     match resolve_backend(&backends, &pane) {
                         Err(error) => Response::err(format!("no active {error} backend")),
                         Ok(target) => {
@@ -4159,6 +4276,7 @@ async fn handle(
                             {
                                 Ok(observation) => {
                                     store.refresh_pane_locations(&observation.panes).await;
+                                    agent_directory.invalidate();
                                     Response::ok()
                                 }
                                 Err(error) => Response::err(error.to_string()),
@@ -5718,6 +5836,7 @@ async fn handle(
                                     None,
                                 )
                                 .await;
+                            agent_directory.invalidate();
                             Response::with_session(session)
                         }
                         Err(e) => Response::err(e.to_string()),
@@ -5819,7 +5938,10 @@ async fn handle(
                 RequestBody::TerminateSession { session_id } => {
                     kind = "terminate_session";
                     match sessions.terminate(&session_id) {
-                        Ok(()) => Response::ok(),
+                        Ok(()) => {
+                            agent_directory.invalidate();
+                            Response::ok()
+                        }
                         Err(e) => Response::err(e.to_string()),
                     }
                 }
@@ -6393,6 +6515,7 @@ impl Client {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "ingest",
+            "ask_entry": std::env::var_os(crate::ask::ASK_ENV_MARKER).map(|_|std::env::var("MUXA_ASK_ENTRY").unwrap_or_else(|_|"headless".into())),
             "event": event
         });
         // Hook ingest is on the agent's critical path — use the tighter
@@ -7078,7 +7201,41 @@ impl Client {
         serde_json::from_value(resp["room"].clone()).map_err(RuntimeError::Json)
     }
 
-    /// Queue a headless question; the returned entry is `Running`.
+    pub async fn invalidate_agent_directory(&self) -> Result<(), RuntimeError> {
+        let request =
+            serde_json::json!({"protocol": PROTOCOL_VERSION, "kind":"invalidate_agent_directory"});
+        let response = self
+            .call_with_timeout(&request, Duration::from_secs(1))
+            .await?;
+        if response["ok"].as_bool() == Some(true) {
+            Ok(())
+        } else {
+            Err(response_error(&response))
+        }
+    }
+
+    /// Returns None only when an older daemon explicitly rejects this request kind.
+    pub async fn agent_find(
+        &self,
+        query: &str,
+        limit: usize,
+        exclude_sessions: &[String],
+        refresh: bool,
+    ) -> Result<Option<crate::agent_locator::LocationResults>, RuntimeError> {
+        let request = serde_json::json!({ "protocol": PROTOCOL_VERSION, "kind": "agent_find",
+            "query": query, "limit": limit, "exclude_sessions": exclude_sessions, "refresh": refresh });
+        match self.call_checked(&request).await {
+            Ok(response) => serde_json::from_value(response["agent_locations"].clone())
+                .map(Some)
+                .map_err(RuntimeError::Json),
+            Err(RuntimeError::Daemon(error)) if error.contains("unknown variant `agent_find`") => {
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Queue a headless question; the returned entry is Running.
     pub async fn ask_send(&self, prompt: &str) -> Result<AskEntry, RuntimeError> {
         self.ask_send_with_credential(prompt, None, None).await
     }
@@ -8916,6 +9073,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_directory_round_trip_shares_cache_across_clients_and_refreshes_on_demand() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("directory.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "lookup-session", AgentKind::ClaudeCode).await;
+        let counting =
+            CountingPaneBackend::new(HostKind::Tmux, vec![collaboration_test_pane("%1", "0")]);
+        let backend: SharedBackend = counting.clone();
+        let server = Server::new(socket.clone(), store).with_backends(vec![backend]);
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let first = Client::new(socket.clone());
+        let second = Client::new(socket);
+        let a = first
+            .agent_find("lookup-session", 10, &[], false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.total, 1);
+        assert!(!a.freshness.unwrap().reused_index);
+        let b = second
+            .agent_find("lookup-session", 10, &[], false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.total, 1);
+        assert!(b.freshness.unwrap().reused_index);
+        assert_eq!(counting.counts(), (1, 0, 0));
+        second
+            .agent_find("lookup-session", 10, &[], true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(counting.counts(), (2, 0, 0));
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn collaboration_context_and_list_scan_panes_once_per_request() {
         let dir = tempdir().unwrap();
         let socket = dir.path().join("single-scan.sock");
@@ -9437,7 +9634,10 @@ mod tests {
         let scan = scan_of(&rmux_backends);
         assert_eq!(
             observed_pane_in_scan(Some("%5".into()), 1, &rmux_backends, &scan, |_| None),
-            Some(("%5".into(), CollaborationPaneEvidence::ProcessEnvironment))
+            Some((
+                "rmux:%5".into(),
+                CollaborationPaneEvidence::ProcessEnvironment
+            ))
         );
         // tmux ids are exact: the same bare id does not match a namespaced one.
         let tmux: SharedBackend =
@@ -9470,6 +9670,82 @@ mod tests {
             (1, 1, 1),
             "one scan; native resolve and pid map"
         );
+    }
+
+    #[test]
+    fn observed_environment_is_canonical_and_cross_host_or_socket_ambiguity_is_not_evidence() {
+        let rmux: SharedBackend =
+            CountingPaneBackend::new(HostKind::Rmux, vec![pid_pane("rmux:%5", 0)]);
+        let tmux: SharedBackend = CountingPaneBackend::new(HostKind::Tmux, vec![pid_pane("%5", 0)]);
+        let backends = vec![rmux, tmux];
+        let scan = scan_of(&backends);
+        assert_eq!(
+            observed_pane_in_scan(Some("%5".into()), 1, &backends, &scan, |_| None),
+            None
+        );
+        let mut one = pid_pane("rmux:%5", 0);
+        one.socket = Some("one".into());
+        let mut two = one.clone();
+        two.socket = Some("two".into());
+        let backends: Vec<SharedBackend> =
+            vec![CountingPaneBackend::new(HostKind::Rmux, vec![one, two])];
+        let scan = scan_of(&backends);
+        assert!(scan.resolve_unique(&backends, "%5").is_none());
+        let mut actor = CollaborationConnectionActor {
+            client_kind: CollaborationClientKind::Mcp,
+            caller_pid: None,
+            caller_uid: None,
+            caller_gid: None,
+            executable: None,
+            observed_pane: Some("rmux:%5".into()),
+            pane_evidence: Some(CollaborationPaneEvidence::ProcessEnvironment),
+            pane_observed: true,
+            request_panes: None,
+        };
+        let origin = CollaborationOrigin {
+            exact_session: false,
+            pane: "rmux:%5".into(),
+            socket: None,
+            console: false,
+            agent_session_id: None,
+        };
+        assert_eq!(
+            actor.provenance(&origin).origin_match,
+            CollaborationOriginMatch::Matched
+        );
+        actor.observed_pane = Some("%5".into());
+        assert_eq!(
+            actor.provenance(&origin).origin_match,
+            CollaborationOriginMatch::Mismatched
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restart_preflight_refusal_does_not_signal_shutdown_and_success_pins_target() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("muxad");
+        let config = dir.path().join("cfg");
+        std::fs::write(&config, "").unwrap();
+        std::fs::write(&target, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (tx, mut rx) = broadcast::channel(4);
+        let controller = RestartController::new(0, tx).with_upgrade_check(Some(
+            crate::binary_upgrade::UpgradeCheck::new(
+                target.clone(),
+                vec!["--config".into(), config.into_os_string()],
+            ),
+        ));
+        assert!(controller.request_checked_restart().await.is_err());
+        assert!(!controller.restart_requested());
+        assert!(rx.try_recv().is_err());
+        std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
+        assert!(controller.request_checked_restart().await.unwrap());
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(controller.validated_launch().await.unwrap().target, target);
+        controller.stop();
+        assert!(!controller.request_checked_restart().await.unwrap());
     }
 
     #[tokio::test]
@@ -11070,6 +11346,7 @@ mod tests {
             CollaborationStore::in_memory(CollaborationOptions::default()),
             CollaborationAuditLog::in_memory(),
             crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+            Arc::default(),
             AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
             None,
             None,

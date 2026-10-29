@@ -5,6 +5,7 @@
 //! pane never inherits stale work.
 
 mod contract;
+pub mod instruction;
 pub(crate) use contract::deserialize_report_input;
 pub use contract::{
     task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,

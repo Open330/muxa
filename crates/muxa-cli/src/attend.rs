@@ -426,6 +426,7 @@ mod tests {
         entered: OffsetDateTime,
     ) -> Agent {
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: AgentKind::ClaudeCode,

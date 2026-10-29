@@ -12,6 +12,14 @@ deterministic agent launcher invokes same-user tmux locally, using the same
 socket routing as the CLI. The MCP server adds no network listener: it can only
 do what a shell on the same machine could already do through `muxa` and tmux.
 
+For a current agent location, start with `muxa_agent_find(query="TASK_KEYWORDS")`.
+It returns bounded, ranked candidates with exact host/socket/session/window/pane
+keys and short evidence, without dumping full topology or transcripts. All
+keywords must match; extract identifiers or a few keywords from prose. It covers
+local observed panes; remote Fleet hosts need a separate Fleet query. Matches
+do not prove task ownership/completion, and historical records never imply a
+current location. Use `muxa_status(pane=...)` for a candidate's further details.
+
 `muxa_agent_search` searches historical Claude/Codex conversations and tool
 executions with a Korean/English natural-language query; `muxa_agent_read`
 expands a hit into surrounding events and paired command results. These tools
@@ -221,7 +229,7 @@ it:
 | `muxa_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
 | `muxa_request_attention` | `body`, `action?`, `dispatch_id?`, `parent_request_id?` | Request required human approval, choice or information; delivered to connected Fleet operator clients. Reuse a UUID dispatch ID on retry; wait for and read the actual human reply. |
 | `muxa_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?`, `withdraw_reply_wakes?` | Create a durable same-window peer request. `withdraw_reply_wakes` names your own earlier requests it replaces; their late replies stop waking you. |
-| `muxa_inbox` | `full?` | Claim and read instructions, authority, paths and attachments addressed to this session. `full=true` includes audit metadata. |
+| `muxa_inbox` | `request_id?, full?` | Claim and read instructions, authority, paths and attachments. Use the wake’s `request_id` to read one request; `full=true` includes audit metadata. CLI: `muxa msg accept ID --json` (one), `muxa msg inbox --json` (compact inbox), `--json --full` (legacy audit records). |
 | `muxa_list_messages` | `mailbox?`, `request_id?`, `limit?`, `offset?`, `include_body?`, `after_update?`, `full?` | List newest metadata records without claiming (default 20, max 100). Read an exact request or incremental progress explicitly. |
 | `muxa_reply` | `request_id`, `status`, `body`, `artifacts?`, `air_artifacts?` | Return a structured terminal response. |
 | `muxa_wait_reply` | `request_id`, `timeout_secs?` | Event-driven wait for a structured peer response. |
@@ -646,3 +654,30 @@ other output. Coverage is limited to supplied files; absent session data cannot
 establish token savings. Reports contain aggregates and tool names, not message
 bodies or tool arguments. The script only reads existing local logs; it adds no
 runtime telemetry, network request, mailbox read, or scheduled task.
+
+### Recovering closed cached clients
+
+`muxa reload mcp --codex-home DIR --reconnect --json` changes a Muxa-owned
+connection generation as well as checking the installed binary revision. Use it
+when a closed client is retained even though its binary revision is unchanged.
+It asks the existing host to rebuild its Muxa clients; agent sessions stay running.
+The version-checked write preserves user environment settings and creates a
+private backup. Ordinary reload does not rotate the generation.
+
+Reload reports `transport_connected` separately from
+`current_revision_connections` (host-cached handshake/schema information). An
+in-place process upgrade can leave old handshake data behind. `queued` remains
+unconfirmed; an API acknowledgement or a current executable alone does not
+prove every loaded conversation has a working tool connection.
+
+Before automatic replacement, MCP and muxad probe the exact candidate with
+`--check-config`. Rejection or timeout keeps the live process and records a
+warning. The same rejected binary/configuration pair is not repeatedly spawned.
+A changed binary or configuration is eligible for another check. Daemon restart
+IPC uses this check before signalling shutdown. On Linux, native binary handoff uses a held descriptor for the validated inode,
+with the original launch path retained as argv[0]. Atomic replacements of its
+pathname cannot substitute an unvalidated image. Destructive in-place writes
+are refused. Scripts and other platforms recheck the canonical path before
+execution; a change after daemon drain can require a cold start. Validation
+checks for binary/configuration changes during the probe; configuration edits
+after shutdown has begun remain a separate concurrent-writer concern.

@@ -152,7 +152,17 @@ where
         if parent <= 1 || parent == cur {
             return false;
         }
-        if argv_of(parent).is_some_and(|argv| codex_subcommand(&argv) == Some("app-server")) {
+        if let Some(argv) =
+            argv_of(parent).filter(|argv| codex_subcommand(argv) == Some("app-server"))
+        {
+            // A managed daemon can remain a child of the first attached TUI.
+            // Other TUIs still share it, so its inherited pane is not theirs.
+            if argv
+                .split(|c: char| c == '\0' || c.is_whitespace())
+                .any(|arg| arg == "--managed-daemon")
+            {
+                return true;
+            }
             // Owned by a TUI (`codex`, `codex resume …`) → private server.
             let owner = parent_of(parent).and_then(&argv_of);
             return !owner.is_some_and(|argv| {
@@ -340,6 +350,35 @@ TracerPid:\t0
         ];
         assert!(shared(&entries, 300));
         assert!(shared(&entries, 311));
+    }
+
+    #[test]
+    fn managed_daemon_is_shared_even_while_its_original_tui_is_the_parent() {
+        for tui in [
+            "codex\0--yolo",
+            "codex\0--yolo\0review this project",
+            "codex\0resume\0thread-1",
+        ] {
+            let entries = [
+                (100, 1, tui),
+                (
+                    200,
+                    100,
+                    "codex\0app-server\0--listen\0unix://\0--managed-daemon",
+                ),
+                (300, 200, "muxa\0mcp"),
+                (310, 200, "sh\0-c\0muxa hook codex"),
+                (311, 310, "muxa\0hook\0codex"),
+            ];
+            assert!(shared(&entries, 300), "{tui:?}");
+            assert!(shared(&entries, 311), "{tui:?}");
+            let mut private = entries;
+            private[1].2 = "codex\0app-server\0--listen\0unix://";
+            assert!(
+                !shared(&private, 311),
+                "private TUI-owned server must stay private"
+            );
+        }
     }
 
     #[test]

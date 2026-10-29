@@ -483,6 +483,7 @@ mod tests {
 
     fn agent(kind: AgentKind, pane: Option<&str>, prompt: Option<&str>) -> Agent {
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind,

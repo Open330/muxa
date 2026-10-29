@@ -1,6 +1,7 @@
 //! muxa CLI — user-facing entry point.
 
 mod activity_query;
+mod agent_find;
 mod agent_launch;
 mod agent_move;
 mod agent_records;
@@ -102,6 +103,10 @@ struct Args {
     /// Config file path. Defaults to `$XDG_CONFIG_HOME/muxa/config.toml`.
     #[arg(long, env = "MUXA_CONFIG", global = true)]
     config: Option<PathBuf>,
+
+    /// Check startup configuration without starting services (upgrade preflight).
+    #[arg(long, global = true, hide = true)]
+    check_config: bool,
 
     #[command(subcommand)]
     cmd: Option<Cmd>,
@@ -537,6 +542,9 @@ enum MsgCmd {
         action: String,
         #[arg(long)]
         json: bool,
+        /// Return the legacy full request, including bodies and audit data.
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Send to `peer`, `%N`, `@alias`, `role:<role>`, or a
     /// `workspace/work/role[@alias]` path.
@@ -597,9 +605,12 @@ enum MsgCmd {
         /// wake you. Its work and reply are unchanged. Repeatable.
         #[arg(long = "withdraw", value_name = "REQUEST")]
         withdraw: Vec<String>,
-        /// Print the stored request instead of a one-line receipt.
+        /// Print a compact acknowledgement without repeating request/reply bodies.
         #[arg(long)]
         json: bool,
+        /// Return the legacy full request, including bodies and audit data.
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Append quiet guidance/progress to an existing open request, preserving its scope.
     Update {
@@ -612,8 +623,12 @@ enum MsgCmd {
     },
     /// Claim and print this agent's pending requests.
     Inbox {
+        /// Compact instructions and routing, matching the MCP inbox view.
         #[arg(long)]
         json: bool,
+        /// Include legacy full audit records instead of the compact view.
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// List incoming, sent, or all requests without claiming them.
     List {
@@ -681,9 +696,12 @@ enum MsgCmd {
         /// AIR 1 artifact reference as JSON. Repeat for multiple references.
         #[arg(long = "air-ref")]
         air_refs: Vec<String>,
-        /// Print the stored request instead of a one-line receipt.
+        /// Print a compact acknowledgement without repeating request/reply bodies.
         #[arg(long)]
         json: bool,
+        /// Return the legacy full request, including bodies and audit data.
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Wait for the structured reply to a sent request.
     Wait {
@@ -704,9 +722,12 @@ enum MsgCmd {
     /// Cancel a request that the recipient has not claimed yet.
     Cancel {
         request_id: String,
-        /// Print the stored request instead of a one-line receipt.
+        /// Print a compact acknowledgement without repeating request/reply bodies.
         #[arg(long)]
         json: bool,
+        /// Return the legacy full request, including bodies and audit data.
+        #[arg(long, requires = "json")]
+        full: bool,
     },
     /// Stop being woken for replies to your own requests you no longer need,
     /// for example ones you gave up on or re-sent. Their work, replies and
@@ -862,6 +883,8 @@ enum AskProviderCmd {
 
 #[derive(Debug, Subcommand)]
 enum AgentCmd {
+    /// Find current agent locations by task keywords, with bounded evidence.
+    Find(agent_find::FindArgs),
     /// Search historical Claude/Codex records with a natural-language question.
     Search(agent_records::SearchArgs),
     /// Read surrounding evidence and paired tool results from a search hit.
@@ -1123,6 +1146,7 @@ async fn run_agent_cmd(
     cfg: &Config,
 ) -> Result<()> {
     match action {
+        AgentCmd::Find(args) => agent_find::run(client, args).await,
         AgentCmd::Search(args) => agent_records::search(args),
         AgentCmd::Read(args) => agent_records::read(args),
         AgentCmd::Start(args) => agent_launch::run(args, client, socket_path, cfg).await,
@@ -1524,6 +1548,11 @@ async fn main() -> Result<()> {
         .init();
 
     let args = parse_args();
+    if args.check_config {
+        let path = args.config.clone().or_else(paths::default_config_file);
+        Config::load_or_default(path.as_deref()).context("checking startup configuration")?;
+        return Ok(());
+    }
     let cmd = args.cmd.unwrap_or(Cmd::Start);
     if let Cmd::Agent {
         action: AgentCmd::Move(move_args),
@@ -1585,7 +1614,28 @@ async fn main() -> Result<()> {
     let client =
         Client::new(socket.clone()).with_collaboration_client_kind(collaboration_client_kind(&cmd));
 
-    match cmd {
+    let invalidates_directory = matches!(
+        &cmd,
+        Cmd::Agent {
+            action: AgentCmd::Start(_) | AgentCmd::Control(_) | AgentCmd::Move(_)
+        } | Cmd::Window { .. }
+            | Cmd::Reload(_)
+            | Cmd::Restore(_)
+            | Cmd::Swap(_)
+            | Cmd::Work {
+                action: WorkCmd::Up(_)
+                    | WorkCmd::Start(_)
+                    | WorkCmd::Done(_)
+                    | WorkCmd::Reconcile(_)
+                    | WorkCmd::Close(_)
+                    | WorkCmd::Down(_)
+            }
+            | Cmd::Workspace {
+                action: WorkspaceCmd::Close(_) | WorkspaceCmd::View(_)
+            }
+    );
+    let invalidation_client = Client::new(socket.clone());
+    let result = match cmd {
         Cmd::Start => start::run(&client, cfg, socket, config_path).await,
         Cmd::Status { theme, flat, json } => cmd_status(&client, &cfg, theme, flat, json).await,
         Cmd::StatusLine {
@@ -1791,7 +1841,11 @@ async fn main() -> Result<()> {
         Cmd::Swap(swap_args) => swap::run(&client, swap_args, &cfg.swap, &cfg.accounts).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune(prune) => cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await,
+    };
+    if invalidates_directory {
+        let _ = invalidation_client.invalidate_agent_directory().await;
     }
+    result
 }
 
 /// Parse a short human duration (`45s`, `30m`, `1h`, `2d`, or a bare
@@ -2221,12 +2275,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string(
-                        &requests
-                            .iter()
-                            .map(|r| collaboration_output::message(r, true))
-                            .collect::<Vec<_>>()
-                    )?
+                    serde_json::to_string(&collaboration_output::inbox(&requests, false))?
                 );
             } else {
                 for request in requests {
@@ -2235,7 +2284,12 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             }
         }
 
-        MsgCmd::Attention { body, action, json } => {
+        MsgCmd::Attention {
+            body,
+            action,
+            json,
+            full,
+        } => {
             mcp_output::require_human_actions(client)
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -2253,7 +2307,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     },
                 )
                 .await?;
-            print_collaboration_receipt(&request, json)?;
+            print_collaboration_receipt(&request, json, full);
         }
         MsgCmd::Send {
             target,
@@ -2276,6 +2330,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             notify,
             withdraw,
             json,
+            full,
         } => {
             if !withdraw.is_empty() {
                 require_capability(
@@ -2336,7 +2391,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     },
                 )
                 .await?;
-            print_collaboration_receipt(&request, json)?;
+            print_collaboration_receipt(&request, json, full);
         }
         MsgCmd::Update {
             request_id,
@@ -2365,10 +2420,10 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 );
             }
         }
-        MsgCmd::Inbox { json } => {
+        MsgCmd::Inbox { json, full } => {
             let requests = client.collaboration_inbox(&origin).await?;
             if json {
-                println!("{}", serde_json::to_string_pretty(&requests)?);
+                println!("{}", collaboration_output::inbox(&requests, full));
             } else if requests.is_empty() {
                 println!("Inbox is empty.");
             } else {
@@ -2426,6 +2481,7 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             artifacts,
             air_refs,
             json,
+            full,
         } => {
             let report: Option<muxa::collaboration::TaskReport> = report
                 .as_deref()
@@ -2444,14 +2500,14 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     &artifacts,
                     &air_artifacts,
                     report.as_ref(),
-                    if json {
+                    if full {
                         muxa::collaboration::CollaborationReadView::Full
                     } else {
                         muxa::collaboration::CollaborationReadView::Metadata
                     },
                 )
                 .await?;
-            print_collaboration_receipt(&request, json)?;
+            print_collaboration_receipt(&request, json, full);
         }
         MsgCmd::Wait {
             request_id,
@@ -2471,9 +2527,13 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             )
             .await?;
         }
-        MsgCmd::Cancel { request_id, json } => {
+        MsgCmd::Cancel {
+            request_id,
+            json,
+            full,
+        } => {
             let request = client.collaboration_cancel(&origin, &request_id).await?;
-            print_collaboration_receipt(&request, json)?;
+            print_collaboration_receipt(&request, json, full);
         }
         MsgCmd::Withdraw { request_ids, json } => {
             require_capability(
@@ -2861,15 +2921,16 @@ fn render_reply_output(
 ///
 /// They used to print the whole stored request — every timestamp, every
 /// `null` — which buries the two facts the caller wants (it went through, and
-/// whether an answer is coming) under thirty lines of JSON. `--json` still
-/// gives the record for anything that wants to parse it.
+/// whether an answer is coming). `--json` acknowledges without body echoes;
+/// `--json --full` opts into the legacy record.
 fn print_collaboration_receipt(
     request: &muxa::collaboration::CollaborationRequest,
     json: bool,
-) -> Result<()> {
+    full: bool,
+) {
     if json {
-        println!("{}", serde_json::to_string_pretty(request)?);
-        return Ok(());
+        println!("{}", collaboration_output::acknowledgement(request, full));
+        return;
     }
     match request.status {
         RequestStatus::Cancelled => println!("cancelled  {}", request.id),
@@ -2905,7 +2966,6 @@ fn print_collaboration_receipt(
             );
         }
     }
-    Ok(())
 }
 
 /// Where a participant sits, for listings that span more than one room.
@@ -6370,6 +6430,7 @@ mod tests {
 
     fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) -> Agent {
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind: AgentKind::ClaudeCode,
@@ -7498,6 +7559,38 @@ mod tests {
                 UnicodeWidthStr::width(line) <= 60,
                 "line exceeded minimal status width: {line:?}"
             );
+        }
+    }
+    #[test]
+    fn inbox_json_is_compact_by_default_and_full_records_are_explicit() {
+        for (args, expected_full) in [
+            (vec!["muxa", "msg", "inbox", "--json"], false),
+            (vec!["muxa", "msg", "inbox", "--json", "--full"], true),
+        ] {
+            let parsed = Args::try_parse_from(args).unwrap();
+            assert!(
+                matches!(parsed.cmd,Some(Cmd::Msg{action:MsgCmd::Inbox{json:true,full}}) if full==expected_full)
+            );
+        }
+        assert!(Args::try_parse_from(["muxa", "msg", "inbox", "--full"]).is_err());
+        let parsed =
+            Args::try_parse_from(["muxa", "msg", "accept", "req-exact", "--json"]).unwrap();
+        assert!(
+            matches!(parsed.cmd,Some(Cmd::Msg{action:MsgCmd::Accept{request_id,json:true}}) if request_id=="req-exact")
+        );
+    }
+    #[test]
+    fn mutation_json_has_an_explicit_legacy_full_escape() {
+        for words in [
+            vec!["send", "peer", "body"],
+            vec!["reply", "req-test", "body"],
+            vec!["cancel", "req-test"],
+            vec!["attention", "body"],
+        ] {
+            let mut args = vec!["muxa", "msg"];
+            args.extend(words);
+            args.extend(["--json", "--full"]);
+            assert!(Args::try_parse_from(args).is_ok());
         }
     }
 }

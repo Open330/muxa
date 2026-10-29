@@ -1150,6 +1150,18 @@ pub(crate) enum QuickAction {
     },
 }
 
+impl QuickAction {
+    fn invalidates_directory(&self) -> bool {
+        matches!(
+            self,
+            Self::TerminateNode(_)
+                | Self::KillPane(_)
+                | Self::SpawnWork { .. }
+                | Self::SpawnAt { .. }
+        )
+    }
+}
+
 /// Payload behind the shared y/N confirmation popup. Most confirmations are
 /// synchronous quick actions; clearing ask history is daemon-owned and must be
 /// dispatched asynchronously by the run loop instead.
@@ -8322,6 +8334,7 @@ pub async fn run(
                 }
                 Action::SubmitRename => {
                     finish_rename(&mut app, &wake_tx, apply_rename);
+                    let _ = client.invalidate_agent_directory().await;
                 }
                 Action::SubmitWorkUp => {
                     if let Some(work) = app.work_composer.take() {
@@ -8550,6 +8563,7 @@ pub async fn run(
                                 start_quick_in_background(&mut app, action);
                             }
                             ConfirmAction::Quick(action) => {
+                                let invalidates = action.invalidates_directory();
                                 // Pane and clipboard actions shell out
                                 // synchronously. Keep them off the input loop.
                                 let outcome = tokio::task::spawn_blocking(move || {
@@ -8560,6 +8574,9 @@ pub async fn run(
                                 .unwrap_or_else(|e| {
                                     ActionOutcome::Err(format!("✗ action task failed: {e}"))
                                 });
+                                if invalidates {
+                                    let _ = client.invalidate_agent_directory().await;
+                                }
                                 apply_outcome_to_app(&mut app, outcome);
                             }
                             ConfirmAction::ClearAskHistory => match client.ask_clear().await {
@@ -8654,6 +8671,7 @@ pub async fn run(
                         // Copy shells out to clipboard helpers (and can fall
                         // back to a /tmp write) — off the loop thread it
                         // goes, same as the confirmed destructive actions.
+                        let invalidates = qa.invalidates_directory();
                         let outcome = tokio::task::spawn_blocking(move || {
                             let mut fx = RealEffects;
                             dispatch_quick_action(qa, &mut fx)
@@ -8662,6 +8680,9 @@ pub async fn run(
                         .unwrap_or_else(|e| {
                             ActionOutcome::Err(format!("✗ action task failed: {e}"))
                         });
+                        if invalidates {
+                            let _ = client.invalidate_agent_directory().await;
+                        }
                         apply_outcome_to_app(&mut app, outcome);
                     }
                 }
@@ -20864,6 +20885,7 @@ mod tests {
     ) -> Agent {
         let now = OffsetDateTime::now_utc();
         Agent {
+            ask_origin: None,
             tmux_socket: None,
             tmux_session: None,
             kind,

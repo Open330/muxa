@@ -385,6 +385,7 @@ mod tests {
     /// Build a bare `Agent` row for ownership tests.
     fn row(kind: AgentKind, session_id: &str, state: AgentState) -> Agent {
         Agent {
+            ask_origin: None,
             kind,
             session_id: session_id.to_owned(),
             surface: None,
@@ -774,6 +775,7 @@ mod tests {
     #[test]
     fn stopped_real_row_is_not_authoritative() {
         let mut agent = Agent {
+            ask_origin: None,
             kind: AgentKind::ClaudeCode,
             session_id: "real".into(),
             surface: None,

@@ -1,5 +1,104 @@
 # Search agent records
 
+## Find a current agent location
+
+For “where is the agent working on this?”, start with the local live lookup:
+
+```sh
+muxa agent find 'CAL-8226' --json
+muxa agent find '화자 분리' --limit 5 --json
+muxa agent find 'AGENT_SESSION_ID' --json
+```
+
+MCP callers use `muxa_agent_find(query="CAL-8226")`. All whitespace-separated
+keywords must match, case-insensitively, across workspace/window names, paths,
+alias, titles, recap and latest prompt/response. Extract a few keywords from a
+natural-language question; try alternate spellings if needed. Results prefer
+location/title matches over incidental message mentions and return at most 10
+candidates by default (maximum 50), with up to three 200-character excerpts.
+`total` and `has_more` distinguish an empty result from a truncated list.
+A query containing only a known agent session ID (or its prefix of at least
+eight characters) resolves identity directly, ignoring mentions in other
+agents’ transcripts. An unknown full UUID never falls back to transcript text.
+
+Each candidate includes the exact host, socket, session, window and pane key,
+agent session ID, provider and observed state. Grouped views are folded through
+the canonical topology. Stopped and unassigned records never receive a guessed
+live location. Ask ownership is tagged on the registry row when its hook or
+structured provider session ID first arrives. A pending execution gate prevents
+shared-server hooks from being assigned by cwd before that ID is known. The tag
+is persisted independently of Ask history, so clearing/evicting history and
+restarting the daemon preserve it. Ask-owned children are stopped when the run
+ends. Explicit interactive resume process evidence, a trusted interactive hook,
+or a fresh interactive prompt confirmed on the pane clears the tag; cwd alone
+cannot promote it. If the conversation already has a trusted interactive pane,
+a headless follow-up preserves that binding and does not replace its live
+metadata with Ask events.
+Matches among unassigned rows are counted in `unlocated_matches`; no pane is
+invented for them. These are keyword candidates, not proof of ownership or
+completion. Use `--exclude-session ID` (MCP `exclude_sessions`) to remove an
+investigating conversation that merely repeats the question.
+
+The lookup runs in the daemon, using its configured backend set rather than
+the CLI/MCP process environment. CLI and MCP each send one `agent_find` IPC
+request. An older daemon must be updated; there is no environment-dependent
+local fallback. Remote Fleet hosts still require a separate Fleet query.
+
+### Shared directory and freshness
+
+```mermaid
+flowchart LR
+    R[Reconciler observations] --> P[Shared pane inventory]
+    H[Registry changes and execution ownership] --> I[Lazy normalized document index]
+    P --> I
+    C[CLI / MCP lookup] --> I
+    I --> B[Bounded candidates and evidence]
+    F[Startup / expiry / new binding / explicit refresh] --> P
+```
+
+The reconciler publishes the observations it already collected after completing
+reconciliation/rebinding. Repeated and concurrent lookups reuse this inventory
+and an immutable search projection; they do not start another background scan
+loop. Registry change signals invalidate the projection lazily, and only
+one request performs a demand refresh/build at a time. Text is redacted before
+normalization and matching, so sensitive values are neither searchable nor
+retained in the normalized document cache. Query text and result lists are not
+cached. All derived state is memory-only and starts empty after daemon restart.
+
+The default inventory maximum age is the configured reconciliation interval
+plus two seconds (32 seconds with the default settings); a standalone server or
+disabled reconciler uses two seconds. `freshness` reports the actual observation
+time, age, configured bound and whether the document index was reused. Window
+changes performed through Muxa lifecycle commands, MCP or Watch invalidate the
+inventory immediately after the mutation; the following lookup refreshes it.
+External multiplexer changes are bounded by the observation age. Registry
+changes update agent text/state independently. A new or moved live binding
+missing from inventory triggers one demand scan per newly missing binding.
+
+Use `muxa agent find 'TASK_KEYWORDS' --refresh --json` (MCP `refresh=true`) when
+an immediate observation is needed. Startup, expired data and explicit refresh
+all use the same collection path. Overlapping force requests share an in-flight
+demand observation; a later sequential force request performs a new one. A late
+reconciler publish does not count as that demand observation. Mutation invalidation
+keeps a monotonic floor so an older in-flight scan cannot make stale data fresh.
+Failed/partial observations replace older
+views with the currently observed subset and warnings; they never silently
+keep an old pane looking current. A slow earlier scan cannot overwrite a newer
+observation. Verify the returned agent session ID and endpoint before any
+control action; a cached location does not authorize one.
+
+If a task has disappeared from live metadata, use historical search below,
+then look up the resulting agent session ID. An empty live result does not mean
+the historical work never happened.
+
+New `muxa ask` conversations using Claude, Codex or Gemini are guided to this
+lookup first. Existing conversations retain their original guidance; start with
+`muxa ask --new 'CAL-8226 작업하던 에이전트 위치 찾아줘'` after updating muxad.
+Direct API providers do not have shell/MCP workspace tools; this change does not
+give them live workspace access.
+
+## Search historical evidence
+
 `muxa agent search` and MCP `muxa_agent_search` search local Claude Code and Codex
 transcripts, including sessions that have ended or started before the requested
 day. `muxa agent read` / `muxa_agent_read` read surrounding events and paired tool

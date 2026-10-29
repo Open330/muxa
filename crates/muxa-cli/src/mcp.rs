@@ -116,7 +116,10 @@ pub async fn run(client: Client, config: muxa::config::Config) -> Result<()> {
 }
 
 /// How often an idle server checks whether its binary was upgraded.
+#[cfg(not(test))]
 const UPGRADE_POLL_INTERVAL: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const UPGRADE_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Set on a server re-executed by [`UpgradeWatch`].
 const REEXEC_ENV: &str = "MUXA_MCP_REEXEC";
@@ -154,6 +157,7 @@ struct UpgradeWatch {
     /// build it resolved to: that is what an upgrade repoints.
     path: std::path::PathBuf,
     started: BinaryStamp,
+    rejected: Option<muxa::binary_upgrade::LaunchStamp>,
     reexec: Box<dyn FnMut(&std::path::Path) + Send>,
 }
 
@@ -161,10 +165,24 @@ impl UpgradeWatch {
     #[cfg(unix)]
     fn for_this_process() -> Option<Self> {
         let path = launch_path()?;
-        let started = BinaryStamp::of(&path)?;
+        #[cfg(target_os = "linux")]
+        let started = {
+            let image = std::path::Path::new("/proc/self/exe");
+            let metadata = std::fs::metadata(image).ok()?;
+            BinaryStamp {
+                target: std::fs::read_link(image).ok()?,
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let started = std::env::current_exe()
+            .ok()
+            .and_then(|image| BinaryStamp::of(&image))?;
         Some(Self {
             path,
             started,
+            rejected: None,
             reexec: Box::new(reexec_in_place),
         })
     }
@@ -200,6 +218,11 @@ fn launch_path() -> Option<std::path::PathBuf> {
 fn reexec_in_place(path: &std::path::Path) {
     use std::os::unix::process::CommandExt as _;
     let error = std::process::Command::new(path)
+        .arg0(
+            std::env::args_os()
+                .next()
+                .unwrap_or_else(|| path.as_os_str().to_owned()),
+        )
         .args(std::env::args_os().skip(1))
         .env(REEXEC_ENV, "1")
         .exec();
@@ -271,10 +294,17 @@ where
                 // unparsed, every response already flushed.
                 let idle = tasks.is_empty() && lines.get_ref().buffer().is_empty();
                 if let Some(watch) = upgrade.as_mut().filter(|watch| idle && watch.replaced()) {
-                    let path = watch.path.clone();
-                    (watch.reexec)(&path);
-                    // Still here: the exec failed (or a test hook returned).
-                    upgrade = None;
+                    let check=muxa::binary_upgrade::UpgradeCheck::new(watch.path.clone(),std::env::args_os().skip(1).collect());
+                    let stamp=check.stamp().ok();
+                    if stamp.is_some() && stamp == watch.rejected {continue;}
+                    watch.rejected=stamp;
+                    match check.validate().await {
+                        Ok(checked) if checked.unchanged()=>(watch.reexec)(&checked.target),
+                        Ok(_)=>tracing::warn!("mcp: replacement changed after validation; keeping the live process"),
+                        Err(reason)=>tracing::warn!(%reason,"mcp: upgrade blocked; keeping the live transport"),
+                    }
+                    // A returning exec failed or a test hook returned. Keep
+                    // watching, but don't probe this binary/config pair again.
                 }
                 continue;
             }
@@ -562,6 +592,21 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
     );
     let mut tools = vec![
         json!({
+            "name": "muxa_agent_find",
+            "description": "Find where agents working on a task are currently located on this daemon's local observed panes. Start here for agent-location questions instead of reading full topology or transcripts. Extract a few task keywords/identifiers from prose; all whitespace-separated keywords must match (case-insensitive) across workspace, window, cwd, alias, titles, recap and latest prompt/response. Returns ranked candidates with exact host/socket/session/window/pane identity and up to three short evidence excerpts. Matches do not prove task ownership or completion. Exclude your investigating session when known. No match: try alternate keywords, then muxa_agent_search for historical evidence; historical sessions do not establish a current pane. Remote Fleet hosts require a separate Fleet query.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Task identifier or a few keywords, not a full question." },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "description": "Default 10." },
+                    "refresh": { "type": "boolean", "description": "Re-observe inventory now. Default false reuses the daemon's shared inventory; freshness reports its observation age and configured maximum." },
+                    "exclude_sessions": { "type": "array", "items": { "type": "string" }, "description": "Agent session IDs to exclude." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }
+        }),
+        json!({
             "name": "muxa_status",
             "description": "Focused observation of muxa agents. With no arguments, \
                 return a compact fleet summary; set full=true only when the complete managed \
@@ -798,7 +843,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
                     "execute": { "type": "boolean", "description": "Default false. Requires intent=task, explicit user authorization, and a control-mode host." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
-                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
+                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true. For a quick check with no independent local work, this avoids a separate send receipt and later wait. Use false while doing independent work." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id." },
                     "parent_request_id": { "type": "string", "description": "Exact prior request that caused this follow-up." },
@@ -895,7 +940,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
                     "execute": { "type": "boolean", "description": "Default false. Requires intent=task and explicit user authorization." },
                     "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
-                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true." },
+                    "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true. For a quick check with no independent local work, this avoids a separate send receipt and later wait. Use false while doing independent work." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "spawn_if_missing": { "type": "boolean", "description": "Override collaboration.auto_spawn_workers (default true). Reuse an existing worker first; new peers use configured provider permissions unless worker_bypass_permissions is explicitly enabled." },
                     "context_bound": {"type":"boolean","description":"Default false routes generic work to a dedicated worker, including when an exact target is primary. True requires that exact session's conversation and keeps primary requests queued for acceptance."},
@@ -999,7 +1044,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         json!({
             "name": "muxa_inbox",
             "description": "Read worker inbox requests, or explicitly accept one request_id on a protected primary session. Primary sessions do not auto-claim queued peer work. Instructions are included; full=true is for diagnostics. Honor kind/work_mode/paths; reply only when requested.",
-            "inputSchema": { "type": "object", "properties": {"request_id":{"type":"string","description":"Explicitly accept this one inbound request, including on a protected primary. Omit for normal worker inbox."},"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
+            "inputSchema": { "type": "object", "properties": {"request_id":{"type":"string","description":"Explicitly accept this one inbound request, including on a protected primary. Use the ID from a wake to avoid rereading other open requests."},"full": {"type":"boolean", "description":"Return legacy full records. Default false."}}, "additionalProperties": false },
         }),
         json!({
             "name": "muxa_list_messages",
@@ -1102,6 +1147,28 @@ async fn call_tool(
     params: Option<&Value>,
     config: &muxa::config::Config,
 ) -> Result<Value> {
+    let name = params.and_then(|p| p.get("name")).and_then(Value::as_str);
+    let mutates = matches!(name, Some("muxa_start_agent" | "muxa_start_work"))
+        || (name == Some("muxa_manage_tmux")
+            && params
+                .and_then(|p| p.pointer("/arguments/action"))
+                .and_then(Value::as_str)
+                .is_some_and(|action| {
+                    matches!(action, "terminate_agent" | "close_work" | "close_workspace")
+                }));
+    let result = call_tool_inner(client, params, config).await;
+    if mutates {
+        let _ = client.invalidate_agent_directory().await;
+    }
+    result
+}
+
+#[allow(clippy::too_many_lines)] // one explicit MCP tool dispatch table
+async fn call_tool_inner(
+    client: &Client,
+    params: Option<&Value>,
+    config: &muxa::config::Config,
+) -> Result<Value> {
     let params = params.ok_or_else(|| anyhow::anyhow!("missing params"))?;
     let name = params
         .get("name")
@@ -1131,6 +1198,43 @@ async fn call_tool(
     };
 
     match name {
+        "muxa_agent_find" => {
+            let Some(query) = args.get("query").and_then(Value::as_str) else {
+                return Ok(error_result("query is required"));
+            };
+            let limit = match args.get("limit") {
+                None => 10,
+                Some(value) => match value.as_u64().filter(|n| (1..=50).contains(n)) {
+                    Some(value) => usize::try_from(value).expect("limit is at most 50"),
+                    None => return Ok(error_result("limit must be between 1 and 50")),
+                },
+            };
+            let exclude: Vec<String> = match args.get("exclude_sessions") {
+                None => Vec::new(),
+                Some(Value::Array(values)) if values.iter().all(Value::is_string) => values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                Some(_) => return Ok(error_result("exclude_sessions must be an array of strings")),
+            };
+            Ok(
+                match crate::agent_find::lookup(
+                    client,
+                    query,
+                    limit,
+                    &exclude,
+                    args.get("refresh")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                )
+                .await
+                {
+                    Ok(result) => json_result(&serde_json::to_value(result)?),
+                    Err(error) => error_result(&error.to_string()),
+                },
+            )
+        }
         "muxa_agent_search" | "muxa_agent_read" => {
             Ok(match crate::agent_records::call(name, args).await {
                 Ok(result) => json_result(&result),
@@ -1717,10 +1821,9 @@ async fn call_tool(
                 client.collaboration_inbox(&origin).await
             };
             Ok(match inbox {
-                Ok(requests) => json_result(&json!({ "requests": requests.iter().map(|request| {
-                    if args.get("full").and_then(Value::as_bool).unwrap_or(false) { json!(request) }
-                    else { crate::collaboration_output::message(request, true) }
-                }).collect::<Vec<_>>() })),
+                Ok(requests) => json_result(
+                    &json!({ "requests": crate::collaboration_output::inbox(&requests,args.get("full").and_then(Value::as_bool).unwrap_or(false)) }),
+                ),
                 Err(error) => error_result(&format!("inbox failed: {error}")),
             })
         }
@@ -2826,6 +2929,9 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         return json_result(&payload);
     }
 
+    let compact_short_reply = config.collaboration.wake_payload
+        == muxa::config::CollaborationWakePayload::Adaptive
+        && muxa::collaboration::instruction::short_inline_prompt(&sent).is_some();
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
@@ -2838,6 +2944,9 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
                 .as_object_mut()
                 .unwrap()
                 .extend(request_outcome(&request).as_object().unwrap().clone());
+            if compact_short_reply && request.status.is_terminal() && request.reply.is_some() {
+                payload = crate::collaboration_output::short_call_outcome(payload, &request);
+            }
             json_result(&payload)
         }
         Ok(None) => {
@@ -3802,6 +3911,7 @@ async fn acquire_peer_capacity(
     }
 }
 
+#[allow(clippy::too_many_lines)] // reservation, launch and registration form one worker lifecycle
 async fn spawn_peer(
     client: &Client,
     room: &RoomContext,
@@ -3874,6 +3984,7 @@ async fn spawn_peer(
             }
         }
     };
+    let _ = client.invalidate_agent_directory().await;
     if host == muxa::HostKind::Rmux {
         started.pane = format!("rmux:{}", started.pane);
     }
@@ -6216,6 +6327,7 @@ mod tests {
         assert_eq!(
             names,
             vec![
+                "muxa_agent_find",
                 "muxa_status",
                 "muxa_recent_prompts",
                 "muxa_guide",
@@ -6287,6 +6399,12 @@ mod tests {
     #[test]
     fn status_and_wait_tool_definitions_bound_context() {
         let tools = tool_definitions(&muxa::config::Config::default());
+        let find = tools
+            .iter()
+            .find(|tool| tool["name"] == "muxa_agent_find")
+            .unwrap();
+        assert_eq!(find["inputSchema"]["required"], json!(["query"]));
+        assert_eq!(find["inputSchema"]["properties"]["limit"]["maximum"], 50);
         let status = tools
             .iter()
             .find(|tool| tool["name"] == "muxa_status")
@@ -7412,6 +7530,13 @@ mod tests {
     async fn record_tools_validate_arguments_without_a_daemon() {
         let client = Client::new(std::path::PathBuf::from("/missing/muxa-record-test.sock"));
         for (name, args) in [
+            ("muxa_agent_find", json!({})),
+            ("muxa_agent_find", json!({"query":"task","limit":0})),
+            ("muxa_agent_find", json!({"query":" ","limit":1})),
+            (
+                "muxa_agent_find",
+                json!({"query":"task","exclude_sessions":[1]}),
+            ),
             (
                 "muxa_agent_search",
                 json!({"providers":["unknown"],"query":"bucket"}),
@@ -7550,17 +7675,20 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn an_idle_server_reexecs_only_after_its_binary_is_replaced() {
+        use std::os::unix::fs::PermissionsExt;
         use std::sync::atomic::{AtomicUsize, Ordering};
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("muxa");
-        std::fs::write(&binary, b"build one").unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let seen = Arc::clone(&calls);
         let watch = UpgradeWatch {
             path: binary.clone(),
             started: BinaryStamp::of(&binary).unwrap(),
+            rejected: None,
             reexec: Box::new(move |_| {
                 seen.fetch_add(1, Ordering::SeqCst);
             }),
@@ -7588,8 +7716,29 @@ mod tests {
         client_out.read_line(&mut line).await.unwrap();
         assert!(line.contains("\"id\":1"));
 
+        // A config-incompatible install cannot take down this live pipe,
+        // and the same rejected binary/config pair is probed only once.
+        let probes = dir.path().join("probes");
+        std::fs::write(
+            &binary,
+            format!("#!/bin/sh\nprintf p >> '{}'\nexit 1\n", probes.display()),
+        )
+        .unwrap();
+        tokio::time::sleep(UPGRADE_POLL_INTERVAL * 6).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(std::fs::read_to_string(&probes).unwrap(), "p");
+        tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
+        assert_eq!(std::fs::read_to_string(&probes).unwrap(), "p");
+        client_in
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"ping\"}\n")
+            .await
+            .unwrap();
+        line.clear();
+        client_out.read_line(&mut line).await.unwrap();
+        assert!(line.contains("\"id\":2"));
+
         // Replaced: the next idle poll hands over to the new binary once.
-        std::fs::write(&binary, b"build two, longer").unwrap();
+        std::fs::write(&binary, b"#!/bin/sh\n# validated new build\nexit 0\n").unwrap();
         tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 

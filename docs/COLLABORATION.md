@@ -407,6 +407,21 @@ muxa msg send peer "retry with write access" --withdraw req_...  # replaces req_
 muxa msg withdraw req_...  # gave up on it: its late reply will not wake you
 ```
 
+Agent-to-agent wakes carry a request ID, rather than pasting the request body
+into the recipient's conversation. Read that one request with
+`muxa_inbox(request_id="REQUEST")` or `muxa msg accept REQUEST --json`;
+then reuse the request ID for updates and the final reply. This avoids
+repeating other claimed requests. `muxa msg inbox --json` shares the compact MCP
+view, including the complete body, permitted paths, attachments and task
+contract. Use `--json --full` only for the legacy audit record. Inbox sender and
+update authors keep a label and agent session ID (plus `console:true` for the
+operator); the reader's endpoint, transport state, physical routing, repeated
+basis revision aliases and empty attachments are omitted. Permission flags and
+`paths: []` stay explicit. Work/parent/role context and unusual or UI provenance
+remain available; requests at least 30 minutes old expose `request_age_minutes`; the attempt is the canonical requested basis. Receipts and
+list views retain routing, and full records retain all audit details. Subsequent progress reads can use
+`muxa msg list --request-id REQUEST --after-update SEQUENCE --json`.
+
 `muxa msg inbox` text output includes the reply obligation, permitted paths and attachments alongside the task. `muxa msg wait --timeout SECONDS` is an alias for `--timeout-secs SECONDS`.
 
 `muxa msg wait` defaults to compact JSON describing delivery and final reply
@@ -730,3 +745,76 @@ unknown-tool/argument error calls for rediscovery.
 
 Read incremental CLI guidance with `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`; resume from `next_after_update`. This returns
 only newer updates and omits the original task and final reply bodies.
+
+### Measuring message overhead
+
+Use UTF-8 bytes of the original body as the primary baseline:
+`extra = received_bytes - body_bytes`, `extra_pct = 100 * extra / body_bytes`.
+Report both the absolute extra and ratio; a percentage reduction from an older
+format is insufficient. Count paths, contracts, attachments and amendments as
+additional content in this primary metric, even when they are necessary.
+Separate a secondary breakdown into required instruction values, JSON escaping,
+metadata/structure, reference wake, sender acknowledgement and MCP framing.
+MCP's text payload is model-facing; serialized MCP result JSON has another
+escaping layer and is a separate wire measurement, not an extra model payload.
+These are byte measurements, not model-independent token counts.
+
+Regression fixtures cover 100-byte text, 4096-byte Korean, escaped characters,
+contracts and amendments. For the base fixtures, structure above JSON-escaped
+body and other required values is capped at 240 bytes, plus 140 per amendment.
+This is a fixture budget, not a promise for arbitrarily long identities,
+optional delegation context or attachments. Reference wakes have a separate
+320-byte base-fixture budget and never contain the body. Replacing a minimal
+sender with its full endpoint must fail the budget test. Optional test artifacts
+are written with `MUXA_OVERHEAD_REPORT`, `MUXA_OVERHEAD_REQUEST` (a full request
+array to measure) and `MUXA_WAKE_OVERHEAD_REPORT`.
+
+CLI `send`, `reply`, `cancel` and `attention --json` acknowledge mutations
+without repeating the supplied body. Initial sends retain resolved routing;
+reply/cancel acknowledgements retain correlation and reported status only.
+Use `--json --full` for the legacy full request. Reply IPC reads metadata unless
+that full view is requested, avoiding an unnecessary body round-trip as well.
+
+### Short checks and quiet handoffs
+
+For a quick question or review with no independent local work, use
+`muxa_call_peer(wait=true)` (the default). It returns the final structured reply
+in the original call; a separate send receipt and later wait are unnecessary.
+Use `wait=false` while useful local work remains. A one-way handoff uses
+`kind=notice`, `expects_reply=false`, and the default quiet notification. Reserve
+`notify=true` for an actionable blocker, decision, conflict, or resource handoff.
+Amend an existing open request with `muxa_update_request` rather than opening a
+new task; updates are quiet and retain the original authority and paths.
+
+Opt in with `[collaboration] wake_payload = "adaptive"`. Operator messages keep
+the existing direct delivery. Agent-originated read-only questions, reviews and
+notices can be claimed and delivered inline to an idle worker when the original
+UTF-8 body is at most 512 bytes and its complete instruction JSON at most 1024
+bytes. Contracts, attempts, attachments, updates, delegation, human actions,
+unsafe terminal controls and larger/execute requests retain reference delivery.
+Primary conversations remain protected, and quiet notices do not trigger a
+wake. The default remains `operator_full`.
+
+The inline document is the same permission-bearing JSON as an inbox read,
+explicitly framed as peer-authored data. It is already claimed, so no initial
+inbox read is needed; rereading after context loss is allowed. Delivery uses
+the existing persisted prompt/Enter recovery phases. Later amendments still
+require incremental reads at agreed checkpoints. This policy does not infer
+request kind or editing permission from body wording.
+
+Measure received bytes against the original body: `extra = received - body`,
+and report JSON escaping separately where useful. Include all receiving
+surfaces, tool calls and latency when comparing paths. Inline delivery mainly
+saves one receiver tool read; permission and attribution metadata remain real
+overhead, especially for very short bodies. A synchronous short check can use
+two calls (call + reply) instead of four (send + inbox + reply + wait).
+
+Successful synchronous eligible adaptive calls also omit duplicate endpoint and
+null context fields from the sender result. The complete reply, declared status,
+request id, actual recipient identity and nonempty lineage/spawn information
+remain. Timeout/interruption results retain the ordinary recovery data.
+
+Caller pane evidence is canonicalized through the already-scanned backend
+inventory. Bare rmux pane ids resolve to their namespaced id before provenance
+comparison; ambiguous host/socket matches are not environment evidence. This
+avoids false mismatch diagnostics while retaining genuine origin differences.
