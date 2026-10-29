@@ -20455,14 +20455,19 @@ fn render_collaboration_composer_footer(
         )
         | None => {}
     }
-    if let Some(CollaborationComposeTarget::Send { target, .. }) = target {
-        // A message to one exact agent session is always a request; Ctrl-E
-        // skips just-send there, so the footer does not offer it.
-        let modes = if is_session_target(target) {
-            "read-only/execute  "
-        } else {
-            "read-only/execute/just-send  "
-        };
+    // The modes Ctrl-E cycles through (`composer_cycle_mode`). A message to
+    // one exact agent session, or to a set, is always a request, so neither
+    // offers just-send.
+    let modes = match target {
+        Some(CollaborationComposeTarget::Send { target, .. }) if !is_session_target(target) => {
+            Some("read-only/execute/just-send  ")
+        }
+        Some(
+            CollaborationComposeTarget::Send { .. } | CollaborationComposeTarget::Broadcast { .. },
+        ) => Some("read-only/execute  "),
+        _ => None,
+    };
+    if let Some(modes) = modes {
         spans.extend([
             Span::styled(" Ctrl-E ", theme.key_badge()),
             Span::raw(modes),
@@ -24520,6 +24525,15 @@ mod tests {
             panic!("marks should open a broadcast composer");
         };
         assert_eq!(mode, ComposeSendMode::ReadOnly);
+        // The footer offers the cycle below, and only the two modes in it.
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        terminal.draw(|frame| render(frame, &mut app)).unwrap();
+        let screen = (0..terminal.backend().buffer().area().height)
+            .map(|y| row_text(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(screen.contains("Ctrl-E read-only/execute"), "{screen}");
+        assert!(!screen.contains("just-send"), "{screen}");
 
         // And Ctrl-E cycles between the two modes a set can be sent in,
         // rather than doing nothing.
