@@ -29,6 +29,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Collaboration writes stage only affected rows instead of copying full history;
+  identical plain replies are safe to retry without repeating wakes. The Work
+  board reuses mailbox revisions and fetches only open-request metadata, while
+  Fleet mailbox reads enforce their existing 32-record limit before IPC transfer.
+  Shared Codex origins resolve by exact session at the daemon without snapshot
+  lookups, and `reload mcp --all --reconnect` includes current-image shared hosts.
+
 - Adaptive short requests carry their request ID once in the shared JSON record;
   the reply hint refers to that ID. The body cap is now 768 UTF-8 bytes, still
   bounded by the complete 1024-byte instruction limit. Renderer cost matrices

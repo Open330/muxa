@@ -3334,6 +3334,7 @@ pub(crate) struct App {
     pending_outcomes: Vec<(Vec<PaneKey>, tokio::sync::oneshot::Receiver<ActionOutcome>)>,
     board_stats: BoardStats,
     board_collab: BoardCollab,
+    board_collab_cache: BoardMailboxCache,
     board_workers: BoardWorkers,
     /// The daemon resolves exact agent sessions (`session:` targets and
     /// exact-session origins). Board collaboration acts for one exact agent,
@@ -3687,6 +3688,7 @@ impl App {
             board_pending: None,
             board_stats: BoardStats::default(),
             board_collab: BoardCollab::default(),
+            board_collab_cache: BoardMailboxCache::default(),
             board_workers: BoardWorkers::default(),
             exact_session_supported: false,
             pending_outcomes: Vec::new(),
@@ -8888,15 +8890,7 @@ pub async fn run(
         }
         if app.watch_cfg.screen == WatchScreen::Board && app.board_collab.due(BOARD_COLLAB_INTERVAL)
         {
-            if let Some(origin) = app.collaboration.origin.clone() {
-                let client = client.clone();
-                let origin = CollaborationOrigin {
-                    console: true,
-                    ..origin
-                };
-                app.board_collab
-                    .start(async move { read_watch_history(&client, &origin, false).await });
-            }
+            refresh_board_collaboration(client, &mut app);
         }
         if app.watch_cfg.screen == WatchScreen::Board && app.board_stats.due(BOARD_STATS_INTERVAL) {
             let client = client.clone();
@@ -9449,10 +9443,97 @@ impl BoardStats {
     }
 }
 
-/// Collaboration history behind the per-Work summary: one console listing
-/// (previews, never claims).
+/// Open-request metadata behind the per-Work summary; never bodies or claims.
 pub(crate) type BoardCollab = Background<Vec<CollaborationRequest>>;
 const BOARD_COLLAB_INTERVAL: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Default)]
+struct BoardMailboxCache {
+    changes: Option<tokio::sync::watch::Receiver<Option<u64>>>,
+    revision: Option<u64>,
+}
+
+fn refresh_board_collaboration(client: &Client, app: &mut App) {
+    let Some(origin) = app.collaboration.origin.clone() else {
+        return;
+    };
+    let cache = &mut app.board_collab_cache;
+    if cache
+        .changes
+        .as_ref()
+        .is_none_or(|changes| changes.has_changed().is_err())
+    {
+        cache.changes = Some(collaboration_revision_updates(client.clone()));
+        cache.revision = None;
+    }
+    // Consume before starting the read: a racing change stays pending.
+    let revision = cache
+        .changes
+        .as_mut()
+        .and_then(|changes| *changes.borrow_and_update());
+    if revision.is_some()
+        && revision == cache.revision
+        && app.board_collab.value.as_ref().is_some_and(Result::is_ok)
+    {
+        return;
+    }
+    cache.revision = revision;
+    let client = client.clone();
+    let origin = CollaborationOrigin {
+        console: true,
+        ..origin
+    };
+    app.board_collab
+        .start(async move { read_board_open_requests(&client, &origin).await });
+}
+
+async fn read_board_open_requests(
+    client: &Client,
+    origin: &CollaborationOrigin,
+) -> Result<Vec<CollaborationRequest>, String> {
+    use muxa::collaboration::CollaborationReadView as View;
+    let mut requests = HashMap::new();
+    for status in [RequestStatus::Queued, RequestStatus::Claimed] {
+        let mut query = muxa::collaboration::CollaborationQuery {
+            status: Some(status),
+            limit: Some(500),
+            ..Default::default()
+        };
+        loop {
+            let result = client
+                .collaboration_query_result(
+                    origin,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &query,
+                    0,
+                    View::Metadata,
+                    false,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            let legacy = result.legacy_requests.is_some();
+            let page = result.page;
+            for mut row in result.legacy_requests.unwrap_or(page.requests) {
+                if !row.status.is_terminal() {
+                    View::Metadata.apply(&mut row);
+                    requests.insert(row.id.clone(), row);
+                }
+            }
+            if legacy {
+                return Ok(requests.into_values().collect());
+            }
+            if !page.has_more {
+                break;
+            }
+            query.cursor = Some(
+                page.next_cursor
+                    .ok_or("open-request page omitted its cursor")?,
+            );
+        }
+    }
+    Ok(requests.into_values().collect())
+}
 
 impl BoardCollab {
     /// The detail line for one Work: counts, still loading, or why not.
@@ -30462,6 +30543,110 @@ sort = ["state"]
         assert_eq!(full.len(), 2);
         assert_eq!(full[0].updates[0].body, "new update");
         assert_eq!(full[1].body, COLLAB_FIXTURE_BODY);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn board_reuses_unchanged_revision_and_queries_only_open_metadata() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("board-open.sock");
+        let queued = collab_request("%2");
+        let mut claimed = queued.clone();
+        claimed.status = RequestStatus::Claimed;
+        let response = |row: &CollaborationRequest| {
+            json!({"ok":true,"collaboration_scope":"all",
+            "collaboration_page":{"requests":[row],"total":1,"has_more":false}})
+        };
+        let mut calls = Vec::new();
+        for _ in 0..2 {
+            calls.push((
+                json!({"/kind":"collaboration_list","/view":"metadata","/query/status":"queued"}),
+                response(&queued),
+            ));
+            calls.push((
+                json!({"/kind":"collaboration_list","/view":"metadata","/query/status":"claimed"}),
+                response(&claimed),
+            ));
+        }
+        let server = crate::collaboration_output::mock_collaboration_responses(&socket, calls);
+        let client = Client::new(socket);
+        let mut app = collab_app("%2");
+        let (sender, changes) = tokio::sync::watch::channel(Some(7));
+        app.board_collab_cache.changes = Some(changes);
+        app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        });
+        refresh_board_collaboration(&client, &mut app);
+        let rows = app
+            .board_collab
+            .in_flight
+            .take()
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "a queued-to-claimed page race must not duplicate a request"
+        );
+        assert_eq!(rows[0].status, RequestStatus::Claimed);
+        assert!(rows[0].body.is_empty());
+        app.board_collab.value = Some(Ok(rows));
+        refresh_board_collaboration(&client, &mut app);
+        assert!(
+            app.board_collab.in_flight.is_none(),
+            "idle mailbox must do no list RPCs"
+        );
+        sender.send_replace(Some(8));
+        refresh_board_collaboration(&client, &mut app);
+        let rows = app
+            .board_collab
+            .in_flight
+            .take()
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn board_legacy_listing_filters_terminal_bodies_in_one_read() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("board-legacy.sock");
+        let queued = collab_request("%2");
+        let mut terminal = queued.clone();
+        terminal.id = "old".into();
+        terminal.status = RequestStatus::Completed;
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![(
+                json!({"/kind":"collaboration_list","/view":"metadata"}),
+                json!({"ok":true,"collaboration_scope":"all","collaboration_requests":[queued,terminal]}),
+            )],
+        );
+        let origin = CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        };
+        let rows = read_board_open_requests(&Client::new(socket), &origin)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].body.is_empty());
         server.await.unwrap();
     }
 

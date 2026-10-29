@@ -18,10 +18,10 @@ pub struct McpReloadArgs {
     /// Codex profile to refresh. Defaults to explicit `CODEX_HOME`; otherwise pass this flag.
     #[arg(long, conflicts_with = "all")]
     codex_home: Option<PathBuf>,
-    /// Discover stale owners, refresh shared Codex profiles, and explain standalone clients needing reconnect.
+    /// Discover stale owners (all shared owners with --reconnect), refresh their Codex profiles, and explain standalone clients needing reconnect.
     #[arg(long)]
     all: bool,
-    /// Rebuild cached Muxa clients even when the binary is unchanged; agent sessions stay running.
+    /// Rebuild cached Muxa clients even when the binary is unchanged; agent sessions stay running, but in-flight Muxa tool calls can be interrupted.
     #[arg(long)]
     reconnect: bool,
     /// Print the selected scope without sending a reload request.
@@ -208,6 +208,24 @@ fn plan(
     })
 }
 
+fn plan_inventory(
+    args: &McpReloadArgs,
+    owners: &crate::stale_agents::McpOwnerInventory,
+    sessions: &Sessions,
+) -> Result<Report> {
+    let mut selected = owners.stale.clone();
+    if args.all && args.reconnect {
+        // A live executable revision says nothing about a host's cached
+        // transport. Do not require an old image before selecting its host.
+        selected.shared_codex.clone_from(&owners.all.shared_codex);
+    }
+    let mut report = plan(args, &selected, sessions)?;
+    for host in &mut report.hosts {
+        host.stale_muxa_processes_before = stale_count(&host.control_socket, &owners.stale);
+    }
+    Ok(report)
+}
+
 async fn refresh_host(
     mut host: HostResult,
     binary: &std::path::Path,
@@ -305,13 +323,13 @@ async fn refresh_hosts(
 pub async fn run(client: &muxa::ipc::Client, args: McpReloadArgs) -> Result<()> {
     let binary = crate::stale_agents::installed_muxa()
         .context("cannot locate installed muxa to discover stale owners")?;
-    let owners = crate::stale_agents::scan(&binary);
+    let owners = crate::stale_agents::scan_inventory(&binary);
     let sessions = if args.all {
-        standalone_sessions(client, &owners).await
+        standalone_sessions(client, &owners.stale).await
     } else {
         Sessions::new()
     };
-    let mut report = plan(&args, &owners, &sessions)?;
+    let mut report = plan_inventory(&args, &owners, &sessions)?;
     let revision = crate::mcp_revision::binary_revision(&binary)?;
     report.hosts = refresh_hosts(report.hosts, &binary, &revision, &args).await;
     if !args.dry_run {
@@ -639,6 +657,36 @@ mod tests {
             timeout_secs: 2,
             json: true,
         }
+    }
+
+    #[test]
+    fn reconnect_all_selects_current_shared_owners_without_calling_them_stale() {
+        let mut all = crate::stale_agents::StaleReport::default();
+        all.shared_codex
+            .insert((42, Some("/profiles/current".into())), 3);
+        all.panes.insert("current Claude".into(), 1);
+        let owners = crate::stale_agents::McpOwnerInventory {
+            stale: crate::stale_agents::StaleReport::default(),
+            all,
+        };
+        let mut options = McpReloadArgs {
+            all: true,
+            codex_home: None,
+            ..args()
+        };
+        assert!(plan_inventory(&options, &owners, &Sessions::new())
+            .unwrap()
+            .hosts
+            .is_empty());
+        options.reconnect = true;
+        let report = plan_inventory(&options, &owners, &Sessions::new()).unwrap();
+        assert_eq!(report.hosts.len(), 1);
+        assert_eq!(report.hosts[0].stale_muxa_processes_before, 0);
+        assert!(report.hosts[0].reconnect_requested);
+        assert!(
+            report.manual_reconnect.is_empty(),
+            "current non-shared owners are not falsely marked stale"
+        );
     }
 
     #[test]

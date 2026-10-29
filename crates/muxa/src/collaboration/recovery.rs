@@ -107,12 +107,14 @@ impl CollaborationStore {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
         let now = OffsetDateTime::now_utc();
-        let snapshot = self.requests.read().await.clone();
+        let snapshot = self.requests.read().await;
         let mut changed = Vec::new();
-        for original in snapshot
-            .values()
-            .filter(|r| !r.to.console && r.expects_reply && r.kind != RequestKind::Notice)
-        {
+        for original in snapshot.values().filter(|r| {
+            !r.to.console
+                && r.expects_reply
+                && r.kind != RequestKind::Notice
+                && (!r.status.is_terminal() || r.interruption.is_some())
+        }) {
             let agent = exact_agent(&original.to, agents);
             let current_reason = agent.and_then(reason);
             let mut parent = original.clone();
@@ -193,6 +195,7 @@ impl CollaborationStore {
                 changed.push(parent);
             }
         }
+        drop(snapshot);
         if !changed.is_empty() {
             self.persist_requests(&changed)?;
             let mut requests = self.requests.write().await;
@@ -402,6 +405,49 @@ mod tests {
             .unwrap();
         mailbox.reconcile_peer_interruptions(&[peer]).await.unwrap();
         assert!(mailbox.pending_human_notifications().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_interrupted_parent_still_closes_its_recovery_action() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, mut coordinator) = actor("%1", "sender").await;
+        let (recipient, mut peer) = actor("%2", "peer").await;
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "finish during recovery".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        coordinator.state = AgentState::Stopped;
+        peer.state = AgentState::Stopped;
+        let agents = [coordinator, peer];
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        let parent = mailbox.peek_for(&sender, &request.id).await.unwrap();
+        let action = parent.interruption.unwrap().action_request_id.unwrap();
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "finished".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        let rows = mailbox.requests.read().await;
+        assert!(!rows[&request.id].interruption.as_ref().unwrap().active);
+        assert_eq!(rows[&action].status, RequestStatus::Cancelled);
+        drop(rows);
+        let changes = mailbox.subscribe();
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(!changes.has_changed().unwrap());
     }
 
     #[tokio::test]

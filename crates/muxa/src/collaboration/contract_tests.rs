@@ -316,6 +316,59 @@ async fn supersession_and_late_reports_survive_restart_and_do_not_resurrect_wake
 }
 
 #[tokio::test]
+async fn failed_claimed_supersession_keeps_notices_withdrawals_and_old_attempt_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = CollaborationOptions {
+        path: Some(dir.path().join("mailbox.sqlite")),
+        ..Default::default()
+    };
+    let store = CollaborationStore::load(options).await.unwrap();
+    let old = create(&store).await;
+    store
+        .claim_by_id(&actor("reviewer", "%2"), &old.id)
+        .await
+        .unwrap();
+    let other = store
+        .create(
+            actor("sender", "%1"),
+            actor("second", "%3"),
+            NewRequest {
+                body: "independent request".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let before = store.requests.read().await.clone();
+    let changes = store.subscribe();
+    let db = Connection::open(store.database_path.as_ref().unwrap()).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_staged BEFORE INSERT ON collaboration_requests BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+    let mut next = input();
+    next.supersedes_request_id = Some(old.id.clone());
+    next.withdraw_reply_wakes = vec![other.id];
+    assert!(store
+        .create(actor("sender", "%1"), actor("second", "%3"), next)
+        .await
+        .is_err());
+    assert_eq!(*store.requests.read().await, before);
+    assert!(!changes.has_changed().unwrap());
+    let stored: HashMap<_, _> = query_database(
+        store.database_path.as_ref().unwrap(),
+        &Participant::console(old.from.room),
+        RequestMailbox::All,
+        MailboxScope::All,
+        &CollaborationQuery::default(),
+        0,
+    )
+    .unwrap()
+    .requests
+    .into_iter()
+    .map(|r| (r.id.clone(), r))
+    .collect();
+    assert_eq!(stored, before);
+}
+
+#[tokio::test]
 async fn failed_supersession_persistence_rolls_back_the_old_request_and_new_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let options = CollaborationOptions {

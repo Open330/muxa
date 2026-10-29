@@ -464,14 +464,14 @@ impl LocalTask {
                             Ok(Vec::new())
                         } else {
                             self.client
-                                .collaboration_list(&agent, RequestMailbox::Incoming)
+                                .collaboration_recent_mailbox(&agent, RequestMailbox::Incoming)
                                 .await
                         }
                     },
                     self.client
-                        .collaboration_list(&console, RequestMailbox::Sent),
+                        .collaboration_recent_mailbox(&console, RequestMailbox::Sent),
                     self.client
-                        .collaboration_list(&console, RequestMailbox::Incoming),
+                        .collaboration_recent_mailbox(&console, RequestMailbox::Incoming),
                 )
                 .map_err(|error| error.to_string())?;
                 incoming.extend(human);

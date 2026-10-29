@@ -2086,10 +2086,22 @@ async fn lifecycle_target(
     client: &Client,
     target: Option<&str>,
 ) -> Result<(Option<muxa::BackendEndpoint>, Option<String>), String> {
-    let resolved_origin = resolve_collaboration_origin(client).await;
+    let mut resolved_origin = resolve_collaboration_origin(client).await;
     if target.is_none_or(|t| muxa::backend::pane_id_host_kind(t).is_none())
         && pane_env_is_borrowed()
     {
+        let origin = resolved_origin.as_ref().map_err(Clone::clone)?;
+        let room = client
+            .collaboration_context(origin)
+            .await
+            .map_err(|error| error.to_string())?;
+        resolved_origin = Ok(CollaborationOrigin {
+            exact_session: true,
+            pane: room.current.pane,
+            socket: room.current.socket,
+            console: room.current.console,
+            agent_session_id: Some(room.current.agent_session_id),
+        });
         let origin = resolved_origin.as_ref().map_err(Clone::clone)?;
         if origin.pane.is_empty() || origin.socket.is_none() {
             return Err("lifecycle caller is not bound to a server yet; refresh room context before retrying".into());
@@ -4167,22 +4179,13 @@ pub(crate) fn pane_env_is_borrowed() -> bool {
     })
 }
 
-/// How long a session-id resolution is reused. Short enough that a binding
-/// the reconciler repairs (a pane claimed before the fix, a late cwd match)
-/// takes effect promptly; long enough that a burst of calls costs one lookup.
-const SESSION_ORIGIN_TTL: Duration = Duration::from_secs(30);
-
-/// The origin this MCP call or CLI invocation speaks for.
-///
-/// Normally the pane env names the caller ([`current_collaboration_origin`]).
-/// Under a shared Codex app-server it names whichever pane started that
-/// server, so the caller is identified by its Codex session id instead — the
-/// MCP `_meta` thread id, or `$CODEX_THREAD_ID` for a shell command — and
-/// mapped to the pane the registry bound that session to. A wrong identity is
-/// worse than none: when the session is unknown or not yet bound to a pane,
-/// this fails rather than borrowing the server's pane.
+/// Resolve collaboration identity at the daemon, where the current session
+/// binding is authoritative. Shared app-server pane variables belong to another
+/// conversation: never copy them, cache a physical pane, or transfer a full
+/// registry snapshot merely to identify the calling thread.
+#[allow(clippy::unused_async)] // common async API; shared identity needs no IPC
 pub(crate) async fn resolve_collaboration_origin(
-    client: &Client,
+    _client: &Client,
 ) -> std::result::Result<CollaborationOrigin, String> {
     let session = CALLER_SESSION
         .try_with(Clone::clone)
@@ -4194,80 +4197,24 @@ pub(crate) async fn resolve_collaboration_origin(
                 .filter(|id| !id.trim().is_empty())
         });
     if !pane_env_is_borrowed() {
-        // The pane env is trustworthy, but a pane can still carry more than
-        // one registry row; the session id lets the daemon pick the caller's.
         let mut origin = current_collaboration_origin()?;
         origin.agent_session_id = session;
         return Ok(origin);
     }
     let session = session.ok_or_else(|| {
-        "collaboration cannot identify this Codex thread: it runs under the shared \
-             Codex app-server, whose pane variables belong to another pane, and the \
-             call carried no thread id. Upgrade Codex, or start it with `codex --no-daemon`"
-            .to_string()
+        "collaboration cannot identify this Codex thread: shared app-server pane variables belong to another pane and no thread id was supplied".to_owned()
     })?;
-    session_origin(client, &session).await
+    Ok(shared_session_origin(session))
 }
 
-async fn session_origin(
-    client: &Client,
-    session: &str,
-) -> std::result::Result<CollaborationOrigin, String> {
-    static CACHE: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, (std::time::Instant, CollaborationOrigin)>>,
-    > = std::sync::OnceLock::new();
-    let cache = CACHE.get_or_init(Default::default);
-    if let Some((at, origin)) = cache
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(session).cloned())
-    {
-        if at.elapsed() < SESSION_ORIGIN_TTL {
-            return Ok(origin);
-        }
-    }
-    let agents = client
-        .snapshot()
-        .await
-        .map_err(|error| format!("collaboration origin lookup failed: {error}"))?;
-    let origin = origin_for_session(&agents, session)?;
-    // An unbound origin is resolved by the daemon, which binds the session on
-    // demand; ask it again next time instead of caching the empty pane.
-    if !origin.pane.is_empty() {
-        if let Ok(mut cache) = cache.lock() {
-            cache.insert(
-                session.to_owned(),
-                (std::time::Instant::now(), origin.clone()),
-            );
-        }
-    }
-    Ok(origin)
-}
-
-fn origin_for_session(
-    agents: &[Agent],
-    session: &str,
-) -> std::result::Result<CollaborationOrigin, String> {
-    let agent = agents
-        .iter()
-        .find(|agent| agent.session_id == session)
-        .ok_or_else(|| {
-            format!(
-                "collaboration origin: Codex thread {session} is not tracked yet; \
-                 submit a prompt so its hooks register it, then retry"
-            )
-        })?;
-    // Not bound yet: send the session alone. The daemon binds it from live
-    // process evidence before resolving; an empty pane can never fall back
-    // onto another agent's pane.
-    let pane = agent.pane.clone().unwrap_or_default();
-    Ok(CollaborationOrigin {
-        exact_session: false,
-        pane,
-        socket: agent.tmux_socket.clone(),
+fn shared_session_origin(session: String) -> CollaborationOrigin {
+    CollaborationOrigin {
+        exact_session: true,
+        pane: String::new(),
+        socket: None,
         console: false,
-        agent_session_id: Some(session.to_owned()),
-    })
+        agent_session_id: Some(session),
+    }
 }
 
 pub(crate) fn current_collaboration_origin() -> std::result::Result<CollaborationOrigin, String> {
@@ -5341,40 +5288,35 @@ mod tests {
         assert_eq!(caller_session_hint(None), None);
     }
 
-    fn tracked(session: &str, pane: Option<&str>) -> Agent {
-        let mut agent: Agent = serde_json::from_value(json!({
-            "kind": "codex",
-            "session_id": session,
-            "state": "idle",
-            "started_at": "2026-10-02T00:00:00Z",
-            "last_activity_at": "2026-10-02T00:00:00Z",
-            "state_entered_at": "2026-10-02T00:00:00Z"
-        }))
-        .expect("minimal agent");
-        agent.pane = pane.map(str::to_owned);
-        agent.tmux_socket = pane.map(|_| "default".to_owned());
-        agent
-    }
-
-    /// Three Codex threads share one app-server whose env says `%9`; each
-    /// must resolve to the pane the registry bound *its* session to.
+    /// Shared-host identity follows the conversation at the daemon and cannot
+    /// fall back to a cached pane after that conversation has gone away.
     #[test]
-    fn session_origin_uses_the_threads_own_binding() {
-        let agents = [
-            tracked("thread-junia", Some("rmux:%9")),
-            tracked("thread-a", Some("rmux:%137")),
-            tracked("thread-b", None),
-        ];
-        let origin = origin_for_session(&agents, "thread-a").unwrap();
-        assert_eq!(origin.pane, "rmux:%137");
-        assert_eq!(origin.socket.as_deref(), Some("default"));
-        assert!(!origin.console);
+    fn shared_origin_has_no_physical_fallback_or_snapshot_dependency() {
+        let origin = shared_session_origin("thread-a".into());
         assert_eq!(origin.agent_session_id.as_deref(), Some("thread-a"));
-        let unbound = origin_for_session(&agents, "thread-b").unwrap();
-        assert_eq!(unbound.pane, "", "an unbound session never borrows a pane");
-        assert_eq!(unbound.agent_session_id.as_deref(), Some("thread-b"));
-        let unknown = origin_for_session(&agents, "thread-c").unwrap_err();
-        assert!(unknown.contains("not tracked"), "{unknown}");
+        assert!(origin.exact_session);
+        assert!(origin.pane.is_empty());
+        assert!(origin.socket.is_none());
+        assert!(!origin.console);
+        let mut caller = crate::collaboration_output::fixture().from;
+        caller.agent_session_id = "thread-a".into();
+        caller.pane = "rmux:%1".into();
+        assert_eq!(
+            muxa::collaboration::resolve_origin(&origin, &[caller.clone()], &[])
+                .unwrap()
+                .pane,
+            "rmux:%1"
+        );
+        caller.pane = "rmux:%2".into();
+        assert_eq!(
+            muxa::collaboration::resolve_origin(&origin, &[caller.clone()], &[])
+                .unwrap()
+                .pane,
+            "rmux:%2"
+        );
+        caller.agent_session_id = "successor".into();
+        caller.pane = "rmux:%1".into();
+        assert!(muxa::collaboration::resolve_origin(&origin, &[caller], &[]).is_err());
     }
     use muxa::backend::{BackendCaps, HostKind, PaneBackend, SharedBackend};
     use muxa::event::AgentEvent;

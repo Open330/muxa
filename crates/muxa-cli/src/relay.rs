@@ -477,12 +477,12 @@ async fn handle_request(
                         Ok(Vec::new())
                     } else {
                         client
-                            .collaboration_list(&agent, RequestMailbox::Incoming)
+                            .collaboration_recent_mailbox(&agent, RequestMailbox::Incoming)
                             .await
                     }
                 },
-                client.collaboration_list(&console, RequestMailbox::Sent),
-                client.collaboration_list(&console, RequestMailbox::Incoming),
+                client.collaboration_recent_mailbox(&console, RequestMailbox::Sent),
+                client.collaboration_recent_mailbox(&console, RequestMailbox::Incoming),
             )
             .context("reading collaboration mailbox")?;
             incoming.extend(human);

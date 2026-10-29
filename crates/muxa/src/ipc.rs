@@ -7722,6 +7722,29 @@ impl Client {
     }
 
     /// One participant's mailbox — the caller's own.
+    /// Fleet mailbox tabs already expose at most 32 recent full records. Apply
+    /// that bound at the daemon query, before transferring and decoding history.
+    /// The existing query fallback keeps older daemons compatible.
+    pub async fn collaboration_recent_mailbox(
+        &self,
+        origin: &CollaborationOrigin,
+        mailbox: RequestMailbox,
+    ) -> Result<Vec<collaboration::CollaborationRequest>, RuntimeError> {
+        self.collaboration_query_view(
+            origin,
+            mailbox,
+            MailboxScope::Caller,
+            &collaboration::CollaborationQuery {
+                limit: Some(crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT),
+                ..Default::default()
+            },
+            0,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+        .map(|page| page.requests)
+    }
+
     pub async fn collaboration_list(
         &self,
         origin: &CollaborationOrigin,
@@ -9108,6 +9131,72 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(counting.counts(), (2, 0, 0));
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fleet_recent_mailbox_bounds_transfer_without_losing_full_contracts() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("recent-mailbox.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "caller", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "peer", AgentKind::ClaudeCode).await;
+        let backend: SharedBackend = CountingPaneBackend::new(
+            HostKind::Tmux,
+            vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        );
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+        };
+        let context = client.collaboration_context(&origin).await.unwrap();
+        for index in 0..80 {
+            mailbox
+                .create(
+                    context.current.clone(),
+                    context.peers[0].clone(),
+                    collaboration::NewRequest {
+                        kind: collaboration::RequestKind::Task,
+                        work_mode: collaboration::WorkMode::Execute,
+                        body: format!("full instructions {index}: {}", "x".repeat(1024)),
+                        paths: vec!["src/allowed.rs".into()],
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let expected = mailbox
+            .list_for(&context.current, RequestMailbox::Sent, MailboxScope::Caller)
+            .await
+            .unwrap();
+        let recent = client
+            .collaboration_recent_mailbox(&origin, RequestMailbox::Sent)
+            .await
+            .unwrap();
+        assert_eq!(recent.len(), crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT);
+        assert_eq!(
+            recent,
+            expected[..crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT]
+        );
+        assert_eq!(recent[0].paths, ["src/allowed.rs"]);
+        assert_eq!(recent[0].work_mode, collaboration::WorkMode::Execute);
+        assert!(recent[0].body.len() > 1024);
         shutdown.send(()).unwrap();
         serving.await.unwrap();
     }
