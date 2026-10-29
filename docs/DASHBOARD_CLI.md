@@ -43,7 +43,8 @@ and saves the order (`[watch] board_sort`).
 
 ## Changes from the earlier dashboard
 
-- **ACT/WACT is attributed per pane**, then summed over each Work's panes.
+- **ACT/WACT is attributed per pane**, then summed over the panes each Work
+  holds now (a pane id seen on two servers reads `?`).
   The old console split it by tmux session name, so every Work in one session
   showed the same figure. Each row has an `ACT` column, the detail shows ACT
   and WACT, and the corner sums all sessions; `--sort active` orders by it.

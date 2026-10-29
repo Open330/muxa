@@ -304,10 +304,15 @@ board_sort`) orders the board without touching the topology sort. `busy` counts
 agents working or starting; `active` orders by ACT. ACT and WACT are attributed
 to the exact pane each second happened in (last touch, so no second counts
 twice) over a window (`--since`, `[watch] board_since`, default `today`). Each
-row's `ACT` column and the detail sum the Work's own panes; the top-right sums
-all sessions and does not follow the filter, shortening or giving way when the
-board is too narrow for both titles. Figures read `…` until known and
-`unavailable` rather than zero when they cannot be read.
+row's `ACT` column and the detail sum the panes the Work holds **now**: a pane it
+gave up takes its history with it, a pane it gained brings its own, and a Work
+whose Runs have all closed reads `-`. Activity is keyed by pane id, so when the
+board sees one id on two servers the Works holding it read `?` instead of each
+being credited. Time in no known pane (a keypress the multiplexer could not
+place) counts toward the total only. The top-right sums all sessions and does
+not follow the filter, shortening or giving way when the board is too narrow
+for both titles. Figures read `…` until known and `n/a` / `unavailable` rather
+than zero when they cannot be read.
 
 Collaboration on the board follows the same agent cursor. `m` messages that
 agent: its pane and agent session are fixed when you press it, and the message

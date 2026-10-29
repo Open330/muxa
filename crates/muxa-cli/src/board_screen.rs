@@ -55,7 +55,10 @@ pub(crate) struct BoardScreen {
     sort: WatchBoardSort,
     /// ACT/WACT per exact pane over the board's window, when known; what the
     /// `active` order and each row's ACT column read.
-    activity: Option<std::collections::BTreeMap<String, ActiveDuration>>,
+    activity: ActivityState,
+    /// Pane ids the board sees on more than one server. Activity is keyed by
+    /// pane id alone, so a Work holding one of these cannot be told apart.
+    ambiguous_panes: std::collections::HashSet<String>,
 }
 
 /// One agent pane, exactly: server, session, window and pane.
@@ -82,6 +85,7 @@ impl AgentRef {
 
 impl BoardScreen {
     pub(crate) fn set_snapshot(&mut self, snapshot: WorkSnapshot, notes: Vec<String>) {
+        self.ambiguous_panes = ambiguous_panes(&snapshot);
         self.works = snapshot.works;
         self.sort_works();
         // Commit the Work the cursor shows, so the next reordering refresh
@@ -122,33 +126,49 @@ impl BoardScreen {
                 .sort_by_key(|work| (Reverse(busy_agents(work)), attention_order(work))),
             WatchBoardSort::Name => self.works.sort_by(|a, b| a.identity.cmp(&b.identity)),
             WatchBoardSort::Active => {
-                let activity = self.activity.as_ref();
-                self.works.sort_by_key(|work| {
-                    let active =
-                        activity.map_or(0, |by_pane| work_active(work, by_pane).active_secs);
-                    (Reverse(active), attention_order(work))
-                });
+                let keys: Vec<_> = self
+                    .works
+                    .iter()
+                    .map(|work| match self.active_of(work) {
+                        WorkActivity::Known(active) => active.active_secs,
+                        _ => 0,
+                    })
+                    .collect();
+                let mut ranked: Vec<_> = std::mem::take(&mut self.works)
+                    .into_iter()
+                    .zip(keys)
+                    .collect();
+                ranked.sort_by_key(|(work, active)| (Reverse(*active), attention_order(work)));
+                self.works = ranked.into_iter().map(|(work, _)| work).collect();
             }
         }
     }
 
     /// Per-pane activity arrived: it feeds the ACT column and, under the
     /// `active` order, the order itself. The cursor stays on its Work.
-    pub(crate) fn set_activity(
-        &mut self,
-        activity: Option<std::collections::BTreeMap<String, ActiveDuration>>,
-    ) {
+    pub(crate) fn set_activity(&mut self, activity: ActivityState) {
         self.activity = activity;
         if self.sort == WatchBoardSort::Active {
             self.sort_works();
         }
     }
 
-    /// The Work's ACT/WACT, or `None` until per-pane activity is known.
-    pub(crate) fn active_of(&self, work: &WorkSnapshotItem) -> Option<ActiveDuration> {
-        self.activity
-            .as_ref()
-            .map(|by_pane| work_active(work, by_pane))
+    /// The Work's ACT/WACT over the panes it holds now, or why not.
+    pub(crate) fn active_of(&self, work: &WorkSnapshotItem) -> WorkActivity {
+        let by_pane = match &self.activity {
+            ActivityState::Loading => return WorkActivity::Loading,
+            ActivityState::Unavailable => return WorkActivity::Unavailable,
+            ActivityState::Known(by_pane) => by_pane,
+        };
+        if let Some(pane) = work
+            .runs
+            .iter()
+            .flat_map(|run| run.panes.iter())
+            .find(|pane| self.ambiguous_panes.contains(&pane.pane_id))
+        {
+            return WorkActivity::Ambiguous(pane.pane_id.clone());
+        }
+        WorkActivity::Known(work_active(work, by_pane))
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -407,6 +427,65 @@ pub(crate) fn worker_summary(
     summary
 }
 
+/// Per-pane activity as the board last heard it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) enum ActivityState {
+    #[default]
+    Loading,
+    Unavailable,
+    Known(std::collections::BTreeMap<String, ActiveDuration>),
+}
+
+/// One Work's activity, or why it cannot be given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkActivity {
+    Loading,
+    Unavailable,
+    /// This pane id is on more than one server, and activity cannot tell
+    /// which: shown as unknown rather than credited twice.
+    Ambiguous(String),
+    Known(ActiveDuration),
+}
+
+impl WorkActivity {
+    /// The compact cell: `…`, `n/a`, `?`, or the ACT figure.
+    pub(crate) fn cell(&self) -> String {
+        match self {
+            Self::Loading => "…".into(),
+            Self::Unavailable => "n/a".into(),
+            Self::Ambiguous(_) => "?".into(),
+            Self::Known(active) => active_label(active.active_secs),
+        }
+    }
+}
+
+/// Pane ids that appear on more than one server among every Run the board
+/// knows, Works and unlinked executions alike.
+fn ambiguous_panes(snapshot: &WorkSnapshot) -> std::collections::HashSet<String> {
+    let mut endpoints: std::collections::HashMap<
+        &str,
+        std::collections::HashSet<(muxa::backend::HostKind, &str)>,
+    > = std::collections::HashMap::new();
+    for run in snapshot
+        .works
+        .iter()
+        .flat_map(|work| work.runs.iter())
+        .chain(snapshot.unlinked_executions.iter())
+    {
+        for pane in &run.panes {
+            endpoints
+                .entry(pane.pane_id.as_str())
+                .or_default()
+                .insert((run.execution.host, run.execution.socket.as_str()));
+        }
+    }
+    endpoints
+        .into_iter()
+        .filter(|(_, servers)| servers.len() > 1)
+        .map(|(pane, _)| pane.to_owned())
+        .collect()
+}
+
 /// A Work's ACT/WACT: the sum over every pane of every Run, each pane once.
 /// The per-pane figures are last-touch attributed, so the sum never counts
 /// one second twice.
@@ -594,7 +673,7 @@ pub(crate) fn row<'a>(
     now: OffsetDateTime,
     theme: WatchThemeSpec,
     selected: bool,
-    active: Option<ActiveDuration>,
+    active: &WorkActivity,
 ) -> Row<'a> {
     let stage = if needs_operator(work) {
         Span::styled(
@@ -624,7 +703,7 @@ pub(crate) fn row<'a>(
         Cell::from(issue),
         Cell::from(work.runs.len().to_string()),
         Cell::from(agent_glyphs(work, theme)),
-        Cell::from(active.map_or_else(|| "…".into(), |active| active_label(active.active_secs))),
+        Cell::from(active.cell()),
         Cell::from(work.latest_at.map_or_else(|| "-".into(), |at| age(now, at))),
     ];
     let row = Row::new(cells);
@@ -1193,6 +1272,64 @@ mod tests {
         assert_eq!(cursor(&board), "%5");
         board.move_selection(-1, "");
         assert_eq!(cursor(&board), "%1", "back on CAL-1 the cursor starts over");
+    }
+
+    fn activity(board: &BoardScreen, id: &str) -> WorkActivity {
+        let work = board
+            .visible("")
+            .into_iter()
+            .find(|work| work.identity.work_id == id)
+            .unwrap();
+        board.active_of(work)
+    }
+
+    #[test]
+    fn a_pane_id_on_two_servers_is_never_credited_to_both_works() {
+        let act = |secs: u64| ActiveDuration {
+            active_secs: secs,
+            work_active_secs: 0,
+        };
+        let mut on_a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        on_a.runs = vec![run(
+            "/tmp/rmux-a/default",
+            vec![("rmux:%1", Some(AgentState::Idle))],
+        )];
+        let mut on_b = work("CAL-2", BoardStage::InProgress, Vec::new(), 2);
+        on_b.runs = vec![run(
+            "/tmp/rmux-b/default",
+            vec![("rmux:%1", Some(AgentState::Idle))],
+        )];
+        let mut alone = work("CAL-3", BoardStage::InProgress, Vec::new(), 3);
+        alone.runs = vec![run(
+            "/tmp/rmux-a/default",
+            vec![("rmux:%7", Some(AgentState::Idle))],
+        )];
+        let mut board = BoardScreen::default();
+        board.set_snapshot(snapshot(vec![on_a, on_b, alone]), Vec::new());
+        board.set_activity(ActivityState::Known(
+            [
+                ("rmux:%1".to_string(), act(600)),
+                ("rmux:%7".to_string(), act(60)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        assert_eq!(
+            activity(&board, "CAL-1"),
+            WorkActivity::Ambiguous("rmux:%1".into())
+        );
+        assert_eq!(activity(&board, "CAL-2").cell(), "?");
+        assert_eq!(activity(&board, "CAL-3"), WorkActivity::Known(act(60)));
+        // An unlinked execution elsewhere makes the id ambiguous too.
+        let mut only_a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        only_a.runs = vec![run(
+            "/tmp/rmux-a/default",
+            vec![("rmux:%1", Some(AgentState::Idle))],
+        )];
+        let mut snap = snapshot(vec![only_a]);
+        snap.unlinked_executions = vec![run("/tmp/rmux-b/default", vec![("rmux:%1", None)])];
+        board.set_snapshot(snap, Vec::new());
+        assert_eq!(activity(&board, "CAL-1").cell(), "?");
     }
 
     #[test]

@@ -42,7 +42,8 @@ muxa dashboard --theme mono
 
 ## 이전 dashboard와 달라진 점
 
-- **ACT/WACT는 pane 단위로 나눈 뒤 Work의 pane들을 합칩니다.** 이전 콘솔은
+- **ACT/WACT는 pane 단위로 나눈 뒤 Work가 지금 가진 pane들을 합칩니다**(두 서버에
+  같은 id가 보이면 `?`). 이전 콘솔은
   tmux session 이름으로 나눠서 한 session의 Work가 모두 같은 값을 보였습니다. 각
   행에 `ACT` 열이, detail에 ACT·WACT가, 모서리에 모든 세션 합계가 나오며
   `--sort active`로 그 순서로 정렬합니다. 작업 중인 agent 수 기준은 `:sort busy`로

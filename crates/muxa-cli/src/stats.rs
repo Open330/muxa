@@ -708,6 +708,15 @@ async fn load_data(
     Ok(data)
 }
 
+/// The pane-grouping key for time that happened in no known pane. It can
+/// never equal a pane id, so no Work is credited with it.
+fn unattributed(scope: &str) -> String {
+    format!("{UNATTRIBUTED_PANE}{scope}")
+}
+
+/// Prefix of [`unattributed`] keys.
+pub(crate) const UNATTRIBUTED_PANE: &str = "unattributed:";
+
 /// ACT/WACT per exact pane id over `since`, with the same last-touch
 /// de-duplication as the totals: each wall-clock second goes to one pane, so
 /// a set of panes can be summed without double counting.
@@ -1898,7 +1907,7 @@ fn agent_group_key(data: &StatsData, agent: &Agent, group_by: GroupBy) -> String
         GroupBy::Pane => agent
             .pane
             .clone()
-            .unwrap_or_else(|| agent.session_id.clone()),
+            .unwrap_or_else(|| unattributed(&agent.session_id)),
         GroupBy::Session => agent
             .pane
             .as_ref()
@@ -1938,7 +1947,7 @@ fn state_transition_group_key(
         GroupBy::Pane => entry
             .pane
             .clone()
-            .unwrap_or_else(|| entry.session_id.clone()),
+            .unwrap_or_else(|| unattributed(&entry.session_id)),
         GroupBy::Session => entry
             .session_name
             .clone()
@@ -2149,7 +2158,11 @@ fn human_presence_group_key(
             .as_ref()
             .and_then(|pane| data.project_by_pane.get(pane))
             .cloned(),
-        GroupBy::Pane => interval.pane.clone(),
+        // A tick with no pane still takes part in the sweep (it can outrank
+        // an older window), but its seconds belong to no pane.
+        GroupBy::Pane => Some(interval.pane.clone().unwrap_or_else(|| {
+            unattributed(interval.session_name.as_deref().unwrap_or("unknown"))
+        })),
         GroupBy::Agent => None,
     }
 }
@@ -3855,6 +3868,66 @@ pub(crate) mod tests {
             by_pane.values().sum::<u64>(),
             by_session.values().sum::<u64>(),
             "the same seconds, split by pane"
+        );
+    }
+
+    /// Ticks without a pane stay in the sweep: a lone one still counts, and
+    /// one that outranks an older prompt still takes its seconds, so pane
+    /// grouping keeps the same ACT/WACT totals as session grouping.
+    #[test]
+    fn pane_grouping_keeps_paneless_ticks_in_the_sweep() {
+        let tick = |kind, minute: i64| {
+            ActivityEntry::HumanInteraction(HumanInteractionEntry::new(HumanInteractionInput {
+                kind,
+                pane: None,
+                session_id: Some("$1".into()),
+                session_name: Some("callabo".into()),
+                started_at: datetime!(2026-05-30 10:00:00 UTC) + time::Duration::minutes(minute),
+                ended_at: datetime!(2026-05-30 10:00:01 UTC) + time::Duration::minutes(minute),
+            }))
+        };
+        let mut early = prompt(
+            AgentKind::Codex,
+            "a",
+            "rmux:%1",
+            Some("/w/a"),
+            "go",
+            datetime!(2026-05-30 10:30:00 UTC),
+        );
+        early.tmux_session = Some("callabo".into());
+        let mut d = data(vec![early]);
+        d.count_tmux_input = true;
+        d.range = TimeRange {
+            label: "bounded".into(),
+            since_at: Some(datetime!(2026-05-30 10:00:00 UTC)),
+            until_at: Some(datetime!(2026-05-30 12:00:00 UTC)),
+        };
+        d.activity_entries = vec![
+            ActivityEntry::SessionForeground(SessionForegroundEntry::new(
+                "$1",
+                "callabo",
+                datetime!(2026-05-30 10:00:00 UTC),
+                datetime!(2026-05-30 12:00:00 UTC),
+            )),
+            // A lone pane-less keypress, and a pane-less scroll inside the
+            // prompt's window.
+            tick(HumanInteractionKind::TmuxInput, 5),
+            tick(HumanInteractionKind::TmuxScroll, 31),
+        ];
+        let sum = |group_by| {
+            let attribution = last_touch_attribution(&active_windows(&d, group_by));
+            (
+                attribution.active.values().sum::<u64>(),
+                attribution.work_active.values().sum::<u64>(),
+            )
+        };
+        let by_session = sum(GroupBy::Session);
+        assert!(by_session.0 > 0);
+        assert_eq!(sum(GroupBy::Pane), by_session);
+        let by_pane = last_touch_attribution(&active_windows(&d, GroupBy::Pane)).active;
+        assert!(
+            by_pane.keys().any(|key| key.starts_with(UNATTRIBUTED_PANE)),
+            "pane-less seconds are kept apart: {by_pane:?}"
         );
     }
 

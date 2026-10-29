@@ -8843,12 +8843,11 @@ pub async fn run(
             needs_render = true;
         }
         if app.board_stats.poll() {
-            let activity = app
-                .board_stats
-                .value
-                .as_ref()
-                .and_then(|value| value.as_ref().ok())
-                .cloned();
+            let activity = match &app.board_stats.value {
+                None => board_screen::ActivityState::Loading,
+                Some(Err(_)) => board_screen::ActivityState::Unavailable,
+                Some(Ok(by_pane)) => board_screen::ActivityState::Known(by_pane.clone()),
+            };
             app.board.set_activity(activity);
             needs_render = true;
         }
@@ -16328,7 +16327,7 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
                 now,
                 theme,
                 index == selected,
-                app.board.active_of(work),
+                &app.board.active_of(work),
             )
         })
         .collect();
@@ -16379,16 +16378,20 @@ fn board_detail(
     let mut lines = board_screen::detail_lines(work, now, theme, selected);
     let at = 1.min(lines.len());
     let window = board_window(app);
-    let active = app.board.active_of(work).map_or_else(
-        || format!("active  … ({window})"),
-        |active| {
-            format!(
-                "active  ACT {} · WACT {} ({window})",
-                board_screen::active_label(active.active_secs),
-                board_screen::active_label(active.work_active_secs)
-            )
-        },
-    );
+    // Time in the panes the Work holds now: a pane it gave up takes its
+    // history with it, and a pane it gained brings its own.
+    let active = match app.board.active_of(work) {
+        board_screen::WorkActivity::Loading => format!("active  … ({window})"),
+        board_screen::WorkActivity::Unavailable => format!("active  unavailable ({window})"),
+        board_screen::WorkActivity::Ambiguous(pane) => {
+            format!("active  ? — {pane} is on more than one server, so its time is not split")
+        }
+        board_screen::WorkActivity::Known(active) => format!(
+            "active  ACT {} · WACT {} in its current panes ({window})",
+            board_screen::active_label(active.active_secs),
+            board_screen::active_label(active.work_active_secs)
+        ),
+    };
     lines.insert(at, Line::from(Span::styled(active, theme.dim_style())));
     lines.insert(
         at,
@@ -31554,7 +31557,8 @@ sort = ["state"]
         ]
         .into_iter()
         .collect();
-        app.board.set_activity(Some(by_pane));
+        app.board
+            .set_activity(board_screen::ActivityState::Known(by_pane));
         let cal1 = app
             .board
             .visible("")
@@ -31562,11 +31566,24 @@ sort = ["state"]
             .find(|work| work.identity.work_id == "CAL-1")
             .unwrap()
             .clone();
-        assert_eq!(app.board.active_of(&cal1), Some(act(660)));
+        assert_eq!(
+            app.board.active_of(&cal1),
+            board_screen::WorkActivity::Known(act(660))
+        );
         app.board.set_sort(muxa::config::WatchBoardSort::Active);
         assert_eq!(app.board.visible("")[0].identity.work_id, "CAL-1");
-        app.board.set_activity(None);
-        assert_eq!(app.board.active_of(&cal1), None, "unknown is not zero");
+        app.board.set_activity(board_screen::ActivityState::Loading);
+        assert_eq!(
+            app.board.active_of(&cal1),
+            board_screen::WorkActivity::Loading
+        );
+        app.board
+            .set_activity(board_screen::ActivityState::Unavailable);
+        assert_eq!(
+            app.board.active_of(&cal1).cell(),
+            "n/a",
+            "a failure is not loading"
+        );
     }
 
     #[test]

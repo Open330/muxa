@@ -19,8 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the card console did: `Enter`/`o` follow the `▸` agent, and `c` copies and
   `K` closes it. `--since`, `--sort attention|activity|name`,
   `--include-paneless` and `--theme` carry over for the run, and so does
-  `--sort active`: ACT/WACT is now attributed per exact pane and summed per
-  Work (an `ACT` column and the detail), where the card console split it by
+  `--sort active`: ACT/WACT is now attributed per pane and summed over the
+  panes each Work holds now (an `ACT` column and the detail; `?` when a pane
+  id is on two servers), where the card console split it by
   tmux session name and showed every Work in a session the same figure. The
   card console is removed. See docs/DASHBOARD_CLI.md.
 

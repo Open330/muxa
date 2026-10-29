@@ -246,8 +246,12 @@ board_sort`)는 topology 정렬을 건드리지 않고 board 순서를 바꿉니
 중이거나 시작 중인 agent 수, `active`는 ACT 순입니다. ACT·WACT는 기간(`--since`,
 `[watch] board_since`, 기본 `today`) 동안 각 초가 일어난 정확한 pane에 나눠
 붙이며(last touch라 한 초를 두 번 세지 않음), 각 행의 `ACT` 열과 detail은 그 Work의
-pane을 합합니다. 오른쪽 위는 모든 세션 합계로 필터를 따르지 않고, 폭이 모자라면
-줄이거나 생략합니다. 아직 모르면 `…`, 읽을 수 없으면 0 대신 `unavailable`입니다.
+pane을 **지금 기준으로** 합합니다. 내준 pane은 그 기록을 가져가고 새로 얻은 pane은
+자기 기록을 가져오며, Run이 모두 닫힌 Work는 `-`입니다. 활동은 pane id로 묶이므로
+같은 id가 두 서버에 보이면 그 Work들은 각자 받지 않고 `?`로 표시됩니다. 위치를 알
+수 없는 입력 시간은 합계에만 들어갑니다. 오른쪽 위는 모든 세션 합계로 필터를 따르지
+않고, 폭이 모자라면 줄이거나 생략합니다. 아직 모르면 `…`, 읽을 수 없으면 0 대신
+`n/a` / `unavailable`입니다.
 
 board의 협업도 같은 agent 커서를 따릅니다. `m`은 그 agent에게 메시지를 보냅니다.
 누른 순간 pane과 agent 세션이 고정되고, 그사이 그 pane에서 다른 agent가 시작됐으면
