@@ -33,6 +33,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `muxa swap` resolves a named target or `--exclude` to exactly one live pane
+  first (a bare `%81` finds `rmux:%81`). A name matching no pane, or the same
+  `%N` on two servers, is reported instead of silently swapping nothing.
+  Rows seen only on screen are listed by `--all`/`--limited` but swapped only
+  when named with `--force`, and never sent a cut-off follow-up. For Claude
+  on Linux, the conversation is read from the running process's
+  `sessions/<pid>.json` (pid + start time): it makes an unregistered Claude
+  swappable, turns a disagreement with the registry or the command line into
+  a reported identity conflict, and is checked again right before the
+  stop. Outcomes gain `session_id_source`, `conversation_verified` and
+  `registered`.
+
 - `muxa swap --continue "<text>"` no longer sends the follow-up to every
   swapped agent. The wording and who gets it are now separate:
   `--continue-text` sets the text and `--continue-when limited|always|never`

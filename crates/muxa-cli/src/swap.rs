@@ -571,6 +571,10 @@ mod tests {
             command: Some("aas e jelly@claude --resume sid".into()),
             note: String::new(),
             continue_reason: None,
+            session_id_source: None,
+            conversation_verified: None,
+            conversation_unverified_reason: None,
+            registered: None,
         }]);
         assert!(
             rendered.contains("e-ed@claude -> jelly@claude"),
