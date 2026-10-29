@@ -267,3 +267,16 @@ to discover them. See [MCP setup](MCP.md).
   "limit": 20
 }
 ```
+
+### Resolved Claude built-in dialogs
+
+Some Claude built-in commands resolve an input dialog without emitting a model
+turn Stop or tool hook. A last `NeedsInput` notification can then outlive its UI.
+For a live Claude row waiting on the known auto-mode setup proposal notification,
+screen detection may recover Idle
+only after two normal empty-composer observations with separators and a normal
+mode footer. Running and selection/cancel affordances veto recovery. Other notification
+messages, including nonmodal review approvals, are not candidates. A new hook,
+move, process replacement or active rate limit vetoes the compare-and-set.
+Recovery clears the resolved notification and emits a state transition without
+counting a new model action or declaring a collaboration request complete.

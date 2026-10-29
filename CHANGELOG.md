@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Resolved Claude auto-mode setup dialogs no longer leave an indefinitely waiting
+  agent: two positive idle-composer observations can repair the exact unchanged
+  row, while current permission/selection UI and newer hooks retain priority.
+
 - `muxa dashboard` opens `muxa watch` on its Work board, which now covers what
   the card console did: `Enter`/`o` follow the `▸` agent, and `c` copies and
   `K` closes it. `--since`, `--sort attention|activity|name`,

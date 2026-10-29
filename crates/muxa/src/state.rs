@@ -1946,6 +1946,48 @@ impl Store {
         flipped
     }
 
+    /// A screen observer may clear a resolved Claude dialog only if no hook,
+    /// move or process replacement changed the exact row during capture.
+    /// This is state evidence, not new model activity.
+    pub async fn recover_claude_wait_from_screen(
+        &self,
+        expected: &Agent,
+        at: OffsetDateTime,
+    ) -> bool {
+        let mut agents = self.agents.write().await;
+        let Some(agent) = agents.get_mut(&expected.session_id) else {
+            return false;
+        };
+        if agent.kind != AgentKind::ClaudeCode
+            || !matches!(
+                agent.state,
+                AgentState::WaitingInput | AgentState::WaitingChoice
+            )
+            || agent.state != expected.state
+            || agent.last_activity_at != expected.last_activity_at
+            || agent.state_entered_at != expected.state_entered_at
+            || agent.pane != expected.pane
+            || agent.tmux_socket != expected.tmux_socket
+            || agent.workload.primary_pid != expected.workload.primary_pid
+            || agent.rate_limit_scope.is_some()
+        {
+            return false;
+        }
+        let from = agent.state;
+        agent.state = AgentState::Idle;
+        agent.state_entered_at = at;
+        agent.last_notification = None;
+        let _ = self.transitions.send(Transition {
+            from,
+            to: agent.state,
+            agent: Arc::new(agent.clone()),
+        });
+        drop(agents);
+        self.dirty.notify_one();
+        self.changes.send_replace(());
+        true
+    }
+
     /// Flip agent rows to `Stopped` whose pane has run no agent process for
     /// `min_idle`. Pane ids are only unique per server lifetime: after a
     /// multiplexer restart a dead session's old id can name an unrelated pane

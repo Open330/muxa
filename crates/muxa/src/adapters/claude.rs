@@ -25,6 +25,61 @@ use serde::Deserialize;
 use std::path::PathBuf;
 use time::OffsetDateTime;
 
+/// Positive evidence that a resolved built-in dialog returned to the normal
+/// composer. History alone and a bare prompt without the normal footer do not
+/// qualify; active/permission overlays retain hook authority.
+pub fn idle_composer_from_capture(raw: &str) -> bool {
+    let text = crate::screen::prepare_capture(raw, 20);
+    let lines: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some(prompt) = lines.iter().rposition(|line| *line == "❯") else {
+        return false;
+    };
+    let separator = |line: &str| line.chars().count() >= 8 && line.chars().all(|c| c == '─');
+    if prompt == 0
+        || prompt + 1 >= lines.len()
+        || !separator(lines[prompt - 1])
+        || !separator(lines[prompt + 1])
+    {
+        return false;
+    }
+    let footer = lines.last().copied().unwrap_or_default().to_lowercase();
+    if lines[prompt + 2..].iter().any(|line| {
+        let trimmed = line.trim_start_matches(['❯', '›', '>']).trim_start();
+        trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && (line.starts_with('❯') || line.starts_with('›') || line.starts_with('>'))
+    }) {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    if [
+        "esc to interrupt",
+        "esc to cancel",
+        "esc to exit",
+        "enter to choose",
+        "enter to confirm",
+        "enter to select",
+        "tab to amend",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        return false;
+    }
+    [
+        "auto mode on",
+        "bypass permissions on",
+        "accept edits on",
+        "plan mode on",
+        "? for shortcuts",
+    ]
+    .iter()
+    .any(|mode| footer.contains(mode))
+}
+
 pub struct ClaudeAdapter;
 
 #[derive(Debug, Deserialize)]
@@ -813,6 +868,26 @@ mod tests {
         match ev {
             AgentEvent::TurnStopped { response, .. } => assert!(response.is_none()),
             _ => panic!("expected TurnStopped"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_composer_tests {
+    use super::*;
+    #[test]
+    fn resolved_auto_mode_dialog_is_idle_but_modals_running_and_unknown_screens_are_not() {
+        let idle="❯ /auto-mode-setup\n● Saved to settings.json (environment).\n────────────────────\n❯ \n────────────────────\n ~/w/project Opus 5.5\n ⏵⏵ auto mode on (shift+tab to cycle)\n";
+        assert!(idle_composer_from_capture(idle));
+        for screen in [
+            idle.replace("❯ \n", "❯ continue\n"),
+            idle.replace("auto mode on", "Enter to confirm · Esc to cancel"),
+            format!("✻ Thinking (esc to interrupt)\n{idle}"),
+            "Permission request\n❯ 1. Yes\n  2. No\nEnter to select".into(),
+            "❯\n auto mode on".into(),
+            "ordinary shell prompt".into(),
+        ] {
+            assert!(!idle_composer_from_capture(&screen), "{screen}");
         }
     }
 }
