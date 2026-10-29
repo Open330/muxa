@@ -155,7 +155,20 @@ fn refresh_recovery_action(
     }
     let mut refreshed = action.clone();
     refreshed.interruption = Some(info.clone());
-    if info.active && !action.status.is_terminal() {
+    // Older bulk expiry could retire an unanswered recovery question while
+    // its parent remained open. Restore that exact daemon-owned question;
+    // explicit cancellation and actual replies remain terminal.
+    if info.active
+        && action.status == RequestStatus::Expired
+        && action.reply.is_none()
+        && action.kind == RequestKind::Question
+        && action.to.console
+        && action.parent_request_id.as_deref() == Some(info.request_id.as_str())
+    {
+        refreshed.status = RequestStatus::Queued;
+        refreshed.notified_at = None;
+    }
+    if info.active && !refreshed.status.is_terminal() {
         refreshed.body = recovery_body(
             recipient_session,
             &info.request_id,
@@ -757,6 +770,82 @@ mod tests {
             .await
             .unwrap()
             .peer_interrupted());
+    }
+
+    #[tokio::test]
+    async fn expired_unanswered_recovery_is_restored_once_but_cancellation_and_completion_stay_final(
+    ) {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, mut coordinator) = actor("%1", "sender").await;
+        let (recipient, mut peer) = actor("%2", "peer").await;
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        coordinator.state = AgentState::Stopped;
+        peer.state = AgentState::Stopped;
+        let agents = [coordinator, peer];
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        let action = mailbox.pending_human_notifications().await.remove(0);
+        {
+            let mut rows = mailbox.requests.write().await;
+            let expired = rows.get_mut(&action.id).unwrap();
+            expired.status = RequestStatus::Expired;
+            expired.notified_at = Some(OffsetDateTime::now_utc());
+        }
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        let restored = mailbox.peek_for(&sender, &action.id).await.unwrap();
+        assert_eq!(restored.status, RequestStatus::Queued);
+        assert!(restored.notified_at.is_none());
+        assert_eq!(mailbox.requests.read().await.len(), 2);
+        let changes = mailbox.subscribe();
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(
+            !changes.has_changed().unwrap(),
+            "restoration must not repeat"
+        );
+        mailbox
+            .requests
+            .write()
+            .await
+            .get_mut(&action.id)
+            .unwrap()
+            .status = RequestStatus::Cancelled;
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert_eq!(
+            mailbox.peek_for(&sender, &action.id).await.unwrap().status,
+            RequestStatus::Cancelled
+        );
+        mailbox
+            .requests
+            .write()
+            .await
+            .get_mut(&action.id)
+            .unwrap()
+            .status = RequestStatus::Expired;
+        mailbox
+            .reply(
+                &recipient,
+                &request.id,
+                RequestStatus::Completed,
+                "done".into(),
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert_eq!(
+            mailbox.peek_for(&sender, &action.id).await.unwrap().status,
+            RequestStatus::Expired
+        );
     }
 
     #[tokio::test]

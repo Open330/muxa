@@ -13,6 +13,10 @@ pub use contract::{
     task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,
     EvidenceReference, TaskAttempt, TaskContract, TaskReport, TASK_CONTRACT_CAPABILITY,
 };
+mod health;
+pub use health::{
+    CollaborationHealth, COLLABORATION_HEALTH_CAPABILITY, FILTERED_EXPIRE_CAPABILITY,
+};
 mod overview;
 pub use overview::{
     CollaborationEndpoint, CollaborationLink, CollaborationLocation, CollaborationOverview,
@@ -4035,6 +4039,8 @@ impl CollaborationStore {
 
     /// Operator housekeeping: mark every request still `Queued` (never
     /// claimed) and created before `cutoff` as `Expired`, and return them.
+    /// Human decisions are protected, including recovery questions: expiring
+    /// them would strand their still-open parent without an answer.
     /// Covers what nobody else can close: a sender may cancel only its own
     /// request, and the sender of a request stuck for weeks is usually an
     /// agent session that no longer exists. `dry_run` reports without
@@ -4044,6 +4050,17 @@ impl CollaborationStore {
         cutoff: OffsetDateTime,
         dry_run: bool,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.expire_queued_filtered(cutoff, dry_run, false, None)
+            .await
+    }
+
+    pub async fn expire_queued_filtered(
+        &self,
+        cutoff: OffsetDateTime,
+        dry_run: bool,
+        quiet_only: bool,
+        request_id: Option<&str>,
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
         let mut staged: HashMap<_, _> = self
@@ -4051,7 +4068,13 @@ impl CollaborationStore {
             .read()
             .await
             .values()
-            .filter(|r| r.status == RequestStatus::Queued && r.created_at < cutoff)
+            .filter(|r| {
+                r.status == RequestStatus::Queued
+                    && !r.needs_human_response()
+                    && r.created_at < cutoff
+                    && (!quiet_only || r.is_undelivered_quiet_notice())
+                    && request_id.is_none_or(|id| r.id == id)
+            })
             .map(|r| (r.id.clone(), r.clone()))
             .collect();
         let mut expired: Vec<CollaborationRequest> = {

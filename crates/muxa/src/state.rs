@@ -1677,6 +1677,16 @@ impl Store {
         self.dirty.notify_one();
         self.changes.send_replace(());
     }
+    /// Borrow only synthetic row fields for diagnostics; no prompt cloning.
+    pub async fn synthetic_health(
+        &self,
+        directory: &crate::agent_directory::AgentDirectory,
+        configured: &[HostKind],
+    ) -> crate::agent_directory::SyntheticDiagnostics {
+        let agents = self.agents.read().await;
+        directory.synthetic_diagnostics(agents.values(), configured)
+    }
+
     pub async fn directory_snapshot(&self) -> Vec<Agent> {
         self.snapshot()
             .await

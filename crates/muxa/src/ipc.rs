@@ -795,8 +795,13 @@ enum RequestBody {
     },
     /// Operator housekeeping: expire never-claimed requests older than
     /// `older_than_secs`. Answers with the affected requests.
+    CollaborationHealth,
     CollaborationExpire {
         older_than_secs: u64,
+        #[serde(default)]
+        quiet_only: bool,
+        #[serde(default)]
+        request_id: Option<String>,
         #[serde(default)]
         dry_run: bool,
     },
@@ -940,6 +945,8 @@ const CAPABILITIES: &[&str] = &[
     collaboration::INBOX_LIMIT_CAPABILITY,
     "collaboration_overview_v1",
     "collaboration_expire_v1",
+    collaboration::COLLABORATION_HEALTH_CAPABILITY,
+    collaboration::FILTERED_EXPIRE_CAPABILITY,
     "collaboration_lifecycle",
     "collaboration_wait",
     "collaboration_peek",
@@ -1088,6 +1095,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_overview: Option<collaboration::CollaborationOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_health: Option<collaboration::CollaborationHealth>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_drain_plan: Option<collaboration::WorkerDrainPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_drain_acquire: Option<collaboration::WorkerDrainAcquire>,
@@ -1209,6 +1218,7 @@ impl Response {
             handle: None,
             collaboration_requests: None,
             collaboration_overview: None,
+            collaboration_health: None,
             worker_drain_plan: None,
             worker_drain_acquire: None,
             worker_drain_token: None,
@@ -5726,9 +5736,25 @@ async fn handle(
                     ));
                     response
                 }
+                RequestBody::CollaborationHealth => {
+                    kind = "collaboration_health";
+                    match collaboration.health().await {
+                        Ok(mut health) => {
+                            let configured = backends.iter().map(|b| b.kind()).collect::<Vec<_>>();
+                            health.synthetic_agents =
+                                store.synthetic_health(&agent_directory, &configured).await;
+                            let mut response = Response::ok();
+                            response.collaboration_health = Some(health);
+                            response
+                        }
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationExpire {
                     older_than_secs,
                     dry_run,
+                    quiet_only,
+                    request_id,
                 } => {
                     kind = "collaboration_expire";
                     let age =
@@ -5736,7 +5762,10 @@ async fn handle(
                     let cutoff = time::OffsetDateTime::now_utc()
                         .checked_sub(age)
                         .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
-                    match collaboration.expire_queued_before(cutoff, dry_run).await {
+                    match collaboration
+                        .expire_queued_filtered(cutoff, dry_run, quiet_only, request_id.as_deref())
+                        .await
+                    {
                         Ok(requests) => Response::with_collaboration_requests(requests),
                         Err(error) => Response::err(error.to_string()),
                     }
@@ -8222,6 +8251,42 @@ impl Client {
         }
     }
 
+    pub async fn collaboration_health(
+        &self,
+    ) -> Result<collaboration::CollaborationHealth, RuntimeError> {
+        let response = self
+            .call_checked(
+                &serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_health"}),
+            )
+            .await?;
+        serde_json::from_value(response["collaboration_health"].clone()).map_err(RuntimeError::Json)
+    }
+
+    pub async fn collaboration_expire_filtered(
+        &self,
+        older_than_secs: u64,
+        dry_run: bool,
+        quiet_only: bool,
+        request_id: Option<&str>,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        if quiet_only || request_id.is_some() {
+            let hello = self.hello(CLIENT_CALL_TIMEOUT).await?;
+            if !hello
+                .capabilities
+                .iter()
+                .any(|c| c == collaboration::FILTERED_EXPIRE_CAPABILITY)
+            {
+                return Err(RuntimeError::Daemon(
+                    "daemon lacks filtered expiry; upgrade muxad before selective cleanup".into(),
+                ));
+            }
+        }
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_expire",
+            "older_than_secs":older_than_secs,"dry_run":dry_run,"quiet_only":quiet_only,"request_id":request_id})).await?;
+        serde_json::from_value(response["collaboration_requests"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     /// Expire never-claimed requests older than `older_than_secs`, or list
     /// them with `dry_run`. Requires the `collaboration_expire_v1` capability.
     pub async fn collaboration_expire(
@@ -9165,6 +9230,42 @@ mod tests {
         assert_eq!(counting.counts(), (2, 0, 0));
         shutdown.send(()).unwrap();
         serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn filtered_expiry_refuses_legacy_daemon_before_any_mutation() {
+        for dry_run in [true, false] {
+            let dir = tempdir().unwrap();
+            let socket = dir.path().join("legacy-expiry.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                for _ in 0..2 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).await.unwrap();
+                    assert_eq!(
+                        serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                        "hello"
+                    );
+                    reader.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_expire_v1\"]}\n").await.unwrap();
+                }
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "must not fall back to broad expiry"
+                );
+            });
+            let result = Client::new(socket)
+                .collaboration_expire_filtered(86400, dry_run, true, Some("notice"))
+                .await;
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("lacks filtered expiry"));
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
