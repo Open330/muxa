@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 pub const COLLABORATION_HEALTH_CAPABILITY: &str = "collaboration_health_v1";
-pub const FILTERED_EXPIRE_CAPABILITY: &str = "collaboration_expire_filtered_v1";
+/// v2 uses a distinct operation name, so a downgrade between connections
+/// cannot make an old daemon ignore the filters and perform broad expiry.
+pub const FILTERED_EXPIRE_CAPABILITY: &str = "collaboration_expire_filtered_v2";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CollaborationHealth {

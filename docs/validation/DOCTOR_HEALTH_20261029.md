@@ -41,8 +41,13 @@ muxa msg expire --older-than 24h --quiet-only --request-id REQUEST --dry-run
 muxa msg expire --older-than 24h --quiet-only --request-id REQUEST
 ```
 
-Selective expiry requires `collaboration_expire_filtered_v1`; a client refuses
-before sending an expiry operation to an older daemon. It rechecks age, exact
+Selective expiry requires `collaboration_expire_filtered_v2`; a client refuses
+before sending an expiry operation to an older daemon. Filtered cleanup also
+uses a separate operation name: if the daemon downgrades between capability
+checking and mutation, its old parser rejects the operation rather than ignoring
+the filters. New CLI expiry calls require v2 even without filters, so human-decision
+protection cannot be silently lost against an older server. Existing v1 clients
+remain supported on the new daemon. It rechecks age, exact
 ID, Queued status, Notice kind, no reply expectation, quiet notification intent,
 and absence of delivery evidence under the mutation lock. A claim after preview
 wins. Expired records retain their original contents in history.

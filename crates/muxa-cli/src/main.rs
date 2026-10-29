@@ -2595,7 +2595,6 @@ async fn cmd_msg_expire(
     quiet_only: bool,
     request_id: Option<&str>,
 ) -> Result<()> {
-    require_capability(client, "collaboration_expire_v1", "msg expire").await?;
     let secs = parse_duration_secs(older_than)?;
     anyhow::ensure!(secs > 0, "--older-than must be greater than zero");
     anyhow::ensure!(
