@@ -8842,7 +8842,16 @@ pub async fn run(
             apply_outcome_to_app(&mut app, outcome);
             needs_render = true;
         }
-        if app.board_stats.poll() | app.board_collab.poll() | app.board_workers.poll() {
+        if app.board_stats.poll() {
+            let activity = match &app.board_stats.value {
+                None => board_screen::ActivityState::Loading,
+                Some(Err(_)) => board_screen::ActivityState::Unavailable,
+                Some(Ok(by_pane)) => board_screen::ActivityState::Known(by_pane.clone()),
+            };
+            app.board.set_activity(activity);
+            needs_render = true;
+        }
+        if app.board_collab.poll() | app.board_workers.poll() {
             needs_render = true;
         }
         if app.watch_cfg.screen == WatchScreen::Board
@@ -8877,15 +8886,9 @@ pub async fn run(
             app.board_stats.start(async move {
                 let cfg = muxa::config::Config::load_or_default(config.as_deref())
                     .map_err(|error| error.to_string())?;
-                crate::stats::session_active_stats(
-                    &client,
-                    &cfg,
-                    &window,
-                    &muxa::ScopeExclusions::default(),
-                )
-                .await
-                .map(|stats| stats.totals)
-                .map_err(|error| error.to_string())
+                crate::stats::pane_active_stats(&client, &cfg, &window)
+                    .await
+                    .map_err(|error| error.to_string())
             });
         }
         // The scan runs off this loop: a slow backend must not freeze input.
@@ -9390,23 +9393,38 @@ impl<T: Send + 'static> Background<T> {
     }
 }
 
-/// The board's ACT/WACT summary: all sessions in a window.
-pub(crate) type BoardStats = Background<crate::stats::ActiveDuration>;
+/// ACT/WACT per exact pane over the board's window. Last-touch attribution
+/// gives each second to one pane, so these sum to the all-sessions total and
+/// to each Work's figure.
+pub(crate) type BoardStats =
+    Background<std::collections::BTreeMap<String, crate::stats::ActiveDuration>>;
 const BOARD_STATS_INTERVAL: Duration = Duration::from_secs(30);
 
 impl BoardStats {
     /// `all sessions · today · ACT 3h · WACT 2h`, or why there is none.
     fn label(&self, window: &str) -> String {
-        let figures = match &self.value {
+        format!("all sessions · {window} · {}", self.figures())
+    }
+
+    /// Just `ACT 3h · WACT 2h`, for where the full label does not fit.
+    fn figures(&self) -> String {
+        match &self.value {
             None => "ACT …".to_string(),
             Some(Err(_)) => "ACT unavailable".to_string(),
-            Some(Ok(active)) => format!(
-                "ACT {} · WACT {}",
-                board_screen::active_label(active.active_secs),
-                board_screen::active_label(active.work_active_secs)
-            ),
-        };
-        format!("all sessions · {window} · {figures}")
+            Some(Ok(by_pane)) => {
+                let (active, work) = by_pane.values().fold((0u64, 0u64), |(a, w), row| {
+                    (
+                        a.saturating_add(row.active_secs),
+                        w.saturating_add(row.work_active_secs),
+                    )
+                });
+                format!(
+                    "ACT {} · WACT {}",
+                    board_screen::active_label(active),
+                    board_screen::active_label(work)
+                )
+            }
+        }
     }
 }
 
@@ -16195,16 +16213,17 @@ const COLLAB_DETAIL_HEIGHT: u16 = 9;
 /// one `M` away instead of leaving three rows of listing.
 const COLLAB_DETAIL_MIN_HEIGHT: u16 = 16;
 
-fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
+/// The board's frame: counts on the left, the all-sessions activity in the
+/// corner when it fits.
+fn board_block(
+    app: &App,
+    area: Rect,
+    works: usize,
+    waiting: usize,
+    theme: WatchThemeSpec,
+) -> Block<'static> {
     use std::fmt::Write as _;
-    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
-    let filter = app.search_query.clone();
-    let visible = app.board.visible(&filter);
-    let waiting = visible
-        .iter()
-        .filter(|work| board_screen::needs_operator(work))
-        .count();
-    let mut title = format!(" Board · {} Works · {waiting} need you ", visible.len());
+    let mut title = format!(" Board · {works} Works · {waiting} need you ");
     // Totals describe the rows on screen; executions no Work claims are said
     // apart so the board never reads as everything that is running.
     if app.board.unlinked() > 0 {
@@ -16216,14 +16235,42 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
         board_screen::sort_label(app.board.sort())
     );
     // Activity is for every session in the window, not the Works on screen,
-    // so it sits apart from the counts and never follows the filter.
-    let activity = format!(" {} ", app.board_stats.label(&board_window(app)));
-    let block = Block::default()
+    // so it sits apart from the counts and never follows the filter. When the
+    // two titles would collide it shortens, then gives way to the counts.
+    let list_width = if area.width >= 140 {
+        area.width * 60 / 100
+    } else {
+        area.width
+    };
+    let activity = fit_corner_title(
+        &title,
+        &[
+            format!(" {} ", app.board_stats.label(&board_window(app))),
+            format!(" {} ", app.board_stats.figures()),
+        ],
+        list_width,
+    );
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(theme.border_style())
         .border_type(theme.border_type)
-        .title(title)
-        .title(Line::from(activity).right_aligned());
+        .title(title);
+    if let Some(activity) = activity {
+        block = block.title(Line::from(activity).right_aligned());
+    }
+
+    block
+}
+
+fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
+    let theme = watch_theme(app.watch_cfg.theme.unwrap_or_default());
+    let filter = app.search_query.clone();
+    let visible = app.board.visible(&filter);
+    let waiting = visible
+        .iter()
+        .filter(|work| board_screen::needs_operator(work))
+        .count();
+    let block = board_block(app, area, visible.len(), waiting, theme);
 
     if visible.is_empty() {
         let hint = if !app.board.loaded {
@@ -16274,7 +16321,15 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
     let rows: Vec<Row> = visible
         .iter()
         .enumerate()
-        .map(|(index, work)| board_screen::row(work, now, theme, index == selected))
+        .map(|(index, work)| {
+            board_screen::row(
+                work,
+                now,
+                theme,
+                index == selected,
+                &app.board.active_of(work),
+            )
+        })
         .collect();
     let header = Row::new(
         board_screen::HEADERS
@@ -16296,6 +16351,17 @@ fn render_board_screen(f: &mut Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// The first corner title that fits beside `left` in a block `width` wide
+/// (two border cells and a separating gap), or none.
+fn fit_corner_title(left: &str, candidates: &[String], width: u16) -> Option<String> {
+    use unicode_width::UnicodeWidthStr;
+    let room = usize::from(width).saturating_sub(left.width() + 3);
+    candidates
+        .iter()
+        .find(|candidate| candidate.width() <= room)
+        .cloned()
+}
+
 /// The selected Work's detail lines, with its collaboration count under
 /// the title.
 fn board_detail(
@@ -16311,6 +16377,22 @@ fn board_detail(
     let selected = agents.get(app.board.selected_agent_index(filter)).copied();
     let mut lines = board_screen::detail_lines(work, now, theme, selected);
     let at = 1.min(lines.len());
+    let window = board_window(app);
+    // Time in the panes the Work holds now: a pane it gave up takes its
+    // history with it, and a pane it gained brings its own.
+    let active = match app.board.active_of(work) {
+        board_screen::WorkActivity::Loading => format!("active  … ({window})"),
+        board_screen::WorkActivity::Unavailable => format!("active  unavailable ({window})"),
+        board_screen::WorkActivity::Ambiguous(pane) => {
+            format!("active  ? — {pane} is on more than one server, so its time is not split")
+        }
+        board_screen::WorkActivity::Known(active) => format!(
+            "active  ACT {} · WACT {} in its current panes ({window})",
+            board_screen::active_label(active.active_secs),
+            board_screen::active_label(active.work_active_secs)
+        ),
+    };
+    lines.insert(at, Line::from(Span::styled(active, theme.dim_style())));
     lines.insert(
         at,
         Line::from(Span::styled(
@@ -31434,11 +31516,85 @@ sort = ["state"]
             stats.label("today"),
             "all sessions · today · ACT unavailable"
         );
-        stats.value = Some(Ok(crate::stats::ActiveDuration {
-            active_secs: 3 * 3600 + 5 * 60,
-            work_active_secs: 0,
-        }));
+        stats.value = Some(Ok([
+            (
+                "rmux:%1".to_string(),
+                crate::stats::ActiveDuration {
+                    active_secs: 3 * 3600,
+                    work_active_secs: 0,
+                },
+            ),
+            (
+                "rmux:%2".to_string(),
+                crate::stats::ActiveDuration {
+                    active_secs: 5 * 60,
+                    work_active_secs: 0,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect()));
         assert_eq!(stats.label("7d"), "all sessions · 7d · ACT 3h05m · WACT -");
+    }
+
+    #[test]
+    fn each_work_gets_the_activity_of_its_own_panes_and_can_sort_by_it() {
+        let (mut app, _) = board_with_agents();
+        let mut quiet = board_work("CAL-2", None);
+        quiet.latest_at = Some(OffsetDateTime::now_utc());
+        let busy = app.board.selected_work("").unwrap().clone();
+        app.board
+            .set_snapshot(board_snapshot(vec![quiet, busy]), Vec::new());
+        let act = |secs: u64| crate::stats::ActiveDuration {
+            active_secs: secs,
+            work_active_secs: secs / 2,
+        };
+        // CAL-1's panes are %1..%3; %9 belongs to nobody on the board.
+        let by_pane: std::collections::BTreeMap<String, _> = [
+            ("%1".to_string(), act(600)),
+            ("%2".to_string(), act(60)),
+            ("%9".to_string(), act(9_000)),
+        ]
+        .into_iter()
+        .collect();
+        app.board
+            .set_activity(board_screen::ActivityState::Known(by_pane));
+        let cal1 = app
+            .board
+            .visible("")
+            .into_iter()
+            .find(|work| work.identity.work_id == "CAL-1")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            app.board.active_of(&cal1),
+            board_screen::WorkActivity::Known(act(660))
+        );
+        app.board.set_sort(muxa::config::WatchBoardSort::Active);
+        assert_eq!(app.board.visible("")[0].identity.work_id, "CAL-1");
+        app.board.set_activity(board_screen::ActivityState::Loading);
+        assert_eq!(
+            app.board.active_of(&cal1),
+            board_screen::WorkActivity::Loading
+        );
+        app.board
+            .set_activity(board_screen::ActivityState::Unavailable);
+        assert_eq!(
+            app.board.active_of(&cal1).cell(),
+            "n/a",
+            "a failure is not loading"
+        );
+    }
+
+    #[test]
+    fn the_corner_title_shortens_then_yields_instead_of_overlapping_the_counts() {
+        let left = " Board · 20 Works · 0 need you · 78 unlinked · by name ";
+        let full = " all sessions · today · ACT 6h04m · WACT 6h04m ".to_string();
+        let short = " ACT 6h04m · WACT 6h04m ".to_string();
+        let candidates = [full.clone(), short.clone()];
+        assert_eq!(fit_corner_title(left, &candidates, 160), Some(full));
+        assert_eq!(fit_corner_title(left, &candidates, 90), Some(short));
+        assert_eq!(fit_corner_title(left, &candidates, 60), None);
     }
 
     #[test]

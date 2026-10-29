@@ -18,10 +18,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `muxa dashboard` opens `muxa watch` on its Work board, which now covers what
   the card console did: `Enter`/`o` follow the `▸` agent, and `c` copies and
   `K` closes it. `--since`, `--sort attention|activity|name`,
-  `--include-paneless` and `--theme` carry over for the run; `--sort active` is
-  refused (active time cannot be attributed per Work yet) and per-card
-  ACT/WACT gives way to an all-sessions summary. The card console is
-  removed. See docs/DASHBOARD_CLI.md.
+  `--include-paneless` and `--theme` carry over for the run, and so does
+  `--sort active`: ACT/WACT is now attributed per pane and summed over the
+  panes each Work holds now (an `ACT` column and the detail; `?` when a pane
+  id is on two servers), where the card console split it by
+  tmux session name and showed every Work in a session the same figure. The
+  card console is removed. See docs/DASHBOARD_CLI.md.
 
 ### Added
 

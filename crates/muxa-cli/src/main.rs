@@ -3567,7 +3567,7 @@ async fn cmd_dashboard(
     config_path: Option<PathBuf>,
     args: &dashboard_cmd::Args,
 ) -> Result<()> {
-    cfg.watch.board_sort = args.board_sort()?;
+    cfg.watch.board_sort = args.board_sort();
     cfg.watch.board_since = Some(args.board_since()?);
     cmd_watch(
         client,
@@ -5266,7 +5266,7 @@ mod tests {
     fn dashboard_flags_carry_over_to_the_work_board() {
         let defaults = dashboard(&[]);
         assert_eq!(
-            defaults.board_sort().unwrap(),
+            defaults.board_sort(),
             muxa::config::WatchBoardSort::Attention
         );
         assert_eq!(defaults.board_since().unwrap(), "today");
@@ -5279,16 +5279,14 @@ mod tests {
             "--theme",
             "mono",
         ]);
-        assert_eq!(
-            chosen.board_sort().unwrap(),
-            muxa::config::WatchBoardSort::Name
-        );
+        assert_eq!(chosen.board_sort(), muxa::config::WatchBoardSort::Name);
         assert_eq!(chosen.board_since().unwrap(), "7d");
         assert!(chosen.include_paneless());
         assert!(matches!(chosen.theme(), Some(ThemeArg::Mono)));
-        // Active time cannot be attributed per Work yet: refused, not remapped.
-        let active = dashboard(&["--sort", "active"]).board_sort().unwrap_err();
-        assert!(active.to_string().contains("active time"), "{active}");
+        assert_eq!(
+            dashboard(&["--sort", "active"]).board_sort(),
+            muxa::config::WatchBoardSort::Active
+        );
         assert!(dashboard(&["--since", "yesterdayish"])
             .board_since()
             .is_err());
