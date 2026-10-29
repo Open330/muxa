@@ -22,8 +22,11 @@ fn plan(targets: usize, text: Option<&str>) -> AcceptedPlan {
         node_id: "node-1".into(),
         continue_when: "limited".into(),
         continue_text: text.map(TextRef::of),
+        settled: Vec::new(),
         targets: (0..targets)
             .map(|i| PlannedTarget {
+                report_index: i,
+                endpoint: format!("rmux:%{i}@/tmp/rmux-1/default"),
                 host: "rmux".into(),
                 socket: Some("/tmp/rmux-1/default".into()),
                 pane: format!("rmux:%{i}"),
@@ -34,7 +37,7 @@ fn plan(targets: usize, text: Option<&str>) -> AcceptedPlan {
                 process_pid: 1000 + u32::try_from(i).unwrap(),
                 process_start: Some("42".into()),
                 from_account: Some("a@claude".into()),
-                assigned_account: "b@claude".into(),
+                assigned_account: Some("b@claude".into()),
             })
             .collect(),
     }
@@ -175,7 +178,7 @@ fn a_repeated_request_is_the_same_job_and_a_changed_one_is_refused() {
     );
     let mut moved = plan(2, Some("continue"));
     moved.targets[0].process_pid = 4242;
-    moved.targets[0].assigned_account = "c@claude".into();
+    moved.targets[0].assigned_account = Some("c@claude".into());
     let again = store.create_job(&lease, "key", &request, &moved).unwrap();
     assert_eq!(
         again,
