@@ -1085,7 +1085,14 @@ impl PreparedTarget {
     pub(crate) fn identity(&self) -> TargetIdentity {
         let planned = &self.planned;
         let pane = planned.agent.pane.clone().unwrap_or_default();
-        let socket = planned.agent.tmux_socket.clone();
+        // The server the planner found the pane on, not what the registry
+        // row happens to carry: a row without a socket is not a second
+        // server.
+        let socket = planned
+            .pane
+            .socket
+            .clone()
+            .or_else(|| planned.agent.tmux_socket.clone());
         TargetIdentity {
             endpoint: endpoint_key(&pane, socket.as_deref()),
             pane,

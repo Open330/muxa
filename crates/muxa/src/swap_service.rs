@@ -62,6 +62,7 @@ pub struct SwapOverrides {
 impl SwapOverrides {
     /// The request as `config` completes it.
     pub fn resolve(&self, config: &SwapConfig) -> Result<SwapRequest, String> {
+        self.validate()?;
         let scope = if !self.targets.is_empty() {
             SwapScope::Targets(self.targets.clone())
         } else if self.all {
@@ -105,6 +106,38 @@ impl SwapOverrides {
         request.exclude.clone_from(&self.exclude);
         request.dry_run = false;
         Ok(request)
+    }
+}
+
+impl SwapOverrides {
+    /// Refuse the combinations the CLI refuses, whoever the caller is: none
+    /// of them is given a silent winner.
+    pub fn validate(&self) -> Result<(), String> {
+        let conflict = |a: &str, b: &str| Err(format!("{a} and {b} cannot be combined"));
+        if !self.targets.is_empty() && self.all {
+            return conflict("targets", "all");
+        }
+        if !self.targets.is_empty() && self.limited {
+            return conflict("targets", "limited");
+        }
+        if self.all && self.limited {
+            return conflict("all", "limited");
+        }
+        if self.spread && self.to.is_some() {
+            return conflict("spread", "to");
+        }
+        if self.no_continue && self.continue_when.is_some() {
+            return conflict("no_continue", "continue_when");
+        }
+        if self.no_continue && self.continue_text.is_some() {
+            return conflict("no_continue", "continue_text");
+        }
+        if let Some(when) = self.continue_when.as_deref() {
+            if !matches!(when, "limited" | "always" | "never") {
+                return Err(format!("unknown continue policy {when:?}"));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -306,42 +339,85 @@ impl SwapService {
     }
 }
 
-/// A process's start in a form that also names the boot it belongs to: a
-/// start time counted from boot means nothing across a reboot.
-fn owner_start(pid: u32) -> Option<String> {
-    let start = crate::agent_conversation::process_start(pid)?;
-    let boot = boot_id()?;
-    Some(format!("{boot}:{start}"))
+/// What can be told about a process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Probe {
+    /// Positively not running.
+    Absent,
+    /// Running, with its start identity where it can be read.
+    Running(Option<String>),
+    /// Could not be told.
+    Unknown,
 }
 
-fn boot_id() -> Option<String> {
-    #[cfg(target_os = "linux")]
-    {
-        std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-            .ok()
-            .map(|id| id.trim().to_owned())
+/// Look a process up. On Linux `/proc/<pid>` answering "not found" is
+/// absence; any other error is unknown. Elsewhere the process table.
+#[cfg(target_os = "linux")]
+fn probe(pid: u32) -> Probe {
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(_) => Probe::Running(owner_start_linux(pid)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Probe::Absent,
+        Err(_) => Probe::Unknown,
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        None
+}
+
+/// A Linux start time counted from boot, scoped to that boot: the same
+/// tick count after a reboot is another process.
+#[cfg(target_os = "linux")]
+fn owner_start_linux(pid: u32) -> Option<String> {
+    let start = crate::agent_conversation::process_start(pid)?;
+    let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    Some(format!("{}:{start}", boot.trim()))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn probe(pid: u32) -> Probe {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let wanted = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[wanted]),
+        true,
+        ProcessRefreshKind::nothing(),
+    );
+    match system.process(wanted) {
+        // Unix seconds: not boot-relative, so no boot scope is needed.
+        Some(process) => Probe::Running(Some(format!("epoch:{}", process.start_time()))),
+        None => Probe::Absent,
+    }
+}
+
+/// This process's start identity, recorded with its ownership.
+fn owner_start(pid: u32) -> Option<String> {
+    match probe(pid) {
+        Probe::Running(start) => start,
+        Probe::Absent | Probe::Unknown => None,
     }
 }
 
 /// Whether a recorded owner still runs. Gone only on positive evidence: its
-/// pid absent from a readable process table, or both start identities known
-/// and different. Anything unreadable counts as alive.
+/// pid absent, or both start identities known and different. Anything that
+/// cannot be read counts as alive.
 fn owner_liveness(pid: u32, recorded: Option<&str>) -> Liveness {
-    #[cfg(target_os = "linux")]
-    {
-        let proc_root = Path::new("/proc");
-        if proc_root.join("self").exists() && !proc_root.join(pid.to_string()).exists() {
-            return Liveness::Gone;
+    match probe(pid) {
+        Probe::Absent => Liveness::Gone,
+        Probe::Running(Some(current)) if recorded.is_some_and(|recorded| recorded != current) => {
+            Liveness::Gone
         }
+        Probe::Running(_) | Probe::Unknown => Liveness::Alive,
     }
-    match (recorded, owner_start(pid)) {
-        (Some(recorded), Some(current)) if recorded != current => Liveness::Gone,
-        _ => Liveness::Alive,
-    }
+}
+
+/// Starts a job's thread; injected so a failure to start is testable.
+type Spawner = Box<dyn Fn(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()> + Send + Sync>;
+
+fn thread_spawner() -> Spawner {
+    Box::new(|name, work| {
+        std::thread::Builder::new()
+            .name(name)
+            .spawn(work)
+            .map(|_| ())
+    })
 }
 
 #[derive(Debug, Default)]
@@ -362,6 +438,7 @@ pub(crate) struct Service<E: Engine> {
     reserved: Mutex<HashMap<String, String>>,
     live: Mutex<HashMap<String, LiveJob>>,
     fault: Mutex<Option<String>>,
+    spawner: Spawner,
 }
 
 impl<E: Engine> Service<E> {
@@ -384,7 +461,14 @@ impl<E: Engine> Service<E> {
             reserved: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             fault: Mutex::new(None),
+            spawner: thread_spawner(),
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_spawner(mut self, spawner: Spawner) -> Self {
+        self.spawner = spawner;
+        self
     }
 
     pub(crate) fn active(&self) -> Result<(), String> {
@@ -481,7 +565,7 @@ impl<E: Engine> Service<E> {
         let request = overrides.resolve(&snapshot.config)?;
         let (resolved, steps) = this.engine.prepare(&request, &snapshot);
 
-        let (settled, runs, taken) = this.split(request_key, steps);
+        let (settled, notes, runs, taken) = this.split(request_key, steps);
         let plan = AcceptedPlan {
             node_id: snapshot.node_id.clone(),
             continue_when: resolved.continue_when.to_string(),
@@ -519,7 +603,12 @@ impl<E: Engine> Service<E> {
             return Err(error.to_string());
         }
         if let Ok(mut live) = this.live.lock() {
-            live.insert(job.clone(), LiveJob::default());
+            live.insert(
+                job.clone(),
+                LiveJob {
+                    outcomes: notes.into_iter().collect(),
+                },
+            );
         }
         Self::spawn(
             this,
@@ -540,40 +629,56 @@ impl<E: Engine> Service<E> {
 
     /// Settled steps and the targets to run, each target's endpoint
     /// reserved; a pane already reserved settles as busy.
-    #[allow(clippy::type_complexity)] // the three parts of one split
+    /// Settled entries (a reason code each, their notes kept apart for
+    /// memory only) and the targets to run, each target's endpoint reserved;
+    /// a pane already reserved, or on a server that cannot be told, settles.
+    #[allow(clippy::type_complexity)] // the parts of one split
     fn split(
         &self,
         owner: &str,
         steps: Vec<EngineStep<E::Target>>,
     ) -> (
         Vec<SettledEntry>,
+        Vec<(usize, SwapOutcome)>,
         Vec<(usize, TargetIdentity, E::Target)>,
         Vec<String>,
     ) {
         let mut settled = Vec::new();
+        let mut notes = Vec::new();
         let mut runs = Vec::new();
         let mut taken = Vec::new();
         for (report_index, step) in steps.into_iter().enumerate() {
             match step {
-                EngineStep::Done(outcome) => settled.push(settled_entry(report_index, &outcome)),
+                EngineStep::Done(outcome) => {
+                    settled.push(settled_entry(report_index, &outcome));
+                    notes.push((report_index, outcome));
+                }
                 EngineStep::Run(target) => {
                     let identity = self.engine.identity(&target);
-                    if self.reserve(&identity.endpoint, owner) {
-                        taken.push(identity.endpoint.clone());
-                        runs.push((report_index, identity, target));
+                    let refused = if identity.socket.is_none() {
+                        Some(("unknown_server", "cannot tell which server this pane is on"))
+                    } else if self.reserve(&identity.endpoint, owner) {
+                        None
                     } else {
+                        Some(("busy", "another swap job is acting on this pane"))
+                    };
+                    if let Some((code, note)) = refused {
                         settled.push(SettledEntry {
                             report_index,
                             pane: Some(identity.pane.clone()),
                             agent_session_id: identity.conversation_id.clone(),
                             disposition: Disposition::Skipped,
-                            reason: "another swap job is acting on this pane".into(),
+                            reason: code.into(),
                         });
+                        notes.push((report_index, skipped_outcome(&identity, note)));
+                    } else {
+                        taken.push(identity.endpoint.clone());
+                        runs.push((report_index, identity, target));
                     }
                 }
             }
         }
-        (settled, runs, taken)
+        (settled, notes, runs, taken)
     }
 
     /// Hand an accepted job to its own thread. If the thread cannot start,
@@ -589,21 +694,40 @@ impl<E: Engine> Service<E> {
     ) -> Result<(), String> {
         let worker = Arc::clone(this);
         let worker_job = job.to_owned();
-        let spawned = std::thread::Builder::new()
-            .name(format!("swap-{}", &job[..job.len().min(13)]))
-            .spawn(move || worker.run(&worker_job, &request, runs, guard));
-        if let Err(error) = spawned {
-            for target in 0..targets {
-                let _ = this.store.finish_target(
-                    &this.lease,
-                    job,
-                    u32::try_from(target).unwrap_or(u32::MAX),
-                    1,
-                    Disposition::Failed,
-                );
+        let work: Box<dyn FnOnce() + Send> = Box::new(move || {
+            // A panic must not leave a job running under a manager that
+            // still reports itself healthy.
+            let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                worker.run(&worker_job, &request, runs, guard);
+            }));
+            if ran.is_err() {
+                worker.set_fault(format!(
+                    "job {worker_job}: the swap executor panicked; no further target is started"
+                ));
             }
-            let _ = this.store.finish(&this.lease, job);
-            this.release_all(taken);
+        });
+        let name = format!("swap-{}", &job[..job.len().min(13)]);
+        if let Err(error) = (this.spawner)(name, work) {
+            // Nothing ran: every target ends with no effect.
+            let mut recorded = Ok(());
+            for target in 0..targets {
+                let target = u32::try_from(target).unwrap_or(u32::MAX);
+                if let Err(error) =
+                    this.store
+                        .finish_target(&this.lease, job, target, 1, Disposition::Failed)
+                {
+                    recorded = Err(error);
+                }
+            }
+            if recorded.is_ok() {
+                recorded = this.store.finish(&this.lease, job);
+            }
+            match recorded {
+                Ok(()) => this.release_all(taken),
+                Err(store) => this.set_fault(format!(
+                    "job {job}: the executor could not start and its end could not be recorded: {store}"
+                )),
+            }
             return Err(format!("the swap executor could not start: {error}"));
         }
         Ok(())
@@ -790,7 +914,7 @@ impl<E: Engine> Service<E> {
                 disposition: Some(entry.disposition.to_string()),
                 reason: Some(entry.reason.clone()),
                 uncertain_effects: 0,
-                outcome: None,
+                outcome: live.get(&entry.report_index).cloned(),
             })
             .collect();
         for (target, planned) in status.targets.iter().zip(&plan.targets) {
@@ -825,7 +949,52 @@ fn settled_entry(report_index: usize, outcome: &SwapOutcome) -> SettledEntry {
             SwapStatus::Failed => Disposition::Failed,
             _ => Disposition::Skipped,
         },
-        reason: outcome.note.clone(),
+        reason: reason_code(outcome).into(),
+    }
+}
+
+/// A bounded code for a planning outcome. The note itself can quote an
+/// external tool's output, so it never goes to disk.
+fn reason_code(outcome: &SwapOutcome) -> &'static str {
+    const CODES: &[(&str, &str)] = &[
+        ("excluded", "excluded"),
+        ("mid-turn", "mid_turn"),
+        ("active in the last", "recently_active"),
+        ("not registered by its own hooks", "unregistered"),
+        ("identity conflict", "identity_conflict"),
+        ("changed while it was being read", "identity_unstable"),
+        ("no provider session id", "no_session_id"),
+        ("more than one live pane", "ambiguous_target"),
+        ("no live pane", "unresolved_target"),
+        ("no agent muxa knows", "no_agent"),
+        ("aas cannot switch", "provider_unsupported"),
+        ("not in a multiplexer pane", "no_pane"),
+    ];
+    if outcome.status == SwapStatus::Failed {
+        return "candidates_unavailable";
+    }
+    CODES
+        .iter()
+        .find(|(needle, _)| outcome.note.contains(needle))
+        .map_or("other", |(_, code)| code)
+}
+
+/// The report row for a target refused before it ran.
+fn skipped_outcome(identity: &TargetIdentity, note: &str) -> SwapOutcome {
+    SwapOutcome {
+        pane: Some(identity.pane.clone()),
+        agent_session_id: identity.conversation_id.clone(),
+        kind: AgentKind::Unknown,
+        from: identity.from_account.clone(),
+        to: identity.assigned_account.clone(),
+        status: SwapStatus::Skipped,
+        command: None,
+        note: note.to_owned(),
+        continue_reason: None,
+        session_id_source: Some(identity.session_id_source),
+        conversation_verified: Some(identity.conversation_verified),
+        conversation_unverified_reason: None,
+        registered: None,
     }
 }
 

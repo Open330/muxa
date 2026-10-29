@@ -73,6 +73,7 @@ impl Engine for FakeEngine {
         if let Some(gate) = &target.gate {
             gate.wait();
         }
+        assert!(target.identity.pane != "%panic", "the engine blew up");
         self.executed
             .lock()
             .unwrap()
@@ -340,10 +341,12 @@ fn a_busy_pane_is_refused_and_a_job_outlives_its_caller() {
     let second = Service::submit(&h.service, "two", &overrides(&["%1"]), None).unwrap();
     let view = settled(&h.service, &second.job_id);
     assert_eq!(view.entries[0].disposition.as_deref(), Some("skipped"));
+    assert_eq!(view.entries[0].reason.as_deref(), Some("busy"));
     assert!(view.entries[0]
-        .reason
-        .as_deref()
+        .outcome
+        .as_ref()
         .unwrap()
+        .note
         .contains("another swap job"));
     gate.open();
     assert_eq!(settled(&h.service, &first.job_id).state, "done");
@@ -516,4 +519,208 @@ fn overrides_resolve_like_the_cli() {
     }
     .resolve(&config)
     .is_err());
+}
+
+/// The real liveness decision: alive while running with the same start,
+/// gone once it has exited or its start differs; unreadable never counts as
+/// gone.
+#[cfg(unix)]
+#[test]
+fn a_recorded_owner_is_gone_only_on_positive_evidence() {
+    let me = std::process::id();
+    let start = owner_start(me);
+    assert!(start.is_some());
+    assert_eq!(owner_liveness(me, start.as_deref()), Liveness::Alive);
+    assert_eq!(owner_liveness(me, None), Liveness::Alive);
+    assert_eq!(owner_liveness(me, Some("another:boot")), Liveness::Gone);
+    let mut child = std::process::Command::new("true").spawn().unwrap();
+    let dead = child.id();
+    child.wait().unwrap();
+    assert_eq!(owner_liveness(dead, None), Liveness::Gone);
+
+    // A store whose owner has exited is taken over through that decision.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("swap-jobs.sqlite3");
+    let provider = || {
+        Arc::new(FakeProvider {
+            config_path: None,
+            config: Mutex::new(SwapConfig::default()),
+            acquired: Mutex::new(Vec::new()),
+        }) as Arc<dyn ContextProvider>
+    };
+    let engine = || FakeEngine {
+        script: Box::new(Vec::new),
+        executed: Arc::new(Mutex::new(Vec::new())),
+        dry_runs: Arc::new(AtomicUsize::new(0)),
+    };
+    let previous = OwnerIdentity {
+        nonce: "previous".into(),
+        pid: dead,
+        process_start: None,
+    };
+    drop(Service::open(&path, previous, &alive, engine(), provider()).unwrap());
+    let current = OwnerIdentity {
+        nonce: "current".into(),
+        pid: me,
+        process_start: start,
+    };
+    Service::open(&path, current, &owner_liveness, engine(), provider()).unwrap();
+}
+
+/// A planning note can quote an external tool; only a code goes to disk.
+#[test]
+fn a_settled_note_is_kept_in_memory_and_only_its_code_is_written() {
+    let h = harness(Box::new(|| {
+        vec![EngineStep::Done(outcome(
+            "%1",
+            SwapStatus::Failed,
+            "aas said: secret-marker token=abc",
+        ))]
+    }));
+    let accepted = Service::submit(&h.service, "key", &overrides(&["%1"]), None).unwrap();
+    let view = settled(&h.service, &accepted.job_id);
+    assert_eq!(
+        view.entries[0].reason.as_deref(),
+        Some("candidates_unavailable")
+    );
+    assert!(view.entries[0]
+        .outcome
+        .as_ref()
+        .unwrap()
+        .note
+        .contains("secret-marker"));
+    let raw: String = rusqlite::Connection::open(h.dir.path().join("swap-jobs.sqlite3"))
+        .unwrap()
+        .query_row("SELECT plan_json FROM jobs", [], |row| row.get(0))
+        .unwrap();
+    assert!(!raw.contains("secret-marker"), "{raw}");
+}
+
+/// Conflicting options are refused before anything is planned or accepted.
+#[test]
+fn conflicting_options_are_refused_before_planning() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let cases = [
+        SwapOverrides {
+            all: true,
+            limited: true,
+            ..SwapOverrides::default()
+        },
+        SwapOverrides {
+            targets: vec!["%1".into()],
+            all: true,
+            ..SwapOverrides::default()
+        },
+        SwapOverrides {
+            spread: true,
+            to: Some("x".into()),
+            ..SwapOverrides::default()
+        },
+        SwapOverrides {
+            no_continue: true,
+            continue_when: Some("bogus".into()),
+            ..SwapOverrides::default()
+        },
+        SwapOverrides {
+            no_continue: true,
+            continue_text: Some("go".into()),
+            ..SwapOverrides::default()
+        },
+    ];
+    for (i, request) in cases.iter().enumerate() {
+        assert!(h.service.plan(request).is_err(), "case {i}");
+        assert!(
+            Service::submit(&h.service, &format!("k{i}"), request, None).is_err(),
+            "case {i}"
+        );
+        assert!(h.service.status(&JobRef::Key(format!("k{i}"))).is_err());
+    }
+    assert!(h.executed.lock().unwrap().is_empty());
+    assert_eq!(h.dry_runs.load(Ordering::SeqCst), 0);
+}
+
+/// A pane whose server cannot be told is not reserved as some other one.
+#[test]
+fn a_target_on_an_unknown_server_is_refused() {
+    let h = harness(Box::new(|| {
+        let mut unknown = identity("%1", "default");
+        unknown.socket = None;
+        unknown.endpoint = endpoint_key("%1", None);
+        vec![EngineStep::Run(FakeTarget {
+            identity: unknown,
+            gate: None,
+        })]
+    }));
+    let accepted = Service::submit(&h.service, "key", &overrides(&["%1"]), None).unwrap();
+    let view = settled(&h.service, &accepted.job_id);
+    assert_eq!(view.entries[0].reason.as_deref(), Some("unknown_server"));
+    assert!(h.executed.lock().unwrap().is_empty());
+    // Two spellings of one tmux server are one endpoint.
+    assert_eq!(
+        endpoint_key("%1", Some("/tmp/tmux-1/default")),
+        endpoint_key("%1", Some("default"))
+    );
+}
+
+/// A thread that cannot start ends the job durably with no effect and frees
+/// its panes.
+#[test]
+fn an_executor_that_cannot_start_ends_the_job_without_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let executed = Arc::new(Mutex::new(Vec::new()));
+    let service = Service::open(
+        &dir.path().join("swap-jobs.sqlite3"),
+        OwnerIdentity {
+            nonce: "a".into(),
+            pid: 1,
+            process_start: None,
+        },
+        &alive,
+        FakeEngine {
+            script: Box::new(|| vec![run("%1"), run("%2")]),
+            executed: Arc::clone(&executed),
+            dry_runs: Arc::new(AtomicUsize::new(0)),
+        },
+        Arc::new(FakeProvider {
+            config_path: None,
+            config: Mutex::new(SwapConfig::default()),
+            acquired: Mutex::new(Vec::new()),
+        }) as Arc<dyn ContextProvider>,
+    )
+    .unwrap()
+    .with_spawner(Box::new(|_, _| Err(std::io::Error::other("no threads"))));
+    let service = Arc::new(service);
+    assert!(
+        Service::submit(&service, "key", &overrides(&["%1", "%2"]), None)
+            .unwrap_err()
+            .contains("could not start")
+    );
+    let view = service.status(&JobRef::Key("key".into())).unwrap();
+    assert_eq!(view.state, "done");
+    assert!(view
+        .entries
+        .iter()
+        .all(|e| e.disposition.as_deref() == Some("failed")));
+    assert!(executed.lock().unwrap().is_empty());
+    assert!(service.reserved.lock().unwrap().is_empty());
+    assert!(service.active().is_ok());
+}
+
+/// A panicking executor faults the service instead of leaving a running
+/// job behind a healthy one.
+#[test]
+fn a_panicking_executor_faults_the_service() {
+    let h = harness(Box::new(|| vec![run("%panic"), run("%2")]));
+    let accepted = Service::submit(&h.service, "key", &overrides(&["%panic", "%2"]), None).unwrap();
+    let view = settled(&h.service, &accepted.job_id);
+    assert!(
+        view.fault
+            .as_deref()
+            .unwrap_or_default()
+            .contains("panicked"),
+        "{view:?}"
+    );
+    assert_ne!(view.state, "done");
+    assert!(h.service.active().is_err());
+    assert!(h.executed.lock().unwrap().is_empty());
 }
