@@ -190,6 +190,9 @@ mod tests {
         screen: Option<String>,
         typed: Mutex<Vec<String>>,
         fail_send: bool,
+        /// When set, the screen is only readable on this server; reading the
+        /// process-default server sees nothing.
+        only_on: Option<&'static str>,
     }
 
     impl FakePane {
@@ -198,6 +201,7 @@ mod tests {
                 screen: Some(screen.into()),
                 typed: Mutex::new(Vec::new()),
                 fail_send: false,
+                only_on: None,
             }
         }
         fn typed(&self) -> Vec<String> {
@@ -216,7 +220,18 @@ mod tests {
             None
         }
         fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            if self.only_on.is_some() {
+                return None;
+            }
             self.screen.clone()
+        }
+        fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
+            match self.only_on {
+                Some(only) => (socket == Some(only))
+                    .then(|| self.screen.clone())
+                    .flatten(),
+                None => self.capture_pane(pane_id),
+            }
         }
         fn pane_pid_map(&self) -> HashMap<u32, String> {
             HashMap::new()
@@ -281,6 +296,23 @@ mod tests {
             assert_eq!(stop(&pane, kind, &exited), StopOutcome::Exited);
             assert_eq!(pane.typed(), [quit, "\r"]);
         }
+    }
+
+    #[test]
+    fn the_pane_is_read_on_the_workers_own_server() {
+        let mut pane = FakePane::showing(CODEX_IDLE);
+        pane.only_on = Some("/tmp/rmux-b/default");
+        let probes = AtomicUsize::new(0);
+        let exited = || Some(probes.fetch_add(1, Ordering::SeqCst) > 0);
+        let outcome = graceful_stop(&StopRequest {
+            backend: &pane,
+            socket: Some("/tmp/rmux-b/default"),
+            pane: "%1",
+            kind: AgentKind::Codex,
+            timeout: Duration::from_millis(300),
+            exited: &exited,
+        });
+        assert_eq!(outcome, StopOutcome::Exited);
     }
 
     #[test]
