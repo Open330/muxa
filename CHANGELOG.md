@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already carries any mark of its kind is left alone, a restored alias is
   dropped if a live peer holds it in that server's room, and worker grants,
   launch and pipeline-attempt markers are never restored.
+- Fleet inbox claims now atomically change only the requests the capped response
+  can return. Unseen requests stay queued; primary protection is applied before
+  the limit. Older daemons are rejected before claiming instead of silently
+  falling back to an unbounded mutation.
 
 - `muxa workers prune --execute` refused every Codex worker with "no Codex
   composer on screen": it read the pane with its colour escapes, which hid an

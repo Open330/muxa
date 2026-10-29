@@ -637,6 +637,8 @@ enum RequestBody {
         origin: CollaborationOrigin,
         #[serde(default)]
         request_id: Option<String>,
+        #[serde(default)]
+        limit: Option<usize>,
     },
     CollaborationPurpose {
         origin: CollaborationOrigin,
@@ -935,6 +937,7 @@ const CAPABILITIES: &[&str] = &[
     collaboration::WORKER_DRAIN_CAPABILITY,
     collaboration::WORKER_SPAWN_RELEASE_CAPABILITY,
     collaboration::EXACT_SESSION_CAPABILITY,
+    collaboration::INBOX_LIMIT_CAPABILITY,
     "collaboration_overview_v1",
     "collaboration_expire_v1",
     "collaboration_lifecycle",
@@ -4893,7 +4896,11 @@ async fn handle(
                     ));
                     response
                 }
-                RequestBody::CollaborationInbox { origin, request_id } => {
+                RequestBody::CollaborationInbox {
+                    origin,
+                    request_id,
+                    limit,
+                } => {
                     kind = "collaboration_inbox";
                     collaboration_actor.observe_pane(&backends).await;
                     let audit_context = CollaborationAuditContext::new(
@@ -4914,6 +4921,8 @@ async fn handle(
                                 .claim_by_id(&current, id)
                                 .await
                                 .map(|request| vec![request])
+                        } else if let Some(limit) = limit {
+                            collaboration.claim_for_limit(&current, limit).await
                         } else {
                             collaboration.claim_for(&current).await
                         } {
@@ -7696,6 +7705,29 @@ impl Client {
         serde_json::from_value(resp["collaboration_requests"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Claim the batch returned to a Fleet mailbox surface.
+    pub async fn collaboration_claim_recent_mailbox(
+        &self,
+        origin: &CollaborationOrigin,
+    ) -> Result<Vec<CollaborationRequest>, RuntimeError> {
+        let hello = self.hello(CLIENT_CALL_TIMEOUT).await?;
+        if !hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == collaboration::INBOX_LIMIT_CAPABILITY)
+        {
+            return Err(RuntimeError::Daemon("bounded Fleet inbox claims require a newer muxad; refusing an unbounded claim that could hide requests".into()));
+        }
+        let response = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION, "kind":"collaboration_inbox", "origin":origin,
+                "limit":crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT
+            }))
+            .await?;
+        serde_json::from_value(response["collaboration_requests"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     /// Body-free room relationship data for an operator surface.
     /// Every live worker muxa launched, host-wide. Read-only.
     pub async fn collaboration_workers(
@@ -9136,6 +9168,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_fleet_claim_refuses_legacy_daemon_before_any_claim() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("legacy-claim.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut line = String::new();
+            // Client::hello first negotiates, then requests the hello view on
+            // the same connection. Neither frame may turn into a claim.
+            for _ in 0..2 {
+                line.clear();
+                reader.read_line(&mut line).await.unwrap();
+                assert_eq!(
+                    serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
+                    "hello"
+                );
+                reader.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_mailbox\"]}\n").await.unwrap();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err(),
+                "an old daemon must not receive an unbounded fallback claim"
+            );
+        });
+        let origin = CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: None,
+            console: false,
+            agent_session_id: None,
+        };
+        let result = Client::new(socket)
+            .collaboration_claim_recent_mailbox(&origin)
+            .await;
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("bounded Fleet inbox claims"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn fleet_recent_mailbox_bounds_transfer_without_losing_full_contracts() {
         let dir = tempdir().unwrap();
         let socket = dir.path().join("recent-mailbox.sock");
@@ -9197,6 +9273,44 @@ mod tests {
         assert_eq!(recent[0].paths, ["src/allowed.rs"]);
         assert_eq!(recent[0].work_mode, collaboration::WorkMode::Execute);
         assert!(recent[0].body.len() > 1024);
+        for index in 0..40 {
+            mailbox
+                .create(
+                    collaboration::Participant::console(context.current.room.clone()),
+                    context.current.clone(),
+                    collaboration::NewRequest {
+                        body: format!("operator request {index}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        let claimed = client
+            .collaboration_claim_recent_mailbox(&origin)
+            .await
+            .unwrap();
+        let delivered = FleetCommandResult::collaboration_mailbox(claimed, Vec::new());
+        assert_eq!(
+            delivered.collaboration_incoming.len(),
+            crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT
+        );
+        let pending = mailbox
+            .list_for(
+                &context.current,
+                RequestMailbox::Incoming,
+                MailboxScope::Caller,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending
+                .iter()
+                .filter(|r| r.status == collaboration::RequestStatus::Queued)
+                .count(),
+            8,
+            "a capped Fleet response must not claim requests it cannot return"
+        );
         shutdown.send(()).unwrap();
         serving.await.unwrap();
     }

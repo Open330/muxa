@@ -350,6 +350,8 @@ pub struct CollaborationOrigin {
 /// The daemon honours [`CollaborationOrigin::exact_session`] and resolves
 /// `session:<agent session id>` targets.
 pub const EXACT_SESSION_CAPABILITY: &str = "collaboration_exact_session_v1";
+/// The daemon atomically claims at most the requested inbox batch size.
+pub const INBOX_LIMIT_CAPABILITY: &str = "collaboration_inbox_limit_v1";
 
 /// Local IPC surface that initiated a collaboration call. This describes the
 /// transport actor, not the agent session represented by `from`.
@@ -3353,7 +3355,22 @@ impl CollaborationStore {
         &self,
         caller: &Participant,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
-        self.claim_selected(caller, None).await
+        self.claim_selected(caller, None, None).await
+    }
+
+    /// Bound a transport batch before changing request state. Prefer queued
+    /// work so another batch can progress without consuming unseen requests.
+    pub async fn claim_for_limit(
+        &self,
+        caller: &Participant,
+        limit: usize,
+    ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
+        self.ensure_enabled()?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        self.claim_selected(caller, None, Some(limit.min(MAX_QUERY_LIMIT)))
+            .await
     }
 
     pub async fn claim_by_id(
@@ -3362,7 +3379,7 @@ impl CollaborationStore {
         request_id: &str,
     ) -> Result<CollaborationRequest, CollaborationError> {
         if let Some(request) = self
-            .claim_selected(caller, Some(request_id))
+            .claim_selected(caller, Some(request_id), None)
             .await?
             .into_iter()
             .next()
@@ -3382,6 +3399,7 @@ impl CollaborationStore {
         &self,
         caller: &Participant,
         selected: Option<&str>,
+        limit: Option<usize>,
     ) -> Result<Vec<CollaborationRequest>, CollaborationError> {
         self.ensure_enabled()?;
         let _transaction = self.transaction_lock.lock().await;
@@ -3390,18 +3408,29 @@ impl CollaborationStore {
                 "worker_draining: inbox claims are paused".into(),
             ));
         }
-        let mut staged: HashMap<_, _> = self
-            .requests
-            .read()
-            .await
-            .values()
-            .filter(|r| {
-                addresses(&r.to, caller)
-                    && selected.is_none_or(|id| r.id == id)
-                    && matches!(r.status, RequestStatus::Queued | RequestStatus::Claimed)
-            })
-            .map(|r| (r.id.clone(), r.clone()))
-            .collect();
+        let mut staged: HashMap<_, _> = {
+            let requests = self.requests.read().await;
+            let mut eligible: Vec<_> = requests
+                .values()
+                .filter(|r| {
+                    addresses(&r.to, caller)
+                        && selected.is_none_or(|id| r.id == id)
+                        && (selected.is_some()
+                            || r.from.console
+                            || caller.accepts_peer_work()
+                            || r.status == RequestStatus::Claimed)
+                        && matches!(r.status, RequestStatus::Queued | RequestStatus::Claimed)
+                })
+                .collect();
+            if limit.is_some() {
+                eligible.sort_by_key(|r| (r.status != RequestStatus::Queued, r.created_at, &r.id));
+            }
+            eligible
+                .into_iter()
+                .take(limit.unwrap_or(usize::MAX))
+                .map(|r| (r.id.clone(), r.clone()))
+                .collect()
+        };
         let now = OffsetDateTime::now_utc();
         let mut changed = false;
         let mut inbox = Vec::new();
@@ -7034,10 +7063,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn limited_inbox_batches_preserve_primary_protection_and_progress() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut recipient = participant("%2", "primary");
+        recipient.launch_purpose = LaunchPurpose::Primary;
+        let blocked = mailbox
+            .create(
+                participant("%1", "sender"),
+                recipient.clone(),
+                NewRequest {
+                    body: "protected peer request".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        for index in 0..3 {
+            mailbox
+                .create(
+                    Participant::console(recipient.room.clone()),
+                    recipient.clone(),
+                    NewRequest {
+                        body: format!("operator request {index}"),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        assert!(mailbox
+            .claim_for_limit(&recipient, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        let first = mailbox.claim_for_limit(&recipient, 2).await.unwrap();
+        let second = mailbox.claim_for_limit(&recipient, 2).await.unwrap();
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+        let ids: HashSet<_> = first.iter().chain(&second).map(|r| &r.id).collect();
+        assert_eq!(
+            ids.len(),
+            3,
+            "new queued work must precede already claimed rereads"
+        );
+        assert!(first.iter().chain(&second).all(|r| r.from.console));
+        assert_eq!(
+            mailbox
+                .peek_for(&recipient, &blocked.id)
+                .await
+                .unwrap()
+                .status,
+            RequestStatus::Queued
+        );
+    }
+
+    #[tokio::test]
     #[allow(clippy::too_many_lines)] // one persistence-failure matrix with shared setup and assertions
     async fn staged_mutations_preserve_all_rows_and_revision_on_persistence_failure() {
         for operation in [
-            "create", "claim", "prepare", "reply", "cancel", "expire", "rebind", "reserve",
+            "create",
+            "claim",
+            "claim_limited",
+            "prepare",
+            "reply",
+            "cancel",
+            "expire",
+            "rebind",
+            "reserve",
             "withdraw",
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -7111,6 +7203,7 @@ mod tests {
                     .prepare_direct_wake(&recipient, &request.id)
                     .await
                     .map(|_| ()),
+                "claim_limited" => mailbox.claim_for_limit(&recipient, 1).await.map(|_| ()),
                 "reply" => mailbox
                     .reply(
                         &recipient,

@@ -510,7 +510,7 @@ async fn handle_request(
             exact_backend(&backends, &pane).await?;
             let agent = collaboration_origin(&pane, false);
             let incoming = client
-                .collaboration_inbox(&agent)
+                .collaboration_claim_recent_mailbox(&agent)
                 .await
                 .context("claiming collaboration inbox")?;
             Ok(RelayFrame::Result {

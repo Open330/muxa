@@ -489,7 +489,7 @@ impl LocalTask {
                 exact_local_backend(&self.backends, &pane).await?;
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_claim", 0);
                 self.client
-                    .collaboration_inbox(&fleet_collaboration_origin(&pane, false))
+                    .collaboration_claim_recent_mailbox(&fleet_collaboration_origin(&pane, false))
                     .await
                     .map(|incoming| FleetCommandResult::collaboration_mailbox(incoming, Vec::new()))
                     .map_err(|error| error.to_string())
