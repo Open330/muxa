@@ -130,7 +130,13 @@ pub fn graceful_stop(req: &StopRequest<'_>) -> StopOutcome {
         Some(false) => {}
         None => return StopOutcome::Refused("cannot observe the worker process".into()),
     }
-    let Some(screen) = req.backend.capture_pane(req.pane) else {
+    // Read the pane on its own server, as plain text: captures keep colour
+    // escapes, and a coloured `›` or `❯` would hide an empty prompt.
+    let Some(screen) = req
+        .backend
+        .capture_pane_on(req.socket, req.pane)
+        .map(|screen| crate::screen::strip_ansi(&screen))
+    else {
         return StopOutcome::Refused("could not read the pane".into());
     };
     match read_composer(&screen, req.kind) {
@@ -184,6 +190,9 @@ mod tests {
         screen: Option<String>,
         typed: Mutex<Vec<String>>,
         fail_send: bool,
+        /// When set, the screen is only readable on this server; reading the
+        /// process-default server sees nothing.
+        only_on: Option<&'static str>,
     }
 
     impl FakePane {
@@ -192,6 +201,7 @@ mod tests {
                 screen: Some(screen.into()),
                 typed: Mutex::new(Vec::new()),
                 fail_send: false,
+                only_on: None,
             }
         }
         fn typed(&self) -> Vec<String> {
@@ -210,7 +220,18 @@ mod tests {
             None
         }
         fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            if self.only_on.is_some() {
+                return None;
+            }
             self.screen.clone()
+        }
+        fn capture_pane_on(&self, socket: Option<&str>, pane_id: &str) -> Option<String> {
+            match self.only_on {
+                Some(only) => (socket == Some(only))
+                    .then(|| self.screen.clone())
+                    .flatten(),
+                None => self.capture_pane(pane_id),
+            }
         }
         fn pane_pid_map(&self) -> HashMap<u32, String> {
             HashMap::new()
@@ -242,6 +263,9 @@ mod tests {
         "────────────────────────\n❯ please also fix\n────────────────────────\n";
     const CODEX_IDLE: &str = "• Done.\n\n› Ask Codex to do anything\n\n  gpt · ~/repo\n";
     const CODEX_DRAFT: &str = "• Done.\n\n› half a thought\n";
+    /// What a live Codex pane captures as: the prompt glyph and placeholder
+    /// are coloured.
+    const CODEX_IDLE_COLOURED: &str = "• Done.\n\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  gpt · ~/repo\n";
 
     fn stop(
         pane: &FakePane,
@@ -263,6 +287,7 @@ mod tests {
         for (screen, kind, quit) in [
             (CLAUDE_IDLE, AgentKind::ClaudeCode, "/exit"),
             (CODEX_IDLE, AgentKind::Codex, "/quit"),
+            (CODEX_IDLE_COLOURED, AgentKind::Codex, "/quit"),
         ] {
             let pane = FakePane::showing(screen);
             let probes = AtomicUsize::new(0);
@@ -271,6 +296,23 @@ mod tests {
             assert_eq!(stop(&pane, kind, &exited), StopOutcome::Exited);
             assert_eq!(pane.typed(), [quit, "\r"]);
         }
+    }
+
+    #[test]
+    fn the_pane_is_read_on_the_workers_own_server() {
+        let mut pane = FakePane::showing(CODEX_IDLE);
+        pane.only_on = Some("/tmp/rmux-b/default");
+        let probes = AtomicUsize::new(0);
+        let exited = || Some(probes.fetch_add(1, Ordering::SeqCst) > 0);
+        let outcome = graceful_stop(&StopRequest {
+            backend: &pane,
+            socket: Some("/tmp/rmux-b/default"),
+            pane: "%1",
+            kind: AgentKind::Codex,
+            timeout: Duration::from_millis(300),
+            exited: &exited,
+        });
+        assert_eq!(outcome, StopOutcome::Exited);
     }
 
     #[test]
