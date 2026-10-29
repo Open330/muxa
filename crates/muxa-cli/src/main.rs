@@ -1786,7 +1786,7 @@ async fn main() -> Result<()> {
         Cmd::Mcp => mcp::run(client, cfg).await,
         Cmd::Logs(logs_args) => logs::run(logs_args).await,
         Cmd::Snapshot(snapshot_args) => reload::snapshot(&client, snapshot_args).await,
-        Cmd::Restore(restore_args) => reload::restore(restore_args),
+        Cmd::Restore(restore_args) => reload::restore(client.socket(), restore_args),
         Cmd::Reload(reload_args) => reload::reload(&client, reload_args).await,
         Cmd::Swap(swap_args) => swap::run(&client, swap_args, &cfg.swap, &cfg.accounts).await,
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,

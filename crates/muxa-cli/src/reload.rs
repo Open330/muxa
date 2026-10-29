@@ -200,6 +200,78 @@ pub struct Snapshot {
     socket: String,
     windows: Vec<WindowShape>,
     panes: Vec<PaneShape>,
+    /// muxa's workspace marks per session, as `(option, value)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sessions: Vec<SessionShape>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SessionShape {
+    session: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<(String, String)>,
+}
+
+/// muxa's identity marks, by the scope muxa writes them at. Restoring them is
+/// what keeps a restored Work, its roles and its handles recognisable: without
+/// them every agent comes back as an anonymous pane in an unmanaged window.
+///
+/// Only descriptive labels travel. Deliberately absent:
+/// - `@muxa_worker_launch` and anything a daemon grant rests on: whether a
+///   pane may take peer work is decided by muxad's process-fenced records,
+///   and a restore must not be able to widen it;
+/// - `@muxa_agent` / `@muxa_managed_agent`: they say muxa launched the
+///   process in the pane, which a rebuilt shell is not;
+/// - `@muxa_pipeline_generation`: it names one pipeline attempt, and a stale
+///   one would let the restored pane pass for that attempt's agent.
+const PANE_MARKS: [&str; 5] = [
+    "@muxa_agent_role",
+    "@muxa_agent_task",
+    "@muxa_agent_alias",
+    "@muxa_agent_workspace_id",
+    "@muxa_agent_work_id",
+];
+const WINDOW_MARKS: [&str; 11] = [
+    "@muxa_workspace_id",
+    "@muxa_work_id",
+    "@muxa_work_cwd",
+    "@muxa_managed_work",
+    "@muxa_external_source",
+    "@muxa_external_scope",
+    "@muxa_external_stable_id",
+    "@muxa_external_key",
+    "@muxa_external_title",
+    "@muxa_external_url",
+    "@muxa_external_status",
+];
+const SESSION_MARKS: [&str; 3] = [
+    "@muxa_workspace_id",
+    "@muxa_workspace_cwd",
+    "@muxa_managed_workspace",
+];
+
+/// `\t#{@a}\t#{@b}…`, appended to a listing format.
+fn marks_format(options: &[&str]) -> String {
+    use std::fmt::Write as _;
+    options.iter().fold(String::new(), |mut format, option| {
+        let _ = write!(format, "\t#{{{option}}}");
+        format
+    })
+}
+
+/// The set marks among `values`, read in `options` order. A row whose mark
+/// columns do not line up — a value holding a tab or a newline shifts or
+/// splits them — yields none, rather than a mark carrying another's value.
+fn read_marks(options: &[&str], values: &[&str]) -> Vec<(String, String)> {
+    if values.len() != options.len() {
+        return Vec::new();
+    }
+    options
+        .iter()
+        .zip(values)
+        .filter(|(_, value)| !value.is_empty())
+        .map(|(option, value)| ((*option).to_owned(), (*value).to_owned()))
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,6 +294,9 @@ struct WindowShape {
     active: bool,
     /// The host's own layout string, replayed verbatim by `select-layout`.
     layout: String,
+    /// muxa's Work marks on this window, as `(option, value)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -247,6 +322,10 @@ struct PaneShape {
     /// The agent muxa had tracked in this pane, when it knew of one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     agent: Option<AgentShape>,
+    /// muxa's agent marks on this pane — role, task, alias, Work — as
+    /// `(option, value)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<(String, String)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -480,14 +559,12 @@ fn print_json(value: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
-pub fn restore(args: RestoreArgs) -> Result<()> {
+/// `daemon` is the caller's muxad, which referees restored aliases.
+pub fn restore(daemon: &Path, args: RestoreArgs) -> Result<()> {
     if args.boot {
-        return restore_at_boot(args);
+        return restore_at_boot(daemon, args);
     }
-    let path = match args.snapshot {
-        Some(path) => path,
-        None => newest_snapshot()?,
-    };
+    let path = args.snapshot.map_or_else(newest_snapshot, Ok)?;
     let snapshot = read_snapshot(&path)?;
     let endpoint = match args.mux_socket {
         Some(socket) => endpoint_for(&snapshot.host, socket)?,
@@ -574,6 +651,7 @@ pub fn restore(args: RestoreArgs) -> Result<()> {
         apply(
             &endpoint,
             &target,
+            daemon,
             args.layout_only,
             args.continue_text.as_deref(),
             &mut report,
@@ -594,7 +672,7 @@ const BOOT_PLACEHOLDER: &str = "__muxa_boot";
 /// `restore --boot`. A server that already has sessions — the hook firing a
 /// second time, or a user quicker than it — is left exactly as it is, and
 /// having no snapshot yet is a fresh install, not a failure.
-fn restore_at_boot(mut args: RestoreArgs) -> Result<()> {
+fn restore_at_boot(daemon: &Path, mut args: RestoreArgs) -> Result<()> {
     let path = match args.snapshot.take() {
         Some(path) => path,
         None => match newest_snapshot() {
@@ -619,7 +697,7 @@ fn restore_at_boot(mut args: RestoreArgs) -> Result<()> {
     args.snapshot = Some(path);
     args.run = true;
     args.boot = false;
-    let restored = restore(args);
+    let restored = restore(daemon, args);
     if placeholder {
         // Its own `=name` target: an unanchored one could match a
         // restored session whose name merely begins the same way.
@@ -770,6 +848,7 @@ async fn reload_multiplexer(client: &Client, args: MultiplexerReloadArgs) -> Res
     apply(
         &endpoint,
         &snapshot,
+        client.socket(),
         args.layout_only,
         follow_up,
         &mut RestoreReport::new(true),
@@ -783,28 +862,26 @@ async fn reload_multiplexer(client: &Client, args: MultiplexerReloadArgs) -> Res
 
 /// Read the whole workspace shape off the host, plus what each pane runs.
 async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot> {
-    let panes = mux_control::capture(
-        endpoint,
-        &[
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_index}\t#{window_id}\t#{pane_index}\t#{pane_id}\t#{pane_pid}\t#{pane_current_path}",
-        ],
-    )
-    .map_err(anyhow::Error::msg)
-    .context("listing panes")?;
-    let windows = mux_control::capture(
-        endpoint,
-        &[
-            "list-windows",
-            "-a",
-            "-F",
-            "#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{window_id}\t#{window_layout}",
-        ],
-    )
-    .map_err(anyhow::Error::msg)
-    .context("listing windows")?;
+    let pane_format = format!(
+        "#{{session_name}}\t#{{window_index}}\t#{{window_id}}\t#{{pane_index}}\t#{{pane_id}}\t#{{pane_pid}}\t#{{pane_current_path}}{}",
+        marks_format(&PANE_MARKS)
+    );
+    let panes = mux_control::capture(endpoint, &["list-panes", "-a", "-F", &pane_format])
+        .map_err(anyhow::Error::msg)
+        .context("listing panes")?;
+    let window_format = format!(
+        "#{{session_name}}\t#{{window_index}}\t#{{window_name}}\t#{{window_active}}\t#{{window_id}}\t#{{window_layout}}{}",
+        marks_format(&WINDOW_MARKS)
+    );
+    let windows = mux_control::capture(endpoint, &["list-windows", "-a", "-F", &window_format])
+        .map_err(anyhow::Error::msg)
+        .context("listing windows")?;
+    let session_format = format!("#{{session_name}}{}", marks_format(&SESSION_MARKS));
+    // Marks are context, not shape: a server that cannot list them still
+    // snapshots its layout.
+    let sessions = mux_control::capture(endpoint, &["list-sessions", "-F", &session_format])
+        .map(|listing| read_sessions(&listing))
+        .unwrap_or_default();
 
     let socket = pinned(endpoint).socket;
 
@@ -814,7 +891,8 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
         .map(|agents| agents_by_pane(&agents, &socket))
         .unwrap_or_default();
 
-    let (windows, keep) = fold_window_groups(&windows);
+    let (mut windows, keep) = fold_window_groups(&windows);
+    drop_inherited_marks(&mut windows, &sessions);
     #[cfg(not(target_os = "linux"))]
     let processes = process::ProcessTable::read();
     #[cfg(not(target_os = "linux"))]
@@ -823,9 +901,12 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
     let mut pane_pids = Vec::new();
     for line in panes.lines() {
         let f: Vec<&str> = line.split('\t').collect();
-        let [session, window_index, window_id, pane_index, pane_id, shell_pid, path] = f[..] else {
+        let [session, window_index, window_id, pane_index, pane_id, shell_pid, path] =
+            f[..f.len().min(7)]
+        else {
             continue;
         };
+        let marks = read_marks(&PANE_MARKS, f.get(7..).unwrap_or_default());
         if keep.get(window_id).map(String::as_str) != Some(session) {
             continue;
         }
@@ -844,6 +925,7 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
             agent: agent::reconcile(recorded, argv.as_deref()),
             command,
             argv,
+            marks,
         });
         pane_pids.push(process);
     }
@@ -862,7 +944,39 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
         socket,
         windows,
         panes: shapes,
+        sessions,
     })
+}
+
+/// A window listing resolves `#{@muxa_workspace_id}` through to its session,
+/// so a value the window only inherits reads as its own. Restoring it there
+/// would pin it to the window; drop what matches the session's own mark.
+fn drop_inherited_marks(windows: &mut [WindowShape], sessions: &[SessionShape]) {
+    for window in windows {
+        let Some(session) = sessions
+            .iter()
+            .find(|session| session.session == window.session)
+        else {
+            continue;
+        };
+        window.marks.retain(|mark| !session.marks.contains(mark));
+    }
+}
+
+/// Sessions with at least one workspace mark.
+fn read_sessions(listing: &str) -> Vec<SessionShape> {
+    listing
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split('\t').collect();
+            let (session, values) = f.split_first()?;
+            let marks = read_marks(&SESSION_MARKS, values);
+            (!marks.is_empty()).then(|| SessionShape {
+                session: (*session).to_owned(),
+                marks,
+            })
+        })
+        .collect()
 }
 
 /// The same server, named by its socket's absolute path. The short name muxad
@@ -894,9 +1008,10 @@ fn fold_window_groups(listing: &str) -> (Vec<WindowShape>, BTreeMap<String, Stri
     let mut rows: Vec<(String, WindowShape)> = Vec::new();
     for line in listing.lines() {
         let f: Vec<&str> = line.split('\t').collect();
-        let [session, index, name, active, window_id, layout] = f[..] else {
+        let [session, index, name, active, window_id, layout] = f[..f.len().min(6)] else {
             continue;
         };
+        let marks = read_marks(&WINDOW_MARKS, f.get(6..).unwrap_or_default());
         let entry = owner
             .entry(window_id.to_owned())
             .or_insert_with(|| session.to_owned());
@@ -911,6 +1026,7 @@ fn fold_window_groups(listing: &str) -> (Vec<WindowShape>, BTreeMap<String, Stri
                 name: name.to_owned(),
                 active: active == "1",
                 layout: layout.to_owned(),
+                marks,
             },
         ));
     }
@@ -1039,11 +1155,15 @@ fn agents_by_pane(agents: &[muxa::Agent], socket: &str) -> HashMap<String, Agent
 fn apply(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
+    daemon: &Path,
     layout_only: bool,
     follow_up: Option<&str>,
     report: &mut RestoreReport,
 ) -> Result<()> {
-    rebuild_shape(endpoint, snapshot, report)?;
+    let fresh = rebuild_shape(endpoint, snapshot, report)?;
+    // Before any agent relaunches, so its first hook already finds the pane
+    // it lands in marked with its role and Work.
+    restore_marks(endpoint, snapshot, &fresh, Some(daemon), report);
     if layout_only {
         return Ok(());
     }
@@ -1052,6 +1172,268 @@ fn apply(
         continue_interrupted(endpoint, snapshot, &relaunched, text, report);
     }
     Ok(())
+}
+
+/// Put muxa's marks back on what this restore built, by stable id once the
+/// layout has settled.
+///
+/// Only sessions and windows the restore created (`fresh`) and the panes in
+/// those windows are marked: one that was already there, and whatever runs
+/// in it, belongs to someone else — a session marked a managed workspace is
+/// one `work close` may close whole. A target is written only when it carries
+/// none of the marks of its kind already — filling the gaps of an identity it
+/// already has would mix two Works into one. A window that inherits its
+/// workspace is left unmarked, panes included, when the session it landed in
+/// is not the workspace it was saved under, for the same reason one level
+/// up. A restored alias is reserved with muxad for the rebuilt pane on this
+/// server first, and dropped if muxad says a live peer holds it. Anything
+/// that cannot be written is skipped: the layout already stands.
+fn restore_marks(
+    endpoint: &BackendEndpoint,
+    snapshot: &Snapshot,
+    fresh: &Fresh,
+    daemon: Option<&Path>,
+    report: &mut RestoreReport,
+) {
+    let listing = |args: &[&str]| -> Vec<(String, String)> {
+        mux_control::capture(endpoint, args)
+            .map(|out| {
+                out.lines()
+                    .filter_map(|line| line.split_once('\t'))
+                    .map(|(key, id)| (key.to_owned(), id.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    // `set-option` refuses the exact `=name` spelling for a session, and a
+    // bare name falls back to a prefix match; an id names one session only.
+    let session_ids: BTreeMap<String, String> =
+        listing(&["list-sessions", "-F", "#{session_name}\t#{session_id}"])
+            .into_iter()
+            .collect();
+    let write = |scope: Option<&str>, id: &str, marks: &[(String, String)], known: &[&str]| {
+        write_marks(endpoint, scope, id, marks, known)
+    };
+    for session in &snapshot.sessions {
+        if !fresh.sessions.contains(&session.session) {
+            continue;
+        }
+        if let Some(id) = session_ids.get(&session.session) {
+            // Its windows are checked against what it ended up with below.
+            let _ = write(None, id, &session.marks, &SESSION_MARKS);
+        }
+    }
+    for window in &snapshot.windows {
+        let key = format!("{}:{}", window.session, window.index);
+        let Some(session_id) = session_ids.get(&window.session) else {
+            continue;
+        };
+        if !fresh.windows.contains(&key) {
+            continue;
+        }
+        let saved = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session == window.session)
+            .map_or(&[][..], |session| session.marks.as_slice());
+        let live = own_marks(endpoint, None, session_id, &SESSION_MARKS);
+        if !same_parent(&window.marks, saved, live.as_deref()) {
+            report.say(&format!(
+                "  {key}: its session is not the workspace it was saved under; left unmarked"
+            ));
+            continue;
+        }
+        let window_ids: BTreeMap<String, String> = listing(&[
+            "list-windows",
+            "-t",
+            session_id,
+            "-F",
+            "#{window_index}\t#{window_id}",
+        ])
+        .into_iter()
+        .collect();
+        let Some(window_id) = window_ids.get(&window.index) else {
+            continue;
+        };
+        // Panes are filed under their window: one that is not the saved
+        // Work would get panes claiming a Work it is not.
+        if !write(Some("-w"), window_id, &window.marks, &WINDOW_MARKS) {
+            report.say(&format!(
+                "  {key}: the window is not the Work it was saved as; left unmarked"
+            ));
+            continue;
+        }
+        let pane_ids: BTreeMap<String, String> = listing(&[
+            "list-panes",
+            "-t",
+            window_id,
+            "-F",
+            "#{pane_index}\t#{pane_id}",
+        ])
+        .into_iter()
+        .collect();
+        for pane in snapshot
+            .panes
+            .iter()
+            .filter(|pane| pane.session == window.session && pane.window_index == window.index)
+        {
+            if let Some(pane_id) = pane_ids.get(&pane.pane_index) {
+                restore_pane_marks(endpoint, pane, pane_id, daemon, report);
+            }
+        }
+    }
+}
+
+/// One rebuilt pane's role, task, alias and Work, under a window already
+/// verified to be the saved one.
+fn restore_pane_marks(
+    endpoint: &BackendEndpoint,
+    pane: &PaneShape,
+    pane_id: &str,
+    daemon: Option<&Path>,
+    report: &mut RestoreReport,
+) {
+    // Checked before reserving, so a pane that keeps its own marks does not
+    // hold an alias it never receives.
+    if pane.marks.is_empty() || has_any_mark(endpoint, Some("-p"), pane_id, &PANE_MARKS) {
+        return;
+    }
+    let marks = reserve_alias(
+        &pane.marks,
+        &namespaced(endpoint.host, pane_id),
+        &endpoint.socket,
+        daemon,
+    );
+    if marks.len() < pane.marks.len() {
+        report.say(&format!(
+            "  {}: alias already used by a live peer; restored without it",
+            pane_target(pane)
+        ));
+    }
+    let _ = write_marks(endpoint, Some("-p"), pane_id, &marks, &PANE_MARKS);
+}
+
+/// Write `marks` onto a target that carries none of `known` yet, and say
+/// whether it ends up carrying exactly them — read back, so a hook that
+/// stamped it first, or a write that failed, is seen.
+fn write_marks(
+    endpoint: &BackendEndpoint,
+    scope: Option<&str>,
+    id: &str,
+    marks: &[(String, String)],
+    known: &[&str],
+) -> bool {
+    if !marks.is_empty() && !has_any_mark(endpoint, scope, id, known) {
+        for (option, value) in marks {
+            let mut args = vec!["set-option"];
+            args.extend(scope);
+            args.extend(["-t", id, option.as_str(), value.as_str()]);
+            let _ = mux_control::run(endpoint, &args);
+        }
+    }
+    own_marks(endpoint, scope, id, known).is_some_and(|now| carries_exactly(&now, known, marks))
+}
+
+/// Whether `id` already carries any of `known` at its own scope (not one it
+/// inherits, which `show-options` without `-A` leaves out).
+fn has_any_mark(endpoint: &BackendEndpoint, scope: Option<&str>, id: &str, known: &[&str]) -> bool {
+    // Unreadable: assume marked, so nothing is mixed in.
+    own_marks(endpoint, scope, id, known).is_none_or(|marks| !marks.is_empty())
+}
+
+/// Whether the `known` options among `now` are exactly `saved`.
+fn carries_exactly(now: &[(String, String)], known: &[&str], saved: &[(String, String)]) -> bool {
+    let mut now: Vec<_> = now
+        .iter()
+        .filter(|(option, _)| known.contains(&option.as_str()))
+        .collect();
+    let mut saved: Vec<_> = saved.iter().collect();
+    now.sort();
+    saved.sort();
+    now == saved
+}
+
+/// Which of `known` `id` sets at its own scope, with their values; `None`
+/// when any cannot be read.
+///
+/// One `show-options -v` per option: the listing form quotes and escapes a
+/// value with a quote or backslash in it, so `Fix "bug"` would read back as
+/// something other than what was written. An empty value is no mark, as it
+/// is when the snapshot captures it.
+fn own_marks(
+    endpoint: &BackendEndpoint,
+    scope: Option<&str>,
+    id: &str,
+    known: &[&str],
+) -> Option<Vec<(String, String)>> {
+    let mut marks = Vec::new();
+    for option in known {
+        let mut args = vec!["show-options", "-v", "-q"];
+        args.extend(scope);
+        args.extend(["-t", id, option]);
+        let out = mux_control::capture(endpoint, &args).ok()?;
+        if let Some(value) = shown_value(&out) {
+            marks.push(((*option).to_owned(), value.to_owned()));
+        }
+    }
+    Some(marks)
+}
+
+/// A `show-options -v` value as written; `None` when unset or empty.
+fn shown_value(out: &str) -> Option<&str> {
+    let value = out.strip_suffix('\n').unwrap_or(out);
+    (!value.is_empty()).then_some(value)
+}
+
+/// Whether a window saved with `window` marks, under a session saved with
+/// `saved`, keeps its saved workspace in a session whose own marks are
+/// `live` (`None`: unreadable). A window that pins its own workspace does
+/// not care; one that inherits it must land under the same one, or its Work
+/// would be filed under another workspace.
+fn same_parent(
+    window: &[(String, String)],
+    saved: &[(String, String)],
+    live: Option<&[(String, String)]>,
+) -> bool {
+    let workspace = |marks: &[(String, String)]| {
+        marks
+            .iter()
+            .find(|(option, _)| option == "@muxa_workspace_id")
+            .map(|(_, value)| value.clone())
+    };
+    if workspace(window).is_some() {
+        return true;
+    }
+    live.is_some_and(|live| workspace(live) == workspace(saved))
+}
+
+/// `marks` without its alias when muxad says a live peer already holds that
+/// handle in the rebuilt pane's room. A daemon that is down, older or cannot
+/// referee leaves the alias as it was configured, as a launch would.
+fn reserve_alias(
+    marks: &[(String, String)],
+    pane: &str,
+    mux_socket: &str,
+    daemon: Option<&Path>,
+) -> Vec<(String, String)> {
+    let Some(daemon) = daemon else {
+        return marks.to_vec();
+    };
+    marks
+        .iter()
+        .filter(|(option, alias)| {
+            option != "@muxa_agent_alias"
+                || muxa::ipc::blocking_reserve_handle(
+                    daemon,
+                    pane,
+                    Some(mux_socket),
+                    alias,
+                    Duration::from_secs(2),
+                )
+                .is_ok()
+        })
+        .cloned()
+        .collect()
 }
 
 /// The panes whose agent was mid-turn, among those that relaunched.
@@ -1133,20 +1515,34 @@ fn screen_settled(endpoint: &BackendEndpoint, target: &str) -> bool {
     false
 }
 
+/// What one restore built itself, as opposed to found already there.
+#[derive(Debug, Default)]
+struct Fresh {
+    /// Session names.
+    sessions: BTreeSet<String>,
+    /// `session:index`.
+    windows: BTreeSet<String>,
+}
+
 /// Sessions, windows, panes, geometry, working directories.
+/// Returns what this restore created.
 fn rebuild_shape(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
     report: &mut RestoreReport,
-) -> Result<()> {
+) -> Result<Fresh> {
     let mut created = 0_usize;
-    let mut fresh: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut built = Fresh::default();
+    let fresh = &mut built.windows;
     for window in &snapshot.windows {
         match ensure_window(endpoint, snapshot, window) {
-            Ok(count) => {
+            Ok((count, made_session)) => {
                 created += count;
                 if count > 0 {
                     fresh.insert(format!("{}:{}", window.session, window.index));
+                }
+                if made_session {
+                    built.sessions.insert(window.session.clone());
                 }
                 report.reached.insert(window.session.clone());
             }
@@ -1238,7 +1634,7 @@ fn rebuild_shape(
     for (target, error) in split_failures {
         report.say(&plan::split_failure_line(&target, &error));
     }
-    Ok(())
+    Ok(built)
 }
 
 /// The `columns x rows` a window had, from its layout string
@@ -1251,11 +1647,13 @@ fn layout_size(layout: &str) -> Option<(u32, u32)> {
 
 /// Create `window` — and its session, if that is missing too — at the size
 /// it was recorded with. Returns how many sessions/windows it created.
+/// Returns how many sessions and windows it created, and whether the session
+/// was one of them.
 fn ensure_window(
     endpoint: &BackendEndpoint,
     snapshot: &Snapshot,
     window: &WindowShape,
-) -> Result<usize> {
+) -> Result<(usize, bool)> {
     let mut created = 0_usize;
     let first = snapshot
         .panes
@@ -1292,6 +1690,7 @@ fn ensure_window(
             .with_context(|| format!("creating session {}", window.session))?;
         created += 1;
     }
+    let made_session = created > 0;
     // `has-session` resolves only the session half of a target, so it
     // answers yes for a window that does not exist. The window list is the
     // only honest answer — and the session's own first window does not
@@ -1332,7 +1731,7 @@ fn ensure_window(
             ],
         );
     }
-    Ok(created)
+    Ok((created, made_session))
 }
 
 /// How many panes a window has right now; `None` when the server could not
@@ -2115,6 +2514,7 @@ mod tests {
 
     fn pane(session: &str, window: &str, index: &str, command: Option<&str>) -> PaneShape {
         PaneShape {
+            marks: Vec::new(),
             session: session.into(),
             window_index: window.into(),
             pane_index: index.into(),
@@ -2124,6 +2524,177 @@ mod tests {
             argv: None,
             agent: None,
         }
+    }
+
+    #[test]
+    fn marks_are_read_in_option_order_and_unset_ones_are_skipped() {
+        assert_eq!(marks_format(&["@a", "@b"]), "\t#{@a}\t#{@b}");
+        assert_eq!(
+            read_marks(&["@a", "@b", "@c"], &["one", "", "three"]),
+            vec![("@a".into(), "one".into()), ("@c".into(), "three".into())]
+        );
+        // The grant behind worker purpose is never captured, so never restored.
+        for option in PANE_MARKS.iter().chain(&WINDOW_MARKS).chain(&SESSION_MARKS) {
+            assert!(!option.contains("worker"), "{option}");
+        }
+    }
+
+    #[test]
+    fn window_and_session_listings_keep_their_marks() {
+        let mut listing = String::from("callabo\t1\tCAL-1\t1\t@4\tabc,80x24,0,0");
+        let values = [
+            "callabo", "CAL-1", "/w", "1", "linear", "", "", "CAL-1", "", "", "",
+        ];
+        for value in values {
+            listing.push('\t');
+            listing.push_str(value);
+        }
+        let (windows, _) = fold_window_groups(&listing);
+        assert_eq!(
+            windows[0].marks,
+            vec![
+                ("@muxa_workspace_id".into(), "callabo".into()),
+                ("@muxa_work_id".into(), "CAL-1".into()),
+                ("@muxa_work_cwd".into(), "/w".into()),
+                ("@muxa_managed_work".into(), "1".into()),
+                ("@muxa_external_source".into(), "linear".into()),
+                ("@muxa_external_key".into(), "CAL-1".into()),
+            ]
+        );
+        // A listing without mark columns (an older format) still folds.
+        let (plain, _) = fold_window_groups("s\t0\tw\t1\t@1\tabc,80x24,0,0");
+        assert!(plain[0].marks.is_empty());
+        let sessions = read_sessions("callabo\tcallabo\t/w\t1\nscratch\t\t\t\n");
+        assert_eq!(sessions.len(), 1, "a session with no marks is not kept");
+        assert_eq!(sessions[0].session, "callabo");
+        assert_eq!(sessions[0].marks.len(), 3);
+    }
+
+    #[test]
+    fn a_window_does_not_keep_a_mark_it_only_inherits_from_its_session() {
+        let (mut windows, _) = fold_window_groups(
+            "demo\t0\tCAL-9\t1\t@1\tabc,80x24,0,0\tdemo\tCAL-9\t\t1\t\t\t\t\t\t\t",
+        );
+        let sessions = [SessionShape {
+            session: "demo".into(),
+            marks: vec![("@muxa_workspace_id".into(), "demo".into())],
+        }];
+        drop_inherited_marks(&mut windows, &sessions);
+        assert_eq!(
+            windows[0].marks,
+            vec![
+                ("@muxa_work_id".into(), "CAL-9".into()),
+                ("@muxa_managed_work".into(), "1".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_mark_value_with_a_tab_or_newline_is_dropped_not_misread() {
+        // A task with a tab: one extra column.
+        let shifted = ["reviewer", "fix\tthis", "rev", "callabo", "CAL-1"]
+            .join("\t")
+            .split('\t')
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let shifted: Vec<&str> = shifted.iter().map(String::as_str).collect();
+        assert!(read_marks(&PANE_MARKS, &shifted).is_empty());
+        // A newline cut the row short.
+        assert!(read_marks(&PANE_MARKS, &["reviewer", "half"]).is_empty());
+        // Lined up, the same row reads.
+        assert_eq!(
+            read_marks(&PANE_MARKS, &["reviewer", "", "rev", "", ""]).len(),
+            2
+        );
+    }
+
+    /// A window that inherits its workspace is marked only under the
+    /// workspace it was saved under; one that pins its own does not care.
+    #[test]
+    fn an_inherited_workspace_must_match_the_session_it_lands_in() {
+        let marks = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(option, value)| ((*option).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        let work = marks(&[("@muxa_work_id", "CAL-1")]);
+        let saved_a = marks(&[("@muxa_workspace_id", "A")]);
+        let live_b = marks(&[("@muxa_workspace_id", "B")]);
+        let live_none = marks(&[("@other", "x")]);
+
+        assert!(same_parent(&work, &saved_a, Some(&saved_a)));
+        // Saved under A, landing under B: B/CAL-1 is a Work nobody had.
+        assert!(!same_parent(&work, &saved_a, Some(&live_b)));
+        // Saved under no workspace, landing under B: the same mix.
+        assert!(!same_parent(&work, &[], Some(&live_b)));
+        assert!(same_parent(&work, &[], Some(&live_none)));
+        // A session that cannot be read is not assumed to match.
+        assert!(!same_parent(&work, &saved_a, None));
+        let pinned = marks(&[("@muxa_workspace_id", "A"), ("@muxa_work_id", "CAL-1")]);
+        assert!(same_parent(&pinned, &[], Some(&live_b)));
+    }
+
+    /// A window's children are restored only under the bundle it was
+    /// saved with: a hook's stamp, a partial write or a stray extra mark is
+    /// another identity.
+    #[test]
+    fn a_window_carries_its_saved_bundle_exactly_or_not_at_all() {
+        let marks = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(option, value)| ((*option).to_owned(), (*value).to_owned()))
+                .collect()
+        };
+        let saved = marks(&[("@muxa_work_id", "A"), ("@muxa_managed_work", "1")]);
+        let written = marks(&[
+            ("@muxa_managed_work", "1"),
+            ("@muxa_work_id", "A"),
+            ("status", "on"),
+        ]);
+        assert!(carries_exactly(&written, &WINDOW_MARKS, &saved));
+        let stamped = marks(&[("@muxa_work_id", "B"), ("@muxa_managed_work", "1")]);
+        assert!(!carries_exactly(&stamped, &WINDOW_MARKS, &saved));
+        let partial = marks(&[("@muxa_work_id", "A")]);
+        assert!(!carries_exactly(&partial, &WINDOW_MARKS, &saved));
+        // Nothing saved: only a window nothing stamped either qualifies.
+        assert!(carries_exactly(
+            &marks(&[("status", "on")]),
+            &WINDOW_MARKS,
+            &[]
+        ));
+        assert!(!carries_exactly(&stamped, &WINDOW_MARKS, &[]));
+    }
+
+    /// `show-options -v` prints a value as written — quotes, backslashes and
+    /// `$` included — so a window restored with one still matches its saved
+    /// bundle, and a different value still does not.
+    #[test]
+    fn a_shown_value_reads_back_as_written() {
+        let title = r#"Fix "bug" in C:\path $HOME"#;
+        assert_eq!(shown_value(&format!("{title}\n")), Some(title));
+        assert_eq!(shown_value(""), None);
+        assert_eq!(shown_value("\n"), None);
+
+        let saved = vec![("@muxa_external_title".to_owned(), title.to_owned())];
+        let now = vec![(
+            "@muxa_external_title".to_owned(),
+            shown_value(&format!("{title}\n")).unwrap().to_owned(),
+        )];
+        assert!(carries_exactly(&now, &WINDOW_MARKS, &saved));
+        let other = vec![(
+            "@muxa_external_title".to_owned(),
+            shown_value("Fix \"bug\" elsewhere\n").unwrap().to_owned(),
+        )];
+        assert!(!carries_exactly(&other, &WINDOW_MARKS, &saved));
+    }
+
+    #[test]
+    fn a_snapshot_from_before_marks_still_reads() {
+        let json = r#"{"version":1,"taken_at":"","host":"tmux","socket":"/tmp/s","windows":[{"session":"s","index":"0","name":"w","active":true,"layout":""}],"panes":[{"session":"s","window_index":"0","pane_index":"0","path":"/tmp"}]}"#;
+        let snapshot: Snapshot = serde_json::from_str(json).unwrap();
+        assert!(snapshot.sessions.is_empty());
+        assert!(snapshot.windows[0].marks.is_empty() && snapshot.panes[0].marks.is_empty());
     }
 
     #[test]
@@ -2237,6 +2808,7 @@ mod tests {
 
     fn snapshot_of(panes: Vec<PaneShape>) -> Snapshot {
         Snapshot {
+            sessions: Vec::new(),
             version: SNAPSHOT_VERSION,
             taken_at: String::new(),
             origin: SnapshotOrigin::Reload,

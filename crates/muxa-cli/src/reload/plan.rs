@@ -695,6 +695,7 @@ mod tests {
 
     fn window(session: &str, index: &str) -> WindowShape {
         WindowShape {
+            marks: Vec::new(),
             session: session.into(),
             index: index.into(),
             name: format!("w{index}"),
@@ -705,6 +706,7 @@ mod tests {
 
     fn pane(session: &str, window: &str, index: &str, command: Option<&str>) -> PaneShape {
         PaneShape {
+            marks: Vec::new(),
             session: session.into(),
             window_index: window.into(),
             pane_index: index.into(),
@@ -724,6 +726,7 @@ mod tests {
             working: false,
         });
         Snapshot {
+            sessions: Vec::new(),
             version: 1,
             taken_at: "2026-09-23T05:05:12Z".into(),
             origin: SnapshotOrigin::Manual,
