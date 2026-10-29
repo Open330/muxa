@@ -342,9 +342,74 @@ impl Engine for RealEngine {
     }
 }
 
+/// What a [`SwapService`] runs: `account_swap`, or, for a daemon's own
+/// tests, a stand-in that touches nothing.
+pub(crate) enum DaemonEngine {
+    Real(RealEngine),
+    #[cfg(feature = "test-support")]
+    Inert(testing::InertEngine),
+}
+
+pub(crate) enum DaemonTarget {
+    Real(Box<PreparedTarget>),
+    #[cfg(feature = "test-support")]
+    Inert(TargetIdentity),
+}
+
+impl Engine for DaemonEngine {
+    type Target = DaemonTarget;
+
+    fn prepare(
+        &self,
+        request: &SwapRequest,
+        snapshot: &Snapshot,
+    ) -> (SwapRequest, Vec<EngineStep<DaemonTarget>>) {
+        match self {
+            Self::Real(engine) => {
+                let (resolved, steps) = engine.prepare(request, snapshot);
+                let steps = steps
+                    .into_iter()
+                    .map(|step| match step {
+                        EngineStep::Done(outcome) => EngineStep::Done(outcome),
+                        EngineStep::Run(target) => EngineStep::Run(DaemonTarget::Real(target)),
+                    })
+                    .collect();
+                (resolved, steps)
+            }
+            #[cfg(feature = "test-support")]
+            Self::Inert(_) => testing::InertEngine::prepare(request, snapshot),
+        }
+    }
+
+    fn identity(&self, target: &DaemonTarget) -> TargetIdentity {
+        match target {
+            DaemonTarget::Real(target) => RealEngine.identity(target),
+            #[cfg(feature = "test-support")]
+            DaemonTarget::Inert(identity) => identity.clone(),
+        }
+    }
+
+    fn execute(
+        &self,
+        request: &SwapRequest,
+        target: &DaemonTarget,
+        observer: &mut dyn EffectObserver,
+    ) -> SwapOutcome {
+        match (self, target) {
+            (Self::Real(engine), DaemonTarget::Real(target)) => {
+                engine.execute(request, target, observer)
+            }
+            #[cfg(feature = "test-support")]
+            (Self::Inert(engine), DaemonTarget::Inert(identity)) => engine.execute(identity),
+            #[cfg(feature = "test-support")]
+            _ => unreachable!("a target is only ever run by the engine that planned it"),
+        }
+    }
+}
+
 /// The daemon's handle.
 pub struct SwapService {
-    inner: Arc<Service<RealEngine>>,
+    inner: Arc<Service<DaemonEngine>>,
 }
 
 impl SwapService {
@@ -355,22 +420,24 @@ impl SwapService {
             .map(Path::to_path_buf)
             .or_else(SwapJobStore::default_path)
             .ok_or("no data directory for the swap job store")?;
-        let lock = ownership_lock(&path)?;
+        Self::open_with(&path, provider, DaemonEngine::Real(RealEngine))
+    }
+
+    fn open_with(
+        path: &Path,
+        provider: Arc<dyn ContextProvider>,
+        engine: DaemonEngine,
+    ) -> Result<Self, String> {
+        let lock = ownership_lock(path)?;
         let identity = OwnerIdentity {
             nonce: uuid::Uuid::new_v4().to_string(),
             pid: std::process::id(),
             process_start: owner_start(std::process::id()),
         };
         // Holding the lock, whoever the store names as owner is gone.
-        let inner = Service::open(
-            &path,
-            identity,
-            &|_, _| Liveness::Gone,
-            RealEngine,
-            provider,
-        )
-        .map_err(|error| error.to_string())?
-        .holding(lock);
+        let inner = Service::open(path, identity, &|_, _| Liveness::Gone, engine, provider)
+            .map_err(|error| error.to_string())?
+            .holding(lock);
         Ok(Self {
             inner: Arc::new(inner),
         })
@@ -390,14 +457,14 @@ impl SwapService {
         &self,
         request_key: &str,
         overrides: &SwapOverrides,
-        guard: Box<dyn TargetGuard>,
+        guard: Option<Box<dyn TargetGuard>>,
     ) -> Result<Accepted, String> {
         Service::submit(
             &self.inner,
             request_key,
             overrides,
             Origin::Automation,
-            Some(guard),
+            guard,
         )
     }
 
@@ -451,6 +518,13 @@ pub(crate) enum Origin {
     Public,
     /// The daemon's own automation.
     Automation,
+}
+
+/// A pane on its server, socket spellings normalized: what a
+/// [`TargetGuard`] is asked to cover.
+#[must_use]
+pub fn endpoint(pane: &str, socket: Option<&str>) -> String {
+    account_swap::endpoint_key(pane, socket)
 }
 
 /// The key one automation firing submits under: the same logical firing —
@@ -1307,4 +1381,115 @@ fn same_path(left: &Path, right: &Path) -> bool {
     let canonical =
         |path: &Path| std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     canonical(left) == canonical(right)
+}
+
+/// For a daemon's own tests: a real service, journal and guard handling
+/// included, over an engine that plans and "runs" targets without touching
+/// any pane, process or account.
+#[cfg(feature = "test-support")]
+pub mod testing {
+    use super::{
+        ContextProvider, DaemonTarget, EngineStep, Path, Snapshot, SwapRequest, SwapService,
+    };
+    use crate::account_swap::{
+        endpoint_key, SessionIdSource, SwapOutcome, SwapScope, SwapStatus, TargetIdentity,
+    };
+    use std::sync::Arc;
+
+    pub(crate) struct InertEngine {
+        run: Arc<dyn Fn() + Send + Sync>,
+    }
+
+    impl InertEngine {
+        /// Every named target the snapshot knows (by session id or pane)
+        /// is one runnable target; anything else is skipped.
+        pub(crate) fn prepare(
+            request: &SwapRequest,
+            snapshot: &Snapshot,
+        ) -> (SwapRequest, Vec<EngineStep<DaemonTarget>>) {
+            let SwapScope::Targets(targets) = &request.scope else {
+                return (request.clone(), Vec::new());
+            };
+            let steps = targets
+                .iter()
+                .map(|wanted| {
+                    let found = snapshot.agents.iter().find(|agent| {
+                        agent.session_id == *wanted || agent.pane.as_deref() == Some(wanted)
+                    });
+                    match found.and_then(|agent| Some((agent, agent.pane.clone()?))) {
+                        Some((agent, pane)) => {
+                            let socket = agent.tmux_socket.clone();
+                            EngineStep::Run(DaemonTarget::Inert(TargetIdentity {
+                                endpoint: endpoint_key(&pane, socket.as_deref()),
+                                pane,
+                                socket,
+                                provider: agent.kind.to_string(),
+                                conversation_id: agent.session_id.clone(),
+                                session_id_source: SessionIdSource::Registry,
+                                conversation_verified: true,
+                                process_pid: 0,
+                                process_start: None,
+                                from_account: None,
+                                assigned_account: None,
+                                direct: false,
+                            }))
+                        }
+                        None => EngineStep::Done(outcome(
+                            None,
+                            wanted,
+                            SwapStatus::Skipped,
+                            "no such agent",
+                        )),
+                    }
+                })
+                .collect();
+            (request.clone(), steps)
+        }
+
+        /// Calls `run`, then reports the target swapped. No effect is made.
+        pub(crate) fn execute(&self, identity: &TargetIdentity) -> SwapOutcome {
+            (self.run)();
+            outcome(
+                Some(&identity.pane),
+                &identity.conversation_id,
+                SwapStatus::Swapped,
+                "inert",
+            )
+        }
+    }
+
+    fn outcome(pane: Option<&str>, session: &str, status: SwapStatus, note: &str) -> SwapOutcome {
+        SwapOutcome {
+            pane: pane.map(str::to_owned),
+            agent_session_id: session.to_owned(),
+            kind: crate::event::AgentKind::ClaudeCode,
+            from: None,
+            to: None,
+            status,
+            command: None,
+            note: note.into(),
+            continue_reason: None,
+            session_id_source: None,
+            conversation_verified: None,
+            conversation_unverified_reason: None,
+            registered: None,
+        }
+    }
+
+    /// A service on `path` whose every target runs `run` on the job's own
+    /// thread and nothing else.
+    ///
+    /// # Errors
+    /// As [`SwapService::open`].
+    pub fn open_inert(
+        path: &Path,
+        provider: Arc<dyn ContextProvider>,
+        run: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<SwapService, String> {
+        SwapService::open_with(
+            path,
+            provider,
+            super::DaemonEngine::Inert(InertEngine { run }),
+        )
+    }
 }

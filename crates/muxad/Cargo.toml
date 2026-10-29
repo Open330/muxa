@@ -25,6 +25,7 @@ time = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+muxa = { workspace = true, features = ["test-support"] }
 tempfile = "3"
 
 [lints]

@@ -8,6 +8,10 @@ repository.workspace = true
 authors.workspace = true
 description = "observability for AI coding agents in tmux."
 
+[features]
+# A swap service over an inert engine, for daemon tests. Never in a release.
+test-support = []
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
