@@ -385,6 +385,7 @@ fn a_job_is_done_only_once_every_target_is_recorded() {
             1,
             &Observation::AccountCheck {
                 result: AccountCheck::Unreadable,
+                observed: None,
                 source: "process_environ".into(),
             },
         )

@@ -115,6 +115,14 @@ pub(crate) trait EffectObserver {
     /// Called after it; an error means it happened but its result is not
     /// recorded.
     fn after(&mut self, effect: &Effect, transport: Transport) -> Result<(), ObserverError>;
+    /// Called with what the executor saw — a phase entered, readiness, the
+    /// account found. An error stops the run before its next effect.
+    fn observe(
+        &mut self,
+        _observation: &crate::swap_job::Observation,
+    ) -> Result<(), ObserverError> {
+        Ok(())
+    }
 }
 
 /// Records nothing.
@@ -136,6 +144,7 @@ pub(super) struct Runner<'a> {
     pub(super) io: &'a dyn SwapIo,
     observer: RefCell<&'a mut dyn EffectObserver>,
     log: RefCell<Vec<(Effect, Transport)>>,
+    seen: RefCell<Vec<crate::swap_job::Observation>>,
     next_group: Cell<u32>,
     halted: RefCell<Option<String>>,
 }
@@ -146,6 +155,7 @@ impl<'a> Runner<'a> {
             io,
             observer: RefCell::new(observer),
             log: RefCell::new(Vec::new()),
+            seen: RefCell::new(Vec::new()),
             next_group: Cell::new(0),
             halted: RefCell::new(None),
         }
@@ -167,6 +177,29 @@ impl<'a> Runner<'a> {
     #[cfg(test)]
     pub(super) fn log(&self) -> Vec<(Effect, Transport)> {
         self.log.borrow().clone()
+    }
+
+    /// Every observation reported, in order.
+    #[cfg(test)]
+    pub(super) fn observations(&self) -> Vec<crate::swap_job::Observation> {
+        self.seen.borrow().clone()
+    }
+
+    /// Report what the executor saw. `false` once the run has halted, or if
+    /// it could not be recorded, which halts it: what comes next may depend
+    /// on it.
+    pub(super) fn observe(&self, observation: crate::swap_job::Observation) -> bool {
+        if self.halted.borrow().is_some() {
+            return false;
+        }
+        if let Err(ObserverError(why)) = self.observer.borrow_mut().observe(&observation) {
+            *self.halted.borrow_mut() = Some(format!(
+                "stopped: an observation could not be recorded ({why})"
+            ));
+            return false;
+        }
+        self.seen.borrow_mut().push(observation);
+        true
     }
 
     /// Type one key or raw `text` (a relaunch line).

@@ -22,6 +22,7 @@ use crate::backend::SharedBackend;
 use crate::event::{AgentKind, AgentState};
 use crate::process_snapshot::ProcessInfo;
 use crate::state::Agent;
+use crate::swap_job::{Observation, Phase, Readiness};
 use effects::{Purpose, Runner};
 use io::Clock;
 use serde::{Deserialize, Serialize};
@@ -488,6 +489,17 @@ fn profile_candidates(
 }
 
 /// Where a relaunched agent turned out to run.
+/// What checking the relaunched agent's account found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AccountVerdict {
+    check: crate::swap_job::AccountCheck,
+    /// The account the process was found on.
+    observed: Option<String>,
+    source: &'static str,
+    /// Added to the report: a reason for a refusal, a caveat otherwise.
+    note: String,
+}
+
 enum Landed {
     /// On this configured account, or on none of them.
     On(Option<String>),
@@ -1480,43 +1492,44 @@ fn swap_one(
     };
     // The relaunch must land on the account it was meant for, checked before
     // any follow-up starts work on the wrong one.
-    let verify = |target: &Target| -> Result<String, String> {
-        let Some((_, resolved)) = profiles else {
-            return Ok(String::new());
-        };
-        match resumed_account(target, resolved) {
-            Landed::On(landed) if landed.as_deref() != Some(account.as_str()) => Err(format!(
-                "the resumed agent runs on {}",
-                landed.as_deref().unwrap_or("no configured account")
-            )),
-            Landed::Unreadable => {
-                Ok(" (account unconfirmed: its environment is not readable here)".into())
-            }
-            Landed::On(_) => Ok(String::new()),
-        }
+    let verify = |target: &Target| verify_account(target, profiles, &account);
+    let binding = crate::swap_job::Observation::Binding {
+        pid: launch.agent_pid,
+        process_start: planned.process_start.clone(),
+        conversation_id: session_id.clone(),
+        verified: *verified,
     };
     let io = io::LiveIo {
         backend,
         target: &target,
     };
-    let (status, note) = run_live(&io, &target, launch, &command, follow_up, &verify, observer);
+    let (status, note) = run_live(
+        &io, &target, launch, &command, follow_up, &verify, &binding, observer,
+    );
     outcome.status = status;
     outcome.note = note;
     outcome
 }
 
 /// [`execute`] on a live pane, as a report status and note.
+#[allow(clippy::too_many_arguments)] // one target's whole execution context
 fn run_live(
     io: &io::LiveIo,
     target: &Target,
     launch: &PaneLaunch,
     command: &str,
     follow_up: Option<&str>,
-    verify: &dyn Fn(&Target) -> Result<String, String>,
+    verify: &dyn Fn(&Target) -> Result<AccountVerdict, AccountVerdict>,
+    binding: &crate::swap_job::Observation,
     observer: &mut dyn effects::EffectObserver,
 ) -> (SwapStatus, String) {
     let runner = Runner::new(io, observer);
-    let executed = execute(&runner, target, launch, command, follow_up, verify);
+    // The process and conversation acted on, recorded before anything is.
+    let executed = if runner.observe(binding.clone()) {
+        execute(&runner, target, launch, command, follow_up, verify)
+    } else {
+        Err(halt(&runner))
+    };
     match (runner.halted(), executed) {
         // An observer that could not record an effect stopped the run; what
         // the executor said after that is not the whole story.
@@ -1524,6 +1537,54 @@ fn run_live(
         (None, Ok(note)) => (SwapStatus::Swapped, note),
         (None, Err(Refusal::Failed(note))) => (SwapStatus::Failed, note),
         (None, Err(Refusal::Kept(note))) => (SwapStatus::Skipped, note),
+    }
+}
+
+/// Check which account the relaunched agent in `target` runs on, against
+/// the one it was assigned. `Err` refuses the swap; `Ok` carries a caveat.
+fn verify_account(
+    target: &Target,
+    profiles: Option<(
+        &[crate::accounts::AccountProfile],
+        &crate::accounts::ResolvedAccounts,
+    )>,
+    account: &str,
+) -> Result<AccountVerdict, AccountVerdict> {
+    use crate::swap_job::AccountCheck;
+    let Some((_, resolved)) = profiles else {
+        return Ok(AccountVerdict {
+            check: AccountCheck::Unchecked,
+            observed: None,
+            source: "aas",
+            note: String::new(),
+        });
+    };
+    match resumed_account(target, resolved) {
+        Landed::On(landed) if landed.as_deref() != Some(account) => Err(AccountVerdict {
+            check: if landed.is_some() {
+                AccountCheck::Mismatched
+            } else {
+                AccountCheck::Unmapped
+            },
+            note: format!(
+                "the resumed agent runs on {}",
+                landed.as_deref().unwrap_or("no configured account")
+            ),
+            observed: landed,
+            source: "process_environ",
+        }),
+        Landed::Unreadable => Ok(AccountVerdict {
+            check: AccountCheck::Unreadable,
+            observed: None,
+            source: "process_environ",
+            note: " (account unconfirmed: its environment is not readable here)".into(),
+        }),
+        Landed::On(landed) => Ok(AccountVerdict {
+            check: AccountCheck::Matched,
+            observed: landed,
+            source: "process_environ",
+            note: String::new(),
+        }),
     }
 }
 
@@ -1873,7 +1934,7 @@ fn execute(
     launch: &PaneLaunch,
     command: &str,
     follow_up: Option<&str>,
-    verify: &dyn Fn(&Target) -> Result<String, String>,
+    verify: &dyn Fn(&Target) -> Result<AccountVerdict, AccountVerdict>,
 ) -> Result<String, Refusal> {
     let io = runner.io;
     let mut answered: Vec<&'static str> = Vec::new();
@@ -1882,6 +1943,7 @@ fn execute(
     let draft = io
         .capture()
         .and_then(|screen| composer_draft(&screen, target.kind));
+    enter(runner, Phase::Stopping)?;
     stop_agent(
         runner,
         target,
@@ -1890,6 +1952,7 @@ fn execute(
         draft.as_deref(),
         &mut answered,
     )?;
+    enter(runner, Phase::Launching)?;
     if target.direct {
         relaunch_in_place(runner, target, command)?;
     } else {
@@ -1924,9 +1987,30 @@ fn execute(
         // Running again: the pane may close with its agent as before.
         runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
+    await_ready(runner, target, &mut answered)?;
+    let checked = check_account(runner, target, verify)?;
+    enter(runner, Phase::FollowThrough)?;
+    Ok(follow_through(
+        runner,
+        follow_up,
+        draft.as_deref(),
+        &answered,
+        &checked,
+    ))
+}
+
+/// Wait for the relaunched agent's conversation to be usable, answering its
+/// startup dialogs; anything else refuses the swap before a follow-up.
+fn await_ready(
+    runner: &Runner,
+    target: &Target,
+    answered: &mut Vec<&'static str>,
+) -> Result<(), Refusal> {
+    let io = runner.io;
     // A running process is not a resumed conversation: the TUI can be up and
     // showing that another app owns the conversation, or a startup error.
     // Every swap, with or without a follow-up, waits for a usable screen.
+    enter(runner, Phase::Readiness)?;
     let readiness = wait_for_resume_answering(
         io,
         || io.capture(),
@@ -1942,8 +2026,17 @@ fn execute(
         READY_TIMEOUT,
         READY_QUIET,
         Duration::from_millis(250),
-        &mut answered,
+        answered,
     );
+    let seen = match &readiness {
+        Resume::Ready => Readiness::Ready,
+        Resume::Blocked(_) => Readiness::Blocked,
+        Resume::Exited => Readiness::Exited,
+        Resume::Unsettled => Readiness::Unsettled,
+    };
+    if !runner.observe(Observation::Readiness { result: seen }) {
+        return Err(halt(runner));
+    }
     match readiness {
         Resume::Ready => {}
         Resume::Blocked(reason) => {
@@ -1970,15 +2063,54 @@ fn execute(
             .into());
         }
     }
-    let checked = verify(target)
-        .map_err(|why| format!("relaunched, but {why}; nothing was sent to the pane"))?;
-    Ok(follow_through(
-        runner,
-        follow_up,
-        draft.as_deref(),
-        &answered,
-        &checked,
-    ))
+    Ok(())
+}
+
+/// The relaunch must land on the account it was meant for, checked before
+/// any follow-up starts work on the wrong one. The note on success.
+fn check_account(
+    runner: &Runner,
+    target: &Target,
+    verify: &dyn Fn(&Target) -> Result<AccountVerdict, AccountVerdict>,
+) -> Result<String, Refusal> {
+    enter(runner, Phase::Verifying)?;
+    let (accepted, verdict) = match verify(target) {
+        Ok(verdict) => (true, verdict),
+        Err(verdict) => (false, verdict),
+    };
+    if !runner.observe(Observation::AccountCheck {
+        result: verdict.check,
+        observed: verdict.observed.clone(),
+        source: verdict.source.to_owned(),
+    }) {
+        return Err(halt(runner));
+    }
+    if !accepted {
+        return Err(format!(
+            "relaunched, but {}; nothing was sent to the pane",
+            verdict.note
+        )
+        .into());
+    }
+    Ok(verdict.note)
+}
+
+/// Record entering `phase`; a phase that cannot be recorded stops the run.
+fn enter(runner: &Runner, phase: Phase) -> Result<(), Refusal> {
+    if runner.observe(Observation::Phase { phase }) {
+        Ok(())
+    } else {
+        Err(halt(runner))
+    }
+}
+
+/// The refusal for a run its observer stopped.
+fn halt(runner: &Runner) -> Refusal {
+    Refusal::Failed(
+        runner
+            .halted()
+            .unwrap_or_else(|| "stopped: the run could not be recorded".into()),
+    )
 }
 
 /// After a usable resume: send the follow-up, see whether a turn started,
