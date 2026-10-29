@@ -119,6 +119,42 @@ fn read_composer(screen: &str, kind: AgentKind) -> Composer {
     }
 }
 
+/// A narrow Codex pane cuts its placeholder short (`› Ask Codex to`), which
+/// no longer matches the full text. It is still the placeholder when the
+/// composer's text is drawn dim — as Codex draws placeholders, never typed
+/// input — *and* is the start of a known placeholder. Both must hold.
+fn codex_placeholder_shown(raw: &str, kind: AgentKind) -> bool {
+    const DIM: &str = "\u{1b}[2m";
+    if kind != AgentKind::Codex {
+        return false;
+    }
+    let Some(line) = raw
+        .lines()
+        .rev()
+        .find(|line| crate::screen::strip_ansi(line).starts_with('›'))
+    else {
+        return false;
+    };
+    // After the glyph and its own styling, the text must open dim and carry
+    // no other styling before its reset.
+    let Some(after_glyph) = line.split_once('›').map(|(_, rest)| rest) else {
+        return false;
+    };
+    let after_glyph = after_glyph.trim_start_matches("\u{1b}[0m").trim_start();
+    let Some(text) = after_glyph.strip_prefix(DIM) else {
+        return false;
+    };
+    let text = text.trim_end().trim_end_matches("\u{1b}[0m");
+    if text.contains('\u{1b}') {
+        return false;
+    }
+    let shown = text.trim().trim_end_matches('…').trim_end();
+    !shown.is_empty()
+        && crate::account_swap::CODEX_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| placeholder.starts_with(shown))
+}
+
 /// Quit the agent in `req.pane` if, and only if, its prompt is plainly idle
 /// and empty. Blocking: it waits up to `req.timeout` for the exit.
 pub fn graceful_stop(req: &StopRequest<'_>) -> StopOutcome {
@@ -132,14 +168,15 @@ pub fn graceful_stop(req: &StopRequest<'_>) -> StopOutcome {
     }
     // Read the pane on its own server, as plain text: captures keep colour
     // escapes, and a coloured `›` or `❯` would hide an empty prompt.
-    let Some(screen) = req
-        .backend
-        .capture_pane_on(req.socket, req.pane)
-        .map(|screen| crate::screen::strip_ansi(&screen))
-    else {
+    let Some(raw) = req.backend.capture_pane_on(req.socket, req.pane) else {
         return StopOutcome::Refused("could not read the pane".into());
     };
-    match read_composer(&screen, req.kind) {
+    let screen = crate::screen::strip_ansi(&raw);
+    let composer = match read_composer(&screen, req.kind) {
+        Composer::Draft if codex_placeholder_shown(&raw, req.kind) => Composer::Empty,
+        composer => composer,
+    };
+    match composer {
         Composer::Empty => {}
         Composer::Draft => {
             return StopOutcome::Refused("something is typed into the prompt; left alone".into())
@@ -265,6 +302,13 @@ mod tests {
     const CODEX_DRAFT: &str = "• Done.\n\n› half a thought\n";
     /// What a live Codex pane captures as: the prompt glyph and placeholder
     /// are coloured.
+    /// A narrow pane: the placeholder is cut short, but still drawn dim.
+    const CODEX_IDLE_NARROW: &str =
+        "• Done.\n\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mAsk Codex to\u{1b}[0m\n\n  gpt\n";
+    /// The same words typed, not dim: a draft.
+    const CODEX_TYPED_PREFIX: &str = "• Done.\n\n\u{1b}[1m›\u{1b}[0m Ask Codex to\n";
+    /// Dim, but not the start of any placeholder.
+    const CODEX_DIM_OTHER: &str = "• Done.\n\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mdeploy prod\u{1b}[0m\n";
     const CODEX_IDLE_COLOURED: &str = "• Done.\n\n\u{1b}[1m›\u{1b}[0m \u{1b}[2mAsk Codex to do anything\u{1b}[0m\n\n  gpt · ~/repo\n";
 
     fn stop(
@@ -288,6 +332,7 @@ mod tests {
             (CLAUDE_IDLE, AgentKind::ClaudeCode, "/exit"),
             (CODEX_IDLE, AgentKind::Codex, "/quit"),
             (CODEX_IDLE_COLOURED, AgentKind::Codex, "/quit"),
+            (CODEX_IDLE_NARROW, AgentKind::Codex, "/quit"),
         ] {
             let pane = FakePane::showing(screen);
             let probes = AtomicUsize::new(0);
@@ -321,6 +366,8 @@ mod tests {
         for (screen, kind) in [
             (CLAUDE_DRAFT, AgentKind::ClaudeCode),
             (CODEX_DRAFT, AgentKind::Codex),
+            (CODEX_TYPED_PREFIX, AgentKind::Codex),
+            (CODEX_DIM_OTHER, AgentKind::Codex),
             (
                 "✻ Thinking… (12s · esc to interrupt)\n",
                 AgentKind::ClaudeCode,
