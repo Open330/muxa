@@ -13,10 +13,17 @@
 //! that signals processes and types into panes. `muxa swap` and the
 //! `swap_account` automation action both go through [`run`].
 
+mod effects;
+#[cfg(test)]
+mod executor_tests;
+mod io;
+
 use crate::backend::SharedBackend;
 use crate::event::{AgentKind, AgentState};
 use crate::process_snapshot::ProcessInfo;
 use crate::state::Agent;
+use effects::{Purpose, Runner};
+use io::Clock;
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
@@ -1299,7 +1306,6 @@ fn swap_one(
         return outcome;
     }
     let target = Target {
-        backend: backend.clone(),
         socket: agent.tmux_socket.clone(),
         pane: pane.pane_id.clone(),
         pane_pid: std::cell::Cell::new(pane.pane_pid),
@@ -1335,14 +1341,36 @@ fn swap_one(
             Landed::On(_) => Ok(String::new()),
         }
     };
-    let (status, note) = match execute(&target, launch, &command, follow_up, &verify) {
-        Ok(note) => (SwapStatus::Swapped, note),
-        Err(Refusal::Failed(note)) => (SwapStatus::Failed, note),
-        Err(Refusal::Kept(note)) => (SwapStatus::Skipped, note),
+    let io = io::LiveIo {
+        backend,
+        target: &target,
     };
+    let (status, note) = run_live(&io, &target, launch, &command, follow_up, &verify);
     outcome.status = status;
     outcome.note = note;
     outcome
+}
+
+/// [`execute`] on a live pane, as a report status and note.
+fn run_live(
+    io: &io::LiveIo,
+    target: &Target,
+    launch: &PaneLaunch,
+    command: &str,
+    follow_up: Option<&str>,
+    verify: &dyn Fn(&Target) -> Result<String, String>,
+) -> (SwapStatus, String) {
+    let mut observer = effects::NoObserver;
+    let runner = Runner::new(io, &mut observer);
+    let executed = execute(&runner, target, launch, command, follow_up, verify);
+    match (runner.halted(), executed) {
+        // An observer that could not record an effect stopped the run; what
+        // the executor said after that is not the whole story.
+        (Some(why), _) => (SwapStatus::Failed, why),
+        (None, Ok(note)) => (SwapStatus::Swapped, note),
+        (None, Err(Refusal::Failed(note))) => (SwapStatus::Failed, note),
+        (None, Err(Refusal::Kept(note))) => (SwapStatus::Skipped, note),
+    }
 }
 
 /// The line that relaunches `planned` on `account`: from its configured
@@ -1668,7 +1696,6 @@ fn locate(
 }
 
 struct Target {
-    backend: SharedBackend,
     socket: Option<String>,
     pane: String,
     /// The pane's root process; a respawn replaces it.
@@ -1687,37 +1714,48 @@ struct Target {
 /// Stop the agent, type `command` into the pane's shell, wait for the
 /// resumed agent, then send `follow_up`. `Ok` carries a note for the report.
 fn execute(
+    runner: &Runner,
     target: &Target,
     launch: &PaneLaunch,
     command: &str,
     follow_up: Option<&str>,
     verify: &dyn Fn(&Target) -> Result<String, String>,
 ) -> Result<String, Refusal> {
-    let socket = target.socket.as_deref();
+    let io = runner.io;
     let mut answered: Vec<&'static str> = Vec::new();
     // Clearing the prompt to quit loses what was half-typed there; it is
     // typed back once the agent is up again (or stays, if it is kept).
-    let draft = screen_text(target).and_then(|screen| composer_draft(&screen, target.kind));
-    stop_agent(target, launch, follow_up, draft.as_deref(), &mut answered)?;
+    let draft = io
+        .capture()
+        .and_then(|screen| composer_draft(&screen, target.kind));
+    stop_agent(
+        runner,
+        target,
+        launch,
+        follow_up,
+        draft.as_deref(),
+        &mut answered,
+    )?;
     if target.direct {
-        relaunch_in_place(target, command)?;
+        relaunch_in_place(runner, target, command)?;
     } else {
-        std::thread::sleep(SHELL_SETTLE);
-        if !target.backend.send_text_on(socket, &target.pane, command)
-            || !target.backend.send_text_on(socket, &target.pane, "\r")
+        io.sleep(SHELL_SETTLE);
+        let group = runner.group();
+        if !runner.send_text(group, Purpose::Relaunch, command)
+            || !runner.send_text(group, Purpose::Relaunch, "\r")
         {
             return Err("could not type the relaunch command into the pane".into());
         }
     }
-    let started = Instant::now();
+    let started = io.now();
     let relaunched = loop {
-        if resumed_agent_running(target) {
+        if io.agent_running(target.pane_pid.get()) {
             break true;
         }
-        if started.elapsed() >= LAUNCH_TIMEOUT {
+        if io.now().saturating_duration_since(started) >= LAUNCH_TIMEOUT {
             break false;
         }
-        std::thread::sleep(Duration::from_millis(300));
+        io.sleep(Duration::from_millis(300));
     };
     if !relaunched {
         return Err(if target.direct {
@@ -1730,19 +1768,20 @@ fn execute(
     }
     if target.direct {
         // Running again: the pane may close with its agent as before.
-        target
-            .backend
-            .set_remain_on_exit_on(socket, &target.pane, false);
+        runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
     // A running process is not a resumed conversation: the TUI can be up and
     // showing that another app owns the conversation, or a startup error.
     // Every swap, with or without a follow-up, waits for a usable screen.
     let readiness = wait_for_resume_answering(
-        || screen_text(target),
-        || resumed_agent_running(target),
+        io,
+        || io.capture(),
+        || io.agent_running(target.pane_pid.get()),
         |keys| {
+            let group = runner.group();
             type_keys(
-                |key| target.backend.send_text_on(socket, &target.pane, key),
+                io,
+                |key| runner.send_text(group, Purpose::StartupDialog, key),
                 keys,
             )
         },
@@ -1755,7 +1794,7 @@ fn execute(
         Resume::Ready => {}
         Resume::Blocked(reason) => {
             let owners = if target.kind == AgentKind::Codex {
-                codex_writer_owners(target.pane_pid.get())
+                io.writer_owners(target.pane_pid.get())
             } else {
                 String::new()
             };
@@ -1780,7 +1819,7 @@ fn execute(
     let checked = verify(target)
         .map_err(|why| format!("relaunched, but {why}; nothing was sent to the pane"))?;
     Ok(follow_through(
-        target,
+        runner,
         follow_up,
         draft.as_deref(),
         &answered,
@@ -1791,13 +1830,13 @@ fn execute(
 /// After a usable resume: send the follow-up, see whether a turn started,
 /// and type back the half-typed prompt. The note for the report.
 fn follow_through(
-    target: &Target,
+    runner: &Runner,
     follow_up: Option<&str>,
     draft: Option<&str>,
     answered: &[&'static str],
     checked: &str,
 ) -> String {
-    let socket = target.socket.as_deref();
+    let io = runner.io;
     let answers = if answered.is_empty() {
         checked.to_owned()
     } else {
@@ -1806,11 +1845,7 @@ fn follow_through(
     // The draft goes back after the follow-up: typed first, the two would
     // be submitted as one prompt.
     let restore = |note: String| match draft {
-        Some(text)
-            if target
-                .backend
-                .send_prompt_text_on(socket, &target.pane, text) =>
-        {
+        Some(text) if runner.send_prompt(runner.group(), Purpose::RestoreDraft, text) => {
             format!("{note}; restored the half-typed prompt")
         }
         _ => note,
@@ -1818,11 +1853,11 @@ fn follow_through(
     let Some(text) = follow_up else {
         return restore(format!("resumed{answers}"));
     };
-    if !send_follow_up(target, text) {
+    if !send_follow_up(runner, Purpose::FollowUp, text) {
         return restore(format!("resumed{answers}; follow-up could not be typed"));
     }
-    let started = wait_until(Duration::from_secs(20), || {
-        screen_text(target).is_some_and(|screen| turn_running(&screen))
+    let started = wait_until(io, Duration::from_secs(20), || {
+        io.capture().is_some_and(|screen| turn_running(&screen))
     });
     restore(if started {
         format!("sent {text:?}, and the agent picked the turn back up{answers}")
@@ -1832,16 +1867,16 @@ fn follow_through(
 }
 
 /// Poll `ready` until it holds or `timeout` passes.
-fn wait_until(timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let started = Instant::now();
+fn wait_until(clock: &dyn Clock, timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
+    let started = clock.now();
     loop {
         if ready() {
             return true;
         }
-        if started.elapsed() >= timeout {
+        if clock.now().saturating_duration_since(started) >= timeout {
             return false;
         }
-        std::thread::sleep(Duration::from_millis(400));
+        clock.sleep(Duration::from_millis(400));
     }
 }
 
@@ -1922,88 +1957,62 @@ fn composer_draft(screen: &str, kind: AgentKind) -> Option<String> {
 /// Stop the agent in `target`'s pane, keeping a direct pane open past the
 /// exit so it can be respawned. A refusal undoes that.
 fn stop_agent(
+    runner: &Runner,
     target: &Target,
     launch: &PaneLaunch,
     follow_up: Option<&str>,
     draft: Option<&str>,
     answered: &mut Vec<&'static str>,
 ) -> Result<(), Refusal> {
-    let socket = target.socket.as_deref();
-    if target.direct
-        && !target
-            .backend
-            .set_remain_on_exit_on(socket, &target.pane, true)
-    {
+    if target.direct && !runner.set_remain_on_exit(Purpose::KeepPaneOpen, true) {
         return Err(
             "the pane runs the agent directly and cannot be kept open to relaunch it".into(),
         );
     }
     let stopped = if target.kind == AgentKind::ClaudeCode {
-        exit_claude(target, launch, follow_up, draft, answered)
+        exit_claude(runner, target, launch, follow_up, draft, answered)
     } else {
-        stop(launch).map_err(Refusal::from)
+        stop(runner, launch).map_err(Refusal::from)
     };
     if stopped.is_err() && target.direct {
-        target
-            .backend
-            .set_remain_on_exit_on(socket, &target.pane, false);
+        runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
     stopped
 }
 
 /// Respawn a pane that ran its agent directly with `command`, keeping the
 /// pane id, then follow the pane's new root process.
-fn relaunch_in_place(target: &Target, command: &str) -> Result<(), Refusal> {
-    let socket = target.socket.as_deref();
+fn relaunch_in_place(runner: &Runner, target: &Target, command: &str) -> Result<(), Refusal> {
     // The pane had no shell; run the relaunch through the user's login
     // shell, which has the `PATH` the typed line would have had.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
     let line =
         crate::shell::Dialect::native().command_line(&[shell, "-lic".into(), command.to_owned()]);
-    if !target
-        .backend
-        .respawn_pane_on(socket, &target.pane, &target.cwd, &line)
-    {
+    if !runner.respawn(Purpose::Respawn, &target.cwd, &line) {
         return Err(
             "the agent stopped, but its pane could not be respawned with the relaunch; \
              it is kept open"
                 .into(),
         );
     }
-    // `%5` exists on every server: match the pane's own.
+    // The respawn was asked for; finding the pane again is a separate read.
     for _ in 0..10 {
-        if let Some(pane) = target.backend.list_panes().into_iter().find(|pane| {
-            pane.pane_id == target.pane
-                && socket.is_none_or(|socket| pane.socket.as_deref().is_none_or(|s| s == socket))
-        }) {
-            target.pane_pid.set(pane.pane_pid);
+        if let Some(pid) = runner.io.pane_pid_now() {
+            target.pane_pid.set(pid);
             return Ok(());
         }
-        std::thread::sleep(Duration::from_millis(200));
+        runner.io.sleep(Duration::from_millis(200));
     }
     Err("respawned the pane, but could not find it again to follow the relaunch".into())
 }
 
-/// The pane's visible text. Captures carry the TUI's colours (`-e`), and
-/// Claude colours each word of a footer apart (`Enter` `to` `confirm`), so
-/// every rule here reads the screen with the escapes stripped.
-fn screen_text(target: &Target) -> Option<String> {
-    target
-        .backend
-        .capture_pane_on(target.socket.as_deref(), &target.pane)
-        .map(|screen| crate::screen::strip_ansi(&screen))
-}
-
 /// Type `text` and submit it.
-fn send_follow_up(target: &Target, text: &str) -> bool {
-    let socket = target.socket.as_deref();
-    target
-        .backend
-        .send_prompt_text_on(socket, &target.pane, text)
-        && {
-            std::thread::sleep(crate::backend::prompt_submit_grace(&target.pane));
-            target.backend.send_text_on(socket, &target.pane, "\r")
-        }
+fn send_follow_up(runner: &Runner, purpose: Purpose, text: &str) -> bool {
+    let group = runner.group();
+    runner.send_prompt(group, purpose, text) && {
+        runner.io.sleep(runner.io.submit_grace());
+        runner.send_text(group, purpose, "\r")
+    }
 }
 
 /// Why [`execute`] did not finish a swap.
@@ -2036,64 +2045,69 @@ const EXIT_TIMEOUT: Duration = Duration::from_secs(15);
 /// `/exit` asks about them and the swap keeps both. A session that owns
 /// scheduled tasks is left running: exiting would cancel them.
 fn exit_claude(
+    runner: &Runner,
     target: &Target,
     launch: &PaneLaunch,
     follow_up: Option<&str>,
     draft: Option<&str>,
     answered: &mut Vec<&'static str>,
 ) -> Result<(), Refusal> {
-    let socket = target.socket.as_deref();
-    let send = |keys: &str| target.backend.send_text_on(socket, &target.pane, keys);
+    let io = runner.io;
+    let send = |purpose: Purpose, keys: &str| runner.send_text(runner.group(), purpose, keys);
     // The relaunch is typed into the shell, so the `aas` wrapper must be gone
     // too, not only the agent.
-    let alive = || is_alive(launch.agent_pid) || is_alive(launch.top_pid);
+    let alive = || io.alive(launch.agent_pid) || io.alive(launch.top_pid);
     // A kept session that the swap interrupted gets its turn back.
     let keep = |note: &str| {
         if let Some(text) = follow_up.filter(|_| target.busy) {
-            std::thread::sleep(Duration::from_millis(800));
-            send_follow_up(target, text);
+            io.sleep(Duration::from_millis(800));
+            send_follow_up(runner, Purpose::KeptFollowUp, text);
         }
         if let Some(text) = draft {
-            std::thread::sleep(Duration::from_millis(300));
-            target
-                .backend
-                .send_prompt_text_on(socket, &target.pane, text);
+            io.sleep(Duration::from_millis(300));
+            runner.send_prompt(runner.group(), Purpose::KeptDraft, text);
         }
         Err(Refusal::Kept(note.to_owned()))
     };
     if target.busy {
         // Interrupt the turn first; `/exit` is only read at the prompt.
-        send("\x1b");
-        std::thread::sleep(Duration::from_millis(1500));
+        send(Purpose::Interrupt, "\x1b");
+        io.sleep(Duration::from_millis(1500));
     }
     // Ctrl-C clears a half-typed draft so `/exit` is not appended to it.
-    if !(send("\x03") && {
-        std::thread::sleep(Duration::from_millis(300));
-        send_follow_up(target, "/exit")
+    if !(send(Purpose::ClearPrompt, "\x03") && {
+        io.sleep(Duration::from_millis(300));
+        send_follow_up(runner, Purpose::Exit, "/exit")
     }) {
         return Err("could not type /exit into the pane".into());
     }
-    let started = Instant::now();
-    while alive() && started.elapsed() < EXIT_TIMEOUT {
-        std::thread::sleep(Duration::from_millis(400));
-        let screen = screen_text(target).unwrap_or_default();
+    let started = io.now();
+    let elapsed = || io.now().saturating_duration_since(started);
+    while alive() && elapsed() < EXIT_TIMEOUT {
+        io.sleep(Duration::from_millis(400));
+        let screen = io.capture().unwrap_or_default();
         if owns_scheduled_tasks(&screen) {
             // Esc cancels the exit, whatever rows the dialog lists.
-            send("\x1b");
+            send(Purpose::CancelExit, "\x1b");
             return keep(
                 "the session owns scheduled tasks, which exiting would cancel; \
                  left it on its account",
             );
         }
         if let Some(dialog) = pending_dialog(&screen, EXIT_DIALOGS, answered) {
-            if type_keys(send, dialog.keys) {
+            let group = runner.group();
+            if type_keys(
+                io,
+                |key| runner.send_text(group, Purpose::ExitDialog, key),
+                dialog.keys,
+            ) {
                 answered.push(dialog.label);
             }
-            std::thread::sleep(dialog.pause);
+            io.sleep(dialog.pause);
             continue;
         }
-        if open_question(&screen).is_some() && started.elapsed() > Duration::from_secs(5) {
-            send("\x1b");
+        if open_question(&screen).is_some() && elapsed() > Duration::from_secs(5) {
+            send(Purpose::CancelExit, "\x1b");
             return keep(
                 "/exit asked a question muxa does not know how to answer; \
                  left the session running",
@@ -2102,7 +2116,7 @@ fn exit_claude(
     }
     if alive() {
         // Wedged or not reading input: fall back to the signal path.
-        stop(launch)?;
+        stop(runner, launch)?;
     }
     Ok(())
 }
@@ -2115,7 +2129,8 @@ fn owns_scheduled_tasks(screen: &str) -> bool {
 
 /// `SIGTERM` the agent (the wrapper exits with it), then the wrapper, then
 /// `SIGKILL` whatever is left.
-fn stop(launch: &PaneLaunch) -> Result<(), String> {
+fn stop(runner: &Runner, launch: &PaneLaunch) -> Result<(), String> {
+    let io = runner.io;
     let pids: Vec<u32> = if launch.top_pid == launch.agent_pid {
         vec![launch.agent_pid]
     } else {
@@ -2126,7 +2141,7 @@ fn stop(launch: &PaneLaunch) -> Result<(), String> {
         ("TERM", Duration::from_secs(2)),
         ("KILL", Duration::from_secs(2)),
     ] {
-        let alive: Vec<u32> = pids.iter().copied().filter(|pid| is_alive(*pid)).collect();
+        let alive: Vec<u32> = pids.iter().copied().filter(|pid| io.alive(*pid)).collect();
         if alive.is_empty() {
             return Ok(());
         }
@@ -2136,13 +2151,15 @@ fn stop(launch: &PaneLaunch) -> Result<(), String> {
         } else {
             &alive[..]
         };
-        signal_pids(signal, first);
-        let started = Instant::now();
-        while started.elapsed() < wait && pids.iter().any(|pid| is_alive(*pid)) {
-            std::thread::sleep(Duration::from_millis(100));
+        runner.signal(Purpose::Stop, signal, first);
+        let started = io.now();
+        while io.now().saturating_duration_since(started) < wait
+            && pids.iter().any(|pid| io.alive(*pid))
+        {
+            io.sleep(Duration::from_millis(100));
         }
     }
-    if pids.iter().any(|pid| is_alive(*pid)) {
+    if pids.iter().any(|pid| io.alive(*pid)) {
         return Err("the agent did not exit".into());
     }
     Ok(())
@@ -2296,13 +2313,6 @@ fn pane_processes(pane_pid: u32) -> Vec<ProcessInfo> {
     processes
 }
 
-/// Is the relaunched agent, on this conversation, still running in the pane?
-fn resumed_agent_running(target: &Target) -> bool {
-    pane_processes(target.pane_pid.get())
-        .iter()
-        .any(|p| is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str()))
-}
-
 /// What a resumed pane turned out to be.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Resume {
@@ -2329,6 +2339,7 @@ fn wait_for_resume(
     tick: Duration,
 ) -> Resume {
     wait_for_resume_answering(
+        &io::RealClock,
         capture,
         alive,
         |_| false,
@@ -2344,7 +2355,9 @@ fn wait_for_resume(
 /// reports whether it could) and recording each answer in `answered`. A
 /// settled screen that still asks a question is never `Ready`: a follow-up
 /// typed into Claude's folder-trust prompt picks its default, "No, exit".
+#[allow(clippy::too_many_arguments)] // the probes and timings tests drive one by one
 fn wait_for_resume_answering(
+    clock: &dyn Clock,
     mut capture: impl FnMut() -> Option<String>,
     mut alive: impl FnMut() -> bool,
     mut answer: impl FnMut(&[&str]) -> bool,
@@ -2353,22 +2366,24 @@ fn wait_for_resume_answering(
     tick: Duration,
     answered: &mut Vec<&'static str>,
 ) -> Resume {
-    let started = Instant::now();
+    let started = clock.now();
     let mut last = String::new();
-    let mut quiet_since = Instant::now();
+    let mut quiet_since = clock.now();
     loop {
         let screen = capture().unwrap_or_default();
         if screen != last {
             last = screen;
-            quiet_since = Instant::now();
-        } else if !last.trim().is_empty() && quiet_since.elapsed() >= quiet {
+            quiet_since = clock.now();
+        } else if !last.trim().is_empty()
+            && clock.now().saturating_duration_since(quiet_since) >= quiet
+        {
             if answered_dialog_lingers(&last, answered)
                 && open_question(&last).is_some()
-                && started.elapsed() < timeout
+                && clock.now().saturating_duration_since(started) < timeout
             {
                 // Answered already; the agent has not redrawn yet.
-                quiet_since = Instant::now();
-                std::thread::sleep(tick);
+                quiet_since = clock.now();
+                clock.sleep(tick);
                 continue;
             }
             if let Some(dialog) = pending_dialog(&last, STARTUP_DIALOGS, answered) {
@@ -2376,9 +2391,9 @@ fn wait_for_resume_answering(
                     answered.push(dialog.label);
                     // The answer redraws the screen; wait for it to settle again.
                     last.clear();
-                    quiet_since = Instant::now();
+                    quiet_since = clock.now();
                     // Bounded by the overall timeout so retries cannot outlast it.
-                    std::thread::sleep(dialog.pause.min(timeout / 8));
+                    clock.sleep(dialog.pause.min(timeout / 8));
                     continue;
                 }
                 return Resume::Blocked(format!("a startup dialog is waiting ({})", dialog.label));
@@ -2396,16 +2411,16 @@ fn wait_for_resume_answering(
             // the shell's echo of the relaunch for seconds before the TUI
             // (or a trust dialog) draws. Wait for the agent's own prompt.
             if !agent_prompt_visible(&last) {
-                if started.elapsed() >= timeout {
+                if clock.now().saturating_duration_since(started) >= timeout {
                     return Resume::Unsettled;
                 }
-                quiet_since = Instant::now();
-                std::thread::sleep(tick);
+                quiet_since = clock.now();
+                clock.sleep(tick);
                 continue;
             }
             return Resume::Ready;
         }
-        if started.elapsed() >= timeout {
+        if clock.now().saturating_duration_since(started) >= timeout {
             // A blocker can sit on a screen that keeps redrawing (a clock,
             // a spinner): report it rather than a bare timeout.
             if let Some(reason) = blocked_screen(&last) {
@@ -2420,7 +2435,7 @@ fn wait_for_resume_answering(
                 Resume::Exited
             };
         }
-        std::thread::sleep(tick);
+        clock.sleep(tick);
     }
 }
 
@@ -2566,10 +2581,10 @@ const ENTER: &str = "\r";
 const KEY_GAP: Duration = Duration::from_millis(300);
 
 /// Type `keys` one by one, [`KEY_GAP`] apart. `false` if any could not be.
-fn type_keys(mut send: impl FnMut(&str) -> bool, keys: &[&str]) -> bool {
+fn type_keys(clock: &dyn Clock, mut send: impl FnMut(&str) -> bool, keys: &[&str]) -> bool {
     keys.iter().enumerate().all(|(i, key)| {
         if i > 0 {
-            std::thread::sleep(KEY_GAP);
+            clock.sleep(KEY_GAP);
         }
         send(key)
     })
@@ -2878,6 +2893,7 @@ mod tests {
         let keys = std::cell::RefCell::new(Vec::<String>::new());
         let mut answered = Vec::new();
         let resume = wait_for_resume_answering(
+            &io::RealClock,
             || {
                 let n = keys.borrow().len();
                 Some(if n >= flips_after { after } else { before }.to_owned())
@@ -2923,6 +2939,7 @@ mod tests {
         let mut answered = Vec::new();
         let keys = std::cell::RefCell::new(Vec::<String>::new());
         let resume = wait_for_resume_answering(
+            &io::RealClock,
             || {
                 captures += 1;
                 Some(
@@ -2976,6 +2993,7 @@ mod tests {
         let answers = std::cell::Cell::new(0usize);
         let mut answered = Vec::new();
         let resume = wait_for_resume_answering(
+            &io::RealClock,
             || {
                 if answers.get() == 0 {
                     return Some(CLAUDE_TRUST.to_owned());
