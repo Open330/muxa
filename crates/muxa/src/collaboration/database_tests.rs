@@ -2,8 +2,8 @@
 
 use super::*;
 
-/// Every persist reopens the database. Reopening an up-to-date database
-/// must not itself commit a write (it used to rewrite `user_version`).
+/// Initializing an up-to-date database must not commit a write merely to
+/// validate its schema (it used to rewrite `user_version`).
 #[test]
 fn reopening_a_current_database_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();

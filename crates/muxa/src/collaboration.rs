@@ -4,6 +4,8 @@
 //! the concrete agent session occupying a pane so a later process reusing the
 //! pane never inherits stale work.
 
+mod database;
+use database::DurableDatabase;
 mod contract;
 pub mod instruction;
 pub(crate) use contract::deserialize_report_input;
@@ -1692,7 +1694,13 @@ fn prepare_database_file(path: &Path) -> Result<(), CollaborationError> {
 
 #[cfg(not(unix))]
 #[allow(clippy::unnecessary_wraps)] // same signature as the Unix arm
-fn prepare_database_file(_path: &Path) -> Result<(), CollaborationError> {
+fn prepare_database_file(path: &Path) -> Result<(), CollaborationError> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
     Ok(())
 }
 
@@ -1907,13 +1915,13 @@ fn write_request(
     } else {
         &request.from
     };
-    connection.execute(
-        if import_only {
+    connection
+        .prepare_cached(if import_only {
             IMPORT_REQUEST_SQL
         } else {
             UPSERT_REQUEST_SQL
-        },
-        params![
+        })?
+        .execute(params![
             request.id,
             timestamp_nanos(request.created_at)?,
             request.thread_id,
@@ -1938,8 +1946,7 @@ fn write_request(
             anchor.tmux_session_id,
             anchor.tmux_session_name,
             payload,
-        ],
-    )?;
+        ])?;
     Ok(())
 }
 
@@ -1953,7 +1960,7 @@ fn identity_key(identity: &CollaborationIdentity) -> Result<String, Collaboratio
 }
 
 fn load_database(
-    path: &Path,
+    connection: &mut Connection,
     legacy: Option<&Snapshot>,
 ) -> Result<
     (
@@ -1962,7 +1969,6 @@ fn load_database(
     ),
     CollaborationError,
 > {
-    let mut connection = open_database(path)?;
     let migrated = connection
         .query_row(
             "SELECT value FROM collaboration_metadata WHERE key = 'legacy_json_imported'",
@@ -1993,7 +1999,6 @@ fn load_database(
             [],
         )?;
         transaction.commit()?;
-        secure_database_files(path)?;
     }
 
     let mut requests = HashMap::new();
@@ -2016,7 +2021,6 @@ fn load_database(
             write_request(&transaction, request, false)?;
         }
         transaction.commit()?;
-        secure_database_files(path)?;
     }
     let mut identities = Vec::new();
     {
@@ -2241,26 +2245,6 @@ fn append_search_query_filters(
     Ok(())
 }
 
-fn query_database(
-    path: &Path,
-    caller: &Participant,
-    mailbox: RequestMailbox,
-    scope: MailboxScope,
-    query: &CollaborationQuery,
-    offset: usize,
-) -> Result<CollaborationPage, CollaborationError> {
-    let connection = open_database(path)?;
-    query_connection(
-        &connection,
-        caller,
-        mailbox,
-        scope,
-        query,
-        offset,
-        MAX_QUERY_LIMIT,
-    )
-}
-
 /// Read the persisted mailbox without creating, migrating, pruning or mutating
 /// it. Used by the standalone CLI viewer, including with an older daemon whose
 /// unbounded IPC list can exceed the transport's message size limit.
@@ -2393,11 +2377,11 @@ fn query_connection(
     } else {
         format!(" WHERE {}", clauses.join(" AND "))
     };
-    let total: i64 = connection.query_row(
-        &format!("SELECT COUNT(*) FROM collaboration_requests{where_sql}"),
-        params_from_iter(values.iter()),
-        |row| row.get(0),
-    )?;
+    let total: i64 = connection
+        .prepare_cached(&format!(
+            "SELECT COUNT(*) FROM collaboration_requests{where_sql}"
+        ))?
+        .query_row(params_from_iter(values.iter()), |row| row.get(0))?;
 
     let mut page_clauses = clauses;
     let mut page_values = values;
@@ -2419,7 +2403,7 @@ fn query_connection(
         .clamp(1, max_limit);
     page_values.push(Value::Integer(i64::try_from(limit + 1).unwrap_or(i64::MAX)));
     page_values.push(Value::Integer(i64::try_from(offset).unwrap_or(i64::MAX)));
-    let mut statement = connection.prepare(&format!(
+    let mut statement = connection.prepare_cached(&format!(
         "SELECT payload FROM collaboration_requests{page_where_sql}
          ORDER BY created_at_ns DESC, id DESC LIMIT ? OFFSET ?"
     ))?;
@@ -2641,7 +2625,7 @@ pub struct CollaborationStore {
     initialization_error: Option<String>,
     /// Indexed `SQLite` sidecar. The configured JSON path remains the migration
     /// source and is deliberately retained as a recoverable backup.
-    database_path: Option<PathBuf>,
+    database: Option<DurableDatabase>,
     requests: RwLock<HashMap<String, CollaborationRequest>>,
     identities: RwLock<Vec<CollaborationIdentity>>,
     purposes: RwLock<Vec<PurposeGrant>>,
@@ -2653,6 +2637,9 @@ pub struct CollaborationStore {
     /// scans also take this lock, so an unpersisted request is never visible
     /// to the delivery loop.
     transaction_lock: Mutex<()>,
+    /// First observed absence of a previously delivered recipient. Reset on
+    /// daemon restart so a startup scan cannot immediately declare uncertainty.
+    missing_recipients: Mutex<HashMap<String, OffsetDateTime>>,
     /// Source of [`ReplyWake::Reserved`] tokens. Reservations never outlive
     /// the store instance: [`Self::load`] turns persisted ones back into owed.
     reply_wake_tokens: AtomicU64,
@@ -2688,7 +2675,7 @@ impl CollaborationStore {
                 ..options
             },
             initialization_error: None,
-            database_path: None,
+            database: None,
             requests: RwLock::new(HashMap::new()),
             identities: RwLock::new(Vec::new()),
             purposes: RwLock::new(Vec::new()),
@@ -2698,6 +2685,7 @@ impl CollaborationStore {
             worker_automation: RwLock::new(HashMap::new()),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
+            missing_recipients: Mutex::new(HashMap::new()),
             reply_wake_tokens: AtomicU64::new(1),
             changes,
         })
@@ -2739,35 +2727,49 @@ impl CollaborationStore {
                 collaboration_database_path(path)
             }
         });
-        let (requests, identities) = if let Some(path) = database_path.as_ref() {
-            load_database(path, legacy.as_ref())?
-        } else {
-            let snapshot = legacy.unwrap_or(Snapshot {
-                version: COLLABORATION_SCHEMA_VERSION,
-                requests: Vec::new(),
-                identities: Vec::new(),
-            });
-            (
-                snapshot
-                    .requests
-                    .into_iter()
-                    .map(|request| (request.id.clone(), request))
-                    .collect(),
-                snapshot.identities,
-            )
-        };
+        let database = database_path
+            .as_deref()
+            .map(DurableDatabase::initialize)
+            .transpose()?;
+        let (requests, identities, purposes, worker_spawns, worker_drains) =
+            if let Some(database) = &database {
+                database.with_connection(|connection| {
+                    let (requests, identities) = load_database(connection, legacy.as_ref())?;
+                    Ok((
+                        requests,
+                        identities,
+                        load_purposes(connection)?,
+                        load_spawns(connection)?,
+                        load_drains(connection)?,
+                    ))
+                })?
+            } else {
+                let snapshot = legacy.unwrap_or(Snapshot {
+                    version: COLLABORATION_SCHEMA_VERSION,
+                    requests: Vec::new(),
+                    identities: Vec::new(),
+                });
+                (
+                    snapshot
+                        .requests
+                        .into_iter()
+                        .map(|request| (request.id.clone(), request))
+                        .collect(),
+                    snapshot.identities,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+            };
         let mut requests = requests;
         for request in requests.values_mut() {
             request.normalize_loaded_reply_wake();
         }
         let (changes, _) = watch::channel(0);
-        let purposes = load_purposes(database_path.as_deref())?;
-        let worker_spawns = load_spawns(database_path.as_deref())?;
-        let worker_drains = load_drains(database_path.as_deref())?;
         let store = Arc::new(Self {
             opts: options,
             initialization_error: None,
-            database_path,
+            database,
             requests: RwLock::new(requests),
             identities: RwLock::new(identities),
             purposes: RwLock::new(purposes),
@@ -2777,6 +2779,7 @@ impl CollaborationStore {
             worker_automation: RwLock::new(HashMap::new()),
             reservations: RwLock::new(Vec::new()),
             transaction_lock: Mutex::new(()),
+            missing_recipients: Mutex::new(HashMap::new()),
             reply_wake_tokens: AtomicU64::new(1),
             changes,
         });
@@ -3959,8 +3962,18 @@ impl CollaborationStore {
             return Err(CollaborationError::ScopeDenied);
         }
         let _transaction = self.transaction_lock.lock().await;
-        if let Some(path) = self.database_path.as_ref() {
-            return query_database(path, caller, mailbox, scope, query, offset);
+        if let Some(database) = &self.database {
+            return database.with_connection(|connection| {
+                query_connection(
+                    connection,
+                    caller,
+                    mailbox,
+                    scope,
+                    query,
+                    offset,
+                    MAX_QUERY_LIMIT,
+                )
+            });
         }
 
         let requests = self.requests.read().await;
@@ -4424,6 +4437,9 @@ impl CollaborationStore {
         if let Some(error) = &self.initialization_error {
             Err(CollaborationError::Unavailable(error.clone()))
         } else if self.opts.enabled {
+            if let Some(database) = &self.database {
+                database.verify()?;
+            }
             Ok(())
         } else {
             Err(CollaborationError::Disabled)
@@ -4461,17 +4477,17 @@ impl CollaborationStore {
         &self,
         requests: &[CollaborationRequest],
     ) -> Result<(), CollaborationError> {
-        let Some(path) = self.database_path.as_ref() else {
+        let Some(database) = &self.database else {
             return Ok(());
         };
-        let mut connection = open_database(path)?;
-        let transaction = connection.transaction()?;
-        for request in requests {
-            write_request(&transaction, request, false)?;
-        }
-        transaction.commit()?;
-        secure_database_files(path)?;
-        Ok(())
+        database.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            for request in requests {
+                write_request(&transaction, request, false)?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     /// Identity rows are tiny and mutable (including deletion), so replace
@@ -4480,39 +4496,39 @@ impl CollaborationStore {
         &self,
         identities: &[CollaborationIdentity],
     ) -> Result<(), CollaborationError> {
-        let Some(path) = self.database_path.as_ref() else {
+        let Some(database) = &self.database else {
             return Ok(());
         };
-        let mut connection = open_database(path)?;
-        let transaction = connection.transaction()?;
-        transaction.execute("DELETE FROM collaboration_identities", [])?;
-        for identity in identities {
-            transaction.execute(
-                "INSERT INTO collaboration_identities (identity_key, payload) VALUES (?1, ?2)",
-                params![identity_key(identity)?, serde_json::to_string(identity)?],
-            )?;
-        }
-        transaction.commit()?;
-        secure_database_files(path)?;
-        Ok(())
+        database.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            transaction.execute("DELETE FROM collaboration_identities", [])?;
+            for identity in identities {
+                transaction.execute(
+                    "INSERT INTO collaboration_identities (identity_key, payload) VALUES (?1, ?2)",
+                    params![identity_key(identity)?, serde_json::to_string(identity)?],
+                )?;
+            }
+            transaction.commit()?;
+            Ok(())
+        })
     }
 
     fn delete_requests(&self, request_ids: &[String]) -> Result<(), CollaborationError> {
-        let Some(path) = self.database_path.as_ref() else {
+        let Some(database) = &self.database else {
             return Ok(());
         };
-        let mut connection = open_database(path)?;
-        let transaction = connection.transaction()?;
-        {
-            let mut statement =
-                transaction.prepare("DELETE FROM collaboration_requests WHERE id = ?1")?;
-            for request_id in request_ids {
-                statement.execute([request_id])?;
+        database.with_connection(|connection| {
+            let transaction = connection.transaction()?;
+            {
+                let mut statement =
+                    transaction.prepare("DELETE FROM collaboration_requests WHERE id = ?1")?;
+                for request_id in request_ids {
+                    statement.execute([request_id])?;
+                }
             }
-        }
-        transaction.commit()?;
-        secure_database_files(path)?;
-        Ok(())
+            transaction.commit()?;
+            Ok(())
+        })
     }
 }
 
@@ -6252,18 +6268,9 @@ mod tests {
         }
     }
 
-    fn remove_database_files(legacy_path: &Path) {
-        let database_path = collaboration_database_path(legacy_path);
-        for suffix in ["", "-wal", "-shm"] {
-            let mut candidate = database_path.as_os_str().to_os_string();
-            candidate.push(suffix);
-            let candidate = PathBuf::from(candidate);
-            match std::fs::remove_file(candidate) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => panic!("remove test database file: {error}"),
-            }
-        }
+    fn reject_request_writes(store: &CollaborationStore) {
+        let db = Connection::open(&store.database.as_ref().unwrap().path).unwrap();
+        db.execute_batch("CREATE TRIGGER reject_request_write BEFORE INSERT ON collaboration_requests BEGIN SELECT RAISE(ABORT,'injected persistence failure'); END;").unwrap();
     }
 
     fn managed_pane(pane_id: &str, role: &str, alias: &str) -> PaneInfo {
@@ -7180,9 +7187,7 @@ mod tests {
             }
             let before = mailbox.requests.read().await.clone();
             let changes = mailbox.subscribe();
-            remove_database_files(&path);
-            std::fs::remove_dir(&parent).unwrap();
-            std::fs::write(&parent, b"blocks persistence").unwrap();
+            reject_request_writes(&mailbox);
             let result = match operation {
                 "create" => mailbox
                     .create(
@@ -7235,7 +7240,7 @@ mod tests {
                 _ => unreachable!(),
             };
             assert!(
-                matches!(result, Err(CollaborationError::Persistence(_))),
+                matches!(result, Err(CollaborationError::Database(_))),
                 "{operation}: {result:?}"
             );
             assert_eq!(*mailbox.requests.read().await, before, "{operation}");
@@ -8123,9 +8128,7 @@ mod tests {
         };
         let mailbox = CollaborationStore::load(options).await.unwrap();
 
-        remove_database_files(&parent.join("collaboration.json"));
-        std::fs::remove_dir(&parent).unwrap();
-        std::fs::write(&parent, b"blocks create_dir_all").unwrap();
+        reject_request_writes(&mailbox);
         let sender = participant("%1", "sender");
         let result = mailbox
             .create(
@@ -8143,7 +8146,7 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(CollaborationError::Persistence(_))));
+        assert!(matches!(result, Err(CollaborationError::Database(_))));
         assert!(mailbox.pending_unnotified().await.is_empty());
         assert!(mailbox
             .list_for(&sender, RequestMailbox::All, MailboxScope::Caller)
@@ -8180,12 +8183,10 @@ mod tests {
             .await
             .unwrap();
 
-        remove_database_files(&path);
-        std::fs::remove_dir(&parent).unwrap();
-        std::fs::write(&parent, b"blocks create_dir_all").unwrap();
+        reject_request_writes(&mailbox);
         assert!(matches!(
             mailbox.mark_notified(&request.id).await,
-            Err(CollaborationError::Persistence(_))
+            Err(CollaborationError::Database(_))
         ));
         assert!(mailbox.pending_unnotified().await.is_empty());
     }
@@ -9529,6 +9530,129 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(second_page.requests.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn missing_database_fences_reads_writes_and_requires_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox.sqlite3");
+        let options = CollaborationOptions {
+            path: Some(path.clone()),
+            ..Default::default()
+        };
+        let store = CollaborationStore::load(options.clone()).await.unwrap();
+        let from = participant("%1", "sender");
+        let to = participant("%2", "recipient");
+        let request = store
+            .create(
+                from.clone(),
+                to.clone(),
+                NewRequest {
+                    body: "durable original".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let parked = dir.path().join("original.sqlite3");
+        std::fs::rename(&path, &parked).unwrap();
+        assert!(matches!(
+            store
+                .query_for(
+                    &from,
+                    RequestMailbox::All,
+                    MailboxScope::Caller,
+                    &CollaborationQuery::default()
+                )
+                .await,
+            Err(CollaborationError::Unavailable(_))
+        ));
+        assert!(
+            !path.exists(),
+            "a read must never recreate a missing database"
+        );
+        assert!(store
+            .create(
+                from.clone(),
+                to.clone(),
+                NewRequest {
+                    body: "must not succeed".into(),
+                    ..Default::default()
+                }
+            )
+            .await
+            .is_err());
+        assert!(store.claim_for(&to).await.is_err());
+        assert!(store.persist_identities(&[]).is_err());
+        assert!(store
+            .delete_requests(std::slice::from_ref(&request.id))
+            .is_err());
+        assert_eq!(store.requests.read().await.len(), 1);
+        std::fs::rename(&parked, &path).unwrap();
+        assert!(
+            store.peek_for(&from, &request.id).await.is_err(),
+            "returning the file must not revive a potentially stale projection"
+        );
+        drop(store);
+        let restored = CollaborationStore::load(options).await.unwrap();
+        assert_eq!(
+            restored
+                .list_for(&from, RequestMailbox::All, MailboxScope::Caller)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn replaced_database_is_not_queried_or_mutated_by_a_loaded_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mailbox.sqlite3");
+        let store = CollaborationStore::load(CollaborationOptions {
+            path: Some(path.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let from = participant("%1", "sender");
+        store
+            .create(
+                from.clone(),
+                participant("%2", "recipient"),
+                NewRequest {
+                    body: "original".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .database
+            .as_ref()
+            .unwrap()
+            .with_connection(|c| {
+                c.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")?;
+                Ok(())
+            })
+            .unwrap();
+        let replacement = dir.path().join("replacement.sqlite3");
+        std::fs::copy(&path, &replacement).unwrap();
+        let bytes = std::fs::read(&replacement).unwrap();
+        std::fs::rename(&path, dir.path().join("original.sqlite3")).unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert!(store
+            .query_for(
+                &from,
+                RequestMailbox::All,
+                MailboxScope::Caller,
+                &CollaborationQuery::default()
+            )
+            .await
+            .is_err());
+        assert!(store.persist_requests(&[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
     }
 
     #[tokio::test]

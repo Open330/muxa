@@ -548,15 +548,12 @@ async fn a_failed_attempt_stays_retryable_when_its_release_cannot_persist() {
     let request = pair.answered("review").await;
     let batch = pair.reserve().await.unwrap();
 
-    // A directory where the database file was makes every write fail, for
-    // any user including root (permission bits would not stop root).
-    let database = pair.store.database_path.clone().unwrap();
-    let saved = dir.path().join("saved.sqlite3");
-    std::fs::rename(&database, &saved).unwrap();
-    std::fs::create_dir(&database).unwrap();
+    // A transactional failure may be retried on the same intact database.
+    // File replacement now permanently fences the store and requires reload.
+    let db = Connection::open(&pair.store.database.as_ref().unwrap().path).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_release BEFORE INSERT ON collaboration_requests BEGIN SELECT RAISE(ABORT,'injected release failure'); END;").unwrap();
     let outcome = pair.store.complete_reply_wakes(&batch, false).await;
-    std::fs::remove_dir(&database).unwrap();
-    std::fs::rename(&saved, &database).unwrap();
+    db.execute_batch("DROP TRIGGER reject_release").unwrap();
     assert!(outcome.is_err(), "the fault must actually hit persistence");
 
     let retry = pair.reserve().await.expect("still owed, without a reload");

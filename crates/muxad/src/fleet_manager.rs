@@ -16,8 +16,8 @@ use muxa::fleet::{
     FleetCapturedWindowPane, FleetCommandEnvelope, FleetCommandReceiver, FleetCommandResult,
     FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
-    RemoteSnapshot, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES, FLEET_MAX_FRAME_BYTES,
-    FLEET_PROTOCOL_VERSION, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
+    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
 use muxa::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -1275,6 +1275,12 @@ impl HostTask {
                         )));
                         continue;
                     }
+                    if let Some(refusal) =
+                        unbounded_claim_refusal(&self.alias, &connected.hello, &command.operation)
+                    {
+                        let _ = command.reply.send(Err(refusal));
+                        continue;
+                    }
                     if command.operation.requires_task_contract() && !connected.hello.capabilities.iter().any(|c|c==muxa::collaboration::TASK_CONTRACT_CAPABILITY) {
                         let _=command.reply.send(Err(format!("host '{}' does not support task contracts; upgrade muxa",self.alias)));
                         continue;
@@ -1798,11 +1804,79 @@ fn audit_operation(host: &str, operation: &str, body_bytes: usize) {
     );
 }
 
+/// Refuse a Fleet inbox claim before any frame reaches a relay that does not
+/// bound it: such a relay claims the whole remote inbox and then returns only
+/// part of it, leaving the rest claimed but never shown. Read-only mailbox
+/// listing is unaffected.
+fn unbounded_claim_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    (matches!(operation, FleetOperation::CollaborationClaim { .. })
+        && !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == FLEET_BOUNDED_CLAIM_CAPABILITY))
+    .then(|| {
+        format!(
+            "host '{alias}' runs a muxa relay that claims its whole inbox but returns only part of it; upgrade muxa on that host before claiming over Fleet"
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use muxa::event::{AgentEvent, AgentId, AgentKind, AgentState};
     use muxa::state::Store;
+
+    #[test]
+    fn unbounded_relays_cannot_claim_but_can_still_list_mailboxes() {
+        let pane = PaneKey {
+            window: WindowKey {
+                session: muxa::SessionKey {
+                    endpoint: muxa::BackendEndpoint {
+                        host: HostKind::Rmux,
+                        socket: "/tmp/rmux-test/default".into(),
+                    },
+                    session_id: "$1".into(),
+                },
+                window_id: "@1".into(),
+            },
+            pane_id: "rmux:%1".into(),
+        };
+        let hello = |capabilities: &[&str]| RelayHello {
+            fleet_protocol: FLEET_PROTOCOL_VERSION,
+            min_fleet_protocol: FLEET_PROTOCOL_VERSION,
+            node_id: NodeId::generate(),
+            hostname: "remote".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            muxa_version: "0.0.0".into(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            daemon_generation: None,
+            boot_id: "boot".into(),
+            backends: Vec::new(),
+            server_time: OffsetDateTime::now_utc(),
+        };
+        let claim = FleetOperation::CollaborationClaim { pane: pane.clone() };
+        let list = FleetOperation::CollaborationMailbox {
+            pane,
+            operator_only: false,
+        };
+        // A relay from before bounded claims advertised collaboration alone.
+        let legacy = hello(&["collaboration", "collaboration_get"]);
+        let refusal = unbounded_claim_refusal("remote", &legacy, &claim).unwrap();
+        assert!(refusal.contains("host 'remote'"), "{refusal}");
+        assert!(refusal.contains("upgrade muxa"), "{refusal}");
+        assert!(unbounded_claim_refusal("remote", &legacy, &list).is_none());
+        // Current relays advertise the shared list, which carries the bound.
+        let current = hello(FLEET_CAPABILITIES);
+        assert!(FLEET_CAPABILITIES.contains(&FLEET_BOUNDED_CLAIM_CAPABILITY));
+        assert!(unbounded_claim_refusal("remote", &current, &claim).is_none());
+        assert!(unbounded_claim_refusal("remote", &current, &list).is_none());
+    }
 
     #[test]
     fn local_host_is_first_class_with_truthful_managed_labels() {

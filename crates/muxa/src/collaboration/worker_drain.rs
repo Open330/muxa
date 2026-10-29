@@ -3,13 +3,13 @@
 //! mailbox/spawn locks before provider IO.
 use super::purpose::ProcessFence;
 use super::{
-    addresses, is_pending_session, open_database, secure_database_files, CollaborationError,
-    CollaborationStore, LaunchPurpose, Participant, RequestStatus, RoomId,
+    addresses, is_pending_session, CollaborationError, CollaborationStore, LaunchPurpose,
+    Participant, RequestStatus, RoomId,
 };
 use crate::{tmux::PaneInfo, Agent, AgentKind, AgentState};
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
@@ -158,13 +158,7 @@ fn drain_error(message: &str) -> CollaborationError {
     CollaborationError::WorkerDrain(message.into())
 }
 
-pub(super) fn load_drains(
-    path: Option<&Path>,
-) -> Result<Vec<WorkerDrainRecord>, CollaborationError> {
-    let Some(path) = path else {
-        return Ok(Vec::new());
-    };
-    let conn = open_database(path)?;
+pub(super) fn load_drains(conn: &Connection) -> Result<Vec<WorkerDrainRecord>, CollaborationError> {
     let mut statement =
         conn.prepare("SELECT payload FROM collaboration_worker_drains ORDER BY rowid")?;
     let rows = statement.query_map([], |r| r.get::<_, String>(0))?;
@@ -190,12 +184,14 @@ pub(super) fn load_drains(
 
 impl CollaborationStore {
     fn persist_drain(&self, record: &WorkerDrainRecord) -> Result<(), CollaborationError> {
-        if let Some(path) = &self.database_path {
-            open_database(path)?.execute(
-                "INSERT OR REPLACE INTO collaboration_worker_drains(id,payload) VALUES (?1,?2)",
-                params![record.view.token.drain_id, serde_json::to_string(record)?],
-            )?;
-            secure_database_files(path)?;
+        if let Some(database) = &self.database {
+            database.with_connection(|connection| {
+                connection.execute(
+                    "INSERT OR REPLACE INTO collaboration_worker_drains(id,payload) VALUES (?1,?2)",
+                    params![record.view.token.drain_id, serde_json::to_string(record)?],
+                )?;
+                Ok(())
+            })?;
         }
         Ok(())
     }

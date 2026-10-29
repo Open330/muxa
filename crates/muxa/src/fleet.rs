@@ -79,6 +79,10 @@ pub const FLEET_MAX_CAPTURE_BYTES: usize = 256 * 1024;
 /// command for a relay that does not advertise it.
 pub const FLEET_WORK_COMMAND_CAPABILITY: &str = "work_command";
 pub const FLEET_MAILBOX_WATCH_CAPABILITY: &str = "mailbox_watch";
+/// Relay capability: a claim changes at most [`FLEET_MAILBOX_REQUEST_LIMIT`]
+/// requests. An older relay claims the whole inbox and then truncates the
+/// reply, leaving the overflow claimed but never shown.
+pub const FLEET_BOUNDED_CLAIM_CAPABILITY: &str = "collaboration_claim_bounded_v1";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
@@ -90,6 +94,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     crate::collaboration::TASK_CONTRACT_CAPABILITY,
     "collaboration_update",
     FLEET_MAILBOX_WATCH_CAPABILITY,
+    FLEET_BOUNDED_CLAIM_CAPABILITY,
     "exact_pane_ref",
     "labels_v1",
     "orchestration_v1",

@@ -2,17 +2,15 @@
 //! that a physical launch failed: uncertain launches continue to occupy capacity.
 use super::purpose::ProcessFence;
 use super::{
-    is_pending_session, open_database, pane_participant, pane_room, secure_database_files,
-    CollaborationError, CollaborationOrigin, CollaborationStore, LaunchPurpose, Participant,
-    RoomId,
+    is_pending_session, pane_participant, pane_room, CollaborationError, CollaborationOrigin,
+    CollaborationStore, LaunchPurpose, Participant, RoomId,
 };
 use crate::{
     event::{AgentKind, AgentState},
     tmux::PaneInfo,
 };
-use rusqlite::params;
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
-use std::path::Path;
 use time::OffsetDateTime;
 
 pub const WORKER_SPAWN_CAPABILITY: &str = "collaboration_worker_spawn_v1";
@@ -203,12 +201,8 @@ impl WorkerSpawnRecord {
 }
 
 pub(super) fn load_spawns(
-    path: Option<&Path>,
+    connection: &Connection,
 ) -> Result<Vec<WorkerSpawnRecord>, CollaborationError> {
-    let Some(path) = path else {
-        return Ok(Vec::new());
-    };
-    let connection = open_database(path)?;
     let mut statement =
         connection.prepare("SELECT payload FROM collaboration_worker_spawns ORDER BY rowid")?;
     let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
@@ -281,28 +275,32 @@ impl CollaborationStore {
         if !records.iter().any(WorkerSpawnRecord::expired_history) {
             return Ok(());
         }
-        if let Some(path) = &self.database_path {
-            let mut connection = open_database(path)?;
-            let tx = connection.transaction()?;
-            for record in records.iter().filter(|r| r.expired_history()) {
-                tx.execute(
-                    "DELETE FROM collaboration_worker_spawns WHERE id=?1",
-                    [&record.launch_id],
-                )?;
-            }
-            tx.commit()?;
+        if let Some(database) = &self.database {
+            database.with_connection(|connection| {
+                let tx = connection.transaction()?;
+                for record in records.iter().filter(|r| r.expired_history()) {
+                    tx.execute(
+                        "DELETE FROM collaboration_worker_spawns WHERE id=?1",
+                        [&record.launch_id],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })?;
         }
         records.retain(|r| !r.expired_history());
         Ok(())
     }
 
     fn persist_spawn(&self, record: &WorkerSpawnRecord) -> Result<(), CollaborationError> {
-        if let Some(path) = &self.database_path {
-            open_database(path)?.execute(
-                "INSERT OR REPLACE INTO collaboration_worker_spawns(id,payload) VALUES (?1,?2)",
-                params![record.launch_id, serde_json::to_string(record)?],
-            )?;
-            secure_database_files(path)?;
+        if let Some(database) = &self.database {
+            database.with_connection(|connection| {
+                connection.execute(
+                    "INSERT OR REPLACE INTO collaboration_worker_spawns(id,payload) VALUES (?1,?2)",
+                    params![record.launch_id, serde_json::to_string(record)?],
+                )?;
+                Ok(())
+            })?;
         }
         Ok(())
     }

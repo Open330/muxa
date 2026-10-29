@@ -54,6 +54,31 @@ fn reason(agent: &Agent) -> Option<&'static str> {
     }
 }
 
+fn missing_binding_reason(
+    request: &CollaborationRequest,
+    agent: Option<&Agent>,
+    missing: &mut std::collections::HashMap<String, OffsetDateTime>,
+    now: OffsetDateTime,
+) -> Option<&'static str> {
+    if agent.is_some()
+        || super::is_pending_session(&request.to.agent_session_id)
+        || request.status.is_terminal()
+        || (request.status != RequestStatus::Claimed
+            && request.wake_delivery.is_none()
+            && request.notified_at.is_none())
+    {
+        missing.remove(&request.id);
+        return None;
+    }
+    let since = missing.entry(request.id.clone()).or_insert(now);
+    (now - *since >= time::Duration::minutes(2)
+        || request
+            .interruption
+            .as_ref()
+            .is_some_and(|i| i.active && i.reason == "binding_unavailable"))
+    .then_some("binding_unavailable")
+}
+
 fn recovery_action(
     parent: &CollaborationRequest,
     id: String,
@@ -83,7 +108,15 @@ fn recovery_action(
     action.kind = RequestKind::Question;
     action.work_mode = WorkMode::ReadOnly;
     action.human_action = Some(HumanAction::Choice);
-    action.body = format!("Muxa detected an interrupted peer: {} ({}).\nOriginal request: {}\nReset: {}\nChoose: wait and recheck, arrange a safe handoff, or stop this work attempt. Recommendation: inspect existing work before reassignment; a capped agent may resume. Your answer records a decision; it does not restart, cancel, or spend automatically.", parent.to.agent_session_id, current_reason, parent.id, parent.interruption.as_ref().and_then(|i| i.reset_at.as_deref()).unwrap_or("unknown"));
+    action.body = recovery_body(
+        &parent.to.agent_session_id,
+        &parent.id,
+        current_reason,
+        parent
+            .interruption
+            .as_ref()
+            .and_then(|i| i.reset_at.as_deref()),
+    );
     action.status = RequestStatus::Queued;
     action.created_at = now;
     action.claimed_at = None;
@@ -97,9 +130,56 @@ fn recovery_action(
     action
 }
 
+fn recovery_body(
+    session: &str,
+    request_id: &str,
+    current_reason: &str,
+    reset: Option<&str>,
+) -> String {
+    let observation = if current_reason == "binding_unavailable" {
+        "cannot verify the recipient binding; delivery and execution are uncertain, and process exit is not established"
+    } else {
+        "detected an interrupted peer"
+    };
+    format!("Muxa {observation}: {session} ({current_reason}).\nOriginal request: {request_id}\nReset: {}\nChoose: wait and recheck, arrange a safe handoff, or stop this work attempt. Recommendation: inspect existing work before reassignment; a capped agent may resume. Your answer records a decision; it does not restart, cancel, or spend automatically.", reset.unwrap_or("unknown"))
+}
+
+fn refresh_recovery_action(
+    action: &CollaborationRequest,
+    info: &PeerInterruption,
+    now: OffsetDateTime,
+    recipient_session: &str,
+) -> Option<CollaborationRequest> {
+    if action.from.agent_session_id != "muxa:peer-recovery" {
+        return None;
+    }
+    let mut refreshed = action.clone();
+    refreshed.interruption = Some(info.clone());
+    if info.active && !action.status.is_terminal() {
+        refreshed.body = recovery_body(
+            recipient_session,
+            &info.request_id,
+            &info.reason,
+            info.reset_at.as_deref(),
+        );
+    }
+    if !info.active && !action.status.is_terminal() {
+        refreshed.status = RequestStatus::Cancelled;
+    }
+    if action.reply.is_some() {
+        // The daemon delivered its own request's answer to the parent;
+        // no service pane remains to wake.
+        refreshed.mark_reply_read(now);
+    }
+    (refreshed != *action).then_some(refreshed)
+}
+
 impl CollaborationStore {
     /// Reconcile a local authoritative registry. Unknown/missing identities never
-    /// imply death or quota exhaustion. Updates and human actions persist together.
+    /// imply death or quota exhaustion. A delivered request whose exact binding
+    /// stays absent is reported as uncertain after a grace period, without
+    /// resending, cancelling, or changing execution authority.
+    #[allow(clippy::too_many_lines)] // Keep parent/action reconciliation and their atomic publication together.
     pub async fn reconcile_peer_interruptions(
         &self,
         agents: &[Agent],
@@ -108,6 +188,8 @@ impl CollaborationStore {
         let _transaction = self.transaction_lock.lock().await;
         let now = OffsetDateTime::now_utc();
         let snapshot = self.requests.read().await;
+        let mut missing = self.missing_recipients.lock().await;
+        missing.retain(|id, _| snapshot.get(id).is_some_and(|r| !r.status.is_terminal()));
         let mut changed = Vec::new();
         for original in snapshot.values().filter(|r| {
             !r.to.console
@@ -116,7 +198,8 @@ impl CollaborationStore {
                 && (!r.status.is_terminal() || r.interruption.is_some())
         }) {
             let agent = exact_agent(&original.to, agents);
-            let current_reason = agent.and_then(reason);
+            let missing_reason = missing_binding_reason(original, agent, &mut missing, now);
+            let current_reason = agent.and_then(reason).or(missing_reason);
             let mut parent = original.clone();
             if let Some(current_reason) = current_reason.filter(|_| !parent.status.is_terminal()) {
                 if !parent.peer_interrupted() {
@@ -162,6 +245,11 @@ impl CollaborationStore {
                 }
             } else if parent.status.is_terminal()
                 || agent.is_some_and(|a| matches!(a.state, AgentState::Working | AgentState::Idle))
+                || (agent.is_some()
+                    && parent
+                        .interruption
+                        .as_ref()
+                        .is_some_and(|i| i.reason == "binding_unavailable"))
             {
                 if let Some(info) = &mut parent.interruption {
                     info.active = false;
@@ -174,20 +262,10 @@ impl CollaborationStore {
                     .and_then(|id| snapshot.get(id))
                 {
                     info.decision.clone_from(&action.reply);
-                    if action.from.agent_session_id == "muxa:peer-recovery" {
-                        let mut refreshed = action.clone();
-                        refreshed.interruption = Some(info.clone());
-                        if !info.active && !action.status.is_terminal() {
-                            refreshed.status = RequestStatus::Cancelled;
-                        }
-                        if action.reply.is_some() {
-                            // The daemon has delivered its own request's answer
-                            // to the parent; there is no service pane to wake.
-                            refreshed.mark_reply_read(now);
-                        }
-                        if refreshed != *action {
-                            changed.push(refreshed);
-                        }
+                    if let Some(refreshed) =
+                        refresh_recovery_action(action, info, now, &original.to.agent_session_id)
+                    {
+                        changed.push(refreshed);
                     }
                 }
             }
@@ -195,6 +273,7 @@ impl CollaborationStore {
                 changed.push(parent);
             }
         }
+        drop(missing);
         drop(snapshot);
         if !changed.is_empty() {
             self.persist_requests(&changed)?;
@@ -448,6 +527,236 @@ mod tests {
         let changes = mailbox.subscribe();
         mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
         assert!(!changes.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn missing_delivered_binding_has_grace_and_never_reassigns_or_replays() {
+        use crate::collaboration::WakeDeliveryState;
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (recipient, peer) = actor("%2", "peer").await;
+        for (delivery, returned_state) in [
+            (None, AgentState::WaitingInput),
+            (Some(WakeDeliveryState::Prepared), AgentState::WaitingChoice),
+            (Some(WakeDeliveryState::PromptWritten), AgentState::Starting),
+        ] {
+            let request = mailbox
+                .create(
+                    sender.clone(),
+                    recipient.clone(),
+                    NewRequest {
+                        body: "already delivered work".into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            mailbox.claim_by_id(&recipient, &request.id).await.unwrap();
+            mailbox
+                .requests
+                .write()
+                .await
+                .get_mut(&request.id)
+                .unwrap()
+                .wake_delivery = delivery;
+            let before = mailbox.peek_for(&sender, &request.id).await.unwrap();
+            mailbox
+                .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+                .await
+                .unwrap();
+            assert!(!mailbox
+                .peek_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .peer_interrupted());
+            *mailbox
+                .missing_recipients
+                .lock()
+                .await
+                .get_mut(&request.id)
+                .unwrap() -= time::Duration::minutes(3);
+            mailbox
+                .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+                .await
+                .unwrap();
+            let uncertain = mailbox.peek_for(&sender, &request.id).await.unwrap();
+            assert!(uncertain.peer_interrupted());
+            assert_eq!(
+                uncertain.interruption.as_ref().unwrap().reason,
+                "binding_unavailable"
+            );
+            assert_eq!(uncertain.status, before.status);
+            assert_eq!(uncertain.to, before.to);
+            assert_eq!(uncertain.wake_delivery, delivery);
+            assert_eq!(uncertain.reply, before.reply);
+            assert!(
+                mailbox.pending_human_notifications().await.is_empty(),
+                "the coordinator receives the first recovery opportunity"
+            );
+            mailbox.missing_recipients.lock().await.remove(&request.id);
+            // A persisted active uncertainty remains visible after tracker reset.
+            mailbox
+                .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+                .await
+                .unwrap();
+            assert!(mailbox
+                .peek_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .peer_interrupted());
+            let mut returned = peer.clone();
+            returned.state = returned_state;
+            mailbox
+                .reconcile_peer_interruptions(&[coordinator.clone(), returned])
+                .await
+                .unwrap();
+            assert!(!mailbox
+                .peek_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .peer_interrupted());
+            assert!(!mailbox
+                .missing_recipients
+                .lock()
+                .await
+                .contains_key(&request.id));
+        }
+    }
+
+    #[tokio::test]
+    async fn notified_unclaimed_binding_is_uncertain_and_return_cancels_recovery_action() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (recipient, mut peer) = actor("%2", "peer").await;
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient,
+                NewRequest {
+                    body: "inbox notification delivered".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox.mark_notified(&request.id).await.unwrap();
+        mailbox
+            .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+            .await
+            .unwrap();
+        *mailbox
+            .missing_recipients
+            .lock()
+            .await
+            .get_mut(&request.id)
+            .unwrap() -= time::Duration::minutes(3);
+        mailbox
+            .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+            .await
+            .unwrap();
+        let uncertain = mailbox.peek_for(&sender, &request.id).await.unwrap();
+        assert!(uncertain.peer_interrupted());
+        assert_eq!(uncertain.status, RequestStatus::Queued);
+        mailbox
+            .requests
+            .write()
+            .await
+            .get_mut(&request.id)
+            .unwrap()
+            .interruption
+            .as_mut()
+            .unwrap()
+            .observed_at -= time::Duration::minutes(3);
+        mailbox
+            .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+            .await
+            .unwrap();
+        let action = mailbox.pending_human_notifications().await.remove(0);
+        assert!(action.body.contains("process exit is not established"));
+        peer.state = AgentState::Stopped;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        let current_action = mailbox.peek_for(&sender, &action.id).await.unwrap();
+        assert!(current_action.body.contains("(stopped)"));
+        assert!(!current_action
+            .body
+            .contains("cannot verify the recipient binding"));
+        peer.state = AgentState::Working;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator, peer])
+            .await
+            .unwrap();
+        assert!(!mailbox
+            .peek_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        assert_eq!(
+            mailbox.peek_for(&sender, &action.id).await.unwrap().status,
+            RequestStatus::Cancelled
+        );
+        assert!(mailbox.pending_human_notifications().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_queued_and_pending_recipients_are_not_interrupted() {
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (recipient, _) = actor("%2", "peer").await;
+        let queued = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "not yet delivered".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox
+            .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+            .await
+            .unwrap();
+        assert!(mailbox.missing_recipients.lock().await.is_empty());
+        assert!(!mailbox
+            .peek_for(&sender, &queued.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
+        let mut pending = recipient;
+        pending.agent_session_id =
+            format!("{}default:%2", crate::collaboration::PENDING_SESSION_PREFIX);
+        let request = mailbox
+            .create(
+                sender.clone(),
+                pending,
+                NewRequest {
+                    body: "pending agent startup".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        mailbox
+            .requests
+            .write()
+            .await
+            .get_mut(&request.id)
+            .unwrap()
+            .wake_delivery = Some(crate::collaboration::WakeDeliveryState::Prepared);
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator])
+            .await
+            .unwrap();
+        assert!(mailbox.missing_recipients.lock().await.is_empty());
+        assert!(!mailbox
+            .peek_for(&sender, &request.id)
+            .await
+            .unwrap()
+            .peer_interrupted());
     }
 
     #[tokio::test]

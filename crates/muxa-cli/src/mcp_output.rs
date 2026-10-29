@@ -69,6 +69,19 @@ fn timestamp(at: time::OffsetDateTime) -> Option<String> {
         .ok()
 }
 
+/// `last_notification` outlives the wait that produced it: a resolved prompt
+/// leaves it set while the agent works or idles. Report it only while the
+/// current state still needs someone (the same states `needs_attention` counts).
+fn current_attention(agent: &muxa::Agent) -> Option<String> {
+    matches!(
+        agent.state,
+        muxa::AgentState::WaitingInput | muxa::AgentState::WaitingChoice | muxa::AgentState::Error
+    )
+    .then(|| agent.last_notification.as_deref())
+    .flatten()
+    .map(|s| crate::truncate_cell(s, 160))
+}
+
 pub fn fleet_view(snapshot: &muxa::fleet::FleetSnapshot, full: bool) -> Value {
     if full {
         return json!(snapshot);
@@ -83,7 +96,7 @@ pub fn fleet_view(snapshot: &muxa::fleet::FleetSnapshot, full: bool) -> Value {
                 "agent_session_id":agent.session_id,"state":agent.state,
                 "rate_limit_scope":agent.rate_limit_scope,"rate_limit_source":agent.rate_limit_source,
                 "rate_limited_until":agent.rate_limited_until.and_then(timestamp),
-                "attention":agent.last_notification.as_deref().map(|s| crate::truncate_cell(s,160))})
+                "attention":current_attention(agent)})
         }).collect();
         json!({"alias":host.alias,"local":host.local,"node_id":host.node_id,
             "labels":host.labels,"capabilities":host.capabilities,"mode":host.mode,"state":host.state,
@@ -269,5 +282,66 @@ mod tests {
         assert_eq!(summary["hosts"][0]["agents_truncated"], true);
         assert!(!summary.to_string().contains("PRIVATE PROMPT"));
         assert_eq!(fleet_view(&snapshot, true), json!(snapshot));
+    }
+
+    #[test]
+    fn fleet_summary_attention_follows_current_state_not_stale_notifications() {
+        let notice = "Claude needs your permission to use Bash";
+        let states = [
+            "starting",
+            "working",
+            "idle",
+            "waiting_input",
+            "waiting_choice",
+            "error",
+        ];
+        let agents: Vec<_> = states
+            .iter()
+            .enumerate()
+            .map(|(i, state)| {
+                json!({"kind":"claude_code","session_id":format!("s{i}"),
+            "pane":format!("rmux:%{i}"),"state":state,"last_notification":notice,
+            "started_at":"2026-10-15T00:00:00Z","last_activity_at":"2026-10-15T00:00:00Z",
+            "state_entered_at":"2026-10-15T00:00:00Z"})
+            })
+            .collect();
+        let snapshot: muxa::fleet::FleetSnapshot = serde_json::from_value(json!({
+            "generated_at":"2026-10-15T00:00:00Z","hosts":[{"alias":"local","local":true,
+            "ssh_target":"","labels":{},"annotations":{},"mode":"control","state":"online",
+            "remote":{"revision":1,"observed_at":"2026-10-15T00:00:00Z","agents":agents,
+                "panes":[],"sessions":[],"backends":[]}}]}))
+        .unwrap();
+        let summary = fleet_view(&snapshot, false);
+        let host = &summary["hosts"][0];
+        let attention: Vec<_> = host["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| {
+                (
+                    agent["state"].as_str().unwrap(),
+                    !agent["attention"].is_null(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            attention,
+            [
+                ("starting", false),
+                ("working", false),
+                ("idle", false),
+                ("waiting_input", true),
+                ("waiting_choice", true),
+                ("error", true),
+            ]
+        );
+        // Per-agent attention and the host badge count the same agents.
+        assert_eq!(host["needs_attention"], 3);
+        assert_eq!(host["agents"][3]["attention"], notice);
+        // An idle agent's leftover notification stays available in full mode.
+        assert_eq!(
+            fleet_view(&snapshot, true)["hosts"][0]["remote"]["agents"][2]["last_notification"],
+            notice
+        );
     }
 }
