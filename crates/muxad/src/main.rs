@@ -126,9 +126,32 @@ struct Args {
     log_file: Option<PathBuf>,
 }
 
-#[tokio::main]
+/// How long the runtime's teardown waits for blocking tasks still running
+/// once the daemon's shutdown sequence is done: a submission stuck behind a
+/// swap or a hung capture must not hold the process past its stop budget.
+const RUNTIME_TEARDOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+fn main() -> Result<()> {
+    run_bounded(run(), RUNTIME_TEARDOWN)
+}
+
+/// Run the daemon on a multi-threaded runtime whose teardown is bounded.
+/// `#[tokio::main]`'s runtime drop waits for every blocking task without
+/// limit; this one gives them `teardown` and then lets the process go.
+fn run_bounded(
+    daemon: impl std::future::Future<Output = Result<()>>,
+    teardown: std::time::Duration,
+) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(daemon);
+    runtime.shutdown_timeout(teardown);
+    result
+}
+
 #[allow(clippy::too_many_lines)] // daemon bootstrap wires long-lived tasks in startup order
-async fn main() -> Result<()> {
+async fn run() -> Result<()> {
     let args = Args::parse();
     if args.check_config {
         let path = args.config.clone().or_else(paths::default_config_file);
@@ -571,10 +594,11 @@ async fn main() -> Result<()> {
     let _ = shutdown_tx.send(());
     // Swap jobs: take no new one, and give running ones a short moment to
     // reach their end while the runtime and stores they use still exist.
-    // The bound sits well inside the service managers' stop timeouts
-    // (systemd 90 s by default, launchd 20 s); a job still running when it
-    // passes is recovered on the next start as needing reconciliation,
-    // never replayed.
+    // A job still running when it passes is recovered on the next start as
+    // needing reconciliation, never replayed. Budget: IPC drain (5 s) +
+    // this + runtime teardown (2 s) stays under launchd's 20 s; the 2 s
+    // per-task timeouts below are a worst-case ceiling on top that only
+    // hung tasks reach.
     if let Some(swap) = &swap_service {
         if !swap.service.drain(SWAP_DRAIN_ON_SHUTDOWN).await {
             tracing::warn!(
@@ -915,10 +939,9 @@ fn build_automation(cfg: &Config, config_path: Option<PathBuf>) -> Arc<Automatio
     store
 }
 
-/// How long shutdown gives running swap jobs to reach their end. Well
-/// inside systemd's default 90 s and launchd's 20 s stop timeouts, together
-/// with the IPC drain.
-const SWAP_DRAIN_ON_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long shutdown gives running swap jobs to reach their end; see the
+/// shutdown sequence for how it fits the stop budget.
+const SWAP_DRAIN_ON_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(8);
 
 /// How long the automation engine waits on one swap job. Running out only
 /// stops the wait; the job carries on under the service.
@@ -1805,6 +1828,12 @@ impl AutomationEngine {
         expected: &AutomationRule,
         revision: u64,
     ) -> Result<(), String> {
+        // Rescan first: everything read after this await is current, and a
+        // rule edited while the scan ran fails the revision check below.
+        if expected.needs_pane_metadata() {
+            self.panes_read_at = None;
+            self.refresh_panes().await;
+        }
         let config = self.automation.config().await;
         let Some(rule) = config.rule_named(&firing.rule).cloned() else {
             return Err("rule_removed".into());
@@ -1829,10 +1858,29 @@ impl AutomationEngine {
             .ledger()
             .guard_state(&firing.rule, &firing.pane, &firing.episode, now)
             .await;
-        match Scheduler::confirm(&config, &rule, firing, latest.as_ref(), guards, now) {
-            Decision::Fire(_) => Ok(()),
-            Decision::Skip(reason) => Err(reason.to_string()),
+        if let Decision::Skip(reason) =
+            Scheduler::confirm(&config, &rule, firing, latest.as_ref(), guards, now)
+        {
+            return Err(reason.to_string());
         }
+        // The ledger read awaited too: nothing may have moved since.
+        if *self.automation.subscribe().borrow() != revision {
+            return Err("configuration_changed".into());
+        }
+        let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
+            return Err("agent_gone".into());
+        };
+        let now_subject = AutomationSubject::from_agent(&agent);
+        if now_subject.episode() != firing.episode
+            || now_subject.socket != firing.socket
+            || now_subject.pane.as_deref() != Some(firing.pane.as_str())
+        {
+            return Err("agent_state_changed".into());
+        }
+        if *self.automation.subscribe().borrow() != revision {
+            return Err("configuration_changed".into());
+        }
+        Ok(())
     }
 
     /// Capture immediately before Enter; a waiting state alone cannot identify
@@ -7005,6 +7053,210 @@ mod tests {
         assert!(!engine.perform(&firing, &rule, 0).await);
         assert!(sends.lock().unwrap().is_empty());
     }
+
+    /// A swap context that knows no agents, so every job settles without
+    /// an effect, and whose snapshot can be held shut to keep a job running.
+    struct HeldContext {
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        snapshots: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl muxa::swap_service::ContextProvider for HeldContext {
+        fn snapshot(&self) -> Result<muxa::swap_service::Snapshot, String> {
+            self.snapshots
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (open, turned) = &*self.gate;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = turned.wait(open).unwrap();
+            }
+            Ok(muxa::swap_service::Snapshot {
+                node_id: "node".into(),
+                agents: Vec::new(),
+                backends: Vec::new(),
+                config: muxa::account_swap::SwapConfig::default(),
+                accounts: muxa::accounts::AccountsConfig::default(),
+                config_path: None,
+            })
+        }
+
+        fn acquire_guard(
+            &self,
+            _pane: &str,
+            _socket: Option<&str>,
+        ) -> Result<Box<dyn muxa::swap_service::TargetGuard>, String> {
+            Err("an automation swap must bring its own guard".into())
+        }
+    }
+
+    struct SwapFixture {
+        engine: AutomationEngine,
+        automation: Arc<AutomationStore>,
+        collaboration: Arc<CollaborationStore>,
+        sends: RecordedSends,
+        gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        snapshots: Arc<std::sync::atomic::AtomicUsize>,
+        _dir: tempfile::TempDir,
+    }
+
+    impl SwapFixture {
+        async fn new() -> Self {
+            let store = muxa::Store::shared();
+            add_capped_agent(&store, "%1", "capped").await;
+            let (backends, sends) = automation_backend(vec![collaboration_pane("%1", "0")]);
+            let mut rule = AutomationRule::new(
+                "swap-on-limit",
+                muxa::automation::AutomationEvent::RateLimited,
+                AutomationAction::SwapAccount,
+            );
+            rule.jitter = Some(muxa::automation::DurationSpec::seconds(0));
+            let automation = AutomationStore::in_memory(muxa::automation::AutomationConfig {
+                rule: vec![rule],
+                ..muxa::automation::AutomationConfig::default()
+            });
+            let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+            let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+            let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let dir = tempfile::tempdir().unwrap();
+            let service = muxa::swap_service::SwapService::open(
+                Some(&dir.path().join("swap-jobs.sqlite3")),
+                Arc::new(HeldContext {
+                    gate: Arc::clone(&gate),
+                    snapshots: Arc::clone(&snapshots),
+                }),
+            )
+            .unwrap();
+            let mut engine = AutomationEngine::new(automation.clone(), store, backends);
+            engine.collaboration = Some(Arc::clone(&collaboration));
+            engine.swap_service = Some(Arc::new(DaemonSwap {
+                service: Arc::new(service),
+                node_id: "node".into(),
+            }));
+            Self {
+                engine,
+                automation,
+                collaboration,
+                sends,
+                gate,
+                snapshots,
+                _dir: dir,
+            }
+        }
+
+        fn hold(&self, held: bool) {
+            let (open, turned) = &*self.gate;
+            *open.lock().unwrap() = !held;
+            turned.notify_all();
+        }
+
+        fn take_engine(&mut self) -> AutomationEngine {
+            std::mem::replace(
+                &mut self.engine,
+                AutomationEngine::new(
+                    AutomationStore::in_memory(muxa::automation::AutomationConfig::default()),
+                    muxa::Store::shared(),
+                    Vec::new(),
+                ),
+            )
+        }
+
+        async fn pane_is_free(&self) -> bool {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                self.collaboration.worker_action_guard("%1"),
+            )
+            .await
+            .is_ok()
+        }
+    }
+
+    /// A failed assertion still opens the gate, so the runtime's teardown
+    /// never waits on a held job.
+    impl Drop for SwapFixture {
+        fn drop(&mut self) {
+            self.hold(false);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_automation_swap_hands_its_pane_guard_to_the_job_until_it_ends() {
+        let mut fixture = SwapFixture::new().await;
+        fixture.hold(true);
+        fixture.engine.rescan().await;
+        let mut engine = fixture.take_engine();
+        let firing = tokio::spawn(async move { engine.fire_due().await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fixture.snapshots.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the swap never reached the service"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Held by the job, not reacquired by it: busy, and still busy once
+        // the engine that submitted it is gone.
+        assert!(!fixture.pane_is_free().await);
+        firing.abort();
+        let _ = firing.await;
+        assert!(!fixture.pane_is_free().await);
+        fixture.hold(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !fixture.pane_is_free().await {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job never let the pane go"
+            );
+        }
+        assert!(fixture.sends.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_automation_swap_disabled_while_it_waited_for_its_pane_is_dropped() {
+        let mut fixture = SwapFixture::new().await;
+        fixture.engine.rescan().await;
+        let held = fixture.collaboration.worker_action_guard("%1").await;
+        let mut engine = fixture.take_engine();
+        let firing = tokio::spawn(async move { engine.fire_due().await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        fixture
+            .automation
+            .set_rule_enabled("swap-on-limit", false)
+            .await
+            .unwrap();
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), firing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            fixture.snapshots.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a stale firing must not reach the swap service"
+        );
+        assert!(fixture.sends.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_daemon_runtime_does_not_wait_out_a_stuck_blocking_task() {
+        let started = std::time::Instant::now();
+        let result = run_bounded(
+            async {
+                tokio::task::spawn_blocking(|| {
+                    std::thread::sleep(std::time::Duration::from_secs(30));
+                });
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                Ok(())
+            },
+            std::time::Duration::from_millis(200),
+        );
+        assert!(result.is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "teardown took {:?}",
+            started.elapsed()
+        );
+    }
+
     #[test]
     fn reference_wake_overhead_is_bounded_independently_of_body_size() {
         let participant = serde_json::json!({"agent_kind":"codex","agent_session_id":"01a1820e-a385-79d0-acfd-8ebda41e2d5b","pane":"rmux:%290","room":{"host":"rmux","window_id":"@34"},"state":"idle"});
