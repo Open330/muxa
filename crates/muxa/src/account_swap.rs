@@ -1072,6 +1072,13 @@ pub(crate) struct TargetIdentity {
     pub(crate) assigned_account: Option<String>,
 }
 
+/// The server a located pane is on: the one the planner found it on, not
+/// what the registry row happens to carry — a row without a socket is not a
+/// second server. Identity, guard, reservation and every effect use this.
+pub(crate) fn target_socket(pane: &crate::tmux::PaneInfo, agent: &Agent) -> Option<String> {
+    pane.socket.clone().or_else(|| agent.tmux_socket.clone())
+}
+
 /// The canonical endpoint of `pane` on `socket`.
 #[must_use]
 pub(crate) fn endpoint_key(pane: &str, socket: Option<&str>) -> String {
@@ -1085,14 +1092,7 @@ impl PreparedTarget {
     pub(crate) fn identity(&self) -> TargetIdentity {
         let planned = &self.planned;
         let pane = planned.agent.pane.clone().unwrap_or_default();
-        // The server the planner found the pane on, not what the registry
-        // row happens to carry: a row without a socket is not a second
-        // server.
-        let socket = planned
-            .pane
-            .socket
-            .clone()
-            .or_else(|| planned.agent.tmux_socket.clone());
+        let socket = target_socket(&planned.pane, &planned.agent);
         TargetIdentity {
             endpoint: endpoint_key(&pane, socket.as_deref()),
             pane,
@@ -1460,7 +1460,7 @@ fn swap_one(
         return outcome;
     }
     let target = Target {
-        socket: agent.tmux_socket.clone(),
+        socket: target_socket(pane, agent),
         pane: pane.pane_id.clone(),
         pane_pid: std::cell::Cell::new(pane.pane_pid),
         direct: !shell_above(
@@ -3666,6 +3666,52 @@ mod tests {
             conversation: None,
         };
         assert!(recheck(&unverified, None, Some(10), None).is_ok());
+    }
+
+    /// Every effect goes to the server the pane was found on, even when the
+    /// registry row names none: the same server the guard and the
+    /// reservation are for.
+    #[test]
+    fn a_target_runs_on_the_server_its_pane_was_found_on() {
+        let mut row = agent("%1", "s1", AgentKind::ClaudeCode, AgentState::Idle);
+        row.tmux_socket = None;
+        let mut pane = crate::tmux::PaneInfo {
+            session_group: None,
+            agent_program: None,
+            worker_launch_id: None,
+            agent_role: None,
+            agent_alias: None,
+            workspace_id: None,
+            work_id: None,
+            pane_id: "%1".into(),
+            session_id: "$1".into(),
+            session: "s".into(),
+            window_id: "@1".into(),
+            window_name: "w".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            current_path: "/w".into(),
+            pane_pid: 0,
+            socket: Some("/tmp/tmux-1/work".into()),
+        };
+        assert_eq!(
+            target_socket(&pane, &row).as_deref(),
+            Some("/tmp/tmux-1/work")
+        );
+        row.tmux_socket = Some("default".into());
+        assert_eq!(
+            target_socket(&pane, &row).as_deref(),
+            Some("/tmp/tmux-1/work")
+        );
+        pane.socket = None;
+        assert_eq!(target_socket(&pane, &row).as_deref(), Some("default"));
+        assert_ne!(
+            endpoint_key("%1", Some("/tmp/tmux-1/work")),
+            endpoint_key("%1", Some("default"))
+        );
     }
 
     /// A bare `%7` that is both a tmux pane and `rmux:%7` is ambiguous; it

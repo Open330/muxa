@@ -521,24 +521,11 @@ fn overrides_resolve_like_the_cli() {
     .is_err());
 }
 
-/// The real liveness decision: alive while running with the same start,
-/// gone once it has exited or its start differs; unreadable never counts as
-/// gone.
-#[cfg(unix)]
+/// One live manager holds the store; a second is refused while it lives,
+/// and takes over once it is gone — the OS releases the lock however the
+/// first one ends — recovering what it left.
 #[test]
-fn a_recorded_owner_is_gone_only_on_positive_evidence() {
-    let me = std::process::id();
-    let start = owner_start(me);
-    assert!(start.is_some());
-    assert_eq!(owner_liveness(me, start.as_deref()), Liveness::Alive);
-    assert_eq!(owner_liveness(me, None), Liveness::Alive);
-    assert_eq!(owner_liveness(me, Some("another:boot")), Liveness::Gone);
-    let mut child = std::process::Command::new("true").spawn().unwrap();
-    let dead = child.id();
-    child.wait().unwrap();
-    assert_eq!(owner_liveness(dead, None), Liveness::Gone);
-
-    // A store whose owner has exited is taken over through that decision.
+fn one_live_manager_holds_the_store_until_it_is_gone() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("swap-jobs.sqlite3");
     let provider = || {
@@ -548,23 +535,15 @@ fn a_recorded_owner_is_gone_only_on_positive_evidence() {
             acquired: Mutex::new(Vec::new()),
         }) as Arc<dyn ContextProvider>
     };
-    let engine = || FakeEngine {
-        script: Box::new(Vec::new),
-        executed: Arc::new(Mutex::new(Vec::new())),
-        dry_runs: Arc::new(AtomicUsize::new(0)),
-    };
-    let previous = OwnerIdentity {
-        nonce: "previous".into(),
-        pid: dead,
-        process_start: None,
-    };
-    drop(Service::open(&path, previous, &alive, engine(), provider()).unwrap());
-    let current = OwnerIdentity {
-        nonce: "current".into(),
-        pid: me,
-        process_start: start,
-    };
-    Service::open(&path, current, &owner_liveness, engine(), provider()).unwrap();
+    let first = SwapService::open(Some(&path), provider()).unwrap();
+    assert!(SwapService::open(Some(&path), provider())
+        .err()
+        .unwrap()
+        .contains("another live manager"));
+    assert!(first.active().is_ok());
+    drop(first);
+    let second = SwapService::open(Some(&path), provider()).unwrap();
+    assert!(second.active().is_ok());
 }
 
 /// A planning note can quote an external tool; only a code goes to disk.

@@ -290,6 +290,8 @@ impl Engine for RealEngine {
 /// The daemon's handle.
 pub struct SwapService {
     inner: Arc<Service<RealEngine>>,
+    /// Held for as long as this service lives; see [`ownership_lock`].
+    _lock: std::fs::File,
 }
 
 impl SwapService {
@@ -300,15 +302,24 @@ impl SwapService {
             .map(Path::to_path_buf)
             .or_else(SwapJobStore::default_path)
             .ok_or("no data directory for the swap job store")?;
+        let lock = ownership_lock(&path)?;
         let identity = OwnerIdentity {
             nonce: uuid::Uuid::new_v4().to_string(),
             pid: std::process::id(),
             process_start: owner_start(std::process::id()),
         };
-        let inner = Service::open(&path, identity, &owner_liveness, RealEngine, provider)
-            .map_err(|error| error.to_string())?;
+        // Holding the lock, whoever the store names as owner is gone.
+        let inner = Service::open(
+            &path,
+            identity,
+            &|_, _| Liveness::Gone,
+            RealEngine,
+            provider,
+        )
+        .map_err(|error| error.to_string())?;
         Ok(Self {
             inner: Arc::new(inner),
+            _lock: lock,
         })
     }
 
@@ -339,39 +350,18 @@ impl SwapService {
     }
 }
 
-/// What can be told about a process.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Probe {
-    /// Positively not running.
-    Absent,
-    /// Running, with its start identity where it can be read.
-    Running(Option<String>),
-    /// Could not be told.
-    Unknown,
-}
-
-/// Look a process up. On Linux `/proc/<pid>` answering "not found" is
-/// absence; any other error is unknown. Elsewhere the process table.
+/// This process's start identity, recorded with its ownership for the
+/// record only: who may take the store over is decided by the lock.
 #[cfg(target_os = "linux")]
-fn probe(pid: u32) -> Probe {
-    match std::fs::metadata(format!("/proc/{pid}")) {
-        Ok(_) => Probe::Running(owner_start_linux(pid)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Probe::Absent,
-        Err(_) => Probe::Unknown,
-    }
-}
-
-/// A Linux start time counted from boot, scoped to that boot: the same
-/// tick count after a reboot is another process.
-#[cfg(target_os = "linux")]
-fn owner_start_linux(pid: u32) -> Option<String> {
+fn owner_start(pid: u32) -> Option<String> {
+    // Counted from boot, so scoped to that boot.
     let start = crate::agent_conversation::process_start(pid)?;
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     Some(format!("{}:{start}", boot.trim()))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn probe(pid: u32) -> Probe {
+fn owner_start(pid: u32) -> Option<String> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let wanted = Pid::from_u32(pid);
     let mut system = System::new();
@@ -380,31 +370,41 @@ fn probe(pid: u32) -> Probe {
         true,
         ProcessRefreshKind::nothing(),
     );
-    match system.process(wanted) {
-        // Unix seconds: not boot-relative, so no boot scope is needed.
-        Some(process) => Probe::Running(Some(format!("epoch:{}", process.start_time()))),
-        None => Probe::Absent,
-    }
+    // A process that could not be read comes back with a zero start: that
+    // is no identity at all.
+    system
+        .process(wanted)
+        .map(sysinfo::Process::start_time)
+        .filter(|start| *start > 0)
+        .map(|start| format!("epoch:{start}"))
 }
 
-/// This process's start identity, recorded with its ownership.
-fn owner_start(pid: u32) -> Option<String> {
-    match probe(pid) {
-        Probe::Running(start) => start,
-        Probe::Absent | Probe::Unknown => None,
+/// Hold the store's ownership lock: an exclusive lock on `<store>.lock`,
+/// kept for the manager's whole life. The OS drops it when the manager
+/// exits however it exits, so holding it is the proof that no other
+/// manager is alive — the one thing a process-table lookup cannot prove.
+fn ownership_lock(store: &Path) -> Result<std::fs::File, String> {
+    if let Some(parent) = store.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     }
-}
-
-/// Whether a recorded owner still runs. Gone only on positive evidence: its
-/// pid absent, or both start identities known and different. Anything that
-/// cannot be read counts as alive.
-fn owner_liveness(pid: u32, recorded: Option<&str>) -> Liveness {
-    match probe(pid) {
-        Probe::Absent => Liveness::Gone,
-        Probe::Running(Some(current)) if recorded.is_some_and(|recorded| recorded != current) => {
-            Liveness::Gone
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(store.with_extension("lock"))
+        .map_err(|error| error.to_string())?;
+    match lock.try_lock() {
+        Ok(()) => Ok(lock),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            Err("swap jobs are owned by another live manager".into())
         }
-        Probe::Running(_) | Probe::Unknown => Liveness::Alive,
+        Err(std::fs::TryLockError::Error(error)) => Err(format!(
+            "could not take the swap job ownership lock: {error}"
+        )),
     }
 }
 
