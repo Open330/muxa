@@ -25,7 +25,7 @@ use crate::backend::SharedBackend;
 use crate::event::AgentKind;
 use crate::state::Agent;
 use crate::swap_job::{
-    request_digest, AcceptedPlan, Disposition, JobError, Lease, Liveness, OwnerIdentity,
+    request_digest, AcceptedPlan, Boundary, Disposition, JobError, Lease, Liveness, OwnerIdentity,
     PlannedTarget, SettledEntry, SwapJobStore, TextRef,
 };
 use serde::{Deserialize, Serialize};
@@ -285,6 +285,10 @@ pub struct JobView {
     pub entries: Vec<EntryView>,
     /// Why the service stopped taking work, if it did.
     pub fault: Option<String>,
+    /// A cancel was asked for: no target starts after it, and targets that
+    /// never started read `cancelled`.
+    #[serde(default)]
+    pub cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -737,6 +741,9 @@ pub trait SwapJobs: Send + Sync {
         parent: &JobRef,
         overrides: &RetryOverrides,
     ) -> Result<Accepted, String>;
+    /// Ask a job to start no further target; accepted whatever the
+    /// service's health.
+    fn cancel(&self, job: &JobRef) -> Result<JobView, String>;
     /// Readable whatever state the service is in, so a halted or recovered
     /// job can always be inspected.
     fn status(&self, job: &JobRef) -> Result<JobView, String>;
@@ -762,6 +769,10 @@ impl SwapJobs for SwapService {
         overrides: &RetryOverrides,
     ) -> Result<Accepted, String> {
         Service::retry(&self.inner, request_key, parent, overrides)
+    }
+
+    fn cancel(&self, job: &JobRef) -> Result<JobView, String> {
+        self.inner.cancel(job)
     }
 
     fn status(&self, job: &JobRef) -> Result<JobView, String> {
@@ -1588,6 +1599,15 @@ impl<E: Engine> Service<E> {
                 // reserved until the daemon restarts and recovers the job.
                 break;
             }
+            // A cancelled job starts nothing more, without waiting on a pane.
+            match self.boundary(job, target_id, false) {
+                Some(Boundary::Cancelled) => {
+                    self.cancelled(job, report_index, &identity);
+                    continue;
+                }
+                Some(_) => {}
+                None => break,
+            }
             // An adopted guard protects the one endpoint it was taken for.
             let held = match adopted.take() {
                 Some(guard) if guard.covers(&identity.endpoint) => Ok(guard),
@@ -1612,6 +1632,16 @@ impl<E: Engine> Service<E> {
                     continue;
                 }
             };
+            // The pane is held: start it, unless a cancel came first. From
+            // here on it runs to its end.
+            match self.boundary(job, target_id, true) {
+                Some(Boundary::Started) => {}
+                Some(_) => {
+                    self.cancelled(job, report_index, &identity);
+                    continue;
+                }
+                None => break,
+            }
             let mut journal = self.store.journal(&self.lease, job, target_id, 1);
             let outcome = self.engine.execute(request, &target, &mut journal);
             let uncertain = journal.uncertain();
@@ -1654,6 +1684,48 @@ impl<E: Engine> Service<E> {
                 self.set_fault(format!("job {job}: could not record its end: {error}"));
             }
         }
+    }
+
+    /// One target boundary; `None` (the service now halted) if it could not
+    /// be recorded: a cancel that cannot be read is never taken as none.
+    fn boundary(&self, job: &str, target_id: u32, start: bool) -> Option<Boundary> {
+        match self
+            .store
+            .start_or_cancel(&self.lease, job, target_id, 1, start)
+        {
+            Ok(boundary) => Some(boundary),
+            Err(error) => {
+                self.set_fault(format!(
+                    "job {job}: could not record the boundary of target {target_id}: {error}"
+                ));
+                None
+            }
+        }
+    }
+
+    /// A target a cancel kept from starting: reported, its pane let go.
+    fn cancelled(&self, job: &str, report_index: usize, identity: &TargetIdentity) {
+        self.remember(
+            job,
+            report_index,
+            SwapOutcome {
+                note: "cancelled before it started; nothing was done".into(),
+                ..skipped_outcome(identity, "")
+            },
+        );
+        self.release(&identity.endpoint);
+    }
+
+    /// Ask `job` to start no further target. A target already started runs
+    /// to its end; nothing running is interrupted or signalled. Accepted
+    /// whatever the service's health, so a halted or draining daemon can
+    /// still be told; an ended job is left as it is.
+    pub(crate) fn cancel(&self, job: &JobRef) -> Result<JobView, String> {
+        let job = self.status(job)?.job_id;
+        self.store
+            .request_cancel(&self.lease, &job)
+            .map_err(|error| error.to_string())?;
+        self.status(&JobRef::Id(job))
     }
 
     #[allow(clippy::too_many_arguments)] // one settled target, all of its identity
@@ -1780,6 +1852,7 @@ impl<E: Engine> Service<E> {
             reason: status.reason,
             entries,
             fault: self.fault(),
+            cancel_requested: status.cancel_requested,
         })
     }
 }

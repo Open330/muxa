@@ -136,6 +136,27 @@ pub struct Args {
         ]
     )]
     retry: Option<String>,
+    /// Ask a daemon swap job (by key or job id) to start no further target:
+    /// the one already started runs to its end, nothing is interrupted or
+    /// signalled. Waits for the job to end and reports it.
+    #[arg(
+        long,
+        value_name = "KEY",
+        conflicts_with_all = [
+            "targets", "all", "limited", "provider", "to", "spread", "force", "bare",
+            "continue_text", "continue_legacy", "continue_when", "no_continue",
+            "continue_evidence", "dry_run", "exclude", "local", "status", "retry",
+        ]
+    )]
+    cancel: Option<String>,
+    /// Return as soon as the daemon accepted the job, with its key, instead
+    /// of following it (`--status <key>` reads it later).
+    #[arg(long, conflicts_with_all = ["local", "dry_run", "status", "cancel"])]
+    detach: bool,
+    /// The request key to start the job under, minted by the caller that
+    /// relays a swap to this host so it can find the job again.
+    #[arg(long, hide = true, value_name = "KEY")]
+    request_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -260,6 +281,9 @@ pub(crate) async fn run(
     if let Some(job) = &args.status {
         return show_status(client, job, args.json).await;
     }
+    if let Some(job) = &args.cancel {
+        return run_cancel(client, job, args.json).await;
+    }
     if let Some(parent) = &args.retry {
         return run_retry(client, &args, parent, explicit_config).await;
     }
@@ -282,6 +306,9 @@ pub(crate) async fn run(
     match route {
         Route::Daemon => run_routed(client, &args, config, accounts, explicit_config).await,
         Route::Unavailable => bail!("{UNAVAILABLE}"),
+        Route::Legacy if args.detach => {
+            bail!("this daemon predates swap jobs, so nothing can be detached; nothing was sent")
+        }
         Route::Legacy => {
             eprintln!("muxa swap: this daemon predates swap jobs; swapping in this process");
             run_local(client, &args, config, accounts).await
@@ -455,36 +482,72 @@ async fn follow_job(
     poll: Duration,
 ) -> JobEnd {
     tokio::pin!(cancel);
+    let view = match start_job(daemon, key, start, &mut cancel).await {
+        Ok(view) => view,
+        Err(Unstarted::Refused(error)) => return JobEnd::Refused(error),
+        Err(Unstarted::Unknown(error)) => return JobEnd::Unknown(error),
+        Err(Unstarted::Interrupted) => return JobEnd::Interrupted,
+    };
+    follow_from(daemon, view, cancel, poll).await
+}
+
+/// Why a start did not get as far as a known job.
+#[derive(Debug)]
+enum Unstarted {
+    /// Answered with a refusal, and no job holds the key.
+    Refused(String),
+    /// Whether it was accepted is not known.
+    Unknown(String),
+    /// Ctrl-C.
+    Interrupted,
+}
+
+/// Send the start and learn whether it was accepted, by its answer or, if
+/// that is lost, by reading the key back. Never sent twice.
+async fn start_job(
+    daemon: &impl SwapDaemon,
+    key: &str,
+    start: impl Future<Output = Result<Accepted, RuntimeError>>,
+    cancel: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
+) -> Result<JobView, Unstarted> {
     let started = tokio::select! {
         biased;
-        () = &mut cancel => return JobEnd::Interrupted,
+        () = cancel.as_mut() => return Err(Unstarted::Interrupted),
         started = start => started,
     };
-    let mut view = match started {
-        Ok(accepted) => accepted.view,
+    match started {
+        Ok(accepted) => Ok(accepted.view),
         Err(start) => {
             let refused = matches!(start, RuntimeError::Daemon(_));
             let by_key_ref = JobRef::Key(key.to_owned());
             let by_key = tokio::select! {
                 biased;
-                () = &mut cancel => return JobEnd::Interrupted,
+                () = cancel.as_mut() => return Err(Unstarted::Interrupted),
                 view = daemon.status(&by_key_ref) => view,
             };
             match by_key {
-                Ok(view) => view,
+                Ok(view) => Ok(view),
                 // A refusal is an answer, and no job holds the key: refused.
                 // Anything else may still be accepted later.
                 Err(status) if refused && not_found(&status) => {
-                    return JobEnd::Refused(start.to_string());
+                    Err(Unstarted::Refused(start.to_string()))
                 }
-                Err(status) => {
-                    return JobEnd::Unknown(format!(
-                        "starting it: {start}; reading it back: {status}"
-                    ));
-                }
+                Err(status) => Err(Unstarted::Unknown(format!(
+                    "starting it: {start}; reading it back: {status}"
+                ))),
             }
         }
-    };
+    }
+}
+
+/// Follow an accepted job until it ends or the service faults.
+async fn follow_from(
+    daemon: &impl SwapDaemon,
+    mut view: JobView,
+    cancel: std::pin::Pin<&mut impl Future<Output = ()>>,
+    poll: Duration,
+) -> JobEnd {
+    let mut cancel = cancel;
     let job = JobRef::Id(view.job_id.clone());
     loop {
         if settled(&view) {
@@ -537,13 +600,16 @@ async fn run_retry(
         force: args.force,
         caller_config: explicit_config.map(Path::to_path_buf),
     };
-    let key = format!("cli-{}", uuid::Uuid::new_v4());
+    let key = request_key(args)?;
     eprintln!("muxa swap: retry {key} of {parent} (see it with `muxa swap --status {key}`)");
     let cancel = async {
         let _ = tokio::signal::ctrl_c().await;
     };
     let parent = job_ref(parent);
     let start = client.swap_job_retry(&key, &parent, &overrides);
+    if args.detach {
+        return detach(client, &key, start, cancel, args.json).await;
+    }
     let view = match follow_job(client, &key, start, cancel, POLL).await {
         JobEnd::Ended(view) => view,
         JobEnd::Refused(error) => bail!("the daemon refused this retry: {error}"),
@@ -558,7 +624,110 @@ async fn run_retry(
     };
     let outcomes = job_outcomes(&view);
     report(&outcomes, args.json)?;
-    job_verdict(&view, &key)
+    job_verdict(&view, &key, false)
+}
+
+/// The key a job starts under: the one a relaying caller minted, or a new
+/// one.
+fn request_key(args: &Args) -> Result<String> {
+    match &args.request_key {
+        Some(key) => {
+            let plain = key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
+            if key.is_empty() || key.len() > 128 || !plain {
+                bail!("--request-key: 1-128 characters of letters, digits and -_.:@");
+            }
+            Ok(key.clone())
+        }
+        None => Ok(format!("cli-{}", uuid::Uuid::new_v4())),
+    }
+}
+
+/// What `--detach` prints once the daemon accepted the job.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct DetachedAck {
+    request_key: String,
+    job_id: String,
+    state: String,
+}
+
+/// Start, and return as soon as the job is known accepted.
+async fn detach(
+    client: &Client,
+    key: &str,
+    start: impl Future<Output = Result<Accepted, RuntimeError>>,
+    cancel: impl Future<Output = ()>,
+    json: bool,
+) -> Result<()> {
+    tokio::pin!(cancel);
+    let view = match start_job(client, key, start, &mut cancel).await {
+        Ok(view) => view,
+        Err(Unstarted::Refused(error)) => bail!("the daemon refused this swap: {error}"),
+        Err(Unstarted::Unknown(error)) => bail!(
+            "{error}\nit may or may not have been accepted; check `muxa swap --status {key}` \
+             before trying again"
+        ),
+        Err(Unstarted::Interrupted) => bail!(
+            "stopped before the daemon answered; check `muxa swap --status {key}` before \
+             trying again"
+        ),
+    };
+    let ack = DetachedAck {
+        request_key: key.to_owned(),
+        job_id: view.job_id,
+        state: view.state,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&ack)?);
+    } else {
+        println!("job {}  {}  (request {key})", ack.job_id, ack.state);
+        eprintln!("muxa swap: detached; follow it with `muxa swap --status {key}`");
+    }
+    Ok(())
+}
+
+/// `--cancel`: ask the job to start no further target, then follow it to
+/// its end. A job that ends cleanly after the cancel is a success here,
+/// unlike for whoever was waiting for the whole swap.
+async fn run_cancel(client: &Client, text: &str, json: bool) -> Result<()> {
+    let first = job_ref(text);
+    let asked = match client.swap_job_cancel(&first).await {
+        Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
+            client.swap_job_cancel(&JobRef::Key(text.to_owned())).await
+        }
+        asked => asked,
+    }
+    .map_err(|error| anyhow!("{error}"))?;
+    if asked.cancel_requested && settled(&asked) {
+        eprintln!("muxa swap: job {} had already ended", asked.job_id);
+    } else if asked.cancel_requested {
+        eprintln!(
+            "muxa swap: cancel requested for job {}; a target already started runs to its end",
+            asked.job_id
+        );
+    } else {
+        eprintln!(
+            "muxa swap: job {} had already ended; nothing to cancel",
+            asked.job_id
+        );
+    }
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    tokio::pin!(cancel);
+    let view = match follow_from(client, asked, cancel, POLL).await {
+        JobEnd::Ended(view) => view,
+        JobEnd::Interrupted => bail!("stopped waiting; the cancel stands"),
+        JobEnd::Unknown(error) | JobEnd::Refused(error) => bail!("{error}"),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        println!("job {}  {}", view.job_id, view.state);
+        print!("{}", render(&job_outcomes(&view)));
+    }
+    job_verdict(&view, text, true)
 }
 
 /// The daemon-owned swap, with any direct panes swapped here afterwards.
@@ -597,12 +766,23 @@ async fn run_routed(
             daemon_overrides.exclude.push(target.pane.clone());
         }
     }
-    let key = format!("cli-{}", uuid::Uuid::new_v4());
+    if args.detach && !direct.is_empty() {
+        bail!(
+            "{} pane(s) run their agent directly and would be swapped by this process after \
+             the daemon's job, which cannot be detached; nothing was sent. Run without \
+             --detach, or with --local",
+            direct.len()
+        );
+    }
+    let key = request_key(args)?;
     eprintln!("muxa swap: request {key} (see it with `muxa swap --status {key}`)");
     let cancel = async {
         let _ = tokio::signal::ctrl_c().await;
     };
     let start = client.swap_job_start(&key, &daemon_overrides);
+    if args.detach {
+        return detach(client, &key, start, cancel, args.json).await;
+    }
     let view = match follow_job(client, &key, start, cancel, POLL).await {
         JobEnd::Ended(view) => view,
         JobEnd::Refused(error) => bail!("the daemon refused this swap: {error}"),
@@ -637,7 +817,7 @@ async fn run_routed(
     };
     let outcomes = merge(daemon_half, &direct, local);
     report(&outcomes, args.json)?;
-    job_verdict(&view, &key)?;
+    job_verdict(&view, &key, false)?;
     if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
         bail!("some agents could not be swapped");
     }
@@ -784,7 +964,9 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
 }
 
 /// An error unless the job ended cleanly.
-fn job_verdict(view: &JobView, key: &str) -> Result<()> {
+/// `cancel_expected`: the caller asked for the cancel, so targets it kept
+/// from starting are not a failure; for anyone else they are.
+fn job_verdict(view: &JobView, key: &str, cancel_expected: bool) -> Result<()> {
     if let Some(fault) = &view.fault {
         bail!(
             "swap job {} ({key}) stopped: the daemon's swap service faulted: {fault}",
@@ -813,6 +995,17 @@ fn job_verdict(view: &JobView, key: &str) -> Result<()> {
     {
         bail!(
             "swap job {} ({key}): some agents could not be swapped",
+            view.job_id
+        );
+    }
+    let never_started = view
+        .entries
+        .iter()
+        .filter(|entry| entry.reason.as_deref() == Some("cancelled"))
+        .count();
+    if view.cancel_requested && !cancel_expected {
+        bail!(
+            "swap job {} ({key}) was cancelled: {never_started} target(s) never started",
             view.job_id
         );
     }
@@ -901,7 +1094,7 @@ async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
         println!("job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
     }
-    job_verdict(&view, text)
+    job_verdict(&view, text, false)
 }
 
 /// The same swap as a `muxa swap … --json` argv for a Fleet host, every
@@ -917,6 +1110,7 @@ fn remote_argv(args: &Args) -> Vec<String> {
         (args.no_continue, "--no-continue"),
         (args.dry_run, "--dry-run"),
         (args.local, "--local"),
+        (args.detach, "--detach"),
     ] {
         if on {
             words.push(flag.to_owned());
@@ -939,6 +1133,9 @@ fn remote_argv(args: &Args) -> Vec<String> {
     }
     if let Some(job) = &args.retry {
         words.push(format!("--retry={job}"));
+    }
+    if let Some(job) = &args.cancel {
+        words.push(format!("--cancel={job}"));
     }
     if let Some(bare) = args.bare {
         words.push(format!(
@@ -1020,14 +1217,55 @@ pub(crate) fn checked_argv(words: &[String]) -> std::result::Result<Vec<String>,
 /// `muxa swap --host`: the host's own `muxa swap` does the work, through
 /// the Fleet transport, and its report is printed here.
 async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
-    if !args.dry_run && args.status.is_none() {
-        eprintln!("{}", remote_wait_notice(host));
+    // A swap that starts a job carries a key minted here, printed before it
+    // is sent: if the answer is lost, the job is still found by it.
+    let starts = !args.dry_run && args.status.is_none() && args.cancel.is_none();
+    let key = starts.then(|| format!("cli-{}", uuid::Uuid::new_v4()));
+    let plain = remote_argv(args);
+    let keyed = key.as_ref().map(|key| {
+        let mut words = plain.clone();
+        words.push(format!("--request-key={key}"));
+        words
+    });
+    if let Some(key) = &key {
+        eprintln!(
+            "muxa swap: request {key} on {host} (see it with `muxa swap --host {host} \
+             --status {key}`)"
+        );
+        if !args.detach {
+            eprintln!("{}", remote_wait_notice(host));
+        }
     }
-    let output = client
-        .work_command(Some(host), &remote_argv(args), None)
+    let lost = |error: anyhow::Error| match &key {
+        Some(key) => error.context(format!(
+            "the swap on {host} may or may not have been accepted; check `muxa swap --host \
+             {host} --status {key}` before trying again"
+        )),
+        None => error,
+    };
+    let output = match client
+        .work_command(Some(host), keyed.as_ref().unwrap_or(&plain), None)
         .await
-        .with_context(|| format!("running the swap on {host}"))?;
-    // The host's own notices (its request key above all) are for the user.
+    {
+        // A host too old for caller keys refuses the word before running
+        // anything; only then is the swap sent again, without one.
+        Err(error) if keyed.is_some() && refuses_request_key(&error.to_string()) => {
+            eprintln!("muxa swap: {host} predates caller request keys; its own key is used");
+            client
+                .work_command(Some(host), &plain, None)
+                .await
+                .map_err(|error| lost(anyhow!(error)))?
+        }
+        Ok(output) if keyed.is_some() && refuses_request_key(&output.stderr) => {
+            eprintln!("muxa swap: {host} predates caller request keys; its own key is used");
+            client
+                .work_command(Some(host), &plain, None)
+                .await
+                .map_err(|error| lost(anyhow!(error)))?
+        }
+        result => result.map_err(|error| lost(anyhow!(error)))?,
+    };
+    // The host's own notices are for the user.
     for line in output
         .stderr
         .lines()
@@ -1035,29 +1273,22 @@ async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
     {
         eprintln!("{host}: {line}");
     }
-    if args.status.is_some() {
-        let Ok(view) = serde_json::from_str::<JobView>(&output.stdout) else {
-            bail!(
-                "{host}: swap status failed (exit {}): {}",
-                output.exit_code,
-                output.stderr.trim()
-            );
-        };
-        if args.json {
-            println!("{}", serde_json::to_string_pretty(&view)?);
-        } else {
-            println!("{host}: job {}  {}", view.job_id, view.state);
-            print!("{}", render(&job_outcomes(&view)));
-        }
-        job_verdict(&view, &format!("on {host}"))?;
-        if output.exit_code != 0 {
-            bail!("{host}: {}", output.stderr.trim());
-        }
-        return Ok(());
+    if args.status.is_some() || args.cancel.is_some() {
+        return remote_job(&output, args, host);
+    }
+    let hint = key.as_deref().unwrap_or("<key>");
+    if args.detach {
+        return remote_detached(
+            &output,
+            args,
+            host,
+            key.as_deref().filter(|_| keyed.is_some()),
+        );
     }
     let Ok(outcomes) = serde_json::from_str::<Vec<SwapOutcome>>(&output.stdout) else {
         bail!(
-            "{host}: swap failed (exit {}): {}",
+            "{host}: swap failed (exit {}): {}\ncheck it with `muxa swap --host {host} \
+             --status {hint}`",
             output.exit_code,
             output.stderr.trim()
         );
@@ -1071,16 +1302,91 @@ async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
         bail!("some agents on {host} could not be swapped");
     }
     // A host's daemon job can end unclean with no failed row (faulted,
-    // uncertain effects): its exit status says so.
+    // uncertain effects, cancelled): its exit status says so.
     if output.exit_code != 0 {
         bail!(
             "the swap on {host} did not end cleanly (exit {}): {}\n\
-             check it with `muxa swap --host {host} --status <key>`",
+             check it with `muxa swap --host {host} --status {hint}`",
             output.exit_code,
             output.stderr.trim()
         );
     }
     Ok(())
+}
+
+/// A host's `--status` or `--cancel`: its job view, judged here too.
+fn remote_job(
+    output: &muxa::work_control::WorkCommandOutput,
+    args: &Args,
+    host: &str,
+) -> Result<()> {
+    let Ok(view) = serde_json::from_str::<JobView>(&output.stdout) else {
+        bail!(
+            "{host}: swap {} failed (exit {}): {}",
+            if args.cancel.is_some() {
+                "cancel"
+            } else {
+                "status"
+            },
+            output.exit_code,
+            output.stderr.trim()
+        );
+    };
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        println!("{host}: job {}  {}", view.job_id, view.state);
+        print!("{}", render(&job_outcomes(&view)));
+    }
+    job_verdict(&view, &format!("on {host}"), args.cancel.is_some())?;
+    if output.exit_code != 0 {
+        bail!("{host}: {}", output.stderr.trim());
+    }
+    Ok(())
+}
+
+/// A host's `--detach`: the acknowledgement for the key minted here (or
+/// the host's own, from a host too old for caller keys).
+fn remote_detached(
+    output: &muxa::work_control::WorkCommandOutput,
+    args: &Args,
+    host: &str,
+    key: Option<&str>,
+) -> Result<()> {
+    let Ok(ack) = serde_json::from_str::<DetachedAck>(&output.stdout) else {
+        bail!(
+            "{host}: detached swap failed (exit {}): {}",
+            output.exit_code,
+            output.stderr.trim()
+        );
+    };
+    if let Some(key) = key.filter(|key| *key != ack.request_key) {
+        eprintln!(
+            "muxa swap: {host} answered for request {}, not {key}",
+            ack.request_key
+        );
+    }
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&ack)?);
+    } else {
+        println!(
+            "{host}: job {}  {}  (request {})",
+            ack.job_id, ack.state, ack.request_key
+        );
+        eprintln!(
+            "muxa swap: detached on {host}; follow it with `muxa swap --host {host} --status {}`",
+            ack.request_key
+        );
+    }
+    if output.exit_code != 0 {
+        bail!("{host}: {}", output.stderr.trim());
+    }
+    Ok(())
+}
+
+/// A host's allowlist refusing the caller's request key: nothing ran.
+fn refuses_request_key(message: &str) -> bool {
+    message.contains("does not accept") && message.contains("--request-key")
 }
 
 fn render(outcomes: &[SwapOutcome]) -> String {
@@ -1458,6 +1764,80 @@ mod tests {
     }
 
     #[test]
+    fn cancel_and_detach_take_no_accidental_meaning() {
+        for argv in [
+            &["swap", "--cancel", "k", "%5"][..],
+            &["swap", "--cancel", "k", "--force"],
+            &["swap", "--cancel", "k", "--retry", "j"],
+            &["swap", "--cancel", "k", "--detach"],
+            &["swap", "--detach", "--local"],
+            &["swap", "--detach", "--dry-run"],
+            &["swap", "--detach", "--status", "k"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(Cli::try_parse_from(["swap", "--cancel", "k", "--json"]).is_ok());
+        assert!(Cli::try_parse_from(["swap", "--retry", "k", "--detach"]).is_ok());
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        for argv in [
+            checked_argv(&words(&["%5", "--detach"])).unwrap(),
+            checked_argv(&words(&["--cancel", "cli-1"])).unwrap(),
+        ] {
+            muxa::work_control::validate_swap_argv(&argv).unwrap();
+        }
+        assert!(checked_argv(&words(&["--cancel", "cli-1"]))
+            .unwrap()
+            .contains(&"--cancel=cli-1".to_owned()));
+        let mut keyed = checked_argv(&words(&["%5"])).unwrap();
+        keyed.push("--request-key=cli-abc".into());
+        muxa::work_control::validate_swap_argv(&keyed).unwrap();
+    }
+
+    #[test]
+    fn a_relayed_request_key_must_be_plain() {
+        let key = |k: &str| {
+            let cli = Cli::parse_from(["swap", "--request-key", k]);
+            request_key(&cli.args)
+        };
+        assert_eq!(key("cli-1:a@b").unwrap(), "cli-1:a@b");
+        assert!(key("has space").is_err());
+        assert!(key(&"x".repeat(129)).is_err());
+        assert!(request_key(&Cli::parse_from(["swap"]).args)
+            .unwrap()
+            .starts_with("cli-"));
+        assert!(refuses_request_key(
+            "`swap` does not accept \"--request-key=cli-1\" here"
+        ));
+        assert!(!refuses_request_key(
+            "`swap` does not accept \"--bogus\" here"
+        ));
+    }
+
+    /// A cancelled job is a failure for whoever waited for the whole swap,
+    /// and not for whoever asked for the cancel.
+    #[test]
+    fn a_cancelled_job_fails_only_those_who_did_not_ask() {
+        let mut job = view("done", None);
+        job.cancel_requested = true;
+        job.entries.push(EntryView {
+            report_index: 0,
+            pane: Some("%2".into()),
+            disposition: Some("skipped".into()),
+            reason: Some("cancelled".into()),
+            uncertain_effects: 0,
+            outcome: None,
+            continuation: None,
+            follow_up: None,
+        });
+        let err = job_verdict(&job, "k", false).unwrap_err().to_string();
+        assert!(
+            err.contains("was cancelled: 1 target(s) never started"),
+            "{err}"
+        );
+        assert!(job_verdict(&job, "k", true).is_ok());
+    }
+
+    #[test]
     fn status_takes_no_action_flags() {
         for argv in [
             &["swap", "--status", "k", "%5"][..],
@@ -1498,6 +1878,7 @@ mod tests {
             reason: None,
             entries: Vec::new(),
             fault: fault.map(str::to_owned),
+            cancel_requested: false,
         }
     }
 
@@ -1612,11 +1993,11 @@ mod tests {
             continuation: None,
             follow_up: None,
         });
-        assert!(job_verdict(&job, "k").is_err());
+        assert!(job_verdict(&job, "k", false).is_err());
         job.entries[0].disposition = Some("kept".into());
-        assert!(job_verdict(&job, "k").is_err());
+        assert!(job_verdict(&job, "k", false).is_err());
         job.entries[0].disposition = Some("swapped".into());
-        assert!(job_verdict(&job, "k").is_ok());
+        assert!(job_verdict(&job, "k", false).is_ok());
     }
 
     /// A status read that never answers still ends on Ctrl-C.
@@ -1701,7 +2082,7 @@ mod tests {
         let JobEnd::Ended(view) = follow(&daemon).await else {
             panic!("a fault must end the wait");
         };
-        assert!(job_verdict(&view, "cli-k").is_err());
+        assert!(job_verdict(&view, "cli-k", false).is_err());
     }
 
     /// A lost answer to an accepted start is recovered by the key, never by
@@ -1841,9 +2222,9 @@ mod tests {
         assert!(shown.note.contains("2 effect(s)"), "{}", shown.note);
         let mut job = view("done", None);
         job.entries.push(entry);
-        assert!(job_verdict(&job, "k").is_err());
-        assert!(job_verdict(&view("done", None), "k").is_ok());
-        assert!(job_verdict(&view("needs_reconciliation", None), "k").is_err());
+        assert!(job_verdict(&job, "k", false).is_err());
+        assert!(job_verdict(&view("done", None), "k", false).is_ok());
+        assert!(job_verdict(&view("needs_reconciliation", None), "k", false).is_err());
     }
 
     #[test]

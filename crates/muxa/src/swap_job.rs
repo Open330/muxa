@@ -415,6 +415,8 @@ pub(crate) struct JobStatus {
     pub(crate) state: String,
     pub(crate) reason: Option<String>,
     pub(crate) targets: Vec<TargetStatus>,
+    /// A cancel was asked for: no target starts after it.
+    pub(crate) cancel_requested: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -537,6 +539,17 @@ impl RetryLink {
     fn parent_ref(&self, parent: &str) -> String {
         format!("{parent}:{}:{}", self.parent_target, self.parent_attempt)
     }
+}
+
+/// What a target boundary decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Boundary {
+    /// Marked started: it runs to its end, whatever is asked meanwhile.
+    Started,
+    /// A cancel was requested first: settled skipped/`cancelled`.
+    Cancelled,
+    /// No cancel, and not asked to start yet.
+    Open,
 }
 
 /// What [`SwapJobStore::create_job`] did.
@@ -1035,6 +1048,84 @@ impl SwapJobStore {
     }
 
     /// Record how a target's attempt ended.
+    /// Ask a job to start no further target. Takes effect at the next
+    /// target boundary ([`Self::start_or_cancel`]); a target already started
+    /// runs to its end. `false` for a job that has already ended.
+    pub(crate) fn request_cancel(&self, lease: &Lease, job: &str) -> Result<bool, JobError> {
+        self.with(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            fence(&tx, lease)?;
+            let state: String = tx
+                .query_row("SELECT state FROM jobs WHERE job_id = ?1", [job], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .ok_or_else(|| JobError::NotFound(job.to_owned()))?;
+            if !matches!(state.as_str(), "accepted" | "running") {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE jobs SET cancel_requested = 1 WHERE job_id = ?1",
+                [job],
+            )?;
+            bump(&tx, job)?;
+            tx.commit()?;
+            Ok(true)
+        })
+    }
+
+    /// The target boundary, ordered with [`Self::request_cancel`] by the
+    /// store's own transactions: a cancel already requested settles the
+    /// target as skipped/`cancelled` and says so; otherwise, if `start`,
+    /// the target is marked started, and a later cancel leaves it be.
+    pub(crate) fn start_or_cancel(
+        &self,
+        lease: &Lease,
+        job: &str,
+        target: u32,
+        attempt: u32,
+        start: bool,
+    ) -> Result<Boundary, JobError> {
+        self.with(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            fence(&tx, lease)?;
+            owned_running(&tx, lease, job)?;
+            let cancelled: bool = tx.query_row(
+                "SELECT cancel_requested != 0 FROM jobs WHERE job_id = ?1",
+                [job],
+                |row| row.get(0),
+            )?;
+            let boundary = if cancelled {
+                let changed = tx.execute(
+                    "UPDATE targets SET disposition = 'skipped', reason = 'cancelled',
+                                        phase = 'finished'
+                     WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3
+                       AND disposition IS NULL AND phase = 'pending'",
+                    params![job, target, attempt],
+                )?;
+                if changed != 1 {
+                    return Err(JobError::Invalid {
+                        job: job.to_owned(),
+                        why: format!("target {target} attempt {attempt} has already started"),
+                    });
+                }
+                Boundary::Cancelled
+            } else if start {
+                tx.execute(
+                    "UPDATE targets SET phase = 'started'
+                     WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND phase = 'pending'",
+                    params![job, target, attempt],
+                )?;
+                Boundary::Started
+            } else {
+                Boundary::Open
+            };
+            bump(&tx, job)?;
+            tx.commit()?;
+            Ok(boundary)
+        })
+    }
+
     pub(crate) fn finish_target(
         &self,
         lease: &Lease,
@@ -1143,15 +1234,29 @@ impl SwapJobStore {
     /// A job and its targets, read back.
     pub(crate) fn status(&self, job: &str) -> Result<JobStatus, JobError> {
         self.with(|connection| {
-            let (state, reason, node_id, revision): (String, Option<String>, String, u64) =
-                connection
-                    .query_row(
-                        "SELECT state, reason, node_id, revision FROM jobs WHERE job_id = ?1",
-                        [job],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                    )
-                    .optional()?
-                    .ok_or_else(|| JobError::NotFound(job.to_owned()))?;
+            let (state, reason, node_id, revision, cancel_requested): (
+                String,
+                Option<String>,
+                String,
+                u64,
+                bool,
+            ) = connection
+                .query_row(
+                    "SELECT state, reason, node_id, revision, cancel_requested != 0
+                         FROM jobs WHERE job_id = ?1",
+                    [job],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| JobError::NotFound(job.to_owned()))?;
             let mut statement = connection.prepare(
                 "SELECT t.target_id, t.attempt, t.phase, t.disposition, t.reason,
                         (SELECT COUNT(*) FROM effects e WHERE e.job_id = t.job_id
@@ -1210,6 +1315,7 @@ impl SwapJobStore {
                 state,
                 reason,
                 targets,
+                cancel_requested,
             })
         })
     }
