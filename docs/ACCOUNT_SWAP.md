@@ -137,6 +137,8 @@ aas = "aas"              # the aas binary; the daemon also looks in /opt/homebre
 | `--no-continue` | Sends nothing (`--continue-when never`). |
 | `--dry-run` | Prints the plan and touches nothing. |
 | `--json` | Machine-readable report. |
+| `--local` | Runs the swap in this process instead of as a daemon job (see below). |
+| `--status <key>` | Shows a daemon swap job by the key it printed (or its job id) and waits for it to end. |
 
 `continue_when = "limited"` sends the follow-up only to agents whose turn was
 cut off: by a usage cap, or by the swap itself when `--force` stopped them
@@ -156,6 +158,34 @@ Each planned follow-up names why the agent is due one — `rate_limited`, then
 `cut_off`, then `always`, the first that applies — in the dry-run note and as
 `continue_reason` in `--json`. It records eligibility when the plan is made,
 not that the prompt was delivered or acted on.
+
+## Daemon jobs
+
+When the daemon runs swaps as jobs, `muxa swap` hands it the request: the
+daemon plans it, records every step in its job journal before taking it, and
+keeps any other writer (its own automation included) off a pane while the
+swap acts on it. The CLI prints the request key first, then follows the job:
+
+```console
+$ muxa swap %5 --to work@claude
+muxa swap: request cli-3f… (see it with `muxa swap --status cli-3f…`)
+```
+
+Ctrl-C only stops waiting; the job runs on, and `--status` shows it. The CLI
+never sends the request again or falls back to swapping here once it was
+sent: an unanswered start is reported with its key, to check before retrying.
+
+A pane that runs its agent directly (no shell above it) is not respawned by
+the daemon yet. The daemon names those panes in its plan, leaves them out of
+its job, and the CLI swaps them itself once the job ended cleanly, bound to the
+exact agents the daemon planned: a pane that changed in the meantime is
+skipped, never swapped as whatever runs there now. Those panes are not in the
+job's record, and get no exclusion against the daemon's automation.
+
+A daemon from before swap jobs means the whole swap runs here, as before. A
+daemon that runs swap jobs but cannot take one right now (starting, halted,
+shutting down) refuses instead; `--local` runs the swap here anyway, without
+the journal or the exclusion.
 
 ## On a Fleet host
 

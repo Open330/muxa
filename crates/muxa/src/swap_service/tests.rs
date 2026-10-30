@@ -889,6 +889,23 @@ fn a_direct_pane_is_refused_publicly_and_kept_for_automation() {
     let h = harness(Box::new(|| vec![direct("%1")]));
     let plan = h.service.plan(&overrides(&["%1"]), Origin::Public).unwrap();
     assert!(plan.outcomes[0].note.contains("runs its agent directly"));
+    // Named for the caller to act on itself, as exactly that agent.
+    assert_eq!(
+        plan.direct_targets,
+        [crate::account_swap::DirectTarget {
+            pane: "%1".into(),
+            socket: Some("/tmp/tmux-1/default".into()),
+            endpoint: endpoint_key("%1", Some("/tmp/tmux-1/default")),
+            conversation_id: "conv-%1".into(),
+        }]
+    );
+    let shell = harness(Box::new(|| vec![run("%2")]));
+    assert!(shell
+        .service
+        .plan(&overrides(&["%2"]), Origin::Public)
+        .unwrap()
+        .direct_targets
+        .is_empty());
     let public = Service::submit(
         &h.service,
         "public",

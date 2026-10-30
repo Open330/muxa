@@ -1845,7 +1845,16 @@ async fn main() -> Result<()> {
         Cmd::Snapshot(snapshot_args) => reload::snapshot(&client, snapshot_args).await,
         Cmd::Restore(restore_args) => reload::restore(client.socket(), restore_args),
         Cmd::Reload(reload_args) => reload::reload(&client, reload_args).await,
-        Cmd::Swap(swap_args) => swap::run(&client, swap_args, &cfg.swap, &cfg.accounts).await,
+        Cmd::Swap(swap_args) => {
+            swap::run(
+                &client,
+                swap_args,
+                &cfg.swap,
+                &cfg.accounts,
+                args.config.as_deref(),
+            )
+            .await
+        }
         Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
         Cmd::Prune(prune) => cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await,
     };

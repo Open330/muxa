@@ -3584,6 +3584,11 @@ const SWAP_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const SWAP_JOBS_CAPABILITY: &str = "swap_jobs_v1";
 /// `swap_plan_v1`: `swap_plan`.
 pub const SWAP_PLAN_CAPABILITY: &str = "swap_plan_v1";
+/// `swap_service_v1`: this daemon runs swaps as jobs, whether or not it can
+/// take one right now. With it and without [`SWAP_JOBS_CAPABILITY`] the
+/// service is unavailable (starting, halted, draining, slow), which a
+/// client must not mistake for a daemon that predates swap jobs.
+pub const SWAP_SERVICE_CAPABILITY: &str = "swap_service_v1";
 
 /// How long `hello` waits to learn whether swap jobs can be taken.
 const SWAP_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
@@ -3843,6 +3848,9 @@ async fn handle(
                         r.protocol = requested;
                         // Only a service that would take a job now is
                         // advertised; status stays served regardless.
+                        if let Some(capabilities) = r.capabilities.as_mut() {
+                            capabilities.push(SWAP_SERVICE_CAPABILITY);
+                        }
                         if swap_healthy(swap.as_ref()).await {
                             if let Some(capabilities) = r.capabilities.as_mut() {
                                 capabilities.push(SWAP_JOBS_CAPABILITY);
@@ -7038,12 +7046,14 @@ impl Client {
     ) -> Result<T, RuntimeError> {
         let response = self.call_with_timeout(req, SWAP_CLIENT_TIMEOUT).await?;
         if !response["ok"].as_bool().unwrap_or(false) {
-            return Err(RuntimeError::Json(serde::de::Error::custom(
+            // An answer, and a no: distinct from a request whose fate is
+            // unknown, which a caller must not treat as refused.
+            return Err(RuntimeError::Daemon(
                 response["error"]
                     .as_str()
                     .unwrap_or("swap request failed")
                     .to_string(),
-            )));
+            ));
         }
         serde_json::from_value(response["swap"].clone()).map_err(RuntimeError::Json)
     }
@@ -12777,6 +12787,7 @@ mod tests {
             Self::on_blocking_thread();
             Ok(crate::swap_service::PlanView {
                 outcomes: Vec::new(),
+                direct_targets: Vec::new(),
                 executable: self.active().is_ok(),
                 unavailable: self.active().err(),
             })
@@ -12839,7 +12850,18 @@ mod tests {
         (dir, Client::new(sock), tx, handle)
     }
 
+    /// Whether swap jobs are advertised. Every daemon of this build marks
+    /// that it runs swaps as jobs, healthy or not, so a client can tell an
+    /// unavailable service from a daemon that predates it.
     fn advertises_swap(hello: &Hello) -> bool {
+        assert!(
+            hello
+                .capabilities
+                .iter()
+                .any(|c| c == SWAP_SERVICE_CAPABILITY),
+            "{:?}",
+            hello.capabilities
+        );
         hello.capabilities.iter().any(|c| c == SWAP_JOBS_CAPABILITY)
             && hello.capabilities.iter().any(|c| c == SWAP_PLAN_CAPABILITY)
     }
