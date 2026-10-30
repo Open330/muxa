@@ -168,6 +168,7 @@ fn outcome(pane: &str, status: SwapStatus, note: &str) -> SwapOutcome {
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     }
 }
 
@@ -1419,4 +1420,40 @@ fn a_retry_with_another_configuration_is_refused() {
     .unwrap();
     settled(&h.service, &accepted.job_id);
     assert_eq!(*h.executed.lock().unwrap(), ["%a"]);
+}
+
+// --- prompt receipts ---------------------------------------------------------
+
+fn prompt(kind: AgentKind, session: &str, pane: &str) -> crate::state::PromptRecord {
+    crate::state::PromptRecord {
+        id: crate::event::AgentId {
+            kind,
+            session_id: session.into(),
+            surface: None,
+            pane: Some(pane.into()),
+            tmux_socket: Some("/tmp/tmux-1/default".into()),
+            cwd: None,
+        },
+        prompt: "secret text".into(),
+        at: time::OffsetDateTime::now_utc(),
+        model: None,
+    }
+}
+
+/// Only a hook after the cursor, from this kind's conversation on this
+/// pane, is evidence; an earlier one, or another pane's, is not.
+#[test]
+fn a_prompt_receipt_counts_only_after_its_cursor_and_on_its_pane() {
+    use crate::account_swap::TurnProbe as _;
+    let receipts = PromptReceipts::default();
+    let endpoint = endpoint_key("%1", Some("/tmp/tmux-1/default"));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1"));
+    let cursor = receipts.cursor();
+    assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%2"));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "other", "%1"));
+    receipts.record(&prompt(AgentKind::Codex, "c", "%1"));
+    assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1"));
+    assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
 }

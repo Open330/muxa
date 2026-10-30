@@ -169,6 +169,17 @@ withheld (<reason>)`, and `continue_withheld` in `--json` carries the reason.
 The half-typed draft captured before the stop goes back only into a relaunch
 that shows the binding, under either setting.
 
+A typed follow-up is reported in two parts, kept apart on purpose. What the
+transport said of its prompt and Enter (`delivered`, `refused` — it may still
+have arrived — or `unconfirmed`), and what followed within 20 seconds: the
+agent's own prompt hook for that conversation on that pane (`prompt_hook`,
+read by the daemon), the screen showing activity (`screen_activity`), or
+neither (`none_seen`, which is not proof that nothing happened). Neither part
+claims the agent did what the text asked. Both are journalled, so `--status`
+shows them after a restart, and `follow_up` in `--json` carries them. A swap
+run in this process (`--local`, a directly-run pane) has no hooks to read and
+reports the screen only.
+
 Each planned follow-up names why the agent is due one — `rate_limited`, then
 `cut_off`, then `always`, the first that applies — in the dry-run note and as
 `continue_reason` in `--json`. It records eligibility when the plan is made,

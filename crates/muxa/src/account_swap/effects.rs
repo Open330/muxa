@@ -174,7 +174,6 @@ impl<'a> Runner<'a> {
     }
 
     /// Every effect that happened, in order, with what the transport said.
-    #[cfg(test)]
     pub(super) fn log(&self) -> Vec<(Effect, Transport)> {
         self.log.borrow().clone()
     }

@@ -748,6 +748,7 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     });
     if outcome.status != status || entry.outcome.is_none() {
         let what = entry.disposition.as_deref().unwrap_or("not finished");
@@ -768,6 +769,9 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
         .filter(|decision| !matches!(*decision, "allowed" | "not_due"))
     {
         outcome.continue_withheld = Some(reason.to_owned());
+    }
+    if outcome.follow_up.is_none() {
+        outcome.follow_up.clone_from(&entry.follow_up);
     }
     if entry.uncertain_effects > 0 {
         let _ = write!(
@@ -1104,6 +1108,22 @@ fn render(outcomes: &[SwapOutcome]) -> String {
             let _ = writeln!(out, "         {}", outcome.note);
         }
         // Read back from a journal, the note may not say it.
+        if let Some(report) = outcome
+            .follow_up
+            .as_ref()
+            .filter(|_| !outcome.note.contains("follow-up") && !outcome.note.contains("sent "))
+        {
+            let _ = writeln!(
+                out,
+                "         follow-up{}: {}; {}",
+                if report.kept { " (kept session)" } else { "" },
+                report.submission,
+                report
+                    .evidence
+                    .as_deref()
+                    .unwrap_or("evidence not recorded")
+            );
+        }
         if let Some(reason) = outcome
             .continue_withheld
             .as_deref()
@@ -1380,6 +1400,7 @@ mod tests {
             uncertain_effects: 0,
             outcome: None,
             continuation: Some("binding_missing".into()),
+            follow_up: None,
         };
         assert_eq!(
             entry_outcome(&entry).continue_withheld.as_deref(),
@@ -1391,7 +1412,19 @@ mod tests {
             shown.contains("follow-up withheld (binding_missing)"),
             "{shown}"
         );
+        // The follow-up's journalled evidence is shown after a restart too.
         entry.continuation = Some("allowed".into());
+        entry.follow_up = Some(account_swap::FollowUpReport {
+            kept: false,
+            submission: "delivered".into(),
+            evidence: Some("prompt_hook".into()),
+        });
+        let shown = render(&[entry_outcome(&entry)]);
+        assert!(
+            shown.contains("follow-up: delivered; prompt_hook"),
+            "{shown}"
+        );
+        entry.follow_up = None;
         assert_eq!(entry_outcome(&entry).continue_withheld, None);
         assert!(!render(&[entry_outcome(&entry)]).contains("withheld"));
     }
@@ -1577,6 +1610,7 @@ mod tests {
             uncertain_effects: 0,
             outcome: None,
             continuation: None,
+            follow_up: None,
         });
         assert!(job_verdict(&job, "k").is_err());
         job.entries[0].disposition = Some("kept".into());
@@ -1736,6 +1770,7 @@ mod tests {
             conversation_unverified_reason: None,
             registered: None,
             continue_withheld: None,
+            follow_up: None,
         }
     }
 
@@ -1794,6 +1829,7 @@ mod tests {
             uncertain_effects: 2,
             outcome: Some(outcome("%1", SwapStatus::Swapped, "resumed")),
             continuation: None,
+            follow_up: None,
         };
         let shown = entry_outcome(&entry);
         assert_eq!(shown.status, SwapStatus::Failed);
@@ -1827,6 +1863,7 @@ mod tests {
             conversation_unverified_reason: None,
             registered: None,
             continue_withheld: None,
+            follow_up: None,
         }]);
         assert!(
             rendered.contains("e-ed@claude -> jelly@claude"),
