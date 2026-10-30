@@ -306,6 +306,11 @@ pub(crate) async fn run(
     match route {
         Route::Daemon => run_routed(client, &args, config, accounts, explicit_config).await,
         Route::Unavailable => bail!("{UNAVAILABLE}"),
+        // A relayed swap names its key: it must become that job, never an
+        // in-process swap the caller cannot find again.
+        Route::Legacy if args.request_key.is_some() => {
+            bail!("this daemon predates swap jobs; a relayed swap cannot run here as one")
+        }
         Route::Legacy if args.detach => {
             bail!("this daemon predates swap jobs, so nothing can be detached; nothing was sent")
         }
@@ -797,23 +802,19 @@ async fn run_routed(
             skipped_direct(&direct)
         ),
     };
-    let clean = view.state == "done" && view.fault.is_none();
     let daemon_half = job_outcomes(&view);
     let local = if direct.is_empty() {
         Vec::new()
-    } else if clean {
+    } else if let Some(why) = local_half_withheld(&view) {
+        eprintln!("muxa swap: {why}{}", skipped_direct(&direct));
+        Vec::new()
+    } else {
         eprintln!(
             "muxa swap: {} pane(s) run their agent directly; the daemon left them to this \
              process, which swaps them now as planned",
             direct.len()
         );
         run_planned_direct(client, &local_request, config, accounts, &direct).await?
-    } else {
-        eprintln!(
-            "muxa swap: the daemon job did not end cleanly{}",
-            skipped_direct(&direct)
-        );
-        Vec::new()
     };
     let outcomes = merge(daemon_half, &direct, local);
     report(&outcomes, args.json)?;
@@ -822,6 +823,18 @@ async fn run_routed(
         bail!("some agents could not be swapped");
     }
     Ok(())
+}
+
+/// Why the planned direct panes are not swapped here after the daemon's
+/// job: only a job that ended cleanly, and was not cancelled, lets them go.
+fn local_half_withheld(view: &JobView) -> Option<&'static str> {
+    if view.cancel_requested {
+        Some("the daemon job was cancelled")
+    } else if view.state != "done" || view.fault.is_some() {
+        Some("the daemon job did not end cleanly")
+    } else {
+        None
+    }
 }
 
 fn skipped_direct(direct: &[DirectTarget]) -> String {
@@ -1216,18 +1229,35 @@ pub(crate) fn checked_argv(words: &[String]) -> std::result::Result<Vec<String>,
 
 /// `muxa swap --host`: the host's own `muxa swap` does the work, through
 /// the Fleet transport, and its report is printed here.
-async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
+/// What a relayed swap needs of the daemon: Fleet's work command. A trait
+/// so the relay can be tested without one.
+trait Relay {
+    fn run(
+        &self,
+        host: &str,
+        argv: &[String],
+    ) -> impl Future<Output = Result<muxa::work_control::WorkCommandOutput, RuntimeError>>;
+}
+
+impl Relay for Client {
+    fn run(
+        &self,
+        host: &str,
+        argv: &[String],
+    ) -> impl Future<Output = Result<muxa::work_control::WorkCommandOutput, RuntimeError>> {
+        self.work_command(Some(host), argv, None)
+    }
+}
+
+async fn run_remote(relay: &impl Relay, args: &Args, host: &str) -> Result<()> {
     // A swap that starts a job carries a key minted here, printed before it
-    // is sent: if the answer is lost, the job is still found by it.
-    let starts = !args.dry_run && args.status.is_none() && args.cancel.is_none();
+    // is sent: if the answer is lost, the job is still found by it. An
+    // explicitly in-process run makes no job and gets none.
+    let starts = !args.dry_run && !args.local && args.status.is_none() && args.cancel.is_none();
     let key = starts.then(|| format!("cli-{}", uuid::Uuid::new_v4()));
-    let plain = remote_argv(args);
-    let keyed = key.as_ref().map(|key| {
-        let mut words = plain.clone();
-        words.push(format!("--request-key={key}"));
-        words
-    });
+    let mut words = remote_argv(args);
     if let Some(key) = &key {
+        words.push(format!("--request-key={key}"));
         eprintln!(
             "muxa swap: request {key} on {host} (see it with `muxa swap --host {host} \
              --status {key}`)"
@@ -1236,35 +1266,24 @@ async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
             eprintln!("{}", remote_wait_notice(host));
         }
     }
-    let lost = |error: anyhow::Error| match &key {
-        Some(key) => error.context(format!(
-            "the swap on {host} may or may not have been accepted; check `muxa swap --host \
-             {host} --status {key}` before trying again"
-        )),
-        None => error,
-    };
-    let output = match client
-        .work_command(Some(host), keyed.as_ref().unwrap_or(&plain), None)
-        .await
-    {
-        // A host too old for caller keys refuses the word before running
-        // anything; only then is the swap sent again, without one.
-        Err(error) if keyed.is_some() && refuses_request_key(&error.to_string()) => {
-            eprintln!("muxa swap: {host} predates caller request keys; its own key is used");
-            client
-                .work_command(Some(host), &plain, None)
-                .await
-                .map_err(|error| lost(anyhow!(error)))?
+    let output = relay.run(host, &words).await.map_err(|error| {
+        let error = anyhow!(error).context(format!("running the swap on {host}"));
+        match &key {
+            Some(key) => error.context(format!(
+                "the swap on {host} may or may not have been accepted; check `muxa swap \
+                 --host {host} --status {key}` before trying again"
+            )),
+            None => error,
         }
-        Ok(output) if keyed.is_some() && refuses_request_key(&output.stderr) => {
-            eprintln!("muxa swap: {host} predates caller request keys; its own key is used");
-            client
-                .work_command(Some(host), &plain, None)
-                .await
-                .map_err(|error| lost(anyhow!(error)))?
-        }
-        result => result.map_err(|error| lost(anyhow!(error)))?,
-    };
+    })?;
+    // Never sent again without its key: a job made under another key could
+    // not be found by the one printed above.
+    if key.is_some() && refuses_request_key(&output.stderr) {
+        bail!(
+            "{host}'s muxa is too old to take a relayed swap's key, so nothing was started \
+             there; upgrade muxa on {host}, or run the swap on it directly"
+        );
+    }
     // The host's own notices are for the user.
     for line in output
         .stderr
@@ -1278,12 +1297,7 @@ async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
     }
     let hint = key.as_deref().unwrap_or("<key>");
     if args.detach {
-        return remote_detached(
-            &output,
-            args,
-            host,
-            key.as_deref().filter(|_| keyed.is_some()),
-        );
+        return remote_detached(&output, args, host, key.as_deref());
     }
     let Ok(outcomes) = serde_json::from_str::<Vec<SwapOutcome>>(&output.stdout) else {
         bail!(
@@ -1361,8 +1375,9 @@ fn remote_detached(
         );
     };
     if let Some(key) = key.filter(|key| *key != ack.request_key) {
-        eprintln!(
-            "muxa swap: {host} answered for request {}, not {key}",
+        bail!(
+            "{host} acknowledged request {} instead of {key}, so whether {key} was accepted \
+             is unknown; check `muxa swap --host {host} --status {key}`",
             ack.request_key
         );
     }
@@ -1835,6 +1850,140 @@ mod tests {
             "{err}"
         );
         assert!(job_verdict(&job, "k", true).is_ok());
+    }
+
+    /// A relay answering with whatever `answer` makes of the argv it got,
+    /// recording every call.
+    type Answer = Result<muxa::work_control::WorkCommandOutput, RuntimeError>;
+    type Answering = Box<dyn Fn(&[String]) -> Answer>;
+
+    struct FakeRelay {
+        answer: Answering,
+        calls: std::cell::RefCell<Vec<Vec<String>>>,
+    }
+
+    impl Relay for FakeRelay {
+        fn run(
+            &self,
+            _: &str,
+            argv: &[String],
+        ) -> impl Future<Output = Result<muxa::work_control::WorkCommandOutput, RuntimeError>>
+        {
+            self.calls.borrow_mut().push(argv.to_vec());
+            let answer = (self.answer)(argv);
+            async move { answer }
+        }
+    }
+
+    fn relay(
+        answer: impl Fn(&[String]) -> Result<muxa::work_control::WorkCommandOutput, RuntimeError>
+            + 'static,
+    ) -> FakeRelay {
+        FakeRelay {
+            answer: Box::new(answer),
+            calls: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    fn sent_key(argv: &[String]) -> Option<String> {
+        argv.iter()
+            .find_map(|word| word.strip_prefix("--request-key="))
+            .map(str::to_owned)
+    }
+
+    fn output(exit_code: i32, stdout: &str, stderr: &str) -> muxa::work_control::WorkCommandOutput {
+        muxa::work_control::WorkCommandOutput {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    /// An answer lost after the host accepted the job leaves the key that
+    /// was sent as the way to find it, and nothing is sent again.
+    #[tokio::test]
+    async fn a_lost_relay_answer_points_at_the_key_it_sent() {
+        let fake = relay(|_| Err(RuntimeError::Disconnected));
+        let cli = Cli::parse_from(["swap", "%5", "--host", "rtzr"]);
+        let error = format!(
+            "{:#}",
+            run_remote(&fake, &cli.args, "rtzr").await.unwrap_err()
+        );
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let key = sent_key(&calls[0]).expect("a starting swap carries a key");
+        assert!(
+            error.contains(&format!("muxa swap --host rtzr --status {key}")),
+            "{error}"
+        );
+    }
+
+    /// A host too old for the key is told so; the swap is not sent again
+    /// under a key nobody here knows.
+    #[tokio::test]
+    async fn a_host_too_old_for_the_key_is_not_resent_to() {
+        let fake = relay(|argv| {
+            let word = argv
+                .iter()
+                .find(|w| w.starts_with("--request-key"))
+                .unwrap();
+            Ok(output(
+                1,
+                "",
+                &format!("`swap` does not accept {word:?} here"),
+            ))
+        });
+        let cli = Cli::parse_from(["swap", "%5", "--host", "rtzr"]);
+        let error = run_remote(&fake, &cli.args, "rtzr")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("too old"), "{error}");
+        assert_eq!(fake.calls.borrow().len(), 1);
+    }
+
+    /// A detach is acknowledged only for the key that was sent.
+    #[tokio::test]
+    async fn a_detach_is_acknowledged_only_for_its_own_key() {
+        let echo = relay(|argv| {
+            let key = sent_key(argv).unwrap();
+            Ok(output(
+                0,
+                &format!(r#"{{"request_key":"{key}","job_id":"swap-1","state":"running"}}"#),
+                "",
+            ))
+        });
+        let cli = Cli::parse_from(["swap", "%5", "--detach", "--host", "rtzr"]);
+        assert!(run_remote(&echo, &cli.args, "rtzr").await.is_ok());
+        let other = relay(|_| {
+            Ok(output(
+                0,
+                r#"{"request_key":"cli-other","job_id":"swap-2","state":"running"}"#,
+                "",
+            ))
+        });
+        let error = run_remote(&other, &cli.args, "rtzr")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("instead of"), "{error}");
+        // An explicitly in-process run on the host makes no job and has no key.
+        let local = relay(|_| Ok(output(0, "[]", "")));
+        let cli = Cli::parse_from(["swap", "%5", "--local", "--host", "rtzr"]);
+        run_remote(&local, &cli.args, "rtzr").await.unwrap();
+        assert_eq!(sent_key(&local.calls.borrow()[0]), None);
+    }
+
+    /// The direct panes are swapped here only after a job that ended
+    /// cleanly and was not cancelled.
+    #[test]
+    fn a_cancelled_job_leaves_the_direct_panes_alone() {
+        assert_eq!(local_half_withheld(&view("done", None)), None);
+        let mut cancelled = view("done", None);
+        cancelled.cancel_requested = true;
+        assert!(local_half_withheld(&cancelled).is_some());
+        assert!(local_half_withheld(&view("done", Some("fault"))).is_some());
+        assert!(local_half_withheld(&view("needs_reconciliation", None)).is_some());
     }
 
     #[test]
