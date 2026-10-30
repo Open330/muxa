@@ -149,6 +149,7 @@ impl AccountChoice {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::struct_excessive_bools)] // independent request switches, as on the CLI
 pub struct SwapRequest {
     pub scope: SwapScope,
     /// Restrict to one provider. `None` means Claude and Codex.
@@ -171,6 +172,9 @@ pub struct SwapRequest {
     /// through the daemon from elsewhere may not, nor a pane whose layout
     /// cannot be read.
     pub allow_direct_respawn: bool,
+    /// Put the pane's half-typed draft back after the relaunch. A retry
+    /// never does: the draft it would restore was captured by another run.
+    pub restore_draft: bool,
 }
 
 impl SwapRequest {
@@ -189,6 +193,7 @@ impl SwapRequest {
             dry_run: false,
             exclude: Vec::new(),
             allow_direct_respawn: true,
+            restore_draft: true,
         }
     }
 
@@ -1197,6 +1202,97 @@ fn bound_skip(want: &DirectTarget, session: &str, note: &str) -> SwapOutcome {
 }
 
 #[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    fn identity(pid: u32, start: Option<&str>) -> TargetIdentity {
+        TargetIdentity {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            endpoint: "%1@default".into(),
+            provider: "claude".into(),
+            conversation_id: "c".into(),
+            session_id_source: SessionIdSource::Registry,
+            conversation_verified: true,
+            process_pid: pid,
+            process_start: start.map(str::to_owned),
+            from_account: None,
+            assigned_account: None,
+            direct: false,
+        }
+    }
+
+    #[test]
+    fn only_the_planned_process_is_retried() {
+        let planned = RetryTarget {
+            endpoint: "%1@default",
+            conversation_id: "c",
+            process_pid: 10,
+            process_start: Some("100"),
+        };
+        assert!(is_planned_process(&identity(10, Some("100")), &planned));
+        // A reused pid, a replacement, an unreadable start.
+        assert!(!is_planned_process(&identity(10, Some("200")), &planned));
+        assert!(!is_planned_process(&identity(11, Some("100")), &planned));
+        assert!(!is_planned_process(&identity(10, None), &planned));
+        let mut other = identity(10, Some("100"));
+        other.conversation_id = "d".into();
+        assert!(!is_planned_process(&other, &planned));
+        let unknown = RetryTarget {
+            process_start: None,
+            ..planned
+        };
+        assert!(!is_planned_process(&identity(10, None), &unknown));
+    }
+
+    /// Swapped needs the binding and the frozen account read positively.
+    #[test]
+    fn an_observation_claims_no_more_than_it_read() {
+        let bound = || {
+            vec![(
+                5,
+                Some(vec!["claude".into(), "--resume".into(), "c".into()]),
+            )]
+        };
+        let look = |candidates: &[io::AgentArgv], landed: Landed| {
+            observed(
+                candidates,
+                AgentKind::ClaudeCode,
+                "c",
+                Some("b"),
+                move |_| match &landed {
+                    Landed::On(on) => Landed::On(on.clone()),
+                    Landed::Unreadable => Landed::Unreadable,
+                },
+            )
+        };
+        assert_eq!(
+            look(&bound(), Landed::On(Some("b".into()))),
+            "observed_swapped"
+        );
+        assert_eq!(
+            look(&bound(), Landed::On(Some("a".into()))),
+            "observed_account_mismatch"
+        );
+        assert_eq!(
+            look(&bound(), Landed::On(None)),
+            "observed_account_mismatch"
+        );
+        assert_eq!(
+            look(&bound(), Landed::Unreadable),
+            "observed_account_unconfirmed"
+        );
+        assert_eq!(look(&[], Landed::Unreadable), "observed_not_running");
+        let other = vec![(
+            5,
+            Some(vec!["claude".into(), "--resume".into(), "x".into()]),
+        )];
+        assert_eq!(look(&other, Landed::Unreadable), "observed_unbound");
+        assert_eq!(look(&[(5, None)], Landed::Unreadable), "observed_unknown");
+    }
+}
+
+#[cfg(test)]
 mod resume_binding_tests {
     use super::*;
 
@@ -1911,6 +2007,7 @@ fn swap_one(
         busy: agent.state == AgentState::Working,
         conversation_verified: *verified,
         evidence: request.continue_evidence,
+        restore_draft: request.restore_draft,
     };
     // The relaunch must land on the account it was meant for, checked before
     // any follow-up starts work on the wrong one.
@@ -2368,6 +2465,7 @@ fn locate(
     Ok((launch, pane, backend.clone()))
 }
 
+#[allow(clippy::struct_excessive_bools)] // independent facts about one pane
 struct Target {
     socket: Option<String>,
     pane: String,
@@ -2386,6 +2484,8 @@ struct Target {
     conversation_verified: bool,
     /// What the relaunch must show before a follow-up.
     evidence: ContinueEvidence,
+    /// Whether the captured draft may be put back at all.
+    restore_draft: bool,
 }
 
 /// Stop the agent, type `command` into the pane's shell, wait for the
@@ -2475,7 +2575,7 @@ fn execute(
     Ok(follow_through(
         runner,
         follow_up,
-        draft.as_deref(),
+        draft.as_deref().filter(|_| target.restore_draft),
         draft_allowed,
         withheld,
         &answered,
@@ -2486,6 +2586,167 @@ fn execute(
 /// Checks which account the relaunched agent (the process bound to the
 /// conversation, when one is) runs on.
 type Verify<'a> = dyn Fn(&Target, Option<u32>) -> Result<AccountVerdict, AccountVerdict> + 'a;
+
+/// A retried target as its parent job planned it: the agent a retry may act
+/// on, and no other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RetryTarget<'a> {
+    pub(crate) endpoint: &'a str,
+    pub(crate) conversation_id: &'a str,
+    pub(crate) process_pid: u32,
+    pub(crate) process_start: Option<&'a str>,
+}
+
+/// Plan one retried target: `request` scoped to its conversation, with its
+/// frozen account. Only the very process the parent planned — same
+/// endpoint, conversation, pid and start — is run; a replacement, a reused
+/// pid, or one whose start cannot be read is skipped.
+pub(crate) fn prepare_retry(
+    request: &SwapRequest,
+    planned: &RetryTarget<'_>,
+    agents: &[Agent],
+    backends: &[SharedBackend],
+    config: &SwapConfig,
+    accounts: &crate::accounts::AccountsConfig,
+) -> (SwapRequest, Step) {
+    let (resolved, steps) = prepare(request, agents, backends, config, accounts);
+    let mut settled = None;
+    for step in steps {
+        match step {
+            Step::Run(target) => {
+                let identity = target.identity();
+                if is_planned_process(&identity, planned) {
+                    return (resolved, Step::Run(target));
+                }
+                settled = Some(SwapOutcome {
+                    note: "skipped: not the agent its job planned (another process now, or its \
+                           start cannot be read); nothing was done"
+                        .into(),
+                    ..identity_outcome(&identity)
+                });
+            }
+            Step::Done(outcome) if settled.is_none() => settled = Some(outcome),
+            Step::Done(_) => {}
+        }
+    }
+    let outcome = settled.unwrap_or_else(|| SwapOutcome {
+        pane: None,
+        agent_session_id: planned.conversation_id.to_owned(),
+        kind: AgentKind::Unknown,
+        from: None,
+        to: None,
+        status: SwapStatus::Skipped,
+        command: None,
+        note: "skipped: no live pane runs the agent its job planned; nothing was done".into(),
+        continue_reason: None,
+        session_id_source: None,
+        conversation_verified: None,
+        conversation_unverified_reason: None,
+        registered: None,
+        continue_withheld: None,
+    });
+    (resolved, Step::Done(outcome))
+}
+
+/// The very process a parent job planned: same endpoint, conversation, pid
+/// and a readable, equal start. A reused pid has another start.
+fn is_planned_process(identity: &TargetIdentity, planned: &RetryTarget<'_>) -> bool {
+    identity.endpoint == planned.endpoint
+        && identity.conversation_id == planned.conversation_id
+        && identity.process_pid == planned.process_pid
+        && planned.process_start.is_some()
+        && identity.process_start.as_deref() == planned.process_start
+}
+
+fn identity_outcome(identity: &TargetIdentity) -> SwapOutcome {
+    SwapOutcome {
+        pane: Some(identity.pane.clone()),
+        agent_session_id: identity.conversation_id.clone(),
+        kind: AgentKind::Unknown,
+        from: identity.from_account.clone(),
+        to: identity.assigned_account.clone(),
+        status: SwapStatus::Skipped,
+        command: None,
+        note: String::new(),
+        continue_reason: None,
+        session_id_source: Some(identity.session_id_source),
+        conversation_verified: Some(identity.conversation_verified),
+        conversation_unverified_reason: None,
+        registered: None,
+        continue_withheld: None,
+    }
+}
+
+/// What a read-only look at a target's pane finds now. Makes no effect:
+/// reads the pane list, the processes under it, their arguments and, for
+/// the bound one, its environment.
+pub(crate) fn observe_target(
+    pane: &str,
+    socket: Option<&str>,
+    kind: AgentKind,
+    conversation_id: &str,
+    assigned: Option<&str>,
+    backends: &[SharedBackend],
+    accounts: &crate::accounts::AccountsConfig,
+) -> &'static str {
+    let Some(host) = crate::backend::pane_id_host_kind(pane) else {
+        return "observed_unknown";
+    };
+    let pane_pid = backends
+        .iter()
+        .filter(|backend| backend.kind() == host)
+        .flat_map(|backend| backend.list_panes())
+        .find(|info| {
+            info.pane_id == pane
+                && socket.is_none_or(|socket| info.socket.as_deref().is_none_or(|s| s == socket))
+        })
+        .map(|info| info.pane_pid);
+    let Some(pane_pid) = pane_pid else {
+        return "observed_unknown";
+    };
+    let candidates: Vec<io::AgentArgv> = pane_processes(pane_pid)
+        .into_iter()
+        .filter(|p| is_agent_process(p, kind))
+        .map(|p| (p.pid, crate::process_snapshot::process_argv(p.pid)))
+        .collect();
+    observed(&candidates, kind, conversation_id, assigned, |pid| {
+        let profiles = provider_name(kind)
+            .map(|provider| accounts.for_provider(provider))
+            .unwrap_or_default();
+        if profiles.is_empty() {
+            return Landed::Unreadable;
+        }
+        let environ = crate::accounts::process_environ(pid);
+        if environ.is_empty() {
+            return Landed::Unreadable;
+        }
+        Landed::On(
+            crate::accounts::ResolvedAccounts::new(profiles)
+                .identify(&environ)
+                .map(str::to_owned),
+        )
+    })
+}
+
+/// [`observe_target`]'s verdict from what it read.
+fn observed(
+    candidates: &[io::AgentArgv],
+    kind: AgentKind,
+    conversation_id: &str,
+    assigned: Option<&str>,
+    account_of: impl Fn(u32) -> Landed,
+) -> &'static str {
+    match resume_binding(candidates, kind, conversation_id) {
+        ResumeBinding::Bound(pid) => match account_of(pid) {
+            Landed::On(Some(on)) if Some(on.as_str()) == assigned => "observed_swapped",
+            Landed::On(_) => "observed_account_mismatch",
+            Landed::Unreadable => "observed_account_unconfirmed",
+        },
+        ResumeBinding::Missing if candidates.is_empty() => "observed_not_running",
+        ResumeBinding::Missing | ResumeBinding::Ambiguous => "observed_unbound",
+        ResumeBinding::Unreadable => "observed_unknown",
+    }
+}
 
 /// What the relaunched agent's own arguments say about the conversation it
 /// resumed.

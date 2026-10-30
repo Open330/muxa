@@ -251,6 +251,14 @@ enum RequestBody {
     SwapPlan {
         overrides: crate::swap_service::SwapOverrides,
     },
+    /// `swap_retry_v1`: retry an ended job's safely retryable targets as a
+    /// new job under `request_key`.
+    SwapJobRetry {
+        request_key: String,
+        parent: crate::swap_service::JobRef,
+        #[serde(default)]
+        overrides: crate::swap_service::RetryOverrides,
+    },
     WorkCommand {
         #[serde(default)]
         host: Option<String>,
@@ -3593,6 +3601,8 @@ const SWAP_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const SWAP_JOBS_CAPABILITY: &str = "swap_jobs_v1";
 /// `swap_plan_v1`: `swap_plan`.
 pub const SWAP_PLAN_CAPABILITY: &str = "swap_plan_v1";
+/// `swap_retry_v1`: `swap_job_retry`.
+pub const SWAP_RETRY_CAPABILITY: &str = "swap_retry_v1";
 /// `swap_service_v1`: this daemon runs swaps as jobs, whether or not it can
 /// take one right now. With it and without [`SWAP_JOBS_CAPABILITY`] the
 /// service is unavailable (starting, halted, draining, slow), which a
@@ -3864,6 +3874,7 @@ async fn handle(
                             if let Some(capabilities) = r.capabilities.as_mut() {
                                 capabilities.push(SWAP_JOBS_CAPABILITY);
                                 capabilities.push(SWAP_PLAN_CAPABILITY);
+                                capabilities.push(SWAP_RETRY_CAPABILITY);
                             }
                         }
                         r
@@ -4041,6 +4052,18 @@ async fn handle(
                     kind = "swap_job_start";
                     swap_call(swap.as_ref(), move |swap| {
                         swap.submit(&request_key, &overrides)
+                            .and_then(|accepted| to_swap_value(&accepted))
+                    })
+                    .await
+                }
+                RequestBody::SwapJobRetry {
+                    request_key,
+                    parent,
+                    overrides,
+                } => {
+                    kind = "swap_job_retry";
+                    swap_call(swap.as_ref(), move |swap| {
+                        swap.retry(&request_key, &parent, &overrides)
                             .and_then(|accepted| to_swap_value(&accepted))
                     })
                     .await
@@ -7066,6 +7089,23 @@ impl Client {
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_job_status",
             "job": job,
+        });
+        self.swap_request(&req).await
+    }
+
+    /// `swap_retry_v1`: retry `parent` under `request_key`.
+    pub async fn swap_job_retry(
+        &self,
+        request_key: &str,
+        parent: &crate::swap_service::JobRef,
+        overrides: &crate::swap_service::RetryOverrides,
+    ) -> Result<crate::swap_service::Accepted, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "swap_job_retry",
+            "request_key": request_key,
+            "parent": parent,
+            "overrides": overrides,
         });
         self.swap_request(&req).await
     }
@@ -12921,6 +12961,21 @@ mod tests {
     }
 
     impl crate::swap_service::SwapJobs for FakeSwap {
+        fn retry(
+            &self,
+            key: &str,
+            _: &crate::swap_service::JobRef,
+            overrides: &crate::swap_service::RetryOverrides,
+        ) -> Result<crate::swap_service::Accepted, String> {
+            self.submit(
+                key,
+                &crate::swap_service::SwapOverrides {
+                    force: overrides.force,
+                    ..crate::swap_service::SwapOverrides::default()
+                },
+            )
+        }
+
         fn active(&self) -> Result<(), String> {
             if self.slow_health {
                 std::thread::sleep(Duration::from_secs(2));

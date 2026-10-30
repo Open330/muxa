@@ -180,6 +180,7 @@ fn target(kind: AgentKind, direct: bool, busy: bool) -> Target {
         busy,
         conversation_verified: true,
         evidence: super::ContinueEvidence::Binding,
+        restore_draft: true,
     }
 }
 

@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa swap --retry <key>` retries an ended daemon swap job: only targets that
+  failed before their relaunch, while the very agent planned still runs, are
+  swapped again (first account, no follow-up); the rest are observed
+  read-only and reported. One retry per target attempt, claimed atomically.
+  The job store moves to schema v2 in place.
+
 ### Changed
 
 - A swap types its follow-up, and puts back the half-typed draft, only into a
