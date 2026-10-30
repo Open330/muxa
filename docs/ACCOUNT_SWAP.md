@@ -205,7 +205,7 @@ first assigned to it, and no follow-up is typed or draft restored, as those
 belonged to the first run. Any other target that did not end swapped, kept
 or skipped is only looked at, read-only, and reported as found
 (`observed_swapped`, `observed_account_unconfirmed`, `observed_unbound`,
-`observed_not_running`, …); nothing is done to it. Each target is retried by
+`observed_unknown` when no agent could be found, …); nothing is done to it. Each target is retried by
 one retry only (a second one reports `retried_elsewhere`); retry the newest
 job to go on from there. `--force` and `--continue-evidence` may be given.
 

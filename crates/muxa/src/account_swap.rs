@@ -1257,7 +1257,6 @@ mod retry_tests {
         let look = |candidates: &[io::AgentArgv], landed: Landed| {
             observed(
                 candidates,
-                true,
                 AgentKind::ClaudeCode,
                 "c",
                 Some("b"),
@@ -1283,14 +1282,8 @@ mod retry_tests {
             look(&bound(), Landed::Unreadable),
             "observed_account_unconfirmed"
         );
-        assert_eq!(look(&[], Landed::Unreadable), "observed_not_running");
-        // No agent in a scan that could not be completed proves nothing.
-        assert_eq!(
-            observed(&[], false, AgentKind::ClaudeCode, "c", Some("b"), |_| {
-                Landed::Unreadable
-            }),
-            "observed_unknown"
-        );
+        // No agent found proves no absence.
+        assert_eq!(look(&[], Landed::Unreadable), "observed_unknown");
         let other = vec![(
             5,
             Some(vec!["claude".into(), "--resume".into(), "x".into()]),
@@ -2715,46 +2708,33 @@ pub(crate) fn observe_target(
     let Some(pane_pid) = pane_pid else {
         return "observed_unknown";
     };
-    // Absence is only evidence from a scan known to be complete.
-    let (processes, complete) = match crate::process_tree::read_descendants_complete(pane_pid) {
-        Some(processes) => (processes, true),
-        None => (pane_processes(pane_pid), false),
-    };
-    let candidates: Vec<io::AgentArgv> = processes
+    let candidates: Vec<io::AgentArgv> = pane_processes(pane_pid)
         .into_iter()
         .filter(|p| is_agent_process(p, kind))
         .map(|p| (p.pid, crate::process_snapshot::process_argv(p.pid)))
         .collect();
-    observed(
-        &candidates,
-        complete,
-        kind,
-        conversation_id,
-        assigned,
-        |pid| {
-            let profiles = provider_name(kind)
-                .map(|provider| accounts.for_provider(provider))
-                .unwrap_or_default();
-            if profiles.is_empty() {
-                return Landed::Unreadable;
-            }
-            let environ = crate::accounts::process_environ(pid);
-            if environ.is_empty() {
-                return Landed::Unreadable;
-            }
-            Landed::On(
-                crate::accounts::ResolvedAccounts::new(profiles)
-                    .identify(&environ)
-                    .map(str::to_owned),
-            )
-        },
-    )
+    observed(&candidates, kind, conversation_id, assigned, |pid| {
+        let profiles = provider_name(kind)
+            .map(|provider| accounts.for_provider(provider))
+            .unwrap_or_default();
+        if profiles.is_empty() {
+            return Landed::Unreadable;
+        }
+        let environ = crate::accounts::process_environ(pid);
+        if environ.is_empty() {
+            return Landed::Unreadable;
+        }
+        Landed::On(
+            crate::accounts::ResolvedAccounts::new(profiles)
+                .identify(&environ)
+                .map(str::to_owned),
+        )
+    })
 }
 
 /// [`observe_target`]'s verdict from what it read.
 fn observed(
     candidates: &[io::AgentArgv],
-    complete: bool,
     kind: AgentKind,
     conversation_id: &str,
     assigned: Option<&str>,
@@ -2766,7 +2746,8 @@ fn observed(
             Landed::On(_) => "observed_account_mismatch",
             Landed::Unreadable => "observed_account_unconfirmed",
         },
-        ResumeBinding::Missing if candidates.is_empty() && complete => "observed_not_running",
+        // A process scan cannot prove an agent absent (a process it could
+        // not read, one under another thread): finding none is not knowing.
         ResumeBinding::Missing if candidates.is_empty() => "observed_unknown",
         ResumeBinding::Missing | ResumeBinding::Ambiguous => "observed_unbound",
         ResumeBinding::Unreadable => "observed_unknown",
