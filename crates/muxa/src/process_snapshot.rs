@@ -227,9 +227,26 @@ pub(crate) fn read_current_process_table() -> ProcessTable {
     ProcessTable::from_processes(processes)
 }
 
+/// One process's argv as the process holds it, or `None` once it has
+/// exited or its command line is unreadable.
+#[cfg(target_os = "linux")]
+pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
+    let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    // NUL-terminated words; an empty one is an argument too (`-n ""`).
+    let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
+    if raw.is_empty() {
+        return None;
+    }
+    Some(
+        raw.split(|byte| *byte == 0)
+            .map(|word| String::from_utf8_lossy(word).into_owned())
+            .collect(),
+    )
+}
+
 /// One process's argv (its image name when the command line is unreadable),
 /// or `None` once it has exited.
-#[cfg(windows)]
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let pid = Pid::from_u32(pid);

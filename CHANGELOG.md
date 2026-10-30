@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A swap types its follow-up, and puts back the half-typed draft, only into a
+  relaunch whose own process arguments resume exactly the planned
+  conversation. Otherwise the agent is relaunched and left alone, and the
+  report says why (`continue_withheld`). `[swap] continue_evidence =
+  "verified"` (or `--continue-evidence verified`) also requires the
+  conversation read from the stopped process and the account confirmed before
+  the follow-up; the default `binding` keeps today's behaviour for a normal
+  resume.
+
 - `muxa swap` runs as a daemon job when the daemon offers swap jobs: it prints
   a request key, follows the journalled job, and `muxa swap --status <key>`
   reads it back. Ctrl-C only stops waiting; nothing is re-sent or run locally

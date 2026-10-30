@@ -22,7 +22,7 @@ use crate::backend::SharedBackend;
 use crate::event::{AgentKind, AgentState};
 use crate::process_snapshot::ProcessInfo;
 use crate::state::Agent;
-use crate::swap_job::{Observation, Phase, Readiness};
+use crate::swap_job::{ContinueDecision, Observation, Phase, Readiness, WithheldReason};
 use effects::{Purpose, Runner};
 use io::Clock;
 use serde::{Deserialize, Serialize};
@@ -55,6 +55,8 @@ pub struct SwapConfig {
     pub continue_text: String,
     /// Which swapped agents get [`Self::continue_text`].
     pub continue_when: ContinueWhen,
+    /// What a relaunch must show before the follow-up is typed into it.
+    pub continue_evidence: ContinueEvidence,
     /// The `aas` binary muxa queries for candidates. The daemon may not
     /// inherit the login shell's `PATH`, so a bare `aas` is also looked for
     /// in the usual install locations.
@@ -67,6 +69,7 @@ impl Default for SwapConfig {
             bare: BareMode::Skip,
             continue_text: "continue".into(),
             continue_when: ContinueWhen::Limited,
+            continue_evidence: ContinueEvidence::Binding,
             aas: "aas".into(),
         }
     }
@@ -93,6 +96,22 @@ pub enum ContinueWhen {
     Limited,
     Always,
     Never,
+}
+
+/// The evidence a relaunched agent must show before a follow-up is typed
+/// into it. Either way the pane's half-typed draft is only put back into a
+/// relaunch that shows the resume binding.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum ContinueEvidence {
+    /// The relaunched process's own arguments resume exactly the planned
+    /// conversation.
+    #[default]
+    Binding,
+    /// That, and the conversation was read from the stopped process itself,
+    /// and the relaunch was confirmed on the assigned account.
+    Verified,
 }
 
 /// Which agents a swap touches.
@@ -142,6 +161,7 @@ pub struct SwapRequest {
     /// "who gets it" by [`SwapRequest::continue_for`].
     pub continue_text: Option<String>,
     pub continue_when: ContinueWhen,
+    pub continue_evidence: ContinueEvidence,
     /// Plan only: report what would happen, touch nothing.
     pub dry_run: bool,
     /// Panes left alone whatever the scope: the caller's own, for one.
@@ -165,6 +185,7 @@ impl SwapRequest {
             bare: config.bare,
             continue_text: Some(config.continue_text.clone()).filter(|t| !t.trim().is_empty()),
             continue_when: config.continue_when,
+            continue_evidence: config.continue_evidence,
             dry_run: false,
             exclude: Vec::new(),
             allow_direct_respawn: true,
@@ -232,6 +253,11 @@ pub struct SwapOutcome {
     /// own hooks: its state is a guess.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered: Option<bool>,
+    /// Why a follow-up that was due was not typed (`binding_missing`,
+    /// `unverified_conversation`, …): the relaunch did not show the
+    /// evidence `continue_evidence` asks for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continue_withheld: Option<String>,
 }
 
 /// The evidence a swap resumed a conversation by.
@@ -276,6 +302,7 @@ impl SwapOutcome {
             conversation_verified: None,
             conversation_unverified_reason: None,
             registered: Some(resumable_id(&agent.session_id)),
+            continue_withheld: None,
         }
     }
 }
@@ -515,13 +542,26 @@ enum Landed {
 }
 
 /// The configured account the relaunched agent in `target`'s pane runs on.
-fn resumed_account(target: &Target, resolved: &crate::accounts::ResolvedAccounts) -> Landed {
-    let Some(agent) = pane_processes(target.pane_pid.get()).into_iter().find(|p| {
-        is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str())
-    }) else {
+/// The process bound to the conversation is the one read; with none bound
+/// the first agent process naming the conversation is, which can only
+/// refuse a swap, never let a follow-up through.
+fn resumed_account(
+    target: &Target,
+    bound: Option<u32>,
+    resolved: &crate::accounts::ResolvedAccounts,
+) -> Landed {
+    let pid = bound.or_else(|| {
+        pane_processes(target.pane_pid.get())
+            .into_iter()
+            .find(|p| {
+                is_agent_process(p, target.kind) && p.cmdline.contains(target.session_id.as_str())
+            })
+            .map(|p| p.pid)
+    });
+    let Some(pid) = pid else {
         return Landed::On(None);
     };
-    let environ = crate::accounts::process_environ(agent.pid);
+    let environ = crate::accounts::process_environ(pid);
     if environ.is_empty() {
         return Landed::Unreadable;
     }
@@ -1152,6 +1192,139 @@ fn bound_skip(want: &DirectTarget, session: &str, note: &str) -> SwapOutcome {
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,
+        continue_withheld: None,
+    }
+}
+
+#[cfg(test)]
+mod resume_binding_tests {
+    use super::*;
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| (*w).to_owned()).collect()
+    }
+
+    fn claude(words: &[&str]) -> ArgvResume {
+        argv_resumes(&argv(words), AgentKind::ClaudeCode, "abc")
+    }
+
+    fn codex(words: &[&str]) -> ArgvResume {
+        argv_resumes(&argv(words), AgentKind::Codex, "abc")
+    }
+
+    #[test]
+    fn claude_resumes_only_by_its_own_option() {
+        use ArgvResume::{Conflicting, Exact, Other};
+        assert_eq!(claude(&["claude", "--resume", "abc"]), Exact);
+        assert_eq!(
+            claude(&[
+                "/x/claude",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "abc"
+            ]),
+            Exact
+        );
+        assert_eq!(claude(&["claude", "--resume=abc"]), Exact);
+        assert_eq!(claude(&["claude", "-r", "abc", "fix it"]), Exact);
+        assert_eq!(claude(&["node", "claude", "--resume", "abc"]), Exact);
+        // Prefixes, other ids, the picker, and no resume at all.
+        assert_eq!(claude(&["claude", "--resume", "abcd"]), Other);
+        assert_eq!(claude(&["claude", "--resume", "ab"]), Other);
+        assert_eq!(claude(&["claude", "--resume"]), Other);
+        assert_eq!(claude(&["claude", "--resume", "--model", "x"]), Other);
+        assert_eq!(claude(&["claude"]), Other);
+        // Prompt text is one word, an option's value is not an option, and
+        // nothing after `--` is.
+        assert_eq!(claude(&["claude", "please --resume abc"]), Other);
+        assert_eq!(
+            claude(&["claude", "--append-system-prompt", "--resume", "abc"]),
+            Other
+        );
+        assert_eq!(claude(&["claude", "--", "--resume", "abc"]), Other);
+        // A new session id, before or after the resume; an option's value
+        // that reads like the flag is not the flag.
+        assert_eq!(
+            claude(&["claude", "--resume", "abc", "--fork-session"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&["claude", "--fork-session", "--resume", "abc"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&["claude", "--session-id", "x", "--resume", "abc"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&["claude", "--session-id=x", "--resume", "abc"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&[
+                "claude",
+                "--append-system-prompt",
+                "--fork-session",
+                "--resume",
+                "abc"
+            ]),
+            Exact
+        );
+        // Twice, or alongside another.
+        assert_eq!(
+            claude(&["claude", "--resume", "abc", "--resume=abc"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&["claude", "--resume", "x", "--resume", "abc"]),
+            Conflicting
+        );
+        // Not this provider.
+        assert_eq!(claude(&["codex", "--resume", "abc"]), Other);
+    }
+
+    #[test]
+    fn codex_resumes_only_through_its_subcommand() {
+        use ArgvResume::{Exact, Other};
+        assert_eq!(codex(&["codex", "resume", "abc"]), Exact);
+        assert_eq!(
+            codex(&["/x/codex", "--yolo", "-C", "/w", "resume", "abc"]),
+            Exact
+        );
+        assert_eq!(
+            codex(&["codex", "-c", "k=v", "resume", "--yolo", "abc", "go on"]),
+            Exact
+        );
+        assert_eq!(codex(&["node", "/x/bin/codex", "resume", "abc"]), Exact);
+        assert_eq!(codex(&["codex", "resume", "abcd"]), Other);
+        assert_eq!(codex(&["codex", "resume", "--last"]), Other);
+        assert_eq!(codex(&["codex", "resume"]), Other);
+        // A prompt is not a subcommand, and an option's value is not either.
+        assert_eq!(codex(&["codex", "please resume abc"]), Other);
+        assert_eq!(codex(&["codex", "exec", "resume", "abc"]), Other);
+        assert_eq!(codex(&["codex", "-m", "resume", "abc"]), Other);
+    }
+
+    #[test]
+    fn exactly_one_bound_process_is_a_binding() {
+        let resumed = || Some(argv(&["codex", "resume", "abc"]));
+        let other = || Some(argv(&["codex", "resume", "zzz"]));
+        let bind = |c: &[(u32, Option<Vec<String>>)]| resume_binding(c, AgentKind::Codex, "abc");
+        assert_eq!(
+            bind(&[(1, other()), (2, resumed())]),
+            ResumeBinding::Bound(2)
+        );
+        assert_eq!(
+            bind(&[(1, resumed()), (2, resumed())]),
+            ResumeBinding::Ambiguous
+        );
+        assert_eq!(bind(&[(1, other()), (2, None)]), ResumeBinding::Unreadable);
+        assert_eq!(
+            bind(&[(1, resumed()), (2, None)]),
+            ResumeBinding::Unreadable
+        );
+        assert_eq!(bind(&[(1, other())]), ResumeBinding::Missing);
+        assert_eq!(bind(&[]), ResumeBinding::Missing);
     }
 }
 
@@ -1645,6 +1818,7 @@ fn profile_steps(
 }
 
 /// Carry one planned target through to its outcome.
+#[allow(clippy::too_many_lines)] // one target's whole swap, in the order it happens
 fn swap_one(
     request: &SwapRequest,
     planned: &Planned,
@@ -1700,7 +1874,7 @@ fn swap_one(
     if request.dry_run {
         outcome.status = SwapStatus::Planned;
         if let Some((text, reason)) = due {
-            outcome.note = format!("then send {text:?} ({reason})");
+            outcome.note = planned_follow_up(request.continue_evidence, *verified, text, reason);
         }
         return outcome;
     }
@@ -1735,10 +1909,13 @@ fn swap_one(
         kind: agent.kind,
         session_id: session_id.clone(),
         busy: agent.state == AgentState::Working,
+        conversation_verified: *verified,
+        evidence: request.continue_evidence,
     };
     // The relaunch must land on the account it was meant for, checked before
     // any follow-up starts work on the wrong one.
-    let verify = |target: &Target| verify_account(target, profiles, &account);
+    let verify =
+        |target: &Target, bound: Option<u32>| verify_account(target, bound, profiles, &account);
     let binding = crate::swap_job::Observation::Binding {
         pid: launch.agent_pid,
         process_start: planned.process_start.clone(),
@@ -1749,12 +1926,33 @@ fn swap_one(
         backend,
         target: &target,
     };
-    let (status, note) = run_live(
+    let (status, note, withheld) = run_live(
         &io, &target, launch, &command, follow_up, &verify, &binding, observer,
     );
     outcome.status = status;
     outcome.note = note;
+    outcome.continue_withheld = withheld;
     outcome
+}
+
+/// The plan's note for a due follow-up. Whether it is typed depends on what
+/// the relaunch shows, which a plan cannot know yet.
+fn planned_follow_up(
+    evidence: ContinueEvidence,
+    verified: bool,
+    text: &str,
+    reason: ContinueReason,
+) -> String {
+    let condition = match evidence {
+        ContinueEvidence::Binding => "if the relaunch resumes this conversation",
+        ContinueEvidence::Verified if !verified => {
+            "withheld: the conversation was not read from the process (verified)"
+        }
+        ContinueEvidence::Verified => {
+            "if the relaunch resumes this conversation on the assigned account (verified)"
+        }
+    };
+    format!("then send {text:?} ({reason}), {condition}")
 }
 
 /// [`execute`] on a live pane, as a report status and note.
@@ -1765,10 +1963,10 @@ fn run_live(
     launch: &PaneLaunch,
     command: &str,
     follow_up: Option<&str>,
-    verify: &dyn Fn(&Target) -> Result<AccountVerdict, AccountVerdict>,
+    verify: &Verify<'_>,
     binding: &crate::swap_job::Observation,
     observer: &mut dyn effects::EffectObserver,
-) -> (SwapStatus, String) {
+) -> (SwapStatus, String, Option<String>) {
     let runner = Runner::new(io, observer);
     // The process and conversation acted on, recorded before anything is.
     let executed = if runner.observe(binding.clone()) {
@@ -1776,20 +1974,33 @@ fn run_live(
     } else {
         Err(halt(&runner))
     };
-    match (runner.halted(), executed) {
+    let withheld = runner
+        .observations()
+        .iter()
+        .rev()
+        .find_map(|observed| match observed {
+            Observation::Continuation {
+                withheld: Some(reason),
+                ..
+            } => Some(reason.to_string()),
+            _ => None,
+        });
+    let (status, note) = match (runner.halted(), executed) {
         // An observer that could not record an effect stopped the run; what
         // the executor said after that is not the whole story.
         (Some(why), _) => (SwapStatus::Failed, why),
         (None, Ok(note)) => (SwapStatus::Swapped, note),
         (None, Err(Refusal::Failed(note))) => (SwapStatus::Failed, note),
         (None, Err(Refusal::Kept(note))) => (SwapStatus::Skipped, note),
-    }
+    };
+    (status, note, withheld)
 }
 
 /// Check which account the relaunched agent in `target` runs on, against
 /// the one it was assigned. `Err` refuses the swap; `Ok` carries a caveat.
 fn verify_account(
     target: &Target,
+    bound: Option<u32>,
     profiles: Option<(
         &[crate::accounts::AccountProfile],
         &crate::accounts::ResolvedAccounts,
@@ -1805,7 +2016,7 @@ fn verify_account(
             note: String::new(),
         });
     };
-    match resumed_account(target, resolved) {
+    match resumed_account(target, bound, resolved) {
         Landed::On(landed) if landed.as_deref() != Some(account) => Err(AccountVerdict {
             check: if landed.is_some() {
                 AccountCheck::Mismatched
@@ -2105,6 +2316,7 @@ fn unresolved(target: &str, note: &str) -> SwapOutcome {
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,
+        continue_withheld: None,
     }
 }
 
@@ -2170,6 +2382,10 @@ struct Target {
     session_id: String,
     /// Mid-turn when the swap began (`--force`).
     busy: bool,
+    /// The conversation was read from the stopped process itself.
+    conversation_verified: bool,
+    /// What the relaunch must show before a follow-up.
+    evidence: ContinueEvidence,
 }
 
 /// Stop the agent, type `command` into the pane's shell, wait for the
@@ -2180,7 +2396,7 @@ fn execute(
     launch: &PaneLaunch,
     command: &str,
     follow_up: Option<&str>,
-    verify: &dyn Fn(&Target) -> Result<AccountVerdict, AccountVerdict>,
+    verify: &Verify<'_>,
 ) -> Result<String, Refusal> {
     let io = runner.io;
     let mut answered: Vec<&'static str> = Vec::new();
@@ -2234,15 +2450,268 @@ fn execute(
         runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
     await_ready(runner, target, &mut answered)?;
-    let checked = check_account(runner, target, verify)?;
+    let binding = resume_binding(
+        &io.agent_argvs(target.pane_pid.get()),
+        target.kind,
+        &target.session_id,
+    );
+    let (checked, account) = check_account(runner, target, verify, binding.pid())?;
+    let (decision, withheld, draft_allowed) = decide_continuation(
+        target.evidence,
+        follow_up.is_some(),
+        &binding,
+        target.conversation_verified,
+        account,
+    );
+    // Decided, and recorded, before anything is typed.
+    if !runner.observe(Observation::Continuation {
+        decision,
+        withheld,
+        draft_allowed,
+    }) {
+        return Err(halt(runner));
+    }
     enter(runner, Phase::FollowThrough)?;
     Ok(follow_through(
         runner,
         follow_up,
         draft.as_deref(),
+        draft_allowed,
+        withheld,
         &answered,
         &checked,
     ))
+}
+
+/// Checks which account the relaunched agent (the process bound to the
+/// conversation, when one is) runs on.
+type Verify<'a> = dyn Fn(&Target, Option<u32>) -> Result<AccountVerdict, AccountVerdict> + 'a;
+
+/// What the relaunched agent's own arguments say about the conversation it
+/// resumed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeBinding {
+    /// Exactly one agent process resumes exactly the planned conversation.
+    Bound(u32),
+    Missing,
+    Ambiguous,
+    Unreadable,
+}
+
+impl ResumeBinding {
+    fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Bound(pid) => Some(*pid),
+            _ => None,
+        }
+    }
+}
+
+/// The binding among `candidates` (agent processes and their arguments).
+pub(crate) fn resume_binding(
+    candidates: &[io::AgentArgv],
+    kind: AgentKind,
+    session_id: &str,
+) -> ResumeBinding {
+    let mut bound = Vec::new();
+    let mut unreadable = false;
+    let mut ambiguous = false;
+    for (pid, argv) in candidates {
+        match argv
+            .as_deref()
+            .map(|argv| argv_resumes(argv, kind, session_id))
+        {
+            Some(ArgvResume::Exact) => bound.push(*pid),
+            Some(ArgvResume::Conflicting) => ambiguous = true,
+            Some(ArgvResume::Other) => {}
+            None => unreadable = true,
+        }
+    }
+    match bound.as_slice() {
+        // An agent process whose arguments cannot be read may be another
+        // match, or the pane's real agent: no binding until it is excluded.
+        [_] if unreadable && !ambiguous => ResumeBinding::Unreadable,
+        [pid] if !ambiguous => ResumeBinding::Bound(*pid),
+        [] if ambiguous => ResumeBinding::Ambiguous,
+        [] if unreadable => ResumeBinding::Unreadable,
+        [] => ResumeBinding::Missing,
+        _ => ResumeBinding::Ambiguous,
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ArgvResume {
+    /// Resumes exactly `session_id`, once.
+    Exact,
+    /// Names `session_id` as well as another, or more than once.
+    Conflicting,
+    /// Resumes something else, or nothing.
+    Other,
+}
+
+/// Claude options that take one value, whose value is never an option even
+/// if it reads like one.
+const CLAUDE_VALUE_OPTIONS: &[&str] = &[
+    "--agent",
+    "--agents",
+    "--append-system-prompt",
+    "--append-system-prompt-file",
+    "--autocompact",
+    "--debug-file",
+    "--effort",
+    "--environment",
+    "--fallback-model",
+    "--input-format",
+    "--json-schema",
+    "--max-budget-usd",
+    "--max-turns",
+    "--model",
+    "-n",
+    "--name",
+    "--output-format",
+    "--permission-mode",
+    "--permission-prompt-tool",
+    "--permission-prompts",
+    "--plugin-dir",
+    "--plugin-url",
+    "--remote-control-session-name-prefix",
+    "--session-id",
+    "--setting-sources",
+    "--settings",
+    "--system-prompt",
+    "--system-prompt-file",
+];
+
+/// Whether `argv` (a process's own arguments) resumes `session_id`, read by
+/// the provider's grammar: Claude's `--resume <id>` / `--resume=<id>` /
+/// `-r <id>` option, Codex's `resume <id>` subcommand. A prompt argument
+/// is one word, so text inside it never reads as an option.
+pub(crate) fn argv_resumes(argv: &[String], kind: AgentKind, session_id: &str) -> ArgvResume {
+    let Some(program) = argv
+        .iter()
+        .take(2)
+        .position(|word| crate::discovery::classify_command(word) == Some(kind))
+    else {
+        return ArgvResume::Other;
+    };
+    let words = &argv[program + 1..];
+    let named = match kind {
+        AgentKind::Codex => codex_resumed(words),
+        _ => claude_resumed(words),
+    };
+    match named.as_slice() {
+        [] => ArgvResume::Other,
+        [Some(id)] if *id == session_id => ArgvResume::Exact,
+        many if many.contains(&Some(session_id)) => ArgvResume::Conflicting,
+        _ => ArgvResume::Other,
+    }
+}
+
+/// Every conversation Claude's arguments resume (`None`: the picker, or a
+/// mode that gives the resumed conversation a new session id —
+/// `--fork-session`, `--session-id` — so it is not the one planned).
+fn claude_resumed(words: &[String]) -> Vec<Option<&str>> {
+    let mut named = Vec::new();
+    let mut i = 0;
+    while let Some(word) = words.get(i) {
+        let word = word.as_str();
+        if word == "--" {
+            break;
+        }
+        if word == "--fork-session" || word == "--session-id" || word.starts_with("--session-id=") {
+            named.push(None);
+        }
+        if CLAUDE_VALUE_OPTIONS.contains(&word) {
+            i += 2;
+            continue;
+        }
+        if word == "--resume" || word == "-r" {
+            let id = words.get(i + 1).filter(|next| !next.starts_with('-'));
+            named.push(id.map(String::as_str));
+            i += if id.is_some() { 2 } else { 1 };
+            continue;
+        }
+        if let Some(id) = word.strip_prefix("--resume=") {
+            named.push(Some(id));
+        }
+        i += 1;
+    }
+    named
+}
+
+/// The conversation Codex's `resume` subcommand names: none when it is not
+/// `resume`, `[None]` for `resume` with no id or `--last`.
+fn codex_resumed(words: &[String]) -> Vec<Option<&str>> {
+    let options = crate::adapters::proc_ancestry::CODEX_VALUE_OPTIONS;
+    let mut words = words.iter().map(String::as_str);
+    let mut positional = false;
+    // The subcommand: the first positional word.
+    loop {
+        let Some(word) = words.next() else {
+            return Vec::new();
+        };
+        if positional || !word.starts_with('-') {
+            if word != "resume" {
+                return Vec::new();
+            }
+            break;
+        }
+        if word == "--" {
+            positional = true;
+        } else if options.contains(&word) {
+            words.next();
+        }
+    }
+    let mut positional = false;
+    while let Some(word) = words.next() {
+        if positional || !word.starts_with('-') {
+            return vec![Some(word)];
+        }
+        match word {
+            "--" => positional = true,
+            "--last" => return vec![None],
+            _ if options.contains(&word) => {
+                words.next();
+            }
+            _ => {}
+        }
+    }
+    vec![None]
+}
+
+/// Whether the follow-up may be typed, why not, and whether the draft may
+/// be put back. The draft needs the binding whatever the policy: it is the
+/// user's own text, never typed into a pane that may run something else.
+pub(crate) fn decide_continuation(
+    evidence: ContinueEvidence,
+    due: bool,
+    binding: &ResumeBinding,
+    conversation_verified: bool,
+    account: crate::swap_job::AccountCheck,
+) -> (ContinueDecision, Option<WithheldReason>, bool) {
+    let draft_allowed = matches!(binding, ResumeBinding::Bound(_));
+    if !due {
+        return (ContinueDecision::NotDue, None, draft_allowed);
+    }
+    let withheld = match binding {
+        ResumeBinding::Missing => Some(WithheldReason::BindingMissing),
+        ResumeBinding::Ambiguous => Some(WithheldReason::BindingAmbiguous),
+        ResumeBinding::Unreadable => Some(WithheldReason::BindingUnreadable),
+        ResumeBinding::Bound(_) if evidence == ContinueEvidence::Verified => {
+            if !conversation_verified {
+                Some(WithheldReason::UnverifiedConversation)
+            } else if account != crate::swap_job::AccountCheck::Matched {
+                Some(WithheldReason::AccountUnconfirmed)
+            } else {
+                None
+            }
+        }
+        ResumeBinding::Bound(_) => None,
+    };
+    match withheld {
+        Some(reason) => (ContinueDecision::Withheld, Some(reason), draft_allowed),
+        None => (ContinueDecision::Allowed, None, draft_allowed),
+    }
 }
 
 /// Wait for the relaunched agent's conversation to be usable, answering its
@@ -2317,10 +2786,11 @@ fn await_ready(
 fn check_account(
     runner: &Runner,
     target: &Target,
-    verify: &dyn Fn(&Target) -> Result<AccountVerdict, AccountVerdict>,
-) -> Result<String, Refusal> {
+    verify: &Verify<'_>,
+    bound: Option<u32>,
+) -> Result<(String, crate::swap_job::AccountCheck), Refusal> {
     enter(runner, Phase::Verifying)?;
-    let (accepted, verdict) = match verify(target) {
+    let (accepted, verdict) = match verify(target, bound) {
         Ok(verdict) => (true, verdict),
         Err(verdict) => (false, verdict),
     };
@@ -2338,7 +2808,7 @@ fn check_account(
         )
         .into());
     }
-    Ok(verdict.note)
+    Ok((verdict.note, verdict.check))
 }
 
 /// Record entering `phase`; a phase that cannot be recorded stops the run.
@@ -2365,6 +2835,8 @@ fn follow_through(
     runner: &Runner,
     follow_up: Option<&str>,
     draft: Option<&str>,
+    draft_allowed: bool,
+    withheld: Option<WithheldReason>,
     answered: &[&'static str],
     checked: &str,
 ) -> String {
@@ -2375,15 +2847,27 @@ fn follow_through(
         format!(" ({}){checked}", answered.join(", "))
     };
     // The draft goes back after the follow-up: typed first, the two would
-    // be submitted as one prompt.
+    // be submitted as one prompt. Never into a relaunch that does not show
+    // it resumed the conversation the draft was typed into.
     let restore = |note: String| match draft {
+        Some(_) if !draft_allowed => {
+            format!("{note}; the half-typed prompt was not put back (resume binding unconfirmed)")
+        }
         Some(text) if runner.send_prompt(runner.group(), Purpose::RestoreDraft, text) => {
             format!("{note}; restored the half-typed prompt")
         }
         _ => note,
     };
+    let resumed = if draft_allowed {
+        "resumed"
+    } else {
+        "relaunched; resume binding unconfirmed"
+    };
+    if let Some(reason) = withheld {
+        return restore(format!("{resumed}{answers}; follow-up withheld ({reason})"));
+    }
     let Some(text) = follow_up else {
-        return restore(format!("resumed{answers}"));
+        return restore(format!("{resumed}{answers}"));
     };
     if !send_follow_up(runner, Purpose::FollowUp, text) {
         return restore(format!("resumed{answers}; follow-up could not be typed"));

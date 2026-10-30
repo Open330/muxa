@@ -390,6 +390,7 @@ const SWAP_VALUE_FLAGS: &[&str] = &[
     "--continue",
     "--continue-text",
     "--continue-when",
+    "--continue-evidence",
     "--exclude",
     "--status",
 ];

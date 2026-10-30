@@ -126,6 +126,7 @@ why each account was passed over.
 bare = "skip"            # skip | wrap: agents started without aas
 continue_text = "continue"
 continue_when = "limited" # limited | always | never
+continue_evidence = "binding" # binding | verified
 aas = "aas"              # the aas binary; the daemon also looks in /opt/homebrew/bin etc.
 ```
 
@@ -135,6 +136,7 @@ aas = "aas"              # the aas binary; the daemon also looks in /opt/homebre
 | `--continue-text "<text>"` | `continue_text`: the wording only. Who gets it is still `continue_when`. |
 | `--continue-when limited\|always\|never` | `continue_when`: which swapped agents get the follow-up. |
 | `--no-continue` | Sends nothing (`--continue-when never`). |
+| `--continue-evidence binding\|verified` | `continue_evidence`: what the relaunch must show before the follow-up is typed. |
 | `--dry-run` | Prints the plan and touches nothing. |
 | `--json` | Machine-readable report. |
 | `--local` | Runs the swap in this process instead of as a daemon job (see below). |
@@ -153,6 +155,18 @@ to send the text to every swapped agent, idle ones included; it now keeps the
 A Fleet host running an older `muxa` refuses the new options rather than
 reading the old meaning. A blank `--continue-text ""` sends nothing, here and
 on a host alike.
+
+A due follow-up is only typed into a relaunch that shows it resumed the right
+conversation. With `continue_evidence = "binding"` (the default) the relaunched
+agent process's own arguments must resume exactly the planned conversation
+(`--resume <id>` for Claude, `resume <id>` for Codex), on one process only.
+`"verified"` also needs the conversation to have been read from the stopped
+process itself, and the relaunch confirmed on the assigned account. When the
+evidence is missing the agent is still relaunched, but nothing is typed into
+it: the report says `relaunched; resume binding unconfirmed` or `follow-up
+withheld (<reason>)`, and `continue_withheld` in `--json` carries the reason.
+The half-typed draft captured before the stop goes back only into a relaunch
+that shows the binding, under either setting.
 
 Each planned follow-up names why the agent is due one — `rate_limited`, then
 `cut_off`, then `always`, the first that applies — in the dry-run note and as

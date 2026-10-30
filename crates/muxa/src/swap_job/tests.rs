@@ -561,3 +561,47 @@ fn an_open_intent_blocks_every_journal_for_that_attempt() {
         .finish_target(&lease, &job, 0, 1, Disposition::NeedsReconciliation)
         .unwrap();
 }
+
+/// The follow-up decision is read back from the journal, the latest one
+/// per target, after the manager that made it is gone.
+#[test]
+fn the_follow_up_decision_survives_in_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 2);
+    assert_eq!(store.status(&job).unwrap().targets[0].continuation, None);
+    store
+        .observe(
+            &lease,
+            &job,
+            0,
+            1,
+            &Observation::Continuation {
+                decision: ContinueDecision::Withheld,
+                withheld: Some(WithheldReason::BindingMissing),
+                draft_allowed: false,
+            },
+        )
+        .unwrap();
+    store
+        .observe(
+            &lease,
+            &job,
+            1,
+            1,
+            &Observation::Continuation {
+                decision: ContinueDecision::NotDue,
+                withheld: None,
+                draft_allowed: true,
+            },
+        )
+        .unwrap();
+    drop(store);
+    let status = open(&dir).status(&job).unwrap();
+    assert_eq!(
+        status.targets[0].continuation.as_deref(),
+        Some("binding_missing")
+    );
+    assert_eq!(status.targets[1].continuation.as_deref(), Some("not_due"));
+}

@@ -294,6 +294,42 @@ pub(crate) enum Observation {
     Phase {
         phase: Phase,
     },
+    /// Whether the follow-up and the draft may be typed, decided from the
+    /// relaunch's evidence before either is. Not that they were sent: the
+    /// effects record that.
+    Continuation {
+        decision: ContinueDecision,
+        withheld: Option<WithheldReason>,
+        draft_allowed: bool,
+    },
+}
+
+/// Whether a due follow-up may be typed into the relaunched agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum ContinueDecision {
+    Allowed,
+    /// No follow-up was due.
+    NotDue,
+    Withheld,
+}
+
+/// Why a due follow-up was withheld.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum WithheldReason {
+    /// No relaunched agent process resumes exactly the planned conversation.
+    BindingMissing,
+    /// More than one does, or one resumes it more than once.
+    BindingAmbiguous,
+    /// An agent process's arguments could not be read.
+    BindingUnreadable,
+    /// `verified`: the conversation was taken on the registry's word.
+    UnverifiedConversation,
+    /// `verified`: the relaunch's account was not confirmed.
+    AccountUnconfirmed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -339,6 +375,9 @@ pub(crate) struct TargetStatus {
     /// or may not have happened.
     pub(crate) uncertain_effects: u32,
     pub(crate) effects: u32,
+    /// The follow-up decision: `allowed`, `not_due`, or why it was
+    /// withheld. `None` before one was made.
+    pub(crate) continuation: Option<String>,
 }
 
 /// What [`SwapJobStore::create_job`] did.
@@ -792,7 +831,10 @@ impl SwapJobStore {
                             AND e.target_id = t.target_id AND e.attempt = t.attempt
                             AND e.state = 'intent'),
                         (SELECT COUNT(*) FROM effects e WHERE e.job_id = t.job_id
-                            AND e.target_id = t.target_id AND e.attempt = t.attempt)
+                            AND e.target_id = t.target_id AND e.attempt = t.attempt),
+                        (SELECT o.value_json FROM observations o WHERE o.job_id = t.job_id
+                            AND o.target_id = t.target_id AND o.attempt = t.attempt
+                            AND o.kind = 'continuation' ORDER BY o.seq DESC LIMIT 1)
                  FROM targets t WHERE t.job_id = ?1 ORDER BY t.target_id, t.attempt",
             )?;
             let targets = statement
@@ -805,6 +847,18 @@ impl SwapJobStore {
                         reason: row.get(4)?,
                         uncertain_effects: row.get(5)?,
                         effects: row.get(6)?,
+                        continuation: row
+                            .get::<_, Option<String>>(7)?
+                            .and_then(|json| serde_json::from_str::<Observation>(&json).ok())
+                            .and_then(|observation| match observation {
+                                Observation::Continuation {
+                                    decision, withheld, ..
+                                } => Some(withheld.map_or_else(
+                                    || decision.to_string(),
+                                    |reason| reason.to_string(),
+                                )),
+                                _ => None,
+                            }),
                     })
                 })?
                 .collect::<Result<_, _>>()?;
