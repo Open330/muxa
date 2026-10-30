@@ -88,6 +88,7 @@ fn recovery_action(
     let mut action = parent.clone();
     action.id = id;
     action.late_replies.clear();
+    action.retirement = None;
     action.task_contract = None;
     action.attempt = None;
     action.supersedes_request_id = None;

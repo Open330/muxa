@@ -621,6 +621,7 @@ mod tests {
             source_node_id: None,
             delegation_parent: None,
             interruption: None,
+            retirement: None,
             human_action: None,
             initiator: None,
             updates: Vec::new(),

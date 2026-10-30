@@ -100,6 +100,10 @@ pub(crate) fn mutation_receipt(request: &CollaborationRequest) -> Value {
     if let Some(action) = request.human_action {
         value["human_action"] = json!(action);
     }
+    if let Some(retirement) = &request.retirement {
+        value["retirement"] = json!(retirement);
+        value["result_applicability"] = json!("retired");
+    }
     if let Some(interruption) = &request.interruption {
         value["interruption"] = json!({"active":interruption.active,
             "reason":interruption.reason, "action_request_id":interruption.action_request_id});
@@ -436,6 +440,24 @@ mod tests {
         assert_eq!(inbox["next_after_update"], 3);
         assert_eq!(inbox["updates"].as_array().unwrap().len(), 3);
     }
+    #[test]
+    fn retired_attempt_receipt_never_claims_a_peer_result() {
+        let mut request = fixture();
+        request.status = RequestStatus::Cancelled;
+        request.reply = None;
+        request.retirement = Some(muxa::collaboration::RequestRetirement {
+            reason: "withdrawn review".into(),
+            evidence: "update:2".into(),
+            at: time::OffsetDateTime::UNIX_EPOCH,
+        });
+        let receipt = mutation_receipt(&request);
+        assert_eq!(receipt["result_applicability"], "retired");
+        assert_eq!(receipt["final_reply_received"], false);
+        assert!(receipt.get("reported_status").is_none());
+        assert!(receipt.get("body").is_none());
+        assert_eq!(receipt["retirement"]["evidence"], "update:2");
+    }
+
     #[test]
     fn compact_contract_results_keep_attribution_and_hide_evidence_bodies() {
         let mut value = serde_json::to_value(fixture()).unwrap();

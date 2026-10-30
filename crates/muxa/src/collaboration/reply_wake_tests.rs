@@ -498,6 +498,7 @@ fn legacy_request(pair: &Pair) -> CollaborationRequest {
         source_node_id: None,
         delegation_parent: None,
         interruption: None,
+        retirement: None,
         human_action: None,
         id: "req_legacy".into(),
         from: pair.sender.clone(),

@@ -810,6 +810,14 @@ enum RequestBody {
     },
     /// Body-free diagnostics over the daemon's cached projections.
     CollaborationHealth,
+    /// Explicit exact-ID operator retirement; no completion or process stop.
+    CollaborationRetire {
+        origin: CollaborationOrigin,
+        request_id: String,
+        reason: String,
+        evidence: String,
+        dry_run: bool,
+    },
     /// Legacy operator expiry. Human decisions are protected on this server.
     CollaborationExpire {
         older_than_secs: u64,
@@ -971,6 +979,7 @@ const CAPABILITIES: &[&str] = &[
     collaboration::COLLABORATION_HEALTH_CAPABILITY,
     "collaboration_expire_filtered_v1",
     collaboration::FILTERED_EXPIRE_CAPABILITY,
+    collaboration::RETIRE_CAPABILITY,
     "collaboration_lifecycle",
     "collaboration_wait",
     "collaboration_peek",
@@ -5912,6 +5921,40 @@ async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::CollaborationRetire {
+                    origin,
+                    request_id,
+                    reason,
+                    evidence,
+                    dry_run,
+                } => {
+                    kind = "collaboration_retire";
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Retire,
+                        origin.clone(),
+                    );
+                    audit_context.request_id = Some(request_id.clone());
+                    let response = if !origin.console
+                        || origin.agent_session_id.is_some()
+                        || origin.exact_session
+                    {
+                        Response::err("retirement requires an explicit operator console origin")
+                    } else {
+                        match collaboration
+                            .retire_request(&request_id, &reason, &evidence, dry_run)
+                            .await
+                        {
+                            Ok(request) => Response::with_collaboration_request(request),
+                            Err(error) => Response::err(error.to_string()),
+                        }
+                    };
+                    pending_audit = Some(collaboration_audit_entry(
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    ));
+                    response
+                }
                 RequestBody::CollaborationCancel { origin, request_id } => {
                     kind = "collaboration_cancel";
                     collaboration_actor.observe_pane(&backends).await;
@@ -8464,6 +8507,29 @@ impl Client {
         serde_json::from_value(response["collaboration_health"].clone()).map_err(RuntimeError::Json)
     }
 
+    pub async fn collaboration_retire(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        reason: &str,
+        evidence: &str,
+        dry_run: bool,
+    ) -> Result<CollaborationRequest, RuntimeError> {
+        let hello = self.hello(CLIENT_CALL_TIMEOUT).await?;
+        if !hello
+            .capabilities
+            .iter()
+            .any(|c| c == collaboration::RETIRE_CAPABILITY)
+        {
+            return Err(RuntimeError::Daemon(
+                "daemon lacks collaboration_retire_v1; upgrade muxad before retirement".into(),
+            ));
+        }
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_retire", "origin":origin, "request_id":request_id,"reason":reason,"evidence":evidence,"dry_run":dry_run})).await?;
+        serde_json::from_value(response["collaboration_request"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     pub async fn collaboration_expire_filtered(
         &self,
         older_than_secs: u64,
@@ -9668,6 +9734,92 @@ mod tests {
                 .count(),
             8,
             "a capped Fleet response must not claim requests it cannot return"
+        );
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn retirement_ipc_requires_operator_origin_and_previews_before_commit() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("retire.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "caller", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "peer", AgentKind::ClaudeCode).await;
+        let backend: SharedBackend = CountingPaneBackend::new(
+            HostKind::Tmux,
+            vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        );
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let server = Server::new(socket.clone(), store.clone())
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: false,
+            agent_session_id: None,
+            exact_session: false,
+        };
+        let context = client.collaboration_context(&origin).await.unwrap();
+        let request = mailbox
+            .create(
+                context.current.clone(),
+                context.peers[0].clone(),
+                collaboration::NewRequest {
+                    body: "retire exact interrupted review".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut agents = store.snapshot().await;
+        for agent in &mut agents {
+            if agent.session_id == "peer" {
+                agent.state = crate::AgentState::Stopped;
+            }
+        }
+        mailbox.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(client
+            .collaboration_retire(&origin, &request.id, "withdrawn", "update:2", false)
+            .await
+            .is_err());
+        let operator = CollaborationOrigin {
+            console: true,
+            agent_session_id: None,
+            ..origin.clone()
+        };
+        let preview = client
+            .collaboration_retire(&operator, &request.id, "withdrawn", "update:2", true)
+            .await
+            .unwrap();
+        assert!(preview.retirement.is_some());
+        assert!(!mailbox
+            .list_for(&context.current, RequestMailbox::Sent, MailboxScope::Caller)
+            .await
+            .unwrap()[0]
+            .status
+            .is_terminal());
+        let retired = client
+            .collaboration_retire(&operator, &request.id, "withdrawn", "update:2", false)
+            .await
+            .unwrap();
+        assert_eq!(retired.status, collaboration::RequestStatus::Cancelled);
+        assert!(retired.reply.is_none());
+        assert_eq!(retired.body, request.body);
+        assert_eq!(
+            client
+                .collaboration_retire(&operator, &request.id, "withdrawn", "update:2", false)
+                .await
+                .unwrap(),
+            retired
         );
         shutdown.send(()).unwrap();
         serving.await.unwrap();
