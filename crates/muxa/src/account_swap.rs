@@ -1242,6 +1242,34 @@ mod resume_binding_tests {
             Other
         );
         assert_eq!(claude(&["claude", "--", "--resume", "abc"]), Other);
+        // A new session id, before or after the resume; an option's value
+        // that reads like the flag is not the flag.
+        assert_eq!(
+            claude(&["claude", "--resume", "abc", "--fork-session"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&["claude", "--fork-session", "--resume", "abc"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&["claude", "--session-id", "x", "--resume", "abc"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&["claude", "--session-id=x", "--resume", "abc"]),
+            Conflicting
+        );
+        assert_eq!(
+            claude(&[
+                "claude",
+                "--append-system-prompt",
+                "--fork-session",
+                "--resume",
+                "abc"
+            ]),
+            Exact
+        );
         // Twice, or alongside another.
         assert_eq!(
             claude(&["claude", "--resume", "abc", "--resume=abc"]),
@@ -1291,6 +1319,10 @@ mod resume_binding_tests {
             ResumeBinding::Ambiguous
         );
         assert_eq!(bind(&[(1, other()), (2, None)]), ResumeBinding::Unreadable);
+        assert_eq!(
+            bind(&[(1, resumed()), (2, None)]),
+            ResumeBinding::Unreadable
+        );
         assert_eq!(bind(&[(1, other())]), ResumeBinding::Missing);
         assert_eq!(bind(&[]), ResumeBinding::Missing);
     }
@@ -2496,6 +2528,9 @@ pub(crate) fn resume_binding(
         }
     }
     match bound.as_slice() {
+        // An agent process whose arguments cannot be read may be another
+        // match, or the pane's real agent: no binding until it is excluded.
+        [_] if unreadable && !ambiguous => ResumeBinding::Unreadable,
         [pid] if !ambiguous => ResumeBinding::Bound(*pid),
         [] if ambiguous => ResumeBinding::Ambiguous,
         [] if unreadable => ResumeBinding::Unreadable,
@@ -2572,7 +2607,9 @@ pub(crate) fn argv_resumes(argv: &[String], kind: AgentKind, session_id: &str) -
     }
 }
 
-/// Every conversation Claude's arguments resume (`None`: the picker).
+/// Every conversation Claude's arguments resume (`None`: the picker, or a
+/// mode that gives the resumed conversation a new session id —
+/// `--fork-session`, `--session-id` — so it is not the one planned).
 fn claude_resumed(words: &[String]) -> Vec<Option<&str>> {
     let mut named = Vec::new();
     let mut i = 0;
@@ -2580,6 +2617,9 @@ fn claude_resumed(words: &[String]) -> Vec<Option<&str>> {
         let word = word.as_str();
         if word == "--" {
             break;
+        }
+        if word == "--fork-session" || word == "--session-id" || word.starts_with("--session-id=") {
+            named.push(None);
         }
         if CLAUDE_VALUE_OPTIONS.contains(&word) {
             i += 2;

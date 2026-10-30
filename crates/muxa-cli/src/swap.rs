@@ -1044,6 +1044,14 @@ fn render(outcomes: &[SwapOutcome]) -> String {
         if !outcome.note.is_empty() {
             let _ = writeln!(out, "         {}", outcome.note);
         }
+        // Read back from a journal, the note may not say it.
+        if let Some(reason) = outcome
+            .continue_withheld
+            .as_deref()
+            .filter(|reason| !outcome.note.contains(reason))
+        {
+            let _ = writeln!(out, "         follow-up withheld ({reason})");
+        }
     }
     out
 }
@@ -1318,8 +1326,15 @@ mod tests {
             entry_outcome(&entry).continue_withheld.as_deref(),
             Some("binding_missing")
         );
+        // Read back after a restart (no executor report), it is shown.
+        let shown = render(&[entry_outcome(&entry)]);
+        assert!(
+            shown.contains("follow-up withheld (binding_missing)"),
+            "{shown}"
+        );
         entry.continuation = Some("allowed".into());
         assert_eq!(entry_outcome(&entry).continue_withheld, None);
+        assert!(!render(&[entry_outcome(&entry)]).contains("withheld"));
     }
 
     #[test]

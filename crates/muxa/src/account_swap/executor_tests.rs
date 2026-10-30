@@ -846,6 +846,31 @@ fn an_ambiguous_or_unreadable_relaunch_is_not_a_binding() {
         decision(&observations).map(|d| d.1),
         Some(Some(WithheldReason::BindingUnreadable))
     );
+    // A match beside an unreadable agent process is no binding either.
+    let (_, sent, observations, _) = run_with_evidence(
+        super::ContinueEvidence::Binding,
+        true,
+        Some(vec![
+            (31, Some(words(&["codex", "resume", "S"]))),
+            (32, None),
+        ]),
+        AccountCheck::Matched,
+        &mut NoObserver,
+    );
+    assert!(
+        !sent
+            .iter()
+            .any(|l| l.contains("continue") || l.contains("half typed")),
+        "{sent:?}"
+    );
+    assert_eq!(
+        decision(&observations),
+        Some((
+            ContinueDecision::Withheld,
+            Some(WithheldReason::BindingUnreadable),
+            false
+        ))
+    );
 }
 
 /// `verified` also needs the stopped process read and the account matched;
