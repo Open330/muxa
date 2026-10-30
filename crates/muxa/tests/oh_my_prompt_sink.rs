@@ -43,6 +43,7 @@ fn make_prompt(prompt: &str, session: &str) -> PromptRecord {
         prompt: prompt.into(),
         at: OffsetDateTime::now_utc(),
         model: Some("opus".into()),
+        seq: 0,
     }
 }
 

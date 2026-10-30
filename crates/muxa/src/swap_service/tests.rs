@@ -168,6 +168,7 @@ fn outcome(pane: &str, status: SwapStatus, note: &str) -> SwapOutcome {
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     }
 }
 
@@ -1419,4 +1420,44 @@ fn a_retry_with_another_configuration_is_refused() {
     .unwrap();
     settled(&h.service, &accepted.job_id);
     assert_eq!(*h.executed.lock().unwrap(), ["%a"]);
+}
+
+// --- prompt receipts ---------------------------------------------------------
+
+fn prompt(kind: AgentKind, session: &str, pane: &str, seq: u64) -> crate::state::PromptRecord {
+    crate::state::PromptRecord {
+        id: crate::event::AgentId {
+            kind,
+            session_id: session.into(),
+            surface: None,
+            pane: Some(pane.into()),
+            tmux_socket: Some("/tmp/tmux-1/default".into()),
+            cwd: None,
+        },
+        prompt: "secret text".into(),
+        at: time::OffsetDateTime::now_utc(),
+        model: None,
+        seq,
+    }
+}
+
+/// Only a hook after the cursor, from this kind's conversation on this
+/// pane, is evidence; an earlier one, or another pane's, is not.
+#[test]
+fn a_prompt_receipt_counts_only_after_its_cursor_and_on_its_pane() {
+    use crate::account_swap::TurnProbe as _;
+    let accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let receipts = PromptReceipts::new(Arc::clone(&accepted));
+    let endpoint = endpoint_key("%1", Some("/tmp/tmux-1/default"));
+    // Accepted by the store (number 1) before the cursor, received after it.
+    accepted.store(1, Ordering::SeqCst);
+    let cursor = receipts.cursor();
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1", 1));
+    assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%2", 2));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "other", "%1", 3));
+    receipts.record(&prompt(AgentKind::Codex, "c", "%1", 4));
+    assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1", 5));
+    assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
 }

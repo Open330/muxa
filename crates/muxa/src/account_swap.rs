@@ -22,7 +22,9 @@ use crate::backend::SharedBackend;
 use crate::event::{AgentKind, AgentState};
 use crate::process_snapshot::ProcessInfo;
 use crate::state::Agent;
-use crate::swap_job::{ContinueDecision, Observation, Phase, Readiness, WithheldReason};
+use crate::swap_job::{
+    ContinueDecision, Observation, Phase, Readiness, Submission, TurnEvidence, WithheldReason,
+};
 use effects::{Purpose, Runner};
 use io::Clock;
 use serde::{Deserialize, Serialize};
@@ -263,6 +265,23 @@ pub struct SwapOutcome {
     /// evidence `continue_evidence` asks for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub continue_withheld: Option<String>,
+    /// A typed follow-up: what the transport said, and what followed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub follow_up: Option<FollowUpReport>,
+}
+
+/// A typed follow-up as reported: codes, never its text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FollowUpReport {
+    /// Sent to a session kept on its original account.
+    #[serde(default)]
+    pub kept: bool,
+    /// `delivered`, `refused` or `unconfirmed`: the transport's word only.
+    pub submission: String,
+    /// `prompt_hook`, `screen_activity` or `none_seen`; absent while (or if
+    /// never) the wait for it ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<String>,
 }
 
 /// The evidence a swap resumed a conversation by.
@@ -308,6 +327,7 @@ impl SwapOutcome {
             conversation_unverified_reason: None,
             registered: Some(resumable_id(&agent.session_id)),
             continue_withheld: None,
+            follow_up: None,
         }
     }
 }
@@ -1087,7 +1107,7 @@ pub fn run(
         .into_iter()
         .map(|step| match step {
             Step::Done(outcome) => outcome,
-            Step::Run(target) => execute_target(&request, &target, &mut effects::NoObserver),
+            Step::Run(target) => execute_target(&request, &target, &mut effects::NoObserver, None),
         })
         .collect()
 }
@@ -1132,7 +1152,7 @@ pub fn run_bound(
         .map(|step| match step {
             BoundStep::Done(outcome) => outcome,
             BoundStep::Run(_, target) => {
-                execute_target(&request, &target, &mut effects::NoObserver)
+                execute_target(&request, &target, &mut effects::NoObserver, None)
             }
         })
         .collect()
@@ -1198,6 +1218,7 @@ fn bound_skip(want: &DirectTarget, session: &str, note: &str) -> SwapOutcome {
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     }
 }
 
@@ -1514,8 +1535,26 @@ mod bind_tests {
     }
 }
 
+/// The agents' own prompt hooks, as the daemon receives them: evidence,
+/// never proof, that a typed follow-up was taken up. Reads are cheap and
+/// never block.
+pub trait TurnProbe: Send + Sync {
+    /// A position in the stream: hooks after it are new.
+    fn cursor(&self) -> u64;
+    /// Whether a prompt hook of `kind`'s `conversation` on `endpoint`
+    /// (`pane@server`) arrived after `cursor`.
+    fn prompt_after(
+        &self,
+        cursor: u64,
+        kind: AgentKind,
+        conversation: &str,
+        endpoint: &str,
+    ) -> bool;
+}
+
 /// One entry of a prepared swap, in report order: an outcome already
 /// settled while planning, or a target still to run.
+#[allow(clippy::large_enum_variant)] // a plan's steps, held only while it is made
 pub(crate) enum Step {
     Done(SwapOutcome),
     Run(Box<PreparedTarget>),
@@ -1663,6 +1702,7 @@ pub(crate) fn execute_target(
     request: &SwapRequest,
     target: &PreparedTarget,
     observer: &mut dyn effects::EffectObserver,
+    probe: Option<&dyn TurnProbe>,
 ) -> SwapOutcome {
     let profiles = target
         .profiles
@@ -1675,6 +1715,7 @@ pub(crate) fn execute_target(
         &target.candidates,
         profiles,
         observer,
+        probe,
     );
     if target.profiles.is_some() {
         outcome.from.clone_from(&target.profile_from);
@@ -1926,6 +1967,7 @@ fn swap_one(
         &crate::accounts::ResolvedAccounts,
     )>,
     observer: &mut dyn effects::EffectObserver,
+    probe: Option<&dyn TurnProbe>,
 ) -> SwapOutcome {
     let Planned {
         agent,
@@ -2023,13 +2065,15 @@ fn swap_one(
     let io = io::LiveIo {
         backend,
         target: &target,
+        probe,
     };
-    let (status, note, withheld) = run_live(
+    let (status, note, withheld, report) = run_live(
         &io, &target, launch, &command, follow_up, &verify, &binding, observer,
     );
     outcome.status = status;
     outcome.note = note;
     outcome.continue_withheld = withheld;
+    outcome.follow_up = report;
     outcome
 }
 
@@ -2064,7 +2108,7 @@ fn run_live(
     verify: &Verify<'_>,
     binding: &crate::swap_job::Observation,
     observer: &mut dyn effects::EffectObserver,
-) -> (SwapStatus, String, Option<String>) {
+) -> (SwapStatus, String, Option<String>, Option<FollowUpReport>) {
     let runner = Runner::new(io, observer);
     // The process and conversation acted on, recorded before anything is.
     let executed = if runner.observe(binding.clone()) {
@@ -2083,6 +2127,7 @@ fn run_live(
             } => Some(reason.to_string()),
             _ => None,
         });
+    let follow_up = follow_up_report(&runner.observations());
     let (status, note) = match (runner.halted(), executed) {
         // An observer that could not record an effect stopped the run; what
         // the executor said after that is not the whole story.
@@ -2091,7 +2136,30 @@ fn run_live(
         (None, Err(Refusal::Failed(note))) => (SwapStatus::Failed, note),
         (None, Err(Refusal::Kept(note))) => (SwapStatus::Skipped, note),
     };
-    (status, note, withheld)
+    (status, note, withheld, follow_up)
+}
+
+/// The last follow-up's report from what the run observed.
+fn follow_up_report(observations: &[Observation]) -> Option<FollowUpReport> {
+    let mut report: Option<FollowUpReport> = None;
+    for observation in observations {
+        match observation {
+            Observation::FollowUpSent { kept, submission } => {
+                report = Some(FollowUpReport {
+                    kept: *kept,
+                    submission: submission.to_string(),
+                    evidence: None,
+                });
+            }
+            Observation::FollowUpEvidence { evidence, .. } => {
+                if let Some(report) = &mut report {
+                    report.evidence = Some(evidence.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    report
 }
 
 /// Check which account the relaunched agent in `target` runs on, against
@@ -2415,6 +2483,7 @@ fn unresolved(target: &str, note: &str) -> SwapOutcome {
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     }
 }
 
@@ -2648,6 +2717,7 @@ pub(crate) fn prepare_retry(
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     });
     (resolved, Step::Done(outcome))
 }
@@ -2678,6 +2748,7 @@ fn identity_outcome(identity: &TargetIdentity) -> SwapOutcome {
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     }
 }
 
@@ -3107,7 +3178,6 @@ fn follow_through(
     answered: &[&'static str],
     checked: &str,
 ) -> String {
-    let io = runner.io;
     let answers = if answered.is_empty() {
         checked.to_owned()
     } else {
@@ -3136,30 +3206,108 @@ fn follow_through(
     let Some(text) = follow_up else {
         return restore(format!("{resumed}{answers}"));
     };
-    if !send_follow_up(runner, Purpose::FollowUp, text) {
-        return restore(format!("resumed{answers}; follow-up could not be typed"));
-    }
-    let started = wait_until(io, Duration::from_secs(20), || {
-        io.capture().is_some_and(|screen| turn_running(&screen))
-    });
-    restore(if started {
-        format!("sent {text:?}, and the agent picked the turn back up{answers}")
-    } else {
-        format!("sent {text:?}{answers}, but no turn started within 20s")
-    })
+    let Some((submission, evidence)) =
+        follow_up_with_evidence(runner, Purpose::FollowUp, text, false)
+    else {
+        // The run stopped: nothing more is typed, the draft included.
+        return format!("{resumed}{answers}; the follow-up's evidence could not be recorded");
+    };
+    restore(format!(
+        "{}{answers}",
+        follow_up_note(text, submission, evidence)
+    ))
 }
 
-/// Poll `ready` until it holds or `timeout` passes.
-fn wait_until(clock: &dyn Clock, timeout: Duration, mut ready: impl FnMut() -> bool) -> bool {
-    let started = clock.now();
-    loop {
-        if ready() {
-            return true;
+/// How long a follow-up's evidence is waited for.
+const FOLLOW_UP_WAIT: Duration = Duration::from_secs(20);
+/// How long a prompt hook is still waited for once the screen shows
+/// activity, as the better evidence of the two.
+const HOOK_GRACE: Duration = Duration::from_secs(3);
+
+/// Type `text` and its Enter as one act, record what the transport said,
+/// then wait for evidence that it was taken up and record that. The cursor
+/// is taken before the prompt, so a hook that beats the transport's answer,
+/// or a turn that ends before the first look, still counts. `None` if a
+/// record could not be written: the run has stopped.
+fn follow_up_with_evidence(
+    runner: &Runner,
+    purpose: Purpose,
+    text: &str,
+    kept: bool,
+) -> Option<(Submission, TurnEvidence)> {
+    let io = runner.io;
+    let cursor = io.prompt_cursor();
+    let group = runner.group();
+    let _ = runner.send_prompt(group, purpose, text) && {
+        io.sleep(io.submit_grace());
+        runner.send_text(group, purpose, "\r")
+    };
+    let submission = submission_of(&runner.log(), group);
+    if !runner.observe(Observation::FollowUpSent { kept, submission }) {
+        return None;
+    }
+    let started = io.now();
+    let mut screen_since = None;
+    let evidence = loop {
+        if cursor.is_some_and(|cursor| io.prompt_seen_after(cursor)) {
+            break TurnEvidence::PromptHook;
         }
-        if clock.now().saturating_duration_since(started) >= timeout {
-            return false;
+        let now = io.now();
+        if screen_since.is_none() && io.capture().is_some_and(|screen| turn_running(&screen)) {
+            screen_since = Some(now);
         }
-        clock.sleep(Duration::from_millis(400));
+        let waited = now.saturating_duration_since(started);
+        let grace_over =
+            screen_since.is_some_and(|since| now.saturating_duration_since(since) >= HOOK_GRACE);
+        if grace_over || (waited >= FOLLOW_UP_WAIT && screen_since.is_some()) {
+            break TurnEvidence::ScreenActivity;
+        }
+        if waited >= FOLLOW_UP_WAIT {
+            break TurnEvidence::NoneSeen;
+        }
+        io.sleep(Duration::from_millis(400));
+    };
+    if !runner.observe(Observation::FollowUpEvidence { kept, evidence }) {
+        return None;
+    }
+    Some((submission, evidence))
+}
+
+/// What the transport said of one act's effects: delivered only if it was
+/// a prompt and its Enter, both accepted.
+fn submission_of(log: &[(effects::Effect, effects::Transport)], group: u32) -> Submission {
+    let results: Vec<effects::Transport> = log
+        .iter()
+        .filter(|(effect, _)| effect.group == group)
+        .map(|(_, transport)| *transport)
+        .collect();
+    if results.contains(&effects::Transport::Refused) {
+        Submission::Refused
+    } else if results.len() == 2 && results.iter().all(|t| *t == effects::Transport::Accepted) {
+        Submission::Delivered
+    } else {
+        Submission::Unconfirmed
+    }
+}
+
+/// The report's words for a follow-up: what the transport said and what
+/// followed, never more.
+fn follow_up_note(text: &str, submission: Submission, evidence: TurnEvidence) -> String {
+    let followed = match evidence {
+        TurnEvidence::PromptHook => "a prompt hook followed",
+        TurnEvidence::ScreenActivity => "the screen shows activity",
+        TurnEvidence::NoneSeen => "no prompt hook or activity seen within 20s",
+    };
+    match submission {
+        Submission::Delivered => format!("sent {text:?} (delivered; {followed})"),
+        Submission::Refused => {
+            format!(
+                "the pane refused the follow-up {text:?} (it may still have arrived; {followed})"
+            )
+        }
+        Submission::Unconfirmed => {
+            format!("the follow-up {text:?} was not confirmed sent ({followed})")
+        }
     }
 }
 
@@ -3344,7 +3492,9 @@ fn exit_claude(
     let keep = |note: &str| {
         if let Some(text) = follow_up.filter(|_| target.busy) {
             io.sleep(Duration::from_millis(800));
-            send_follow_up(runner, Purpose::KeptFollowUp, text);
+            if follow_up_with_evidence(runner, Purpose::KeptFollowUp, text, true).is_none() {
+                return Err(Refusal::Kept(note.to_owned()));
+            }
         }
         if let Some(text) = draft {
             io.sleep(Duration::from_millis(300));

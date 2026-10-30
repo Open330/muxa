@@ -316,6 +316,45 @@ pub(crate) enum Observation {
         withheld: Option<WithheldReason>,
         draft_allowed: bool,
     },
+    /// What the transport said of a typed follow-up (its prompt and Enter),
+    /// recorded as soon as both settled.
+    FollowUpSent {
+        kept: bool,
+        submission: Submission,
+    },
+    /// What followed it, once the wait for evidence ended.
+    FollowUpEvidence {
+        kept: bool,
+        evidence: TurnEvidence,
+    },
+}
+
+/// What the transport said of a follow-up's prompt and its Enter. Not what
+/// the agent did: a refused write may still have arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum Submission {
+    /// Both were accepted.
+    Delivered,
+    /// One was refused.
+    Refused,
+    /// Not both settled (one never happened, or its result is unknown).
+    Unconfirmed,
+}
+
+/// What followed a follow-up within the wait: evidence, never proof, that
+/// it was taken up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub(crate) enum TurnEvidence {
+    /// The agent's own prompt hook, for this conversation on this pane.
+    PromptHook,
+    /// The screen shows activity.
+    ScreenActivity,
+    /// Neither was seen; not proof that nothing happened.
+    NoneSeen,
 }
 
 /// Whether a due follow-up may be typed into the relaunched agent.
@@ -392,6 +431,73 @@ pub(crate) struct TargetStatus {
     /// The follow-up decision: `allowed`, `not_due`, or why it was
     /// withheld. `None` before one was made.
     pub(crate) continuation: Option<String>,
+    /// The latest follow-up typed: the transport's word, and the evidence
+    /// once its wait ended.
+    pub(crate) follow_up: Option<crate::account_swap::FollowUpReport>,
+}
+
+/// A follow-up's transport word from its effects alone, for an attempt
+/// that stopped before recording it (a crash, or a record that could not
+/// be written): its latest group's prompt and Enter. No evidence.
+fn follow_up_from_effects(
+    connection: &Connection,
+    job: &str,
+    target: u32,
+    attempt: u32,
+) -> Result<Option<crate::account_swap::FollowUpReport>, JobError> {
+    let mut statement = connection.prepare(
+        "SELECT purpose, state FROM effects
+         WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3
+           AND purpose IN ('follow_up', 'kept_follow_up')
+           AND grp = (SELECT MAX(grp) FROM effects
+                      WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3
+                        AND purpose IN ('follow_up', 'kept_follow_up'))",
+    )?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![job, target, attempt], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let Some((purpose, _)) = rows.first() else {
+        return Ok(None);
+    };
+    let submission = if rows.iter().any(|(_, state)| state == "refused") {
+        Submission::Refused
+    } else if rows.len() == 2 && rows.iter().all(|(_, state)| state == "accepted") {
+        Submission::Delivered
+    } else {
+        Submission::Unconfirmed
+    };
+    Ok(Some(crate::account_swap::FollowUpReport {
+        kept: purpose == "kept_follow_up",
+        submission: submission.to_string(),
+        evidence: None,
+    }))
+}
+
+/// The follow-up from its two journalled observations. An attempt types at
+/// most one (a kept session's or the relaunch's), so its evidence is the
+/// one of the same kind; none yet means the wait never ended.
+fn follow_up_status(
+    sent: Option<String>,
+    evidence: Option<String>,
+) -> Option<crate::account_swap::FollowUpReport> {
+    let parse = |json: Option<String>| json.and_then(|json| serde_json::from_str(&json).ok());
+    let Some(Observation::FollowUpSent { kept, submission }) = parse(sent) else {
+        return None;
+    };
+    let evidence = match parse(evidence) {
+        Some(Observation::FollowUpEvidence {
+            kept: evidence_kept,
+            evidence,
+        }) if evidence_kept == kept => Some(evidence.to_string()),
+        _ => None,
+    };
+    Some(crate::account_swap::FollowUpReport {
+        kept,
+        submission: submission.to_string(),
+        evidence,
+    })
 }
 
 /// Effect purposes at or past the relaunch: once any was even intended, the
@@ -1055,7 +1161,13 @@ impl SwapJobStore {
                             AND e.target_id = t.target_id AND e.attempt = t.attempt),
                         (SELECT o.value_json FROM observations o WHERE o.job_id = t.job_id
                             AND o.target_id = t.target_id AND o.attempt = t.attempt
-                            AND o.kind = 'continuation' ORDER BY o.seq DESC LIMIT 1)
+                            AND o.kind = 'continuation' ORDER BY o.seq DESC LIMIT 1),
+                        (SELECT o.value_json FROM observations o WHERE o.job_id = t.job_id
+                            AND o.target_id = t.target_id AND o.attempt = t.attempt
+                            AND o.kind = 'follow_up_sent' ORDER BY o.seq DESC LIMIT 1),
+                        (SELECT o.value_json FROM observations o WHERE o.job_id = t.job_id
+                            AND o.target_id = t.target_id AND o.attempt = t.attempt
+                            AND o.kind = 'follow_up_evidence' ORDER BY o.seq DESC LIMIT 1)
                  FROM targets t WHERE t.job_id = ?1 ORDER BY t.target_id, t.attempt",
             )?;
             let targets = statement
@@ -1080,9 +1192,17 @@ impl SwapJobStore {
                                 )),
                                 _ => None,
                             }),
+                        follow_up: follow_up_status(row.get(8)?, row.get(9)?),
                     })
                 })?
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<Vec<TargetStatus>, _>>()?;
+            let mut targets = targets;
+            for target in &mut targets {
+                if target.follow_up.is_none() {
+                    target.follow_up =
+                        follow_up_from_effects(connection, job, target.target_id, target.attempt)?;
+                }
+            }
             Ok(JobStatus {
                 job_id: job.to_owned(),
                 node_id,

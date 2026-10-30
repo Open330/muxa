@@ -10,7 +10,8 @@ use super::io::{AgentArgv, Clock, SwapIo};
 use super::{execute, AccountVerdict, LaunchLine, PaneLaunch, Refusal, Target};
 use crate::event::AgentKind;
 use crate::swap_job::{
-    AccountCheck, ContinueDecision, Observation, Phase, Readiness, WithheldReason,
+    AccountCheck, ContinueDecision, Observation, Phase, Readiness, Submission, TurnEvidence,
+    WithheldReason,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -41,6 +42,10 @@ struct FakeIo {
     /// that resumes the target's conversation the provider's way.
     argvs: RefCell<Option<Vec<AgentArgv>>>,
     kind: Cell<AgentKind>,
+    /// Whether the daemon's prompt hooks can be read, and when (virtual
+    /// time) a hook for the target arrived.
+    probe: Cell<bool>,
+    hooks: RefCell<Vec<Duration>>,
 }
 
 impl FakeIo {
@@ -59,6 +64,8 @@ impl FakeIo {
             react,
             argvs: RefCell::new(None),
             kind: Cell::new(AgentKind::Codex),
+            probe: Cell::new(false),
+            hooks: RefCell::new(Vec::new()),
         }
     }
 
@@ -132,6 +139,20 @@ impl SwapIo for FakeIo {
         self.agent_from
             .get()
             .is_some_and(|from| self.now.get() >= from)
+    }
+
+    fn prompt_cursor(&self) -> Option<u64> {
+        self.probe
+            .get()
+            .then(|| u64::try_from(self.now.get().as_millis()).unwrap_or(u64::MAX))
+    }
+
+    fn prompt_seen_after(&self, cursor: u64) -> bool {
+        let now = self.now.get();
+        self.hooks
+            .borrow()
+            .iter()
+            .any(|at| u64::try_from(at.as_millis()).unwrap_or(u64::MAX) > cursor && *at <= now)
     }
 
     fn agent_argvs(&self, pane_pid: u32) -> Vec<AgentArgv> {
@@ -268,7 +289,7 @@ fn a_codex_swap_stops_relaunches_and_sends_the_follow_up_in_order() {
     );
     assert_eq!(
         result.unwrap(),
-        "sent \"continue\", and the agent picked the turn back up"
+        "sent \"continue\" (delivered; the screen shows activity)"
     );
     assert_eq!(
         io.sent(),
@@ -468,7 +489,11 @@ fn a_follow_up_whose_enter_fails_is_reported_and_recorded_apart() {
         Some("continue"),
         &mut NoObserver,
     );
-    assert_eq!(result.unwrap(), "resumed; follow-up could not be typed");
+    assert_eq!(
+        result.unwrap(),
+        "the pane refused the follow-up \"continue\" (it may still have arrived; no prompt hook \
+         or activity seen within 20s)"
+    );
     let follow: Vec<_> = log
         .iter()
         .filter(|(effect, _)| effect.purpose == Purpose::FollowUp)
@@ -623,6 +648,14 @@ fn a_swap_reports_what_it_saw_in_order() {
             },
             Observation::Phase {
                 phase: Phase::FollowThrough
+            },
+            Observation::FollowUpSent {
+                kept: false,
+                submission: Submission::Delivered,
+            },
+            Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::ScreenActivity,
             },
         ]
     );
@@ -1011,4 +1044,271 @@ fn a_run_without_draft_restoration_never_types_the_draft() {
     assert!(!log
         .iter()
         .any(|(effect, _)| matches!(effect.purpose, Purpose::KeptDraft | Purpose::RestoreDraft)));
+}
+
+// --- follow-up evidence ---------------------------------------------------
+
+/// A Codex agent whose prompt hook fires the moment the follow-up's Enter
+/// lands (before the transport answers), and whose turn may end at once.
+fn codex_with_hook(screen_after: &'static str) -> React {
+    Box::new(move |io: &FakeIo, line: &str| {
+        if line.starts_with("signal TERM") {
+            io.kill(AGENT);
+        }
+        if line == "text \"\\r\"" {
+            match io.previous().as_deref() {
+                Some("text \"RELAUNCH\"") => {
+                    io.agent_appears_in(Duration::from_secs(1));
+                    io.show(CODEX_IDLE);
+                }
+                Some("prompt \"continue\"") => {
+                    io.hooks.borrow_mut().push(io.now.get());
+                    io.show(screen_after);
+                }
+                _ => {}
+            }
+        }
+    })
+}
+
+fn evidence_of(observations: &[Observation]) -> Vec<Observation> {
+    observations
+        .iter()
+        .filter(|o| {
+            matches!(
+                o,
+                Observation::FollowUpSent { .. } | Observation::FollowUpEvidence { .. }
+            )
+        })
+        .cloned()
+        .collect()
+}
+
+fn follow_up_run(
+    io: &FakeIo,
+    observer: &mut dyn EffectObserver,
+) -> (Result<String, Refusal>, Vec<Observation>) {
+    let target = target(AgentKind::Codex, false, false);
+    io.kind.set(target.kind);
+    let runner = Runner::new(io, observer);
+    let verified = |_: &Target, _: Option<u32>| {
+        Ok(AccountVerdict {
+            check: AccountCheck::Matched,
+            observed: Some("b".into()),
+            source: "test",
+            note: String::new(),
+        })
+    };
+    let result = execute(
+        &runner,
+        &target,
+        &launch(),
+        "RELAUNCH",
+        Some("continue"),
+        &verified,
+    );
+    let observations = runner.observations();
+    (result, observations)
+}
+
+/// A hook that beats the transport's answer, for a turn that is over before
+/// the first look at the screen, still counts: the cursor was taken first.
+#[test]
+fn a_prompt_hook_during_the_enter_is_the_evidence() {
+    let io = FakeIo::new(CODEX_IDLE, codex_with_hook(CODEX_IDLE));
+    io.probe.set(true);
+    let (result, observations) = follow_up_run(&io, &mut NoObserver);
+    assert_eq!(
+        result.unwrap(),
+        "sent \"continue\" (delivered; a prompt hook followed)"
+    );
+    assert_eq!(
+        evidence_of(&observations),
+        [
+            Observation::FollowUpSent {
+                kept: false,
+                submission: Submission::Delivered
+            },
+            Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::PromptHook
+            },
+        ]
+    );
+}
+
+/// A hook from before the follow-up is not its evidence; with nothing else
+/// seen, none is claimed, and without a probe only the screen can speak.
+#[test]
+fn a_stale_hook_or_no_probe_is_no_hook_evidence() {
+    let io = FakeIo::new(CODEX_IDLE, codex_agent_idle_after_follow_up());
+    io.probe.set(true);
+    io.hooks.borrow_mut().push(Duration::ZERO);
+    let (result, observations) = follow_up_run(&io, &mut NoObserver);
+    assert!(result
+        .unwrap()
+        .contains("no prompt hook or activity seen within 20s"));
+    assert!(
+        evidence_of(&observations).contains(&Observation::FollowUpEvidence {
+            kept: false,
+            evidence: TurnEvidence::NoneSeen
+        })
+    );
+    // No probe: a fresh hook cannot be read, the screen's activity can.
+    let io = FakeIo::new(CODEX_IDLE, codex_with_hook(CODEX_WORKING));
+    let (result, _) = follow_up_run(&io, &mut NoObserver);
+    assert_eq!(
+        result.unwrap(),
+        "sent \"continue\" (delivered; the screen shows activity)"
+    );
+}
+
+fn codex_agent_idle_after_follow_up() -> React {
+    Box::new(|io: &FakeIo, line: &str| {
+        if line.starts_with("signal TERM") {
+            io.kill(AGENT);
+        }
+        if line == "text \"\\r\"" && io.previous().as_deref() == Some("text \"RELAUNCH\"") {
+            io.agent_appears_in(Duration::from_secs(1));
+            io.show(CODEX_IDLE);
+        }
+    })
+}
+
+/// The transport's word and the evidence are independent: a refused Enter
+/// with a hook after it is reported as both, and nothing is sent again.
+#[test]
+fn a_refused_enter_with_a_hook_after_it_is_not_resent() {
+    let io = FakeIo::new(CODEX_IDLE, codex_with_hook(CODEX_IDLE));
+    io.probe.set(true);
+    io.enter_ok.set(false);
+    // The relaunch's own Enter must still land.
+    let (result, observations) = {
+        let react_io = &io;
+        react_io.enter_ok.set(true);
+        let target = target(AgentKind::Codex, false, false);
+        react_io.kind.set(target.kind);
+        let mut observer = NoObserver;
+        let runner = Runner::new(react_io, &mut observer);
+        let verified = |_: &Target, _: Option<u32>| {
+            // Refuse every Enter from here on: the follow-up's.
+            react_io.enter_ok.set(false);
+            Ok(AccountVerdict {
+                check: AccountCheck::Matched,
+                observed: Some("b".into()),
+                source: "test",
+                note: String::new(),
+            })
+        };
+        let result = execute(
+            &runner,
+            &target,
+            &launch(),
+            "RELAUNCH",
+            Some("continue"),
+            &verified,
+        );
+        (result, runner.observations())
+    };
+    assert!(result
+        .unwrap()
+        .starts_with("the pane refused the follow-up"));
+    assert_eq!(
+        evidence_of(&observations),
+        [
+            Observation::FollowUpSent {
+                kept: false,
+                submission: Submission::Refused
+            },
+            Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::PromptHook
+            },
+        ]
+    );
+    let prompts = io
+        .sent()
+        .iter()
+        .filter(|line| *line == "prompt \"continue\"")
+        .count();
+    assert_eq!(prompts, 1);
+}
+
+/// A follow-up whose record cannot be written stops the run: no evidence
+/// wait, no draft.
+#[test]
+fn an_unrecorded_follow_up_stops_before_the_draft() {
+    struct FailsOnSent;
+    impl EffectObserver for FailsOnSent {
+        fn before(&mut self, _: &Effect) -> Result<(), ObserverError> {
+            Ok(())
+        }
+        fn after(&mut self, _: &Effect, _: Transport) -> Result<(), ObserverError> {
+            Ok(())
+        }
+        fn observe(&mut self, observation: &Observation) -> Result<(), ObserverError> {
+            match observation {
+                Observation::FollowUpSent { .. } => Err(ObserverError("journal full".into())),
+                _ => Ok(()),
+            }
+        }
+    }
+    // Nothing would ever show up: only stopping spares the wait.
+    let io = FakeIo::new(CODEX_WITH_DRAFT, codex_agent_idle_after_follow_up());
+    let (result, observations) = follow_up_run(&io, &mut FailsOnSent);
+    assert!(
+        result.is_err()
+            || result
+                .as_deref()
+                .is_ok_and(|n| n.contains("could not be recorded"))
+    );
+    assert!(
+        !io.sent().iter().any(|l| l.contains("half typed")),
+        "{:?}",
+        io.sent()
+    );
+    assert!(!observations
+        .iter()
+        .any(|o| matches!(o, Observation::FollowUpEvidence { .. })));
+    // Stopped at once: no wait for evidence that could not be kept anyway.
+    assert!(io.now.get() < Duration::from_secs(20), "{:?}", io.now.get());
+}
+
+/// A kept session's follow-up is reported the same way, marked kept.
+#[test]
+fn a_kept_follow_up_records_the_same_evidence() {
+    let io = FakeIo::new(
+        CLAUDE_WITH_DRAFT,
+        Box::new(|io: &FakeIo, line: &str| {
+            if line == "text \"\\r\"" && io.previous().as_deref() == Some("prompt \"/exit\"") {
+                io.show(SCHEDULED);
+            }
+        }),
+    );
+    let target = target(AgentKind::ClaudeCode, false, true);
+    io.kind.set(target.kind);
+    let mut observer = NoObserver;
+    let runner = Runner::new(&io, &mut observer);
+    let verified = |_: &Target, _: Option<u32>| unreachable!("a kept session is not relaunched");
+    let result = execute(
+        &runner,
+        &target,
+        &claude_launch(),
+        "RELAUNCH",
+        Some("continue"),
+        &verified,
+    );
+    assert!(matches!(result, Err(Refusal::Kept(_))));
+    let seen = evidence_of(&runner.observations());
+    assert_eq!(
+        seen[0],
+        Observation::FollowUpSent {
+            kept: true,
+            submission: Submission::Delivered
+        }
+    );
+    assert!(matches!(
+        seen[1],
+        Observation::FollowUpEvidence { kept: true, .. }
+    ));
 }

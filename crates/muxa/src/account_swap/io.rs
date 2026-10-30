@@ -64,12 +64,17 @@ pub(super) trait SwapIo: Clock {
     fn writer_owners(&self, pane_pid: u32) -> String;
     /// How long a composer needs between a prompt and its Enter.
     fn submit_grace(&self) -> Duration;
+    /// Where the agents' prompt hooks stand now, when they can be read here.
+    fn prompt_cursor(&self) -> Option<u64>;
+    /// Whether this target's own prompt hook arrived after `cursor`.
+    fn prompt_seen_after(&self, cursor: u64) -> bool;
 }
 
 /// The pane and processes of a real target.
 pub(super) struct LiveIo<'a> {
     pub(super) backend: &'a SharedBackend,
     pub(super) target: &'a Target,
+    pub(super) probe: Option<&'a dyn super::TurnProbe>,
 }
 
 impl Clock for LiveIo<'_> {
@@ -152,5 +157,20 @@ impl SwapIo for LiveIo<'_> {
 
     fn submit_grace(&self) -> Duration {
         crate::backend::prompt_submit_grace(&self.target.pane)
+    }
+
+    fn prompt_cursor(&self) -> Option<u64> {
+        self.probe.map(super::TurnProbe::cursor)
+    }
+
+    fn prompt_seen_after(&self, cursor: u64) -> bool {
+        self.probe.is_some_and(|probe| {
+            probe.prompt_after(
+                cursor,
+                self.target.kind,
+                &self.target.session_id,
+                &super::endpoint_key(&self.target.pane, self.target.socket.as_deref()),
+            )
+        })
     }
 }

@@ -17,6 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- A swap's follow-up is reported as what the transport said (`delivered`,
+  `refused`, `unconfirmed`) and, separately, what followed within 20s: the
+  agent's own prompt hook, screen activity, or nothing seen. The old "picked
+  the turn back up" no longer claims more than that. Both are journalled and
+  shown by `--status`; a kept session's follow-up is reported the same way.
 - A swap types its follow-up, and puts back the half-typed draft, only into a
   relaunch whose own process arguments resume exactly the planned
   conversation. Otherwise the agent is relaunched and left alone, and the

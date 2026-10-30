@@ -965,6 +965,10 @@ async fn open_swap_service(
     collaboration: Arc<CollaborationStore>,
 ) -> Option<Arc<DaemonSwap>> {
     let runtime = tokio::runtime::Handle::current();
+    let receipts = Arc::new(muxa::swap_service::PromptReceipts::new(
+        store.prompt_sequence(),
+    ));
+    spawn_prompt_receipts(&store, Arc::clone(&receipts));
     let opened = tokio::task::spawn_blocking(move || {
         let path = paths::default_node_id_file().ok_or("no data directory for the node id")?;
         let node_id = muxa::fleet::load_or_create_node_id(&path)
@@ -980,6 +984,7 @@ async fn open_swap_service(
             config_path,
             node_id: node_id.clone(),
             collaboration,
+            receipts,
         };
         muxa::swap_service::SwapService::open(None, Arc::new(context)).map(|service| DaemonSwap {
             service: Arc::new(service),
@@ -1000,6 +1005,25 @@ async fn open_swap_service(
     }
 }
 
+/// Feed every agent prompt hook the store receives into `receipts`, its
+/// text dropped, for a swap follow-up's evidence. A lagging receiver only
+/// loses evidence, never claims any.
+fn spawn_prompt_receipts(
+    store: &muxa::SharedStore,
+    receipts: Arc<muxa::swap_service::PromptReceipts>,
+) {
+    let mut prompts = store.subscribe_prompts();
+    tokio::spawn(async move {
+        loop {
+            match prompts.recv().await {
+                Ok(record) => receipts.record(&record),
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 /// What the swap service reads of the daemon. Its methods block on the
 /// runtime, so the service only ever calls them from its own threads.
 struct DaemonContext {
@@ -1011,9 +1035,14 @@ struct DaemonContext {
     config_path: Option<std::path::PathBuf>,
     node_id: String,
     collaboration: Arc<CollaborationStore>,
+    receipts: Arc<muxa::swap_service::PromptReceipts>,
 }
 
 impl muxa::swap_service::ContextProvider for DaemonContext {
+    fn turn_probe(&self) -> Option<Arc<dyn muxa::account_swap::TurnProbe>> {
+        Some(Arc::clone(&self.receipts) as Arc<dyn muxa::account_swap::TurnProbe>)
+    }
+
     fn snapshot(&self) -> Result<muxa::swap_service::Snapshot, String> {
         Ok(muxa::swap_service::Snapshot {
             node_id: self.node_id.clone(),
@@ -6957,6 +6986,7 @@ mod tests {
             config_path: None,
             node_id: "node".into(),
             collaboration: Arc::clone(&c),
+            receipts: Arc::new(muxa::swap_service::PromptReceipts::new(Arc::default())),
         };
         let (pane_id, socket) = (p.pane.clone(), p.socket.clone());
         let refused = tokio::task::spawn_blocking(move || {
@@ -6995,6 +7025,50 @@ mod tests {
 
     /// The daemon's pane guard is per pane name: with no server it covers
     /// that pane on any, with one only that endpoint, and never another pane.
+    /// The store's prompt hooks reach the swap probe, by conversation and
+    /// pane, without their text.
+    #[tokio::test]
+    async fn prompt_hooks_reach_the_swap_probe() {
+        use muxa::account_swap::TurnProbe as _;
+        let store = muxa::Store::shared();
+        add_agent(&store, "%1", "conv", AgentKind::ClaudeCode).await;
+        let receipts = Arc::new(muxa::swap_service::PromptReceipts::new(
+            store.prompt_sequence(),
+        ));
+        let prompt = || -> muxa::AgentEvent {
+            serde_json::from_value(serde_json::json!({
+                "type": "prompt_submitted",
+                "id": {"kind": "claude_code", "session_id": "conv", "pane": "%1", "tmux_socket": "default"},
+                "prompt": "continue",
+                "at": OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            }))
+            .unwrap()
+        };
+        let endpoint = muxa::swap_service::endpoint("%1", Some("default"));
+        // Forwarding held: an old hook is accepted, the cursor taken, and
+        // only then is the old hook received. It is not after the cursor.
+        let mut held = store.subscribe_prompts();
+        store.apply(&prompt()).await;
+        let cursor = receipts.cursor();
+        receipts.record(&held.recv().await.unwrap());
+        assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "conv", &endpoint));
+        // A new one, through the real forwarder, is.
+        spawn_prompt_receipts(&store, Arc::clone(&receipts));
+        tokio::task::yield_now().await;
+        store.apply(&prompt()).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !receipts.prompt_after(cursor, AgentKind::ClaudeCode, "conv", &endpoint) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the hook never arrived"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "other", &endpoint));
+    }
+
     #[test]
     fn a_pane_guard_covers_its_pane_and_no_other_server() {
         use muxa::swap_service::TargetGuard as _;

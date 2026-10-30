@@ -767,3 +767,114 @@ fn a_v1_store_is_migrated_in_place() {
     // Reopening a migrated store changes nothing.
     assert!(SwapJobStore::open(&path).is_ok());
 }
+
+/// A follow-up's transport word is durable as soon as it is written; its
+/// evidence joins it when the wait ends, and is absent until then.
+#[test]
+fn a_follow_up_is_read_back_from_the_journal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 1);
+    store
+        .observe(
+            &lease,
+            &job,
+            0,
+            1,
+            &Observation::FollowUpSent {
+                kept: false,
+                submission: Submission::Refused,
+            },
+        )
+        .unwrap();
+    let pending = store.status(&job).unwrap().targets[0]
+        .follow_up
+        .clone()
+        .unwrap();
+    assert_eq!(
+        (pending.submission.as_str(), pending.evidence),
+        ("refused", None)
+    );
+    store
+        .observe(
+            &lease,
+            &job,
+            0,
+            1,
+            &Observation::FollowUpEvidence {
+                kept: false,
+                evidence: TurnEvidence::PromptHook,
+            },
+        )
+        .unwrap();
+    drop(store);
+    let report = open(&dir).status(&job).unwrap().targets[0]
+        .follow_up
+        .clone()
+        .unwrap();
+    assert_eq!(report.evidence.as_deref(), Some("prompt_hook"));
+    assert!(!report.kept);
+}
+
+/// Evidence of another kind of follow-up (a kept session's) is not this
+/// one's.
+#[test]
+fn a_follow_up_takes_only_evidence_of_its_own_kind() {
+    let sent = serde_json::to_string(&Observation::FollowUpSent {
+        kept: false,
+        submission: Submission::Delivered,
+    })
+    .unwrap();
+    let kept_evidence = serde_json::to_string(&Observation::FollowUpEvidence {
+        kept: true,
+        evidence: TurnEvidence::PromptHook,
+    })
+    .unwrap();
+    let report = follow_up_status(Some(sent), Some(kept_evidence)).unwrap();
+    assert_eq!(report.evidence, None);
+    assert_eq!(follow_up_status(None, None), None);
+}
+
+/// An attempt that stopped before recording its follow-up still reads back
+/// what its effects say: both accepted is delivered, an Enter with no
+/// result is unconfirmed. No evidence is claimed.
+#[test]
+fn a_follow_up_without_its_record_is_read_from_its_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 2);
+    let prompt = Effect {
+        group: 3,
+        purpose: Purpose::FollowUp,
+        op: Op::Prompt { chars: 8 },
+    };
+    let enter = Effect {
+        group: 3,
+        purpose: Purpose::FollowUp,
+        op: Op::Key(Key::Enter),
+    };
+    let mut journal = store.journal(&lease, &job, 0, 1);
+    for effect in [&prompt, &enter] {
+        journal.before(effect).unwrap();
+        journal.after(effect, Transport::Accepted).unwrap();
+    }
+    let mut journal = store.journal(&lease, &job, 1, 1);
+    journal.before(&prompt).unwrap();
+    journal.after(&prompt, Transport::Accepted).unwrap();
+    journal.before(&enter).unwrap();
+    drop(store);
+    let status = open(&dir).status(&job).unwrap();
+    let delivered = status.targets[0].follow_up.clone().unwrap();
+    assert_eq!(
+        (
+            delivered.submission.as_str(),
+            delivered.evidence,
+            delivered.kept
+        ),
+        ("delivered", None, false)
+    );
+    let open_enter = status.targets[1].follow_up.clone().unwrap();
+    assert_eq!(open_enter.submission, "unconfirmed");
+}

@@ -238,6 +238,10 @@ pub trait ContextProvider: Send + Sync {
         pane: &str,
         socket: Option<&str>,
     ) -> Result<Box<dyn TargetGuard>, String>;
+    /// The agents' prompt hooks as they arrive, if this daemon reads them.
+    fn turn_probe(&self) -> Option<Arc<dyn account_swap::TurnProbe>> {
+        None
+    }
 }
 
 /// A job by id, or by the request key that made it.
@@ -265,6 +269,10 @@ pub struct EntryView {
     /// or why it was withheld.
     #[serde(default)]
     pub continuation: Option<String>,
+    /// The follow-up the journal recorded: the transport's word, and the
+    /// evidence once its wait ended.
+    #[serde(default)]
+    pub follow_up: Option<account_swap::FollowUpReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +305,82 @@ pub struct PlanView {
     /// Whether a submit would be taken now.
     pub executable: bool,
     pub unavailable: Option<String>,
+}
+
+/// The agents' prompt hooks as the daemon receives them, kept only as long
+/// as a follow-up could wait for one and without their text: kind,
+/// conversation and pane, in arrival order. The daemon feeds it from its
+/// store; the swap executor reads it as a [`account_swap::TurnProbe`].
+pub struct PromptReceipts {
+    /// The store's own count of accepted prompt hooks: the cursor.
+    source: Arc<std::sync::atomic::AtomicU64>,
+    seen: Mutex<std::collections::VecDeque<Receipt>>,
+}
+
+struct Receipt {
+    seq: u64,
+    kind: AgentKind,
+    conversation: String,
+    endpoint: String,
+}
+
+/// More than enough for every pane's hooks within one follow-up's wait.
+const RECEIPTS_KEPT: usize = 512;
+
+impl PromptReceipts {
+    /// Receipts numbered by `source`, the store's [`crate::Store::prompt_sequence`]:
+    /// a hook the store accepted before a cursor was read is never after it,
+    /// however late it is received here.
+    #[must_use]
+    pub fn new(source: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            source,
+            seen: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Note one prompt hook, by who sent it and from where, under the number
+    /// the store gave it; its text is not kept.
+    pub fn record(&self, record: &crate::state::PromptRecord) {
+        let Ok(mut seen) = self.seen.lock() else {
+            return;
+        };
+        let receipt = Receipt {
+            seq: record.seq,
+            kind: record.id.kind,
+            conversation: record.id.session_id.clone(),
+            endpoint: record.id.pane.as_deref().map_or_else(String::new, |pane| {
+                account_swap::endpoint_key(pane, record.id.tmux_socket.as_deref())
+            }),
+        };
+        seen.push_back(receipt);
+        while seen.len() > RECEIPTS_KEPT {
+            seen.pop_front();
+        }
+    }
+}
+
+impl account_swap::TurnProbe for PromptReceipts {
+    fn cursor(&self) -> u64 {
+        self.source.load(Ordering::SeqCst)
+    }
+
+    fn prompt_after(
+        &self,
+        cursor: u64,
+        kind: AgentKind,
+        conversation: &str,
+        endpoint: &str,
+    ) -> bool {
+        self.seen.lock().is_ok_and(|seen| {
+            seen.iter().any(|receipt| {
+                receipt.seq > cursor
+                    && receipt.kind == kind
+                    && receipt.conversation == conversation
+                    && receipt.endpoint == endpoint
+            })
+        })
+    }
 }
 
 /// What a retry may set: everything else is the parent's.
@@ -345,6 +429,7 @@ struct RetryDigest<'a> {
 }
 
 /// A planned step: settled already, or a target to run.
+#[allow(clippy::large_enum_variant)] // a plan's steps, held only while it is made
 pub(crate) enum EngineStep<T> {
     Done(SwapOutcome),
     Run(T),
@@ -378,7 +463,11 @@ pub(crate) trait Engine: Send + Sync + 'static {
 }
 
 /// The real thing: `account_swap`.
-pub(crate) struct RealEngine;
+#[derive(Default)]
+pub(crate) struct RealEngine {
+    /// The daemon's prompt hooks, for a follow-up's evidence.
+    probe: Option<Arc<dyn account_swap::TurnProbe>>,
+}
 
 impl Engine for RealEngine {
     type Target = Box<PreparedTarget>;
@@ -453,7 +542,7 @@ impl Engine for RealEngine {
         target: &Self::Target,
         observer: &mut dyn EffectObserver,
     ) -> SwapOutcome {
-        account_swap::execute_target(request, target, observer)
+        account_swap::execute_target(request, target, observer, self.probe.as_deref())
     }
 }
 
@@ -506,7 +595,7 @@ impl Engine for DaemonEngine {
 
     fn identity(&self, target: &DaemonTarget) -> TargetIdentity {
         match target {
-            DaemonTarget::Real(target) => RealEngine.identity(target),
+            DaemonTarget::Real(target) => target.identity(),
             #[cfg(feature = "test-support")]
             DaemonTarget::Inert(identity) => identity.clone(),
         }
@@ -571,7 +660,10 @@ impl SwapService {
             .map(Path::to_path_buf)
             .or_else(SwapJobStore::default_path)
             .ok_or("no data directory for the swap job store")?;
-        Self::open_with(&path, provider, DaemonEngine::Real(RealEngine))
+        let engine = RealEngine {
+            probe: provider.turn_probe(),
+        };
+        Self::open_with(&path, provider, DaemonEngine::Real(engine))
     }
 
     fn open_with(
@@ -1599,6 +1691,7 @@ impl<E: Engine> Service<E> {
             conversation_unverified_reason: None,
             registered: None,
             continue_withheld: None,
+            follow_up: None,
         });
         self.remember(job, report_index, outcome);
         self.release(&identity.endpoint);
@@ -1663,6 +1756,7 @@ impl<E: Engine> Service<E> {
                 uncertain_effects: 0,
                 outcome: live.get(&entry.report_index).cloned(),
                 continuation: None,
+                follow_up: None,
             })
             .collect();
         for (target, planned) in status.targets.iter().zip(&plan.targets) {
@@ -1674,6 +1768,7 @@ impl<E: Engine> Service<E> {
                 uncertain_effects: target.uncertain_effects,
                 outcome: live.get(&planned.report_index).cloned(),
                 continuation: target.continuation.clone(),
+                follow_up: target.follow_up.clone(),
             });
         }
         entries.sort_by_key(|entry| entry.report_index);
@@ -1765,6 +1860,7 @@ fn skipped_outcome(identity: &TargetIdentity, note: &str) -> SwapOutcome {
         conversation_unverified_reason: None,
         registered: None,
         continue_withheld: None,
+        follow_up: None,
     }
 }
 
@@ -1905,6 +2001,7 @@ pub mod testing {
             conversation_unverified_reason: None,
             registered: None,
             continue_withheld: None,
+            follow_up: None,
         }
     }
 
