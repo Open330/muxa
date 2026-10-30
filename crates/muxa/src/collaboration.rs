@@ -834,6 +834,9 @@ pub struct CollaborationRequest {
     pub delegation_parent: Option<DelegationRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interruption: Option<PeerInterruption>,
+    /// Operator retirement ends an attempt; it is never a peer success report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement: Option<RequestRetirement>,
     /// Explicit operator decision. Never inferred from prose or the sender.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub human_action: Option<HumanAction>,
@@ -1437,6 +1440,10 @@ impl CollaborationRequest {
     /// A display-only projection. Exact get/claim/reply paths retain their full contract.
     pub fn omit_list_bodies(&mut self) {
         self.body.clear();
+        if let Some(retirement) = &mut self.retirement {
+            retirement.reason.clear();
+            retirement.evidence.clear();
+        }
         self.task_contract = None;
         for late in &mut self.late_replies {
             late.body.clear();
@@ -1605,6 +1612,8 @@ pub enum CollaborationError {
     TooManyWithdrawals(usize),
     #[error("invalid reply-wake withdrawal: {0}")]
     InvalidWithdrawal(String),
+    #[error("invalid request retirement: {0}")]
+    InvalidRetirement(String),
     #[error("invalid collaboration alias {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
     InvalidAlias(String),
     #[error("invalid collaboration role {0:?}; use 1-32 letters, digits, '.', '_', or '-'")]
@@ -2615,9 +2624,12 @@ fn request_latest_activity(request: &CollaborationRequest) -> OffsetDateTime {
         request.reply_notified_at,
         request.reply_read_at,
         request.reply.as_ref().map(|reply| reply.at),
+        request.retirement.as_ref().map(|retirement| retirement.at),
     ]
     .into_iter()
     .flatten()
+    .chain(request.late_replies.iter().map(|reply| reply.at))
+    .chain(request.updates.iter().map(|update| update.at))
     .fold(request.created_at, std::cmp::max)
 }
 
@@ -3195,6 +3207,7 @@ impl CollaborationStore {
             source_node_id: input.source_node_id,
             delegation_parent: input.delegation_parent,
             interruption: None,
+            retirement: None,
             human_action: input.human_action,
             id,
             from,
@@ -3718,11 +3731,13 @@ impl CollaborationStore {
             if request.reply.as_ref().is_some_and(identical) {
                 return Ok(request.clone());
             }
-            if request.superseded_by.is_some() && request.late_replies.iter().any(identical) {
+            if (request.superseded_by.is_some() || request.retirement.is_some())
+                && request.late_replies.iter().any(identical)
+            {
                 return Ok(request.clone());
             }
             let late = request.status == RequestStatus::Cancelled
-                && request.superseded_by.is_some()
+                && (request.superseded_by.is_some() || request.retirement.is_some())
                 && request.reply.is_none();
             if request.status.is_terminal() && !late {
                 return Err(CollaborationError::AlreadyTerminal(request_id.to_string()));
@@ -9960,6 +9975,8 @@ mod purpose_promote_tests;
 #[cfg(test)]
 mod recipient_slot_tests;
 mod recovery;
+mod retirement;
+pub use retirement::{RequestRetirement, RETIRE_CAPABILITY};
 #[cfg(test)]
 mod reply_wake_tests;
 pub use recovery::PeerInterruption;

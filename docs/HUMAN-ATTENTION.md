@@ -94,3 +94,41 @@ editable reply drafts for wait/recheck, safe handoff and stopping an attempt. It
 Reply button records only the decision. Dashboard detail shows the same structured
 recovery metadata; decision and progress bodies stay redacted without detail auth.
 Installed agents should reread the skill or reconnect MCP for the updated contract.
+
+
+### Retiring a reviewed stale attempt
+
+A missing binding is uncertainty, not completion. Before closing an old attempt,
+inspect its exact request, coordinator updates, actual artifacts and any replacement
+report. For a withdrawn review, verified handoff, or result produced outside the
+old attempt, an operator can record its retirement without impersonating the peer:
+
+```sh
+muxa msg retire REQUEST --reason "review explicitly withdrawn" --evidence "REQUEST#update-2"
+muxa msg retire REQUEST --reason "review explicitly withdrawn" --evidence "REQUEST#update-2" --execute
+```
+
+This is an operator-initiated, audited operation under the existing same-UID local
+trust model. The console flag records intent; it is not proof of human identity.
+The audit retains the actual calling process provenance, including when an agent
+executes authorized housekeeping on the user's behalf.
+
+The first command only previews; `--execute` commits one exact ID. Both reason and
+evidence are required and bounded; evidence is an operator assertion, not an
+automatically verified claim. Only an actively interrupted original request with
+no in-flight wake is eligible. Healthy tasks, human decisions, and notices are
+rejected. Obsolete queued notices use `msg expire --request-id REQUEST --older-than
+24h --dry-run` followed by the same command without `--dry-run` after review.
+
+Retirement atomically cancels the attempt and its exact unanswered daemon-owned
+recovery question, deactivates the interruption, and preserves instructions and
+existing human answers. It records no peer reply or task success. It stops no
+process and grants no replacement editing authority; safe handoff still needs
+verified stop or isolation. The durable revision wakes subscribers and waiters;
+retirement sends no additional pane prompt or synthetic acknowledgement. Identical
+retries are idempotent, and subsequent real peer reports are retained as bounded
+historical evidence without reopening the attempt or waking the sender as success.
+The request's full detail retains the retirement reason, evidence and timestamp.
+New retirement and late-report activity starts a fresh history retention window.
+Older daemons refuse the distinct retirement operation; the client never falls
+back to broad expiry or ordinary cancellation.

@@ -729,6 +729,19 @@ enum MsgCmd {
         #[arg(long, requires = "json")]
         full: bool,
     },
+    /// Retire one reviewed interrupted attempt; no process stop or success report.
+    Retire {
+        request_id: String,
+        #[arg(long)]
+        reason: String,
+        #[arg(long)]
+        evidence: String,
+        /// Commit the retirement; without this flag only preview it.
+        #[arg(long)]
+        execute: bool,
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop being woken for replies to your own requests you no longer need,
     /// for example ones you gave up on or re-sent. Their work, replies and
     /// `msg wait` results are unchanged; use `cancel` to stop queued work.
@@ -2288,6 +2301,39 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
         )
         .await;
     }
+    if let MsgCmd::Retire {
+        request_id,
+        reason,
+        evidence,
+        execute,
+        json,
+    } = action
+    {
+        let operator = CollaborationOrigin {
+            pane: String::new(),
+            socket: None,
+            console: true,
+            agent_session_id: None,
+            exact_session: false,
+        };
+        let request = client
+            .collaboration_retire(&operator, &request_id, &reason, &evidence, !execute)
+            .await?;
+        let mut output = collaboration_output::receipt(&request);
+        output["dry_run"] = serde_json::json!(!execute);
+        if json {
+            println!("{}", serde_json::to_string(&output)?);
+        } else {
+            println!(
+                "{} {}: {} (evidence: {})",
+                if execute { "retired" } else { "would retire" },
+                request.id,
+                reason,
+                evidence
+            );
+        }
+        return Ok(());
+    }
     let origin = collaboration_origin(client).await?;
     match action {
         MsgCmd::Accept { request_id, json } => {
@@ -2591,7 +2637,9 @@ async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 }
             }
         }
-        MsgCmd::Expire { .. } => unreachable!("handled before resolving an origin"),
+        MsgCmd::Expire { .. } | MsgCmd::Retire { .. } => {
+            unreachable!("handled before resolving an origin")
+        }
     }
     Ok(())
 }
@@ -6192,6 +6240,7 @@ mod tests {
             source_node_id: None,
             delegation_parent: None,
             interruption: None,
+            retirement: None,
             human_action: None,
             initiator: None,
             updates: Vec::new(),
@@ -7594,6 +7643,54 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn retirement_defaults_to_preview_and_requires_exact_id_reason_and_evidence() {
+        let base = [
+            "muxa",
+            "msg",
+            "retire",
+            "req-exact",
+            "--reason",
+            "withdrawn",
+            "--evidence",
+            "update:2",
+        ];
+        let preview = Args::try_parse_from(base).unwrap();
+        assert!(matches!(
+            preview.cmd,
+            Some(Cmd::Msg {
+                action: MsgCmd::Retire { execute: false, .. }
+            })
+        ));
+        let mut execute = base.to_vec();
+        execute.push("--execute");
+        assert!(matches!(
+            Args::try_parse_from(execute).unwrap().cmd,
+            Some(Cmd::Msg {
+                action: MsgCmd::Retire { execute: true, .. }
+            })
+        ));
+        assert!(Args::try_parse_from([
+            "muxa",
+            "msg",
+            "retire",
+            "req-exact",
+            "--reason",
+            "withdrawn"
+        ])
+        .is_err());
+        assert!(Args::try_parse_from([
+            "muxa",
+            "msg",
+            "retire",
+            "--reason",
+            "withdrawn",
+            "--evidence",
+            "update:2"
+        ])
+        .is_err());
+    }
+
     #[test]
     fn inbox_json_is_compact_by_default_and_full_records_are_explicit() {
         for (args, expected_full) in [
