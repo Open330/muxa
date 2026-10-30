@@ -1,18 +1,25 @@
 //! `muxa swap` — move agents onto another `aas` account and resume them.
 //!
-//! The work is [`muxa::account_swap::run`], shared with the `swap_account`
-//! automation action; this module turns flags into a request and prints the
-//! per-agent report.
+//! A daemon that runs swaps as jobs gets the request: it plans, journals and
+//! runs it under the same exclusion its automation uses, and this module
+//! follows the job. A pane that runs its agent directly is left to this
+//! process by the daemon and swapped here, bound to the agent the daemon
+//! planned. A daemon from before swap jobs, or `--local`, means the whole
+//! swap runs here, as [`muxa::account_swap::run`].
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use muxa::account_swap::{
-    self, AccountChoice, BareMode, ContinueWhen, SwapConfig, SwapOutcome, SwapRequest, SwapScope,
-    SwapStatus,
+    self, AccountChoice, BareMode, ContinueWhen, DirectTarget, SwapConfig, SwapOutcome,
+    SwapRequest, SwapScope, SwapStatus,
 };
 use muxa::event::AgentKind;
-use muxa::ipc::Client;
+use muxa::ipc::{Client, RuntimeError};
+use muxa::swap_service::{Accepted, EntryView, JobRef, JobView, SwapOverrides};
 use std::fmt::Write as _;
+use std::future::Future;
+use std::path::Path;
+use std::time::Duration;
 
 /// Move agents whose account ran out onto another `aas` account, resuming
 /// each conversation in place.
@@ -28,6 +35,7 @@ use std::fmt::Write as _;
   muxa swap --all --spread      move every idle agent, spread across accounts
   muxa swap --all --force --provider codex
   muxa swap --dry-run           show the plan, touch nothing
+  muxa swap --status cli-…      follow a swap the daemon is running or ran
   muxa swap --host rtzr --to work@claude   swap on a Fleet host")]
 #[allow(clippy::struct_excessive_bools)] // independent CLI switches
 pub struct Args {
@@ -43,15 +51,10 @@ pub struct Args {
     /// Only this provider's agents.
     #[arg(long, value_enum)]
     provider: Option<Provider>,
-    /// Account to move to: an `aas` name, or `auto` for the best-ranked
-    /// account with quota left.
-    #[arg(
-        long,
-        value_name = "ACCOUNT",
-        default_value = "auto",
-        conflicts_with = "spread"
-    )]
-    to: String,
+    /// Account to move to: an `aas` name, or `auto` (the default) for the
+    /// best-ranked account with quota left.
+    #[arg(long, value_name = "ACCOUNT", conflicts_with = "spread")]
+    to: Option<String>,
     /// Round-robin the agents over every account with quota left.
     #[arg(long)]
     spread: bool,
@@ -95,6 +98,22 @@ pub struct Args {
     /// Leave this pane alone whatever the scope (repeatable).
     #[arg(long, value_name = "PANE")]
     exclude: Vec<String>,
+    /// Run the swap in this process rather than as a daemon job: no journal,
+    /// no exclusion against the daemon's own automation.
+    #[arg(long)]
+    local: bool,
+    /// Show a daemon swap job by its request key (printed when it started)
+    /// or job id, and wait for it to end.
+    #[arg(
+        long,
+        value_name = "KEY",
+        conflicts_with_all = [
+            "targets", "all", "limited", "provider", "to", "spread", "force", "bare",
+            "continue_text", "continue_legacy", "continue_when", "no_continue", "dry_run",
+            "exclude", "local",
+        ]
+    )]
+    status: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -157,7 +176,7 @@ fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
     request.to = if args.spread {
         AccountChoice::Spread
     } else {
-        AccountChoice::parse(&args.to)
+        AccountChoice::parse(args.to.as_deref().unwrap_or("auto"))
     };
     request.force = args.force;
     if let Some(bare) = args.bare {
@@ -186,6 +205,7 @@ pub(crate) async fn run(
     args: Args,
     config: &SwapConfig,
     accounts: &muxa::accounts::AccountsConfig,
+    explicit_config: Option<&Path>,
 ) -> Result<()> {
     if args.continue_legacy.is_some() {
         eprintln!("{CONTINUE_DEPRECATED}");
@@ -193,7 +213,93 @@ pub(crate) async fn run(
     if let Some(host) = muxa::work_control::remote_host_alias(args.host.as_deref()) {
         return run_remote(client, &args, host).await;
     }
-    let request = request(&args, config);
+    // Reading a job never depends on the service taking new ones.
+    if let Some(job) = &args.status {
+        return show_status(client, job, args.json).await;
+    }
+    if args.local {
+        return run_local(client, &args, config, accounts).await;
+    }
+    let hello = client.hello(HELLO_TIMEOUT).await.map_err(|error| {
+        anyhow!(
+            "could not ask the daemon how it runs swaps: {error}\n\
+             pass --local to swap in this process instead"
+        )
+    })?;
+    let route = match route(&hello.capabilities) {
+        // No marker: an old daemon, or one that serves swap jobs from before
+        // the marker and cannot take one now. Only a daemon that does not
+        // know the request at all is old enough to bypass.
+        Route::Legacy => probe(&client.swap_job_status(&JobRef::Key(PROBE_KEY.into())).await),
+        route => route,
+    };
+    match route {
+        Route::Daemon => run_routed(client, &args, config, accounts, explicit_config).await,
+        Route::Unavailable => bail!("{UNAVAILABLE}"),
+        Route::Legacy => {
+            eprintln!("muxa swap: this daemon predates swap jobs; swapping in this process");
+            run_local(client, &args, config, accounts).await
+        }
+    }
+}
+
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often a running job is read back.
+const POLL: Duration = Duration::from_millis(500);
+
+const UNAVAILABLE: &str = "swap jobs are unavailable on this daemon right now \
+     (starting, halted or shutting down; see `muxa doctor`). Nothing was sent.\n\
+     Retry shortly, or pass --local to swap in this process instead";
+
+/// Where a swap runs, from what the daemon advertised.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    /// As a daemon job.
+    Daemon,
+    /// The daemon runs swaps as jobs but cannot take one now: refuse, never
+    /// run around its exclusion.
+    Unavailable,
+    /// A daemon from before swap jobs: here, as it always was.
+    Legacy,
+}
+
+/// A key no job is made under, read to learn whether the daemon knows swap
+/// jobs at all.
+const PROBE_KEY: &str = "cli-probe";
+
+/// What reading [`PROBE_KEY`] says, with no swap tag advertised: only the
+/// daemon's "unknown request" is a daemon from before swap jobs. Any other
+/// answer, a not-found included, is a service that exists and is not
+/// taking jobs now; a failed read cannot tell, so it refuses too.
+fn probe(read: &Result<JobView, RuntimeError>) -> Route {
+    match read {
+        Err(RuntimeError::Daemon(error)) if error.contains("unknown variant `swap_job_status`") => {
+            Route::Legacy
+        }
+        _ => Route::Unavailable,
+    }
+}
+
+fn route(capabilities: &[String]) -> Route {
+    let has = |name: &str| capabilities.iter().any(|c| c == name);
+    if has(muxa::ipc::SWAP_JOBS_CAPABILITY) && has(muxa::ipc::SWAP_PLAN_CAPABILITY) {
+        Route::Daemon
+    } else if has(muxa::ipc::SWAP_SERVICE_CAPABILITY) {
+        Route::Unavailable
+    } else {
+        Route::Legacy
+    }
+}
+
+/// The whole swap in this process.
+async fn run_local(
+    client: &Client,
+    args: &Args,
+    config: &SwapConfig,
+    accounts: &muxa::accounts::AccountsConfig,
+) -> Result<()> {
+    let request = request(args, config);
     let agents = client.snapshot().await.context("listing agents")?;
     let backends = muxa::backend::active_backends();
     let config = config.clone();
@@ -203,15 +309,502 @@ pub(crate) async fn run(
     })
     .await
     .context("swap worker")?;
-    if args.json {
-        println!("{}", serde_json::to_string_pretty(&outcomes)?);
-    } else {
-        print!("{}", render(&outcomes));
-    }
+    report(&outcomes, args.json)?;
     if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
         bail!("some agents could not be swapped");
     }
     Ok(())
+}
+
+fn report(outcomes: &[SwapOutcome], json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(outcomes)?);
+    } else {
+        print!("{}", render(outcomes));
+    }
+    Ok(())
+}
+
+/// The request exactly as typed, nothing filled in from configuration: its
+/// digest is what makes a repeated send the same request.
+fn overrides(args: &Args, explicit_config: Option<&Path>) -> SwapOverrides {
+    SwapOverrides {
+        targets: args.targets.clone(),
+        all: args.all,
+        limited: args.limited,
+        provider: args.provider.map(|provider| {
+            match provider {
+                Provider::Claude => "claude",
+                Provider::Codex => "codex",
+            }
+            .to_owned()
+        }),
+        to: args.to.clone(),
+        spread: args.spread,
+        force: args.force,
+        bare: args.bare.map(|bare| {
+            match bare {
+                Bare::Skip => "skip",
+                Bare::Wrap => "wrap",
+            }
+            .to_owned()
+        }),
+        continue_text: args.follow_up_text().cloned(),
+        continue_when: args.continue_when.map(|when| {
+            match when {
+                When::Limited => "limited",
+                When::Always => "always",
+                When::Never => "never",
+            }
+            .to_owned()
+        }),
+        no_continue: args.no_continue,
+        exclude: args.exclude.clone(),
+        caller_config: explicit_config.map(Path::to_path_buf),
+    }
+}
+
+/// What the CLI needs of the daemon's swap jobs; a trait so the job flow
+/// can be tested without one.
+trait SwapDaemon {
+    fn start(
+        &self,
+        key: &str,
+        overrides: &SwapOverrides,
+    ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send;
+    fn status(&self, job: &JobRef) -> impl Future<Output = Result<JobView, RuntimeError>> + Send;
+}
+
+impl SwapDaemon for Client {
+    fn start(
+        &self,
+        key: &str,
+        overrides: &SwapOverrides,
+    ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
+        self.swap_job_start(key, overrides)
+    }
+
+    fn status(&self, job: &JobRef) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
+        self.swap_job_status(job)
+    }
+}
+
+/// How following a daemon job ended.
+#[derive(Debug)]
+enum JobEnd {
+    /// The job ended, or the service faulted under it.
+    Ended(JobView),
+    /// The daemon answered the start with a refusal and holds no job for
+    /// the key: nothing was accepted.
+    Refused(String),
+    /// Whether the job exists, or how far it got, is not known.
+    Unknown(String),
+    /// Ctrl-C: waiting stopped; the job, if accepted, runs on.
+    Interrupted,
+}
+
+/// Whether there is nothing more to wait for: the job ended, or the
+/// service faulted (a faulted job may stay `running` with nothing left to
+/// run it).
+fn settled(view: &JobView) -> bool {
+    view.fault.is_some() || !matches!(view.state.as_str(), "accepted" | "running")
+}
+
+/// Start `key` and follow it to its end. Ctrl-C is armed before the start
+/// is sent: an interrupted start, like a lost answer, leaves the key as the
+/// only handle, and nothing here ever sends the request again.
+async fn follow_job(
+    daemon: &impl SwapDaemon,
+    key: &str,
+    overrides: &SwapOverrides,
+    cancel: impl Future<Output = ()>,
+    poll: Duration,
+) -> JobEnd {
+    tokio::pin!(cancel);
+    let started = tokio::select! {
+        biased;
+        () = &mut cancel => return JobEnd::Interrupted,
+        started = daemon.start(key, overrides) => started,
+    };
+    let mut view = match started {
+        Ok(accepted) => accepted.view,
+        Err(start) => {
+            let refused = matches!(start, RuntimeError::Daemon(_));
+            let by_key_ref = JobRef::Key(key.to_owned());
+            let by_key = tokio::select! {
+                biased;
+                () = &mut cancel => return JobEnd::Interrupted,
+                view = daemon.status(&by_key_ref) => view,
+            };
+            match by_key {
+                Ok(view) => view,
+                // A refusal is an answer, and no job holds the key: refused.
+                // Anything else may still be accepted later.
+                Err(status) if refused && not_found(&status) => {
+                    return JobEnd::Refused(start.to_string());
+                }
+                Err(status) => {
+                    return JobEnd::Unknown(format!(
+                        "starting it: {start}; reading it back: {status}"
+                    ));
+                }
+            }
+        }
+    };
+    let job = JobRef::Id(view.job_id.clone());
+    loop {
+        if settled(&view) {
+            return JobEnd::Ended(view);
+        }
+        let read = tokio::select! {
+            biased;
+            () = &mut cancel => return JobEnd::Interrupted,
+            read = async {
+                tokio::time::sleep(poll).await;
+                daemon.status(&job).await
+            } => read,
+        };
+        match read {
+            Ok(next) => view = next,
+            Err(error) => return JobEnd::Unknown(format!("reading it back: {error}")),
+        }
+    }
+}
+
+/// The store's "no such job", as the daemon words it.
+fn not_found(error: &RuntimeError) -> bool {
+    matches!(error, RuntimeError::Daemon(message)
+        if message.starts_with("swap job ") && message.ends_with(" not found"))
+}
+
+/// The daemon-owned swap, with any direct panes swapped here afterwards.
+async fn run_routed(
+    client: &Client,
+    args: &Args,
+    config: &SwapConfig,
+    accounts: &muxa::accounts::AccountsConfig,
+    explicit_config: Option<&Path>,
+) -> Result<()> {
+    let overrides = overrides(args, explicit_config);
+    let plan = client.swap_plan(&overrides).await.map_err(|error| {
+        anyhow!(
+            "the daemon could not plan this swap: {error}\nnothing was sent; \
+             pass --local to swap in this process instead"
+        )
+    })?;
+    if !plan.executable {
+        bail!(
+            "swap jobs are unavailable on this daemon: {}\nnothing was sent; \
+             pass --local to swap in this process instead",
+            plan.unavailable.as_deref().unwrap_or("unknown reason")
+        );
+    }
+    let direct = plan.direct_targets.clone();
+    let local_request = request(args, config);
+    if args.dry_run {
+        let local = run_planned_direct(client, &local_request, config, accounts, &direct).await?;
+        let outcomes = merge(plan.outcomes, &direct, local);
+        report(&outcomes, args.json)?;
+        return Ok(());
+    }
+    let mut daemon_overrides = overrides;
+    for target in &direct {
+        if !daemon_overrides.exclude.contains(&target.pane) {
+            daemon_overrides.exclude.push(target.pane.clone());
+        }
+    }
+    let key = format!("cli-{}", uuid::Uuid::new_v4());
+    eprintln!("muxa swap: request {key} (see it with `muxa swap --status {key}`)");
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let view = match follow_job(client, &key, &daemon_overrides, cancel, POLL).await {
+        JobEnd::Ended(view) => view,
+        JobEnd::Refused(error) => bail!("the daemon refused this swap: {error}"),
+        JobEnd::Unknown(error) => bail!(
+            "{error}\nthe swap may or may not have been accepted; do not retry before \
+             checking `muxa swap --status {key}`{}",
+            skipped_direct(&direct)
+        ),
+        JobEnd::Interrupted => bail!(
+            "stopped waiting. The swap, if accepted, runs on under the daemon: \
+             `muxa swap --status {key}`{}",
+            skipped_direct(&direct)
+        ),
+    };
+    let clean = view.state == "done" && view.fault.is_none();
+    let daemon_half = job_outcomes(&view);
+    let local = if direct.is_empty() {
+        Vec::new()
+    } else if clean {
+        eprintln!(
+            "muxa swap: {} pane(s) run their agent directly; the daemon left them to this \
+             process, which swaps them now as planned",
+            direct.len()
+        );
+        run_planned_direct(client, &local_request, config, accounts, &direct).await?
+    } else {
+        eprintln!(
+            "muxa swap: the daemon job did not end cleanly{}",
+            skipped_direct(&direct)
+        );
+        Vec::new()
+    };
+    let outcomes = merge(daemon_half, &direct, local);
+    report(&outcomes, args.json)?;
+    job_verdict(&view, &key)?;
+    if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
+        bail!("some agents could not be swapped");
+    }
+    Ok(())
+}
+
+fn skipped_direct(direct: &[DirectTarget]) -> String {
+    if direct.is_empty() {
+        return String::new();
+    }
+    let panes: Vec<&str> = direct.iter().map(|target| target.pane.as_str()).collect();
+    format!(
+        "\nthe directly-run pane(s) {} were not swapped",
+        panes.join(", ")
+    )
+}
+
+/// The planned direct panes, swapped here: the request's own scope, bound
+/// to exactly the agents the daemon planned.
+async fn run_planned_direct(
+    client: &Client,
+    request: &SwapRequest,
+    config: &SwapConfig,
+    accounts: &muxa::accounts::AccountsConfig,
+    direct: &[DirectTarget],
+) -> Result<Vec<SwapOutcome>> {
+    if direct.is_empty() {
+        return Ok(Vec::new());
+    }
+    let agents = client.snapshot().await.context("listing agents")?;
+    let backends = muxa::backend::active_backends();
+    let (request, config, accounts, direct) = (
+        request.clone(),
+        config.clone(),
+        accounts.clone(),
+        direct.to_vec(),
+    );
+    tokio::task::spawn_blocking(move || {
+        account_swap::run_bound(&request, &agents, &backends, &config, &accounts, &direct)
+    })
+    .await
+    .context("swap worker")
+}
+
+/// The daemon's report with each direct pane's placeholder (excluded from
+/// the job, or skipped in its plan) replaced by what happened to it here,
+/// in place; a direct outcome with no placeholder goes last.
+fn merge(
+    daemon: Vec<SwapOutcome>,
+    direct: &[DirectTarget],
+    local: Vec<SwapOutcome>,
+) -> Vec<SwapOutcome> {
+    let mut local: Vec<Option<SwapOutcome>> = local.into_iter().map(Some).collect();
+    let mut merged = Vec::with_capacity(daemon.len() + local.len());
+    for outcome in daemon {
+        // The job's exclusion of the pane, or the plan's refusal of it:
+        // a genuine skip on that pane stays.
+        let placeholder = outcome.status == SwapStatus::Skipped
+            && (outcome.note.contains("excluded")
+                || outcome.note.contains("runs its agent directly"))
+            && direct
+                .iter()
+                .any(|target| outcome.pane.as_deref() == Some(target.pane.as_str()));
+        if placeholder {
+            let pane = outcome.pane.clone();
+            if let Some(mine) = local
+                .iter_mut()
+                .find(|mine| mine.as_ref().is_some_and(|mine| mine.pane == pane))
+                .and_then(Option::take)
+            {
+                merged.push(mine);
+            }
+            continue;
+        }
+        merged.push(outcome);
+    }
+    merged.extend(local.into_iter().flatten());
+    merged
+}
+
+/// One report row per job entry, in request order. The journal is the
+/// authority: an entry it does not record as swapped is never shown as
+/// swapped, whatever the executor's own report said.
+fn job_outcomes(view: &JobView) -> Vec<SwapOutcome> {
+    let mut entries: Vec<&EntryView> = view.entries.iter().collect();
+    entries.sort_by_key(|entry| entry.report_index);
+    entries.into_iter().map(entry_outcome).collect()
+}
+
+fn entry_outcome(entry: &EntryView) -> SwapOutcome {
+    let status = match entry.disposition.as_deref() {
+        Some("swapped") => SwapStatus::Swapped,
+        Some("skipped") => SwapStatus::Skipped,
+        _ => SwapStatus::Failed,
+    };
+    let mut outcome = entry.outcome.clone().unwrap_or_else(|| SwapOutcome {
+        pane: entry.pane.clone(),
+        agent_session_id: String::new(),
+        kind: AgentKind::Unknown,
+        from: None,
+        to: None,
+        status,
+        command: None,
+        note: String::new(),
+        continue_reason: None,
+        session_id_source: None,
+        conversation_verified: None,
+        conversation_unverified_reason: None,
+        registered: None,
+    });
+    if outcome.status != status || entry.outcome.is_none() {
+        let what = entry.disposition.as_deref().unwrap_or("not finished");
+        let reason = entry
+            .reason
+            .as_deref()
+            .map_or_else(String::new, |reason| format!(" ({reason})"));
+        outcome.note = if outcome.note.is_empty() {
+            format!("{what}{reason}")
+        } else {
+            format!("{what}{reason}: {}", outcome.note)
+        };
+        outcome.status = status;
+    }
+    if entry.uncertain_effects > 0 {
+        let _ = write!(
+            outcome.note,
+            "; {} effect(s) may or may not have happened",
+            entry.uncertain_effects
+        );
+    }
+    outcome
+}
+
+/// An error unless the job ended cleanly.
+fn job_verdict(view: &JobView, key: &str) -> Result<()> {
+    if let Some(fault) = &view.fault {
+        bail!(
+            "swap job {} ({key}) stopped: the daemon's swap service faulted: {fault}",
+            view.job_id
+        );
+    }
+    if view.state != "done" {
+        bail!(
+            "swap job {} ({key}) ended {}{}",
+            view.job_id,
+            view.state,
+            view.reason
+                .as_deref()
+                .map_or_else(String::new, |reason| format!(": {reason}"))
+        );
+    }
+    if view.entries.iter().any(|entry| entry.uncertain_effects > 0) {
+        bail!(
+            "swap job {} ({key}) has effects whose result was never recorded; check those panes",
+            view.job_id
+        );
+    }
+    if job_outcomes(view)
+        .iter()
+        .any(|outcome| outcome.status == SwapStatus::Failed)
+    {
+        bail!(
+            "swap job {} ({key}): some agents could not be swapped",
+            view.job_id
+        );
+    }
+    Ok(())
+}
+
+/// A job id as the store makes them: `swap-` and a UUID.
+fn job_ref(text: &str) -> JobRef {
+    let id = text
+        .strip_prefix("swap-")
+        .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok());
+    if id {
+        JobRef::Id(text.to_owned())
+    } else {
+        JobRef::Key(text.to_owned())
+    }
+}
+
+/// How watching a job by `--status` ended.
+#[derive(Debug)]
+enum Watch {
+    Settled(JobView),
+    /// Ctrl-C; the job, if found, by id.
+    Interrupted(Option<String>),
+    Failed(RuntimeError),
+}
+
+/// Read the job (an id that is not found is tried as a key) and follow it
+/// to its end. Ctrl-C ends any wait, a slow read included.
+async fn watch_job(
+    daemon: &impl SwapDaemon,
+    text: &str,
+    cancel: impl Future<Output = ()>,
+    poll: Duration,
+) -> Watch {
+    tokio::pin!(cancel);
+    let first = job_ref(text);
+    let read = async {
+        match daemon.status(&first).await {
+            Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
+                daemon.status(&JobRef::Key(text.to_owned())).await
+            }
+            read => read,
+        }
+    };
+    let mut view = tokio::select! {
+        biased;
+        () = &mut cancel => return Watch::Interrupted(None),
+        read = read => match read {
+            Ok(view) => view,
+            Err(error) => return Watch::Failed(error),
+        },
+    };
+    let job = JobRef::Id(view.job_id.clone());
+    while !settled(&view) {
+        let read = tokio::select! {
+            biased;
+            () = &mut cancel => return Watch::Interrupted(Some(view.job_id)),
+            read = async {
+                tokio::time::sleep(poll).await;
+                daemon.status(&job).await
+            } => read,
+        };
+        match read {
+            Ok(next) => view = next,
+            Err(error) => return Watch::Failed(error),
+        }
+    }
+    Watch::Settled(view)
+}
+
+/// `--status`: follow the job to its end and report it.
+async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let view = match watch_job(client, text, cancel, POLL).await {
+        Watch::Settled(view) => view,
+        Watch::Interrupted(Some(job)) => bail!("stopped waiting; swap job {job} runs on"),
+        Watch::Interrupted(None) => bail!("stopped waiting"),
+        Watch::Failed(error) => bail!("{error}"),
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&view)?);
+    } else {
+        println!("job {}  {}", view.job_id, view.state);
+        print!("{}", render(&job_outcomes(&view)));
+    }
+    job_verdict(&view, text)
 }
 
 /// The same swap as a `muxa swap … --json` argv for a Fleet host, every
@@ -226,6 +819,7 @@ fn remote_argv(args: &Args) -> Vec<String> {
         (args.force, "--force"),
         (args.no_continue, "--no-continue"),
         (args.dry_run, "--dry-run"),
+        (args.local, "--local"),
     ] {
         if on {
             words.push(flag.to_owned());
@@ -240,8 +834,11 @@ fn remote_argv(args: &Args) -> Vec<String> {
             }
         ));
     }
-    if !args.spread {
-        words.push(format!("--to={}", args.to));
+    if let Some(to) = &args.to {
+        words.push(format!("--to={to}"));
+    }
+    if let Some(job) = &args.status {
+        words.push(format!("--status={job}"));
     }
     if let Some(bare) = args.bare {
         words.push(format!(
@@ -320,13 +917,41 @@ pub(crate) fn checked_argv(words: &[String]) -> std::result::Result<Vec<String>,
 /// `muxa swap --host`: the host's own `muxa swap` does the work, through
 /// the Fleet transport, and its report is printed here.
 async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
-    if !args.dry_run {
+    if !args.dry_run && args.status.is_none() {
         eprintln!("{}", remote_wait_notice(host));
     }
     let output = client
         .work_command(Some(host), &remote_argv(args), None)
         .await
         .with_context(|| format!("running the swap on {host}"))?;
+    // The host's own notices (its request key above all) are for the user.
+    for line in output
+        .stderr
+        .lines()
+        .filter(|line| line.starts_with("muxa swap:"))
+    {
+        eprintln!("{host}: {line}");
+    }
+    if args.status.is_some() {
+        let Ok(view) = serde_json::from_str::<JobView>(&output.stdout) else {
+            bail!(
+                "{host}: swap status failed (exit {}): {}",
+                output.exit_code,
+                output.stderr.trim()
+            );
+        };
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&view)?);
+        } else {
+            println!("{host}: job {}  {}", view.job_id, view.state);
+            print!("{}", render(&job_outcomes(&view)));
+        }
+        job_verdict(&view, &format!("on {host}"))?;
+        if output.exit_code != 0 {
+            bail!("{host}: {}", output.stderr.trim());
+        }
+        return Ok(());
+    }
     let Ok(outcomes) = serde_json::from_str::<Vec<SwapOutcome>>(&output.stdout) else {
         bail!(
             "{host}: swap failed (exit {}): {}",
@@ -341,6 +966,16 @@ async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
     }
     if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
         bail!("some agents on {host} could not be swapped");
+    }
+    // A host's daemon job can end unclean with no failed row (faulted,
+    // uncertain effects): its exit status says so.
+    if output.exit_code != 0 {
+        bail!(
+            "the swap on {host} did not end cleanly (exit {}): {}\n\
+             check it with `muxa swap --host {host} --status <key>`",
+            output.exit_code,
+            output.stderr.trim()
+        );
     }
     Ok(())
 }
@@ -443,7 +1078,7 @@ mod tests {
         assert!(checked_argv(&words(&["--to", "x", "--spread"])).is_err());
         assert_eq!(
             checked_argv(&words(&["--all", "--exclude", "%9"])).unwrap(),
-            ["swap", "--all", "--to=auto", "--exclude=%9", "--json"]
+            ["swap", "--all", "--exclude=%9", "--json"]
         );
     }
 
@@ -519,7 +1154,7 @@ mod tests {
         let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
         assert_eq!(
             checked_argv(&words(&["--continue", "go"])).unwrap(),
-            ["swap", "--to=auto", "--continue-text=go", "--json"]
+            ["swap", "--continue-text=go", "--json"]
         );
         assert!(checked_argv(&words(&["--continue", "a", "--continue-text", "b"])).is_err());
         assert!(checked_argv(&words(&["--no-continue", "--continue-when", "always"])).is_err());
@@ -557,6 +1192,437 @@ mod tests {
             );
             muxa::work_control::validate_swap_argv(&argv).unwrap();
         }
+    }
+
+    // --- daemon routing -------------------------------------------------
+
+    fn caps(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// No swap tags at all is a daemon from before swap jobs; the service
+    /// marker without them is a service that cannot take one now, which
+    /// must never be run around.
+    #[test]
+    fn an_unavailable_service_is_not_mistaken_for_an_old_daemon() {
+        assert_eq!(route(&caps(&["collaboration"])), Route::Legacy);
+        assert_eq!(route(&caps(&["swap_service_v1"])), Route::Unavailable);
+        assert_eq!(
+            route(&caps(&["swap_service_v1", "swap_jobs_v1"])),
+            Route::Unavailable
+        );
+        assert_eq!(
+            route(&caps(&["swap_service_v1", "swap_jobs_v1", "swap_plan_v1"])),
+            Route::Daemon
+        );
+    }
+
+    /// The request as typed: no `auto` the user never wrote, no defaults,
+    /// and the config file only when one was named.
+    #[test]
+    fn overrides_carry_only_what_was_typed() {
+        let cli = Cli::parse_from(["swap", "%5", "--force"]);
+        let typed = overrides(&cli.args, None);
+        assert_eq!(typed.targets, ["%5"]);
+        assert!(typed.force);
+        assert_eq!(typed.to, None);
+        assert_eq!(typed.continue_when, None);
+        assert_eq!(typed.caller_config, None);
+        let named = overrides(&cli.args, Some(Path::new("/etc/muxa.toml")));
+        assert_eq!(
+            named.caller_config.as_deref(),
+            Some(Path::new("/etc/muxa.toml"))
+        );
+        let cli = Cli::parse_from(["swap", "--to", "a@claude", "--continue-when", "always"]);
+        let typed = overrides(&cli.args, None);
+        assert_eq!(typed.to.as_deref(), Some("a@claude"));
+        assert_eq!(typed.continue_when.as_deref(), Some("always"));
+    }
+
+    #[test]
+    fn status_takes_no_action_flags() {
+        for argv in [
+            &["swap", "--status", "k", "%5"][..],
+            &["swap", "--status", "k", "--all"],
+            &["swap", "--status", "k", "--local"],
+            &["swap", "--status", "k", "--dry-run"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(Cli::try_parse_from(["swap", "--status", "k", "--json"]).is_ok());
+    }
+
+    #[test]
+    fn a_job_id_is_read_as_one_and_anything_else_as_a_key() {
+        let id = format!("swap-{}", uuid::Uuid::new_v4());
+        assert_eq!(job_ref(&id), JobRef::Id(id.clone()));
+        assert_eq!(job_ref("cli-123"), JobRef::Key("cli-123".into()));
+        assert_eq!(job_ref("swap-nope"), JobRef::Key("swap-nope".into()));
+    }
+
+    #[test]
+    fn local_and_status_reach_a_host() {
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let argv = checked_argv(&words(&["--local", "%5"])).unwrap();
+        assert_eq!(argv, ["swap", "%5", "--local", "--json"]);
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+        let argv = checked_argv(&words(&["--status", "cli-1"])).unwrap();
+        assert_eq!(argv, ["swap", "--status=cli-1", "--json"]);
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+    }
+
+    fn view(state: &str, fault: Option<&str>) -> JobView {
+        JobView {
+            job_id: "swap-job".into(),
+            node_id: "node".into(),
+            state: state.into(),
+            revision: 1,
+            reason: None,
+            entries: Vec::new(),
+            fault: fault.map(str::to_owned),
+        }
+    }
+
+    /// A scripted daemon: each start answer, and status answers in order.
+    struct Scripted {
+        start: Mutex<Option<Result<Accepted, RuntimeError>>>,
+        statuses: Mutex<std::collections::VecDeque<Result<JobView, RuntimeError>>>,
+        starts: std::sync::atomic::AtomicUsize,
+        hold_start: bool,
+    }
+
+    use std::sync::Mutex;
+
+    impl Scripted {
+        fn new(
+            start: Result<Accepted, RuntimeError>,
+            statuses: Vec<Result<JobView, RuntimeError>>,
+        ) -> Self {
+            Self {
+                start: Mutex::new(Some(start)),
+                statuses: Mutex::new(statuses.into()),
+                starts: std::sync::atomic::AtomicUsize::new(0),
+                hold_start: false,
+            }
+        }
+    }
+
+    impl SwapDaemon for Scripted {
+        fn start(
+            &self,
+            _: &str,
+            _: &SwapOverrides,
+        ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
+            self.starts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let answer = self.start.lock().unwrap().take().expect("one start only");
+            let hold = self.hold_start;
+            async move {
+                if hold {
+                    std::future::pending::<()>().await;
+                }
+                answer
+            }
+        }
+
+        fn status(&self, _: &JobRef) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
+            let answer = self
+                .statuses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("no more status answers");
+            async move { answer }
+        }
+    }
+
+    fn accepted(state: &str) -> Accepted {
+        Accepted {
+            job_id: "swap-job".into(),
+            existing: false,
+            view: view(state, None),
+        }
+    }
+
+    async fn follow(daemon: &Scripted) -> JobEnd {
+        follow_job(
+            daemon,
+            "cli-k",
+            &SwapOverrides::default(),
+            std::future::pending(),
+            Duration::from_millis(1),
+        )
+        .await
+    }
+
+    #[test]
+    fn only_a_daemon_that_does_not_know_swap_jobs_is_bypassed() {
+        let daemon = |error: &str| Err(RuntimeError::Daemon(error.into()));
+        assert_eq!(
+            probe(&daemon(
+                "bad request: unknown variant `swap_job_status`, expected one of `hello`"
+            )),
+            Route::Legacy
+        );
+        // A daemon serving swap jobs from before the marker, not taking one now.
+        assert_eq!(
+            probe(&daemon("swap job cli-probe not found")),
+            Route::Unavailable
+        );
+        assert_eq!(
+            probe(&daemon("swap jobs are unavailable on this daemon")),
+            Route::Unavailable
+        );
+        assert_eq!(probe(&Err(RuntimeError::Disconnected)), Route::Unavailable);
+        assert_eq!(
+            probe(&Err(RuntimeError::Timeout(Duration::from_secs(1)))),
+            Route::Unavailable
+        );
+        assert_eq!(probe(&Ok(view("done", None))), Route::Unavailable);
+    }
+
+    /// A job that ended with a failed row fails, however it is read.
+    #[test]
+    fn a_done_job_with_a_failed_row_is_a_failure() {
+        let mut job = view("done", None);
+        job.entries.push(EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("failed".into()),
+            reason: Some("candidates_unavailable".into()),
+            uncertain_effects: 0,
+            outcome: None,
+        });
+        assert!(job_verdict(&job, "k").is_err());
+        job.entries[0].disposition = Some("kept".into());
+        assert!(job_verdict(&job, "k").is_err());
+        job.entries[0].disposition = Some("swapped".into());
+        assert!(job_verdict(&job, "k").is_ok());
+    }
+
+    /// A status read that never answers still ends on Ctrl-C.
+    #[tokio::test]
+    async fn ctrl_c_ends_a_held_status_read() {
+        struct Held;
+        impl SwapDaemon for Held {
+            fn start(
+                &self,
+                _: &str,
+                _: &SwapOverrides,
+            ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
+                std::future::pending()
+            }
+            fn status(
+                &self,
+                _: &JobRef,
+            ) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
+                std::future::pending()
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let watch = watch_job(
+            &Held,
+            "cli-k",
+            async move {
+                let _ = rx.await;
+            },
+            Duration::from_millis(1),
+        );
+        tokio::pin!(watch);
+        tokio::select! {
+            biased;
+            _ = &mut watch => panic!("ended while the read was held"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        tx.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), watch)
+            .await
+            .expect("Ctrl-C must end a held read");
+        assert!(matches!(ended, Watch::Interrupted(None)));
+    }
+
+    /// An id that is not found is read as a key; any other error is final.
+    #[tokio::test]
+    async fn status_tries_an_unknown_id_as_a_key_only_when_not_found() {
+        let id = format!("swap-{}", uuid::Uuid::new_v4());
+        let missing = || Err(RuntimeError::Daemon(format!("swap job {id} not found")));
+        let daemon = Scripted::new(
+            Ok(accepted("done")),
+            vec![missing(), Ok(view("done", None))],
+        );
+        assert!(matches!(
+            watch_job(&daemon, &id, std::future::pending(), Duration::from_millis(1)).await,
+            Watch::Settled(v) if v.state == "done"
+        ));
+        let daemon = Scripted::new(
+            Ok(accepted("done")),
+            vec![Err(RuntimeError::Disconnected), Ok(view("done", None))],
+        );
+        assert!(matches!(
+            watch_job(
+                &daemon,
+                &id,
+                std::future::pending(),
+                Duration::from_millis(1)
+            )
+            .await,
+            Watch::Failed(RuntimeError::Disconnected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_job_is_followed_to_its_end() {
+        let daemon = Scripted::new(
+            Ok(accepted("running")),
+            vec![Ok(view("running", None)), Ok(view("done", None))],
+        );
+        assert!(matches!(follow(&daemon).await, JobEnd::Ended(v) if v.state == "done"));
+    }
+
+    /// A fault ends the wait even with the job still marked running.
+    #[tokio::test]
+    async fn a_faulted_job_ends_the_wait() {
+        let daemon = Scripted::new(
+            Ok(accepted("running")),
+            vec![Ok(view("running", Some("journal")))],
+        );
+        let JobEnd::Ended(view) = follow(&daemon).await else {
+            panic!("a fault must end the wait");
+        };
+        assert!(job_verdict(&view, "cli-k").is_err());
+    }
+
+    /// A lost answer to an accepted start is recovered by the key, never by
+    /// sending the request again.
+    #[tokio::test]
+    async fn a_lost_acknowledgement_is_recovered_by_key() {
+        let daemon = Scripted::new(
+            Err(RuntimeError::Disconnected),
+            vec![Ok(view("running", None)), Ok(view("done", None))],
+        );
+        assert!(matches!(follow(&daemon).await, JobEnd::Ended(v) if v.state == "done"));
+        assert_eq!(daemon.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// Not found after a lost answer is not a refusal: the start may still
+    /// be planning.
+    #[tokio::test]
+    async fn an_unanswered_start_with_no_job_yet_is_unknown_not_refused() {
+        let missing = || Err(RuntimeError::Daemon("swap job cli-k not found".into()));
+        let daemon = Scripted::new(Err(RuntimeError::Disconnected), vec![missing()]);
+        assert!(matches!(follow(&daemon).await, JobEnd::Unknown(_)));
+        let daemon = Scripted::new(Err(RuntimeError::Daemon("busy".into())), vec![missing()]);
+        assert!(matches!(follow(&daemon).await, JobEnd::Refused(e) if e == "busy"));
+    }
+
+    /// Ctrl-C during the start stops the wait at once.
+    #[tokio::test]
+    async fn ctrl_c_during_the_start_only_stops_waiting() {
+        let mut daemon = Scripted::new(Ok(accepted("running")), Vec::new());
+        daemon.hold_start = true;
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let cancel = async move {
+            let _ = rx.await;
+        };
+        let request = SwapOverrides::default();
+        let follow = follow_job(&daemon, "cli-k", &request, cancel, Duration::from_millis(1));
+        tokio::pin!(follow);
+        tokio::select! {
+            biased;
+            _ = &mut follow => panic!("ended while the start was held"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        tx.send(()).unwrap();
+        assert!(matches!(follow.await, JobEnd::Interrupted));
+        assert_eq!(daemon.starts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    fn outcome(pane: &str, status: SwapStatus, note: &str) -> SwapOutcome {
+        SwapOutcome {
+            pane: Some(pane.into()),
+            agent_session_id: format!("s{pane}"),
+            kind: AgentKind::ClaudeCode,
+            from: None,
+            to: None,
+            status,
+            command: None,
+            note: note.into(),
+            continue_reason: None,
+            session_id_source: None,
+            conversation_verified: None,
+            conversation_unverified_reason: None,
+            registered: None,
+        }
+    }
+
+    fn direct(pane: &str) -> DirectTarget {
+        DirectTarget {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            endpoint: format!("{pane}@default"),
+            conversation_id: format!("s{pane}"),
+        }
+    }
+
+    /// One row per agent, in order: each direct pane's placeholder becomes
+    /// what happened to it here, and a genuine skip on that pane stays.
+    #[test]
+    fn a_split_swap_reports_each_agent_once_in_order() {
+        let daemon = vec![
+            outcome("%1", SwapStatus::Swapped, "resumed"),
+            outcome("%2", SwapStatus::Skipped, "skipped: excluded"),
+            outcome("%2", SwapStatus::Skipped, "skipped: mid-turn"),
+            outcome(
+                "%3",
+                SwapStatus::Skipped,
+                "skipped: this pane runs its agent directly",
+            ),
+        ];
+        let local = vec![
+            outcome("%2", SwapStatus::Swapped, "here"),
+            outcome("%3", SwapStatus::Failed, "here"),
+        ];
+        let merged = merge(daemon, &[direct("%2"), direct("%3")], local);
+        let shape: Vec<_> = merged
+            .iter()
+            .map(|o| (o.pane.clone().unwrap(), o.status, o.note.clone()))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("%1".into(), SwapStatus::Swapped, "resumed".into()),
+                ("%2".into(), SwapStatus::Swapped, "here".into()),
+                ("%2".into(), SwapStatus::Skipped, "skipped: mid-turn".into()),
+                ("%3".into(), SwapStatus::Failed, "here".into()),
+            ]
+        );
+    }
+
+    /// The journal decides: an executor report of "swapped" on an entry the
+    /// journal left uncertain is not shown as swapped.
+    #[test]
+    fn the_journal_outranks_the_executors_report() {
+        let entry = EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("needs_reconciliation".into()),
+            reason: Some("interrupted".into()),
+            uncertain_effects: 2,
+            outcome: Some(outcome("%1", SwapStatus::Swapped, "resumed")),
+        };
+        let shown = entry_outcome(&entry);
+        assert_eq!(shown.status, SwapStatus::Failed);
+        assert!(
+            shown.note.contains("needs_reconciliation"),
+            "{}",
+            shown.note
+        );
+        assert!(shown.note.contains("2 effect(s)"), "{}", shown.note);
+        let mut job = view("done", None);
+        job.entries.push(entry);
+        assert!(job_verdict(&job, "k").is_err());
+        assert!(job_verdict(&view("done", None), "k").is_ok());
+        assert!(job_verdict(&view("needs_reconciliation", None), "k").is_err());
     }
 
     #[test]

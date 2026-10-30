@@ -1047,6 +1047,203 @@ pub fn run(
         .collect()
 }
 
+/// A pane the daemon planned but left to the caller because it runs its
+/// agent directly: what it was when planned, so the caller acts on that
+/// agent and no other.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectTarget {
+    pub pane: String,
+    pub socket: Option<String>,
+    /// `pane@server`, normalized ([`endpoint_key`]).
+    pub endpoint: String,
+    pub conversation_id: String,
+}
+
+/// [`run`] limited to `bound`: the request is planned with its own scope,
+/// provider and exclusions, and only a target that is still the planned
+/// agent on the planned endpoint, still running directly, is run. A bound
+/// target that changed is skipped, one that is gone is reported as such;
+/// every other agent the request selects is left out of the report, since
+/// someone else (the daemon) reports it.
+#[must_use]
+pub fn run_bound(
+    request: &SwapRequest,
+    agents: &[Agent],
+    backends: &[SharedBackend],
+    config: &SwapConfig,
+    accounts: &crate::accounts::AccountsConfig,
+    bound: &[DirectTarget],
+) -> Vec<SwapOutcome> {
+    let (request, steps) = prepare(request, agents, backends, config, accounts);
+    let steps = steps
+        .into_iter()
+        .map(|step| match step {
+            Step::Done(outcome) => BoundStep::Done(outcome),
+            Step::Run(target) => BoundStep::Run(target.identity(), target),
+        })
+        .collect();
+    bind(steps, bound)
+        .into_iter()
+        .map(|step| match step {
+            BoundStep::Done(outcome) => outcome,
+            BoundStep::Run(_, target) => {
+                execute_target(&request, &target, &mut effects::NoObserver)
+            }
+        })
+        .collect()
+}
+
+pub(crate) enum BoundStep<T> {
+    Done(SwapOutcome),
+    Run(TargetIdentity, T),
+}
+
+/// The steps of a plan that concern `bound`, in `bound`'s order: each one's
+/// target if it is unchanged, its settled outcome if planning settled it,
+/// and a skip otherwise.
+pub(crate) fn bind<T>(steps: Vec<BoundStep<T>>, bound: &[DirectTarget]) -> Vec<BoundStep<T>> {
+    let mut steps: Vec<Option<BoundStep<T>>> = steps.into_iter().map(Some).collect();
+    bound
+        .iter()
+        .map(|want| {
+            let found = steps.iter().position(|step| match step {
+                Some(BoundStep::Run(identity, _)) => identity.endpoint == want.endpoint,
+                Some(BoundStep::Done(outcome)) => {
+                    outcome.pane.as_deref() == Some(want.pane.as_str())
+                        && outcome.agent_session_id == want.conversation_id
+                }
+                None => false,
+            });
+            match found.and_then(|index| steps[index].take()) {
+                Some(BoundStep::Run(identity, target))
+                    if identity.conversation_id == want.conversation_id && identity.direct =>
+                {
+                    BoundStep::Run(identity, target)
+                }
+                Some(BoundStep::Run(identity, _)) => BoundStep::Done(bound_skip(
+                    want,
+                    &identity.conversation_id,
+                    "skipped: this pane changed since it was planned (another agent, or no longer \
+                     run directly); nothing was done",
+                )),
+                Some(done @ BoundStep::Done(_)) => done,
+                None => BoundStep::Done(bound_skip(
+                    want,
+                    &want.conversation_id,
+                    "skipped: the planned agent is no longer selected here; nothing was done",
+                )),
+            }
+        })
+        .collect()
+}
+
+fn bound_skip(want: &DirectTarget, session: &str, note: &str) -> SwapOutcome {
+    SwapOutcome {
+        pane: Some(want.pane.clone()),
+        agent_session_id: session.to_owned(),
+        kind: AgentKind::Unknown,
+        from: None,
+        to: None,
+        status: SwapStatus::Skipped,
+        command: None,
+        note: note.to_owned(),
+        continue_reason: None,
+        session_id_source: None,
+        conversation_verified: None,
+        conversation_unverified_reason: None,
+        registered: None,
+    }
+}
+
+#[cfg(test)]
+mod bind_tests {
+    use super::*;
+
+    fn want(pane: &str, conversation: &str) -> DirectTarget {
+        DirectTarget {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            endpoint: endpoint_key(pane, Some("default")),
+            conversation_id: conversation.into(),
+        }
+    }
+
+    fn target(pane: &str, conversation: &str, direct: bool) -> BoundStep<&'static str> {
+        let identity = TargetIdentity {
+            pane: pane.into(),
+            socket: Some("default".into()),
+            endpoint: endpoint_key(pane, Some("default")),
+            provider: "claude".into(),
+            conversation_id: conversation.into(),
+            session_id_source: SessionIdSource::Registry,
+            conversation_verified: true,
+            process_pid: 1,
+            process_start: None,
+            from_account: None,
+            assigned_account: None,
+            direct,
+        };
+        BoundStep::Run(identity, "target")
+    }
+
+    fn done(pane: &str, conversation: &str, note: &str) -> BoundStep<&'static str> {
+        let mut outcome = bound_skip(&want(pane, conversation), conversation, note);
+        outcome.note = note.into();
+        BoundStep::Done(outcome)
+    }
+
+    fn shape(steps: &[BoundStep<&'static str>]) -> Vec<String> {
+        steps
+            .iter()
+            .map(|step| match step {
+                BoundStep::Run(identity, _) => format!("run {}", identity.pane),
+                BoundStep::Done(outcome) => format!(
+                    "done {} {}",
+                    outcome.pane.as_deref().unwrap_or("-"),
+                    outcome.note
+                ),
+            })
+            .collect()
+    }
+
+    /// Only the planned agents, each still the same direct pane, are run;
+    /// everything else the scope selects is left to whoever reports it.
+    #[test]
+    fn a_bound_run_acts_only_on_the_planned_unchanged_direct_agents() {
+        let steps = vec![
+            target("%1", "a", true),
+            target("%2", "b", false),
+            done("%3", "c", "skipped: mid-turn"),
+            target("%4", "other", true),
+            target("%5", "e", false),
+        ];
+        let bound = [
+            want("%5", "e"),
+            want("%1", "a"),
+            want("%3", "c"),
+            want("%4", "d"),
+            want("%9", "z"),
+        ];
+        let shaped = shape(&bind(steps, &bound));
+        assert_eq!(shaped.len(), 5);
+        assert!(
+            shaped[0].starts_with("done %5 skipped: this pane changed"),
+            "{shaped:?}"
+        );
+        assert_eq!(shaped[1], "run %1");
+        assert_eq!(shaped[2], "done %3 skipped: mid-turn");
+        assert!(
+            shaped[3].starts_with("done %4 skipped: this pane changed"),
+            "{shaped:?}"
+        );
+        assert!(
+            shaped[4].starts_with("done %9 skipped: the planned agent is no longer"),
+            "{shaped:?}"
+        );
+        assert!(!shaped.iter().any(|line| line.contains("%2")), "{shaped:?}");
+    }
+}
+
 /// One entry of a prepared swap, in report order: an outcome already
 /// settled while planning, or a target still to run.
 pub(crate) enum Step {

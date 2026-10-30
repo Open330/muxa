@@ -271,6 +271,10 @@ pub struct Accepted {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanView {
     pub outcomes: Vec<SwapOutcome>,
+    /// Planned targets left out because they run their agent directly: a
+    /// caller may act on exactly these itself.
+    #[serde(default)]
+    pub direct_targets: Vec<account_swap::DirectTarget>,
     /// Whether a submit would be taken now.
     pub executable: bool,
     pub unavailable: Option<String>,
@@ -834,6 +838,7 @@ impl<E: Engine> Service<E> {
         // Plan-only whatever was asked: the dry run returns before any effect.
         let mut resolved = resolved;
         resolved.dry_run = true;
+        let mut direct_targets = Vec::new();
         let outcomes = steps
             .into_iter()
             .map(|step| match step {
@@ -841,7 +846,17 @@ impl<E: Engine> Service<E> {
                 EngineStep::Run(target) => {
                     let identity = self.engine.identity(&target);
                     match refusal(&identity, origin) {
-                        Some((_, note)) => skipped_outcome(&identity, note),
+                        Some((code, note)) => {
+                            if code == DIRECT_PANE_UNSUPPORTED {
+                                direct_targets.push(account_swap::DirectTarget {
+                                    pane: identity.pane.clone(),
+                                    socket: identity.socket.clone(),
+                                    endpoint: identity.endpoint.clone(),
+                                    conversation_id: identity.conversation_id.clone(),
+                                });
+                            }
+                            skipped_outcome(&identity, note)
+                        }
                         None => self.engine.execute(&resolved, &target, &mut NoObserver),
                     }
                 }
@@ -850,6 +865,7 @@ impl<E: Engine> Service<E> {
         let unavailable = self.active().err();
         Ok(PlanView {
             outcomes,
+            direct_targets,
             executable: unavailable.is_none(),
             unavailable,
         })
@@ -1286,13 +1302,15 @@ impl<E: Engine> Service<E> {
 /// cannot be told, or — for a public request — a pane running its agent
 /// directly, whose respawn would run in the daemon's environment instead of
 /// the shell the caller had.
+const DIRECT_PANE_UNSUPPORTED: &str = "direct_pane_unsupported";
+
 fn refusal(identity: &TargetIdentity, origin: Origin) -> Option<(&'static str, &'static str)> {
     if identity.socket.is_none() {
         return Some(("unknown_server", "cannot tell which server this pane is on"));
     }
     if identity.direct && origin == Origin::Public {
         return Some((
-            "direct_pane_unsupported",
+            DIRECT_PANE_UNSUPPORTED,
             "this pane runs its agent directly; swaps through the daemon do not respawn such \
              panes yet",
         ));

@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `muxa swap` runs as a daemon job when the daemon offers swap jobs: it prints
+  a request key, follows the journalled job, and `muxa swap --status <key>`
+  reads it back. Ctrl-C only stops waiting; nothing is re-sent or run locally
+  after the request went out. Panes that run their agent directly are swapped
+  by the CLI afterwards, bound to the agents the daemon planned. A daemon that
+  runs swap jobs but cannot take one now refuses rather than being bypassed;
+  `--local` swaps in-process, and older daemons keep the in-process swap.
+
 ### Fixed
 
 - `muxa snapshot` / `muxa restore` keep muxa's identity marks. A restored
