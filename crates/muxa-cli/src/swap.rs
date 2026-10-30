@@ -1276,14 +1276,6 @@ async fn run_remote(relay: &impl Relay, args: &Args, host: &str) -> Result<()> {
             None => error,
         }
     })?;
-    // Never sent again without its key: a job made under another key could
-    // not be found by the one printed above.
-    if key.is_some() && refuses_request_key(&output.stderr) {
-        bail!(
-            "{host}'s muxa is too old to take a relayed swap's key, so nothing was started \
-             there; upgrade muxa on {host}, or run the swap on it directly"
-        );
-    }
     // The host's own notices are for the user.
     for line in output
         .stderr
@@ -1295,14 +1287,22 @@ async fn run_remote(relay: &impl Relay, args: &Args, host: &str) -> Result<()> {
     if args.status.is_some() || args.cancel.is_some() {
         return remote_job(&output, args, host);
     }
-    let hint = key.as_deref().unwrap_or("<key>");
+    // Where to look when the answer does not settle it: the job, by the key
+    // sent (never sent again, under that key or another), or, for an
+    // in-process run, the host itself.
+    let hint = match &key {
+        Some(key) => format!(
+            "check it with `muxa swap --host {host} --status {key}` (a muxa on {host} older \
+             than this one may not take relayed request keys; upgrade it)"
+        ),
+        None => format!("check {host}"),
+    };
     if args.detach {
         return remote_detached(&output, args, host, key.as_deref());
     }
     let Ok(outcomes) = serde_json::from_str::<Vec<SwapOutcome>>(&output.stdout) else {
         bail!(
-            "{host}: swap failed (exit {}): {}\ncheck it with `muxa swap --host {host} \
-             --status {hint}`",
+            "{host}: swap failed (exit {}): {}\n{hint}",
             output.exit_code,
             output.stderr.trim()
         );
@@ -1319,8 +1319,7 @@ async fn run_remote(relay: &impl Relay, args: &Args, host: &str) -> Result<()> {
     // uncertain effects, cancelled): its exit status says so.
     if output.exit_code != 0 {
         bail!(
-            "the swap on {host} did not end cleanly (exit {}): {}\n\
-             check it with `muxa swap --host {host} --status {hint}`",
+            "the swap on {host} did not end cleanly (exit {}): {}\n{hint}",
             output.exit_code,
             output.stderr.trim()
         );
@@ -1359,8 +1358,8 @@ fn remote_job(
     Ok(())
 }
 
-/// A host's `--detach`: the acknowledgement for the key minted here (or
-/// the host's own, from a host too old for caller keys).
+/// A host's `--detach`: the acknowledgement for the key minted here, and
+/// for no other.
 fn remote_detached(
     output: &muxa::work_control::WorkCommandOutput,
     args: &Args,
@@ -1397,11 +1396,6 @@ fn remote_detached(
         bail!("{host}: {}", output.stderr.trim());
     }
     Ok(())
-}
-
-/// A host's allowlist refusing the caller's request key: nothing ran.
-fn refuses_request_key(message: &str) -> bool {
-    message.contains("does not accept") && message.contains("--request-key")
 }
 
 fn render(outcomes: &[SwapOutcome]) -> String {
@@ -1820,12 +1814,6 @@ mod tests {
         assert!(request_key(&Cli::parse_from(["swap"]).args)
             .unwrap()
             .starts_with("cli-"));
-        assert!(refuses_request_key(
-            "`swap` does not accept \"--request-key=cli-1\" here"
-        ));
-        assert!(!refuses_request_key(
-            "`swap` does not accept \"--bogus\" here"
-        ));
     }
 
     /// A cancelled job is a failure for whoever waited for the whole swap,
@@ -1918,10 +1906,11 @@ mod tests {
         );
     }
 
-    /// A host too old for the key is told so; the swap is not sent again
-    /// under a key nobody here knows.
+    /// What a host printed never settles that nothing started: a failed
+    /// answer points at the key sent, and is not sent again; an answer that
+    /// carries the job is taken, whatever else it printed.
     #[tokio::test]
-    async fn a_host_too_old_for_the_key_is_not_resent_to() {
+    async fn a_relayed_failure_is_never_read_as_nothing_started() {
         let fake = relay(|argv| {
             let word = argv
                 .iter()
@@ -1938,8 +1927,29 @@ mod tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("too old"), "{error}");
+        let key = sent_key(&fake.calls.borrow()[0]).unwrap();
+        assert!(error.contains(&format!("--status {key}")), "{error}");
+        assert!(!error.contains("nothing was started"), "{error}");
         assert_eq!(fake.calls.borrow().len(), 1);
+        let accepted = relay(|argv| {
+            let key = sent_key(argv).unwrap();
+            Ok(output(
+                0,
+                &format!(r#"{{"request_key":"{key}","job_id":"swap-1","state":"running"}}"#),
+                "warning: something does not accept --request-key elsewhere",
+            ))
+        });
+        let cli = Cli::parse_from(["swap", "%5", "--detach", "--host", "rtzr"]);
+        assert!(run_remote(&accepted, &cli.args, "rtzr").await.is_ok());
+        // An in-process run that fails names the host, and no job.
+        let local = relay(|_| Ok(output(2, "", "boom")));
+        let cli = Cli::parse_from(["swap", "%5", "--local", "--host", "rtzr"]);
+        let error = run_remote(&local, &cli.args, "rtzr")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("check rtzr"), "{error}");
+        assert!(!error.contains("--status"), "{error}");
     }
 
     /// A detach is acknowledged only for the key that was sent.

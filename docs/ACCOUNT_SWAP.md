@@ -236,7 +236,8 @@ swapped); for `--cancel` itself a job that ended cleanly is a success.
 
 On a Fleet host the key is minted here and printed before the swap is sent,
 so if the answer is lost `muxa swap --host <alias> --status <key>` still finds
-it. (A host too old to take a caller's key uses its own.)
+it. The swap is never sent again under another key: a host whose `muxa` is too
+old for relayed keys fails the request, and the hint to check the key stays.
 
 A daemon from before swap jobs means the whole swap runs here, as before. A
 daemon that runs swap jobs but cannot take one right now (starting, halted,
