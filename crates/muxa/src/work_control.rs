@@ -379,6 +379,7 @@ const SWAP_SWITCHES: &[&str] = &[
     "--no-continue",
     "--dry-run",
     "--local",
+    "--detach",
 ];
 
 /// `muxa swap` options a remote run may pass, each as one non-empty
@@ -394,6 +395,8 @@ const SWAP_VALUE_FLAGS: &[&str] = &[
     "--exclude",
     "--status",
     "--retry",
+    "--cancel",
+    "--request-key",
 ];
 
 /// Check a `swap` argv: JSON output, only the allowlisted flags, and plain

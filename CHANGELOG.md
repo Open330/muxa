@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `muxa swap --cancel <key>` stops a daemon swap job at its next target
+  boundary (nothing running is interrupted); `--detach` returns as soon as the
+  job is accepted. A swap relayed with `--host` now carries a key minted by
+  the caller, so a lost answer can still be followed up.
 - `muxa swap --retry <key>` retries an ended daemon swap job: only targets that
   failed before their relaunch, while the very agent planned still runs, are
   swapped again (first account, no follow-up); the rest are observed

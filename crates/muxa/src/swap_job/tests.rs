@@ -878,3 +878,40 @@ fn a_follow_up_without_its_record_is_read_from_its_effects() {
     let open_enter = status.targets[1].follow_up.clone().unwrap();
     assert_eq!(open_enter.submission, "unconfirmed");
 }
+
+/// A target boundary and a cancel are ordered by the store: whichever is
+/// recorded first wins, and an ended job takes no cancel.
+#[test]
+fn a_cancel_and_a_target_start_are_ordered() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 3);
+    assert_eq!(
+        store.start_or_cancel(&lease, &job, 0, 1, true).unwrap(),
+        Boundary::Started
+    );
+    assert!(store.request_cancel(&lease, &job).unwrap());
+    // Started before the cancel: it runs to its end.
+    store
+        .finish_target(&lease, &job, 0, 1, Disposition::Swapped)
+        .unwrap();
+    // A look before the pane is taken, and the start itself, both cancel.
+    assert_eq!(
+        store.start_or_cancel(&lease, &job, 1, 1, false).unwrap(),
+        Boundary::Cancelled
+    );
+    assert_eq!(
+        store.start_or_cancel(&lease, &job, 2, 1, true).unwrap(),
+        Boundary::Cancelled
+    );
+    let status = store.status(&job).unwrap();
+    assert!(status.cancel_requested);
+    assert_eq!(status.targets[1].reason.as_deref(), Some("cancelled"));
+    store.finish(&lease, &job).unwrap();
+    assert!(!store.request_cancel(&lease, &job).unwrap());
+    assert!(matches!(
+        store.request_cancel(&lease, "swap-nope"),
+        Err(JobError::NotFound(_))
+    ));
+}

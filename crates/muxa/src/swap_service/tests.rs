@@ -208,6 +208,8 @@ struct FakeProvider {
     config_path: Option<PathBuf>,
     config: Mutex<SwapConfig>,
     acquired: Mutex<Vec<String>>,
+    /// Holds every guard acquisition until opened, when set.
+    guard_gate: Mutex<Option<Arc<Gate>>>,
 }
 
 impl ContextProvider for FakeProvider {
@@ -229,6 +231,10 @@ impl ContextProvider for FakeProvider {
     ) -> Result<Box<dyn TargetGuard>, String> {
         let endpoint = endpoint_key(pane, socket);
         self.acquired.lock().unwrap().push(endpoint.clone());
+        let gate = self.guard_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         Ok(Box::new(FakeGuard(endpoint)))
     }
 }
@@ -260,6 +266,7 @@ fn harness(script: Script) -> Harness {
         config_path: Some(config_path),
         config: Mutex::new(SwapConfig::default()),
         acquired: Mutex::new(Vec::new()),
+        guard_gate: Mutex::new(None),
     });
     let executed = Arc::new(Mutex::new(Vec::new()));
     let dry_runs = Arc::new(AtomicUsize::new(0));
@@ -678,6 +685,7 @@ fn one_live_manager_holds_the_store_until_it_is_gone() {
             config_path: None,
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
+            guard_gate: Mutex::new(None),
         }) as Arc<dyn ContextProvider>
     };
     let first = SwapService::open(Some(&path), provider()).unwrap();
@@ -830,6 +838,7 @@ fn an_executor_that_cannot_start_ends_the_job_without_effects() {
             config_path: None,
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
+            guard_gate: Mutex::new(None),
         }) as Arc<dyn ContextProvider>,
     )
     .unwrap()
@@ -892,6 +901,7 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
             config_path: None,
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
+            guard_gate: Mutex::new(None),
         }) as Arc<dyn ContextProvider>
     };
 
@@ -1460,4 +1470,123 @@ fn a_prompt_receipt_counts_only_after_its_cursor_and_on_its_pane() {
     assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
     receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1", 5));
     assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
+}
+
+// --- cancel ------------------------------------------------------------------
+
+fn gated(pane: &str, gate: &Arc<Gate>) -> EngineStep<FakeTarget> {
+    EngineStep::Run(FakeTarget {
+        identity: identity(pane, "/tmp/tmux-1/default"),
+        gate: Some(Arc::clone(gate)),
+    })
+}
+
+/// A cancel lets the target already started finish and starts no other;
+/// the panes it never touched are let go.
+#[test]
+fn a_cancel_stops_at_the_next_target() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let h = harness(Box::new(move || {
+        vec![gated("%1", &held), run("%2"), run("%3")]
+    }));
+    let _open = OpenOnDrop(Arc::clone(&gate));
+    let job = Service::submit(
+        &h.service,
+        "k",
+        &overrides(&["%1", "%2", "%3"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap()
+    .job_id;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.provider.acquired.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    let view = h.service.cancel(&JobRef::Id(job.clone())).unwrap();
+    assert!(view.cancel_requested);
+    gate.open();
+    let view = settled(&h.service, &job);
+    assert_eq!(view.state, "done");
+    assert_eq!(*h.executed.lock().unwrap(), ["%1"]);
+    let reasons: Vec<_> = view
+        .entries
+        .iter()
+        .map(|e| (e.disposition.clone(), e.reason.clone()))
+        .collect();
+    assert_eq!(reasons[0].0.as_deref(), Some("swapped"));
+    assert_eq!(
+        reasons[1],
+        (Some("skipped".into()), Some("cancelled".into()))
+    );
+    assert_eq!(
+        reasons[2],
+        (Some("skipped".into()), Some("cancelled".into()))
+    );
+    // Every pane is free again.
+    for pane in ["%1", "%2", "%3"] {
+        assert!(h
+            .service
+            .reserve(&endpoint_key(pane, Some("/tmp/tmux-1/default")), "next"));
+    }
+    // Repeating it, on the ended job, changes nothing.
+    let again = h.service.cancel(&JobRef::Id(job)).unwrap();
+    assert_eq!(again.state, "done");
+}
+
+/// A cancel that lands while the target waits for its pane wins: the target
+/// never starts, though the pane was taken.
+#[test]
+fn a_cancel_while_waiting_for_the_pane_keeps_the_target_from_starting() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let gate = Arc::new(Gate::default());
+    *h.provider.guard_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let _open = OpenOnDrop(Arc::clone(&gate));
+    let job = Service::submit(&h.service, "k", &overrides(&["%1"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.provider.acquired.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.service.cancel(&JobRef::Id(job.clone())).unwrap();
+    gate.open();
+    let view = settled(&h.service, &job);
+    assert_eq!(view.entries[0].reason.as_deref(), Some("cancelled"));
+    assert!(h.executed.lock().unwrap().is_empty());
+}
+
+/// A service that takes no new job (draining) can still be told to stop
+/// one, and a job it cannot find is an error.
+#[test]
+fn a_cancel_is_taken_while_draining() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let h = harness(Box::new(move || vec![gated("%1", &held), run("%2")]));
+    let _open = OpenOnDrop(Arc::clone(&gate));
+    let job = Service::submit(
+        &h.service,
+        "k",
+        &overrides(&["%1", "%2"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap()
+    .job_id;
+    h.service.draining.store(true, Ordering::SeqCst);
+    assert!(h.service.active().is_err());
+    assert!(
+        h.service
+            .cancel(&JobRef::Id(job.clone()))
+            .unwrap()
+            .cancel_requested
+    );
+    gate.open();
+    let view = settled(&h.service, &job);
+    assert_eq!(view.entries[1].reason.as_deref(), Some("cancelled"));
+    assert!(h.service.cancel(&JobRef::Id("swap-nope".into())).is_err());
 }

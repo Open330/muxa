@@ -251,6 +251,10 @@ enum RequestBody {
     SwapPlan {
         overrides: crate::swap_service::SwapOverrides,
     },
+    /// `swap_cancel_v1`: ask a job to start no further target.
+    SwapJobCancel {
+        job: crate::swap_service::JobRef,
+    },
     /// `swap_retry_v1`: retry an ended job's safely retryable targets as a
     /// new job under `request_key`.
     SwapJobRetry {
@@ -3601,6 +3605,9 @@ const SWAP_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const SWAP_JOBS_CAPABILITY: &str = "swap_jobs_v1";
 /// `swap_plan_v1`: `swap_plan`.
 pub const SWAP_PLAN_CAPABILITY: &str = "swap_plan_v1";
+/// `swap_cancel_v1`: `swap_job_cancel`. Advertised whenever this daemon has
+/// a swap service, healthy or not: a job can always be told to stop.
+pub const SWAP_CANCEL_CAPABILITY: &str = "swap_cancel_v1";
 /// `swap_retry_v1`: `swap_job_retry`.
 pub const SWAP_RETRY_CAPABILITY: &str = "swap_retry_v1";
 /// `swap_service_v1`: this daemon runs swaps as jobs, whether or not it can
@@ -3869,6 +3876,9 @@ async fn handle(
                         // advertised; status stays served regardless.
                         if let Some(capabilities) = r.capabilities.as_mut() {
                             capabilities.push(SWAP_SERVICE_CAPABILITY);
+                            if swap.is_some() {
+                                capabilities.push(SWAP_CANCEL_CAPABILITY);
+                            }
                         }
                         if swap_healthy(swap.as_ref()).await {
                             if let Some(capabilities) = r.capabilities.as_mut() {
@@ -4065,6 +4075,13 @@ async fn handle(
                     swap_call(swap.as_ref(), move |swap| {
                         swap.retry(&request_key, &parent, &overrides)
                             .and_then(|accepted| to_swap_value(&accepted))
+                    })
+                    .await
+                }
+                RequestBody::SwapJobCancel { job } => {
+                    kind = "swap_job_cancel";
+                    swap_call(swap.as_ref(), move |swap| {
+                        swap.cancel(&job).and_then(|view| to_swap_value(&view))
                     })
                     .await
                 }
@@ -7088,6 +7105,19 @@ impl Client {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_job_status",
+            "job": job,
+        });
+        self.swap_request(&req).await
+    }
+
+    /// `swap_cancel_v1`: ask `job` to start no further target.
+    pub async fn swap_job_cancel(
+        &self,
+        job: &crate::swap_service::JobRef,
+    ) -> Result<crate::swap_service::JobView, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "swap_job_cancel",
             "job": job,
         });
         self.swap_request(&req).await
@@ -12951,6 +12981,7 @@ mod tests {
                 reason: None,
                 entries: Vec::new(),
                 fault: None,
+                cancel_requested: false,
             }
         }
 
@@ -12961,6 +12992,13 @@ mod tests {
     }
 
     impl crate::swap_service::SwapJobs for FakeSwap {
+        fn cancel(
+            &self,
+            job: &crate::swap_service::JobRef,
+        ) -> Result<crate::swap_service::JobView, String> {
+            self.status(job)
+        }
+
         fn retry(
             &self,
             key: &str,
@@ -13119,9 +13157,17 @@ mod tests {
         swap.healthy
             .store(false, std::sync::atomic::Ordering::SeqCst);
 
-        assert!(!advertises_swap(
-            &client.hello(Duration::from_secs(2)).await.unwrap()
-        ));
+        let hello = client.hello(Duration::from_secs(2)).await.unwrap();
+        assert!(!advertises_swap(&hello));
+        // A halted service can still be told to stop a job.
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|c| c == SWAP_CANCEL_CAPABILITY));
+        assert!(client
+            .swap_job_cancel(&crate::swap_service::JobRef::Id(accepted.job_id.clone()))
+            .await
+            .is_ok());
         assert!(client.swap_job_start("next", &overrides).await.is_err());
         let status = client
             .swap_job_status(&crate::swap_service::JobRef::Id(accepted.job_id.clone()))
@@ -13141,9 +13187,12 @@ mod tests {
     #[tokio::test]
     async fn without_a_swap_service_every_swap_request_is_refused() {
         let (_dir, client, tx, handle) = swap_server(None).await;
-        assert!(!advertises_swap(
-            &client.hello(Duration::from_secs(2)).await.unwrap()
-        ));
+        let hello = client.hello(Duration::from_secs(2)).await.unwrap();
+        assert!(!advertises_swap(&hello));
+        assert!(!hello
+            .capabilities
+            .iter()
+            .any(|c| c == SWAP_CANCEL_CAPABILITY));
         let overrides = crate::swap_service::SwapOverrides::default();
         let refused = client.swap_job_start("key", &overrides).await.unwrap_err();
         assert!(refused.to_string().contains("unavailable"), "{refused}");

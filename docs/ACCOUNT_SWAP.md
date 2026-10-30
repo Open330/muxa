@@ -142,6 +142,8 @@ aas = "aas"              # the aas binary; the daemon also looks in /opt/homebre
 | `--local` | Runs the swap in this process instead of as a daemon job (see below). |
 | `--status <key>` | Shows a daemon swap job by the key it printed (or its job id) and waits for it to end. |
 | `--retry <key>` | Retries an ended daemon swap job's safely retryable targets as a new job (see below). |
+| `--detach` | Returns as soon as the daemon accepted the job, printing its key, instead of following it. |
+| `--cancel <key>` | Asks a daemon swap job to start no further target, then waits for it to end. |
 
 `continue_when = "limited"` sends the follow-up only to agents whose turn was
 cut off: by a usage cap, or by the swap itself when `--force` stopped them
@@ -219,6 +221,23 @@ or skipped is only looked at, read-only, and reported as found
 `observed_unknown` when no agent could be found, …); nothing is done to it. Each target is retried by
 one retry only (a second one reports `retried_elsewhere`); retry the newest
 job to go on from there. `--force` and `--continue-evidence` may be given.
+
+`--detach` starts the job and returns with its key; `--status <key>` reads it
+later. A swap with directly-run panes cannot be detached (their half runs in
+this process after the job), and neither can one sent to a daemon from before
+swap jobs: both are refused before anything is sent.
+
+`--cancel <key>` stops a job at its next target: the target already started
+finishes (its stop, relaunch, follow-up), nothing is interrupted or
+signalled, and every target not yet started ends as skipped, `cancelled`. A
+daemon that is shutting down or halted still takes a cancel. For whoever was
+waiting for the whole swap a cancelled job is a failure (not everything was
+swapped); for `--cancel` itself a job that ended cleanly is a success.
+
+On a Fleet host the key is minted here and printed before the swap is sent,
+so if the answer is lost `muxa swap --host <alias> --status <key>` still finds
+it. The swap is never sent again under another key: a host whose `muxa` is too
+old for relayed keys fails the request, and the hint to check the key stays.
 
 A daemon from before swap jobs means the whole swap runs here, as before. A
 daemon that runs swap jobs but cannot take one right now (starting, halted,
