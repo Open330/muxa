@@ -226,7 +226,14 @@ pub(crate) async fn run(
              pass --local to swap in this process instead"
         )
     })?;
-    match route(&hello.capabilities) {
+    let route = match route(&hello.capabilities) {
+        // No marker: an old daemon, or one that serves swap jobs from before
+        // the marker and cannot take one now. Only a daemon that does not
+        // know the request at all is old enough to bypass.
+        Route::Legacy => probe(&client.swap_job_status(&JobRef::Key(PROBE_KEY.into())).await),
+        route => route,
+    };
+    match route {
         Route::Daemon => run_routed(client, &args, config, accounts, explicit_config).await,
         Route::Unavailable => bail!("{UNAVAILABLE}"),
         Route::Legacy => {
@@ -255,6 +262,23 @@ enum Route {
     Unavailable,
     /// A daemon from before swap jobs: here, as it always was.
     Legacy,
+}
+
+/// A key no job is made under, read to learn whether the daemon knows swap
+/// jobs at all.
+const PROBE_KEY: &str = "cli-probe";
+
+/// What reading [`PROBE_KEY`] says, with no swap tag advertised: only the
+/// daemon's "unknown request" is a daemon from before swap jobs. Any other
+/// answer, a not-found included, is a service that exists and is not
+/// taking jobs now; a failed read cannot tell, so it refuses too.
+fn probe(read: &Result<JobView, RuntimeError>) -> Route {
+    match read {
+        Err(RuntimeError::Daemon(error)) if error.contains("unknown variant `swap_job_status`") => {
+            Route::Legacy
+        }
+        _ => Route::Unavailable,
+    }
 }
 
 fn route(capabilities: &[String]) -> Route {
@@ -686,6 +710,15 @@ fn job_verdict(view: &JobView, key: &str) -> Result<()> {
             view.job_id
         );
     }
+    if job_outcomes(view)
+        .iter()
+        .any(|outcome| outcome.status == SwapStatus::Failed)
+    {
+        bail!(
+            "swap job {} ({key}): some agents could not be swapped",
+            view.job_id
+        );
+    }
     Ok(())
 }
 
@@ -701,28 +734,70 @@ fn job_ref(text: &str) -> JobRef {
     }
 }
 
-/// `--status`: read the job (an id that is not found is tried as a key),
-/// follow it to its end, and report it.
-async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
+/// How watching a job by `--status` ended.
+#[derive(Debug)]
+enum Watch {
+    Settled(JobView),
+    /// Ctrl-C; the job, if found, by id.
+    Interrupted(Option<String>),
+    Failed(RuntimeError),
+}
+
+/// Read the job (an id that is not found is tried as a key) and follow it
+/// to its end. Ctrl-C ends any wait, a slow read included.
+async fn watch_job(
+    daemon: &impl SwapDaemon,
+    text: &str,
+    cancel: impl Future<Output = ()>,
+    poll: Duration,
+) -> Watch {
+    tokio::pin!(cancel);
     let first = job_ref(text);
-    let mut view = match client.swap_job_status(&first).await {
-        Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
-            client.swap_job_status(&JobRef::Key(text.to_owned())).await
+    let read = async {
+        match daemon.status(&first).await {
+            Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
+                daemon.status(&JobRef::Key(text.to_owned())).await
+            }
+            read => read,
         }
-        read => read,
-    }
-    .map_err(|error| anyhow!("{error}"))?;
+    };
+    let mut view = tokio::select! {
+        biased;
+        () = &mut cancel => return Watch::Interrupted(None),
+        read = read => match read {
+            Ok(view) => view,
+            Err(error) => return Watch::Failed(error),
+        },
+    };
     let job = JobRef::Id(view.job_id.clone());
     while !settled(&view) {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => bail!("stopped waiting; swap job {} runs on", view.job_id),
-            () = tokio::time::sleep(POLL) => {}
+        let read = tokio::select! {
+            biased;
+            () = &mut cancel => return Watch::Interrupted(Some(view.job_id)),
+            read = async {
+                tokio::time::sleep(poll).await;
+                daemon.status(&job).await
+            } => read,
+        };
+        match read {
+            Ok(next) => view = next,
+            Err(error) => return Watch::Failed(error),
         }
-        view = client
-            .swap_job_status(&job)
-            .await
-            .map_err(|error| anyhow!("{error}"))?;
     }
+    Watch::Settled(view)
+}
+
+/// `--status`: follow the job to its end and report it.
+async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let view = match watch_job(client, text, cancel, POLL).await {
+        Watch::Settled(view) => view,
+        Watch::Interrupted(Some(job)) => bail!("stopped waiting; swap job {job} runs on"),
+        Watch::Interrupted(None) => bail!("stopped waiting"),
+        Watch::Failed(error) => bail!("{error}"),
+    };
     if json {
         println!("{}", serde_json::to_string_pretty(&view)?);
     } else {
@@ -871,6 +946,7 @@ async fn run_remote(client: &Client, args: &Args, host: &str) -> Result<()> {
             println!("{host}: job {}  {}", view.job_id, view.state);
             print!("{}", render(&job_outcomes(&view)));
         }
+        job_verdict(&view, &format!("on {host}"))?;
         if output.exit_code != 0 {
             bail!("{host}: {}", output.stderr.trim());
         }
@@ -1277,6 +1353,121 @@ mod tests {
             Duration::from_millis(1),
         )
         .await
+    }
+
+    #[test]
+    fn only_a_daemon_that_does_not_know_swap_jobs_is_bypassed() {
+        let daemon = |error: &str| Err(RuntimeError::Daemon(error.into()));
+        assert_eq!(
+            probe(&daemon(
+                "bad request: unknown variant `swap_job_status`, expected one of `hello`"
+            )),
+            Route::Legacy
+        );
+        // A daemon serving swap jobs from before the marker, not taking one now.
+        assert_eq!(
+            probe(&daemon("swap job cli-probe not found")),
+            Route::Unavailable
+        );
+        assert_eq!(
+            probe(&daemon("swap jobs are unavailable on this daemon")),
+            Route::Unavailable
+        );
+        assert_eq!(probe(&Err(RuntimeError::Disconnected)), Route::Unavailable);
+        assert_eq!(
+            probe(&Err(RuntimeError::Timeout(Duration::from_secs(1)))),
+            Route::Unavailable
+        );
+        assert_eq!(probe(&Ok(view("done", None))), Route::Unavailable);
+    }
+
+    /// A job that ended with a failed row fails, however it is read.
+    #[test]
+    fn a_done_job_with_a_failed_row_is_a_failure() {
+        let mut job = view("done", None);
+        job.entries.push(EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("failed".into()),
+            reason: Some("candidates_unavailable".into()),
+            uncertain_effects: 0,
+            outcome: None,
+        });
+        assert!(job_verdict(&job, "k").is_err());
+        job.entries[0].disposition = Some("kept".into());
+        assert!(job_verdict(&job, "k").is_err());
+        job.entries[0].disposition = Some("swapped".into());
+        assert!(job_verdict(&job, "k").is_ok());
+    }
+
+    /// A status read that never answers still ends on Ctrl-C.
+    #[tokio::test]
+    async fn ctrl_c_ends_a_held_status_read() {
+        struct Held;
+        impl SwapDaemon for Held {
+            fn start(
+                &self,
+                _: &str,
+                _: &SwapOverrides,
+            ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
+                std::future::pending()
+            }
+            fn status(
+                &self,
+                _: &JobRef,
+            ) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
+                std::future::pending()
+            }
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let watch = watch_job(
+            &Held,
+            "cli-k",
+            async move {
+                let _ = rx.await;
+            },
+            Duration::from_millis(1),
+        );
+        tokio::pin!(watch);
+        tokio::select! {
+            biased;
+            _ = &mut watch => panic!("ended while the read was held"),
+            () = tokio::time::sleep(Duration::from_millis(20)) => {}
+        }
+        tx.send(()).unwrap();
+        let ended = tokio::time::timeout(Duration::from_secs(2), watch)
+            .await
+            .expect("Ctrl-C must end a held read");
+        assert!(matches!(ended, Watch::Interrupted(None)));
+    }
+
+    /// An id that is not found is read as a key; any other error is final.
+    #[tokio::test]
+    async fn status_tries_an_unknown_id_as_a_key_only_when_not_found() {
+        let id = format!("swap-{}", uuid::Uuid::new_v4());
+        let missing = || Err(RuntimeError::Daemon(format!("swap job {id} not found")));
+        let daemon = Scripted::new(
+            Ok(accepted("done")),
+            vec![missing(), Ok(view("done", None))],
+        );
+        assert!(matches!(
+            watch_job(&daemon, &id, std::future::pending(), Duration::from_millis(1)).await,
+            Watch::Settled(v) if v.state == "done"
+        ));
+        let daemon = Scripted::new(
+            Ok(accepted("done")),
+            vec![Err(RuntimeError::Disconnected), Ok(view("done", None))],
+        );
+        assert!(matches!(
+            watch_job(
+                &daemon,
+                &id,
+                std::future::pending(),
+                Duration::from_millis(1)
+            )
+            .await,
+            Watch::Failed(RuntimeError::Disconnected)
+        ));
     }
 
     #[tokio::test]
