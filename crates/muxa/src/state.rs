@@ -449,6 +449,10 @@ pub struct PromptRecord {
     pub prompt: String,
     pub at: OffsetDateTime,
     pub model: Option<String>,
+    /// Its place among every prompt hook the store accepted, assigned as it
+    /// was accepted ([`Store::prompt_sequence`]): a receiver that sees it
+    /// late can still tell it came before a given moment.
+    pub seq: u64,
 }
 
 struct AskExecutionScope {
@@ -475,6 +479,8 @@ pub struct Store {
     /// Coalescing invalidation signal; independent of semantic transitions.
     changes: watch::Sender<()>,
     prompts: broadcast::Sender<PromptRecord>,
+    /// How many prompt hooks were accepted; each record carries its number.
+    prompt_seq: Arc<std::sync::atomic::AtomicU64>,
     /// Disk-backed audit log of every prompt. Lives separately from
     /// `agents` so reaping/GC of the live registry doesn't take prompt
     /// history with it. Tests and consumers that want a no-op history use
@@ -536,6 +542,7 @@ impl Store {
             transitions: tx,
             changes: watch::channel(()).0,
             prompts: prompts_tx,
+            prompt_seq: Arc::default(),
             history,
             dirty: Arc::new(Notify::new()),
             metrics: Metrics::new(),
@@ -828,6 +835,7 @@ fn mutate_for_event(
                 prompt: prompt.clone(),
                 at,
                 model: agent.model.clone(),
+                seq: 0,
             });
             let history_key = agent
                 .pane
@@ -1336,6 +1344,13 @@ impl Store {
         self.prompts.subscribe()
     }
 
+    /// The number of the last prompt hook accepted, live: a record whose
+    /// `seq` is above a value read from it came after that read.
+    #[must_use]
+    pub fn prompt_sequence(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        Arc::clone(&self.prompt_seq)
+    }
+
     pub async fn begin_ask_execution(
         &self,
         run: &str,
@@ -1614,7 +1629,13 @@ impl Store {
             let _ = self.transitions.send(transition);
         }
 
-        if let Some(record) = prompt_record {
+        if let Some(mut record) = prompt_record {
+            // Numbered as accepted, under the registry's guard, before any
+            // receiver can see it.
+            record.seq = self
+                .prompt_seq
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
             // Same "errors only when no subscribers" semantics as the
             // transitions channel — sinks are opt-in, so a no-subscriber
             // state is the steady-state default.

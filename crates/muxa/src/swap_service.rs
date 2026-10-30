@@ -311,15 +311,10 @@ pub struct PlanView {
 /// as a follow-up could wait for one and without their text: kind,
 /// conversation and pane, in arrival order. The daemon feeds it from its
 /// store; the swap executor reads it as a [`account_swap::TurnProbe`].
-#[derive(Default)]
 pub struct PromptReceipts {
-    inner: Mutex<Receipts>,
-}
-
-#[derive(Default)]
-struct Receipts {
-    next: u64,
-    seen: std::collections::VecDeque<Receipt>,
+    /// The store's own count of accepted prompt hooks: the cursor.
+    source: Arc<std::sync::atomic::AtomicU64>,
+    seen: Mutex<std::collections::VecDeque<Receipt>>,
 }
 
 struct Receipt {
@@ -333,31 +328,41 @@ struct Receipt {
 const RECEIPTS_KEPT: usize = 512;
 
 impl PromptReceipts {
-    /// Note one prompt hook, by who sent it and from where; its text is
-    /// not kept.
+    /// Receipts numbered by `source`, the store's [`crate::Store::prompt_sequence`]:
+    /// a hook the store accepted before a cursor was read is never after it,
+    /// however late it is received here.
+    #[must_use]
+    pub fn new(source: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self {
+            source,
+            seen: Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    /// Note one prompt hook, by who sent it and from where, under the number
+    /// the store gave it; its text is not kept.
     pub fn record(&self, record: &crate::state::PromptRecord) {
-        let Ok(mut receipts) = self.inner.lock() else {
+        let Ok(mut seen) = self.seen.lock() else {
             return;
         };
-        receipts.next += 1;
         let receipt = Receipt {
-            seq: receipts.next,
+            seq: record.seq,
             kind: record.id.kind,
             conversation: record.id.session_id.clone(),
             endpoint: record.id.pane.as_deref().map_or_else(String::new, |pane| {
                 account_swap::endpoint_key(pane, record.id.tmux_socket.as_deref())
             }),
         };
-        receipts.seen.push_back(receipt);
-        while receipts.seen.len() > RECEIPTS_KEPT {
-            receipts.seen.pop_front();
+        seen.push_back(receipt);
+        while seen.len() > RECEIPTS_KEPT {
+            seen.pop_front();
         }
     }
 }
 
 impl account_swap::TurnProbe for PromptReceipts {
     fn cursor(&self) -> u64 {
-        self.inner.lock().map_or(0, |receipts| receipts.next)
+        self.source.load(Ordering::SeqCst)
     }
 
     fn prompt_after(
@@ -367,8 +372,8 @@ impl account_swap::TurnProbe for PromptReceipts {
         conversation: &str,
         endpoint: &str,
     ) -> bool {
-        self.inner.lock().is_ok_and(|receipts| {
-            receipts.seen.iter().any(|receipt| {
+        self.seen.lock().is_ok_and(|seen| {
+            seen.iter().any(|receipt| {
                 receipt.seq > cursor
                     && receipt.kind == kind
                     && receipt.conversation == conversation

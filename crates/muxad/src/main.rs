@@ -965,7 +965,9 @@ async fn open_swap_service(
     collaboration: Arc<CollaborationStore>,
 ) -> Option<Arc<DaemonSwap>> {
     let runtime = tokio::runtime::Handle::current();
-    let receipts = Arc::new(muxa::swap_service::PromptReceipts::default());
+    let receipts = Arc::new(muxa::swap_service::PromptReceipts::new(
+        store.prompt_sequence(),
+    ));
     spawn_prompt_receipts(&store, Arc::clone(&receipts));
     let opened = tokio::task::spawn_blocking(move || {
         let path = paths::default_node_id_file().ok_or("no data directory for the node id")?;
@@ -6984,7 +6986,7 @@ mod tests {
             config_path: None,
             node_id: "node".into(),
             collaboration: Arc::clone(&c),
-            receipts: Arc::default(),
+            receipts: Arc::new(muxa::swap_service::PromptReceipts::new(Arc::default())),
         };
         let (pane_id, socket) = (p.pane.clone(), p.socket.clone());
         let refused = tokio::task::spawn_blocking(move || {
@@ -7030,20 +7032,32 @@ mod tests {
         use muxa::account_swap::TurnProbe as _;
         let store = muxa::Store::shared();
         add_agent(&store, "%1", "conv", AgentKind::ClaudeCode).await;
-        let receipts = Arc::new(muxa::swap_service::PromptReceipts::default());
-        spawn_prompt_receipts(&store, Arc::clone(&receipts));
-        let cursor = receipts.cursor();
-        let event = serde_json::from_value(serde_json::json!({
-            "type": "prompt_submitted",
-            "id": {"kind": "claude_code", "session_id": "conv", "pane": "%1", "tmux_socket": "default"},
-            "prompt": "continue",
-            "at": OffsetDateTime::now_utc()
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-        }))
-        .unwrap();
-        store.apply(&event).await;
+        let receipts = Arc::new(muxa::swap_service::PromptReceipts::new(
+            store.prompt_sequence(),
+        ));
+        let prompt = || -> muxa::AgentEvent {
+            serde_json::from_value(serde_json::json!({
+                "type": "prompt_submitted",
+                "id": {"kind": "claude_code", "session_id": "conv", "pane": "%1", "tmux_socket": "default"},
+                "prompt": "continue",
+                "at": OffsetDateTime::now_utc()
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .unwrap(),
+            }))
+            .unwrap()
+        };
         let endpoint = muxa::swap_service::endpoint("%1", Some("default"));
+        // Forwarding held: an old hook is accepted, the cursor taken, and
+        // only then is the old hook received. It is not after the cursor.
+        let mut held = store.subscribe_prompts();
+        store.apply(&prompt()).await;
+        let cursor = receipts.cursor();
+        receipts.record(&held.recv().await.unwrap());
+        assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "conv", &endpoint));
+        // A new one, through the real forwarder, is.
+        spawn_prompt_receipts(&store, Arc::clone(&receipts));
+        tokio::task::yield_now().await;
+        store.apply(&prompt()).await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !receipts.prompt_after(cursor, AgentKind::ClaudeCode, "conv", &endpoint) {
             assert!(

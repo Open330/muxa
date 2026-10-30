@@ -436,6 +436,45 @@ pub(crate) struct TargetStatus {
     pub(crate) follow_up: Option<crate::account_swap::FollowUpReport>,
 }
 
+/// A follow-up's transport word from its effects alone, for an attempt
+/// that stopped before recording it (a crash, or a record that could not
+/// be written): its latest group's prompt and Enter. No evidence.
+fn follow_up_from_effects(
+    connection: &Connection,
+    job: &str,
+    target: u32,
+    attempt: u32,
+) -> Result<Option<crate::account_swap::FollowUpReport>, JobError> {
+    let mut statement = connection.prepare(
+        "SELECT purpose, state FROM effects
+         WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3
+           AND purpose IN ('follow_up', 'kept_follow_up')
+           AND grp = (SELECT MAX(grp) FROM effects
+                      WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3
+                        AND purpose IN ('follow_up', 'kept_follow_up'))",
+    )?;
+    let rows: Vec<(String, String)> = statement
+        .query_map(params![job, target, attempt], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?;
+    let Some((purpose, _)) = rows.first() else {
+        return Ok(None);
+    };
+    let submission = if rows.iter().any(|(_, state)| state == "refused") {
+        Submission::Refused
+    } else if rows.len() == 2 && rows.iter().all(|(_, state)| state == "accepted") {
+        Submission::Delivered
+    } else {
+        Submission::Unconfirmed
+    };
+    Ok(Some(crate::account_swap::FollowUpReport {
+        kept: purpose == "kept_follow_up",
+        submission: submission.to_string(),
+        evidence: None,
+    }))
+}
+
 /// The follow-up from its two journalled observations. An attempt types at
 /// most one (a kept session's or the relaunch's), so its evidence is the
 /// one of the same kind; none yet means the wait never ended.
@@ -1156,7 +1195,14 @@ impl SwapJobStore {
                         follow_up: follow_up_status(row.get(8)?, row.get(9)?),
                     })
                 })?
-                .collect::<Result<_, _>>()?;
+                .collect::<Result<Vec<TargetStatus>, _>>()?;
+            let mut targets = targets;
+            for target in &mut targets {
+                if target.follow_up.is_none() {
+                    target.follow_up =
+                        follow_up_from_effects(connection, job, target.target_id, target.attempt)?;
+                }
+            }
             Ok(JobStatus {
                 job_id: job.to_owned(),
                 node_id,

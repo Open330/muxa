@@ -1424,7 +1424,7 @@ fn a_retry_with_another_configuration_is_refused() {
 
 // --- prompt receipts ---------------------------------------------------------
 
-fn prompt(kind: AgentKind, session: &str, pane: &str) -> crate::state::PromptRecord {
+fn prompt(kind: AgentKind, session: &str, pane: &str, seq: u64) -> crate::state::PromptRecord {
     crate::state::PromptRecord {
         id: crate::event::AgentId {
             kind,
@@ -1437,6 +1437,7 @@ fn prompt(kind: AgentKind, session: &str, pane: &str) -> crate::state::PromptRec
         prompt: "secret text".into(),
         at: time::OffsetDateTime::now_utc(),
         model: None,
+        seq,
     }
 }
 
@@ -1445,15 +1446,18 @@ fn prompt(kind: AgentKind, session: &str, pane: &str) -> crate::state::PromptRec
 #[test]
 fn a_prompt_receipt_counts_only_after_its_cursor_and_on_its_pane() {
     use crate::account_swap::TurnProbe as _;
-    let receipts = PromptReceipts::default();
+    let accepted = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let receipts = PromptReceipts::new(Arc::clone(&accepted));
     let endpoint = endpoint_key("%1", Some("/tmp/tmux-1/default"));
-    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1"));
+    // Accepted by the store (number 1) before the cursor, received after it.
+    accepted.store(1, Ordering::SeqCst);
     let cursor = receipts.cursor();
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1", 1));
     assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
-    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%2"));
-    receipts.record(&prompt(AgentKind::ClaudeCode, "other", "%1"));
-    receipts.record(&prompt(AgentKind::Codex, "c", "%1"));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%2", 2));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "other", "%1", 3));
+    receipts.record(&prompt(AgentKind::Codex, "c", "%1", 4));
     assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
-    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1"));
+    receipts.record(&prompt(AgentKind::ClaudeCode, "c", "%1", 5));
     assert!(receipts.prompt_after(cursor, AgentKind::ClaudeCode, "c", &endpoint));
 }

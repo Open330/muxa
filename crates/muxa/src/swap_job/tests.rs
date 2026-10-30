@@ -835,3 +835,46 @@ fn a_follow_up_takes_only_evidence_of_its_own_kind() {
     assert_eq!(report.evidence, None);
     assert_eq!(follow_up_status(None, None), None);
 }
+
+/// An attempt that stopped before recording its follow-up still reads back
+/// what its effects say: both accepted is delivered, an Enter with no
+/// result is unconfirmed. No evidence is claimed.
+#[test]
+fn a_follow_up_without_its_record_is_read_from_its_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 2);
+    let prompt = Effect {
+        group: 3,
+        purpose: Purpose::FollowUp,
+        op: Op::Prompt { chars: 8 },
+    };
+    let enter = Effect {
+        group: 3,
+        purpose: Purpose::FollowUp,
+        op: Op::Key(Key::Enter),
+    };
+    let mut journal = store.journal(&lease, &job, 0, 1);
+    for effect in [&prompt, &enter] {
+        journal.before(effect).unwrap();
+        journal.after(effect, Transport::Accepted).unwrap();
+    }
+    let mut journal = store.journal(&lease, &job, 1, 1);
+    journal.before(&prompt).unwrap();
+    journal.after(&prompt, Transport::Accepted).unwrap();
+    journal.before(&enter).unwrap();
+    drop(store);
+    let status = open(&dir).status(&job).unwrap();
+    let delivered = status.targets[0].follow_up.clone().unwrap();
+    assert_eq!(
+        (
+            delivered.submission.as_str(),
+            delivered.evidence,
+            delivered.kept
+        ),
+        ("delivered", None, false)
+    );
+    let open_enter = status.targets[1].follow_up.clone().unwrap();
+    assert_eq!(open_enter.submission, "unconfirmed");
+}
