@@ -1376,3 +1376,47 @@ fn a_retry_leaves_a_busy_pane_alone() {
     );
     assert!(h.observed.lock().unwrap().is_empty());
 }
+
+/// A retry made with another configuration file than the daemon's is
+/// refused before anything; the daemon's own file, however spelled, is not.
+#[test]
+fn a_retry_with_another_configuration_is_refused() {
+    let h = harness(Box::new(|| vec![run("%a")]));
+    h.failing
+        .lock()
+        .unwrap()
+        .insert("%a".into(), Fail::BeforeLaunch);
+    let parent = Service::submit(&h.service, "p", &overrides(&["%a"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    settled(&h.service, &parent);
+    h.executed.lock().unwrap().clear();
+    let elsewhere = h.dir.path().join("other.toml");
+    std::fs::write(&elsewhere, "").unwrap();
+    let refused = Service::retry(
+        &h.service,
+        "r1",
+        &JobRef::Id(parent.clone()),
+        &RetryOverrides {
+            caller_config: Some(elsewhere),
+            ..RetryOverrides::default()
+        },
+    );
+    assert!(refused
+        .unwrap_err()
+        .contains("swaps run with the daemon's configuration"));
+    assert!(h.executed.lock().unwrap().is_empty());
+    let same = h.dir.path().join(".").join("config.toml");
+    let accepted = Service::retry(
+        &h.service,
+        "r2",
+        &JobRef::Id(parent),
+        &RetryOverrides {
+            caller_config: Some(same),
+            ..RetryOverrides::default()
+        },
+    )
+    .unwrap();
+    settled(&h.service, &accepted.job_id);
+    assert_eq!(*h.executed.lock().unwrap(), ["%a"]);
+}

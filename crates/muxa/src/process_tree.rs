@@ -455,6 +455,62 @@ pub(crate) fn read_descendants(root: u32) -> Vec<ProcessInfo> {
     out
 }
 
+/// [`read_descendants`], including `root` itself, but `None` unless every
+/// live process's children could be read and nothing was cut off: a scan
+/// whose "no such process" can be trusted.
+#[cfg(target_os = "linux")]
+pub(crate) fn read_descendants_complete(root: u32) -> Option<Vec<ProcessInfo>> {
+    let mut out = vec![read_proc(root, 0)?];
+    let mut seen: HashSet<u32> = HashSet::from([root]);
+    let mut q: VecDeque<(u32, u8)> = read_children_checked(root)?
+        .into_iter()
+        .map(|pid| (pid, 1))
+        .collect();
+    while let Some((pid, depth)) = q.pop_front() {
+        if depth > MAX_DEPTH || out.len() >= MAX_NODES {
+            return None;
+        }
+        if !seen.insert(pid) {
+            continue;
+        }
+        // Gone meanwhile: nothing to read, nothing missed.
+        let Some(proc) = read_proc(pid, depth) else {
+            continue;
+        };
+        let children = match read_children_checked(pid) {
+            Some(children) => children,
+            None if read_proc(pid, depth).is_none() => Vec::new(),
+            None => return None,
+        };
+        q.extend(
+            children
+                .into_iter()
+                .map(|child| (child, depth.saturating_add(1))),
+        );
+        out.push(proc);
+    }
+    Some(out)
+}
+
+/// Without `/proc`, the process table is a snapshot that cannot say it is
+/// complete.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn read_descendants_complete(_root: u32) -> Option<Vec<ProcessInfo>> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn read_children_checked(pid: u32) -> Option<Vec<u32>> {
+    std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))
+        .ok()
+        .map(|children| {
+            children
+                .split_whitespace()
+                .filter_map(|s| s.parse().ok())
+                .collect()
+        })
+}
+
 #[cfg(target_os = "linux")]
 fn read_children(pid: u32) -> Vec<u32> {
     std::fs::read_to_string(format!("/proc/{pid}/task/{pid}/children"))

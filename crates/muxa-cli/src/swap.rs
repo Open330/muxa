@@ -261,7 +261,7 @@ pub(crate) async fn run(
         return show_status(client, job, args.json).await;
     }
     if let Some(parent) = &args.retry {
-        return run_retry(client, &args, parent).await;
+        return run_retry(client, &args, parent, explicit_config).await;
     }
     if args.local {
         return run_local(client, &args, config, accounts).await;
@@ -513,7 +513,12 @@ fn not_found(error: &RuntimeError) -> bool {
 
 /// `--retry`: only a daemon can retry its job; nothing falls back to a
 /// fresh or in-process swap.
-async fn run_retry(client: &Client, args: &Args, parent: &str) -> Result<()> {
+async fn run_retry(
+    client: &Client,
+    args: &Args,
+    parent: &str,
+    explicit_config: Option<&Path>,
+) -> Result<()> {
     let hello = client.hello(HELLO_TIMEOUT).await.map_err(|error| {
         anyhow!("could not ask the daemon whether it can retry swap jobs: {error}")
     })?;
@@ -530,6 +535,7 @@ async fn run_retry(client: &Client, args: &Args, parent: &str) -> Result<()> {
     let overrides = muxa::swap_service::RetryOverrides {
         continue_evidence: args.continue_evidence.map(|e| e.as_str().to_owned()),
         force: args.force,
+        caller_config: explicit_config.map(Path::to_path_buf),
     };
     let key = format!("cli-{}", uuid::Uuid::new_v4());
     eprintln!("muxa swap: retry {key} of {parent} (see it with `muxa swap --status {key}`)");

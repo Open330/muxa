@@ -980,3 +980,35 @@ fn a_swap_with_no_follow_up_due_still_restores_the_draft() {
     assert!(result.unwrap().contains("restored the half-typed prompt"));
     assert!(io.sent().contains(&"prompt \"half typed\"".to_owned()));
 }
+
+/// A run that may not restore the draft (a retry) types it back on no path,
+/// the kept session's included.
+#[test]
+fn a_run_without_draft_restoration_never_types_the_draft() {
+    let io = FakeIo::new(
+        CLAUDE_WITH_DRAFT,
+        Box::new(|io: &FakeIo, line: &str| {
+            if line == "text \"\\r\"" && io.previous().as_deref() == Some("prompt \"/exit\"") {
+                io.show(SCHEDULED);
+            }
+        }),
+    );
+    let mut target = target(AgentKind::ClaudeCode, false, true);
+    target.restore_draft = false;
+    let (result, log, _) = run(
+        &io,
+        &target,
+        &claude_launch(),
+        Some("continue"),
+        &mut NoObserver,
+    );
+    assert!(matches!(result, Err(Refusal::Kept(_))));
+    assert!(
+        !io.sent().iter().any(|line| line.contains("half typed")),
+        "{:?}",
+        io.sent()
+    );
+    assert!(!log
+        .iter()
+        .any(|(effect, _)| matches!(effect.purpose, Purpose::KeptDraft | Purpose::RestoreDraft)));
+}

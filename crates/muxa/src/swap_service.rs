@@ -310,10 +310,21 @@ pub struct RetryOverrides {
     /// Also stop an agent that is mid-turn now.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub force: bool,
+    /// The configuration file the caller named, if it named one: refused
+    /// unless it is the daemon's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_config: Option<PathBuf>,
 }
 
 impl RetryOverrides {
     pub fn validate(&self) -> Result<(), String> {
+        if self
+            .caller_config
+            .as_deref()
+            .is_some_and(|path| path.as_os_str().len() > MAX_PATH)
+        {
+            return Err(format!("caller_config: longer than {MAX_PATH} bytes"));
+        }
         self.evidence().map(|_| ())
     }
 
@@ -954,8 +965,14 @@ impl<E: Engine> Service<E> {
 
     /// A snapshot planned against the configuration the caller loaded.
     fn snapshot_for(&self, overrides: &SwapOverrides) -> Result<Snapshot, String> {
+        self.snapshot_with(overrides.caller_config.as_deref())
+    }
+
+    /// The daemon's snapshot, refused if the caller planned with another
+    /// configuration file than the daemon runs.
+    fn snapshot_with(&self, caller_config: Option<&Path>) -> Result<Snapshot, String> {
         let snapshot = self.provider.snapshot()?;
-        if let Some(caller) = &overrides.caller_config {
+        if let Some(caller) = caller_config {
             let same = snapshot
                 .config_path
                 .as_deref()
@@ -1199,7 +1216,7 @@ impl<E: Engine> Service<E> {
             .store
             .plan(&parent)
             .map_err(|error| error.to_string())?;
-        let snapshot = this.provider.snapshot()?;
+        let snapshot = this.snapshot_with(overrides.caller_config.as_deref())?;
         let mut settled: Vec<SettledEntry> = plan
             .settled
             .iter()

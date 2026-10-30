@@ -1257,6 +1257,7 @@ mod retry_tests {
         let look = |candidates: &[io::AgentArgv], landed: Landed| {
             observed(
                 candidates,
+                true,
                 AgentKind::ClaudeCode,
                 "c",
                 Some("b"),
@@ -1283,6 +1284,13 @@ mod retry_tests {
             "observed_account_unconfirmed"
         );
         assert_eq!(look(&[], Landed::Unreadable), "observed_not_running");
+        // No agent in a scan that could not be completed proves nothing.
+        assert_eq!(
+            observed(&[], false, AgentKind::ClaudeCode, "c", Some("b"), |_| {
+                Landed::Unreadable
+            }),
+            "observed_unknown"
+        );
         let other = vec![(
             5,
             Some(vec!["claude".into(), "--resume".into(), "x".into()]),
@@ -2502,9 +2510,12 @@ fn execute(
     let mut answered: Vec<&'static str> = Vec::new();
     // Clearing the prompt to quit loses what was half-typed there; it is
     // typed back once the agent is up again (or stays, if it is kept).
+    // A run that may not restore the draft (a retry) never holds one, so
+    // no path, the kept session's included, can type it back.
     let draft = io
         .capture()
-        .and_then(|screen| composer_draft(&screen, target.kind));
+        .and_then(|screen| composer_draft(&screen, target.kind))
+        .filter(|_| target.restore_draft);
     enter(runner, Phase::Stopping)?;
     stop_agent(
         runner,
@@ -2575,7 +2586,7 @@ fn execute(
     Ok(follow_through(
         runner,
         follow_up,
-        draft.as_deref().filter(|_| target.restore_draft),
+        draft.as_deref(),
         draft_allowed,
         withheld,
         &answered,
@@ -2704,33 +2715,46 @@ pub(crate) fn observe_target(
     let Some(pane_pid) = pane_pid else {
         return "observed_unknown";
     };
-    let candidates: Vec<io::AgentArgv> = pane_processes(pane_pid)
+    // Absence is only evidence from a scan known to be complete.
+    let (processes, complete) = match crate::process_tree::read_descendants_complete(pane_pid) {
+        Some(processes) => (processes, true),
+        None => (pane_processes(pane_pid), false),
+    };
+    let candidates: Vec<io::AgentArgv> = processes
         .into_iter()
         .filter(|p| is_agent_process(p, kind))
         .map(|p| (p.pid, crate::process_snapshot::process_argv(p.pid)))
         .collect();
-    observed(&candidates, kind, conversation_id, assigned, |pid| {
-        let profiles = provider_name(kind)
-            .map(|provider| accounts.for_provider(provider))
-            .unwrap_or_default();
-        if profiles.is_empty() {
-            return Landed::Unreadable;
-        }
-        let environ = crate::accounts::process_environ(pid);
-        if environ.is_empty() {
-            return Landed::Unreadable;
-        }
-        Landed::On(
-            crate::accounts::ResolvedAccounts::new(profiles)
-                .identify(&environ)
-                .map(str::to_owned),
-        )
-    })
+    observed(
+        &candidates,
+        complete,
+        kind,
+        conversation_id,
+        assigned,
+        |pid| {
+            let profiles = provider_name(kind)
+                .map(|provider| accounts.for_provider(provider))
+                .unwrap_or_default();
+            if profiles.is_empty() {
+                return Landed::Unreadable;
+            }
+            let environ = crate::accounts::process_environ(pid);
+            if environ.is_empty() {
+                return Landed::Unreadable;
+            }
+            Landed::On(
+                crate::accounts::ResolvedAccounts::new(profiles)
+                    .identify(&environ)
+                    .map(str::to_owned),
+            )
+        },
+    )
 }
 
 /// [`observe_target`]'s verdict from what it read.
 fn observed(
     candidates: &[io::AgentArgv],
+    complete: bool,
     kind: AgentKind,
     conversation_id: &str,
     assigned: Option<&str>,
@@ -2742,7 +2766,8 @@ fn observed(
             Landed::On(_) => "observed_account_mismatch",
             Landed::Unreadable => "observed_account_unconfirmed",
         },
-        ResumeBinding::Missing if candidates.is_empty() => "observed_not_running",
+        ResumeBinding::Missing if candidates.is_empty() && complete => "observed_not_running",
+        ResumeBinding::Missing if candidates.is_empty() => "observed_unknown",
         ResumeBinding::Missing | ResumeBinding::Ambiguous => "observed_unbound",
         ResumeBinding::Unreadable => "observed_unknown",
     }
