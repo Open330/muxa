@@ -393,6 +393,7 @@ const SWAP_VALUE_FLAGS: &[&str] = &[
     "--continue-evidence",
     "--exclude",
     "--status",
+    "--retry",
 ];
 
 /// Check a `swap` argv: JSON output, only the allowlisted flags, and plain

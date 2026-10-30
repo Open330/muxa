@@ -299,6 +299,51 @@ pub struct PlanView {
     pub unavailable: Option<String>,
 }
 
+/// What a retry may set: everything else is the parent's.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RetryOverrides {
+    /// `binding` or `verified`; only matters to the relaunch's report, as a
+    /// retry types no follow-up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continue_evidence: Option<String>,
+    /// Also stop an agent that is mid-turn now.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub force: bool,
+    /// The configuration file the caller named, if it named one: refused
+    /// unless it is the daemon's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_config: Option<PathBuf>,
+}
+
+impl RetryOverrides {
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .caller_config
+            .as_deref()
+            .is_some_and(|path| path.as_os_str().len() > MAX_PATH)
+        {
+            return Err(format!("caller_config: longer than {MAX_PATH} bytes"));
+        }
+        self.evidence().map(|_| ())
+    }
+
+    fn evidence(&self) -> Result<Option<ContinueEvidence>, String> {
+        match self.continue_evidence.as_deref() {
+            None => Ok(None),
+            Some("binding") => Ok(Some(ContinueEvidence::Binding)),
+            Some("verified") => Ok(Some(ContinueEvidence::Verified)),
+            Some(other) => Err(format!("unknown continue evidence {other:?}")),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct RetryDigest<'a> {
+    retry_of: &'a str,
+    overrides: &'a RetryOverrides,
+}
+
 /// A planned step: settled already, or a target to run.
 pub(crate) enum EngineStep<T> {
     Done(SwapOutcome),
@@ -315,6 +360,15 @@ pub(crate) trait Engine: Send + Sync + 'static {
         snapshot: &Snapshot,
     ) -> (SwapRequest, Vec<EngineStep<Self::Target>>);
     fn identity(&self, target: &Self::Target) -> TargetIdentity;
+    /// Plan one target of a retry, as its parent planned it.
+    fn prepare_retry(
+        &self,
+        request: &SwapRequest,
+        planned: &PlannedTarget,
+        snapshot: &Snapshot,
+    ) -> (SwapRequest, EngineStep<Self::Target>);
+    /// Look at a target's pane now, read-only: a reason code.
+    fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str;
     fn execute(
         &self,
         request: &SwapRequest,
@@ -355,6 +409,44 @@ impl Engine for RealEngine {
         target.identity()
     }
 
+    fn prepare_retry(
+        &self,
+        request: &SwapRequest,
+        planned: &PlannedTarget,
+        snapshot: &Snapshot,
+    ) -> (SwapRequest, EngineStep<Self::Target>) {
+        let (resolved, step) = account_swap::prepare_retry(
+            request,
+            &account_swap::RetryTarget {
+                endpoint: &planned.endpoint,
+                conversation_id: &planned.conversation_id,
+                process_pid: planned.process_pid,
+                process_start: planned.process_start.as_deref(),
+            },
+            &snapshot.agents,
+            &snapshot.backends,
+            &snapshot.config,
+            &snapshot.accounts,
+        );
+        let step = match step {
+            Step::Done(outcome) => EngineStep::Done(outcome),
+            Step::Run(target) => EngineStep::Run(target),
+        };
+        (resolved, step)
+    }
+
+    fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str {
+        account_swap::observe_target(
+            &planned.pane,
+            planned.socket.as_deref(),
+            provider_kind(&planned.provider),
+            &planned.conversation_id,
+            planned.assigned_account.as_deref(),
+            &snapshot.backends,
+            &snapshot.accounts,
+        )
+    }
+
     fn execute(
         &self,
         request: &SwapRequest,
@@ -362,6 +454,14 @@ impl Engine for RealEngine {
         observer: &mut dyn EffectObserver,
     ) -> SwapOutcome {
         account_swap::execute_target(request, target, observer)
+    }
+}
+
+fn provider_kind(provider: &str) -> AgentKind {
+    match provider {
+        "codex" => AgentKind::Codex,
+        "claude" => AgentKind::ClaudeCode,
+        _ => AgentKind::Unknown,
     }
 }
 
@@ -409,6 +509,34 @@ impl Engine for DaemonEngine {
             DaemonTarget::Real(target) => RealEngine.identity(target),
             #[cfg(feature = "test-support")]
             DaemonTarget::Inert(identity) => identity.clone(),
+        }
+    }
+
+    fn prepare_retry(
+        &self,
+        request: &SwapRequest,
+        planned: &PlannedTarget,
+        snapshot: &Snapshot,
+    ) -> (SwapRequest, EngineStep<DaemonTarget>) {
+        match self {
+            Self::Real(engine) => {
+                let (resolved, step) = engine.prepare_retry(request, planned, snapshot);
+                let step = match step {
+                    EngineStep::Done(outcome) => EngineStep::Done(outcome),
+                    EngineStep::Run(target) => EngineStep::Run(DaemonTarget::Real(target)),
+                };
+                (resolved, step)
+            }
+            #[cfg(feature = "test-support")]
+            Self::Inert(_) => testing::InertEngine::prepare_retry(request, planned, snapshot),
+        }
+    }
+
+    fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str {
+        match self {
+            Self::Real(engine) => engine.observe(planned, snapshot),
+            #[cfg(feature = "test-support")]
+            Self::Inert(_) => "observed_unknown",
         }
     }
 
@@ -511,6 +639,12 @@ pub trait SwapJobs: Send + Sync {
     fn active(&self) -> Result<(), String>;
     fn plan(&self, overrides: &SwapOverrides) -> Result<PlanView, String>;
     fn submit(&self, request_key: &str, overrides: &SwapOverrides) -> Result<Accepted, String>;
+    fn retry(
+        &self,
+        request_key: &str,
+        parent: &JobRef,
+        overrides: &RetryOverrides,
+    ) -> Result<Accepted, String>;
     /// Readable whatever state the service is in, so a halted or recovered
     /// job can always be inspected.
     fn status(&self, job: &JobRef) -> Result<JobView, String>;
@@ -527,6 +661,15 @@ impl SwapJobs for SwapService {
 
     fn submit(&self, request_key: &str, overrides: &SwapOverrides) -> Result<Accepted, String> {
         Service::submit(&self.inner, request_key, overrides, Origin::Public, None)
+    }
+
+    fn retry(
+        &self,
+        request_key: &str,
+        parent: &JobRef,
+        overrides: &RetryOverrides,
+    ) -> Result<Accepted, String> {
+        Service::retry(&self.inner, request_key, parent, overrides)
     }
 
     fn status(&self, job: &JobRef) -> Result<JobView, String> {
@@ -822,8 +965,14 @@ impl<E: Engine> Service<E> {
 
     /// A snapshot planned against the configuration the caller loaded.
     fn snapshot_for(&self, overrides: &SwapOverrides) -> Result<Snapshot, String> {
+        self.snapshot_with(overrides.caller_config.as_deref())
+    }
+
+    /// The daemon's snapshot, refused if the caller planned with another
+    /// configuration file than the daemon runs.
+    fn snapshot_with(&self, caller_config: Option<&Path>) -> Result<Snapshot, String> {
         let snapshot = self.provider.snapshot()?;
-        if let Some(caller) = &overrides.caller_config {
+        if let Some(caller) = caller_config {
             let same = snapshot
                 .config_path
                 .as_deref()
@@ -966,9 +1115,32 @@ impl<E: Engine> Service<E> {
                 view,
             });
         }
-        let job = created.job_id;
+        Self::run_accepted(
+            this,
+            created.job_id,
+            resolved,
+            runs,
+            guard,
+            plan.targets.len(),
+            &taken,
+            notes,
+        )
+    }
+
+    /// Start a job just written and hand it to its executor.
+    #[allow(clippy::too_many_arguments)] // one accepted job's whole hand-over
+    fn run_accepted(
+        this: &Arc<Self>,
+        job: String,
+        resolved: SwapRequest,
+        runs: Vec<(usize, TargetIdentity, E::Target)>,
+        guard: Option<Box<dyn TargetGuard>>,
+        targets: usize,
+        taken: &[String],
+        notes: Vec<(usize, SwapOutcome)>,
+    ) -> Result<Accepted, String> {
         if let Err(error) = this.store.start(&this.lease, &job) {
-            this.release_all(&taken);
+            this.release_all(taken);
             this.set_fault(format!("could not start job {job}: {error}"));
             return Err(error.to_string());
         }
@@ -983,21 +1155,218 @@ impl<E: Engine> Service<E> {
                 },
             );
         }
-        Self::spawn(
-            this,
-            &job,
-            resolved,
-            runs,
-            guard,
-            plan.targets.len(),
-            &taken,
-        )?;
+        Self::spawn(this, &job, resolved, runs, guard, targets, taken)?;
         let view = this.status(&JobRef::Id(job.clone()))?;
         Ok(Accepted {
             job_id: job,
             existing: false,
             view,
         })
+    }
+
+    /// Retry the targets of an ended job that can be retried safely, as a
+    /// new job under `request_key`.
+    ///
+    /// A target is run again only if it failed before anything at or past
+    /// its relaunch was even intended, with no effect left uncertain, and
+    /// the very process its job planned (same pid and start) still runs on
+    /// the same endpoint and conversation: then nothing replaced it, and
+    /// the swap starts from where it was. Its account is the one first
+    /// assigned. No follow-up is typed and no draft restored: both were
+    /// another run's. Every other target that did not end swapped, kept or
+    /// skipped is only looked at, read-only, and reported as found.
+    #[allow(clippy::too_many_lines)] // the whole acceptance, in order
+    pub(crate) fn retry(
+        this: &Arc<Self>,
+        request_key: &str,
+        parent: &JobRef,
+        overrides: &RetryOverrides,
+    ) -> Result<Accepted, String> {
+        validate_key(request_key)?;
+        overrides.validate()?;
+        let parent = this.status(parent)?.job_id;
+        // What makes a resend the same retry: the parent and what was typed,
+        // never the eligibility read now, which a first send changes.
+        let digest = request_digest(&RetryDigest {
+            retry_of: &parent,
+            overrides,
+        });
+        let _one_at_a_time = this
+            .submit
+            .lock()
+            .map_err(|_| "swap job submission lock poisoned".to_owned())?;
+        this.active()?;
+        if let Some(job) = this
+            .store
+            .lookup(request_key, &digest)
+            .map_err(|error| error.to_string())?
+        {
+            let view = this.status(&JobRef::Id(job.clone()))?;
+            return Ok(Accepted {
+                job_id: job,
+                existing: true,
+                view,
+            });
+        }
+        let sources = this
+            .store
+            .retry_sources(&parent)
+            .map_err(|error| error.to_string())?;
+        let plan = this
+            .store
+            .plan(&parent)
+            .map_err(|error| error.to_string())?;
+        let snapshot = this.snapshot_with(overrides.caller_config.as_deref())?;
+        let mut settled: Vec<SettledEntry> = plan
+            .settled
+            .iter()
+            .map(|entry| SettledEntry {
+                disposition: Disposition::Skipped,
+                reason: "not_retried".into(),
+                ..entry.clone()
+            })
+            .collect();
+        let mut notes = Vec::new();
+        let mut runs = Vec::new();
+        let mut links = Vec::new();
+        let mut taken = Vec::new();
+        let mut resolved = None;
+        for source in &sources {
+            let Some(planned) = usize::try_from(source.target_id)
+                .ok()
+                .and_then(|index| plan.targets.get(index))
+            else {
+                continue;
+            };
+            let settle = |reason: &str| SettledEntry {
+                report_index: planned.report_index,
+                pane: Some(planned.pane.clone()),
+                agent_session_id: planned.conversation_id.clone(),
+                disposition: Disposition::Skipped,
+                reason: reason.into(),
+            };
+            if let Some(by) = &source.retried_by {
+                let _ = by;
+                settled.push(settle("retried_elsewhere"));
+                continue;
+            }
+            let done = matches!(
+                source.disposition.as_deref(),
+                Some("swapped" | "kept" | "skipped")
+            );
+            if done {
+                settled.push(settle("not_retried"));
+                continue;
+            }
+            let rerun = source.disposition.as_deref() == Some("failed")
+                && !source.launched
+                && source.uncertain_effects == 0;
+            if !this.reserve(&planned.endpoint, request_key) {
+                settled.push(settle("busy"));
+                continue;
+            }
+            if !rerun {
+                // Looked at under the reservation, so no job acting on it
+                // can make this read misleading; nothing is done to it.
+                let found = this.engine.observe(planned, &snapshot);
+                this.release(&planned.endpoint);
+                settled.push(settle(found));
+                continue;
+            }
+            let Some(account) = planned.assigned_account.clone() else {
+                this.release(&planned.endpoint);
+                settled.push(settle("no_assigned_account"));
+                continue;
+            };
+            let mut request = SwapRequest::new(
+                SwapScope::Targets(vec![planned.conversation_id.clone()]),
+                &snapshot.config,
+            );
+            request.to = AccountChoice::Named(account);
+            request.force = overrides.force;
+            request.continue_when = ContinueWhen::Never;
+            request.continue_text = None;
+            request.restore_draft = false;
+            request.allow_direct_respawn = false;
+            if let Some(evidence) = overrides.evidence()? {
+                request.continue_evidence = evidence;
+            }
+            let (request, step) = this.engine.prepare_retry(&request, planned, &snapshot);
+            match step {
+                EngineStep::Run(target) => {
+                    let identity = this.engine.identity(&target);
+                    if let Some((code, note)) = refusal(&identity, Origin::Public) {
+                        this.release(&planned.endpoint);
+                        settled.push(settle(code));
+                        notes.push((planned.report_index, skipped_outcome(&identity, note)));
+                        continue;
+                    }
+                    links.push(crate::swap_job::RetryLink {
+                        target_index: runs.len(),
+                        parent_target: source.target_id,
+                        parent_attempt: source.attempt,
+                        lineage: source.lineage.clone(),
+                    });
+                    taken.push(planned.endpoint.clone());
+                    runs.push((planned.report_index, identity, target));
+                    resolved.get_or_insert(request);
+                }
+                EngineStep::Done(outcome) => {
+                    this.release(&planned.endpoint);
+                    settled.push(settled_entry(planned.report_index, &outcome));
+                    notes.push((planned.report_index, outcome));
+                }
+            }
+        }
+        settled.sort_by_key(|entry| entry.report_index);
+        let accepted = AcceptedPlan {
+            node_id: snapshot.node_id.clone(),
+            continue_when: ContinueWhen::Never.to_string(),
+            continue_text: None,
+            targets: runs
+                .iter()
+                .map(|(report_index, identity, _)| planned_target(*report_index, identity))
+                .collect(),
+            settled,
+        };
+        let created = match this.store.create_retry_job(
+            &this.lease,
+            request_key,
+            &digest,
+            &accepted,
+            &parent,
+            &links,
+        ) {
+            Ok(created) => created,
+            Err(error) => {
+                this.release_all(&taken);
+                return Err(error.to_string());
+            }
+        };
+        if created.existing {
+            this.release_all(&taken);
+            let view = this.status(&JobRef::Id(created.job_id.clone()))?;
+            return Ok(Accepted {
+                job_id: created.job_id,
+                existing: true,
+                view,
+            });
+        }
+        let resolved = resolved.unwrap_or_else(|| {
+            let mut request = SwapRequest::new(SwapScope::Targets(Vec::new()), &snapshot.config);
+            request.continue_when = ContinueWhen::Never;
+            request
+        });
+        Self::run_accepted(
+            this,
+            created.job_id,
+            resolved,
+            runs,
+            None,
+            accepted.targets.len(),
+            &taken,
+            notes,
+        )
     }
 
     /// Settled steps and the targets to run, each target's endpoint
@@ -1485,6 +1854,27 @@ pub mod testing {
                 })
                 .collect();
             (request.clone(), steps)
+        }
+
+        /// A retried target runs again if the snapshot still has its agent on
+        /// its pane.
+        pub(crate) fn prepare_retry(
+            request: &SwapRequest,
+            planned: &super::PlannedTarget,
+            snapshot: &Snapshot,
+        ) -> (SwapRequest, EngineStep<DaemonTarget>) {
+            let mut request = request.clone();
+            request.scope = SwapScope::Targets(vec![planned.conversation_id.clone()]);
+            let (request, mut steps) = Self::prepare(&request, snapshot);
+            let step = steps.pop().unwrap_or_else(|| {
+                EngineStep::Done(outcome(
+                    Some(&planned.pane),
+                    &planned.conversation_id,
+                    SwapStatus::Skipped,
+                    "no such agent",
+                ))
+            });
+            (request, step)
         }
 
         /// Calls `run`, then reports the target swapped. No effect is made.

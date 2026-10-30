@@ -605,3 +605,165 @@ fn the_follow_up_decision_survives_in_the_journal() {
     );
     assert_eq!(status.targets[1].continuation.as_deref(), Some("not_due"));
 }
+
+// --- retry ----------------------------------------------------------------
+
+/// A retry sees each target's latest attempt: how it ended, whether
+/// anything at or past the relaunch was intended or seen, and what is
+/// uncertain.
+#[test]
+fn a_retry_reads_how_far_each_target_got() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 4);
+    // 0: stopped only. 1: a relaunch typed, even refused. 2: launching seen.
+    // 3: an intent with no result.
+    let stop = effect(Purpose::Interrupt, Op::Key(Key::Esc));
+    let mut journal = store.journal(&lease, &job, 0, 1);
+    journal.before(&stop).unwrap();
+    journal.after(&stop, Transport::Accepted).unwrap();
+    let relaunch = effect(Purpose::Relaunch, Op::Text { chars: 4 });
+    let mut journal = store.journal(&lease, &job, 1, 1);
+    journal.before(&relaunch).unwrap();
+    journal.after(&relaunch, Transport::Refused).unwrap();
+    store
+        .observe(
+            &lease,
+            &job,
+            2,
+            1,
+            &Observation::Phase {
+                phase: Phase::Launching,
+            },
+        )
+        .unwrap();
+    for target in 0..3 {
+        store
+            .finish_target(&lease, &job, target, 1, Disposition::Failed)
+            .unwrap();
+    }
+    store.journal(&lease, &job, 3, 1).before(&stop).unwrap();
+    // Taken over: the open intent leaves the job needing reconciliation.
+    drop(store);
+    let store = open(&dir);
+    let lease = store.acquire(&me("b", 2), &gone).unwrap();
+    store.recover(&lease).unwrap();
+    let sources = store.retry_sources(&job).unwrap();
+    let shape: Vec<_> = sources
+        .iter()
+        .map(|s| {
+            (
+                s.target_id,
+                s.disposition.clone(),
+                s.launched,
+                s.uncertain_effects,
+            )
+        })
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (0, Some("failed".into()), false, 0),
+            (1, Some("failed".into()), true, 0),
+            (2, Some("failed".into()), true, 0),
+            (3, Some("needs_reconciliation".into()), false, 1),
+        ]
+    );
+    assert_eq!(sources[0].lineage, format!("{job}:0"));
+}
+
+/// Two retries of one attempt: the first claims it, the second is refused
+/// whole, in the transaction that would have created it.
+#[test]
+fn an_attempt_is_retried_by_one_retry_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 1);
+    store
+        .finish_target(&lease, &job, 0, 1, Disposition::Failed)
+        .unwrap();
+    store.finish(&lease, &job).unwrap();
+    let link = RetryLink {
+        target_index: 0,
+        parent_target: 0,
+        parent_attempt: 1,
+        lineage: format!("{job}:0"),
+    };
+    let plan = plan(1, None);
+    let first = store
+        .create_retry_job(&lease, "r1", "d1", &plan, &job, std::slice::from_ref(&link))
+        .unwrap();
+    assert!(!first.existing);
+    // Its resend is the same job; another key is refused.
+    let again = store
+        .create_retry_job(&lease, "r1", "d1", &plan, &job, std::slice::from_ref(&link))
+        .unwrap();
+    assert!(again.existing);
+    assert_eq!(again.job_id, first.job_id);
+    let other = store.create_retry_job(&lease, "r2", "d2", &plan, &job, &[link]);
+    assert!(matches!(other, Err(JobError::Invalid { .. })), "{other:?}");
+    let sources = store.retry_sources(&job).unwrap();
+    assert_eq!(
+        sources[0].retried_by.as_deref(),
+        Some(first.job_id.as_str())
+    );
+    // The retry's target carries the root's lineage.
+    store.start(&lease, &first.job_id).unwrap();
+    store
+        .finish_target(&lease, &first.job_id, 0, 1, Disposition::Failed)
+        .unwrap();
+    store.finish(&lease, &first.job_id).unwrap();
+    assert_eq!(
+        store.retry_sources(&first.job_id).unwrap()[0].lineage,
+        format!("{job}:0")
+    );
+}
+
+/// A v1 store with jobs in it, an interrupted one included, opens as v2
+/// with everything kept, and its targets are their own roots.
+#[test]
+fn a_v1_store_is_migrated_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("muxa/swap-jobs.sqlite3");
+    let job = {
+        let store = SwapJobStore::open(&path).unwrap();
+        let lease = store.acquire(&me("a", 1), &alive).unwrap();
+        let job = running(&store, &lease, "k", 2);
+        store
+            .finish_target(&lease, &job, 0, 1, Disposition::Failed)
+            .unwrap();
+        job
+    };
+    // Back to the v1 shape: no lineage, no retry links.
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX targets_retry_of;
+                 ALTER TABLE targets DROP COLUMN retry_of;
+                 ALTER TABLE targets DROP COLUMN lineage;
+                 ALTER TABLE jobs DROP COLUMN retry_of;
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+    }
+    let store = SwapJobStore::open(&path).unwrap();
+    let version: i64 = store
+        .hold()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, SCHEMA_VERSION);
+    let lease = store.acquire(&me("b", 2), &gone).unwrap();
+    store.recover(&lease).unwrap();
+    // Recovered after the migration, as any interrupted job is.
+    let status = store.status(&job).unwrap();
+    assert_eq!(status.state, "abandoned");
+    let sources = store.retry_sources(&job).unwrap();
+    assert_eq!(sources[0].lineage, format!("{job}:0"));
+    assert_eq!(sources[0].disposition.as_deref(), Some("failed"));
+    drop(store);
+    // Reopening a migrated store changes nothing.
+    assert!(SwapJobStore::open(&path).is_ok());
+}

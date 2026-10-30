@@ -121,6 +121,21 @@ pub struct Args {
         ]
     )]
     status: Option<String>,
+    /// Retry a daemon swap job that has ended (by key or job id): only a
+    /// target that failed before its relaunch, while the very agent it
+    /// planned still runs, is swapped again, on the account first assigned,
+    /// with no follow-up; the others are only looked at. `--force` and
+    /// `--continue-evidence` may be given.
+    #[arg(
+        long,
+        value_name = "KEY",
+        conflicts_with_all = [
+            "targets", "all", "limited", "provider", "to", "spread", "bare",
+            "continue_text", "continue_legacy", "continue_when", "no_continue",
+            "dry_run", "exclude", "local", "status",
+        ]
+    )]
+    retry: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -244,6 +259,9 @@ pub(crate) async fn run(
     // Reading a job never depends on the service taking new ones.
     if let Some(job) = &args.status {
         return show_status(client, job, args.json).await;
+    }
+    if let Some(parent) = &args.retry {
+        return run_retry(client, &args, parent, explicit_config).await;
     }
     if args.local {
         return run_local(client, &args, config, accounts).await;
@@ -396,23 +414,10 @@ fn overrides(args: &Args, explicit_config: Option<&Path>) -> SwapOverrides {
 /// What the CLI needs of the daemon's swap jobs; a trait so the job flow
 /// can be tested without one.
 trait SwapDaemon {
-    fn start(
-        &self,
-        key: &str,
-        overrides: &SwapOverrides,
-    ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send;
     fn status(&self, job: &JobRef) -> impl Future<Output = Result<JobView, RuntimeError>> + Send;
 }
 
 impl SwapDaemon for Client {
-    fn start(
-        &self,
-        key: &str,
-        overrides: &SwapOverrides,
-    ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
-        self.swap_job_start(key, overrides)
-    }
-
     fn status(&self, job: &JobRef) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
         self.swap_job_status(job)
     }
@@ -445,7 +450,7 @@ fn settled(view: &JobView) -> bool {
 async fn follow_job(
     daemon: &impl SwapDaemon,
     key: &str,
-    overrides: &SwapOverrides,
+    start: impl Future<Output = Result<Accepted, RuntimeError>>,
     cancel: impl Future<Output = ()>,
     poll: Duration,
 ) -> JobEnd {
@@ -453,7 +458,7 @@ async fn follow_job(
     let started = tokio::select! {
         biased;
         () = &mut cancel => return JobEnd::Interrupted,
-        started = daemon.start(key, overrides) => started,
+        started = start => started,
     };
     let mut view = match started {
         Ok(accepted) => accepted.view,
@@ -506,6 +511,56 @@ fn not_found(error: &RuntimeError) -> bool {
         if message.starts_with("swap job ") && message.ends_with(" not found"))
 }
 
+/// `--retry`: only a daemon can retry its job; nothing falls back to a
+/// fresh or in-process swap.
+async fn run_retry(
+    client: &Client,
+    args: &Args,
+    parent: &str,
+    explicit_config: Option<&Path>,
+) -> Result<()> {
+    let hello = client.hello(HELLO_TIMEOUT).await.map_err(|error| {
+        anyhow!("could not ask the daemon whether it can retry swap jobs: {error}")
+    })?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|c| c == muxa::ipc::SWAP_RETRY_CAPABILITY)
+    {
+        bail!(
+            "this daemon cannot retry swap jobs right now (too old, or its swap service is \
+             unavailable); nothing was sent"
+        );
+    }
+    let overrides = muxa::swap_service::RetryOverrides {
+        continue_evidence: args.continue_evidence.map(|e| e.as_str().to_owned()),
+        force: args.force,
+        caller_config: explicit_config.map(Path::to_path_buf),
+    };
+    let key = format!("cli-{}", uuid::Uuid::new_v4());
+    eprintln!("muxa swap: retry {key} of {parent} (see it with `muxa swap --status {key}`)");
+    let cancel = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    let parent = job_ref(parent);
+    let start = client.swap_job_retry(&key, &parent, &overrides);
+    let view = match follow_job(client, &key, start, cancel, POLL).await {
+        JobEnd::Ended(view) => view,
+        JobEnd::Refused(error) => bail!("the daemon refused this retry: {error}"),
+        JobEnd::Unknown(error) => bail!(
+            "{error}\nthe retry may or may not have been accepted; do not retry again before \
+             checking `muxa swap --status {key}`"
+        ),
+        JobEnd::Interrupted => bail!(
+            "stopped waiting. The retry, if accepted, runs on under the daemon: \
+             `muxa swap --status {key}`"
+        ),
+    };
+    let outcomes = job_outcomes(&view);
+    report(&outcomes, args.json)?;
+    job_verdict(&view, &key)
+}
+
 /// The daemon-owned swap, with any direct panes swapped here afterwards.
 async fn run_routed(
     client: &Client,
@@ -547,7 +602,8 @@ async fn run_routed(
     let cancel = async {
         let _ = tokio::signal::ctrl_c().await;
     };
-    let view = match follow_job(client, &key, &daemon_overrides, cancel, POLL).await {
+    let start = client.swap_job_start(&key, &daemon_overrides);
+    let view = match follow_job(client, &key, start, cancel, POLL).await {
         JobEnd::Ended(view) => view,
         JobEnd::Refused(error) => bail!("the daemon refused this swap: {error}"),
         JobEnd::Unknown(error) => bail!(
@@ -876,6 +932,9 @@ fn remote_argv(args: &Args) -> Vec<String> {
     }
     if let Some(job) = &args.status {
         words.push(format!("--status={job}"));
+    }
+    if let Some(job) = &args.retry {
+        words.push(format!("--retry={job}"));
     }
     if let Some(bare) = args.bare {
         words.push(format!(
@@ -1338,6 +1397,34 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_takes_only_force_evidence_and_json() {
+        for argv in [
+            &["swap", "--retry", "k", "%5"][..],
+            &["swap", "--retry", "k", "--all"],
+            &["swap", "--retry", "k", "--to", "a"],
+            &["swap", "--retry", "k", "--local"],
+            &["swap", "--retry", "k", "--dry-run"],
+            &["swap", "--retry", "k", "--status", "k"],
+        ] {
+            assert!(Cli::try_parse_from(argv).is_err(), "{argv:?}");
+        }
+        assert!(Cli::try_parse_from([
+            "swap",
+            "--retry",
+            "k",
+            "--force",
+            "--continue-evidence",
+            "verified",
+            "--json"
+        ])
+        .is_ok());
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let argv = checked_argv(&words(&["--retry", "cli-1", "--force"])).unwrap();
+        assert_eq!(argv, ["swap", "--force", "--retry=cli-1", "--json"]);
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+    }
+
+    #[test]
     fn status_takes_no_action_flags() {
         for argv in [
             &["swap", "--status", "k", "%5"][..],
@@ -1405,12 +1492,9 @@ mod tests {
         }
     }
 
-    impl SwapDaemon for Scripted {
-        fn start(
-            &self,
-            _: &str,
-            _: &SwapOverrides,
-        ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
+    impl Scripted {
+        /// The one start this daemon answers.
+        fn start(&self) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
             self.starts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let answer = self.start.lock().unwrap().take().expect("one start only");
@@ -1422,7 +1506,9 @@ mod tests {
                 answer
             }
         }
+    }
 
+    impl SwapDaemon for Scripted {
         fn status(&self, _: &JobRef) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
             let answer = self
                 .statuses
@@ -1446,7 +1532,7 @@ mod tests {
         follow_job(
             daemon,
             "cli-k",
-            &SwapOverrides::default(),
+            daemon.start(),
             std::future::pending(),
             Duration::from_millis(1),
         )
@@ -1504,13 +1590,6 @@ mod tests {
     async fn ctrl_c_ends_a_held_status_read() {
         struct Held;
         impl SwapDaemon for Held {
-            fn start(
-                &self,
-                _: &str,
-                _: &SwapOverrides,
-            ) -> impl Future<Output = Result<Accepted, RuntimeError>> + Send {
-                std::future::pending()
-            }
             fn status(
                 &self,
                 _: &JobRef,
@@ -1623,8 +1702,13 @@ mod tests {
         let cancel = async move {
             let _ = rx.await;
         };
-        let request = SwapOverrides::default();
-        let follow = follow_job(&daemon, "cli-k", &request, cancel, Duration::from_millis(1));
+        let follow = follow_job(
+            &daemon,
+            "cli-k",
+            daemon.start(),
+            cancel,
+            Duration::from_millis(1),
+        );
         tokio::pin!(follow);
         tokio::select! {
             biased;

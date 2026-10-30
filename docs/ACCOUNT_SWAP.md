@@ -141,6 +141,7 @@ aas = "aas"              # the aas binary; the daemon also looks in /opt/homebre
 | `--json` | Machine-readable report. |
 | `--local` | Runs the swap in this process instead of as a daemon job (see below). |
 | `--status <key>` | Shows a daemon swap job by the key it printed (or its job id) and waits for it to end. |
+| `--retry <key>` | Retries an ended daemon swap job's safely retryable targets as a new job (see below). |
 
 `continue_when = "limited"` sends the follow-up only to agents whose turn was
 cut off: by a usage cap, or by the swap itself when `--force` stopped them
@@ -195,6 +196,18 @@ its job, and the CLI swaps them itself once the job ended cleanly, bound to the
 exact agents the daemon planned: a pane that changed in the meantime is
 skipped, never swapped as whatever runs there now. Those panes are not in the
 job's record, and get no exclusion against the daemon's automation.
+
+`muxa swap --retry <key>` retries a daemon job that has ended. A target is
+swapped again only if it failed before anything at or past its relaunch was
+even attempted, nothing about it is uncertain, and the very agent the job
+planned (same process) still runs on the same pane: it moves to the account
+first assigned to it, and no follow-up is typed or draft restored, as those
+belonged to the first run. Any other target that did not end swapped, kept
+or skipped is only looked at, read-only, and reported as found
+(`observed_swapped`, `observed_account_unconfirmed`, `observed_unbound`,
+`observed_unknown` when no agent could be found, …); nothing is done to it. Each target is retried by
+one retry only (a second one reports `retried_elsewhere`); retry the newest
+job to go on from there. `--force` and `--continue-evidence` may be given.
 
 A daemon from before swap jobs means the whole swap runs here, as before. A
 daemon that runs swap jobs but cannot take one right now (starting, halted,

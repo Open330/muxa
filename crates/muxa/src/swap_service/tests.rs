@@ -38,10 +38,25 @@ struct FakeTarget {
 /// What the engine plans, per call to `prepare`.
 type Script = Box<dyn Fn() -> Vec<EngineStep<FakeTarget>> + Send + Sync>;
 
+/// How a scripted target fails, once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Fail {
+    /// Before anything at or past the relaunch.
+    BeforeLaunch,
+    /// After the relaunch was typed.
+    AfterLaunch,
+}
+
 struct FakeEngine {
     script: Script,
     executed: Arc<Mutex<Vec<String>>>,
     dry_runs: Arc<AtomicUsize>,
+    /// Panes to fail, each once.
+    failing: Arc<Mutex<HashMap<String, Fail>>>,
+    /// Every pane a retry looked at, read-only.
+    observed: Arc<Mutex<Vec<String>>>,
+    /// The request each executed target ran under.
+    requests: Arc<Mutex<Vec<SwapRequest>>>,
 }
 
 impl Engine for FakeEngine {
@@ -59,6 +74,30 @@ impl Engine for FakeEngine {
         target.identity.clone()
     }
 
+    fn prepare_retry(
+        &self,
+        request: &SwapRequest,
+        planned: &PlannedTarget,
+        _snapshot: &Snapshot,
+    ) -> (SwapRequest, EngineStep<FakeTarget>) {
+        let mut identity = identity(&planned.pane, "/tmp/tmux-1/default");
+        identity
+            .assigned_account
+            .clone_from(&planned.assigned_account);
+        (
+            request.clone(),
+            EngineStep::Run(FakeTarget {
+                identity,
+                gate: None,
+            }),
+        )
+    }
+
+    fn observe(&self, planned: &PlannedTarget, _snapshot: &Snapshot) -> &'static str {
+        self.observed.lock().unwrap().push(planned.pane.clone());
+        "observed_unbound"
+    }
+
     fn execute(
         &self,
         request: &SwapRequest,
@@ -74,6 +113,24 @@ impl Engine for FakeEngine {
             gate.wait();
         }
         assert!(target.identity.pane != "%panic", "the engine blew up");
+        self.requests.lock().unwrap().push(request.clone());
+        let fail = self.failing.lock().unwrap().remove(&target.identity.pane);
+        if let Some(fail) = fail {
+            let (purpose, op) = match fail {
+                Fail::BeforeLaunch => (Purpose::Interrupt, Op::Key(Key::Esc)),
+                Fail::AfterLaunch => (Purpose::Relaunch, Op::Text { chars: 8 }),
+            };
+            let effect = Effect {
+                group: 0,
+                purpose,
+                op,
+            };
+            let _ = observer.before(&effect);
+            let _ = observer.after(&effect, Transport::Accepted);
+            outcome.status = SwapStatus::Failed;
+            outcome.note = "failed".into();
+            return outcome;
+        }
         self.executed
             .lock()
             .unwrap()
@@ -181,6 +238,9 @@ struct Harness {
     provider: Arc<FakeProvider>,
     executed: Arc<Mutex<Vec<String>>>,
     dry_runs: Arc<AtomicUsize>,
+    failing: Arc<Mutex<HashMap<String, Fail>>>,
+    observed: Arc<Mutex<Vec<String>>>,
+    requests: Arc<Mutex<Vec<SwapRequest>>>,
 }
 
 fn alive(_: u32, _: Option<&str>) -> Liveness {
@@ -202,6 +262,9 @@ fn harness(script: Script) -> Harness {
     });
     let executed = Arc::new(Mutex::new(Vec::new()));
     let dry_runs = Arc::new(AtomicUsize::new(0));
+    let failing = Arc::new(Mutex::new(HashMap::new()));
+    let observed = Arc::new(Mutex::new(Vec::new()));
+    let requests = Arc::new(Mutex::new(Vec::new()));
     let service = Service::open(
         &dir.path().join("swap-jobs.sqlite3"),
         OwnerIdentity {
@@ -214,6 +277,9 @@ fn harness(script: Script) -> Harness {
             script,
             executed: Arc::clone(&executed),
             dry_runs: Arc::clone(&dry_runs),
+            failing: Arc::clone(&failing),
+            observed: Arc::clone(&observed),
+            requests: Arc::clone(&requests),
         },
         Arc::clone(&provider) as Arc<dyn ContextProvider>,
     )
@@ -224,6 +290,9 @@ fn harness(script: Script) -> Harness {
         provider,
         executed,
         dry_runs,
+        failing,
+        observed,
+        requests,
     }
 }
 
@@ -547,6 +616,9 @@ fn a_restarted_service_reads_an_interrupted_job_back_in_order() {
             script: Box::new(Vec::new),
             executed: Arc::new(Mutex::new(Vec::new())),
             dry_runs: Arc::new(AtomicUsize::new(0)),
+            failing: Arc::default(),
+            observed: Arc::default(),
+            requests: Arc::default(),
         },
         Arc::clone(&h.provider) as Arc<dyn ContextProvider>,
     )
@@ -749,6 +821,9 @@ fn an_executor_that_cannot_start_ends_the_job_without_effects() {
             script: Box::new(|| vec![run("%1"), run("%2")]),
             executed: Arc::clone(&executed),
             dry_runs: Arc::new(AtomicUsize::new(0)),
+            failing: Arc::default(),
+            observed: Arc::default(),
+            requests: Arc::default(),
         },
         Arc::new(FakeProvider {
             config_path: None,
@@ -849,6 +924,9 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
                 }),
                 executed: Arc::new(Mutex::new(Vec::new())),
                 dry_runs: Arc::new(AtomicUsize::new(0)),
+                failing: Arc::default(),
+                observed: Arc::default(),
+                requests: Arc::default(),
             },
             provider(),
         )
@@ -1112,4 +1190,233 @@ fn an_automation_firing_has_one_key_per_episode() {
     );
     assert_ne!(key(Some("default"), "e1"), key(Some("default"), "e2"));
     validate_key(&key(None, "e1")).unwrap();
+}
+
+// --- retry -----------------------------------------------------------------
+
+fn retry(h: &Harness, key: &str, parent: &str) -> Result<Accepted, String> {
+    Service::retry(
+        &h.service,
+        key,
+        &JobRef::Id(parent.into()),
+        &RetryOverrides::default(),
+    )
+}
+
+fn reasons(view: &JobView) -> Vec<(String, Option<String>, Option<String>)> {
+    view.entries
+        .iter()
+        .map(|e| {
+            (
+                e.pane.clone().unwrap_or_default(),
+                e.disposition.clone(),
+                e.reason.clone(),
+            )
+        })
+        .collect()
+}
+
+/// A parent whose targets ended three ways: %a failed before its
+/// relaunch, %b after it, %c swapped. (An uncertain effect halts a live
+/// service; the store's own tests cover it.)
+fn mixed_parent(h: &Harness) -> String {
+    h.failing.lock().unwrap().extend([
+        ("%a".to_owned(), Fail::BeforeLaunch),
+        ("%b".to_owned(), Fail::AfterLaunch),
+    ]);
+    let job = Service::submit(
+        &h.service,
+        "parent",
+        &overrides(&["%a", "%b", "%c"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap()
+    .job_id;
+    settled(&h.service, &job);
+    job
+}
+
+/// Only the target that failed before its relaunch runs again, on its
+/// first account, with no follow-up and no draft; the others are looked at
+/// and nothing is done to them.
+#[test]
+fn a_retry_runs_again_only_what_failed_before_its_relaunch() {
+    let h = harness(Box::new(|| vec![run("%a"), run("%b"), run("%c")]));
+    let parent = mixed_parent(&h);
+    h.executed.lock().unwrap().clear();
+    h.requests.lock().unwrap().clear();
+    let accepted = retry(&h, "retry-1", &parent).unwrap();
+    let view = settled(&h.service, &accepted.job_id);
+    assert_eq!(view.state, "done");
+    assert_eq!(*h.executed.lock().unwrap(), ["%a"]);
+    let observed = h.observed.lock().unwrap().clone();
+    assert_eq!(observed, ["%b"]);
+    let rows = reasons(&view);
+    let row = |pane: &str| rows.iter().find(|r| r.0 == pane).cloned().unwrap();
+    assert_eq!(row("%a").1.as_deref(), Some("swapped"));
+    assert_eq!(row("%b").2.as_deref(), Some("observed_unbound"));
+    assert_eq!(row("%c").2.as_deref(), Some("not_retried"));
+    let requests = h.requests.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].continue_when, ContinueWhen::Never);
+    assert_eq!(requests[0].continue_text, None);
+    assert!(!requests[0].restore_draft);
+    assert!(!requests[0].allow_direct_respawn);
+    assert_eq!(requests[0].to, AccountChoice::Named("b".into()));
+}
+
+/// A resend after a lost answer gets the job it made, even once a later
+/// retry has moved on.
+#[test]
+fn a_resent_retry_gets_its_own_job_back() {
+    let h = harness(Box::new(|| vec![run("%a")]));
+    h.failing
+        .lock()
+        .unwrap()
+        .insert("%a".into(), Fail::BeforeLaunch);
+    let parent = Service::submit(&h.service, "p", &overrides(&["%a"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    settled(&h.service, &parent);
+    let first = retry(&h, "r1", &parent).unwrap();
+    settled(&h.service, &first.job_id);
+    let again = retry(&h, "r1", &parent).unwrap();
+    assert!(again.existing);
+    assert_eq!(again.job_id, first.job_id);
+    // A different key on the same parent finds the target already retried.
+    let sibling = retry(&h, "r2", &parent).unwrap();
+    let view = settled(&h.service, &sibling.job_id);
+    assert_eq!(reasons(&view)[0].2.as_deref(), Some("retried_elsewhere"));
+    assert_eq!(*h.executed.lock().unwrap(), ["%a"]);
+}
+
+/// A retried target that failed again before its relaunch is retried from
+/// its retry, and the root it came from is not retried a second time.
+#[test]
+fn a_lineage_is_retried_from_its_newest_attempt_only() {
+    let h = harness(Box::new(|| vec![run("%a")]));
+    h.failing
+        .lock()
+        .unwrap()
+        .insert("%a".into(), Fail::BeforeLaunch);
+    let root = Service::submit(&h.service, "p", &overrides(&["%a"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    settled(&h.service, &root);
+    h.failing
+        .lock()
+        .unwrap()
+        .insert("%a".into(), Fail::BeforeLaunch);
+    let child = retry(&h, "r1", &root).unwrap();
+    assert_eq!(
+        settled(&h.service, &child.job_id).entries[0]
+            .disposition
+            .as_deref(),
+        Some("failed")
+    );
+    let again = retry(&h, "r2", &root).unwrap();
+    assert_eq!(
+        reasons(&settled(&h.service, &again.job_id))[0].2.as_deref(),
+        Some("retried_elsewhere")
+    );
+    let grandchild = retry(&h, "r3", &child.job_id).unwrap();
+    assert_eq!(
+        settled(&h.service, &grandchild.job_id).entries[0]
+            .disposition
+            .as_deref(),
+        Some("swapped")
+    );
+}
+
+#[test]
+fn a_running_job_or_an_unknown_one_is_not_retried() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let h = harness(Box::new(move || {
+        vec![EngineStep::Run(FakeTarget {
+            identity: identity("%1", "/tmp/tmux-1/default"),
+            gate: Some(Arc::clone(&held)),
+        })]
+    }));
+    let _open = OpenOnDrop(Arc::clone(&gate));
+    let running = Service::submit(&h.service, "p", &overrides(&["%1"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    assert!(retry(&h, "r", &running)
+        .unwrap_err()
+        .contains("still running"));
+    assert!(retry(&h, "r", "swap-nope")
+        .unwrap_err()
+        .contains("not found"));
+    gate.open();
+    settled(&h.service, &running);
+}
+
+/// A pane another job is acting on is only reported busy.
+#[test]
+fn a_retry_leaves_a_busy_pane_alone() {
+    let h = harness(Box::new(|| vec![run("%a")]));
+    h.failing
+        .lock()
+        .unwrap()
+        .insert("%a".into(), Fail::AfterLaunch);
+    let parent = Service::submit(&h.service, "p", &overrides(&["%a"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    settled(&h.service, &parent);
+    let endpoint = endpoint_key("%a", Some("/tmp/tmux-1/default"));
+    assert!(h.service.reserve(&endpoint, "someone"));
+    let accepted = retry(&h, "r", &parent).unwrap();
+    assert_eq!(
+        reasons(&settled(&h.service, &accepted.job_id))[0]
+            .2
+            .as_deref(),
+        Some("busy")
+    );
+    assert!(h.observed.lock().unwrap().is_empty());
+}
+
+/// A retry made with another configuration file than the daemon's is
+/// refused before anything; the daemon's own file, however spelled, is not.
+#[test]
+fn a_retry_with_another_configuration_is_refused() {
+    let h = harness(Box::new(|| vec![run("%a")]));
+    h.failing
+        .lock()
+        .unwrap()
+        .insert("%a".into(), Fail::BeforeLaunch);
+    let parent = Service::submit(&h.service, "p", &overrides(&["%a"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    settled(&h.service, &parent);
+    h.executed.lock().unwrap().clear();
+    let elsewhere = h.dir.path().join("other.toml");
+    std::fs::write(&elsewhere, "").unwrap();
+    let refused = Service::retry(
+        &h.service,
+        "r1",
+        &JobRef::Id(parent.clone()),
+        &RetryOverrides {
+            caller_config: Some(elsewhere),
+            ..RetryOverrides::default()
+        },
+    );
+    assert!(refused
+        .unwrap_err()
+        .contains("swaps run with the daemon's configuration"));
+    assert!(h.executed.lock().unwrap().is_empty());
+    let same = h.dir.path().join(".").join("config.toml");
+    let accepted = Service::retry(
+        &h.service,
+        "r2",
+        &JobRef::Id(parent),
+        &RetryOverrides {
+            caller_config: Some(same),
+            ..RetryOverrides::default()
+        },
+    )
+    .unwrap();
+    settled(&h.service, &accepted.job_id);
+    assert_eq!(*h.executed.lock().unwrap(), ["%a"]);
 }
