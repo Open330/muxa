@@ -12,6 +12,9 @@ use super::{is_agent_process, is_alive, pane_processes, signal_pids, Target};
 use crate::backend::SharedBackend;
 use std::time::{Duration, Instant};
 
+/// An agent process and its arguments (`None`: unreadable).
+pub(crate) type AgentArgv = (u32, Option<Vec<String>>);
+
 /// Time, so a fake can advance it instead of waiting.
 pub(super) trait Clock {
     fn now(&self) -> Instant;
@@ -47,8 +50,12 @@ pub(super) trait SwapIo: Clock {
     /// The pane's root process now, found by its own id and server.
     fn pane_pid_now(&self) -> Option<u32>;
     /// Whether the relaunched agent, on this conversation, runs under
-    /// `pane_pid`.
+    /// `pane_pid`. Presence only: it is not evidence of which conversation
+    /// the agent resumed ([`Self::agent_argvs`] is).
     fn agent_running(&self, pane_pid: u32) -> bool;
+    /// Every agent process of the target's kind under `pane_pid`, with its
+    /// arguments as the process holds them (`None`: unreadable).
+    fn agent_argvs(&self, pane_pid: u32) -> Vec<AgentArgv>;
     fn alive(&self, pid: u32) -> bool;
     /// Send `signal` to `pids`. Whether it arrived is not reported: the
     /// processes' liveness is observed separately.
@@ -121,6 +128,14 @@ impl SwapIo for LiveIo<'_> {
             is_agent_process(p, self.target.kind)
                 && p.cmdline.contains(self.target.session_id.as_str())
         })
+    }
+
+    fn agent_argvs(&self, pane_pid: u32) -> Vec<AgentArgv> {
+        pane_processes(pane_pid)
+            .into_iter()
+            .filter(|p| is_agent_process(p, self.target.kind))
+            .map(|p| (p.pid, crate::process_snapshot::process_argv(p.pid)))
+            .collect()
     }
 
     fn alive(&self, pid: u32) -> bool {

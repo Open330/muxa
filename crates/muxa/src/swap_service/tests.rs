@@ -110,6 +110,7 @@ fn outcome(pane: &str, status: SwapStatus, note: &str) -> SwapOutcome {
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,
+        continue_withheld: None,
     }
 }
 

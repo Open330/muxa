@@ -180,7 +180,6 @@ impl<'a> Runner<'a> {
     }
 
     /// Every observation reported, in order.
-    #[cfg(test)]
     pub(super) fn observations(&self) -> Vec<crate::swap_job::Observation> {
         self.seen.borrow().clone()
     }

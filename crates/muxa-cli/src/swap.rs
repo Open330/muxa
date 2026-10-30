@@ -86,6 +86,12 @@ pub struct Args {
     /// Send no follow-up prompt (`--continue-when never`).
     #[arg(long)]
     no_continue: bool,
+    /// What the relaunch must show before the follow-up is typed:
+    /// `binding` (its own arguments resume exactly that conversation) or
+    /// `verified` (also read from the stopped process, and confirmed on the
+    /// assigned account). Default from `[swap] continue_evidence`.
+    #[arg(long = "continue-evidence", value_enum)]
+    continue_evidence: Option<Evidence>,
     /// Print the plan without stopping or typing anything.
     #[arg(long)]
     dry_run: bool,
@@ -109,7 +115,8 @@ pub struct Args {
         value_name = "KEY",
         conflicts_with_all = [
             "targets", "all", "limited", "provider", "to", "spread", "force", "bare",
-            "continue_text", "continue_legacy", "continue_when", "no_continue", "dry_run",
+            "continue_text", "continue_legacy", "continue_when", "no_continue",
+            "continue_evidence", "dry_run",
             "exclude", "local",
         ]
     )]
@@ -126,6 +133,21 @@ enum Provider {
 enum Bare {
     Skip,
     Wrap,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum Evidence {
+    Binding,
+    Verified,
+}
+
+impl Evidence {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::Verified => "verified",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -194,6 +216,12 @@ fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
         request.continue_when = ContinueWhen::Never;
     } else if let Some(when) = args.continue_when {
         request.continue_when = when.into();
+    }
+    if let Some(evidence) = args.continue_evidence {
+        request.continue_evidence = match evidence {
+            Evidence::Binding => account_swap::ContinueEvidence::Binding,
+            Evidence::Verified => account_swap::ContinueEvidence::Verified,
+        };
     }
     request.dry_run = args.dry_run;
     request.exclude.clone_from(&args.exclude);
@@ -359,6 +387,7 @@ fn overrides(args: &Args, explicit_config: Option<&Path>) -> SwapOverrides {
             .to_owned()
         }),
         no_continue: args.no_continue,
+        continue_evidence: args.continue_evidence.map(|e| e.as_str().to_owned()),
         exclude: args.exclude.clone(),
         caller_config: explicit_config.map(Path::to_path_buf),
     }
@@ -662,6 +691,7 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
         conversation_verified: None,
         conversation_unverified_reason: None,
         registered: None,
+        continue_withheld: None,
     });
     if outcome.status != status || entry.outcome.is_none() {
         let what = entry.disposition.as_deref().unwrap_or("not finished");
@@ -675,6 +705,13 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
             format!("{what}{reason}: {}", outcome.note)
         };
         outcome.status = status;
+    }
+    if let Some(reason) = entry
+        .continuation
+        .as_deref()
+        .filter(|decision| !matches!(*decision, "allowed" | "not_due"))
+    {
+        outcome.continue_withheld = Some(reason.to_owned());
     }
     if entry.uncertain_effects > 0 {
         let _ = write!(
@@ -871,6 +908,9 @@ fn remote_argv(args: &Args) -> Vec<String> {
                 When::Never => "never",
             }
         ));
+    }
+    if let Some(evidence) = args.continue_evidence {
+        words.push(format!("--continue-evidence={}", evidence.as_str()));
     }
     words.extend(args.exclude.iter().map(|pane| format!("--exclude={pane}")));
     words.push("--json".to_owned());
@@ -1239,6 +1279,49 @@ mod tests {
         assert_eq!(typed.continue_when.as_deref(), Some("always"));
     }
 
+    /// The evidence policy is typed, carried to the daemon and to a host,
+    /// and a withheld follow-up recorded in the journal reaches the report.
+    #[test]
+    fn continue_evidence_travels_and_a_withheld_follow_up_is_reported() {
+        let cli = Cli::parse_from(["swap", "%5", "--continue-evidence", "verified"]);
+        assert_eq!(
+            request(&cli.args, &SwapConfig::default()).continue_evidence,
+            account_swap::ContinueEvidence::Verified
+        );
+        assert_eq!(
+            overrides(&cli.args, None).continue_evidence.as_deref(),
+            Some("verified")
+        );
+        assert_eq!(
+            overrides(&Cli::parse_from(["swap"]).args, None).continue_evidence,
+            None
+        );
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let argv = checked_argv(&words(&["--continue-evidence", "binding"])).unwrap();
+        assert!(
+            argv.contains(&"--continue-evidence=binding".to_owned()),
+            "{argv:?}"
+        );
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+        assert!(checked_argv(&words(&["--continue-evidence", "maybe"])).is_err());
+
+        let mut entry = EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("swapped".into()),
+            reason: None,
+            uncertain_effects: 0,
+            outcome: None,
+            continuation: Some("binding_missing".into()),
+        };
+        assert_eq!(
+            entry_outcome(&entry).continue_withheld.as_deref(),
+            Some("binding_missing")
+        );
+        entry.continuation = Some("allowed".into());
+        assert_eq!(entry_outcome(&entry).continue_withheld, None);
+    }
+
     #[test]
     fn status_takes_no_action_flags() {
         for argv in [
@@ -1392,6 +1475,7 @@ mod tests {
             reason: Some("candidates_unavailable".into()),
             uncertain_effects: 0,
             outcome: None,
+            continuation: None,
         });
         assert!(job_verdict(&job, "k").is_err());
         job.entries[0].disposition = Some("kept".into());
@@ -1552,6 +1636,7 @@ mod tests {
             conversation_verified: None,
             conversation_unverified_reason: None,
             registered: None,
+            continue_withheld: None,
         }
     }
 
@@ -1609,6 +1694,7 @@ mod tests {
             reason: Some("interrupted".into()),
             uncertain_effects: 2,
             outcome: Some(outcome("%1", SwapStatus::Swapped, "resumed")),
+            continuation: None,
         };
         let shown = entry_outcome(&entry);
         assert_eq!(shown.status, SwapStatus::Failed);
@@ -1641,6 +1727,7 @@ mod tests {
             conversation_verified: None,
             conversation_unverified_reason: None,
             registered: None,
+            continue_withheld: None,
         }]);
         assert!(
             rendered.contains("e-ed@claude -> jelly@claude"),

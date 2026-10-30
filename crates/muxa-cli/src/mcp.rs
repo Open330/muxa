@@ -719,6 +719,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "force": { "type": "boolean", "description": "Also stop agents that are mid-turn." },
                     "continue_text": { "type": "string", "description": "Follow-up prompt wording. Who gets it is continue_when; naming it does not widen it." },
                     "continue_when": { "type": "string", "enum": ["limited", "always", "never"], "description": "Which swapped agents get the follow-up: limited (cut off by a usage cap or by this swap; idle, finished and waiting-for-you agents are never woken), always, or never. Defaults to [swap] continue_when." },
+                    "continue_evidence": { "type": "string", "enum": ["binding", "verified"], "description": "What the relaunch must show before the follow-up is typed: binding (its own arguments resume exactly that conversation) or verified (also read from the stopped process and confirmed on the assigned account). Defaults to [swap] continue_evidence." },
                     "continue": { "type": "string", "description": "Deprecated alias of continue_text; no longer sends to every agent." },
                     "no_continue": { "type": "boolean", "description": "Send no follow-up prompt." },
                     "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." }
@@ -5092,6 +5093,7 @@ async fn swap_account(client: &Client, args: &Value) -> Value {
         ("to", "--to"),
         ("continue_text", "--continue-text"),
         ("continue_when", "--continue-when"),
+        ("continue_evidence", "--continue-evidence"),
         ("continue", "--continue"),
     ] {
         if let Some(value) = text(name) {

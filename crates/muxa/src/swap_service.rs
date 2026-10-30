@@ -18,8 +18,8 @@ mod tests;
 
 use crate::account_swap::effects::{EffectObserver, NoObserver};
 use crate::account_swap::{
-    self, AccountChoice, BareMode, ContinueWhen, PreparedTarget, Step, SwapConfig, SwapOutcome,
-    SwapRequest, SwapScope, SwapStatus, TargetIdentity,
+    self, AccountChoice, BareMode, ContinueEvidence, ContinueWhen, PreparedTarget, Step,
+    SwapConfig, SwapOutcome, SwapRequest, SwapScope, SwapStatus, TargetIdentity,
 };
 use crate::backend::SharedBackend;
 use crate::event::AgentKind;
@@ -53,6 +53,10 @@ pub struct SwapOverrides {
     pub continue_text: Option<String>,
     pub continue_when: Option<String>,
     pub no_continue: bool,
+    /// `binding` or `verified`. Left out of the digest when not typed, so a
+    /// request from before the option is the same request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub continue_evidence: Option<String>,
     pub exclude: Vec<String>,
     /// The configuration file the caller loaded, if it named one. A request
     /// planned against a different file than the daemon's is refused rather
@@ -104,6 +108,12 @@ impl SwapOverrides {
                 Some(other) => return Err(format!("unknown continue policy {other:?}")),
             }
         };
+        request.continue_evidence = match self.continue_evidence.as_deref() {
+            None => request.continue_evidence,
+            Some("binding") => ContinueEvidence::Binding,
+            Some("verified") => ContinueEvidence::Verified,
+            Some(other) => return Err(format!("unknown continue evidence {other:?}")),
+        };
         request.exclude.clone_from(&self.exclude);
         request.dry_run = false;
         Ok(request)
@@ -136,6 +146,11 @@ impl SwapOverrides {
         if let Some(when) = self.continue_when.as_deref() {
             if !matches!(when, "limited" | "always" | "never") {
                 return Err(format!("unknown continue policy {when:?}"));
+            }
+        }
+        if let Some(evidence) = self.continue_evidence.as_deref() {
+            if !matches!(evidence, "binding" | "verified") {
+                return Err(format!("unknown continue evidence {evidence:?}"));
             }
         }
         let names = |what: &str, names: &[String]| {
@@ -246,6 +261,10 @@ pub struct EntryView {
     pub uncertain_effects: u32,
     /// The executor's own report, while the daemon that ran it holds it.
     pub outcome: Option<SwapOutcome>,
+    /// The follow-up decision the journal recorded: `allowed`, `not_due`,
+    /// or why it was withheld.
+    #[serde(default)]
+    pub continuation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1210,6 +1229,7 @@ impl<E: Engine> Service<E> {
             conversation_verified: Some(identity.conversation_verified),
             conversation_unverified_reason: None,
             registered: None,
+            continue_withheld: None,
         });
         self.remember(job, report_index, outcome);
         self.release(&identity.endpoint);
@@ -1273,6 +1293,7 @@ impl<E: Engine> Service<E> {
                 reason: Some(entry.reason.clone()),
                 uncertain_effects: 0,
                 outcome: live.get(&entry.report_index).cloned(),
+                continuation: None,
             })
             .collect();
         for (target, planned) in status.targets.iter().zip(&plan.targets) {
@@ -1283,6 +1304,7 @@ impl<E: Engine> Service<E> {
                 reason: target.reason.clone(),
                 uncertain_effects: target.uncertain_effects,
                 outcome: live.get(&planned.report_index).cloned(),
+                continuation: target.continuation.clone(),
             });
         }
         entries.sort_by_key(|entry| entry.report_index);
@@ -1373,6 +1395,7 @@ fn skipped_outcome(identity: &TargetIdentity, note: &str) -> SwapOutcome {
         conversation_verified: Some(identity.conversation_verified),
         conversation_unverified_reason: None,
         registered: None,
+        continue_withheld: None,
     }
 }
 
@@ -1491,6 +1514,7 @@ pub mod testing {
             conversation_verified: None,
             conversation_unverified_reason: None,
             registered: None,
+            continue_withheld: None,
         }
     }
 

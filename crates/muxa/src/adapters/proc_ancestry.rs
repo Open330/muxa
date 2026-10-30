@@ -175,7 +175,7 @@ where
 }
 
 /// Codex global options that take their value as the next argument.
-const CODEX_VALUE_OPTIONS: &[&str] = &[
+pub(crate) const CODEX_VALUE_OPTIONS: &[&str] = &[
     "-c",
     "--config",
     "--enable",

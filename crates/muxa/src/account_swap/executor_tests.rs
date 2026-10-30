@@ -6,10 +6,12 @@
 use super::effects::{
     Effect, EffectObserver, Key, NoObserver, ObserverError, Op, Purpose, Runner, Transport,
 };
-use super::io::{Clock, SwapIo};
+use super::io::{AgentArgv, Clock, SwapIo};
 use super::{execute, AccountVerdict, LaunchLine, PaneLaunch, Refusal, Target};
 use crate::event::AgentKind;
-use crate::swap_job::{AccountCheck, Observation, Phase, Readiness};
+use crate::swap_job::{
+    AccountCheck, ContinueDecision, Observation, Phase, Readiness, WithheldReason,
+};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -35,6 +37,10 @@ struct FakeIo {
     enter_ok: Cell<bool>,
     sent: RefCell<Vec<String>>,
     react: React,
+    /// The relaunched agent processes' arguments; by default one process
+    /// that resumes the target's conversation the provider's way.
+    argvs: RefCell<Option<Vec<AgentArgv>>>,
+    kind: Cell<AgentKind>,
 }
 
 impl FakeIo {
@@ -51,6 +57,8 @@ impl FakeIo {
             enter_ok: Cell::new(true),
             sent: RefCell::new(Vec::new()),
             react,
+            argvs: RefCell::new(None),
+            kind: Cell::new(AgentKind::Codex),
         }
     }
 
@@ -126,6 +134,20 @@ impl SwapIo for FakeIo {
             .is_some_and(|from| self.now.get() >= from)
     }
 
+    fn agent_argvs(&self, pane_pid: u32) -> Vec<AgentArgv> {
+        if let Some(argvs) = self.argvs.borrow().clone() {
+            return argvs;
+        }
+        if !self.agent_running(pane_pid) {
+            return Vec::new();
+        }
+        let argv = match self.kind.get() {
+            AgentKind::Codex => ["codex", "resume", "S"],
+            _ => ["claude", "--resume", "S"],
+        };
+        vec![(20, Some(argv.iter().map(|w| (*w).to_owned()).collect()))]
+    }
+
     fn alive(&self, pid: u32) -> bool {
         self.dies_at
             .borrow()
@@ -156,6 +178,8 @@ fn target(kind: AgentKind, direct: bool, busy: bool) -> Target {
         kind,
         session_id: "S".into(),
         busy,
+        conversation_verified: true,
+        evidence: super::ContinueEvidence::Binding,
     }
 }
 
@@ -217,8 +241,9 @@ fn run(
     follow_up: Option<&str>,
     observer: &mut dyn EffectObserver,
 ) -> Ran {
+    io.kind.set(target.kind);
     let runner = Runner::new(io, observer);
-    let verified = |_: &Target| {
+    let verified = |_: &Target, _: Option<u32>| {
         Ok(AccountVerdict {
             check: AccountCheck::Matched,
             observed: Some("b".into()),
@@ -550,7 +575,7 @@ fn a_swap_reports_what_it_saw_in_order() {
     let io = FakeIo::new(CODEX_IDLE, codex_agent());
     let mut observer = NoObserver;
     let runner = Runner::new(&io, &mut observer);
-    let verified = |_: &Target| {
+    let verified = |_: &Target, _: Option<u32>| {
         Ok(AccountVerdict {
             check: AccountCheck::Matched,
             observed: Some("b".into()),
@@ -590,6 +615,11 @@ fn a_swap_reports_what_it_saw_in_order() {
                 observed: Some("b".into()),
                 source: "test".into(),
             },
+            Observation::Continuation {
+                decision: ContinueDecision::Allowed,
+                withheld: None,
+                draft_allowed: true,
+            },
             Observation::Phase {
                 phase: Phase::FollowThrough
             },
@@ -623,7 +653,7 @@ fn a_mismatched_account_is_reported_with_what_was_found() {
     let io = FakeIo::new(CODEX_IDLE, codex_agent());
     let mut observer = NoObserver;
     let runner = Runner::new(&io, &mut observer);
-    let wrong = |_: &Target| {
+    let wrong = |_: &Target, _: Option<u32>| {
         Err(AccountVerdict {
             check: AccountCheck::Mismatched,
             observed: Some("c".into()),
@@ -652,4 +682,275 @@ fn a_mismatched_account_is_reported_with_what_was_found() {
         source: "test".into(),
     }));
     assert!(!io.sent().iter().any(|line| line.contains("continue")));
+}
+
+// --- continuation evidence ------------------------------------------------
+
+const CODEX_WITH_DRAFT: &str = "› half typed\n";
+
+fn words(argv: &[&str]) -> Vec<String> {
+    argv.iter().map(|w| (*w).to_owned()).collect()
+}
+
+/// What a run returned, what was typed, what was observed, and which bound
+/// process each account check was asked about.
+type EvidenceRun = (
+    Result<String, Refusal>,
+    Vec<String>,
+    Vec<Observation>,
+    Vec<Option<u32>>,
+);
+
+/// Run a Codex swap with a draft in the composer under `evidence`, the
+/// relaunch's processes as given, and an account check that says `account`.
+fn run_with_evidence(
+    evidence: super::ContinueEvidence,
+    verified: bool,
+    argvs: Option<Vec<AgentArgv>>,
+    account: AccountCheck,
+    observer: &mut dyn EffectObserver,
+) -> EvidenceRun {
+    let io = FakeIo::new(CODEX_WITH_DRAFT, codex_agent());
+    *io.argvs.borrow_mut() = argvs;
+    let mut target = target(AgentKind::Codex, false, false);
+    target.evidence = evidence;
+    target.conversation_verified = verified;
+    let asked = RefCell::new(Vec::new());
+    let check = |_: &Target, bound: Option<u32>| {
+        asked.borrow_mut().push(bound);
+        Ok(AccountVerdict {
+            check: account,
+            observed: None,
+            source: "test",
+            note: String::new(),
+        })
+    };
+    let runner = Runner::new(&io, observer);
+    let result = execute(
+        &runner,
+        &target,
+        &launch(),
+        "RELAUNCH",
+        Some("continue"),
+        &check,
+    );
+    let observations = runner.observations();
+    drop(runner);
+    (result, io.sent(), observations, asked.into_inner())
+}
+
+fn decision(
+    observations: &[Observation],
+) -> Option<(ContinueDecision, Option<WithheldReason>, bool)> {
+    observations.iter().find_map(|o| match o {
+        Observation::Continuation {
+            decision,
+            withheld,
+            draft_allowed,
+        } => Some((*decision, *withheld, *draft_allowed)),
+        _ => None,
+    })
+}
+
+/// The account is read on the very process bound to the conversation.
+#[test]
+fn a_bound_relaunch_gets_its_follow_up_and_its_draft_back() {
+    let (result, sent, observations, asked) = run_with_evidence(
+        super::ContinueEvidence::Binding,
+        false,
+        Some(vec![(31, Some(words(&["codex", "resume", "S"])))]),
+        AccountCheck::Unchecked,
+        &mut NoObserver,
+    );
+    let note = result.unwrap();
+    assert!(sent.contains(&"prompt \"continue\"".to_owned()), "{sent:?}");
+    assert!(
+        sent.contains(&"prompt \"half typed\"".to_owned()),
+        "{sent:?}"
+    );
+    assert!(note.contains("restored the half-typed prompt"), "{note}");
+    assert_eq!(
+        decision(&observations),
+        Some((ContinueDecision::Allowed, None, true))
+    );
+    assert_eq!(asked, [Some(31)]);
+}
+
+/// No process resuming exactly the conversation: neither the follow-up nor
+/// the draft is typed, and the report does not claim a resume.
+#[test]
+fn a_relaunch_without_the_resume_binding_gets_neither_follow_up_nor_draft() {
+    for argvs in [
+        vec![(31, Some(words(&["codex", "resume", "S-other"])))],
+        vec![(31, Some(words(&["codex", "resume", "--last"])))],
+        vec![],
+    ] {
+        let (result, sent, observations, asked) = run_with_evidence(
+            super::ContinueEvidence::Binding,
+            true,
+            Some(argvs),
+            AccountCheck::Matched,
+            &mut NoObserver,
+        );
+        let note = result.unwrap();
+        assert!(!sent.iter().any(|l| l.contains("continue")), "{sent:?}");
+        assert!(!sent.iter().any(|l| l.contains("half typed")), "{sent:?}");
+        assert!(
+            note.starts_with("relaunched; resume binding unconfirmed"),
+            "{note}"
+        );
+        assert!(
+            note.contains("follow-up withheld (binding_missing)"),
+            "{note}"
+        );
+        assert!(note.contains("not put back"), "{note}");
+        assert_eq!(
+            decision(&observations),
+            Some((
+                ContinueDecision::Withheld,
+                Some(WithheldReason::BindingMissing),
+                false
+            ))
+        );
+        assert_eq!(asked, [None]);
+    }
+}
+
+/// Two processes resuming it, or one that cannot be read, is not a binding.
+#[test]
+fn an_ambiguous_or_unreadable_relaunch_is_not_a_binding() {
+    let (_, sent, observations, _) = run_with_evidence(
+        super::ContinueEvidence::Binding,
+        true,
+        Some(vec![
+            (31, Some(words(&["codex", "resume", "S"]))),
+            (32, Some(words(&["codex", "resume", "S"]))),
+        ]),
+        AccountCheck::Matched,
+        &mut NoObserver,
+    );
+    assert!(!sent.iter().any(|l| l.contains("continue")), "{sent:?}");
+    assert_eq!(
+        decision(&observations).map(|d| d.1),
+        Some(Some(WithheldReason::BindingAmbiguous))
+    );
+    let (_, sent, observations, _) = run_with_evidence(
+        super::ContinueEvidence::Binding,
+        true,
+        Some(vec![(31, None)]),
+        AccountCheck::Matched,
+        &mut NoObserver,
+    );
+    assert!(!sent.iter().any(|l| l.contains("continue")), "{sent:?}");
+    assert_eq!(
+        decision(&observations).map(|d| d.1),
+        Some(Some(WithheldReason::BindingUnreadable))
+    );
+}
+
+/// `verified` also needs the stopped process read and the account matched;
+/// the draft still goes back into a bound relaunch.
+#[test]
+fn verified_evidence_withholds_the_follow_up_but_not_the_draft() {
+    let bound = || Some(vec![(31, Some(words(&["codex", "resume", "S"])))]);
+    let cases = [
+        (
+            false,
+            AccountCheck::Matched,
+            Some(WithheldReason::UnverifiedConversation),
+        ),
+        (
+            true,
+            AccountCheck::Unchecked,
+            Some(WithheldReason::AccountUnconfirmed),
+        ),
+        (
+            true,
+            AccountCheck::Unreadable,
+            Some(WithheldReason::AccountUnconfirmed),
+        ),
+        (true, AccountCheck::Matched, None),
+    ];
+    for (verified, account, withheld) in cases {
+        let (_, sent, observations, _) = run_with_evidence(
+            super::ContinueEvidence::Verified,
+            verified,
+            bound(),
+            account,
+            &mut NoObserver,
+        );
+        assert_eq!(
+            sent.iter().any(|l| l == "prompt \"continue\""),
+            withheld.is_none(),
+            "{verified} {account:?}: {sent:?}"
+        );
+        assert!(
+            sent.contains(&"prompt \"half typed\"".to_owned()),
+            "{sent:?}"
+        );
+        assert_eq!(decision(&observations).map(|d| d.1), Some(withheld));
+    }
+    // `binding` asks for none of that.
+    for (verified, account) in [
+        (false, AccountCheck::Unchecked),
+        (true, AccountCheck::Unreadable),
+    ] {
+        let (_, sent, _, _) = run_with_evidence(
+            super::ContinueEvidence::Binding,
+            verified,
+            bound(),
+            account,
+            &mut NoObserver,
+        );
+        assert!(sent.contains(&"prompt \"continue\"".to_owned()), "{sent:?}");
+    }
+}
+
+/// A decision that cannot be recorded stops the run: nothing more is typed.
+#[test]
+fn an_unrecorded_continuation_decision_types_nothing_more() {
+    struct FailsOnDecision;
+    impl EffectObserver for FailsOnDecision {
+        fn before(&mut self, _: &Effect) -> Result<(), ObserverError> {
+            Ok(())
+        }
+        fn after(&mut self, _: &Effect, _: Transport) -> Result<(), ObserverError> {
+            Ok(())
+        }
+        fn observe(&mut self, observation: &Observation) -> Result<(), ObserverError> {
+            match observation {
+                Observation::Continuation { .. } => Err(ObserverError("journal full".into())),
+                _ => Ok(()),
+            }
+        }
+    }
+    let (result, sent, _, _) = run_with_evidence(
+        super::ContinueEvidence::Binding,
+        true,
+        Some(vec![(31, Some(words(&["codex", "resume", "S"])))]),
+        AccountCheck::Matched,
+        &mut FailsOnDecision,
+    );
+    assert!(result.is_err());
+    assert!(
+        !sent
+            .iter()
+            .any(|l| l.contains("continue") || l.contains("half typed")),
+        "{sent:?}"
+    );
+}
+
+/// No follow-up due is not missing evidence: the draft still goes back.
+#[test]
+fn a_swap_with_no_follow_up_due_still_restores_the_draft() {
+    let io = FakeIo::new(CODEX_WITH_DRAFT, codex_agent());
+    let (result, _, _) = run(
+        &io,
+        &target(AgentKind::Codex, false, false),
+        &launch(),
+        None,
+        &mut NoObserver,
+    );
+    assert!(result.unwrap().contains("restored the half-typed prompt"));
+    assert!(io.sent().contains(&"prompt \"half typed\"".to_owned()));
 }
