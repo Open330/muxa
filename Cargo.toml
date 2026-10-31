@@ -55,6 +55,16 @@ needless_pass_by_value = "allow"
 # Rust 1.99 pedantic; `assert!(x.is_empty())` is the house style in tests.
 assert_is_empty = "allow"
 
+# Full debuginfo for every crate made `target/debug` the bulk of the target
+# directory, and each rebuild of a test binary keeps another copy. Line tables
+# keep panics and backtraces readable; set `CARGO_PROFILE_DEV_DEBUG=full` for a
+# debugger session.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
