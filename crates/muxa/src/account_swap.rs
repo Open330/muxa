@@ -3529,11 +3529,13 @@ fn exit_claude(
         }
         if let Some(dialog) = pending_dialog(&screen, EXIT_DIALOGS, answered) {
             let group = runner.group();
-            if type_keys(
-                io,
-                |key| runner.send_text(group, Purpose::ExitDialog, key),
-                dialog.keys,
-            ) {
+            if dialog.keys_on(&screen).is_some_and(|keys| {
+                type_keys(
+                    io,
+                    |key| runner.send_text(group, Purpose::ExitDialog, key),
+                    &keys,
+                )
+            }) {
                 answered.push(dialog.label);
             }
             io.sleep(dialog.pause);
@@ -3820,7 +3822,7 @@ fn wait_for_resume_answering(
                 continue;
             }
             if let Some(dialog) = pending_dialog(&last, STARTUP_DIALOGS, answered) {
-                if answer(dialog.keys) {
+                if dialog.keys_on(&last).is_some_and(|keys| answer(&keys)) {
                     answered.push(dialog.label);
                     // The answer redraws the screen; wait for it to settle again.
                     last.clear();
@@ -3995,8 +3997,12 @@ struct Dialog {
     /// Every one of these must be on the screen's last
     /// [`DIALOG_TAIL_LINES`] non-blank lines.
     needles: &'static [&'static str],
-    /// Keys typed to answer it.
+    /// Keys typed to answer it, when [`Dialog::pick`] cannot place the
+    /// cursor (or there is no row to pick). Empty: refuse instead.
     keys: &'static [&'static str],
+    /// The row to choose, reached from wherever the dialog's `❯` cursor
+    /// sits: Claude orders and focuses some confirm rows case by case.
+    pick: Option<&'static str>,
     /// Named in the report.
     label: &'static str,
     /// How many times one swap may answer it.
@@ -4009,9 +4015,38 @@ struct Dialog {
 /// time: Claude's input layer reads `ESC [ B CR` arriving in one write as
 /// a single unknown sequence, not as Down then Enter.
 const DOWN: &str = "\x1b[B";
+const UP: &str = "\x1b[A";
 const ENTER: &str = "\r";
+const ESC: &str = "\x1b";
 /// Pause between the keys of one answer.
 const KEY_GAP: Duration = Duration::from_millis(300);
+
+impl Dialog {
+    /// The keys that answer this dialog as `screen` draws it, or `None` when
+    /// muxa cannot tell which row a key would pick.
+    fn keys_on(&self, screen: &str) -> Option<Vec<&'static str>> {
+        let picked = self.pick.and_then(|row| {
+            let tail = screen_tail(screen, DIALOG_TAIL_LINES);
+            let lines: Vec<&str> = tail.lines().map(str::trim).collect();
+            let target = lines.iter().position(|l| {
+                l.trim_start_matches('❯')
+                    .trim_start()
+                    .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+                    .trim_start()
+                    == row
+            })?;
+            // The dialog's own cursor, not a prompt mark further up.
+            let cursor = (0..lines.len())
+                .filter(|&i| lines[i].starts_with('❯'))
+                .min_by_key(|&i| i.abs_diff(target))?;
+            let step = if target > cursor { DOWN } else { UP };
+            let mut keys = vec![step; target.abs_diff(cursor)];
+            keys.push(ENTER);
+            Some(keys)
+        });
+        picked.or_else(|| (!self.keys.is_empty()).then(|| self.keys.to_vec()))
+    }
+}
 
 /// Type `keys` one by one, [`KEY_GAP`] apart. `false` if any could not be.
 fn type_keys(clock: &dyn Clock, mut send: impl FnMut(&str) -> bool, keys: &[&str]) -> bool {
@@ -4035,21 +4070,55 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Yes, I trust this folder", "Enter to confirm"],
         keys: &[DOWN, ENTER],
+        pick: Some("Yes, I trust this folder"),
         label: "trusted the folder",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    // Claude, when the folder's settings pre-approve tools or hooks. Its row
+    // order and focus vary, so the cursor decides the keys.
+    Dialog {
+        needles: &["Yes, I trust these settings", "Enter to confirm"],
+        keys: &[],
+        pick: Some("Yes, I trust these settings"),
+        label: "trusted the folder's settings",
+        max: 1,
+        pause: Duration::from_millis(500),
+    },
+    // Claude, relaunched with --dangerously-skip-permissions on a profile
+    // that has not accepted it yet; the old process already ran that way.
+    Dialog {
+        needles: &["Yes, I accept", "Bypass Permissions mode"],
+        keys: &[DOWN, ENTER],
+        pick: Some("Yes, I accept"),
+        label: "accepted bypass-permissions mode",
         max: 1,
         pause: Duration::from_millis(500),
     },
     Dialog {
         needles: &["Teach auto mode", "Enter to confirm"],
         keys: &[DOWN, ENTER],
+        pick: None,
         label: "dismissed the auto-mode tour",
         max: 1,
         pause: Duration::from_millis(500),
+    },
+    // Codex, when a newer release is out: "1. Update now" is the default
+    // row; Esc skips without installing anything.
+    Dialog {
+        needles: &["Update available", "Skip until next version"],
+        keys: &[ESC],
+        pick: None,
+        label: "skipped the Codex update prompt",
+        // Once: a second Esc on Codex's composer opens its backtrack view.
+        max: 1,
+        pause: Duration::from_millis(800),
     },
     // Codex: "1. Trust and continue" is the default row.
     Dialog {
         needles: &["Trust this folder", "Trust and continue"],
         keys: &[ENTER],
+        pick: None,
         label: "trusted the folder",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4058,6 +4127,7 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Working directory · resume", "Use session directory"],
         keys: &[ENTER],
+        pick: None,
         label: "kept the session directory",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4065,6 +4135,7 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["1. Resume goal", "enter select"],
         keys: &[ENTER],
+        pick: None,
         label: "resumed the paused goal",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4074,6 +4145,7 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["open in another app", "r to retry"],
         keys: &["r"],
+        pick: None,
         label: "retried a conversation another app still held",
         max: 5,
         pause: Duration::from_secs(3),
@@ -4086,6 +4158,7 @@ const EXIT_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Move to background and exit", "Enter to confirm"],
         keys: &[DOWN, ENTER],
+        pick: None,
         label: "moved background work out of the way",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4093,6 +4166,7 @@ const EXIT_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Keep worktree", "Enter to confirm"],
         keys: &[ENTER],
+        pick: None,
         label: "kept the worktree",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4418,6 +4492,53 @@ mod tests {
         assert_eq!(answered, vec!["trusted the folder"]);
         // Down to "Yes", then Enter: Enter alone would pick "No, exit".
         assert_eq!(keys, vec!["\x1b[B\r".to_owned()]);
+    }
+
+    #[test]
+    fn claudes_settings_trust_is_answered_from_wherever_its_cursor_sits() {
+        let cancel_first = " This folder pre-approves 2 tool permissions in .claude/settings.json:\n \
+            ❯ No, exit Claude Code\n   Yes, I trust these settings\n Enter to confirm · Esc to cancel\n";
+        let confirm_first = " This folder pre-approves 2 tool permissions in .claude/settings.json:\n \
+            ❯ Yes, I trust these settings\n   No, exit Claude Code\n Enter to confirm · Esc to cancel\n";
+        for (screen, keys) in [
+            (cancel_first, vec![DOWN, ENTER]),
+            (confirm_first, vec![ENTER]),
+        ] {
+            let dialog = pending_dialog(screen, STARTUP_DIALOGS, &[]).expect("settings dialog");
+            assert_eq!(dialog.label, "trusted the folder's settings");
+            assert_eq!(dialog.keys_on(screen), Some(keys));
+        }
+        // No cursor to start from: refuse rather than guess a row.
+        let bare = cancel_first.replace('❯', " ");
+        let dialog = pending_dialog(&bare, STARTUP_DIALOGS, &[]).unwrap();
+        assert_eq!(dialog.keys_on(&bare), None);
+        let (resume, _, keys) = answering(confirm_first, CLAUDE_READY, 1, true);
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(keys, vec!["\r".to_owned()]);
+    }
+
+    #[test]
+    fn claudes_bypass_permissions_warning_is_accepted() {
+        let warning = " WARNING: Claude Code running in Bypass Permissions mode\n \
+            In Bypass Permissions mode, Claude Code will not ask for your approval.\n \
+            ❯ No, exit\n   Yes, I accept\n Enter to confirm · Esc to cancel\n";
+        let (resume, answered, keys) = answering(warning, CLAUDE_READY, 1, true);
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answered, vec!["accepted bypass-permissions mode"]);
+        assert_eq!(keys, vec!["\x1b[B\r".to_owned()]);
+    }
+
+    #[test]
+    fn codexs_update_prompt_is_skipped_not_installed() {
+        // Seen live on 0.164.0: it blocked every relaunch until skipped.
+        let update = "  Update available · 0.164.0 → 0.166.0\n  Release notes:\n  \
+            https://github.com/openai/codex/releases/latest\n› 1. Update now (runs `npm install -g @openai/codex`)\n  \
+            2. Skip\n  3. Skip until next version\n  enter continue · esc skip\n";
+        let ready = "› Ask Codex to do anything\n  gpt-6 medium · ~/repo\n";
+        let (resume, answered, keys) = answering(update, ready, 1, true);
+        assert_eq!(resume, Resume::Ready);
+        assert_eq!(answered, vec!["skipped the Codex update prompt"]);
+        assert_eq!(keys, vec!["\x1b".to_owned()]);
     }
 
     #[test]
