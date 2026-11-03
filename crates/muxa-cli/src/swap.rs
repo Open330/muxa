@@ -629,6 +629,7 @@ async fn run_retry(
     };
     let outcomes = job_outcomes(&view);
     report(&outcomes, args.json)?;
+    service_notice(&view);
     job_verdict(&view, &key, false)
 }
 
@@ -732,6 +733,7 @@ async fn run_cancel(client: &Client, text: &str, json: bool) -> Result<()> {
         println!("job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
     }
+    service_notice(&view);
     job_verdict(&view, text, true)
 }
 
@@ -818,6 +820,7 @@ async fn run_routed(
     };
     let outcomes = merge(daemon_half, &direct, local);
     report(&outcomes, args.json)?;
+    service_notice(&view);
     job_verdict(&view, &key, false)?;
     if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
         bail!("some agents could not be swapped");
@@ -977,6 +980,19 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
 }
 
 /// An error unless the job ended cleanly.
+/// The daemon's swap service health, once per command and apart from the
+/// job's own result: a fault that came after a job ended does not change
+/// what that job did.
+fn service_notice(view: &JobView) {
+    if let Some(fault) = view
+        .service_fault
+        .as_deref()
+        .filter(|_| view.fault.is_none())
+    {
+        eprintln!("muxa swap: the daemon's swap service is halted: {fault}");
+    }
+}
+
 /// `cancel_expected`: the caller asked for the cancel, so targets it kept
 /// from starting are not a failure; for anyone else they are.
 fn job_verdict(view: &JobView, key: &str, cancel_expected: bool) -> Result<()> {
@@ -1107,6 +1123,7 @@ async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
         println!("job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
     }
+    service_notice(&view);
     job_verdict(&view, text, false)
 }
 
@@ -1351,6 +1368,8 @@ fn remote_job(
         println!("{host}: job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
     }
+    // The host's own command reports its service's health on stderr, which
+    // is forwarded above: said once, by the host.
     job_verdict(&view, &format!("on {host}"), args.cancel.is_some())?;
     if output.exit_code != 0 {
         bail!("{host}: {}", output.stderr.trim());
@@ -1816,6 +1835,37 @@ mod tests {
             .starts_with("cli-"));
     }
 
+    /// An ended job is judged by what it did, whatever the service's health
+    /// now: done is a success, a failed row a failure, a stopped job (still
+    /// running under a fault) a stop.
+    #[test]
+    fn an_ended_job_is_judged_apart_from_the_service_health() {
+        let mut done = view("done", None);
+        done.service_fault = Some("job b faulted".into());
+        assert!(job_verdict(&done, "k", false).is_ok());
+        let mut failed = done.clone();
+        failed.entries.push(EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("failed".into()),
+            reason: None,
+            uncertain_effects: 0,
+            outcome: None,
+            continuation: None,
+            follow_up: None,
+        });
+        let err = job_verdict(&failed, "k", false).unwrap_err().to_string();
+        assert!(err.contains("could not be swapped"), "{err}");
+        assert!(!err.contains("faulted"), "{err}");
+        let mut stuck = view("running", Some("journal"));
+        stuck.service_fault = Some("journal".into());
+        assert!(settled(&stuck));
+        assert!(job_verdict(&stuck, "k", false)
+            .unwrap_err()
+            .to_string()
+            .contains("faulted"));
+    }
+
     /// A cancelled job is a failure for whoever waited for the whole swap,
     /// and not for whoever asked for the cancel.
     #[test]
@@ -2037,6 +2087,7 @@ mod tests {
             reason: None,
             entries: Vec::new(),
             fault: fault.map(str::to_owned),
+            service_fault: None,
             cancel_requested: false,
         }
     }

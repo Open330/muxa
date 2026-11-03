@@ -1019,6 +1019,21 @@ fn automation_still_due(
     firing: &PlannedFiring,
     revision: u64,
 ) -> muxa::swap_service::StillDue {
+    still_due_from(
+        move |session| runtime.block_on(store.by_session(session)),
+        revision_now,
+        firing,
+        revision,
+    )
+}
+
+/// [`automation_still_due`] over any way of reading the agent's row.
+fn still_due_from(
+    read: impl Fn(&str) -> Option<muxa::Agent> + Send + 'static,
+    revision_now: tokio::sync::watch::Receiver<u64>,
+    firing: &PlannedFiring,
+    revision: u64,
+) -> muxa::swap_service::StillDue {
     let session = firing.agent_session_id.clone();
     let episode = firing.episode.clone();
     let pane = firing.pane.clone();
@@ -1033,7 +1048,7 @@ fn automation_still_due(
             }
         };
         unchanged()?;
-        let agent = runtime.block_on(store.by_session(&session));
+        let agent = read(&session);
         still_due_with(
             agent.as_ref(),
             &pane,
@@ -7195,10 +7210,10 @@ mod tests {
         assert!(tokio::task::spawn_blocking(stale).await.unwrap().is_err());
     }
 
-    /// A configuration change that lands while the check waits on the store
+    /// A configuration change that lands while the check reads the agent
     /// still makes the firing stale: the revision is read again last.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_config_change_during_the_store_read_is_seen() {
+    #[tokio::test]
+    async fn a_config_change_during_the_agent_read_is_seen() {
         let store = muxa::Store::shared();
         add_capped_agent(&store, "%1", "capped").await;
         let agent = store.by_session("capped").await.unwrap();
@@ -7218,21 +7233,31 @@ mod tests {
             only_if_still: muxa::automation::AutomationCondition::RateLimited,
             account: None,
         };
-        let check = automation_still_due(
-            tokio::runtime::Handle::current(),
-            store.clone(),
+        let read_at = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let reads = Arc::clone(&read_at);
+        let unchanged = still_due_from(
+            {
+                let agent = agent.clone();
+                move |_| Some(agent.clone())
+            },
+            bump.subscribe(),
+            &firing,
+            0,
+        );
+        assert!(unchanged().is_ok());
+        // The rule is edited exactly while the agent is being read.
+        let check = still_due_from(
+            move |_| {
+                reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                bump.send(1).unwrap();
+                Some(agent.clone())
+            },
             revision_now,
             &firing,
             0,
         );
-        // Hold the store so the check's read waits, change the revision,
-        // then let the read go.
-        let held = store.hold_for_test().await;
-        let running = tokio::task::spawn_blocking(check);
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        bump.send(1).unwrap();
-        drop(held);
-        assert!(running.await.unwrap().is_err());
+        assert_eq!(check().unwrap_err(), "the automation configuration changed");
+        assert_eq!(read_at.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

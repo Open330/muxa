@@ -13024,6 +13024,7 @@ mod tests {
                 reason: None,
                 entries: Vec::new(),
                 fault: None,
+                service_fault: None,
                 cancel_requested: false,
             }
         }
