@@ -873,6 +873,9 @@ projection and encoding, without copying body text or logging content hashes:
 | --- | --- |
 | `response_bytes` | Complete IPC JSON line, including its newline |
 | `response_body_bytes` | Raw UTF-8 bytes of transported request, reply, update, late-report and decision body fields |
+| `response_unique_body_bytes` | Raw bodies counting each transported request ID once |
+| `response_duplicate_body_bytes` | Raw body bytes in additional copies of the same request record |
+| `response_extra_unique_bytes` | Complete line minus the unique raw bodies |
 | `response_body_json_bytes` | Those body contents after JSON escaping, excluding their quote delimiters |
 | `response_extra_bytes` | Complete line minus raw body bytes |
 | `response_structure_bytes` | Complete line minus escaped body contents |
@@ -880,11 +883,15 @@ projection and encoding, without copying body text or logging content hashes:
 
 Field names, quotes, contracts, evidence references and other metadata count as
 structure; their cost is not automatically waste. Duplicate transported body fields
-count separately because they consume separate wire bytes. Metadata and unchanged
+count separately in transported body bytes because they consume separate wire bytes;
+unique-body counters also expose duplicate carriage of the same request in multiple
+arrays. This is record-identity accounting, not text deduplication across different
+requests. Metadata and unchanged
 responses legitimately have zero body bytes. Their extra/body ratio is undefined,
 not zero or infinity. Legacy protocol downgrades without these counters remain
 unmeasured rather than being treated as free. `read_view`, `query_limit`,
 `result_count`, caller provenance and `conditional_unchanged` identify the read path.
 `scripts/collaboration-cost-audit.py --json` aggregates sampled counters and reports
-`extra_per_body_byte` only when a nonzero raw-body denominator is available.
+`extra_per_body_byte` only when a nonzero raw-body denominator is available,
+and `extra_per_unique_body_byte` for the single-copy request-record baseline.
 These are IPC bytes, separate from final model input and billed tokens.

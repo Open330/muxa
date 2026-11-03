@@ -101,6 +101,12 @@ pub struct CollaborationAuditEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_body_json_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_unique_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_duplicate_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_extra_unique_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_extra_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_structure_bytes: Option<usize>,
@@ -188,6 +194,10 @@ impl CollaborationAuditContext {
             response_bytes: None,
             response_body_bytes: None,
             response_body_json_bytes: None,
+            response_unique_body_bytes: None,
+            response_duplicate_body_bytes: None,
+            response_extra_unique_bytes: None,
+
             response_extra_bytes: None,
             response_structure_bytes: None,
             response_escape_bytes: None,

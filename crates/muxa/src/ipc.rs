@@ -6352,6 +6352,9 @@ async fn handle(
                 let body = response_cost::measure(&resp);
                 entry.response_body_bytes = Some(body.raw);
                 entry.response_body_json_bytes = Some(body.json);
+                entry.response_unique_body_bytes = Some(body.unique);
+                entry.response_duplicate_body_bytes = Some(body.raw.saturating_sub(body.unique));
+                entry.response_extra_unique_bytes = Some(bytes.len().saturating_sub(body.unique));
                 entry.response_extra_bytes = Some(bytes.len().saturating_sub(body.raw));
                 entry.response_structure_bytes = Some(bytes.len().saturating_sub(body.json));
                 entry.response_escape_bytes = Some(body.json.saturating_sub(body.raw));

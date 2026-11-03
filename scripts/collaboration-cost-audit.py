@@ -97,7 +97,7 @@ def summarize(audit, sessions, since, repeat_seconds):
             client = row.get("actor", {}).get("client_kind", "unknown")
             key = (client, row.get("operation", "unknown"))
             ipc[key] += 1
-            for field in ("response_bytes", "elapsed_us", "message_bytes", "response_body_bytes", "response_body_json_bytes",
+            for field in ("response_bytes", "elapsed_us", "message_bytes", "response_body_bytes", "response_body_json_bytes", "response_unique_body_bytes", "response_duplicate_body_bytes", "response_extra_unique_bytes",
                           "response_extra_bytes", "response_structure_bytes", "response_escape_bytes"):
                 value = row.get(field)
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
@@ -156,6 +156,9 @@ def summarize(audit, sessions, since, repeat_seconds):
         if metrics.get("response_body_bytes_samples", 0):
             body = metrics.get("response_body_bytes", 0)
             metrics["extra_per_body_byte"] = metrics.get("response_extra_bytes", 0) / body if body else None
+        if metrics.get("response_unique_body_bytes_samples", 0):
+            unique = metrics.get("response_unique_body_bytes", 0)
+            metrics["extra_per_unique_body_byte"] = metrics.get("response_extra_unique_bytes", 0) / unique if unique else None
         ipc_rows.append({"client": client, "operation": operation, "calls": count,
                          "failed": ipc_failed[(client, operation)], **metrics})
     return {

@@ -2,10 +2,12 @@
 use super::Response;
 use crate::collaboration::{CollaborationReply, CollaborationRequest};
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default)]
 pub(super) struct BodyBytes {
     pub raw: usize,
     pub json: usize,
+    pub unique: usize,
+    seen: std::collections::HashSet<String>,
 }
 
 impl BodyBytes {
@@ -27,6 +29,8 @@ impl BodyBytes {
     }
 
     fn request(&mut self, request: &CollaborationRequest) {
+        let before = self.raw;
+        let first = self.seen.insert(request.id.clone());
         self.text(&request.body);
         if let Some(reply) = &request.reply {
             self.reply(reply);
@@ -43,6 +47,9 @@ impl BodyBytes {
             .and_then(|i| i.decision.as_ref())
         {
             self.reply(reply);
+        }
+        if first {
+            self.unique += self.raw - before;
         }
     }
 }
@@ -81,5 +88,46 @@ mod tests {
         bytes.text(text);
         assert_eq!(bytes.raw, text.len());
         assert_eq!(bytes.json, serde_json::to_vec(text).unwrap().len() - 2);
+    }
+
+    #[tokio::test]
+    async fn copied_request_records_are_extra_over_the_single_copy_body_baseline() {
+        use crate::collaboration::{
+            CollaborationOptions, CollaborationStore, NewRequest, Participant, RoomId,
+        };
+        let console = Participant::console(RoomId {
+            host: "tmux".into(),
+            socket: Some("default".into()),
+            window_id: "@1".into(),
+        });
+        let mut recipient = console.clone();
+        recipient.console = false;
+        recipient.agent_session_id = "peer".into();
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let request = store
+            .create(
+                console,
+                recipient,
+                NewRequest {
+                    body: "한글\\\"\n".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut response = Response::with_collaboration_request(request.clone());
+        response.collaboration_requests = Some(vec![request.clone()]);
+        let bytes = measure(&response);
+        assert_eq!(bytes.raw, request.body.len() * 2);
+        assert_eq!(bytes.unique, request.body.len());
+        assert_eq!(
+            bytes.json,
+            (serde_json::to_vec(&request.body).unwrap().len() - 2) * 2
+        );
+        let mut projected = request;
+        projected.omit_list_bodies();
+        let metadata = measure(&Response::with_collaboration_request(projected));
+        assert_eq!(metadata.raw, 0);
+        assert_eq!(metadata.unique, 0);
     }
 }

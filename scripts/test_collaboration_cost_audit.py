@@ -75,10 +75,12 @@ class CostAuditTests(unittest.TestCase):
             base = {"at": "2026-10-20T01:00:00Z", "actor": {"client_kind": "cli"}, "operation": "list", "ok": True}
             rows = [base, dict(base, response_bytes=300, response_body_bytes=100,
                               response_extra_bytes=200, response_structure_bytes=180,
-                              response_body_json_bytes=120, response_escape_bytes=20, conditional_unchanged=False),
+                              response_body_json_bytes=120, response_escape_bytes=20, conditional_unchanged=False,
+                              response_unique_body_bytes=50, response_duplicate_body_bytes=50, response_extra_unique_bytes=250),
                     dict(base, response_bytes=60, response_body_bytes=0, response_extra_bytes=60,
                          response_structure_bytes=60, response_body_json_bytes=0,
-                         response_escape_bytes=0, conditional_unchanged=True)]
+                         response_escape_bytes=0, conditional_unchanged=True,
+                         response_unique_body_bytes=0, response_duplicate_body_bytes=0, response_extra_unique_bytes=60)]
             ledger.write_text("\n".join(json.dumps(row) for row in rows))
             since = dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc)
             row = audit.summarize(ledger, [], since, 300)["ipc"][0]
@@ -86,6 +88,8 @@ class CostAuditTests(unittest.TestCase):
             self.assertEqual(row["response_extra_bytes"], 260)
             self.assertEqual(row["extra_per_body_byte"], 2.6)
             self.assertEqual(row["conditional_hits"], 1)
+            self.assertEqual(row["response_duplicate_body_bytes"], 50)
+            self.assertEqual(row["extra_per_unique_body_byte"], 6.2)
             ledger.write_text(json.dumps(rows[-1]))
             self.assertIsNone(audit.summarize(ledger, [], since, 300)["ipc"][0]["extra_per_body_byte"])
 
