@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-/// Blocks a target until opened.
+/// Blocks a target until opened, and tells whether one has reached it.
 #[derive(Default)]
 struct Gate {
     open: Mutex<bool>,
     changed: Condvar,
+    reached: std::sync::atomic::AtomicBool,
 }
 
 impl Gate {
@@ -23,9 +24,20 @@ impl Gate {
     }
 
     fn wait(&self) {
+        self.reached.store(true, Ordering::SeqCst);
         let mut open = self.open.lock().unwrap();
         while !*open {
             open = self.changed.wait(open).unwrap();
+        }
+    }
+
+    /// Wait until a target is held at this gate: past every boundary before
+    /// its execution.
+    fn until_reached(&self) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.reached.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "no target reached the gate");
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 }
@@ -512,7 +524,9 @@ fn a_journal_failure_halts_the_job_and_the_service() {
         None,
     )
     .unwrap();
-    // Another manager takes the store while the first target is held.
+    // Another manager takes the store while the first target is held (in
+    // its execution, past its start boundary, which is fenced too).
+    gate.until_reached();
     let usurper = SwapJobStore::open(&h.dir.path().join("swap-jobs.sqlite3")).unwrap();
     usurper
         .acquire(
