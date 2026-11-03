@@ -397,6 +397,7 @@ const SWAP_VALUE_FLAGS: &[&str] = &[
     "--retry",
     "--cancel",
     "--request-key",
+    "--wait-secs",
 ];
 
 /// Check a `swap` argv: JSON output, only the allowlisted flags, and plain

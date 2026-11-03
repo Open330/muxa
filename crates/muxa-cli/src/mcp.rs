@@ -722,7 +722,12 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "continue_evidence": { "type": "string", "enum": ["binding", "verified"], "description": "What the relaunch must show before the follow-up is typed: binding (its own arguments resume exactly that conversation) or verified (also read from the stopped process and confirmed on the assigned account). Defaults to [swap] continue_evidence." },
                     "continue": { "type": "string", "description": "Deprecated alias of continue_text; no longer sends to every agent." },
                     "no_continue": { "type": "boolean", "description": "Send no follow-up prompt." },
-                    "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." }
+                    "dry_run": { "type": "boolean", "description": "Return the plan without touching any agent." },
+                    "action": { "type": "string", "enum": ["swap", "retry", "status", "cancel"], "description": "swap (default) starts one; retry reruns an ended job's safely retryable targets; status reads a job; cancel stops it at its next target. Every result carries request_key/job: the handle to read it again (action=status), never a reason to send it twice." },
+                    "job": { "type": "string", "description": "For retry, status and cancel: the request key (or job id) a start returned." },
+                    "request_key": { "type": "string", "description": "For swap and retry: your own key to start the job under (1-128 of letters, digits, -_.:@), so you hold the handle before anything is sent. Omitted: one is minted and returned." },
+                    "detach": { "type": "boolean", "description": "For swap and retry: return once the job is accepted instead of waiting for it." },
+                    "wait_secs": { "type": "integer", "minimum": 0, "maximum": 120, "description": "For status and cancel: wait at most this long for the job to end (default 0: return it as it is now)." }
                 },
                 "additionalProperties": false
             },
@@ -5063,79 +5068,627 @@ fn error_result(message: &str) -> Value {
 }
 
 /// `muxa_swap_account`: `muxa swap --json` through the daemon's work
-/// command transport, here or on a Fleet host. The caller's own pane is
-/// never swapped from under its tool call.
+/// command transport, here or on a Fleet host. `action` picks a start
+/// (`swap`, the default), a `retry` of an ended job, or a read (`status`)
+/// or `cancel` of one. A start or retry runs under a request key, the
+/// caller's own or one minted here before anything is sent, and every
+/// result carries it: the handle to find the job again. Nothing is ever
+/// sent twice. The caller's own pane is never swapped from under its call.
 async fn swap_account(client: &Client, args: &Value) -> Value {
-    let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
-    let text = |name: &str| args.get(name).and_then(Value::as_str);
-    let host = muxa::work_control::remote_host_alias(text("host"));
-    let mut words: Vec<String> = args
-        .get("targets")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .map(str::to_owned)
-        .collect();
-    for (name, switch) in [
-        ("all", "--all"),
-        ("spread", "--spread"),
-        ("force", "--force"),
-        ("no_continue", "--no-continue"),
-        ("dry_run", "--dry-run"),
-    ] {
-        if flag(name) {
-            words.push(switch.to_owned());
-        }
-    }
-    for (name, option) in [
-        ("provider", "--provider"),
-        ("to", "--to"),
-        ("continue_text", "--continue-text"),
-        ("continue_when", "--continue-when"),
-        ("continue_evidence", "--continue-evidence"),
-        ("continue", "--continue"),
-    ] {
-        if let Some(value) = text(name) {
-            words.extend([option.to_owned(), value.to_owned()]);
-        }
-    }
-    if host.is_none() {
-        if let Some(pane) = muxa::default_backend()
-            .current_pane()
-            .or_else(current_process_host_pane)
+    let host = muxa::work_control::remote_host_alias(args.get("host").and_then(Value::as_str));
+    let plan = match swap_plan(args, host, own_pane()) {
+        Ok(plan) => plan,
+        Err(error) => return swap_error(&SwapCall::rejected(host, args), &error),
+    };
+    if plan.action == SwapAction::Retry && host.is_none() {
+        if let Err(error) =
+            retry_spares_caller(client, plan.job.as_deref(), own_pane().as_deref()).await
         {
-            words.extend(["--exclude".to_owned(), pane]);
+            return swap_error(&plan.call(host), &error);
         }
     }
-    let command_line = match crate::swap::checked_argv(&words) {
-        Ok(command_line) => command_line,
-        Err(error) => return error_result(&format!("swap: {error}")),
-    };
-    let output = match client.work_command(host, &command_line, None).await {
+    let output = match client.work_command(host, &plan.argv, None).await {
         Ok(output) => output,
-        Err(error) => return error_result(&format!("swap failed: {error}")),
+        Err(error) => {
+            return swap_error(
+                &plan.call(host),
+                &format!("{error}; whether it was accepted is unknown"),
+            )
+        }
     };
-    let Ok(outcomes) = serde_json::from_str::<Value>(&output.stdout) else {
-        return error_result(&format!(
-            "swap failed (exit {}): {}",
-            output.exit_code,
-            output.stderr.trim()
-        ));
-    };
-    let report = json!({ "host": host.unwrap_or("local"), "outcomes": outcomes });
-    let failed = outcomes
-        .as_array()
-        .is_some_and(|all| all.iter().any(|o| o["status"] == "failed"));
-    if failed || output.exit_code != 0 {
-        error_result(&format!("some agents could not be swapped: {report}"))
-    } else {
-        json_result(&report)
+    swap_reply(&plan, host, &output)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SwapAction {
+    Swap,
+    Retry,
+    Status,
+    Cancel,
+}
+
+/// One call, before it is sent: what to run and what to report.
+#[derive(Debug)]
+struct SwapPlan {
+    action: SwapAction,
+    argv: Vec<String>,
+    job: Option<String>,
+    request_key: Option<String>,
+    dry_run: bool,
+    detach: bool,
+}
+
+/// What every result names.
+struct SwapCall {
+    host: String,
+    action: &'static str,
+    job: Option<String>,
+    request_key: Option<String>,
+}
+
+impl SwapCall {
+    fn rejected(host: Option<&str>, args: &Value) -> Self {
+        Self {
+            host: host.unwrap_or("local").to_owned(),
+            action: args
+                .get("action")
+                .and_then(Value::as_str)
+                .map_or("swap", |a| match a {
+                    "retry" => "retry",
+                    "status" => "status",
+                    "cancel" => "cancel",
+                    _ => "swap",
+                }),
+            job: args.get("job").and_then(Value::as_str).map(str::to_owned),
+            request_key: None,
+        }
+    }
+
+    fn fields(&self) -> serde_json::Map<String, Value> {
+        let mut fields = serde_json::Map::new();
+        fields.insert("host".into(), json!(self.host));
+        fields.insert("action".into(), json!(self.action));
+        if let Some(job) = &self.job {
+            fields.insert("job".into(), json!(job));
+        }
+        if let Some(key) = &self.request_key {
+            fields.insert("request_key".into(), json!(key));
+        }
+        fields
     }
 }
+
+impl SwapPlan {
+    fn call(&self, host: Option<&str>) -> SwapCall {
+        SwapCall {
+            host: host.unwrap_or("local").to_owned(),
+            action: match self.action {
+                SwapAction::Swap => "swap",
+                SwapAction::Retry => "retry",
+                SwapAction::Status => "status",
+                SwapAction::Cancel => "cancel",
+            },
+            job: self.job.clone(),
+            request_key: self.request_key.clone(),
+        }
+    }
+}
+
+fn own_pane() -> Option<String> {
+    muxa::default_backend()
+        .current_pane()
+        .or_else(current_process_host_pane)
+}
+
+/// Fields a start takes, and that a read or a retry must not.
+const SWAP_START_FIELDS: &[&str] = &[
+    "targets",
+    "all",
+    "provider",
+    "to",
+    "spread",
+    "continue_text",
+    "continue_when",
+    "continue",
+    "no_continue",
+    "dry_run",
+];
+
+/// Turn the tool's arguments into one `muxa swap` argv, refusing what the
+/// action does not take before anything is sent.
+#[allow(clippy::too_many_lines)] // one validation and translation per action, in order
+fn swap_plan(
+    args: &Value,
+    host: Option<&str>,
+    own_pane: Option<String>,
+) -> Result<SwapPlan, String> {
+    let flag = |name: &str| args.get(name).and_then(Value::as_bool).unwrap_or(false);
+    let text = |name: &str| args.get(name).and_then(Value::as_str);
+    let present = |name: &str| args.get(name).is_some_and(|v| !v.is_null());
+    let action = match text("action").unwrap_or("swap") {
+        "swap" => SwapAction::Swap,
+        "retry" => SwapAction::Retry,
+        "status" => SwapAction::Status,
+        "cancel" => SwapAction::Cancel,
+        other => {
+            return Err(format!(
+                "unknown action {other:?} (swap, retry, status, cancel)"
+            ))
+        }
+    };
+    let job = text("job").map(str::to_owned);
+    if action != SwapAction::Swap && job.is_none() {
+        return Err("this action needs `job` (a request key or job id)".into());
+    }
+    if action == SwapAction::Swap && job.is_some() {
+        return Err("`job` goes with action retry, status or cancel".into());
+    }
+    if action != SwapAction::Swap {
+        if let Some(field) = SWAP_START_FIELDS.iter().find(|field| present(field)) {
+            return Err(format!("`{field}` is for action swap only"));
+        }
+    }
+    let reads = matches!(action, SwapAction::Status | SwapAction::Cancel);
+    if reads {
+        for field in ["force", "continue_evidence", "detach", "request_key"] {
+            if present(field) {
+                return Err(format!(
+                    "`{field}` does not go with action {}",
+                    text("action").unwrap_or("")
+                ));
+            }
+        }
+    }
+    let wait = args.get("wait_secs").and_then(Value::as_u64);
+    if present("wait_secs") && !reads {
+        return Err("`wait_secs` goes with action status or cancel".into());
+    }
+    if wait.is_some_and(|wait| wait > 120) {
+        return Err("`wait_secs` is 0-120".into());
+    }
+    let dry_run = flag("dry_run");
+    let detach = flag("detach");
+    if detach && dry_run {
+        return Err("`detach` does not go with `dry_run`".into());
+    }
+    // A start or a retry runs under a key the caller can keep.
+    let request_key = match (action, dry_run) {
+        (SwapAction::Swap | SwapAction::Retry, false) => Some(match text("request_key") {
+            Some(key) if crate::swap::plain_request_key(key) => key.to_owned(),
+            Some(_) => {
+                return Err("`request_key`: 1-128 characters of letters, digits and -_.:@".into())
+            }
+            None => format!("cli-{}", uuid::Uuid::new_v4()),
+        }),
+        _ if present("request_key") => {
+            return Err("`request_key` goes with a swap or retry that is not a dry run".into())
+        }
+        _ => None,
+    };
+    let mut words: Vec<String> = Vec::new();
+    match action {
+        SwapAction::Swap => {
+            words.extend(
+                args.get("targets")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned),
+            );
+            for (name, switch) in [
+                ("all", "--all"),
+                ("spread", "--spread"),
+                ("no_continue", "--no-continue"),
+                ("dry_run", "--dry-run"),
+            ] {
+                if flag(name) {
+                    words.push(switch.to_owned());
+                }
+            }
+            for (name, option) in [
+                ("provider", "--provider"),
+                ("to", "--to"),
+                ("continue_text", "--continue-text"),
+                ("continue_when", "--continue-when"),
+                ("continue", "--continue"),
+            ] {
+                if let Some(value) = text(name) {
+                    words.extend([option.to_owned(), value.to_owned()]);
+                }
+            }
+            // Only a start widens nothing toward the caller: its own pane
+            // is left out here.
+            if host.is_none() {
+                if let Some(pane) = own_pane {
+                    words.extend(["--exclude".to_owned(), pane]);
+                }
+            }
+        }
+        SwapAction::Retry | SwapAction::Status | SwapAction::Cancel => {
+            let flag = match action {
+                SwapAction::Retry => "--retry",
+                SwapAction::Status => "--status",
+                _ => "--cancel",
+            };
+            words.extend([flag.to_owned(), job.clone().unwrap_or_default()]);
+        }
+    }
+    if matches!(action, SwapAction::Swap | SwapAction::Retry) {
+        if flag("force") {
+            words.push("--force".to_owned());
+        }
+        if let Some(evidence) = text("continue_evidence") {
+            words.extend(["--continue-evidence".to_owned(), evidence.to_owned()]);
+        }
+        if detach {
+            words.push("--detach".to_owned());
+        }
+    }
+    if reads {
+        words.extend(["--wait-secs".to_owned(), wait.unwrap_or(0).to_string()]);
+    }
+    if let Some(key) = &request_key {
+        words.extend(["--request-key".to_owned(), key.clone()]);
+    }
+    let command_line = crate::swap::checked_argv(&words)?;
+    Ok(SwapPlan {
+        action,
+        argv: command_line,
+        job,
+        request_key,
+        dry_run,
+        detach,
+    })
+}
+
+/// A retry acts on what its parent planned: refused here if that is the
+/// caller's own pane, which a start would have left out.
+async fn retry_spares_caller(
+    client: &Client,
+    parent: Option<&str>,
+    own: Option<&str>,
+) -> Result<(), String> {
+    let (Some(parent), Some(own)) = (parent, own) else {
+        return Ok(());
+    };
+    let parent_ref = if parent
+        .strip_prefix("swap-")
+        .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
+    {
+        muxa::swap_service::JobRef::Id(parent.to_owned())
+    } else {
+        muxa::swap_service::JobRef::Key(parent.to_owned())
+    };
+    let view = client
+        .swap_job_status(&parent_ref)
+        .await
+        .map_err(|error| format!("could not read the job to retry: {error}; nothing was sent"))?;
+    if view
+        .entries
+        .iter()
+        .any(|entry| entry.pane.as_deref() == Some(own))
+    {
+        return Err(format!(
+            "job {} includes this caller's own pane {own}; a retry from here would swap it from \
+             under the call. Nothing was sent; retry it from another pane or the CLI",
+            view.job_id
+        ));
+    }
+    Ok(())
+}
+
+/// The result of a sent call: its payload, the exit status, the host's
+/// diagnostics, and, for a job that may exist, how to find it.
+fn swap_reply(
+    plan: &SwapPlan,
+    host: Option<&str>,
+    output: &muxa::work_control::WorkCommandOutput,
+) -> Value {
+    let call = plan.call(host);
+    let payload = serde_json::from_str::<Value>(&output.stdout).ok();
+    let mut fields = call.fields();
+    fields.insert("exit_code".into(), json!(output.exit_code));
+    if !output.stderr.trim().is_empty() {
+        fields.insert("stderr".into(), json!(output.stderr.trim()));
+    }
+    if let Some(job_id) = payload
+        .as_ref()
+        .and_then(|p| p.get("job_id"))
+        .and_then(Value::as_str)
+    {
+        fields.insert("job_id".into(), json!(job_id));
+    }
+    // A detach acknowledges the key that was sent, or nothing settles.
+    let mismatch = plan.detach
+        && payload
+            .as_ref()
+            .and_then(|p| p.get("request_key"))
+            .and_then(Value::as_str)
+            != plan.request_key.as_deref();
+    let failed_rows = payload
+        .as_ref()
+        .and_then(Value::as_array)
+        .is_some_and(|rows| rows.iter().any(|o| o["status"] == "failed"));
+    let field = match plan.action {
+        SwapAction::Status | SwapAction::Cancel => "job_view",
+        _ if plan.detach => "detached",
+        _ => "outcomes",
+    };
+    if let Some(payload) = payload.clone() {
+        fields.insert(field.into(), payload);
+    }
+    let ok = payload.is_some() && output.exit_code == 0 && !failed_rows && !mismatch;
+    if !ok {
+        if plan.request_key.is_some() {
+            fields.insert("recovery".into(), recovery(&call));
+        }
+        let note = if mismatch {
+            "the host acknowledged another request key; whether this one was accepted is unknown"
+        } else if payload.is_none() {
+            "no result came back; that is not proof nothing started"
+        } else {
+            "the call did not end cleanly"
+        };
+        fields.insert("error".into(), json!(note));
+        return json!({
+            "content": [ { "type": "text", "text": Value::Object(fields).to_string() } ],
+            "isError": true,
+        });
+    }
+    if plan.dry_run {
+        fields.remove("request_key");
+    }
+    json_result(&Value::Object(fields))
+}
+
+/// How to find a job that may exist: never by sending it again.
+fn recovery(call: &SwapCall) -> Value {
+    let mut args = serde_json::Map::new();
+    args.insert("action".into(), json!("status"));
+    args.insert("job".into(), json!(call.request_key));
+    if call.host != "local" {
+        args.insert("host".into(), json!(call.host));
+    }
+    json!({ "tool": "muxa_swap_account", "arguments": Value::Object(args) })
+}
+
+fn swap_error(call: &SwapCall, error: &str) -> Value {
+    let mut fields = call.fields();
+    fields.insert("error".into(), json!(error));
+    if call.request_key.is_some() {
+        fields.insert("recovery".into(), recovery(call));
+    }
+    json!({
+        "content": [ { "type": "text", "text": Value::Object(fields).to_string() } ],
+        "isError": true,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- muxa_swap_account -------------------------------------------------
+
+    fn key_in(argv: &[String]) -> Option<String> {
+        argv.iter()
+            .find_map(|w| w.strip_prefix("--request-key="))
+            .map(str::to_owned)
+    }
+
+    /// A start runs under a key, the caller's or a minted one, and the key
+    /// survives the argv's canonical form; the caller's pane is left out.
+    #[test]
+    fn a_swap_call_carries_its_key_through_the_argv() {
+        let plan = swap_plan(&json!({"targets": ["%5"]}), None, Some("%9".into())).unwrap();
+        let key = plan.request_key.clone().unwrap();
+        assert!(key.starts_with("cli-"));
+        assert_eq!(key_in(&plan.argv).as_deref(), Some(key.as_str()));
+        assert!(
+            plan.argv.contains(&"--exclude=%9".to_owned()),
+            "{:?}",
+            plan.argv
+        );
+        muxa::work_control::validate_swap_argv(&plan.argv).unwrap();
+        let own = swap_plan(&json!({"request_key": "agent-7"}), Some("rtzr"), None).unwrap();
+        assert_eq!(key_in(&own.argv).as_deref(), Some("agent-7"));
+        assert!(!own.argv.iter().any(|w| w.starts_with("--exclude")));
+        // A dry run makes no job and has no key.
+        let dry = swap_plan(&json!({"dry_run": true}), None, None).unwrap();
+        assert_eq!(dry.request_key, None);
+        assert_eq!(key_in(&dry.argv), None);
+        assert!(swap_plan(&json!({"dry_run": true, "request_key": "k"}), None, None).is_err());
+        assert!(swap_plan(&json!({"request_key": "has space"}), None, None).is_err());
+    }
+
+    /// Retries, reads and cancels take only what they mean.
+    #[test]
+    fn each_swap_action_takes_only_its_own_fields() {
+        let retry = swap_plan(
+            &json!({"action": "retry", "job": "cli-1", "force": true}),
+            None,
+            Some("%9".into()),
+        )
+        .unwrap();
+        assert!(retry.argv.contains(&"--retry=cli-1".to_owned()));
+        assert!(key_in(&retry.argv).is_some());
+        assert!(!retry.argv.iter().any(|w| w.starts_with("--exclude")));
+        let status = swap_plan(&json!({"action": "status", "job": "cli-1"}), None, None).unwrap();
+        assert!(status.argv.contains(&"--status=cli-1".to_owned()));
+        assert!(status.argv.contains(&"--wait-secs=0".to_owned()));
+        assert_eq!(status.request_key, None);
+        muxa::work_control::validate_swap_argv(&status.argv).unwrap();
+        let cancel = swap_plan(
+            &json!({"action": "cancel", "job": "k", "wait_secs": 30}),
+            Some("h"),
+            None,
+        )
+        .unwrap();
+        assert!(cancel.argv.contains(&"--cancel=k".to_owned()));
+        assert!(cancel.argv.contains(&"--wait-secs=30".to_owned()));
+        for bad in [
+            json!({"action": "status"}),
+            json!({"action": "nope"}),
+            json!({"job": "k"}),
+            json!({"action": "status", "job": "k", "targets": ["%5"]}),
+            json!({"action": "retry", "job": "k", "to": "a"}),
+            json!({"action": "cancel", "job": "k", "request_key": "x"}),
+            json!({"action": "status", "job": "k", "wait_secs": 121}),
+            json!({"wait_secs": 5}),
+            json!({"detach": true, "dry_run": true}),
+        ] {
+            assert!(swap_plan(&bad, None, None).is_err(), "{bad}");
+        }
+    }
+
+    fn output(exit_code: i32, stdout: &str, stderr: &str) -> muxa::work_control::WorkCommandOutput {
+        muxa::work_control::WorkCommandOutput {
+            exit_code,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    fn reply_fields(reply: &Value) -> (bool, Value) {
+        let error = reply["isError"].as_bool().unwrap_or(false);
+        let text = reply["content"][0]["text"].as_str().unwrap();
+        (error, serde_json::from_str(text).unwrap())
+    }
+
+    /// Every result names its handle; a failure keeps the host's output and
+    /// says how to find the job, never to send it again.
+    #[test]
+    fn a_swap_reply_keeps_its_handle_whatever_happened() {
+        let plan = swap_plan(
+            &json!({"targets": ["%5"], "request_key": "k-1"}),
+            Some("rtzr"),
+            None,
+        )
+        .unwrap();
+        let (error, fields) = reply_fields(&swap_reply(&plan, Some("rtzr"), &output(0, "[]", "")));
+        assert!(!error);
+        assert_eq!(fields["request_key"], "k-1");
+        assert_eq!(fields["host"], "rtzr");
+        let failed =
+            r#"[{"pane":"%5","agent_session_id":"s","kind":"claude_code","status":"failed"}]"#;
+        let (error, fields) =
+            reply_fields(&swap_reply(&plan, Some("rtzr"), &output(1, failed, "boom")));
+        assert!(error);
+        assert_eq!(fields["outcomes"][0]["status"], "failed");
+        assert_eq!(fields["stderr"], "boom");
+        assert_eq!(fields["recovery"]["arguments"]["job"], "k-1");
+        assert_eq!(fields["recovery"]["arguments"]["host"], "rtzr");
+        let (error, fields) =
+            reply_fields(&swap_reply(&plan, Some("rtzr"), &output(1, "", "refused")));
+        assert!(error);
+        assert!(fields["error"]
+            .as_str()
+            .unwrap()
+            .contains("not proof nothing started"));
+        // A lost answer: the error still names the key.
+        let (error, fields) = reply_fields(&swap_error(&plan.call(Some("rtzr")), "disconnected"));
+        assert!(error);
+        assert_eq!(fields["recovery"]["arguments"]["action"], "status");
+    }
+
+    /// A detach is settled only by an acknowledgement of the key sent.
+    #[test]
+    fn a_detached_swap_needs_its_own_acknowledgement() {
+        let plan = swap_plan(&json!({"detach": true, "request_key": "k-2"}), None, None).unwrap();
+        let ack =
+            |key: &str| format!(r#"{{"request_key":"{key}","job_id":"swap-9","state":"running"}}"#);
+        let (error, fields) = reply_fields(&swap_reply(&plan, None, &output(0, &ack("k-2"), "")));
+        assert!(!error);
+        assert_eq!(fields["job_id"], "swap-9");
+        assert_eq!(fields["detached"]["request_key"], "k-2");
+        let (error, fields) = reply_fields(&swap_reply(&plan, None, &output(0, &ack("other"), "")));
+        assert!(error);
+        assert!(fields["error"]
+            .as_str()
+            .unwrap()
+            .contains("another request key"));
+    }
+
+    /// A daemon whose one job planned pane `%9`.
+    struct OneJob;
+
+    impl muxa::swap_service::SwapJobs for OneJob {
+        fn active(&self) -> Result<(), String> {
+            Ok(())
+        }
+        fn plan(
+            &self,
+            _: &muxa::swap_service::SwapOverrides,
+        ) -> Result<muxa::swap_service::PlanView, String> {
+            Err("no".into())
+        }
+        fn submit(
+            &self,
+            _: &str,
+            _: &muxa::swap_service::SwapOverrides,
+        ) -> Result<muxa::swap_service::Accepted, String> {
+            Err("no".into())
+        }
+        fn retry(
+            &self,
+            _: &str,
+            _: &muxa::swap_service::JobRef,
+            _: &muxa::swap_service::RetryOverrides,
+        ) -> Result<muxa::swap_service::Accepted, String> {
+            Err("no".into())
+        }
+        fn cancel(
+            &self,
+            _: &muxa::swap_service::JobRef,
+        ) -> Result<muxa::swap_service::JobView, String> {
+            Err("no".into())
+        }
+        fn status(
+            &self,
+            _: &muxa::swap_service::JobRef,
+        ) -> Result<muxa::swap_service::JobView, String> {
+            Ok(serde_json::from_value(json!({
+                "job_id": "swap-1", "node_id": "n", "state": "done", "revision": 1,
+                "reason": null, "fault": null,
+                "entries": [{"report_index": 0, "pane": "%9", "disposition": "failed",
+                    "reason": null, "uncertain_effects": 0, "outcome": null}]
+            }))
+            .unwrap())
+        }
+    }
+
+    /// A retry from here is refused if its job planned the caller's own
+    /// pane, before anything is sent; another caller may retry it.
+    #[tokio::test]
+    async fn a_retry_never_swaps_the_callers_own_pane() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("retry.sock");
+        let server = Server::new(socket.clone(), Store::shared())
+            .with_swap(Some(std::sync::Arc::new(OneJob)));
+        let (shutdown, rx) = broadcast::channel(1);
+        let daemon = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket);
+        let refused = retry_spares_caller(&client, Some("cli-1"), Some("%9")).await;
+        let allowed = retry_spares_caller(&client, Some("cli-1"), Some("%2")).await;
+        shutdown.send(()).unwrap();
+        daemon.await.unwrap();
+        assert!(refused.unwrap_err().contains("own pane %9"));
+        assert!(allowed.is_ok());
+    }
+
+    /// A job still at work is a successful read, not a failure.
+    #[test]
+    fn a_status_of_a_running_job_is_a_success() {
+        let plan = swap_plan(&json!({"action": "status", "job": "k"}), None, None).unwrap();
+        let view = r#"{"job_id":"swap-3","node_id":"n","state":"running","revision":1,"reason":null,"entries":[],"fault":null}"#;
+        let (error, fields) = reply_fields(&swap_reply(&plan, None, &output(0, view, "")));
+        assert!(!error);
+        assert_eq!(fields["job_view"]["state"], "running");
+        assert_eq!(fields["job_id"], "swap-3");
+        assert!(fields.get("request_key").is_none());
+    }
 
     #[tokio::test]
     async fn lifecycle_target_keeps_rmux_namespace_bound_to_registered_socket() {

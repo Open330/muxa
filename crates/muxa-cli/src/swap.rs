@@ -157,6 +157,15 @@ pub struct Args {
     /// relays a swap to this host so it can find the job again.
     #[arg(long, hide = true, value_name = "KEY")]
     request_key: Option<String>,
+    /// With `--status` or `--cancel`: wait at most this many seconds
+    /// (0-120) for the job to end, then report it as it is. Without it,
+    /// they wait for the end.
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u64).range(0..=120)
+    )]
+    wait_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -278,11 +287,14 @@ pub(crate) async fn run(
         return run_remote(client, &args, host).await;
     }
     // Reading a job never depends on the service taking new ones.
+    if args.wait_secs.is_some() && args.status.is_none() && args.cancel.is_none() {
+        bail!("--wait-secs goes with --status or --cancel");
+    }
     if let Some(job) = &args.status {
-        return show_status(client, job, args.json).await;
+        return show_status(client, job, args.json, args.wait_secs).await;
     }
     if let Some(job) = &args.cancel {
-        return run_cancel(client, job, args.json).await;
+        return run_cancel(client, job, args.json, args.wait_secs).await;
     }
     if let Some(parent) = &args.retry {
         return run_retry(client, &args, parent, explicit_config).await;
@@ -637,17 +649,19 @@ async fn run_retry(
 /// one.
 fn request_key(args: &Args) -> Result<String> {
     match &args.request_key {
-        Some(key) => {
-            let plain = key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
-            if key.is_empty() || key.len() > 128 || !plain {
-                bail!("--request-key: 1-128 characters of letters, digits and -_.:@");
-            }
-            Ok(key.clone())
-        }
+        Some(key) if plain_request_key(key) => Ok(key.clone()),
+        Some(_) => bail!("--request-key: 1-128 characters of letters, digits and -_.:@"),
         None => Ok(format!("cli-{}", uuid::Uuid::new_v4())),
     }
+}
+
+/// A request key as the job store takes one.
+pub(crate) fn plain_request_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c))
 }
 
 /// What `--detach` prints once the daemon accepted the job.
@@ -696,7 +710,7 @@ async fn detach(
 /// `--cancel`: ask the job to start no further target, then follow it to
 /// its end. A job that ends cleanly after the cancel is a success here,
 /// unlike for whoever was waiting for the whole swap.
-async fn run_cancel(client: &Client, text: &str, json: bool) -> Result<()> {
+async fn run_cancel(client: &Client, text: &str, json: bool, wait: Option<u64>) -> Result<()> {
     let first = job_ref(text);
     let asked = match client.swap_job_cancel(&first).await {
         Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
@@ -718,22 +732,30 @@ async fn run_cancel(client: &Client, text: &str, json: bool) -> Result<()> {
             asked.job_id
         );
     }
-    let cancel = async {
-        let _ = tokio::signal::ctrl_c().await;
-    };
-    tokio::pin!(cancel);
-    let view = match follow_from(client, asked, cancel, POLL).await {
-        JobEnd::Ended(view) => view,
-        JobEnd::Interrupted => bail!("stopped waiting; the cancel stands"),
-        JobEnd::Unknown(error) | JobEnd::Refused(error) => bail!("{error}"),
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
+    let job_id = asked.job_id.clone();
+    let view = if wait == Some(0) {
+        asked
     } else {
-        println!("job {}  {}", view.job_id, view.state);
-        print!("{}", render(&job_outcomes(&view)));
-    }
+        let deadline = Deadline::new(wait);
+        let cancel = deadline.or_ctrl_c();
+        tokio::pin!(cancel);
+        match follow_from(client, asked, cancel, POLL).await {
+            JobEnd::Ended(view) => view,
+            JobEnd::Interrupted if deadline.passed() => client
+                .swap_job_status(&JobRef::Id(job_id))
+                .await
+                .map_err(|error| anyhow!("{error}"))?,
+            JobEnd::Interrupted => bail!("stopped waiting; the cancel stands"),
+            JobEnd::Unknown(error) | JobEnd::Refused(error) => bail!("{error}"),
+        }
+    };
+    print_job(&view, json)?;
     service_notice(&view);
+    if !settled(&view) {
+        // The cancel is recorded; the target already started finishes.
+        eprintln!("muxa swap: job {} is still {}", view.job_id, view.state);
+        return Ok(());
+    }
     job_verdict(&view, text, true)
 }
 
@@ -1106,25 +1128,91 @@ async fn watch_job(
     Watch::Settled(view)
 }
 
-/// `--status`: follow the job to its end and report it.
-async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
-    let cancel = async {
-        let _ = tokio::signal::ctrl_c().await;
+/// `--status`: follow the job to its end (or for at most `wait` seconds)
+/// and report it.
+async fn show_status(client: &Client, text: &str, json: bool, wait: Option<u64>) -> Result<()> {
+    let view = if wait == Some(0) {
+        read_job(client, text).await?
+    } else {
+        let deadline = Deadline::new(wait);
+        match watch_job(client, text, deadline.or_ctrl_c(), POLL).await {
+            Watch::Settled(view) => view,
+            Watch::Interrupted(Some(job)) if deadline.passed() => client
+                .swap_job_status(&JobRef::Id(job))
+                .await
+                .map_err(|error| anyhow!("{error}"))?,
+            Watch::Interrupted(Some(job)) => bail!("stopped waiting; swap job {job} runs on"),
+            Watch::Interrupted(None) => bail!("stopped waiting"),
+            Watch::Failed(error) => bail!("{error}"),
+        }
     };
-    let view = match watch_job(client, text, cancel, POLL).await {
-        Watch::Settled(view) => view,
-        Watch::Interrupted(Some(job)) => bail!("stopped waiting; swap job {job} runs on"),
-        Watch::Interrupted(None) => bail!("stopped waiting"),
-        Watch::Failed(error) => bail!("{error}"),
-    };
+    print_job(&view, json)?;
+    service_notice(&view);
+    if !settled(&view) {
+        // A bounded read of a job still at work: a status, not a failure.
+        eprintln!("muxa swap: job {} is still {}", view.job_id, view.state);
+        return Ok(());
+    }
+    job_verdict(&view, text, false)
+}
+
+/// The job named by `text` (an id not found is tried as a key), as it is.
+async fn read_job(client: &Client, text: &str) -> Result<JobView> {
+    let first = job_ref(text);
+    match client.swap_job_status(&first).await {
+        Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
+            client.swap_job_status(&JobRef::Key(text.to_owned())).await
+        }
+        read => read,
+    }
+    .map_err(|error| anyhow!("{error}"))
+}
+
+fn print_job(view: &JobView, json: bool) -> Result<()> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
+        println!("{}", serde_json::to_string_pretty(view)?);
     } else {
         println!("job {}  {}", view.job_id, view.state);
-        print!("{}", render(&job_outcomes(&view)));
+        print!("{}", render(&job_outcomes(view)));
     }
-    service_notice(&view);
-    job_verdict(&view, text, false)
+    Ok(())
+}
+
+/// A wait that ends at Ctrl-C, or once `wait` seconds have passed.
+struct Deadline {
+    wait: Option<Duration>,
+    passed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl Deadline {
+    fn new(wait: Option<u64>) -> Self {
+        Self {
+            wait: wait.map(Duration::from_secs),
+            passed: std::sync::Arc::default(),
+        }
+    }
+
+    fn or_ctrl_c(&self) -> impl Future<Output = ()> + use<> {
+        let wait = self.wait;
+        let passed = std::sync::Arc::clone(&self.passed);
+        async move {
+            match wait {
+                Some(wait) => tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    () = tokio::time::sleep(wait) => {
+                        passed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                },
+                None => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+    }
+
+    fn passed(&self) -> bool {
+        self.passed.load(std::sync::atomic::Ordering::SeqCst)
+    }
 }
 
 /// The same swap as a `muxa swap … --json` argv for a Fleet host, every
@@ -1166,6 +1254,12 @@ fn remote_argv(args: &Args) -> Vec<String> {
     }
     if let Some(job) = &args.cancel {
         words.push(format!("--cancel={job}"));
+    }
+    if let Some(wait) = args.wait_secs {
+        words.push(format!("--wait-secs={wait}"));
+    }
+    if let Some(key) = &args.request_key {
+        words.push(format!("--request-key={key}"));
     }
     if let Some(bare) = args.bare {
         words.push(format!(
@@ -1271,10 +1365,19 @@ async fn run_remote(relay: &impl Relay, args: &Args, host: &str) -> Result<()> {
     // is sent: if the answer is lost, the job is still found by it. An
     // explicitly in-process run makes no job and gets none.
     let starts = !args.dry_run && !args.local && args.status.is_none() && args.cancel.is_none();
-    let key = starts.then(|| format!("cli-{}", uuid::Uuid::new_v4()));
+    // A caller's own key (an agent's, through MCP) is kept; else one is
+    // minted here.
+    let minted = args.request_key.is_none();
+    let key = starts.then(|| {
+        args.request_key
+            .clone()
+            .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4()))
+    });
     let mut words = remote_argv(args);
-    if let Some(key) = &key {
+    if let Some(key) = key.as_ref().filter(|_| minted) {
         words.push(format!("--request-key={key}"));
+    }
+    if let Some(key) = &key {
         eprintln!(
             "muxa swap: request {key} on {host} (see it with `muxa swap --host {host} \
              --status {key}`)"
@@ -2044,6 +2147,45 @@ mod tests {
         assert!(local_half_withheld(&cancelled).is_some());
         assert!(local_half_withheld(&view("done", Some("fault"))).is_some());
         assert!(local_half_withheld(&view("needs_reconciliation", None)).is_some());
+    }
+
+    /// A bounded read reaches a host as one word, and a relayed key survives
+    /// the canonical argv.
+    #[test]
+    fn a_bounded_read_and_a_relayed_key_reach_a_host() {
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let argv = checked_argv(&words(&["--status", "k", "--wait-secs", "0"])).unwrap();
+        assert!(argv.contains(&"--wait-secs=0".to_owned()), "{argv:?}");
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+        assert!(checked_argv(&words(&["--status", "k", "--wait-secs", "121"])).is_err());
+        let argv = checked_argv(&words(&["%5", "--request-key", "agent-1"])).unwrap();
+        assert!(
+            argv.contains(&"--request-key=agent-1".to_owned()),
+            "{argv:?}"
+        );
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+        assert!(plain_request_key("a:b@c-1_2.3"));
+        assert!(!plain_request_key(""));
+        assert!(!plain_request_key("a b"));
+    }
+
+    /// A caller's own key on a relayed swap is the one sent and named.
+    #[tokio::test]
+    async fn a_relayed_swap_keeps_the_callers_key() {
+        let fake = relay(|_| Err(RuntimeError::Disconnected));
+        let cli = Cli::parse_from(["swap", "%5", "--host", "rtzr", "--request-key", "agent-9"]);
+        let error = format!(
+            "{:#}",
+            run_remote(&fake, &cli.args, "rtzr").await.unwrap_err()
+        );
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let sent: Vec<_> = calls[0]
+            .iter()
+            .filter(|w| w.starts_with("--request-key="))
+            .collect();
+        assert_eq!(sent, ["--request-key=agent-9"]);
+        assert!(error.contains("--status agent-9"), "{error}");
     }
 
     #[test]
