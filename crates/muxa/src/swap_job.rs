@@ -296,6 +296,11 @@ pub(crate) enum Disposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub(crate) enum Observation {
+    /// What the relaunch needs, checked before any effect: paths, verdicts
+    /// and file digests only.
+    Preflight {
+        checks: Vec<crate::account_swap::preflight::Check>,
+    },
     /// The process and conversation acted on, read just before the stop.
     Binding {
         pid: u32,

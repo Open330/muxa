@@ -46,6 +46,12 @@ struct FakeIo {
     /// time) a hook for the target arrived.
     probe: Cell<bool>,
     hooks: RefCell<Vec<Duration>>,
+    /// What each path is; anything unlisted reads as a directory.
+    paths: RefCell<HashMap<String, super::io::PathFacts>>,
+    digests: RefCell<HashMap<String, String>>,
+    shell_cwd: RefCell<Option<super::io::ShellCwd>>,
+    /// The line each respawn was given.
+    respawned: RefCell<Vec<String>>,
 }
 
 impl FakeIo {
@@ -66,6 +72,16 @@ impl FakeIo {
             kind: Cell::new(AgentKind::Codex),
             probe: Cell::new(false),
             hooks: RefCell::new(Vec::new()),
+            paths: RefCell::new(HashMap::from([(
+                "/bin/sh".to_owned(),
+                super::io::PathFacts::File {
+                    executable: true,
+                    interpreter: None,
+                },
+            )])),
+            digests: RefCell::new(HashMap::new()),
+            shell_cwd: RefCell::new(None),
+            respawned: RefCell::new(Vec::new()),
         }
     }
 
@@ -107,6 +123,22 @@ impl Clock for FakeIo {
 }
 
 impl SwapIo for FakeIo {
+    fn path_facts(&self, path: &str) -> super::io::PathFacts {
+        self.paths
+            .borrow()
+            .get(path)
+            .cloned()
+            .unwrap_or(super::io::PathFacts::Directory)
+    }
+
+    fn file_digest(&self, path: &str) -> Option<String> {
+        self.digests.borrow().get(path).cloned()
+    }
+
+    fn process_cwd(&self, _pid: u32) -> Option<super::io::ShellCwd> {
+        self.shell_cwd.borrow().clone()
+    }
+
     fn capture(&self) -> Option<String> {
         Some(self.screen.borrow().clone())
     }
@@ -126,7 +158,8 @@ impl SwapIo for FakeIo {
         self.remain_ok.get()
     }
 
-    fn respawn(&self, _cwd: &str, _line: &str) -> bool {
+    fn respawn(&self, _cwd: &str, line: &str) -> bool {
+        self.respawned.borrow_mut().push(line.to_owned());
         self.record("respawn".into());
         self.respawn_ok.get()
     }
@@ -203,6 +236,10 @@ fn target(kind: AgentKind, direct: bool, busy: bool) -> Target {
         evidence: super::ContinueEvidence::Binding,
         restore_draft: true,
         ran_with_bypass: true,
+        prerequisites: super::preflight::Prerequisites {
+            respawn_shell: Some("/bin/sh".into()),
+            ..super::preflight::Prerequisites::default()
+        },
     }
 }
 
@@ -619,8 +656,11 @@ fn a_swap_reports_what_it_saw_in_order() {
         &verified,
     )
     .unwrap();
+    let observations = runner.observations();
+    // First, before anything is done, what the relaunch needs.
+    assert!(matches!(observations[0], Observation::Preflight { .. }));
     assert_eq!(
-        runner.observations(),
+        observations[1..],
         [
             Observation::Phase {
                 phase: Phase::Stopping
@@ -1379,4 +1419,232 @@ fn bypass_mode_is_accepted_only_when_both_processes_run_with_it() {
     assert!(swap(true, &with));
     assert!(!swap(false, &with));
     assert!(!swap(true, &without));
+}
+
+mod preflight_tests {
+    use super::super::io::PathFacts;
+    use super::super::preflight::{Prerequisites, Stage, Verdict};
+    use super::*;
+
+    fn file(executable: bool, interpreter: Option<&str>) -> PathFacts {
+        PathFacts::File {
+            executable,
+            interpreter: interpreter.map(str::to_owned),
+        }
+    }
+
+    fn with(target: &mut Target, prerequisites: Prerequisites) {
+        target.prerequisites = Prerequisites {
+            respawn_shell: target.prerequisites.respawn_shell.clone(),
+            ..prerequisites
+        };
+    }
+
+    /// A refused preflight: failed, its reason given, and nothing at all
+    /// done to the pane: no key, no signal, not even keeping it open.
+    fn refused(io: &FakeIo, target: &Target, why: &str) {
+        let (result, log, halted) = run(io, target, &launch(), None, &mut NoObserver);
+        let Err(Refusal::Failed(note)) = result else {
+            panic!("a missing prerequisite must refuse, got {result:?}");
+        };
+        assert!(note.starts_with("preflight_failed:"), "{note}");
+        assert!(note.contains(why), "{note}");
+        assert!(io.sent().is_empty(), "{:?}", io.sent());
+        assert!(log.is_empty());
+        assert!(halted.is_none());
+    }
+
+    fn env_file(path: &str, digest: Option<&str>) -> Prerequisites {
+        Prerequisites {
+            programs: vec![
+                (Stage::Shell, "sh".into()),
+                (Stage::Provider, "codex".into()),
+            ],
+            env_file: Some((path.into(), digest.map(str::to_owned))),
+            respawn_shell: None,
+        }
+    }
+
+    #[test]
+    fn a_missing_or_changed_env_file_refuses_before_anything() {
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        io.paths
+            .borrow_mut()
+            .insert("/acct/env".into(), PathFacts::Missing);
+        let mut target = target(AgentKind::Codex, false, false);
+        with(&mut target, env_file("/acct/env", Some("aa")));
+        refused(&io, &target, "env_file /acct/env: it is gone");
+        // There, but not the file the swap was planned with.
+        io.paths
+            .borrow_mut()
+            .insert("/acct/env".into(), file(false, None));
+        io.digests
+            .borrow_mut()
+            .insert("/acct/env".into(), "bb".into());
+        refused(&io, &target, "changed since the relaunch was built");
+        // Put back as planned: the same target goes through.
+        io.digests
+            .borrow_mut()
+            .insert("/acct/env".into(), "aa".into());
+        let (result, _, _) = run(&io, &target, &launch(), None, &mut NoObserver);
+        assert!(result.is_ok(), "{result:?}");
+    }
+
+    #[test]
+    fn a_directory_that_is_gone_refuses_before_anything() {
+        // A typed line runs where the pane's shell is now.
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        *io.shell_cwd.borrow_mut() = Some(super::super::io::ShellCwd {
+            path: "/gone (deleted)".into(),
+            removed: true,
+        });
+        refused(
+            &io,
+            &target(AgentKind::Codex, false, false),
+            "cwd /gone (deleted): the pane's shell is in a directory that was removed",
+        );
+        // A respawn starts where it is told to.
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        io.paths
+            .borrow_mut()
+            .insert("/work".into(), PathFacts::Missing);
+        refused(&io, &target(AgentKind::Codex, true, false), "cwd /work");
+    }
+
+    #[test]
+    fn a_respawn_runs_through_the_shell_it_checked() {
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        io.paths
+            .borrow_mut()
+            .insert("/bin/sh".into(), PathFacts::Missing);
+        refused(
+            &io,
+            &target(AgentKind::Codex, true, false),
+            "respawn_shell /bin/sh",
+        );
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        io.paths
+            .borrow_mut()
+            .insert("/opt/zsh".into(), file(true, None));
+        io.pane_pid.set(None);
+        let mut target = target(AgentKind::Codex, true, false);
+        target.prerequisites.respawn_shell = Some("/opt/zsh".into());
+        let _ = run(&io, &target, &launch(), None, &mut NoObserver);
+        let respawned = io.respawned.borrow();
+        assert_eq!(respawned.len(), 1);
+        assert!(respawned[0].contains("/opt/zsh"), "{respawned:?}");
+    }
+
+    /// A FIFO or device where a file should be is refused, never read.
+    #[test]
+    fn a_path_that_is_not_a_regular_file_is_refused() {
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        io.paths
+            .borrow_mut()
+            .insert("/acct/env".into(), PathFacts::Other);
+        let mut target = target(AgentKind::Codex, false, false);
+        with(&mut target, env_file("/acct/env", None));
+        refused(&io, &target, "not a regular file");
+    }
+
+    #[test]
+    fn a_program_named_by_path_must_run_with_its_interpreter() {
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        io.paths
+            .borrow_mut()
+            .insert("/tools/codex".into(), file(true, Some("/usr/bin/node")));
+        io.paths
+            .borrow_mut()
+            .insert("/usr/bin/node".into(), PathFacts::Missing);
+        let mut target = target(AgentKind::Codex, false, false);
+        with(
+            &mut target,
+            Prerequisites {
+                programs: vec![(Stage::Provider, "/tools/codex".into())],
+                ..Prerequisites::default()
+            },
+        );
+        refused(&io, &target, "interpreter /usr/bin/node cannot run");
+        io.paths
+            .borrow_mut()
+            .insert("/tools/codex".into(), file(false, None));
+        refused(&io, &target, "not executable");
+    }
+
+    /// What is found through the pane's own PATH is not certified, and not
+    /// refused: it is recorded as unknown and the swap goes on as before.
+    #[test]
+    fn a_program_found_on_the_pane_path_is_unknown_not_refused() {
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        let mut target = target(AgentKind::Codex, false, false);
+        with(
+            &mut target,
+            Prerequisites {
+                programs: vec![
+                    (Stage::Wrapper, "aas".into()),
+                    (Stage::Provider, "codex".into()),
+                ],
+                ..Prerequisites::default()
+            },
+        );
+        let mut observer = NoObserver;
+        let runner = Runner::new(&io, &mut observer);
+        let verified = |_: &Target, _: Option<u32>| {
+            Ok(AccountVerdict {
+                check: AccountCheck::Matched,
+                observed: Some("b".into()),
+                source: "test",
+                note: String::new(),
+            })
+        };
+        execute(&runner, &target, &launch(), "RELAUNCH", None, &verified).unwrap();
+        let observations = runner.observations();
+        let Observation::Preflight { checks } = &observations[0] else {
+            panic!("no preflight first: {observations:?}");
+        };
+        let verdicts: Vec<_> = checks
+            .iter()
+            .map(|check| (check.name.as_str(), check.verdict))
+            .collect();
+        assert_eq!(
+            verdicts,
+            [
+                ("cwd", Verdict::Unknown),
+                ("wrapper", Verdict::Unknown),
+                ("provider", Verdict::Unknown),
+            ]
+        );
+    }
+
+    /// A preflight that cannot be journalled stops everything, too.
+    #[test]
+    fn an_unrecorded_preflight_does_nothing() {
+        struct NoPreflight;
+        impl EffectObserver for NoPreflight {
+            fn before(&mut self, _: &Effect) -> Result<(), ObserverError> {
+                Ok(())
+            }
+            fn after(&mut self, _: &Effect, _: Transport) -> Result<(), ObserverError> {
+                Ok(())
+            }
+            fn observe(&mut self, observation: &Observation) -> Result<(), ObserverError> {
+                match observation {
+                    Observation::Preflight { .. } => Err(ObserverError("journal full".into())),
+                    _ => Ok(()),
+                }
+            }
+        }
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        let (result, log, halted) = run(
+            &io,
+            &target(AgentKind::Codex, true, false),
+            &launch(),
+            None,
+            &mut NoPreflight,
+        );
+        assert!(result.is_err());
+        assert!(halted.is_some());
+        assert!(io.sent().is_empty(), "{:?}", io.sent());
+        assert!(log.is_empty());
+    }
 }

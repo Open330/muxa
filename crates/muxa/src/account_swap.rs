@@ -17,6 +17,7 @@ pub(crate) mod effects;
 #[cfg(test)]
 mod executor_tests;
 mod io;
+pub(crate) mod preflight;
 
 use crate::backend::SharedBackend;
 use crate::event::{AgentKind, AgentState};
@@ -1315,6 +1316,59 @@ mod retry_tests {
 }
 
 #[cfg(test)]
+mod prerequisite_tests {
+    use super::*;
+
+    /// An `aas` line names its wrapper as it ran and leaves the provider
+    /// to `aas`; a configured account's line runs `sh` for its `env_file`,
+    /// `env` for its variables, then the provider, its file digested.
+    #[test]
+    fn a_relaunch_names_what_it_runs() {
+        let line = LaunchLine {
+            tokens: [
+                "/opt/bin/aas",
+                "e",
+                "a@claude",
+                "--dangerously-skip-permissions",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            account_at: Some(2),
+        };
+        let aas = aas_prerequisites(&line, AgentKind::ClaudeCode);
+        assert_eq!(
+            aas.programs,
+            [
+                (preflight::Stage::Wrapper, "/opt/bin/aas".to_owned()),
+                (preflight::Stage::Provider, "claude".to_owned()),
+            ]
+        );
+        assert!(aas.env_file.is_none());
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("work.env");
+        std::fs::write(&file, "TOKEN=x\n").unwrap();
+        let profile: crate::accounts::AccountProfile = toml::from_str(&format!(
+            "name = \"work\"\nenv_file = \"{}\"\nenv = {{ CLAUDE_CONFIG_DIR = \"/w\" }}\n",
+            file.display()
+        ))
+        .unwrap();
+        let bare = LaunchLine::bare("claude");
+        let profiled = profile_prerequisites(&bare, AgentKind::ClaudeCode, &profile);
+        assert_eq!(
+            profiled.programs,
+            [
+                (preflight::Stage::Shell, "sh".to_owned()),
+                (preflight::Stage::Env, "env".to_owned()),
+                (preflight::Stage::Provider, "claude".to_owned()),
+            ]
+        );
+        let (path, digest) = profiled.env_file.unwrap();
+        assert_eq!(path, file.to_str().unwrap());
+        assert_eq!(digest, io::file_digest(&path));
+    }
+}
+
+#[cfg(test)]
 mod resume_binding_tests {
     use super::*;
 
@@ -1999,8 +2053,9 @@ fn swap_one(
         }
     };
     outcome.to = Some(account.clone());
-    let command = match relaunch_command(request, planned, &account, profiles) {
-        Ok(command) => command,
+    let (command, mut prerequisites) = match relaunch_command(request, planned, &account, profiles)
+    {
+        Ok(built) => built,
         Err(note) => {
             outcome.note = note;
             return outcome;
@@ -2035,7 +2090,14 @@ fn swap_one(
             return outcome;
         }
     };
+    // The pane had no shell: the relaunch runs through the user's login
+    // shell, the one checked and the one respawned with.
+    if direct {
+        prerequisites.respawn_shell =
+            Some(std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()));
+    }
     let target = Target {
+        prerequisites,
         socket: target_socket(pane, agent),
         pane: pane.pane_id.clone(),
         pane_pid: std::cell::Cell::new(pane.pane_pid),
@@ -2225,7 +2287,7 @@ fn relaunch_command(
         &[crate::accounts::AccountProfile],
         &crate::accounts::ResolvedAccounts,
     )>,
-) -> Result<String, String> {
+) -> Result<(String, preflight::Prerequisites), String> {
     let Planned {
         agent,
         session_id,
@@ -2235,12 +2297,67 @@ fn relaunch_command(
     let provider = provider_name(agent.kind).unwrap_or_default();
     match profiles {
         Some((profiles, _)) => match crate::accounts::find_profile(profiles, provider, account) {
-            Some(profile) => profile_relaunch_line(&launch.line, agent.kind, session_id, profile),
+            Some(profile) => Ok((
+                profile_relaunch_line(&launch.line, agent.kind, session_id, profile)?,
+                profile_prerequisites(&launch.line, agent.kind, profile),
+            )),
             None => Err(format!(
                 "no account named {account} in [[accounts.{provider}]] (aas accounts are not used once a provider lists its own)"
             )),
         },
-        None => relaunch_line(&launch.line, agent.kind, session_id, account, request.bare),
+        None => Ok((
+            relaunch_line(&launch.line, agent.kind, session_id, account, request.bare)?,
+            aas_prerequisites(&launch.line, agent.kind),
+        )),
+    }
+}
+
+/// The programs an `aas e <account> …` relaunch runs: the wrapper as the
+/// line names it, then the provider it starts (resolved by `aas`).
+fn aas_prerequisites(line: &LaunchLine, kind: AgentKind) -> preflight::Prerequisites {
+    let provider = provider_name(kind).unwrap_or("claude").to_owned();
+    let (wrapper, frontend) = match line.account_at {
+        Some(at) => (
+            line.tokens.first().cloned().unwrap_or_else(|| "aas".into()),
+            line.tokens
+                .get(at + 1)
+                .filter(|word| matches!(word.as_str(), "claude" | "codex"))
+                .cloned(),
+        ),
+        None => ("aas".to_owned(), None),
+    };
+    preflight::Prerequisites {
+        programs: vec![
+            (preflight::Stage::Wrapper, wrapper),
+            (preflight::Stage::Provider, frontend.unwrap_or(provider)),
+        ],
+        ..preflight::Prerequisites::default()
+    }
+}
+
+/// The programs and file a configured account's relaunch uses, its
+/// `env_file` digested as it is now, to be compared right before the stop.
+fn profile_prerequisites(
+    line: &LaunchLine,
+    kind: AgentKind,
+    profile: &crate::accounts::AccountProfile,
+) -> preflight::Prerequisites {
+    let (program, _) = agent_program_and_args(line, kind);
+    let mut programs = Vec::new();
+    let env_file = profile.env_file.as_deref().map(|file| {
+        programs.push((preflight::Stage::Shell, "sh".to_owned()));
+        let path = crate::accounts::expand_home(file);
+        let digest = io::file_digest(&path);
+        (path, digest)
+    });
+    if !profile.env.is_empty() {
+        programs.push((preflight::Stage::Env, "env".to_owned()));
+    }
+    programs.push((preflight::Stage::Provider, program));
+    preflight::Prerequisites {
+        programs,
+        env_file,
+        respawn_shell: None,
     }
 }
 
@@ -2562,6 +2679,8 @@ struct Target {
     restore_draft: bool,
     /// The stopped agent's own arguments ran it in bypass-permissions mode.
     ran_with_bypass: bool,
+    /// What the relaunch needs, checked before anything is done.
+    prerequisites: preflight::Prerequisites,
 }
 
 /// Stop the agent, type `command` into the pane's shell, wait for the
@@ -2575,6 +2694,24 @@ fn execute(
     verify: &Verify<'_>,
 ) -> Result<String, Refusal> {
     let io = runner.io;
+    // Before any effect (keeping the pane open included): what the relaunch
+    // needs, journalled, and nothing done if any of it is not there.
+    let checks = preflight::run(
+        io,
+        &target.prerequisites,
+        target.direct,
+        &target.cwd,
+        target.pane_pid.get(),
+    );
+    let failed = preflight::failure(&checks);
+    if !runner.observe(Observation::Preflight { checks }) {
+        return Err(halt(runner));
+    }
+    if let Some(failed) = failed {
+        return Err(Refusal::Failed(format!(
+            "preflight_failed: {failed}; nothing was done to the agent"
+        )));
+    }
     let mut answered: Vec<&'static str> = Vec::new();
     // Clearing the prompt to quit loses what was half-typed there; it is
     // typed back once the agent is up again (or stays, if it is kept).
@@ -3445,8 +3582,13 @@ fn stop_agent(
 /// pane id, then follow the pane's new root process.
 fn relaunch_in_place(runner: &Runner, target: &Target, command: &str) -> Result<(), Refusal> {
     // The pane had no shell; run the relaunch through the user's login
-    // shell, which has the `PATH` the typed line would have had.
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into());
+    // shell, which has the `PATH` the typed line would have had: the very
+    // one its preflight checked.
+    let shell = target
+        .prerequisites
+        .respawn_shell
+        .clone()
+        .ok_or_else(|| Refusal::Failed("no shell to respawn the pane through".into()))?;
     let line =
         crate::shell::Dialect::native().command_line(&[shell, "-lic".into(), command.to_owned()]);
     if !runner.respawn(Purpose::Respawn, &target.cwd, &line) {
@@ -6102,9 +6244,129 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
             "{screen}"
         );
         assert!(screen.contains("GOT continue"), "{screen}");
+        // The follow-up went in, and something followed it.
         assert!(
-            outcome.note.contains("picked the turn back up"),
+            outcome
+                .follow_up
+                .as_ref()
+                .is_some_and(|f| f.submission == "delivered" && f.evidence.is_some()),
             "{outcome:?}"
+        );
+    }
+
+    /// A configured account whose `env_file` is gone refuses before the
+    /// agent is touched (it keeps running on its account); once the file is
+    /// there, the swap goes through it.
+    #[test]
+    #[ignore = "drives a private tmux server; run with --ignored"]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one live fixture, refused then swapped"
+    )]
+    fn a_live_swap_whose_env_file_is_gone_leaves_the_agent_running() {
+        use std::process::Command;
+        let _live = live_tmux();
+        let dir = std::env::temp_dir().join(format!("muxa-swap-pre-{}", std::process::id()));
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let claude = bin.join("claude");
+        crate::test_support::write_executable(
+            &claude,
+            format!(
+                "#!/bin/sh\n{}",
+                r#"trap '' INT
+echo "FAKE CLAUDE on $CLAUDE_CONFIG_DIR $*"
+echo '⏵⏵ bypass permissions on'
+while read line; do case "$line" in */exit*) echo EXITING; exit 0 ;; esac; echo "GOT $line"; echo '✻ Working… (1s · esc to interrupt)'; done
+"#
+            ),
+            0o755,
+        );
+        let socket = dir.join("tmux.sock");
+        let socket = socket.to_str().unwrap();
+        let tmux = |args: &[&str]| {
+            let out = Command::new(crate::tmux::tmux_binary())
+                .arg("-S")
+                .arg(socket)
+                .args(args)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        };
+        tmux(&[
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "160",
+            "-y",
+            "40",
+            "/bin/sh",
+        ]);
+        std::env::set_var("MUXA_TMUX_SOCKET", socket);
+        let pane = tmux(&["display-message", "-p", "#{pane_id}"]);
+        let sid = "6f1d1c0e-0000-4000-8000-00000000b22d";
+        let launch = format!(
+            "env CLAUDE_CONFIG_DIR=/acct/work {} --dangerously-skip-permissions fix it",
+            claude.display()
+        );
+        tmux(&["send-keys", "-t", &pane, &launch, "Enter"]);
+        std::thread::sleep(Duration::from_secs(1));
+        let env_file = dir.join("home.env");
+        let accounts = crate::accounts::AccountsConfig {
+            claude: vec![
+                account("work", "CLAUDE_CONFIG_DIR", "/acct/work"),
+                crate::accounts::AccountProfile {
+                    name: "home".into(),
+                    env: std::collections::BTreeMap::new(),
+                    env_file: Some(env_file.to_str().unwrap().to_owned()),
+                },
+            ],
+            codex: Vec::new(),
+        };
+        let mut capped = limited(&pane, sid);
+        capped.tmux_socket = None;
+        let mut request = request(SwapScope::Targets(vec![pane.clone()]));
+        request.to = AccountChoice::Named("home".into());
+        let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
+        let refused = run(
+            &request,
+            std::slice::from_ref(&capped),
+            std::slice::from_ref(&backend),
+            &SwapConfig::default(),
+            &accounts,
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        let untouched = tmux(&["capture-pane", "-p", "-t", &pane]);
+        // Now the file is there: the swap sources it.
+        std::fs::write(&env_file, "CLAUDE_CONFIG_DIR=/acct/home\n").unwrap();
+        let swapped = run(
+            &request,
+            &[capped],
+            &[backend],
+            &SwapConfig::default(),
+            &accounts,
+        );
+        let screen = tmux(&["capture-pane", "-p", "-t", &pane]);
+        tmux(&["kill-server"]);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let outcome = &refused[0];
+        assert_eq!(outcome.status, SwapStatus::Failed, "{outcome:?}");
+        assert!(
+            outcome.note.contains("preflight_failed: env_file"),
+            "{outcome:?}"
+        );
+        assert!(!untouched.contains("EXITING"), "{untouched}");
+        assert!(!untouched.contains("GOT"), "nothing was typed: {untouched}");
+        let outcome = &swapped[0];
+        assert_eq!(outcome.status, SwapStatus::Swapped, "{outcome:?}\n{screen}");
+        assert!(
+            screen.contains(&format!(
+                "FAKE CLAUDE on /acct/home --dangerously-skip-permissions --resume {sid}"
+            )),
+            "{screen}"
         );
     }
 
@@ -6289,8 +6551,12 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         assert!(screen.contains("TRUSTED"), "{screen}");
         assert!(outcome.note.contains("trusted the folder"), "{outcome:?}");
         assert!(screen.contains("GOT continue"), "{screen}");
+        // The follow-up went in, and something followed it.
         assert!(
-            outcome.note.contains("picked the turn back up"),
+            outcome
+                .follow_up
+                .as_ref()
+                .is_some_and(|f| f.submission == "delivered" && f.evidence.is_some()),
             "{outcome:?}"
         );
         assert_eq!(outcome.from.as_deref(), Some("e-ed@claude"));

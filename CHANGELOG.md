@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A swap checks what a target's relaunch needs before it touches the agent:
+  the directory it runs in, a configured account's `env_file` (a regular
+  file, unchanged since its relaunch was built), a directly-run pane's respawn shell (the one
+  then used), and programs named by absolute path with their interpreters.
+  A missing one fails that target with nothing done (`preflight_failed`),
+  instead of stopping an agent that cannot be relaunched; the checks are
+  journalled. Programs resolved through the pane's own PATH are recorded as
+  unknown, not certified.
+
 ## [0.9.4] - 2026-11-03
 
 ### Added
