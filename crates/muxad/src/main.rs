@@ -396,7 +396,7 @@ async fn run() -> Result<()> {
     // Daemon-owned swap jobs: automation swaps and `muxa swap` requests
     // run through them. Without them no swap runs at all — there is no
     // unjournalled path to fall back to.
-    let swap_service = open_swap_service(
+    let opened_swap = open_swap_service(
         store.clone(),
         backends.clone(),
         cfg.swap.clone(),
@@ -405,6 +405,13 @@ async fn run() -> Result<()> {
         collaboration.clone(),
     )
     .await;
+    // What IPC serves: the service, or the reason it did not open, so a
+    // health check can still say why.
+    let swap_jobs: Arc<dyn muxa::swap_service::SwapJobs> = match &opened_swap {
+        Ok(swap) => Arc::clone(&swap.service) as Arc<dyn muxa::swap_service::SwapJobs>,
+        Err(reason) => Arc::new(muxa::swap_service::UnopenedSwap::new(reason.clone())),
+    };
+    let swap_service = opened_swap.ok();
     // Automation engine. Subscribes to the same transition broadcast the
     // waker uses, so it must be spawned before the IPC server takes
     // ownership of `store`.
@@ -538,11 +545,7 @@ async fn run() -> Result<()> {
         .with_fleet(fleet_runtime)
         .with_pipeline_runs(pipeline_runs.clone())
         .with_mux_snapshots(mux_snapshots) // WS-F: snapshot
-        .with_swap(
-            swap_service
-                .as_ref()
-                .map(|swap| Arc::clone(&swap.service) as Arc<dyn muxa::swap_service::SwapJobs>),
-        )
+        .with_swap(Some(swap_jobs))
         .with_restart_controller(Arc::clone(&restart));
     let handle = tokio::spawn(server.run(shutdown_tx.subscribe()));
 
@@ -963,7 +966,7 @@ async fn open_swap_service(
     accounts: muxa::accounts::AccountsConfig,
     config_path: Option<std::path::PathBuf>,
     collaboration: Arc<CollaborationStore>,
-) -> Option<Arc<DaemonSwap>> {
+) -> Result<Arc<DaemonSwap>, String> {
     let runtime = tokio::runtime::Handle::current();
     let receipts = Arc::new(muxa::swap_service::PromptReceipts::new(
         store.prompt_sequence(),
@@ -993,14 +996,14 @@ async fn open_swap_service(
     })
     .await;
     match opened {
-        Ok(Ok(swap)) => Some(Arc::new(swap)),
+        Ok(Ok(swap)) => Ok(Arc::new(swap)),
         Ok(Err(error)) => {
             tracing::warn!(%error, "swap jobs disabled");
-            None
+            Err(error)
         }
         Err(error) => {
             tracing::warn!(%error, "swap jobs disabled: could not open their store");
-            None
+            Err(format!("could not open the swap job store: {error}"))
         }
     }
 }

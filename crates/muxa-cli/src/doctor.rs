@@ -61,6 +61,8 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
         for result in check_collaboration(&socket).await {
             add(&mut report, "muxad", None, result);
         }
+        // Its own check: an earlier verdict on muxad never hides it.
+        add(&mut report, "muxad", None, check_swap(&socket).await);
     }
     add(&mut report, "muxad", None, check_service_manager());
     add(&mut report, "muxad", None, check_unit_file());
@@ -300,6 +302,80 @@ fn muxad_hello_verdict(hello: &muxa::ipc::Hello, socket: &Path) -> CheckResult {
         return CheckResult::Warn("muxad lacks collaboration_worker_spawn_v1; automatic worker creation is disabled — upgrade/restart muxad".into());
     }
     CheckResult::Ok(format!("muxad responding at {}", socket.display()))
+}
+
+/// Whether the daemon's swap service takes jobs, and if not why: read-only,
+/// bounded, and never a plan.
+async fn check_swap(socket: &Path) -> CheckResult {
+    let client = Client::new(socket.to_path_buf());
+    let probe = async {
+        let hello = client.hello(Duration::from_millis(1500)).await?;
+        let has = |name: &str| hello.capabilities.iter().any(|c| c == name);
+        if !has(muxa::ipc::SWAP_SERVICE_CAPABILITY) {
+            return Ok(Probe::NotOffered);
+        }
+        if !has(muxa::ipc::SWAP_HEALTH_CAPABILITY) {
+            return Ok(Probe::NoHealth);
+        }
+        client.swap_health().await.map(Probe::Health)
+    };
+    match timeout(Duration::from_millis(3000), probe).await {
+        Ok(Ok(probe)) => swap_verdict(&probe),
+        Ok(Err(error)) => CheckResult::Warn(format!("swap jobs: health unknown ({error})")),
+        Err(_) => CheckResult::Warn("swap jobs: health check did not answer within 3 s".into()),
+    }
+}
+
+/// What asking the daemon about swap jobs found.
+enum Probe {
+    /// A daemon from before swap jobs.
+    NotOffered,
+    /// Swap jobs, but no health endpoint: an older daemon.
+    NoHealth,
+    Health(muxa::swap_service::SwapHealth),
+}
+
+fn swap_verdict(probe: &Probe) -> CheckResult {
+    use muxa::swap_service::SwapReadiness;
+    let health = match probe {
+        Probe::NotOffered => {
+            return CheckResult::Ok(
+                "swap jobs: not offered by this daemon (swaps run in the CLI)".into(),
+            );
+        }
+        Probe::NoHealth => {
+            return CheckResult::Warn(
+                "swap jobs: muxad predates swap health checks — upgrade/restart muxad".into(),
+            );
+        }
+        Probe::Health(health) => health,
+    };
+    let reason = health.reason.as_deref().unwrap_or("no reason given");
+    match health.readiness {
+        SwapReadiness::Ready => CheckResult::Ok(format!(
+            "swap jobs: taking jobs (store schema {}, {} running)",
+            health
+                .schema
+                .map_or_else(|| "?".to_owned(), |schema| schema.to_string()),
+            health.jobs_running
+        )),
+        SwapReadiness::Draining => {
+            CheckResult::Warn(format!("swap jobs: shutting down ({reason})"))
+        }
+        SwapReadiness::Halted => CheckResult::Warn(format!(
+            "swap jobs: halted by a fault — {reason}; restart muxad once it is understood"
+        )),
+        SwapReadiness::Unavailable => CheckResult::Warn(format!(
+            "swap jobs: unavailable — {reason}{}",
+            match health.schema {
+                Some(schema) if schema != health.expected_schema => format!(
+                    " (store schema {schema}, this build reads {})",
+                    health.expected_schema
+                ),
+                _ => String::new(),
+            }
+        )),
+    }
 }
 
 /// One-shot snapshot fetch shared by the post-IPC checks. Returns
@@ -1245,6 +1321,64 @@ fn uid_string() -> String {
 
 #[cfg(test)]
 mod tests {
+    fn health(
+        readiness: muxa::swap_service::SwapReadiness,
+        reason: Option<&str>,
+        schema: Option<i64>,
+    ) -> Probe {
+        Probe::Health(muxa::swap_service::SwapHealth {
+            readiness,
+            reason: reason.map(str::to_owned),
+            schema,
+            expected_schema: 2,
+            fault: None,
+            jobs_running: 1,
+        })
+    }
+
+    /// Every state the swap service can be in gets its own verdict; only a
+    /// service taking jobs (or no service at all) is OK.
+    #[test]
+    fn the_swap_verdict_names_each_state() {
+        use muxa::swap_service::SwapReadiness::{Draining, Halted, Ready, Unavailable};
+        let text = |result: &CheckResult| match result {
+            CheckResult::Ok(t) | CheckResult::Warn(t) | CheckResult::Fail(t) => t.clone(),
+        };
+        let ok = swap_verdict(&health(Ready, None, Some(2)));
+        assert!(
+            matches!(&ok, CheckResult::Ok(t) if t.contains("taking jobs") && t.contains("1 running"))
+        );
+        assert!(matches!(
+            swap_verdict(&Probe::NotOffered),
+            CheckResult::Ok(_)
+        ));
+        assert!(text(&swap_verdict(&Probe::NoHealth)).contains("predates"));
+        for (probe, word) in [
+            (
+                health(Draining, Some("shutting down"), Some(2)),
+                "shutting down",
+            ),
+            (
+                health(Halted, Some("journal full"), Some(2)),
+                "journal full",
+            ),
+            (
+                health(Unavailable, Some("owned by another live manager"), None),
+                "another live manager",
+            ),
+        ] {
+            let verdict = swap_verdict(&probe);
+            assert!(
+                matches!(verdict, CheckResult::Warn(_)),
+                "{}",
+                text(&verdict)
+            );
+            assert!(text(&verdict).contains(word), "{}", text(&verdict));
+        }
+        let skewed = swap_verdict(&health(Unavailable, Some("store schema too new"), Some(9)));
+        assert!(text(&skewed).contains("store schema 9, this build reads 2"));
+    }
+
     use super::*;
 
     #[test]
