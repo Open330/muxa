@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A swap answers a relaunched agent's startup dialog only when the screen ends
+  in that dialog (its footer, not the agent's own prompt) and only for the
+  process resuming the planned conversation; a dialog's words quoted above the
+  composer no longer get keys typed into it. A menu is read by its own rows (the
+  run at its cursor's column right above its footer); one that could answer
+  two dialogs is left alone. Claude's bypass-permissions warning is accepted
+  only when the stopped agent's own arguments carry
+  `--dangerously-skip-permissions` as an option and the relaunched process's
+  do too, and trusting a folder's settings is never done for the user: the
+  swap stops there and types nothing.
+
 ### Added
 
 - `muxa swap --cancel <key>` stops a daemon swap job at its next target

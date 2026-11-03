@@ -2051,6 +2051,10 @@ fn swap_one(
         conversation_verified: *verified,
         evidence: request.continue_evidence,
         restore_draft: request.restore_draft,
+        ran_with_bypass: claude_switch(
+            crate::process_snapshot::process_argv(launch.agent_pid).as_deref(),
+            BYPASS_SWITCH,
+        ),
     };
     // The relaunch must land on the account it was meant for, checked before
     // any follow-up starts work on the wrong one.
@@ -2556,6 +2560,8 @@ struct Target {
     evidence: ContinueEvidence,
     /// Whether the captured draft may be put back at all.
     restore_draft: bool,
+    /// The stopped agent's own arguments ran it in bypass-permissions mode.
+    ran_with_bypass: bool,
 }
 
 /// Stop the agent, type `command` into the pane's shell, wait for the
@@ -2825,6 +2831,16 @@ fn observed(
     }
 }
 
+/// The arguments of the one relaunched process bound to the conversation.
+fn bound_argv(io: &dyn io::SwapIo, target: &Target) -> Option<Vec<String>> {
+    let candidates = io.agent_argvs(target.pane_pid.get());
+    let pid = resume_binding(&candidates, target.kind, &target.session_id).pid()?;
+    candidates
+        .into_iter()
+        .find(|(candidate, _)| *candidate == pid)
+        .and_then(|(_, argv)| argv)
+}
+
 /// What the relaunched agent's own arguments say about the conversation it
 /// resumed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3069,12 +3085,26 @@ fn await_ready(
         || io.capture(),
         || io.agent_running(target.pane_pid.get()),
         |keys| {
+            // Only into the relaunch itself: the one process resuming this
+            // conversation, so a dialog on the screen is that agent's.
+            if bound_argv(io, target).is_none() {
+                return false;
+            }
             let group = runner.group();
             type_keys(
                 io,
                 |key| runner.send_text(group, Purpose::StartupDialog, key),
                 keys,
             )
+        },
+        // Bypass mode is kept only if the stopped agent ran with it and the
+        // relaunch bound to the conversation does too; a folder's settings
+        // are never trusted for the user.
+        &|consent| {
+            consent == Consent::Bypass
+                && target.ran_with_bypass
+                && bound_argv(io, target)
+                    .is_some_and(|argv| claude_switch(Some(&argv), BYPASS_SWITCH))
         },
         READY_TIMEOUT,
         READY_QUIET,
@@ -3778,6 +3808,7 @@ fn wait_for_resume(
         capture,
         alive,
         |_| false,
+        &|_| false,
         timeout,
         quiet,
         tick,
@@ -3796,6 +3827,7 @@ fn wait_for_resume_answering(
     mut capture: impl FnMut() -> Option<String>,
     mut alive: impl FnMut() -> bool,
     mut answer: impl FnMut(&[&str]) -> bool,
+    granted: &dyn Fn(Consent) -> bool,
     timeout: Duration,
     quiet: Duration,
     tick: Duration,
@@ -3822,6 +3854,17 @@ fn wait_for_resume_answering(
                 continue;
             }
             if let Some(dialog) = pending_dialog(&last, STARTUP_DIALOGS, answered) {
+                // Agreeing for the user needs evidence; a dialog drawn by an
+                // agent that is gone is a stale screen.
+                if dialog.consent != Consent::None && !granted(dialog.consent) {
+                    return Resume::Blocked(format!(
+                        "a startup dialog needs your answer ({}); nothing was typed",
+                        dialog.label
+                    ));
+                }
+                if !alive() {
+                    return Resume::Exited;
+                }
                 if dialog.keys_on(&last).is_some_and(|keys| answer(&keys)) {
                     answered.push(dialog.label);
                     // The answer redraws the screen; wait for it to settle again.
@@ -4003,12 +4046,35 @@ struct Dialog {
     /// The row to choose, reached from wherever the dialog's `❯` cursor
     /// sits: Claude orders and focuses some confirm rows case by case.
     pick: Option<&'static str>,
+    /// For a dialog answered with fixed keys: a row its own menu must show,
+    /// or a word its own last lines must show. With neither (and no
+    /// `pick`), muxa cannot tell it is the dialog on screen now, and it is
+    /// never answered.
+    row: Option<&'static str>,
+    footer: Option<&'static str>,
     /// Named in the report.
     label: &'static str,
     /// How many times one swap may answer it.
     max: usize,
     /// Time for the agent to act on the answer before the screen is read again.
     pause: Duration,
+    /// What answering it agrees to on the user's behalf, if anything.
+    consent: Consent,
+}
+
+/// A startup answer that agrees to something for the user. Only given with
+/// evidence the agent already ran that way; otherwise the swap stops at the
+/// dialog and types nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Consent {
+    /// Nothing is agreed to (a tour dismissed, an update skipped).
+    None,
+    /// Bypass-permissions mode: only when the stopped agent ran with it and
+    /// the relaunch keeps it.
+    Bypass,
+    /// Trusting a folder's settings (tools, hooks): never on the user's
+    /// behalf.
+    Settings,
 }
 
 /// Down arrow and Enter, as typed into a pane. A dialog's keys go one at a
@@ -4025,27 +4091,132 @@ impl Dialog {
     /// The keys that answer this dialog as `screen` draws it, or `None` when
     /// muxa cannot tell which row a key would pick.
     fn keys_on(&self, screen: &str) -> Option<Vec<&'static str>> {
-        let picked = self.pick.and_then(|row| {
-            let tail = screen_tail(screen, DIALOG_TAIL_LINES);
-            let lines: Vec<&str> = tail.lines().map(str::trim).collect();
-            let target = lines.iter().position(|l| {
-                l.trim_start_matches('❯')
-                    .trim_start()
-                    .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
-                    .trim_start()
-                    == row
-            })?;
-            // The dialog's own cursor, not a prompt mark further up.
-            let cursor = (0..lines.len())
-                .filter(|&i| lines[i].starts_with('❯'))
-                .min_by_key(|&i| i.abs_diff(target))?;
-            let step = if target > cursor { DOWN } else { UP };
-            let mut keys = vec![step; target.abs_diff(cursor)];
-            keys.push(ENTER);
-            Some(keys)
-        });
-        picked.or_else(|| (!self.keys.is_empty()).then(|| self.keys.to_vec()))
+        let Some(row) = self.pick else {
+            return (!self.keys.is_empty()).then(|| self.keys.to_vec());
+        };
+        // Only the current menu's own rows: a row's text further up (a
+        // quoted warning, an earlier dialog) is not one of its options.
+        let (rows, cursor) = option_rows(screen)?;
+        let target = rows.iter().position(|line| names(line, row))?;
+        let step = if target > cursor { DOWN } else { UP };
+        let mut keys = vec![step; target.abs_diff(cursor)];
+        keys.push(ENTER);
+        Some(keys)
     }
+}
+
+/// Claude's switch for bypass-permissions mode.
+const BYPASS_SWITCH: &str = "--dangerously-skip-permissions";
+
+/// Whether a Claude process's own arguments (lossless, as the process holds
+/// them) carry `switch` as an option of its own: not inside a prompt, not
+/// as another option's value, not after `--`. Unreadable is no.
+pub(crate) fn claude_switch(argv: Option<&[String]>, switch: &str) -> bool {
+    let Some(argv) = argv else {
+        return false;
+    };
+    let Some(program) = argv
+        .iter()
+        .take(2)
+        .position(|word| crate::discovery::classify_command(word) == Some(AgentKind::ClaudeCode))
+    else {
+        return false;
+    };
+    let mut words = argv[program + 1..].iter().map(String::as_str);
+    while let Some(word) = words.next() {
+        if word == "--" {
+            return false;
+        }
+        if word == switch {
+            return true;
+        }
+        if CLAUDE_VALUE_OPTIONS.contains(&word) {
+            words.next();
+        }
+    }
+    false
+}
+
+/// Whether a menu row is `label`: exactly, or followed by its description
+/// (`Keep worktree    Stays at …`, `Use session directory (/x)`).
+fn names(row: &str, label: &str) -> bool {
+    row == label
+        || row
+            .strip_prefix(label)
+            .is_some_and(|rest| rest.starts_with(' '))
+}
+
+/// How many lines above a dialog's footer can be its option rows.
+const OPTION_ROWS: usize = 6;
+
+/// The current dialog's options, and which one its cursor is on: the
+/// contiguous rows around its one cursor (`❯`/`›`) that start at the cursor
+/// row's text column, ending directly above the dialog's own footer.
+/// Explanatory text, a quoted earlier dialog, or a second cursor make it
+/// `None`: muxa cannot tell which menu a key would move in.
+fn option_rows(screen: &str) -> Option<(Vec<String>, usize)> {
+    if !dialog_is_active(screen) {
+        return None;
+    }
+    let lines: Vec<&str> = screen
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let footer = lines.iter().rposition(|line| {
+        let line = line.to_lowercase();
+        QUESTION_FOOTERS.iter().any(|footer| line.contains(footer))
+    })?;
+    let window = &lines[footer.saturating_sub(OPTION_ROWS)..footer];
+    let is_cursor = |line: &str| line.trim_start().starts_with(['❯', '›']);
+    let mut cursors = (0..window.len()).filter(|&i| is_cursor(window[i]));
+    let cursor = cursors.next()?;
+    if cursors.next().is_some() {
+        return None;
+    }
+    let indent = |line: &str| line.chars().take_while(|c| *c == ' ').count();
+    let marked = window[cursor];
+    let after_marker = marked
+        .trim_start()
+        .chars()
+        .skip(1)
+        .take_while(|c| *c == ' ')
+        .count();
+    let column = indent(marked) + 1 + after_marker;
+    let is_row = |line: &str| !is_cursor(line) && indent(line) == column;
+    let mut first = cursor;
+    while first > 0 && is_row(window[first - 1]) {
+        first -= 1;
+    }
+    let mut last = cursor;
+    while last + 1 < window.len() && is_row(window[last + 1]) {
+        last += 1;
+    }
+    // The menu runs down to the footer; anything after it is not a menu.
+    if last + 1 != window.len() || first == last {
+        return None;
+    }
+    let text = |line: &str| {
+        line.trim_start()
+            .trim_start_matches(['❯', '›'])
+            .trim_start()
+            .trim_start_matches(|c: char| c.is_ascii_digit() || c == '.')
+            .trim_start()
+            .to_owned()
+    };
+    Some((
+        window[first..=last].iter().map(|line| text(line)).collect(),
+        cursor - first,
+    ))
+}
+
+/// Whether the screen ends in a dialog still waiting for an answer, and not
+/// in the agent's own prompt (whose mode line can quote a dialog's words).
+fn dialog_is_active(screen: &str) -> bool {
+    open_question(screen).is_some()
+        && !PROMPT_MARKS
+            .iter()
+            .any(|mark| screen_tail(screen, 2).contains(mark))
 }
 
 /// Type `keys` one by one, [`KEY_GAP`] apart. `false` if any could not be.
@@ -4071,9 +4242,12 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Yes, I trust this folder", "Enter to confirm"],
         keys: &[DOWN, ENTER],
         pick: Some("Yes, I trust this folder"),
+        row: None,
+        footer: None,
         label: "trusted the folder",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::None,
     },
     // Claude, when the folder's settings pre-approve tools or hooks. Its row
     // order and focus vary, so the cursor decides the keys.
@@ -4081,9 +4255,12 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Yes, I trust these settings", "Enter to confirm"],
         keys: &[],
         pick: Some("Yes, I trust these settings"),
-        label: "trusted the folder's settings",
+        row: None,
+        footer: None,
+        label: "trust the folder's settings",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::Settings,
     },
     // Claude, relaunched with --dangerously-skip-permissions on a profile
     // that has not accepted it yet; the old process already ran that way.
@@ -4091,17 +4268,23 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Yes, I accept", "Bypass Permissions mode"],
         keys: &[DOWN, ENTER],
         pick: Some("Yes, I accept"),
+        row: None,
+        footer: None,
         label: "accepted bypass-permissions mode",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::Bypass,
     },
     Dialog {
         needles: &["Teach auto mode", "Enter to confirm"],
-        keys: &[DOWN, ENTER],
+        keys: &[],
         pick: None,
+        row: None,
+        footer: None,
         label: "dismissed the auto-mode tour",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::None,
     },
     // Codex, when a newer release is out: "1. Update now" is the default
     // row; Esc skips without installing anything.
@@ -4109,36 +4292,48 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Update available", "Skip until next version"],
         keys: &[ESC],
         pick: None,
+        row: Some("Update now"),
+        footer: None,
         label: "skipped the Codex update prompt",
         // Once: a second Esc on Codex's composer opens its backtrack view.
         max: 1,
         pause: Duration::from_millis(800),
+        consent: Consent::None,
     },
     // Codex: "1. Trust and continue" is the default row.
     Dialog {
         needles: &["Trust this folder", "Trust and continue"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Trust and continue"),
+        row: None,
+        footer: None,
         label: "trusted the folder",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::None,
     },
     // Codex: the conversation's own last directory is the default row.
     Dialog {
         needles: &["Working directory · resume", "Use session directory"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Use session directory"),
+        row: None,
+        footer: None,
         label: "kept the session directory",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::None,
     },
     Dialog {
         needles: &["1. Resume goal", "enter select"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Resume goal"),
+        row: None,
+        footer: None,
         label: "resumed the paused goal",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::None,
     },
     // Codex: the old process's app-server can still hold the thread for a
     // few seconds after it exits.
@@ -4146,9 +4341,12 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["open in another app", "r to retry"],
         keys: &["r"],
         pick: None,
+        row: None,
+        footer: Some("f fork"),
         label: "retried a conversation another app still held",
         max: 5,
         pause: Duration::from_secs(3),
+        consent: Consent::None,
     },
 ];
 
@@ -4158,18 +4356,24 @@ const EXIT_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Move to background and exit", "Enter to confirm"],
         keys: &[DOWN, ENTER],
-        pick: None,
+        pick: Some("Move to background and exit"),
+        row: None,
+        footer: None,
         label: "moved background work out of the way",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::None,
     },
     Dialog {
         needles: &["Keep worktree", "Enter to confirm"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Keep worktree"),
+        row: None,
+        footer: None,
         label: "kept the worktree",
         max: 1,
         pause: Duration::from_millis(500),
+        consent: Consent::None,
     },
 ];
 
@@ -4179,9 +4383,36 @@ fn pending_dialog<'a>(
     table: &'a [Dialog],
     answered: &[&'static str],
 ) -> Option<&'a Dialog> {
+    if !dialog_is_active(screen) {
+        return None;
+    }
     let tail = screen_tail(screen, DIALOG_TAIL_LINES);
+    let options = option_rows(screen)
+        .map(|(rows, _)| rows)
+        .unwrap_or_default();
+    let offers = |dialog: &Dialog| {
+        dialog
+            .pick
+            .is_some_and(|row| options.iter().any(|o| names(o, row)))
+    };
+    // Which dialog this is, shown by the dialog itself: its row in the
+    // current menu, or its own words on its last lines. Words further up
+    // (an earlier dialog, the conversation) prove nothing.
+    let current = |dialog: &Dialog| match (dialog.pick, dialog.row, dialog.footer) {
+        (Some(_), _, _) => offers(dialog),
+        (None, Some(row), _) => options.iter().any(|o| names(o, row)),
+        (None, None, Some(word)) => screen_tail(screen, 2).contains(word),
+        // Nothing to tell it by: matched only to be named, never answered.
+        (None, None, None) => true,
+    };
+    // A menu whose rows answer two dialogs (a folder trust and a settings
+    // trust) is not one muxa can tell apart: none.
+    if table.iter().filter(|dialog| offers(dialog)).count() > 1 {
+        return None;
+    }
     table.iter().find(|dialog| {
         dialog.needles.iter().all(|needle| tail.contains(needle))
+            && current(dialog)
             && answered
                 .iter()
                 .filter(|label| **label == dialog.label)
@@ -4216,6 +4447,8 @@ const QUESTION_FOOTERS: &[&str] = &[
     "enter select",
     "enter continue",
     "r to retry",
+    // Codex's lock screen: `r retry   f fork   esc/⌃c/q exit`.
+    "r retry",
 ];
 
 /// The footer line of a dialog still waiting for an answer, if any. A
@@ -4412,6 +4645,7 @@ mod tests {
                 }
                 can_answer
             },
+            &|consent| consent == Consent::Bypass,
             Duration::from_secs(10),
             Duration::from_millis(20),
             Duration::from_millis(5),
@@ -4463,6 +4697,7 @@ mod tests {
                 keys.borrow_mut().push(k.concat());
                 true
             },
+            &|consent| consent == Consent::Bypass,
             Duration::from_secs(10),
             Duration::from_millis(20),
             Duration::from_millis(5),
@@ -4494,38 +4729,195 @@ mod tests {
         assert_eq!(keys, vec!["\x1b[B\r".to_owned()]);
     }
 
+    /// Drive readiness over `before` (then `after` once answered) with the
+    /// consents `granted` and an agent that is `alive`.
+    fn answering_with(
+        before: &str,
+        after: &str,
+        granted: &[Consent],
+        alive: bool,
+    ) -> (Resume, Vec<&'static str>, Vec<String>) {
+        let keys = std::cell::RefCell::new(Vec::<String>::new());
+        let mut answered = Vec::new();
+        let resume = wait_for_resume_answering(
+            &io::RealClock,
+            || {
+                Some(
+                    if keys.borrow().is_empty() {
+                        before
+                    } else {
+                        after
+                    }
+                    .to_owned(),
+                )
+            },
+            || alive,
+            |k| {
+                keys.borrow_mut().push(k.concat());
+                true
+            },
+            &|consent| granted.contains(&consent),
+            Duration::from_secs(10),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            &mut answered,
+        );
+        (resume, answered, keys.into_inner())
+    }
+
+    /// Trusting a folder's settings is never done for the user: the swap
+    /// stops at it with nothing typed, wherever its cursor sits.
     #[test]
-    fn claudes_settings_trust_is_answered_from_wherever_its_cursor_sits() {
+    fn claudes_settings_trust_is_left_to_the_user() {
         let cancel_first = " This folder pre-approves 2 tool permissions in .claude/settings.json:\n \
             ❯ No, exit Claude Code\n   Yes, I trust these settings\n Enter to confirm · Esc to cancel\n";
         let confirm_first = " This folder pre-approves 2 tool permissions in .claude/settings.json:\n \
             ❯ Yes, I trust these settings\n   No, exit Claude Code\n Enter to confirm · Esc to cancel\n";
-        for (screen, keys) in [
-            (cancel_first, vec![DOWN, ENTER]),
-            (confirm_first, vec![ENTER]),
-        ] {
+        for screen in [cancel_first, confirm_first] {
             let dialog = pending_dialog(screen, STARTUP_DIALOGS, &[]).expect("settings dialog");
-            assert_eq!(dialog.label, "trusted the folder's settings");
-            assert_eq!(dialog.keys_on(screen), Some(keys));
+            assert_eq!(dialog.consent, Consent::Settings);
+            let (resume, answered, keys) =
+                answering_with(screen, CLAUDE_READY, &[Consent::Bypass], true);
+            assert!(
+                matches!(&resume, Resume::Blocked(r) if r.contains("needs your answer")),
+                "{resume:?}"
+            );
+            assert!(answered.is_empty() && keys.is_empty(), "{keys:?}");
         }
-        // No cursor to start from: refuse rather than guess a row.
+        // The cursor still decides the keys where an answer is allowed.
+        let dialog = pending_dialog(cancel_first, STARTUP_DIALOGS, &[]).unwrap();
+        assert_eq!(dialog.keys_on(cancel_first), Some(vec![DOWN, ENTER]));
         let bare = cancel_first.replace('❯', " ");
-        let dialog = pending_dialog(&bare, STARTUP_DIALOGS, &[]).unwrap();
         assert_eq!(dialog.keys_on(&bare), None);
-        let (resume, _, keys) = answering(confirm_first, CLAUDE_READY, 1, true);
-        assert_eq!(resume, Resume::Ready);
-        assert_eq!(keys, vec!["\r".to_owned()]);
     }
 
+    const BYPASS_WARNING: &str = " WARNING: Claude Code running in Bypass Permissions mode\n \
+        In Bypass Permissions mode, Claude Code will not ask for your approval.\n \
+        ❯ No, exit\n   Yes, I accept\n Enter to confirm · Esc to cancel\n";
+
+    /// Bypass-permissions mode is accepted only with the evidence that the
+    /// stopped agent already ran that way.
     #[test]
-    fn claudes_bypass_permissions_warning_is_accepted() {
-        let warning = " WARNING: Claude Code running in Bypass Permissions mode\n \
-            In Bypass Permissions mode, Claude Code will not ask for your approval.\n \
-            ❯ No, exit\n   Yes, I accept\n Enter to confirm · Esc to cancel\n";
-        let (resume, answered, keys) = answering(warning, CLAUDE_READY, 1, true);
+    fn claudes_bypass_permissions_warning_is_accepted_only_with_evidence() {
+        let (resume, answered, keys) =
+            answering_with(BYPASS_WARNING, CLAUDE_READY, &[Consent::Bypass], true);
         assert_eq!(resume, Resume::Ready);
         assert_eq!(answered, vec!["accepted bypass-permissions mode"]);
         assert_eq!(keys, vec!["\x1b[B\r".to_owned()]);
+        let (resume, _, keys) = answering_with(BYPASS_WARNING, CLAUDE_READY, &[], true);
+        assert!(matches!(resume, Resume::Blocked(r) if r.contains("needs your answer")));
+        assert!(keys.is_empty());
+        // The evidence: the switch as an option of the process's own.
+        let argv = |words: &[&str]| words.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let has = |words: &[&str]| claude_switch(Some(&argv(words)), BYPASS_SWITCH);
+        assert!(has(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--resume",
+            "x"
+        ]));
+        assert!(has(&[
+            "/x/claude",
+            "--model",
+            "opus",
+            "--dangerously-skip-permissions"
+        ]));
+        // Prompt text, another option's value, after `--`, another program,
+        // or unreadable: no.
+        assert!(!has(&[
+            "claude",
+            "explain --dangerously-skip-permissions safely"
+        ]));
+        assert!(!has(&[
+            "claude",
+            "--append-system-prompt",
+            "--dangerously-skip-permissions",
+            "--resume",
+            "x"
+        ]));
+        assert!(!has(&["claude", "--", "--dangerously-skip-permissions"]));
+        assert!(!has(&["aas", "e", "b", "--dangerously-skip-permissions"]));
+        assert!(!claude_switch(None, BYPASS_SWITCH));
+    }
+
+    /// A dialog's words quoted above the agent's own prompt are not a
+    /// dialog: no key goes into the composer (reproduced by the Codex peer
+    /// on #344, which typed Up and Enter here).
+    #[test]
+    fn dialog_words_above_the_composer_are_not_a_dialog() {
+        let quoted = "Earlier explanation of a warning:\nBypass Permissions mode\nYes, I accept\n\
+            ❯ half typed draft\n⏵⏵ bypass permissions on (shift+tab to cycle)\n? for shortcuts\n";
+        assert!(pending_dialog(quoted, STARTUP_DIALOGS, &[]).is_none());
+        let dialog = STARTUP_DIALOGS
+            .iter()
+            .find(|d| d.consent == Consent::Bypass)
+            .unwrap();
+        assert_eq!(dialog.keys_on(quoted), None);
+        let (_, answered, keys) = answering_with(quoted, quoted, &[Consent::Bypass], true);
+        assert!(answered.is_empty() && keys.is_empty(), "{keys:?}");
+    }
+
+    /// A menu whose rows answer two dialogs, or whose row is only quoted
+    /// above it, is never answered: the settings gate cannot be lost to an
+    /// earlier folder-trust label (reproduced by the Codex peer on #345).
+    #[test]
+    fn a_mixed_or_quoted_menu_is_not_answered() {
+        // Folder-trust words above a live settings menu, at the menu's column.
+        let same_column = "    Yes, I trust this folder\n  ❯ No, exit Claude Code\n    \
+            Yes, I trust these settings\n  Enter to confirm · Esc to cancel\n";
+        let mixed = " Yes, I trust this folder\n ❯ No, exit Claude Code\n   Yes, I trust these \
+            settings\n Enter to confirm · Esc to cancel\n";
+        for screen in [same_column, mixed] {
+            if let Some(dialog) = pending_dialog(screen, STARTUP_DIALOGS, &[]) {
+                assert_eq!(dialog.consent, Consent::Settings, "{screen}");
+            }
+            let (_, answered, keys) = answering_with(screen, CLAUDE_READY, &[], true);
+            assert!(answered.is_empty() && keys.is_empty(), "{screen}: {keys:?}");
+        }
+        // The rows of the menu itself, and only those.
+        let (rows, cursor) = option_rows(BYPASS_WARNING).unwrap();
+        assert_eq!(rows, ["No, exit", "Yes, I accept"]);
+        assert_eq!(cursor, 0);
+    }
+
+    /// A fixed-key dialog is answered only when the dialog on screen shows
+    /// it is that one: its row in the current menu, or its own words on its
+    /// last lines. An earlier mention never stands in (reproduced by the
+    /// Codex peer on #345, which typed Down and Enter into another modal).
+    #[test]
+    fn a_fixed_key_dialog_needs_its_own_current_identity() {
+        let other_menu =
+            "Earlier discussion: Teach auto mode\nA different confirmation is now open\n \
+            ❯ No, cancel\n   Yes, allow\n Enter to confirm · Esc to cancel\n";
+        let unparseable =
+            "Earlier discussion: Teach auto mode\n This folder pre-approves tools:\n \
+            ❯ No, exit Claude Code\n   Yes, I trust these settings\n   ❯ other\n \
+            Enter to confirm · Esc to cancel\n";
+        for screen in [other_menu, unparseable] {
+            let (_, answered, keys) =
+                answering_with(screen, CLAUDE_READY, &[Consent::Bypass], true);
+            assert!(answered.is_empty() && keys.is_empty(), "{screen}: {keys:?}");
+        }
+        // Codex's update prompt by its own menu row; its lock screen by its
+        // own last line.
+        let update = "  Update available · 0.164.0 → 0.166.0\n› 1. Update now (runs `npm i`)\n  \
+            2. Skip\n  3. Skip until next version\n  enter continue · esc skip\n";
+        assert!(pending_dialog(update, STARTUP_DIALOGS, &[]).is_some());
+        let quoted_update = "Update available, Skip until next version, said the log\n \
+            ❯ No, cancel\n   Yes, allow\n Enter to confirm · Esc to cancel\n";
+        assert!(pending_dialog(quoted_update, STARTUP_DIALOGS, &[]).is_none());
+        let lock = "  🔒  This conversation is open in another app        r to retry\n      \
+            Close it there and press R to continue here.\n   r retry   f fork   esc/⌃c/q exit\n";
+        assert!(pending_dialog(lock, STARTUP_DIALOGS, &[]).is_some());
+    }
+
+    /// A dialog left on the screen by an agent that is gone is not answered.
+    #[test]
+    fn a_stale_dialog_of_an_exited_agent_is_not_answered() {
+        let (resume, _, keys) =
+            answering_with(BYPASS_WARNING, CLAUDE_READY, &[Consent::Bypass], false);
+        assert_eq!(resume, Resume::Exited);
+        assert!(keys.is_empty());
     }
 
     #[test]
@@ -4568,6 +4960,7 @@ mod tests {
                 answers.set(answers.get() + 1);
                 true
             },
+            &|consent| consent == Consent::Bypass,
             Duration::from_secs(10),
             Duration::from_millis(20),
             Duration::from_millis(5),
