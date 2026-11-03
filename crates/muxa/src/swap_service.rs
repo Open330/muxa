@@ -337,6 +337,10 @@ struct Receipt {
 /// More than enough for every pane's hooks within one follow-up's wait.
 const RECEIPTS_KEPT: usize = 512;
 
+/// Ended jobs whose rich outcomes stay in memory, newest kept. An older
+/// one reads as it would after a restart: its journal, without them.
+const LIVE_ENDED_KEPT: usize = 64;
+
 impl PromptReceipts {
     /// Receipts numbered by `source`, the store's [`crate::Store::prompt_sequence`]:
     /// a hook the store accepted before a cursor was read is never after it,
@@ -1024,6 +1028,8 @@ pub(crate) struct Service<E: Engine> {
     /// effect is uncertain stays reserved until the daemon restarts.
     reserved: Mutex<HashMap<String, String>>,
     live: Mutex<HashMap<String, LiveJob>>,
+    /// Ended jobs still in `live`, oldest first.
+    ended_live: Mutex<std::collections::VecDeque<String>>,
     fault: Mutex<Option<String>>,
     spawner: Spawner,
     /// The ownership lock ([`ownership_lock`]). Owned here, where every
@@ -1057,6 +1063,7 @@ impl<E: Engine> Service<E> {
             submit: Mutex::new(()),
             reserved: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            ended_live: Mutex::new(std::collections::VecDeque::new()),
             fault: Mutex::new(None),
             spawner: thread_spawner(),
             ownership: None,
@@ -1187,8 +1194,21 @@ impl<E: Engine> Service<E> {
         )
     }
 
-    /// The job ended, however it ended: wake whoever waits on it.
+    /// The job ended, however it ended: wake whoever waits on it, and let
+    /// the oldest ended job's outcomes go once more than
+    /// [`LIVE_ENDED_KEPT`] have.
     fn ended(&self, job: &str) {
+        // The cache settles first: whoever is woken reads it as it stays.
+        if let (Ok(mut ended), Ok(mut live)) = (self.ended_live.lock(), self.live.lock()) {
+            if live.contains_key(job) && !ended.iter().any(|kept| kept == job) {
+                ended.push_back(job.to_owned());
+            }
+            while ended.len() > LIVE_ENDED_KEPT {
+                if let Some(oldest) = ended.pop_front() {
+                    live.remove(&oldest);
+                }
+            }
+        }
         if let Ok(mut done) = self.done.lock() {
             if let Some(sender) = done.remove(job) {
                 let _ = sender.send(true);
