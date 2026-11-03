@@ -286,6 +286,16 @@ hourly cap, and a fire-time re-check that the agent is still capped. A new
 account that is also capped is a new episode, so the next swap excludes it;
 `max_per_hour` bounds how many times one pane can be moved.
 
+The engine never waits on a swap. It admits one (at most two at a time, one
+per pane; a firing with no room is checked again a few seconds later),
+records it as `admitted` in the automation log, and that admission is what
+the cooldown and hourly caps count, at once and once. The swap then takes
+the pane, checks the firing is still due, and runs as a job; its end is
+recorded when the job ends, and it is `fired` only if the job ended `done`
+with its agent swapped and nothing uncertain. A job still running is waited
+on, never taken as failed. A daemon that restarts follows every admitted
+swap it finds unfinished to its job's end; it never starts one again.
+
 ## New agents
 
 `muxa swap` moves agents that are already running. To keep new ones off a

@@ -494,7 +494,11 @@ may have been written with.
 }
 ```
 
-`outcome` is `fired`, `skipped`, or `failed` for deterministic actions. Ask
+`outcome` is `fired`, `skipped`, or `failed` for deterministic actions. A
+`swap_account` firing is first recorded as `admitted`, with the swap job's
+request key as `operation`; the entry that ends it (`fired`, `failed`, or
+`skipped` if no job was ever accepted) carries the same `operation` and its
+`job`. Ask
 also records `judging` (reserved attempt), `judged`, and `judge_test`; completed
 judgments carry decision, reason, evidence, provider/model, and context hash
 in their details. For a skip, `detail` is the

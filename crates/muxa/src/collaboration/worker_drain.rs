@@ -207,6 +207,17 @@ impl CollaborationStore {
             .clone();
         gate.lock_owned().await
     }
+    /// [`Self::worker_action_guard`], only if nothing holds it now.
+    pub async fn try_worker_action_guard(&self, pane: &str) -> Option<OwnedMutexGuard<()>> {
+        let gate = self
+            .worker_action_gates
+            .lock()
+            .await
+            .entry(pane.into())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        gate.try_lock_owned().ok()
+    }
     /// Reservations cover scheduled and judged firings, not just keystrokes.
     pub async fn reserve_worker_automation(
         self: &Arc<Self>,
@@ -214,7 +225,27 @@ impl CollaborationStore {
         pane: &str,
         socket: Option<&str>,
     ) -> Option<WorkerAutomationReservation> {
-        let _gate = self.worker_action_guard(pane).await;
+        let gate = self.worker_action_guard(pane).await;
+        self.reserve_holding(gate, session_id, pane, socket).await
+    }
+    /// [`Self::reserve_worker_automation`] without waiting for the pane:
+    /// `None` while something holds it.
+    pub async fn try_reserve_worker_automation(
+        self: &Arc<Self>,
+        session_id: &str,
+        pane: &str,
+        socket: Option<&str>,
+    ) -> Option<Option<WorkerAutomationReservation>> {
+        let gate = self.try_worker_action_guard(pane).await?;
+        Some(self.reserve_holding(gate, session_id, pane, socket).await)
+    }
+    async fn reserve_holding(
+        self: &Arc<Self>,
+        _gate: OwnedMutexGuard<()>,
+        session_id: &str,
+        pane: &str,
+        socket: Option<&str>,
+    ) -> Option<WorkerAutomationReservation> {
         let _transaction = self.transaction_lock.lock().await;
         let mut records = self.worker_drains.lock().await;
         for r in records.iter_mut().filter(|r| {

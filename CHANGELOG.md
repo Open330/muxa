@@ -47,6 +47,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An automation `swap_account` no longer holds the automation engine while
+  it waits for its pane, plans, or runs: it is admitted (at most two at a
+  time, one per pane), recorded as `admitted` and charged to the guards at
+  once, and its job's end is recorded under the same `operation` key when it
+  comes. A wait that runs out is waited again rather than recorded as a
+  failure, and a restarted daemon follows unfinished admitted swaps to their
+  end without starting them again.
 - A swap's follow-up is reported as what the transport said (`delivered`,
   `refused`, `unconfirmed`) and, separately, what followed within 20s: the
   agent's own prompt hook, screen activity, or nothing seen. The old "picked

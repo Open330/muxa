@@ -505,6 +505,8 @@ mod tests {
             outcome: AutomationOutcome::Skipped,
             detail: Some("condition_cleared".into()),
             episode: None,
+            operation: None,
+            job: None,
         }]);
         assert!(rendered.contains("skipped"), "{rendered}");
         assert!(rendered.contains("condition_cleared"), "{rendered}");

@@ -946,14 +946,78 @@ fn build_automation(cfg: &Config, config_path: Option<PathBuf>) -> Arc<Automatio
 /// shutdown sequence for how it fits the stop budget.
 const SWAP_DRAIN_ON_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(8);
 
-/// How long the automation engine waits on one swap job. Running out only
-/// stops the wait; the job carries on under the service.
+/// How long one wait on an automation's swap job lasts. Running out only
+/// ends that wait: the job carries on under the service and its operation
+/// is waited on again.
 const AUTOMATION_SWAP_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Automation swaps admitted at once, across every rule and pane; one more
+/// waits its turn. One per pane besides.
+const AUTOMATION_SWAP_CAPACITY: usize = 2;
+
+/// How long a firing that found its pane busy, or no room for a swap,
+/// waits before it is checked again.
+const AUTOMATION_BUSY_DEFER: time::Duration = time::Duration::seconds(5);
+
+/// The longest pause between waits on an operation whose job or store does
+/// not answer.
+const AUTOMATION_SWAP_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(300);
 
 /// The swap job service and the node it belongs to.
 struct DaemonSwap {
     service: Arc<muxa::swap_service::SwapService>,
     node_id: String,
+    /// Automation submissions still able to accept a job, by key, for as
+    /// long as this daemon (and the service) lives.
+    submissions: Arc<Submissions>,
+}
+
+/// Which automation submissions could still accept a job. A key nothing is
+/// submitting under is settled: if no job has it, none will.
+#[derive(Default)]
+struct Submissions(std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<bool>>>);
+
+/// Held by a submission's blocking call; dropping it, however the call
+/// ends, says that submission can accept nothing more.
+struct Submitting {
+    key: String,
+    registry: Arc<Submissions>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Submissions {
+    fn begin(self: &Arc<Self>, key: &str) -> Submitting {
+        let (done, watch) = tokio::sync::watch::channel(false);
+        if let Ok(mut submitting) = self.0.lock() {
+            submitting.insert(key.to_owned(), watch);
+        }
+        Submitting {
+            key: key.to_owned(),
+            registry: Arc::clone(self),
+            done,
+        }
+    }
+
+    /// Return once nothing is submitting under `key`.
+    async fn settled(&self, key: &str) {
+        let watch = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|submitting| submitting.get(key).cloned());
+        if let Some(mut watch) = watch {
+            let _ = watch.wait_for(|done| *done).await;
+        }
+    }
+}
+
+impl Drop for Submitting {
+    fn drop(&mut self) {
+        if let Ok(mut submitting) = self.registry.0.lock() {
+            submitting.remove(&self.key);
+        }
+        let _ = self.done.send(true);
+    }
 }
 
 /// Open the swap job service off the reactor. A node identity that cannot
@@ -992,6 +1056,7 @@ async fn open_swap_service(
         muxa::swap_service::SwapService::open(None, Arc::new(context)).map(|service| DaemonSwap {
             service: Arc::new(service),
             node_id,
+            submissions: Arc::default(),
         })
     })
     .await;
@@ -1059,6 +1124,208 @@ fn still_due_from(
         // The store read can wait: a configuration change meanwhile counts.
         unchanged()
     })
+}
+
+/// One admitted swap operation, from its pane's guard to its job's end.
+/// With `start`, it is new: it takes the pane, checks the firing is still
+/// due and starts the job under `key`. Without, it only finds the job an
+/// earlier run started under `key`. Either way it then follows that job
+/// for as long as it runs: a wait that runs out is waited again, never
+/// taken for an end.
+async fn run_swap_operation(
+    swap: Arc<DaemonSwap>,
+    key: String,
+    start: Option<SwapStart>,
+) -> SwapEnded {
+    let service = &swap.service;
+    let released = |reason: String| SwapEnded {
+        key: key.clone(),
+        job: None,
+        end: SwapEnd::Released(reason),
+    };
+    let job = match start {
+        Some(start) => match start_swap_job(&swap, &key, start).await {
+            Ok(job) => job,
+            Err(reason) => return released(reason),
+        },
+        None => match find_swap_job(&swap, &key).await {
+            Some(job) => job,
+            None => return released("no job was accepted under its key".into()),
+        },
+    };
+    let mut pause = std::time::Duration::from_secs(5);
+    loop {
+        match service.wait(&job, AUTOMATION_SWAP_WAIT).await {
+            Ok(view) if job_settled(&view) => {
+                return SwapEnded {
+                    key,
+                    job: Some(job),
+                    end: SwapEnd::Ended(view),
+                };
+            }
+            Ok(view) => {
+                tracing::info!(%key, %job, state = %view.state, "automation swap still running");
+            }
+            Err(error) => {
+                tracing::info!(%key, %job, %error, "automation swap still being followed");
+            }
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(AUTOMATION_SWAP_BACKOFF_MAX);
+    }
+}
+
+/// Take the pane, check the firing is still due, and start its job: the
+/// job's id, or why nothing was started.
+async fn start_swap_job(swap: &DaemonSwap, key: &str, start: SwapStart) -> Result<String, String> {
+    let SwapStart {
+        firing,
+        revision,
+        revision_now,
+        store,
+        collaboration,
+        submitting,
+    } = start;
+    let gate = match &collaboration {
+        Some(collaboration) => {
+            let gate = collaboration.worker_action_guard(&firing.pane).await;
+            if collaboration
+                .worker_input_blocked(&firing.pane, firing.socket.as_deref())
+                .await
+            {
+                return Err("the worker's input is blocked".into());
+            }
+            Some(Arc::new(gate))
+        }
+        None => None,
+    };
+    // The guard may have been waited on: the firing has to still be due,
+    // for the same configuration, agent and server, now that it is held.
+    swap_still_due_now(&store, &revision_now, &firing, revision).await?;
+    let overrides = muxa::swap_service::SwapOverrides {
+        targets: vec![firing.agent_session_id.clone()],
+        to: firing.account.clone(),
+        force: true,
+        continue_text: firing.text.clone(),
+        ..muxa::swap_service::SwapOverrides::default()
+    };
+    // The guard moves into the swap job: no copy of it is kept here while
+    // the job runs.
+    let guard = gate.map(|gate| {
+        Box::new(PaneGuard {
+            pane: firing.pane.clone(),
+            socket: firing.socket.clone(),
+            _gate: gate,
+        }) as Box<dyn muxa::swap_service::TargetGuard>
+    });
+    let still_due = automation_still_due(
+        tokio::runtime::Handle::current(),
+        store,
+        revision_now,
+        &firing,
+        revision,
+    );
+    let submit = Arc::clone(&swap.service);
+    let submit_key = key.to_owned();
+    // The claim moves into the call: whoever looks for this key later
+    // waits for the call, even if this task is gone by then.
+    let accepted = tokio::task::spawn_blocking(move || {
+        let _submitting = submitting;
+        submit.submit_automation(&submit_key, &overrides, guard, Some(still_due))
+    })
+    .await;
+    match accepted {
+        Ok(Ok(accepted)) => Ok(accepted.job_id),
+        // Refused, or not known to have been: the key says which.
+        Ok(Err(error)) => find_swap_job(swap, key).await.ok_or(error),
+        Err(error) => find_swap_job(swap, key)
+            .await
+            .ok_or_else(|| error.to_string()),
+    }
+}
+
+/// The job started under `key`, if one was. Asked only once nothing is
+/// submitting under it any more (a submission still planning may yet
+/// accept one); a store that does not answer is asked again, and only "not
+/// found" then says no job was accepted.
+async fn find_swap_job(swap: &DaemonSwap, key: &str) -> Option<String> {
+    use muxa::swap_service::SwapJobs as _;
+    let mut pause = std::time::Duration::from_secs(1);
+    loop {
+        swap.submissions.settled(key).await;
+        let read = Arc::clone(&swap.service);
+        let job = muxa::swap_service::JobRef::Key(key.to_owned());
+        match tokio::task::spawn_blocking(move || read.status(&job)).await {
+            Ok(Ok(view)) => return Some(view.job_id),
+            Ok(Err(error)) if error.contains("not found") => return None,
+            Ok(Err(error)) => {
+                tracing::warn!(%key, %error, "automation swap lookup failed; asking again");
+            }
+            Err(error) => {
+                tracing::warn!(%key, %error, "automation swap lookup failed; asking again");
+            }
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(AUTOMATION_SWAP_BACKOFF_MAX);
+    }
+}
+
+/// [`automation_still_due`], asked from the reactor.
+async fn swap_still_due_now(
+    store: &muxa::SharedStore,
+    revision_now: &tokio::sync::watch::Receiver<u64>,
+    firing: &PlannedFiring,
+    revision: u64,
+) -> Result<(), String> {
+    let unchanged = || {
+        if *revision_now.borrow() == revision {
+            Ok(())
+        } else {
+            Err("the automation configuration changed".to_owned())
+        }
+    };
+    unchanged()?;
+    let agent = store.by_session(&firing.agent_session_id).await;
+    still_due_with(
+        agent.as_ref(),
+        &firing.pane,
+        firing.socket.as_deref(),
+        &firing.episode,
+        firing.only_if_still,
+    )?;
+    unchanged()
+}
+
+/// A job that will not change any more.
+fn job_settled(view: &muxa::swap_service::JobView) -> bool {
+    view.fault.is_some() || !matches!(view.state.as_str(), "accepted" | "running")
+}
+
+/// A job that did what the automation asked: done, its one target swapped,
+/// with no fault and no effect left uncertain.
+fn swap_fired(view: &muxa::swap_service::JobView) -> bool {
+    view.state == "done"
+        && view.fault.is_none()
+        && matches!(
+            view.entries.as_slice(),
+            [entry] if entry.disposition.as_deref() == Some("swapped") && entry.uncertain_effects == 0
+        )
+}
+
+/// A judgment's ledger detail, with what came of it.
+fn judgment_detail(completed: &JudgedFiring, execution: &str) -> String {
+    let condition = completed
+        .rule
+        .ask_condition
+        .as_ref()
+        .expect("judged rule has a condition");
+    serde_json::json!({
+        "judgment": completed.judgment,
+        "condition": condition.prompt,
+        "observe_only": condition.observe_only,
+        "execution": execution,
+    })
+    .to_string()
 }
 
 /// The agent half of [`automation_still_due`], read from its row.
@@ -1215,6 +1482,7 @@ fn spawn_automation_task(
         engine.accounts = accounts;
         engine.collaboration = Some(collaboration);
         engine.swap_service = swap_service;
+        engine.reattach_swaps().await;
         engine.rescan().await;
         let mut reconcile =
             tokio::time::interval(std::time::Duration::from_secs(AUTOMATION_RECONCILE_SECONDS));
@@ -1247,6 +1515,11 @@ fn spawn_automation_task(
                     engine.rescan().await;
                 }
                 () = tokio::time::sleep(idle) => engine.fire_due().await,
+                ended = engine.swap_ops.join_next_with_id(), if !engine.swap_ops.is_empty() => {
+                    if let Some(ended) = ended {
+                        engine.swap_task_ended(ended).await;
+                    }
+                }
                 completed = engine.judgments.join_next(), if !engine.judgments.is_empty() => {
                     match completed {
                         Some(Ok(completed)) => engine.finish_judgment(completed).await,
@@ -1290,6 +1563,71 @@ struct AutomationEngine {
     /// `[accounts]`, which the `swap_account` action moves agents between
     /// when a provider lists them.
     accounts: muxa::accounts::AccountsConfig,
+    /// The tasks that own admitted swap operations, each from its pane's
+    /// guard to its job's end; the engine never waits on one.
+    swap_ops: tokio::task::JoinSet<SwapEnded>,
+    /// Which operation each of those tasks owns, so a task that fails still
+    /// leaves its operation found.
+    swap_tasks: HashMap<tokio::task::Id, String>,
+    /// Admitted operations nothing has ended yet, by request key.
+    swap_inflight: HashMap<String, SwapOperation>,
+    /// Judged swap firings that found no room, tried again as room frees.
+    deferred_judgments: std::collections::VecDeque<JudgedFiring>,
+}
+
+/// A swap the automation admitted: charged to its guards from then on,
+/// owned by its own task until its job ends or it is released.
+struct SwapOperation {
+    /// Its `admitted` ledger entry, which the entry that ends it copies.
+    admitted: AutomationLedgerEntry,
+    /// Held while it runs, as it was while its firing waited.
+    _drain_reservation: Option<muxa::collaboration::WorkerAutomationReservation>,
+}
+
+/// What an operation's task came to.
+struct SwapEnded {
+    key: String,
+    job: Option<String>,
+    end: SwapEnd,
+}
+
+enum SwapEnd {
+    /// No job was accepted under its key: nothing was done.
+    Released(String),
+    /// Its job ended so.
+    Ended(muxa::swap_service::JobView),
+}
+
+/// What came of performing a firing's action.
+enum Performed {
+    Done,
+    Failed,
+    /// Its pane was busy; nothing was done, and it is tried again later.
+    Busy,
+}
+
+/// Where a swap firing stands after it asks to be admitted.
+enum Admission {
+    Admitted,
+    /// No room yet; the firing is asked again later.
+    Deferred,
+    /// The guards or a fresh check refused it.
+    Refused(String),
+    /// This daemon cannot run swaps.
+    Unavailable,
+}
+
+/// What a newly admitted operation's task needs to start its job.
+struct SwapStart {
+    firing: PlannedFiring,
+    revision: u64,
+    revision_now: tokio::sync::watch::Receiver<u64>,
+    store: muxa::SharedStore,
+    collaboration: Option<Arc<CollaborationStore>>,
+    /// Its claim on the key, made before the operation was spawned and
+    /// owned until the submission ends or the operation is dropped short
+    /// of one: a later lookup by key waits for whichever comes first.
+    submitting: Submitting,
 }
 
 struct JudgedFiring {
@@ -1299,7 +1637,7 @@ struct JudgedFiring {
     revision: u64,
     context: Option<JudgmentContext>,
     judgment: AutomationJudgment,
-    _drain_reservation: Option<muxa::collaboration::WorkerAutomationReservation>,
+    drain_reservation: Option<muxa::collaboration::WorkerAutomationReservation>,
 }
 
 impl AutomationEngine {
@@ -1324,13 +1662,20 @@ impl AutomationEngine {
             swap: muxa::account_swap::SwapConfig::default(),
             swap_service: None,
             accounts: muxa::accounts::AccountsConfig::default(),
+            swap_ops: tokio::task::JoinSet::new(),
+            swap_tasks: HashMap::new(),
+            swap_inflight: HashMap::new(),
+            deferred_judgments: std::collections::VecDeque::new(),
         }
     }
 
     /// How long to park before the next firing is due, bounded so a rule
     /// added at runtime is still picked up promptly.
     fn time_until_next_firing(&self) -> std::time::Duration {
-        let cap = std::time::Duration::from_secs(AUTOMATION_MAX_IDLE_SECONDS);
+        let mut cap = std::time::Duration::from_secs(AUTOMATION_MAX_IDLE_SECONDS);
+        if !self.deferred_judgments.is_empty() {
+            cap = cap.min(AUTOMATION_BUSY_DEFER.unsigned_abs());
+        }
         let Some(next) = self.pending.peek() else {
             return cap;
         };
@@ -1415,8 +1760,11 @@ impl AutomationEngine {
                 match Scheduler::arm(&config, rule, subject, guards, now, jitter_ratio()) {
                     Decision::Fire(firing) => {
                         if let Some(collaboration) = &self.collaboration {
-                            let Some(reservation) = collaboration
-                                .reserve_worker_automation(
+                            // A pane something is acting on (a swap may hold
+                            // it for minutes) is armed on a later pass, never
+                            // waited for here.
+                            let Some(Some(reservation)) = collaboration
+                                .try_reserve_worker_automation(
                                     &subject.agent_session_id,
                                     &pane,
                                     subject.socket.as_deref(),
@@ -1456,6 +1804,10 @@ impl AutomationEngine {
     /// Act on every firing whose time has come, re-checking each against
     /// the live store first.
     async fn fire_due(&mut self) {
+        // Judged firings that found no room or a busy pane, asked again.
+        for completed in std::mem::take(&mut self.deferred_judgments) {
+            self.finish_judgment(completed).await;
+        }
         let now = time::OffsetDateTime::now_utc();
         let mut due = Vec::new();
         while self
@@ -1545,7 +1897,18 @@ impl AutomationEngine {
                     }
                     return;
                 }
-                let delivered = self.perform(&confirmed, &rule, revision).await;
+                if confirmed.action == AutomationAction::SwapAccount {
+                    self.fire_swap(*confirmed, rule, revision, key, now).await;
+                    return;
+                }
+                let delivered = match self.perform(&confirmed).await {
+                    Performed::Done => true,
+                    Performed::Failed => false,
+                    Performed::Busy => {
+                        self.requeue(*confirmed, rule, revision, now + AUTOMATION_BUSY_DEFER);
+                        return;
+                    }
+                };
                 let outcome = if delivered {
                     AutomationOutcome::Fired
                 } else {
@@ -1570,6 +1933,78 @@ impl AutomationEngine {
         }
     }
 
+    /// A confirmed swap firing: admitted, deferred for room, or recorded as
+    /// refused.
+    async fn fire_swap(
+        &mut self,
+        confirmed: PlannedFiring,
+        rule: AutomationRule,
+        revision: u64,
+        key: (String, String, String),
+        now: time::OffsetDateTime,
+    ) {
+        let ledger = self.automation.ledger();
+        let mut drain = self.drain_reservations.remove(&key);
+        let admission = self
+            .admit_swap(
+                &confirmed,
+                &rule,
+                revision,
+                confirmed.text.clone(),
+                false,
+                &mut drain,
+            )
+            .await;
+        match admission {
+            Admission::Admitted => {}
+            Admission::Deferred => {
+                if let Some(drain) = drain {
+                    self.drain_reservations.insert(key, drain);
+                }
+                self.requeue(confirmed, rule, revision, now + AUTOMATION_BUSY_DEFER);
+            }
+            Admission::Refused(reason) => {
+                ledger
+                    .append(ledger_entry(
+                        &confirmed,
+                        now,
+                        AutomationOutcome::Skipped,
+                        Some(reason),
+                    ))
+                    .await;
+            }
+            Admission::Unavailable => {
+                ledger
+                    .append(ledger_entry(
+                        &confirmed,
+                        now,
+                        AutomationOutcome::Failed,
+                        Some(SkipReason::ActionFailed.to_string()),
+                    ))
+                    .await;
+            }
+        }
+    }
+
+    /// Put `firing` back in the queue, due at `at`, to be checked afresh.
+    fn requeue(
+        &mut self,
+        mut firing: PlannedFiring,
+        rule: AutomationRule,
+        revision: u64,
+        at: time::OffsetDateTime,
+    ) {
+        firing.fire_at = at;
+        let key = (
+            firing.rule.clone(),
+            firing.pane.clone(),
+            firing.episode.clone(),
+        );
+        self.queued_rules.insert(key.clone(), (rule, revision));
+        self.armed.insert(key);
+        self.pending.push(std::cmp::Reverse(firing));
+    }
+
     async fn start_judgment(
         &mut self,
         firing: PlannedFiring,
@@ -1580,22 +2015,7 @@ impl AutomationEngine {
     ) {
         let slot = self.automation.try_judgment_slot();
         if self.judgments.len() >= 2 || slot.is_err() {
-            let mut deferred = firing;
-            deferred.fire_at = now + time::Duration::seconds(1);
-            self.queued_rules.insert(
-                (
-                    deferred.rule.clone(),
-                    deferred.pane.clone(),
-                    deferred.episode.clone(),
-                ),
-                (rule, revision),
-            );
-            self.armed.insert((
-                deferred.rule.clone(),
-                deferred.pane.clone(),
-                deferred.episode.clone(),
-            ));
-            self.pending.push(std::cmp::Reverse(deferred));
+            self.requeue(firing, rule, revision, now + time::Duration::seconds(1));
             return;
         }
         let permit = slot.expect("judgment slot checked");
@@ -1657,12 +2077,12 @@ impl AutomationEngine {
                 revision,
                 context: context.ok(),
                 judgment,
-                _drain_reservation: drain_reservation,
+                drain_reservation,
             }
         });
     }
 
-    async fn finish_judgment(&mut self, completed: JudgedFiring) {
+    async fn finish_judgment(&mut self, mut completed: JudgedFiring) {
         let condition = completed
             .rule
             .ask_condition
@@ -1674,28 +2094,51 @@ impl AutomationEngine {
             execution = "observe_only".into();
         } else if completed.judgment.decision == JudgmentDecision::Match {
             match self.confirm_judgment(&completed).await {
-                Ok(()) => {
-                    if self
-                        .perform(&completed.firing, &completed.rule, completed.revision)
-                        .await
-                    {
+                Ok(()) if completed.firing.action == AutomationAction::SwapAccount => {
+                    let detail = judgment_detail(&completed, "admitted");
+                    let (firing, rule) = (completed.firing.clone(), completed.rule.clone());
+                    let admission = self
+                        .admit_swap(
+                            &firing,
+                            &rule,
+                            completed.revision,
+                            Some(detail),
+                            true,
+                            &mut completed.drain_reservation,
+                        )
+                        .await;
+                    match admission {
+                        // Its own end is recorded when its job ends.
+                        Admission::Admitted => return,
+                        Admission::Deferred => {
+                            self.deferred_judgments.push_back(completed);
+                            return;
+                        }
+                        Admission::Refused(reason) => execution = reason,
+                        Admission::Unavailable => {
+                            execution = "action_failed".into();
+                            outcome = AutomationOutcome::Failed;
+                        }
+                    }
+                }
+                Ok(()) => match self.perform(&completed.firing).await {
+                    Performed::Done => {
                         execution = "fired".into();
                         outcome = AutomationOutcome::Fired;
-                    } else {
+                    }
+                    Performed::Failed => {
                         execution = "action_failed".into();
                         outcome = AutomationOutcome::Failed;
                     }
-                }
+                    Performed::Busy => {
+                        self.deferred_judgments.push_back(completed);
+                        return;
+                    }
+                },
                 Err(reason) => execution = reason,
             }
         }
-        let detail = serde_json::json!({
-            "judgment": completed.judgment,
-            "condition": condition.prompt,
-            "observe_only": condition.observe_only,
-            "execution": execution,
-        })
-        .to_string();
+        let detail = judgment_detail(&completed, &execution);
         self.automation
             .ledger()
             .append(ledger_entry(
@@ -1766,46 +2209,11 @@ impl AutomationEngine {
     /// Carry out one action. Every arm keeps the injection inside this
     /// function, so "what an automation can do to a pane" has exactly one
     /// place to read.
-    async fn perform(
-        &mut self,
-        firing: &PlannedFiring,
-        rule: &AutomationRule,
-        revision: u64,
-    ) -> bool {
-        let io_guard = if let Some(collaboration) = &self.collaboration {
-            let gate = collaboration.worker_action_guard(&firing.pane).await;
-            if collaboration
-                .worker_input_blocked(&firing.pane, firing.socket.as_deref())
-                .await
-            {
-                return false;
-            }
-            Some(Arc::new(gate))
-        } else {
-            None
-        };
+    async fn perform(&mut self, firing: &PlannedFiring) -> Performed {
         match firing.action {
-            AutomationAction::PressEnter => {
-                self.confirm_selected_yes(firing, io_guard.clone()).await
-            }
-            AutomationAction::SendPrompt => {
-                let Some(text) = firing.text.as_deref() else {
-                    return false;
-                };
-                if !send_automation_text(&self.backends, firing, text, io_guard.clone()).await {
-                    return false;
-                }
-                if !firing.submit {
-                    return true;
-                }
-                // Native hosts use explicit paste boundaries; only hosts
-                // without that support need a best-effort fallback delay.
-                tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
-                send_automation_text(&self.backends, firing, "\r", io_guard.clone()).await
-            }
-            // A notice, not a keystroke: nothing is typed into the pane. The
-            // ledger entry is the durable half, and `muxa automation log`
-            // is where an operator reads it back.
+            // A notice, not a keystroke: nothing is typed into the pane, so
+            // it takes no hold on it. The ledger entry is the durable half,
+            // and `muxa automation log` is where an operator reads it back.
             AutomationAction::Notify => {
                 tracing::warn!(
                     rule = %firing.rule,
@@ -1814,49 +2222,97 @@ impl AutomationEngine {
                     message = firing.text.as_deref().unwrap_or_default(),
                     "automation notice",
                 );
-                true
+                return Performed::Done;
+            }
+            // Admitted, never performed here: see `admit_swap`.
+            AutomationAction::SwapAccount => {
+                tracing::error!(
+                    rule = %firing.rule,
+                    pane = %firing.pane,
+                    "an automation swap reached perform; it is admitted instead"
+                );
+                return Performed::Failed;
+            }
+            _ => {}
+        }
+        // A pane something else is acting on is tried again later, never
+        // waited for: a swap can hold it for minutes.
+        let io_guard = if let Some(collaboration) = &self.collaboration {
+            let Some(gate) = collaboration.try_worker_action_guard(&firing.pane).await else {
+                return Performed::Busy;
+            };
+            if collaboration
+                .worker_input_blocked(&firing.pane, firing.socket.as_deref())
+                .await
+            {
+                return Performed::Failed;
+            }
+            Some(Arc::new(gate))
+        } else {
+            None
+        };
+        let done = match firing.action {
+            AutomationAction::PressEnter => {
+                self.confirm_selected_yes(firing, io_guard.clone()).await
+            }
+            AutomationAction::SendPrompt => {
+                let Some(text) = firing.text.as_deref() else {
+                    return Performed::Failed;
+                };
+                if !send_automation_text(&self.backends, firing, text, io_guard.clone()).await {
+                    return Performed::Failed;
+                }
+                if !firing.submit {
+                    return Performed::Done;
+                }
+                // Native hosts use explicit paste boundaries; only hosts
+                // without that support need a best-effort fallback delay.
+                tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
+                send_automation_text(&self.backends, firing, "\r", io_guard.clone()).await
             }
             // ETX — the same byte `muxa agent control --action interrupt`
             // writes into a native PTY session.
             AutomationAction::Interrupt => {
                 send_automation_text(&self.backends, firing, "\u{3}", io_guard.clone()).await
             }
-            // The guard moves into the swap job: no copy of it is kept here
-            // while the job runs.
-            AutomationAction::SwapAccount => {
-                self.swap_account(firing, rule, revision, io_guard).await
-            }
+            AutomationAction::Notify | AutomationAction::SwapAccount => false,
+        };
+        if done {
+            Performed::Done
+        } else {
+            Performed::Failed
         }
     }
 
-    /// Move the capped agent onto another `aas` account and resume it. The
-    /// firing was re-checked just before this, so the agent is the one the
-    /// rule armed on; `force` only lets a cap that reads as `Starting` through.
-    async fn swap_account(
+    /// Admit a swap for `firing`, never waiting on anything that can hold:
+    /// with room for it (globally and on its pane) and the guards still
+    /// passing under the ledger's lock, it is recorded as `admitted`,
+    /// charged once, and handed to a task that takes its pane, checks it is
+    /// still due, starts its job and follows it to its end.
+    async fn admit_swap(
         &mut self,
         firing: &PlannedFiring,
         rule: &AutomationRule,
         revision: u64,
-        io_guard: Option<WorkerIoGuard>,
-    ) -> bool {
+        detail: Option<String>,
+        judged: bool,
+        drain: &mut Option<muxa::collaboration::WorkerAutomationReservation>,
+    ) -> Admission {
         let Some(swap) = self.swap_service.clone() else {
             tracing::warn!(
                 rule = %firing.rule,
                 pane = %firing.pane,
                 "automation swap refused: swap jobs are unavailable on this daemon"
             );
-            return false;
+            return Admission::Unavailable;
         };
-        // The guard may have been waited on: the firing has to still be due,
-        // for the same rule, agent and server, now that it is held.
-        if let Err(reason) = self.swap_still_due(firing, rule, revision).await {
-            tracing::info!(
-                rule = %firing.rule,
-                pane = %firing.pane,
-                %reason,
-                "automation swap no longer due once the pane was free"
-            );
-            return false;
+        if self.swap_inflight.len() >= AUTOMATION_SWAP_CAPACITY
+            || self
+                .swap_inflight
+                .values()
+                .any(|op| op.admitted.pane == firing.pane)
+        {
+            return Admission::Deferred;
         }
         let key = muxa::swap_service::automation_request_key(
             &swap.node_id,
@@ -1866,135 +2322,178 @@ impl AutomationEngine {
             &firing.rule,
             &firing.episode,
         );
-        let overrides = muxa::swap_service::SwapOverrides {
-            targets: vec![firing.agent_session_id.clone()],
-            to: firing.account.clone(),
-            force: true,
-            continue_text: firing.text.clone(),
-            ..muxa::swap_service::SwapOverrides::default()
+        let config = self.automation.config().await;
+        let subject = self.live_subject(rule, &firing.agent_session_id).await;
+        if *self.automation.subscribe().borrow() != revision
+            || config.rule_named(&firing.rule) != Some(rule)
+        {
+            return Admission::Refused("configuration_changed".into());
+        }
+        let now = time::OffsetDateTime::now_utc();
+        let mut admitted = ledger_entry(firing, now, AutomationOutcome::Admitted, detail);
+        admitted.operation = Some(key.clone());
+        let check = |mut guards: muxa::automation::GuardState| {
+            // A judged firing's own judgment already holds its episode.
+            if judged {
+                guards.episode_handled = false;
+            }
+            match Scheduler::confirm(&config, rule, firing, subject.as_ref(), guards, now) {
+                Decision::Fire(_) => Ok(()),
+                Decision::Skip(reason) => Err(reason.to_string()),
+            }
         };
-        let guard = io_guard.map(|gate| {
-            Box::new(PaneGuard {
-                pane: firing.pane.clone(),
-                socket: firing.socket.clone(),
-                _gate: gate,
-            }) as Box<dyn muxa::swap_service::TargetGuard>
-        });
-        let still_due = automation_still_due(
-            tokio::runtime::Handle::current(),
-            self.store.clone(),
-            self.automation.subscribe(),
-            firing,
-            revision,
+        if let Err(reason) = self
+            .automation
+            .ledger()
+            .reserve_operation(admitted.clone(), check)
+            .await
+        {
+            return Admission::Refused(reason);
+        }
+        tracing::info!(
+            rule = %firing.rule,
+            pane = %firing.pane,
+            %key,
+            "automation swap admitted",
         );
-        let service = Arc::clone(&swap.service);
-        let submit_key = key.clone();
-        let accepted = tokio::task::spawn_blocking(move || {
-            service.submit_automation(&submit_key, &overrides, guard, Some(still_due))
-        })
-        .await;
-        let job = match accepted {
-            Ok(Ok(accepted)) => accepted.job_id,
-            Ok(Err(error)) => {
-                tracing::warn!(rule = %firing.rule, pane = %firing.pane, %key, %error, "automation swap not accepted");
-                return false;
-            }
-            Err(error) => {
-                tracing::warn!(rule = %firing.rule, pane = %firing.pane, %key, %error, "automation swap submission failed");
-                return false;
-            }
+        self.swap_inflight.insert(
+            key.clone(),
+            SwapOperation {
+                admitted,
+                _drain_reservation: drain.take(),
+            },
+        );
+        let start = SwapStart {
+            firing: firing.clone(),
+            revision,
+            revision_now: self.automation.subscribe(),
+            store: self.store.clone(),
+            collaboration: self.collaboration.clone(),
+            submitting: swap.submissions.begin(&key),
         };
-        // The engine waits here, one firing at a time; a wait that runs out
-        // only stops waiting — the job runs on under the service.
-        match swap.service.wait(&job, AUTOMATION_SWAP_WAIT).await {
-            Ok(view) => {
-                let swapped = view.entries.len() == 1
-                    && view.entries[0].disposition.as_deref() == Some("swapped");
-                tracing::info!(
-                    rule = %firing.rule,
-                    pane = %firing.pane,
-                    job = %job,
-                    state = %view.state,
-                    disposition = view.entries.first().and_then(|entry| entry.disposition.as_deref()).unwrap_or("none"),
-                    "automation account swap",
-                );
-                swapped
+        self.spawn_swap_task(&swap, key, Some(start));
+        Admission::Admitted
+    }
+
+    fn spawn_swap_task(&mut self, swap: &Arc<DaemonSwap>, key: String, start: Option<SwapStart>) {
+        let task = self
+            .swap_ops
+            .spawn(run_swap_operation(Arc::clone(swap), key.clone(), start));
+        self.swap_tasks.insert(task.id(), key);
+    }
+
+    /// Follow again every operation an earlier engine admitted and nothing
+    /// ended: never starting it again, only reading what its job did.
+    async fn reattach_swaps(&mut self) {
+        for admitted in self.automation.ledger().unresolved_operations().await {
+            let Some(key) = admitted.operation.clone() else {
+                continue;
+            };
+            if self.swap_inflight.contains_key(&key) {
+                continue;
             }
-            Err(error) => {
-                tracing::warn!(
-                    rule = %firing.rule,
-                    pane = %firing.pane,
-                    job = %job,
-                    %error,
-                    "automation account swap incomplete"
-                );
-                false
+            tracing::info!(rule = %admitted.rule, pane = %admitted.pane, %key, "automation swap reattached");
+            self.swap_inflight.insert(
+                key.clone(),
+                SwapOperation {
+                    admitted,
+                    _drain_reservation: None,
+                },
+            );
+            match self.swap_service.clone() {
+                Some(swap) => self.spawn_swap_task(&swap, key, None),
+                // Its admission stays charged until a daemon that runs swap
+                // jobs reads what became of it.
+                None => {
+                    tracing::warn!(%key, "automation swap left unresolved: swap jobs are unavailable");
+                }
             }
         }
     }
 
-    /// Whether `firing` is still due now that its pane's guard is held:
-    /// the same rule and configuration revision, the agent still there on
-    /// the same pane and server, and the scheduler still saying fire.
-    async fn swap_still_due(
+    async fn swap_task_ended(
         &mut self,
-        firing: &PlannedFiring,
-        expected: &AutomationRule,
-        revision: u64,
-    ) -> Result<(), String> {
-        // Rescan first: everything read after this await is current, and a
-        // rule edited while the scan ran fails the revision check below.
-        if expected.needs_pane_metadata() {
-            self.panes_read_at = None;
-            self.refresh_panes().await;
-        }
-        let config = self.automation.config().await;
-        let Some(rule) = config.rule_named(&firing.rule).cloned() else {
-            return Err("rule_removed".into());
-        };
-        if rule != *expected || *self.automation.subscribe().borrow() != revision {
-            return Err("configuration_changed".into());
-        }
-        let latest = self.live_subject(&rule, &firing.agent_session_id).await;
-        match &latest {
-            None => return Err("agent_gone".into()),
-            Some(subject)
-                if subject.socket != firing.socket
-                    || subject.pane.as_deref() != Some(firing.pane.as_str()) =>
-            {
-                return Err("endpoint_changed".into());
+        ended: Result<(tokio::task::Id, SwapEnded), tokio::task::JoinError>,
+    ) {
+        match ended {
+            Ok((id, ended)) => {
+                self.swap_tasks.remove(&id);
+                self.finish_swap_operation(ended).await;
             }
-            Some(_) => {}
+            Err(error) => {
+                let Some(key) = self.swap_tasks.remove(&error.id()) else {
+                    return;
+                };
+                // A task that failed loses nothing: its operation is
+                // followed again by its key, never started again.
+                tracing::warn!(%key, %error, "automation swap task failed; following its job again");
+                if let Some(swap) = self.swap_service.clone() {
+                    self.spawn_swap_task(&swap, key, None);
+                }
+            }
         }
-        let now = time::OffsetDateTime::now_utc();
-        let guards = self
-            .automation
-            .ledger()
-            .guard_state(&firing.rule, &firing.pane, &firing.episode, now)
-            .await;
-        if let Decision::Skip(reason) =
-            Scheduler::confirm(&config, &rule, firing, latest.as_ref(), guards, now)
-        {
-            return Err(reason.to_string());
+        // Room may have freed for a judged swap that found none.
+        for completed in std::mem::take(&mut self.deferred_judgments) {
+            self.finish_judgment(completed).await;
         }
-        // The ledger read awaited too: nothing may have moved since.
-        if *self.automation.subscribe().borrow() != revision {
-            return Err("configuration_changed".into());
-        }
-        let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
-            return Err("agent_gone".into());
+    }
+
+    /// Record how an operation ended, once, as the entry that closes its
+    /// admission: `fired` only for a job that ended done with its one
+    /// target swapped, cleanly.
+    async fn finish_swap_operation(&mut self, ended: SwapEnded) {
+        let Some(operation) = self.swap_inflight.remove(&ended.key) else {
+            return;
         };
-        let now_subject = AutomationSubject::from_agent(&agent);
-        if now_subject.episode() != firing.episode
-            || now_subject.socket != firing.socket
-            || now_subject.pane.as_deref() != Some(firing.pane.as_str())
+        let admitted = operation.admitted;
+        let (outcome, execution) = match &ended.end {
+            SwapEnd::Released(reason) => (AutomationOutcome::Skipped, reason.clone()),
+            SwapEnd::Ended(view) if swap_fired(view) => (AutomationOutcome::Fired, "fired".into()),
+            SwapEnd::Ended(view) => (
+                AutomationOutcome::Failed,
+                format!(
+                    "{}: job {} ended {}{}",
+                    SkipReason::ActionFailed,
+                    view.job_id,
+                    view.state,
+                    view.fault
+                        .as_deref()
+                        .map(|fault| format!(" ({fault})"))
+                        .unwrap_or_default()
+                ),
+            ),
+        };
+        // A judged swap keeps its judgment, with what came of it.
+        let detail = match admitted
+            .detail
+            .as_deref()
+            .and_then(|detail| serde_json::from_str::<serde_json::Value>(detail).ok())
         {
-            return Err("agent_state_changed".into());
-        }
-        if *self.automation.subscribe().borrow() != revision {
-            return Err("configuration_changed".into());
-        }
-        Ok(())
+            Some(mut judged) if judged.get("judgment").is_some() => {
+                judged["execution"] = serde_json::json!(execution);
+                Some(judged.to_string())
+            }
+            _ if outcome == AutomationOutcome::Fired => admitted.detail.clone(),
+            _ => Some(execution),
+        };
+        tracing::info!(
+            rule = %admitted.rule,
+            pane = %admitted.pane,
+            key = %ended.key,
+            job = ended.job.as_deref().unwrap_or("none"),
+            %outcome,
+            "automation account swap",
+        );
+        self.automation
+            .ledger()
+            .append(AutomationLedgerEntry {
+                fired_at: time::OffsetDateTime::now_utc(),
+                outcome,
+                detail,
+                job: ended.job,
+                ..admitted
+            })
+            .await;
     }
 
     /// Capture immediately before Enter; a waiting state alone cannot identify
@@ -2121,6 +2620,8 @@ fn ledger_entry(
         outcome,
         detail,
         episode: Some(firing.episode.clone()),
+        operation: None,
+        job: None,
     }
 }
 
@@ -7103,8 +7604,7 @@ mod tests {
             only_if_still: muxa::automation::AutomationCondition::Idle,
             account: None,
         };
-        let rule = resume_rule_config().rule[0].clone();
-        assert!(!engine.perform(&firing, &rule, 0).await);
+        assert!(matches!(engine.perform(&firing).await, Performed::Failed));
         assert!(sends.lock().unwrap().is_empty());
     }
 
@@ -7315,7 +7815,13 @@ mod tests {
             only_if_still: muxa::automation::AutomationCondition::Idle,
             account: None,
         };
-        assert!(!engine.perform(&firing, &rule, 0).await);
+        assert!(matches!(
+            engine
+                .admit_swap(&firing, &rule, 0, None, false, &mut None)
+                .await,
+            Admission::Unavailable
+        ));
+        assert!(engine.swap_inflight.is_empty());
         assert!(sends.lock().unwrap().is_empty());
     }
 
@@ -7331,12 +7837,20 @@ mod tests {
         agents: Vec<muxa::Agent>,
         snapshots: Counter,
         guards: Counter,
+        /// Closed: planning waits, as a slow one does.
+        planning: Arc<(Mutex<bool>, std::sync::Condvar)>,
     }
 
     impl muxa::swap_service::ContextProvider for FixtureContext {
         fn snapshot(&self) -> Result<muxa::swap_service::Snapshot, String> {
             self.snapshots
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (open, turned) = &*self.planning;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = turned.wait(open).unwrap();
+            }
+            drop(open);
             Ok(muxa::swap_service::Snapshot {
                 node_id: "node".into(),
                 agents: self.agents.clone(),
@@ -7366,8 +7880,10 @@ mod tests {
         automation: Arc<AutomationStore>,
         collaboration: Arc<CollaborationStore>,
         service: Arc<muxa::swap_service::SwapService>,
+        swap: Arc<DaemonSwap>,
         sends: RecordedSends,
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        planning: Arc<(Mutex<bool>, std::sync::Condvar)>,
         snapshots: Counter,
         guards: Counter,
         runs: Counter,
@@ -7394,6 +7910,7 @@ mod tests {
             });
             let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
             let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+            let planning = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
             let (snapshots, guards, runs) =
                 (Counter::default(), Counter::default(), Counter::default());
             let dir = tempfile::tempdir().unwrap();
@@ -7405,6 +7922,7 @@ mod tests {
                         agents,
                         snapshots: Arc::clone(&snapshots),
                         guards: Arc::clone(&guards),
+                        planning: Arc::clone(&planning),
                     }),
                     Arc::new(move || {
                         ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7419,10 +7937,12 @@ mod tests {
             );
             let mut engine = AutomationEngine::new(automation.clone(), store, backends);
             engine.collaboration = Some(Arc::clone(&collaboration));
-            engine.swap_service = Some(Arc::new(DaemonSwap {
+            let swap = Arc::new(DaemonSwap {
                 service: Arc::clone(&service),
                 node_id: "node".into(),
-            }));
+                submissions: Arc::default(),
+            });
+            engine.swap_service = Some(Arc::clone(&swap));
             let key = muxa::swap_service::automation_request_key(
                 "node",
                 "%1",
@@ -7436,8 +7956,10 @@ mod tests {
                 automation,
                 collaboration,
                 service,
+                swap,
                 sends,
                 gate,
+                planning,
                 snapshots,
                 guards,
                 runs,
@@ -7448,6 +7970,12 @@ mod tests {
 
         fn hold(&self, held: bool) {
             let (open, turned) = &*self.gate;
+            *open.lock().unwrap() = !held;
+            turned.notify_all();
+        }
+
+        fn hold_planning(&self, held: bool) {
+            let (open, turned) = &*self.planning;
             *open.lock().unwrap() = !held;
             turned.notify_all();
         }
@@ -7485,44 +8013,76 @@ mod tests {
     impl Drop for SwapFixture {
         fn drop(&mut self) {
             self.hold(false);
+            self.hold_planning(false);
         }
     }
 
+    impl SwapFixture {
+        /// Wait for the one operation's task and let the engine record it.
+        async fn settle(&mut self) {
+            let ended = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                self.engine.swap_ops.join_next_with_id(),
+            )
+            .await
+            .expect("the operation never ended")
+            .expect("an operation was running");
+            self.engine.swap_task_ended(ended).await;
+        }
+
+        async fn outcomes(&self) -> Vec<(AutomationOutcome, Option<String>)> {
+            self.automation
+                .ledger()
+                .all()
+                .await
+                .into_iter()
+                .map(|entry| (entry.outcome, entry.operation))
+                .collect()
+        }
+
+        async fn wait_for_runs(&self, runs: usize) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while count(&self.runs) < runs {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the swap never started running"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+    }
+
+    /// The engine admits the swap and goes on at once; the job holds the
+    /// automation's own guard until it ends, and its end is recorded once.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_automation_swap_hands_its_pane_guard_to_the_job_until_it_ends() {
         let mut fixture = SwapFixture::new().await;
         fixture.hold(true);
         fixture.engine.rescan().await;
-        let mut engine = fixture.take_engine();
-        let firing = tokio::spawn(async move { engine.fire_due().await });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while count(&fixture.runs) == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the swap never started running"
-            );
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), fixture.engine.fire_due())
+            .await
+            .expect("the engine must not wait on the swap");
+        fixture.wait_for_runs(1).await;
         // An accepted, journalled job is running its one target.
         assert_eq!(fixture.job().state, "running");
-        // The job holds the automation's own guard: busy, and still busy
-        // once the engine that submitted it is gone.
         assert!(!fixture.pane_is_free().await);
-        firing.abort();
-        let _ = firing.await;
-        assert!(!fixture.pane_is_free().await);
-        assert_eq!(fixture.job().state, "running");
+        let key = Some(fixture.key.clone());
+        assert_eq!(
+            fixture.outcomes().await,
+            vec![(AutomationOutcome::Admitted, key.clone())]
+        );
+        // Admitted is charged at once: the guards see it.
+        let guards = fixture
+            .automation
+            .ledger()
+            .guard_state("swap-on-limit", "%1", "", OffsetDateTime::now_utc())
+            .await;
+        assert_eq!(guards.global_fired_last_hour, 1);
         fixture.hold(false);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !fixture.pane_is_free().await {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the job never let the pane go"
-            );
-        }
+        fixture.settle().await;
+        assert!(fixture.pane_is_free().await);
         let job = fixture.job();
         assert_eq!(job.state, "done");
-        assert_eq!(job.entries.len(), 1);
         assert_eq!(job.entries[0].disposition.as_deref(), Some("swapped"));
         assert_eq!(count(&fixture.runs), 1);
         assert_eq!(
@@ -7530,34 +8090,395 @@ mod tests {
             0,
             "the job never takes the pane again"
         );
+        let log = fixture.automation.ledger().all().await;
+        assert_eq!(
+            fixture.outcomes().await,
+            vec![
+                (AutomationOutcome::Admitted, key.clone()),
+                (AutomationOutcome::Fired, key)
+            ]
+        );
+        assert_eq!(log[1].job.as_deref(), Some(job.job_id.as_str()));
+        // Charged once, not again for its end.
+        let guards = fixture
+            .automation
+            .ledger()
+            .guard_state("swap-on-limit", "%1", "", OffsetDateTime::now_utc())
+            .await;
+        assert_eq!(guards.global_fired_last_hour, 1);
+        assert_eq!(guards.fired_last_hour, 1);
+        assert!(fixture.engine.swap_inflight.is_empty());
         assert!(fixture.sends.lock().unwrap().is_empty());
     }
 
+    /// A rule disabled while its admitted swap waited for the pane starts
+    /// nothing, and its admission is released, not charged.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_automation_swap_disabled_while_it_waited_for_its_pane_is_dropped() {
         let mut fixture = SwapFixture::new().await;
         fixture.engine.rescan().await;
         let held = fixture.collaboration.worker_action_guard("%1").await;
-        let mut engine = fixture.take_engine();
-        let firing = tokio::spawn(async move { engine.fire_due().await });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), fixture.engine.fire_due())
+            .await
+            .expect("a held pane must not hold the engine");
+        // The engine still serves other work meanwhile.
+        fixture.engine.rescan().await;
         fixture
             .automation
             .set_rule_enabled("swap-on-limit", false)
             .await
             .unwrap();
         drop(held);
-        tokio::time::timeout(std::time::Duration::from_secs(5), firing)
-            .await
-            .unwrap()
-            .unwrap();
+        fixture.settle().await;
         assert_eq!(
             count(&fixture.snapshots),
             0,
             "a stale firing must not reach the swap service"
         );
         assert_eq!(count(&fixture.runs), 0);
+        let key = Some(fixture.key.clone());
+        assert_eq!(
+            fixture.outcomes().await,
+            vec![
+                (AutomationOutcome::Admitted, key.clone()),
+                (AutomationOutcome::Skipped, key)
+            ]
+        );
+        let guards = fixture
+            .automation
+            .ledger()
+            .guard_state("swap-on-limit", "%1", "", OffsetDateTime::now_utc())
+            .await;
+        assert_eq!(guards.global_fired_last_hour, 0);
         assert!(fixture.sends.lock().unwrap().is_empty());
+    }
+
+    /// A pane with a swap under way, or no room left, defers a firing
+    /// instead of waiting on it or starting another.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_automation_swap_without_room_is_deferred() {
+        let mut fixture = SwapFixture::new().await;
+        let firing = |pane: &str| PlannedFiring {
+            rule: "swap-on-limit".into(),
+            pane: pane.into(),
+            socket: Some("default".into()),
+            agent_session_id: "capped".into(),
+            agent: AgentKind::ClaudeCode,
+            episode: "episode".into(),
+            fire_at: OffsetDateTime::now_utc(),
+            action: AutomationAction::SwapAccount,
+            text: None,
+            submit: false,
+            only_if_still: muxa::automation::AutomationCondition::Idle,
+            account: None,
+        };
+        let rule = fixture.automation.config().await.rule[0].clone();
+        let busy = |pane: &str| SwapOperation {
+            admitted: ledger_entry(
+                &firing(pane),
+                OffsetDateTime::now_utc(),
+                AutomationOutcome::Admitted,
+                None,
+            ),
+            _drain_reservation: None,
+        };
+        fixture.engine.swap_inflight.insert("a".into(), busy("%1"));
+        assert!(matches!(
+            fixture
+                .engine
+                .admit_swap(&firing("%1"), &rule, 0, None, false, &mut None)
+                .await,
+            Admission::Deferred
+        ));
+        fixture.engine.swap_inflight.clear();
+        fixture.engine.swap_inflight.insert("a".into(), busy("%7"));
+        fixture.engine.swap_inflight.insert("b".into(), busy("%8"));
+        assert!(matches!(
+            fixture
+                .engine
+                .admit_swap(&firing("%1"), &rule, 0, None, false, &mut None)
+                .await,
+            Admission::Deferred
+        ));
+        assert!(fixture.automation.ledger().all().await.is_empty());
+        assert_eq!(count(&fixture.snapshots), 0);
+    }
+
+    /// An engine that stopped while its swap ran leaves the operation on
+    /// record; the next one follows that same job to its end, recording it
+    /// once, and never starts it again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_new_engine_follows_an_admitted_swap_it_did_not_start() {
+        let mut fixture = SwapFixture::new().await;
+        fixture.hold(true);
+        fixture.engine.rescan().await;
+        fixture.engine.fire_due().await;
+        fixture.wait_for_runs(1).await;
+        // The engine goes away; its task with it, not the job.
+        drop(fixture.take_engine());
+        assert_eq!(fixture.job().state, "running");
+        let mut engine = AutomationEngine::new(
+            fixture.automation.clone(),
+            muxa::Store::shared(),
+            Vec::new(),
+        );
+        engine.swap_service = Some(Arc::clone(&fixture.swap));
+        engine.reattach_swaps().await;
+        assert_eq!(engine.swap_inflight.len(), 1);
+        // Reattaching twice follows it once.
+        engine.reattach_swaps().await;
+        assert_eq!(engine.swap_ops.len(), 1);
+        fixture.engine = engine;
+        fixture.hold(false);
+        fixture.settle().await;
+        let key = Some(fixture.key.clone());
+        assert_eq!(
+            fixture.outcomes().await,
+            vec![
+                (AutomationOutcome::Admitted, key.clone()),
+                (AutomationOutcome::Fired, key)
+            ]
+        );
+        assert_eq!(count(&fixture.runs), 1);
+        assert!(fixture
+            .automation
+            .ledger()
+            .unresolved_operations()
+            .await
+            .is_empty());
+    }
+
+    /// A task that fails loses nothing: its operation is followed again by
+    /// its key, never started again; a judged swap's end keeps its judgment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_swap_task_is_followed_again_and_keeps_its_judgment() {
+        let mut fixture = SwapFixture::new().await;
+        let judged = serde_json::json!({
+            "judgment": {"decision": "match"},
+            "condition": "is it stuck?",
+            "observe_only": false,
+            "execution": "admitted",
+        })
+        .to_string();
+        let admitted = AutomationLedgerEntry {
+            rule: "swap-on-limit".into(),
+            pane: "%1".into(),
+            agent: AgentKind::ClaudeCode,
+            fired_at: OffsetDateTime::now_utc(),
+            action: AutomationAction::SwapAccount,
+            outcome: AutomationOutcome::Admitted,
+            detail: Some(judged),
+            episode: Some("episode".into()),
+            operation: Some(fixture.key.clone()),
+            job: None,
+        };
+        fixture
+            .automation
+            .ledger()
+            .reserve_operation(admitted.clone(), |_| Ok(()))
+            .await
+            .unwrap();
+        fixture.engine.swap_inflight.insert(
+            fixture.key.clone(),
+            SwapOperation {
+                admitted,
+                _drain_reservation: None,
+            },
+        );
+        let task = fixture
+            .engine
+            .swap_ops
+            .spawn(async { panic!("the operation's task failed") });
+        fixture
+            .engine
+            .swap_tasks
+            .insert(task.id(), fixture.key.clone());
+        // The failure, then the operation followed again to its end.
+        fixture.settle().await;
+        assert_eq!(fixture.engine.swap_ops.len(), 1);
+        fixture.settle().await;
+        let log = fixture.automation.ledger().all().await;
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[1].outcome, AutomationOutcome::Skipped);
+        let detail: serde_json::Value =
+            serde_json::from_str(log[1].detail.as_deref().unwrap()).unwrap();
+        assert_eq!(detail["condition"], "is it stuck?");
+        assert_eq!(detail["execution"], "no job was accepted under its key");
+        assert_eq!(count(&fixture.runs), 0, "nothing was started again");
+        assert!(fixture.engine.swap_inflight.is_empty());
+    }
+
+    /// An engine that stops while its swap's submission is still planning
+    /// does not take the job's absence for "nothing accepted": the next one
+    /// waits for that submission, then follows the job it made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reattached_operation_waits_for_a_submission_still_planning() {
+        let mut fixture = SwapFixture::new().await;
+        fixture.hold_planning(true);
+        fixture.engine.rescan().await;
+        fixture.engine.fire_due().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while count(&fixture.snapshots) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "planning never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(fixture.take_engine());
+        // No job yet: the submission is still planning.
+        assert!(muxa::swap_service::SwapJobs::status(
+            fixture.service.as_ref(),
+            &muxa::swap_service::JobRef::Key(fixture.key.clone())
+        )
+        .is_err());
+        let mut engine = AutomationEngine::new(
+            fixture.automation.clone(),
+            muxa::Store::shared(),
+            Vec::new(),
+        );
+        engine.swap_service = Some(Arc::clone(&fixture.swap));
+        engine.reattach_swaps().await;
+        fixture.engine = engine;
+        // The follower waits instead of releasing it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            fixture.outcomes().await.len(),
+            1,
+            "nothing may end it while its submission can still accept"
+        );
+        fixture.hold_planning(false);
+        fixture.settle().await;
+        let key = Some(fixture.key.clone());
+        assert_eq!(
+            fixture.outcomes().await,
+            vec![
+                (AutomationOutcome::Admitted, key.clone()),
+                (AutomationOutcome::Fired, key)
+            ]
+        );
+        assert_eq!(count(&fixture.runs), 1);
+    }
+
+    /// The claim on a key exists from admission, before the operation is
+    /// ever polled: an operation dropped short of its submission settles
+    /// the key only once it is gone, and then never submits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operation_dropped_before_its_submission_never_submits() {
+        let mut fixture = SwapFixture::new().await;
+        fixture.engine.rescan().await;
+        // Armed while free; held now, so the operation waits for the pane.
+        let held = fixture.collaboration.worker_action_guard("%1").await;
+        let key = fixture.key.clone();
+        fixture.engine.fire_due().await;
+        assert!(
+            fixture
+                .swap
+                .submissions
+                .0
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "claimed at admission"
+        );
+        drop(fixture.take_engine());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.swap.submissions.settled(&key),
+        )
+        .await
+        .expect("the dropped operation releases its claim");
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(muxa::swap_service::SwapJobs::status(
+            fixture.service.as_ref(),
+            &muxa::swap_service::JobRef::Key(key)
+        )
+        .is_err());
+        assert_eq!(count(&fixture.snapshots), 0);
+        assert_eq!(count(&fixture.runs), 0);
+    }
+
+    /// While a swap holds its pane, another rule on that pane neither
+    /// holds the engine nor waits: a notice goes out without the pane, a
+    /// keystroke waits its turn in the queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_pane_defers_other_actions_without_holding_the_engine() {
+        let mut fixture = SwapFixture::new().await;
+        let held = fixture.collaboration.worker_action_guard("%1").await;
+        let firing = |action: AutomationAction| PlannedFiring {
+            rule: "other".into(),
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            agent_session_id: "capped".into(),
+            agent: AgentKind::ClaudeCode,
+            episode: "episode".into(),
+            fire_at: OffsetDateTime::now_utc(),
+            action,
+            text: Some("continue".into()),
+            submit: true,
+            only_if_still: muxa::automation::AutomationCondition::Idle,
+            account: None,
+        };
+        let performed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            (
+                fixture
+                    .engine
+                    .perform(&firing(AutomationAction::Notify))
+                    .await,
+                fixture
+                    .engine
+                    .perform(&firing(AutomationAction::SendPrompt))
+                    .await,
+            )
+        })
+        .await
+        .expect("a held pane must not hold the engine");
+        assert!(matches!(performed.0, Performed::Done));
+        assert!(matches!(performed.1, Performed::Busy));
+        // Arming on the held pane is skipped, not waited for.
+        tokio::time::timeout(std::time::Duration::from_secs(2), fixture.engine.rescan())
+            .await
+            .expect("arming must not wait on a held pane");
+        assert!(fixture.engine.pending.is_empty());
+        drop(held);
+        fixture.engine.rescan().await;
+        assert_eq!(fixture.engine.pending.len(), 1);
+        assert!(fixture.sends.lock().unwrap().is_empty());
+    }
+
+    /// An admission whose job was never accepted is released on reattach,
+    /// with nothing sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reattached_operation_with_no_job_is_released() {
+        let mut fixture = SwapFixture::new().await;
+        let mut admitted = AutomationLedgerEntry {
+            rule: "swap-on-limit".into(),
+            pane: "%1".into(),
+            agent: AgentKind::ClaudeCode,
+            fired_at: OffsetDateTime::now_utc(),
+            action: AutomationAction::SwapAccount,
+            outcome: AutomationOutcome::Admitted,
+            detail: None,
+            episode: Some("episode".into()),
+            operation: None,
+            job: None,
+        };
+        admitted.operation = Some(fixture.key.clone());
+        fixture
+            .automation
+            .ledger()
+            .reserve_operation(admitted, |_| Ok(()))
+            .await
+            .unwrap();
+        fixture.engine.reattach_swaps().await;
+        fixture.settle().await;
+        assert_eq!(
+            fixture.outcomes().await.last().unwrap().0,
+            AutomationOutcome::Skipped
+        );
+        assert_eq!(count(&fixture.runs), 0);
+        assert_eq!(count(&fixture.snapshots), 0);
     }
 
     #[test]
