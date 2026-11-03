@@ -4046,6 +4046,12 @@ struct Dialog {
     /// The row to choose, reached from wherever the dialog's `❯` cursor
     /// sits: Claude orders and focuses some confirm rows case by case.
     pick: Option<&'static str>,
+    /// For a dialog answered with fixed keys: a row its own menu must show,
+    /// or a word its own last lines must show. With neither (and no
+    /// `pick`), muxa cannot tell it is the dialog on screen now, and it is
+    /// never answered.
+    row: Option<&'static str>,
+    footer: Option<&'static str>,
     /// Named in the report.
     label: &'static str,
     /// How many times one swap may answer it.
@@ -4091,7 +4097,7 @@ impl Dialog {
         // Only the current menu's own rows: a row's text further up (a
         // quoted warning, an earlier dialog) is not one of its options.
         let (rows, cursor) = option_rows(screen)?;
-        let target = rows.iter().position(|line| line == row)?;
+        let target = rows.iter().position(|line| names(line, row))?;
         let step = if target > cursor { DOWN } else { UP };
         let mut keys = vec![step; target.abs_diff(cursor)];
         keys.push(ENTER);
@@ -4129,6 +4135,15 @@ pub(crate) fn claude_switch(argv: Option<&[String]>, switch: &str) -> bool {
         }
     }
     false
+}
+
+/// Whether a menu row is `label`: exactly, or followed by its description
+/// (`Keep worktree    Stays at …`, `Use session directory (/x)`).
+fn names(row: &str, label: &str) -> bool {
+    row == label
+        || row
+            .strip_prefix(label)
+            .is_some_and(|rest| rest.starts_with(' '))
 }
 
 /// How many lines above a dialog's footer can be its option rows.
@@ -4227,6 +4242,8 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Yes, I trust this folder", "Enter to confirm"],
         keys: &[DOWN, ENTER],
         pick: Some("Yes, I trust this folder"),
+        row: None,
+        footer: None,
         label: "trusted the folder",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4238,6 +4255,8 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Yes, I trust these settings", "Enter to confirm"],
         keys: &[],
         pick: Some("Yes, I trust these settings"),
+        row: None,
+        footer: None,
         label: "trust the folder's settings",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4249,6 +4268,8 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Yes, I accept", "Bypass Permissions mode"],
         keys: &[DOWN, ENTER],
         pick: Some("Yes, I accept"),
+        row: None,
+        footer: None,
         label: "accepted bypass-permissions mode",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4256,8 +4277,10 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     },
     Dialog {
         needles: &["Teach auto mode", "Enter to confirm"],
-        keys: &[DOWN, ENTER],
+        keys: &[],
         pick: None,
+        row: None,
+        footer: None,
         label: "dismissed the auto-mode tour",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4269,6 +4292,8 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["Update available", "Skip until next version"],
         keys: &[ESC],
         pick: None,
+        row: Some("Update now"),
+        footer: None,
         label: "skipped the Codex update prompt",
         // Once: a second Esc on Codex's composer opens its backtrack view.
         max: 1,
@@ -4279,7 +4304,9 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Trust this folder", "Trust and continue"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Trust and continue"),
+        row: None,
+        footer: None,
         label: "trusted the folder",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4289,7 +4316,9 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Working directory · resume", "Use session directory"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Use session directory"),
+        row: None,
+        footer: None,
         label: "kept the session directory",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4298,7 +4327,9 @@ const STARTUP_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["1. Resume goal", "enter select"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Resume goal"),
+        row: None,
+        footer: None,
         label: "resumed the paused goal",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4310,6 +4341,8 @@ const STARTUP_DIALOGS: &[Dialog] = &[
         needles: &["open in another app", "r to retry"],
         keys: &["r"],
         pick: None,
+        row: None,
+        footer: Some("f fork"),
         label: "retried a conversation another app still held",
         max: 5,
         pause: Duration::from_secs(3),
@@ -4323,7 +4356,9 @@ const EXIT_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Move to background and exit", "Enter to confirm"],
         keys: &[DOWN, ENTER],
-        pick: None,
+        pick: Some("Move to background and exit"),
+        row: None,
+        footer: None,
         label: "moved background work out of the way",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4332,7 +4367,9 @@ const EXIT_DIALOGS: &[Dialog] = &[
     Dialog {
         needles: &["Keep worktree", "Enter to confirm"],
         keys: &[ENTER],
-        pick: None,
+        pick: Some("Keep worktree"),
+        row: None,
+        footer: None,
         label: "kept the worktree",
         max: 1,
         pause: Duration::from_millis(500),
@@ -4356,7 +4393,17 @@ fn pending_dialog<'a>(
     let offers = |dialog: &Dialog| {
         dialog
             .pick
-            .is_some_and(|row| options.iter().any(|o| o == row))
+            .is_some_and(|row| options.iter().any(|o| names(o, row)))
+    };
+    // Which dialog this is, shown by the dialog itself: its row in the
+    // current menu, or its own words on its last lines. Words further up
+    // (an earlier dialog, the conversation) prove nothing.
+    let current = |dialog: &Dialog| match (dialog.pick, dialog.row, dialog.footer) {
+        (Some(_), _, _) => offers(dialog),
+        (None, Some(row), _) => options.iter().any(|o| names(o, row)),
+        (None, None, Some(word)) => screen_tail(screen, 2).contains(word),
+        // Nothing to tell it by: matched only to be named, never answered.
+        (None, None, None) => true,
     };
     // A menu whose rows answer two dialogs (a folder trust and a settings
     // trust) is not one muxa can tell apart: none.
@@ -4365,7 +4412,7 @@ fn pending_dialog<'a>(
     }
     table.iter().find(|dialog| {
         dialog.needles.iter().all(|needle| tail.contains(needle))
-            && (dialog.pick.is_none() || offers(dialog))
+            && current(dialog)
             && answered
                 .iter()
                 .filter(|label| **label == dialog.label)
@@ -4831,6 +4878,37 @@ mod tests {
         let (rows, cursor) = option_rows(BYPASS_WARNING).unwrap();
         assert_eq!(rows, ["No, exit", "Yes, I accept"]);
         assert_eq!(cursor, 0);
+    }
+
+    /// A fixed-key dialog is answered only when the dialog on screen shows
+    /// it is that one: its row in the current menu, or its own words on its
+    /// last lines. An earlier mention never stands in (reproduced by the
+    /// Codex peer on #345, which typed Down and Enter into another modal).
+    #[test]
+    fn a_fixed_key_dialog_needs_its_own_current_identity() {
+        let other_menu =
+            "Earlier discussion: Teach auto mode\nA different confirmation is now open\n \
+            ❯ No, cancel\n   Yes, allow\n Enter to confirm · Esc to cancel\n";
+        let unparseable =
+            "Earlier discussion: Teach auto mode\n This folder pre-approves tools:\n \
+            ❯ No, exit Claude Code\n   Yes, I trust these settings\n   ❯ other\n \
+            Enter to confirm · Esc to cancel\n";
+        for screen in [other_menu, unparseable] {
+            let (_, answered, keys) =
+                answering_with(screen, CLAUDE_READY, &[Consent::Bypass], true);
+            assert!(answered.is_empty() && keys.is_empty(), "{screen}: {keys:?}");
+        }
+        // Codex's update prompt by its own menu row; its lock screen by its
+        // own last line.
+        let update = "  Update available · 0.164.0 → 0.166.0\n› 1. Update now (runs `npm i`)\n  \
+            2. Skip\n  3. Skip until next version\n  enter continue · esc skip\n";
+        assert!(pending_dialog(update, STARTUP_DIALOGS, &[]).is_some());
+        let quoted_update = "Update available, Skip until next version, said the log\n \
+            ❯ No, cancel\n   Yes, allow\n Enter to confirm · Esc to cancel\n";
+        assert!(pending_dialog(quoted_update, STARTUP_DIALOGS, &[]).is_none());
+        let lock = "  🔒  This conversation is open in another app        r to retry\n      \
+            Close it there and press R to continue here.\n   r retry   f fork   esc/⌃c/q exit\n";
+        assert!(pending_dialog(lock, STARTUP_DIALOGS, &[]).is_some());
     }
 
     /// A dialog left on the screen by an agent that is gone is not answered.
