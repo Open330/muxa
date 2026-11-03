@@ -52,7 +52,7 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
     let mut report = Report::default();
 
     // muxad: reachable, every live agent correlated, how it is kept running.
-    let daemon = check_muxad(&socket).await;
+    let (daemon, responded) = probe_muxad(&socket).await;
     let reachable = !matches!(&daemon, CheckResult::Fail(_));
     add(&mut report, "muxad", None, daemon);
     // Skipped silently when muxad is unreachable: `check_muxad` already
@@ -61,7 +61,10 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
         for result in check_collaboration(&socket).await {
             add(&mut report, "muxad", None, result);
         }
-        // Its own check: an earlier verdict on muxad never hides it.
+    }
+    // Its own check, on any daemon that answered: a failed verdict on
+    // something else (a corrupt mailbox) never hides why swaps are down.
+    if responded {
         add(&mut report, "muxad", None, check_swap(&socket).await);
     }
     add(&mut report, "muxad", None, check_service_manager());
@@ -254,15 +257,22 @@ impl CheckResult {
 /// IPC ping with a 1.5 s budget — same window `init::verify` uses.
 /// Cold-started muxad answers a snapshot in <50 ms; anything past 1.5 s
 /// is a real problem worth surfacing.
+#[cfg(test)]
 async fn check_muxad(socket: &Path) -> CheckResult {
+    probe_muxad(socket).await.0
+}
+
+/// The daemon's verdict, and whether it answered at all (a failed verdict
+/// can come from a daemon that did).
+async fn probe_muxad(socket: &Path) -> (CheckResult, bool) {
     let client = Client::new(socket.to_path_buf());
-    match timeout(
+    let verdict = match timeout(
         Duration::from_millis(1500),
         client.hello(Duration::from_millis(1500)),
     )
     .await
     {
-        Ok(Ok(hello)) => muxad_hello_verdict(&hello, socket),
+        Ok(Ok(hello)) => return (muxad_hello_verdict(&hello, socket), true),
         // The inner error already carries the failure mode — including
         // socket path, connection refused vs. RPC mismatch, etc. The
         // previous wording ("reachable but errored") was misleading when
@@ -284,7 +294,8 @@ async fn check_muxad(socket: &Path) -> CheckResult {
             "muxad not responding within 1.5 s at {} — start `muxad` or run `muxa init`",
             socket.display()
         )),
-    }
+    };
+    (verdict, false)
 }
 
 fn muxad_hello_verdict(hello: &muxa::ipc::Hello, socket: &Path) -> CheckResult {
@@ -2017,5 +2028,48 @@ mod tests {
             CheckResult::Fail(message) => assert!(message.contains("corrupt durable mailbox")),
             _ => panic!("expected an explicit collaboration diagnostic"),
         }
+    }
+
+    /// A daemon that answers with two failures reports both: a corrupt
+    /// mailbox does not hide why its swap service did not open.
+    #[tokio::test]
+    async fn a_mailbox_failure_does_not_hide_the_swap_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("two-failures.sock");
+        let mailbox = muxa::collaboration::CollaborationStore::unavailable(
+            muxa::collaboration::CollaborationOptions::default(),
+            "corrupt durable mailbox".into(),
+        );
+        let unopened: std::sync::Arc<dyn muxa::swap_service::SwapJobs> =
+            std::sync::Arc::new(muxa::swap_service::UnopenedSwap::new(
+                "swap jobs are owned by another live manager (pid 7)".into(),
+            ));
+        let server = muxa::ipc::Server::new(socket.clone(), muxa::Store::shared())
+            .with_collaboration(mailbox)
+            .with_swap(Some(unopened));
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        let (daemon, responded) = probe_muxad(&socket).await;
+        let swap = check_swap(&socket).await;
+        shutdown.send(()).unwrap();
+        task.await.unwrap();
+        assert!(matches!(&daemon, CheckResult::Fail(m) if m.contains("corrupt durable mailbox")));
+        assert!(responded, "the daemon answered");
+        assert!(
+            matches!(&swap, CheckResult::Warn(m) if m.contains("another live manager")),
+            "{}",
+            match &swap {
+                CheckResult::Ok(t) | CheckResult::Warn(t) | CheckResult::Fail(t) => t,
+            }
+        );
+        // Nobody listening: not answered, so no swap probe is made.
+        let (_, responded) = probe_muxad(&dir.path().join("nobody.sock")).await;
+        assert!(!responded);
     }
 }
