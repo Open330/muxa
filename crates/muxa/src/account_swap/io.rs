@@ -68,6 +68,76 @@ pub(super) trait SwapIo: Clock {
     fn prompt_cursor(&self) -> Option<u64>;
     /// Whether this target's own prompt hook arrived after `cursor`.
     fn prompt_seen_after(&self, cursor: u64) -> bool;
+    /// What is at `path` now, symlinks followed. Read-only.
+    fn path_facts(&self, path: &str) -> PathFacts;
+    /// The sha256 of the file at `path`, if it can be read.
+    fn file_digest(&self, path: &str) -> Option<String>;
+    /// The working directory of process `pid`, if it can be read.
+    fn process_cwd(&self, pid: u32) -> Option<String>;
+}
+
+/// What a path names, as far as a launch cares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PathFacts {
+    Missing,
+    Directory,
+    File {
+        /// Some execute bit is set. Not proof it runs (a `noexec` mount,
+        /// another user's bit, a loader it lacks).
+        executable: bool,
+        /// A script's `#!` program.
+        interpreter: Option<String>,
+    },
+    Unreadable,
+}
+
+/// [`SwapIo::path_facts`] on the real filesystem.
+pub(super) fn path_facts(path: &str) -> PathFacts {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return PathFacts::Missing,
+        Err(_) => return PathFacts::Unreadable,
+    };
+    if metadata.is_dir() {
+        return PathFacts::Directory;
+    }
+    #[cfg(unix)]
+    let executable = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let executable = true;
+    PathFacts::File {
+        executable,
+        interpreter: shebang(path),
+    }
+}
+
+/// The program a `#!` line names, read from the first bytes only.
+fn shebang(path: &str) -> Option<String> {
+    use std::io::Read;
+    let mut head = [0_u8; 256];
+    let read = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    let line = head[..read].strip_prefix(b"#!")?;
+    let line = line.split(|byte| *byte == b'\n').next()?;
+    let text = std::str::from_utf8(line).ok()?;
+    text.split_whitespace().next().map(str::to_owned)
+}
+
+/// [`SwapIo::file_digest`] on the real filesystem.
+pub(super) fn file_digest(path: &str) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// [`SwapIo::process_cwd`] from `/proc`.
+pub(super) fn process_cwd(pid: u32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let path = link.to_str()?;
+    // A removed directory still reads, marked; it is not there to run in.
+    Some(path.strip_suffix(" (deleted)").unwrap_or(path).to_owned())
 }
 
 /// The pane and processes of a real target.
@@ -88,6 +158,18 @@ impl Clock for LiveIo<'_> {
 }
 
 impl SwapIo for LiveIo<'_> {
+    fn path_facts(&self, path: &str) -> PathFacts {
+        path_facts(path)
+    }
+
+    fn file_digest(&self, path: &str) -> Option<String> {
+        file_digest(path)
+    }
+
+    fn process_cwd(&self, pid: u32) -> Option<String> {
+        process_cwd(pid)
+    }
+
     fn capture(&self) -> Option<String> {
         self.backend
             .capture_pane_on(self.target.socket.as_deref(), &self.target.pane)

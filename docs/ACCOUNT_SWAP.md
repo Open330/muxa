@@ -313,6 +313,27 @@ capped account in the first place, set `[agent.<program>].account = "auto"`
 (see [Configuration](CONFIGURATION.md#starting-on-an-aas-account)): every muxa
 launch then starts `aas e <best eligible account> …` instead of the bare CLI.
 
+## Before the agent is stopped
+
+Right before a target is touched (before its pane is even kept open), the
+swap checks what its relaunch will need and journals the result, and refuses
+the target with nothing done (`preflight_failed: …`, retryable once fixed) if
+any of it is not there:
+
+- the directory the relaunch runs in: where the pane's shell is now, or for a
+  pane that runs its agent directly the directory its respawn is given;
+- a configured account's `env_file`: there, readable, and unchanged since the
+  swap was planned (only its digest is recorded, never its contents);
+- for a directly-run pane, the shell it is respawned through, which is the
+  very one then used;
+- any program the line names by an absolute path, and the interpreter of a
+  script among them.
+
+A program found through the pane's own `PATH` (`aas`, a bare `claude`) is
+resolved by that shell, in a context muxa does not reproduce: it is recorded
+as `unknown`, not certified, and the swap goes on as before. Passing these
+checks is not a promise the launch works.
+
 ## Limits
 
 - A pane started *with* the agent (`new-window 'aas e …'`, `exec claude …`)
