@@ -202,7 +202,7 @@ fn target(kind: AgentKind, direct: bool, busy: bool) -> Target {
         conversation_verified: true,
         evidence: super::ContinueEvidence::Binding,
         restore_draft: true,
-        consents: vec![super::Consent::Bypass],
+        ran_with_bypass: true,
     }
 }
 
@@ -1344,4 +1344,39 @@ fn a_startup_dialog_of_an_unbound_relaunch_is_not_answered() {
     assert!(!log
         .iter()
         .any(|(effect, _)| effect.purpose == Purpose::StartupDialog));
+}
+
+/// Bypass mode is accepted only when the stopped agent ran with it AND the
+/// relaunch bound to the conversation does too, both read from their own
+/// arguments.
+#[test]
+fn bypass_mode_is_accepted_only_when_both_processes_run_with_it() {
+    const BYPASS: &str = " WARNING: Claude Code running in Bypass Permissions mode\n \
+        ❯ No, exit\n   Yes, I accept\n Enter to confirm · Esc to cancel\n";
+    let swap = |ran_with: bool, relaunched: &[&str]| {
+        let io = FakeIo::new(
+            CODEX_IDLE,
+            Box::new(|io: &FakeIo, line: &str| {
+                if line.starts_with("signal TERM") {
+                    io.kill(AGENT);
+                }
+                if line == "text \"\\r\"" && io.previous().as_deref() == Some("text \"RELAUNCH\"") {
+                    io.agent_appears_in(Duration::from_secs(1));
+                    io.show(BYPASS);
+                }
+            }),
+        );
+        *io.argvs.borrow_mut() = Some(vec![(31, Some(words(relaunched)))]);
+        let mut target = target(AgentKind::Codex, false, false);
+        target.kind = AgentKind::ClaudeCode;
+        target.ran_with_bypass = ran_with;
+        let (_, log, _) = run(&io, &target, &launch(), None, &mut NoObserver);
+        log.iter()
+            .any(|(effect, _)| effect.purpose == Purpose::StartupDialog)
+    };
+    let with = ["claude", "--dangerously-skip-permissions", "--resume", "S"];
+    let without = ["claude", "--resume", "S"];
+    assert!(swap(true, &with));
+    assert!(!swap(false, &with));
+    assert!(!swap(true, &without));
 }
