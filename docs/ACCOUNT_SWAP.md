@@ -249,6 +249,16 @@ daemon that runs swap jobs but cannot take one right now (starting, halted,
 shutting down) refuses instead; `--local` runs the swap here anyway, without
 the journal or the exclusion.
 
+The journal keeps every job's record (its request key, plan, each target's
+outcome, lineage and retry claims) for good. The step-by-step detail of a job
+that ended cleanly (done or abandoned, nothing uncertain, nothing left to
+reconcile) is pruned 30 days after it ended, at most once a day: `--status`
+then says the detail was pruned, and such a job can no longer be retried,
+since how far each target got is no longer known. A job with any uncertain
+effect, or one needing reconciliation, keeps all of it. A failed pruning run
+is shown by `muxa doctor` and retried the next day. The journal is at schema
+v3 from this version on; an older muxa refuses it rather than misread it.
+
 ## On a Fleet host
 
 `muxa swap --host <alias>` runs the same swap on a control-mode

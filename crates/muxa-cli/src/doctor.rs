@@ -362,6 +362,11 @@ fn swap_verdict(probe: &Probe) -> CheckResult {
         Probe::Health(health) => health,
     };
     let reason = health.reason.as_deref().unwrap_or("no reason given");
+    if let (SwapReadiness::Ready, Some(maintenance)) = (health.readiness, &health.maintenance) {
+        return CheckResult::Warn(format!(
+            "swap jobs: taking jobs, but {maintenance}; it is tried again after a day"
+        ));
+    }
     match health.readiness {
         SwapReadiness::Ready => CheckResult::Ok(format!(
             "swap jobs: taking jobs (store schema {}, {} running)",
@@ -1344,6 +1349,7 @@ mod tests {
             expected_schema: 2,
             fault: None,
             jobs_running: 1,
+            maintenance: None,
         })
     }
 
@@ -1388,6 +1394,13 @@ mod tests {
         }
         let skewed = swap_verdict(&health(Unavailable, Some("store schema too new"), Some(9)));
         assert!(text(&skewed).contains("store schema 9, this build reads 2"));
+        // Upkeep that failed is a warning, not a halt.
+        let Probe::Health(mut upkeep) = health(Ready, None, Some(3)) else {
+            unreachable!()
+        };
+        upkeep.maintenance = Some("pruning old swap job evidence failed: disk I/O".into());
+        let verdict = swap_verdict(&Probe::Health(upkeep));
+        assert!(matches!(&verdict, CheckResult::Warn(t) if t.contains("disk I/O")));
     }
 
     use super::*;

@@ -38,7 +38,7 @@ use std::sync::Mutex;
 
 /// The schema this build writes and reads. Any other version is refused
 /// without being touched.
-pub(crate) const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE owner (
@@ -63,7 +63,8 @@ CREATE TABLE jobs (
     reason TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
-    retry_of TEXT
+    retry_of TEXT,
+    evidence_pruned_at TEXT
 );
 CREATE TABLE targets (
     job_id TEXT NOT NULL REFERENCES jobs (job_id),
@@ -113,6 +114,13 @@ ALTER TABLE jobs ADD COLUMN retry_of TEXT;
 ALTER TABLE targets ADD COLUMN lineage TEXT;
 ALTER TABLE targets ADD COLUMN retry_of TEXT;
 CREATE UNIQUE INDEX targets_retry_of ON targets (retry_of) WHERE retry_of IS NOT NULL;
+";
+
+/// v2 -> v3: a job whose effects and observations were pruned says so, and
+/// when. A build that predates it refuses the store rather than read a
+/// pruned job's missing evidence as evidence that nothing happened.
+const MIGRATE_2_TO_3: &str = "
+ALTER TABLE jobs ADD COLUMN evidence_pruned_at TEXT;
 ";
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -417,6 +425,9 @@ pub(crate) struct JobStatus {
     pub(crate) targets: Vec<TargetStatus>,
     /// A cancel was asked for: no target starts after it.
     pub(crate) cancel_requested: bool,
+    /// When its effects and observations were pruned, if they were: what
+    /// they would have said is no longer known, not absent.
+    pub(crate) evidence_pruned_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -611,6 +622,14 @@ impl SwapJobStore {
                 // the version moves last, in the same transaction.
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
                 tx.execute_batch(MIGRATE_1_TO_2)?;
+                tx.execute_batch(MIGRATE_2_TO_3)?;
+                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.commit()?;
+            }
+            2 => {
+                connection.pragma_update(None, "synchronous", "FULL")?;
+                let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+                tx.execute_batch(MIGRATE_2_TO_3)?;
                 tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
                 tx.commit()?;
             }
@@ -766,6 +785,61 @@ impl SwapJobStore {
         })
     }
 
+    /// Prune the observations and the settled (accepted or refused) effects
+    /// of at most `batch` jobs that ended cleanly before `cutoff` (an RFC
+    /// 3339 time), marking each in the same transaction: done or abandoned,
+    /// with no target left needing reconciliation and no effect still at its
+    /// intent. An effect the transport could not confirm is kept, as is every
+    /// job and target row: the request key and digest, the plan, every
+    /// disposition, lineage and retry claim. Returns how many were pruned.
+    pub(crate) fn prune_evidence(
+        &self,
+        lease: &Lease,
+        cutoff: &str,
+        batch: usize,
+    ) -> Result<usize, JobError> {
+        self.with(|connection| {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            fence(&tx, lease)?;
+            let jobs: Vec<String> = {
+                let mut statement = tx.prepare(
+                    "SELECT j.job_id FROM jobs j
+                     WHERE j.state IN ('done', 'abandoned')
+                       AND j.evidence_pruned_at IS NULL
+                       AND j.updated_at < ?1
+                       AND NOT EXISTS (SELECT 1 FROM targets t WHERE t.job_id = j.job_id
+                           AND (t.disposition IS NULL OR t.disposition = 'needs_reconciliation'))
+                       AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.job_id = j.job_id
+                           AND e.state = 'intent')
+                       AND (EXISTS (SELECT 1 FROM effects e WHERE e.job_id = j.job_id
+                                AND e.state IN ('accepted', 'refused'))
+                            OR EXISTS (SELECT 1 FROM observations o WHERE o.job_id = j.job_id))
+                     ORDER BY j.updated_at
+                     LIMIT ?2",
+                )?;
+                let rows = statement.query_map(
+                    params![cutoff, i64::try_from(batch).unwrap_or(i64::MAX)],
+                    |row| row.get(0),
+                )?;
+                rows.collect::<Result<_, _>>()?
+            };
+            let at = now();
+            for job in &jobs {
+                tx.execute(
+                    "UPDATE jobs SET evidence_pruned_at = ?2 WHERE job_id = ?1",
+                    params![job, at],
+                )?;
+                tx.execute("DELETE FROM observations WHERE job_id = ?1", [job])?;
+                tx.execute(
+                    "DELETE FROM effects WHERE job_id = ?1 AND state IN ('accepted', 'refused')",
+                    [job],
+                )?;
+            }
+            tx.commit()?;
+            Ok(jobs.len())
+        })
+    }
+
     /// Whether `request_key` was used before: `Some(job)` for the same
     /// request, an error for a different one, `None` if unseen. Checked
     /// before any planning, so a repeated request is answered with the job
@@ -875,12 +949,17 @@ impl SwapJobStore {
     /// attempted, and which later job already retried it.
     pub(crate) fn retry_sources(&self, job: &str) -> Result<Vec<RetrySource>, JobError> {
         self.with(|connection| {
-            let state: String = connection
-                .query_row("SELECT state FROM jobs WHERE job_id = ?1", [job], |row| {
-                    row.get(0)
-                })
+            let (state, pruned): (String, Option<String>) = connection
+                .query_row(
+                    "SELECT state, evidence_pruned_at FROM jobs WHERE job_id = ?1",
+                    [job],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
                 .optional()?
                 .ok_or_else(|| JobError::NotFound(job.to_owned()))?;
+            if let Some(at) = pruned {
+                return Err(pruned_error(job, &at));
+            }
             if matches!(state.as_str(), "accepted" | "running") {
                 return Err(JobError::Invalid {
                     job: job.to_owned(),
@@ -958,6 +1037,19 @@ impl SwapJobStore {
                 } else {
                     Err(JobError::KeyReused(request_key.to_owned()))
                 };
+            }
+            // Checked again where the retry is accepted: a parent pruned
+            // since its sources were read is not retried on what it was.
+            let pruned: Option<String> = tx
+                .query_row(
+                    "SELECT evidence_pruned_at FROM jobs WHERE job_id = ?1",
+                    [parent],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .flatten();
+            if let Some(at) = pruned {
+                return Err(pruned_error(parent, &at));
             }
             for link in links {
                 let latest: Option<u32> = tx.query_row(
@@ -1234,15 +1326,17 @@ impl SwapJobStore {
     /// A job and its targets, read back.
     pub(crate) fn status(&self, job: &str) -> Result<JobStatus, JobError> {
         self.with(|connection| {
-            let (state, reason, node_id, revision, cancel_requested): (
+            let (state, reason, node_id, revision, cancel_requested, evidence_pruned_at): (
                 String,
                 Option<String>,
                 String,
                 u64,
                 bool,
+                Option<String>,
             ) = connection
                 .query_row(
-                    "SELECT state, reason, node_id, revision, cancel_requested != 0
+                    "SELECT state, reason, node_id, revision, cancel_requested != 0,
+                            evidence_pruned_at
                          FROM jobs WHERE job_id = ?1",
                     [job],
                     |row| {
@@ -1252,6 +1346,7 @@ impl SwapJobStore {
                             row.get(2)?,
                             row.get(3)?,
                             row.get(4)?,
+                            row.get(5)?,
                         ))
                     },
                 )
@@ -1302,7 +1397,9 @@ impl SwapJobStore {
                 })?
                 .collect::<Result<Vec<TargetStatus>, _>>()?;
             let mut targets = targets;
-            for target in &mut targets {
+            // A pruned job's follow-up is expired, never pieced together
+            // from the effects that were kept.
+            for target in targets.iter_mut().filter(|_| evidence_pruned_at.is_none()) {
                 if target.follow_up.is_none() {
                     target.follow_up =
                         follow_up_from_effects(connection, job, target.target_id, target.attempt)?;
@@ -1316,6 +1413,7 @@ impl SwapJobStore {
                 reason,
                 targets,
                 cancel_requested,
+                evidence_pruned_at,
             })
         })
     }
@@ -1620,6 +1718,16 @@ fn op_json(op: &Op) -> String {
 }
 
 /// Refuse a write from anyone but the current owner.
+fn pruned_error(job: &str, at: &str) -> JobError {
+    JobError::Invalid {
+        job: job.to_owned(),
+        why: format!(
+            "its evidence was pruned at {at}, so how far each target got is no longer known; \
+             it cannot be retried"
+        ),
+    }
+}
+
 fn fence(tx: &rusqlite::Transaction, lease: &Lease) -> Result<(), JobError> {
     let owner: Option<String> = tx
         .query_row("SELECT nonce FROM owner WHERE id = 1", [], |row| row.get(0))
