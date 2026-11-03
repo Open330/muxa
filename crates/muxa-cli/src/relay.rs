@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use muxa::collaboration::{CollaborationOrigin, RequestMailbox};
+use muxa::collaboration::CollaborationOrigin;
 use muxa::fleet::{
     load_or_create_node_id, read_bounded_line, sanitize_capture_text, FleetBackendInfo,
     FleetCapturedWindowPane, FleetCommandResult, FleetWindowCapture, GlobalPaneRef, RelayFrame,
@@ -32,6 +32,7 @@ const RELAY_KEEPALIVE: Duration = Duration::from_secs(10);
 
 #[allow(clippy::too_many_lines)] // relay lifecycle and its owned tasks are one protocol boundary
 pub(crate) async fn run(client: Client) -> Result<()> {
+    let client = client.with_mailbox_compat_cache();
     let id_path = muxa::paths::default_node_id_file()
         .context("no data directory is available for the fleet host id")?;
     let node_id = load_or_create_node_id(&id_path)
@@ -465,30 +466,22 @@ async fn handle_request(
             request_id,
             pane,
             operator_only,
+            if_unchanged,
         } => {
             if !operator_only {
                 exact_backend(&backends, &pane).await?;
             }
-            let agent = collaboration_origin(&pane, false);
-            let console = collaboration_origin(&pane, true);
-            let (mut incoming, sent, human) = tokio::try_join!(
-                async {
-                    if operator_only {
-                        Ok(Vec::new())
-                    } else {
-                        client
-                            .collaboration_recent_mailbox(&agent, RequestMailbox::Incoming)
-                            .await
-                    }
-                },
-                client.collaboration_recent_mailbox(&console, RequestMailbox::Sent),
-                client.collaboration_recent_mailbox(&console, RequestMailbox::Incoming),
-            )
-            .context("reading collaboration mailbox")?;
-            incoming.extend(human);
+            let snapshot = client
+                .collaboration_mailbox_snapshot(
+                    &collaboration_origin(&pane, true),
+                    operator_only,
+                    if_unchanged.as_deref(),
+                )
+                .await
+                .context("reading collaboration mailbox")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::collaboration_mailbox(incoming, sent),
+                result: FleetCommandResult::collaboration_snapshot(snapshot),
             })
         }
         RelayRequest::CollaborationGet {
@@ -985,6 +978,7 @@ mod tests {
                 request_id: "read".into(),
                 pane: pane.clone(),
                 operator_only: true,
+                if_unchanged: None,
             },
             client.clone(),
             vec![],
@@ -1018,6 +1012,7 @@ mod tests {
                 request_id: "other-client".into(),
                 pane: pane.clone(),
                 operator_only: true,
+                if_unchanged: None,
             },
             client.clone(),
             vec![],
@@ -1041,7 +1036,8 @@ mod tests {
             RelayRequest::CollaborationMailbox {
                 request_id: "agent-mailbox".into(),
                 pane,
-                operator_only: false
+                operator_only: false,
+                if_unchanged: None
             },
             client,
             vec![],

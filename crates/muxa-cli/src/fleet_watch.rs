@@ -2254,6 +2254,7 @@ fn refresh_mailbox(
                 &FleetOperation::CollaborationMailbox {
                     pane,
                     operator_only: false,
+                    if_unchanged: None,
                 },
             )
             .await

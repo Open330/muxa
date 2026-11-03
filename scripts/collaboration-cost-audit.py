@@ -97,13 +97,17 @@ def summarize(audit, sessions, since, repeat_seconds):
             client = row.get("actor", {}).get("client_kind", "unknown")
             key = (client, row.get("operation", "unknown"))
             ipc[key] += 1
-            for field in ("response_bytes", "elapsed_us"):
+            for field in ("response_bytes", "elapsed_us", "message_bytes", "response_body_bytes", "response_body_json_bytes", "response_unique_body_bytes", "response_duplicate_body_bytes", "response_extra_unique_bytes",
+                          "response_extra_bytes", "response_structure_bytes", "response_escape_bytes"):
                 value = row.get(field)
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     metrics = ipc_metrics[key]
                     metrics[field] += value
                     metrics[field + "_samples"] += 1
                     metrics["max_" + field] = max(metrics["max_" + field], value)
+            if isinstance(row.get("conditional_unchanged"), bool):
+                ipc_metrics[key]["conditional_samples"] += 1
+                ipc_metrics[key]["conditional_hits"] += int(row["conditional_unchanged"])
             if row.get("ok") is False:
                 ipc_failed[key] += 1
     stats = {}
@@ -146,17 +150,30 @@ def summarize(audit, sessions, since, repeat_seconds):
                 stat["same_result_repeats"] += 1
                 stat["same_result_repeat_bytes"] += len(data)
             previous[signature] = (at, digest)
+    ipc_rows = []
+    for (client, operation), count in sorted(ipc.items()):
+        metrics = dict(ipc_metrics[(client, operation)])
+        if metrics.get("response_body_bytes_samples", 0):
+            body = metrics.get("response_body_bytes", 0)
+            metrics["extra_per_body_byte"] = metrics.get("response_extra_bytes", 0) / body if body else None
+        if metrics.get("response_unique_body_bytes_samples", 0):
+            unique = metrics.get("response_unique_body_bytes", 0)
+            metrics["extra_per_unique_body_byte"] = metrics.get("response_extra_unique_bytes", 0) / unique if unique else None
+        ipc_rows.append({"client": client, "operation": operation, "calls": count,
+                         "failed": ipc_failed[(client, operation)], **metrics})
     return {
         "since": since.isoformat(),
         "units": "UTF-8 bytes of recorded tool results; not billed tokens",
         "caveats": ["IPC calls include watch/UI traffic, which is not model input.",
                     "IPC bytes are daemon wire responses, not final MCP/CLI output or billed tokens; timings exclude audit IO and socket writes.",
                     "Mixed execution outputs can include unrelated commands.",
+                    "Body fields count request/reply/update/late/decision text after projection; raw UTF-8 and escaped JSON content exclude quotes.",
+                    "extra_per_body_byte compares total IPC bytes beyond raw body text to raw body bytes; metadata is not inherently waste. Zero-body responses have no ratio.",
+                    "Legacy or downgraded responses without body counters are unmeasured, not zero-cost.",
                     "Identical short-window results are candidates for review, not proven waste.",
                     "Only supplied session files are measured; provider caching/tokenization is unknown."],
         "audit_available": audit.exists(),
-        "ipc": [{"client": c, "operation": op, "calls": count, "failed": ipc_failed[(c, op)], **ipc_metrics[(c, op)]}
-                for (c, op), count in sorted(ipc.items())],
+        "ipc": ipc_rows,
         "sessions_scanned": len(seen_files),
         "unmeasured_calls_without_timestamp": unknown_at,
         "tool_results": sorted(stats.values(), key=lambda s: s["output_bytes"], reverse=True),

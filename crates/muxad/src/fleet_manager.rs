@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use muxa::collaboration::{CollaborationOrigin, RequestMailbox};
+use muxa::collaboration::CollaborationOrigin;
 use muxa::config::{FleetCapturePolicy, FleetConfig, FleetConnectPolicy, FleetHostConfig};
 use muxa::fleet::{
     drain_bounded, load_or_create_node_id, read_bounded_line, sanitize_capture_text,
@@ -451,31 +451,21 @@ impl LocalTask {
             FleetOperation::CollaborationMailbox {
                 pane,
                 operator_only,
+                if_unchanged,
             } => {
                 if !operator_only {
                     exact_local_backend(&self.backends, &pane).await?;
                 }
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_mailbox", 0);
-                let agent = fleet_collaboration_origin(&pane, false);
-                let console = fleet_collaboration_origin(&pane, true);
-                let (mut incoming, sent, human) = tokio::try_join!(
-                    async {
-                        if operator_only {
-                            Ok(Vec::new())
-                        } else {
-                            self.client
-                                .collaboration_recent_mailbox(&agent, RequestMailbox::Incoming)
-                                .await
-                        }
-                    },
-                    self.client
-                        .collaboration_recent_mailbox(&console, RequestMailbox::Sent),
-                    self.client
-                        .collaboration_recent_mailbox(&console, RequestMailbox::Incoming),
-                )
-                .map_err(|error| error.to_string())?;
-                incoming.extend(human);
-                Ok(FleetCommandResult::collaboration_mailbox(incoming, sent))
+                self.client
+                    .collaboration_mailbox_snapshot(
+                        &fleet_collaboration_origin(&pane, true),
+                        operator_only,
+                        if_unchanged.as_deref(),
+                    )
+                    .await
+                    .map(FleetCommandResult::collaboration_snapshot)
+                    .map_err(|error| error.to_string())
             }
             FleetOperation::CollaborationGet { pane, request_id } => {
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_get", 0);
@@ -1361,13 +1351,13 @@ impl HostTask {
                             );
                             if request.task_contract.is_some() || request.supersedes_request_id.is_some() { RelayRequest::CollaborationSendContract {request_id:id,pane,request} } else { RelayRequest::CollaborationSend { request_id: id, pane, request } }
                         }
-                        FleetOperation::CollaborationMailbox { pane, operator_only } => {
+                        FleetOperation::CollaborationMailbox { pane, operator_only, if_unchanged } => {
                             audit_operation(&self.alias, "collaboration_mailbox", 0);
                             pending.insert(
                                 id.clone(),
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
-                            RelayRequest::CollaborationMailbox { request_id: id, pane, operator_only }
+                            RelayRequest::CollaborationMailbox { request_id: id, pane, operator_only, if_unchanged }
                         }
                         FleetOperation::CollaborationGet { pane, request_id } => {
                             audit_operation(&self.alias, "collaboration_get", 0);
@@ -1864,6 +1854,7 @@ mod tests {
         let list = FleetOperation::CollaborationMailbox {
             pane,
             operator_only: false,
+            if_unchanged: None,
         };
         // A relay from before bounded claims advertised collaboration alone.
         let legacy = hello(&["collaboration", "collaboration_get"]);

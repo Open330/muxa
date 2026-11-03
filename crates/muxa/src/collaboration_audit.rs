@@ -80,6 +80,10 @@ pub struct CollaborationAuditEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_view: Option<crate::collaboration::CollaborationReadView>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result_count: Option<usize>,
     /// Exact agent sessions an operator purpose change named, granted or not.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,6 +96,24 @@ pub struct CollaborationAuditEntry {
     /// Encoded daemon IPC response size, including its newline; not model tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_body_json_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_unique_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_duplicate_body_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_extra_unique_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_extra_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_structure_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_escape_bytes: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conditional_unchanged: Option<bool>,
     /// Request elapsed time through encoding (including waits), excluding audit IO and socket writes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub elapsed_us: Option<u64>,
@@ -110,6 +132,8 @@ pub struct CollaborationAuditContext {
     pub scope: Option<MailboxScope>,
     pub status: Option<RequestStatus>,
     pub message_bytes: Option<usize>,
+    pub read_view: Option<crate::collaboration::CollaborationReadView>,
+    pub query_limit: Option<usize>,
     pub target_sessions: Vec<String>,
     pub purpose: Option<crate::collaboration::LaunchPurpose>,
     pub release_reason: Option<String>,
@@ -129,6 +153,8 @@ impl CollaborationAuditContext {
             scope: None,
             status: None,
             message_bytes: None,
+            read_view: None,
+            query_limit: None,
             target_sessions: Vec::new(),
             purpose: None,
             release_reason: None,
@@ -159,11 +185,24 @@ impl CollaborationAuditContext {
             scope: self.scope,
             status: self.status,
             message_bytes: self.message_bytes,
+            read_view: self.read_view,
+            query_limit: self.query_limit,
             result_count,
             target_sessions: self.target_sessions,
             purpose: self.purpose,
             release_reason: self.release_reason,
             response_bytes: None,
+            response_body_bytes: None,
+            response_body_json_bytes: None,
+            response_unique_body_bytes: None,
+            response_duplicate_body_bytes: None,
+            response_extra_unique_bytes: None,
+
+            response_extra_bytes: None,
+            response_structure_bytes: None,
+            response_escape_bytes: None,
+            conditional_unchanged: None,
+
             elapsed_us: None,
             ok: error.is_none(),
             error: error.map(str::to_string),

@@ -836,3 +836,62 @@ Caller pane evidence is canonicalized through the already-scanned backend
 inventory. Bare rmux pane ids resolve to their namespaced id before provenance
 comparison; ambiguous host/socket matches are not environment evidence. This
 avoids false mismatch diagnostics while retaining genuine origin differences.
+
+
+### Conditional Fleet mailbox reads and body-relative costs
+
+`collaboration_mailbox_snapshot_v1` adds one authorized read for the agent inbox,
+operator inbox and operator sent box. Each merged mailbox retains at most 32
+full records, newest first; claiming and exact-request reads retain their original
+contracts. Fleet operations and SSH relays forward an optional `if_unchanged`
+token and return `collaboration_read_token` plus `collaboration_unchanged`.
+An unchanged response contains no rows. The macOS operator inbox keeps its existing
+visible rows on that response, clears tokens on reconnect/failure/unregistration,
+and bypasses its token on explicit forced refresh.
+
+The token is an invalidation hint, never authority. The daemon resolves origin
+and scope on every call before comparing it. The token binds a random per-load
+epoch, the published revision, a separate read revision covering quiet wake
+reservations/settlements and delete attempts, and the resolved participant metadata.
+All pages and the token are read under the same transaction lock. A changed
+identity, room, server instance or mailbox forces a fresh snapshot. Failed writes
+may conservatively invalidate a token; they never make failed state look committed.
+
+Only a relay opts into a compatibility LRU for controllers that still expect full
+rows on every read: at most 32 origin/mode keys and 8 MiB of encoded snapshots.
+A hit is usable only after the daemon returns a matching token with no rows.
+Errors and malformed hits invalidate the entry; unsupported legacy daemons fall
+back only on the exact unknown-operation error, using the existing bounded reads.
+Daemon clients do not retain a duplicate body cache. This compatibility path cuts
+the daemon-to-relay transfer; an old controller still receives full SSH results.
+Updating the macOS app removes unchanged body transfers across that final hop too.
+
+The existing audit ledger now records the following numeric fields after response
+projection and encoding, without copying body text or logging content hashes:
+
+| Field | Meaning |
+| --- | --- |
+| `response_bytes` | Complete IPC JSON line, including its newline |
+| `response_body_bytes` | Raw UTF-8 bytes of transported request, reply, update, late-report and decision body fields |
+| `response_unique_body_bytes` | Raw bodies counting each transported request ID once |
+| `response_duplicate_body_bytes` | Raw body bytes in additional copies of the same request record |
+| `response_extra_unique_bytes` | Complete line minus the unique raw bodies |
+| `response_body_json_bytes` | Those body contents after JSON escaping, excluding their quote delimiters |
+| `response_extra_bytes` | Complete line minus raw body bytes |
+| `response_structure_bytes` | Complete line minus escaped body contents |
+| `response_escape_bytes` | Escaped body contents minus raw body bytes |
+
+Field names, quotes, contracts, evidence references and other metadata count as
+structure; their cost is not automatically waste. Duplicate transported body fields
+count separately in transported body bytes because they consume separate wire bytes;
+unique-body counters also expose duplicate carriage of the same request in multiple
+arrays. This is record-identity accounting, not text deduplication across different
+requests. Metadata and unchanged
+responses legitimately have zero body bytes. Their extra/body ratio is undefined,
+not zero or infinity. Legacy protocol downgrades without these counters remain
+unmeasured rather than being treated as free. `read_view`, `query_limit`,
+`result_count`, caller provenance and `conditional_unchanged` identify the read path.
+`scripts/collaboration-cost-audit.py --json` aggregates sampled counters and reports
+`extra_per_body_byte` only when a nonzero raw-body denominator is available,
+and `extra_per_unique_body_byte` for the single-copy request-record baseline.
+These are IPC bytes, separate from final model input and billed tokens.
