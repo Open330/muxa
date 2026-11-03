@@ -13028,6 +13028,7 @@ mod tests {
                 fault: None,
                 service_fault: None,
                 cancel_requested: false,
+                evidence_pruned_at: None,
             }
         }
 
@@ -13054,6 +13055,7 @@ mod tests {
                 expected_schema: 2,
                 fault: (!ready).then(|| "halted".to_owned()),
                 jobs_running: 0,
+                maintenance: None,
             }
         }
 

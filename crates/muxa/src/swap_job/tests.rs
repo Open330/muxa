@@ -745,6 +745,7 @@ fn a_v1_store_is_migrated_in_place() {
                  ALTER TABLE targets DROP COLUMN retry_of;
                  ALTER TABLE targets DROP COLUMN lineage;
                  ALTER TABLE jobs DROP COLUMN retry_of;
+                 ALTER TABLE jobs DROP COLUMN evidence_pruned_at;
                  PRAGMA user_version = 1;",
             )
             .unwrap();
@@ -914,4 +915,317 @@ fn a_cancel_and_a_target_start_are_ordered() {
         store.request_cancel(&lease, "swap-nope"),
         Err(JobError::NotFound(_))
     ));
+}
+
+/// A v2 store opens as v3 with every job kept and none marked pruned.
+#[test]
+fn a_v2_store_is_migrated_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("muxa/swap-jobs.sqlite3");
+    let job = {
+        let store = SwapJobStore::open(&path).unwrap();
+        let lease = store.acquire(&me("a", 1), &alive).unwrap();
+        ended(&store, &lease, "k", Disposition::Swapped)
+    };
+    {
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE jobs DROP COLUMN evidence_pruned_at;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+    }
+    let store = SwapJobStore::open(&path).unwrap();
+    let version: i64 = store
+        .hold()
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+    let status = store.status(&job).unwrap();
+    assert_eq!(status.state, "done");
+    assert_eq!(status.targets[0].effects, 2);
+    assert!(status.evidence_pruned_at.is_none());
+    drop(store);
+    assert!(SwapJobStore::open(&path).is_ok());
+}
+
+/// A one-target job that stopped its agent (accepted), saw it launching,
+/// and ended with `disposition`.
+fn ended(store: &SwapJobStore, lease: &Lease, key: &str, disposition: Disposition) -> String {
+    let job = running(store, lease, key, 1);
+    let stop = effect(Purpose::Interrupt, Op::Key(Key::Esc));
+    let relaunch = effect(Purpose::Relaunch, Op::Text { chars: 4 });
+    let mut journal = store.journal(lease, &job, 0, 1);
+    for e in [&stop, &relaunch] {
+        journal.before(e).unwrap();
+        journal.after(e, Transport::Accepted).unwrap();
+    }
+    store
+        .observe(
+            lease,
+            &job,
+            0,
+            1,
+            &Observation::Phase {
+                phase: Phase::Launching,
+            },
+        )
+        .unwrap();
+    store.finish_target(lease, &job, 0, 1, disposition).unwrap();
+    store.finish(lease, &job).unwrap();
+    job
+}
+
+fn age(store: &SwapJobStore, job: &str, at: &str) {
+    store
+        .hold()
+        .execute(
+            "UPDATE jobs SET updated_at = ?2 WHERE job_id = ?1",
+            params![job, at],
+        )
+        .unwrap();
+}
+
+fn rows(store: &SwapJobStore, job: &str) -> (u32, u32, u32) {
+    let connection = store.hold();
+    let count = |table: &str| -> u32 {
+        connection
+            .query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE job_id = ?1"),
+                [job],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    (count("effects"), count("observations"), count("targets"))
+}
+
+const OLD: &str = "2001-01-01T00:00:00Z";
+const CUTOFF: &str = "2020-01-01T00:00:00Z";
+
+/// Only cleanly ended jobs older than the cutoff lose their effects and
+/// observations, marked in the same transaction; their job and target rows
+/// stay, and everything uncertain or unfinished is kept whole.
+#[test]
+fn pruning_takes_only_old_clean_evidence_and_keeps_every_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let clean = ended(&store, &lease, "clean", Disposition::Swapped);
+    let recent = ended(&store, &lease, "recent", Disposition::Swapped);
+    // A relaunch whose result is unknown.
+    let unknown = running(&store, &lease, "unknown", 1);
+    let relaunch = effect(Purpose::Relaunch, Op::Text { chars: 4 });
+    let mut journal = store.journal(&lease, &unknown, 0, 1);
+    journal.before(&relaunch).unwrap();
+    journal.after(&relaunch, Transport::Unconfirmed).unwrap();
+    store
+        .observe(
+            &lease,
+            &unknown,
+            0,
+            1,
+            &Observation::Phase {
+                phase: Phase::Launching,
+            },
+        )
+        .unwrap();
+    store
+        .finish_target(&lease, &unknown, 0, 1, Disposition::Failed)
+        .unwrap();
+    store.finish(&lease, &unknown).unwrap();
+    let still = running(&store, &lease, "still", 1);
+    store
+        .journal(&lease, &still, 0, 1)
+        .before(&effect(Purpose::Interrupt, Op::Key(Key::Esc)))
+        .unwrap();
+    // An intent never answered, in a job that ended anyway.
+    let open_intent = running(&store, &lease, "open", 1);
+    store
+        .journal(&lease, &open_intent, 0, 1)
+        .before(&effect(Purpose::Interrupt, Op::Key(Key::Esc)))
+        .unwrap();
+    store
+        .hold()
+        .execute_batch(&format!(
+            "UPDATE targets SET disposition = 'failed', phase = 'finished'
+                 WHERE job_id = '{open_intent}';
+             UPDATE jobs SET state = 'done' WHERE job_id = '{open_intent}';"
+        ))
+        .unwrap();
+    for job in [&clean, &unknown, &still, &open_intent] {
+        age(&store, job, OLD);
+    }
+    assert_eq!(store.prune_evidence(&lease, CUTOFF, 32).unwrap(), 2);
+    assert_eq!(rows(&store, &clean), (0, 0, 1));
+    let status = store.status(&clean).unwrap();
+    assert!(status.evidence_pruned_at.is_some());
+    assert_eq!(status.state, "done");
+    assert_eq!(status.targets[0].disposition.as_deref(), Some("swapped"));
+    // The unconfirmed relaunch is kept; nothing else of it.
+    assert_eq!(rows(&store, &unknown), (1, 0, 1));
+    let unconfirmed: String = store
+        .hold()
+        .query_row(
+            "SELECT state FROM effects WHERE job_id = ?1",
+            [&unknown],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(unconfirmed, "unconfirmed");
+    assert!(store.status(&unknown).unwrap().evidence_pruned_at.is_some());
+    for kept in [&recent, &still, &open_intent] {
+        assert!(store.status(kept).unwrap().evidence_pruned_at.is_none());
+        assert_ne!(rows(&store, kept).0, 0, "{kept} keeps its effects");
+    }
+    // Taken over: the interrupted one needs reconciliation, and stays.
+    drop(store);
+    let store = open(&dir);
+    let lease = store.acquire(&me("b", 2), &gone).unwrap();
+    store.recover(&lease).unwrap();
+    age(&store, &still, OLD);
+    assert_eq!(store.status(&still).unwrap().state, "needs_reconciliation");
+    assert_eq!(store.prune_evidence(&lease, CUTOFF, 32).unwrap(), 0);
+    // Nothing left to prune: a second run is a no-op.
+    assert_eq!(store.prune_evidence(&lease, CUTOFF, 32).unwrap(), 0);
+}
+
+/// The marker, not the clock, says evidence is gone: a pruned job is never
+/// retried, even once its timestamps look recent again; its key still
+/// finds it, and a retry made before the pruning keeps its claim.
+#[test]
+fn a_pruned_job_keeps_its_key_and_claims_and_is_never_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = ended(&store, &lease, "k", Disposition::Failed);
+    let retried = ended(&store, &lease, "k2", Disposition::Failed);
+    let link = |parent: &str| RetryLink {
+        target_index: 0,
+        parent_target: 0,
+        parent_attempt: 1,
+        lineage: format!("{parent}:0"),
+    };
+    let plan = plan(1, None);
+    let first = store
+        .create_retry_job(&lease, "r1", "d1", &plan, &retried, &[link(&retried)])
+        .unwrap();
+    for parent in [&job, &retried] {
+        age(&store, parent, OLD);
+    }
+    assert_eq!(store.prune_evidence(&lease, CUTOFF, 32).unwrap(), 2);
+    age(&store, &job, "2999-01-01T00:00:00Z");
+    let refused = store.retry_sources(&job);
+    assert!(
+        matches!(&refused, Err(JobError::Invalid { why, .. }) if why.contains("pruned")),
+        "{refused:?}"
+    );
+    let refused = store.create_retry_job(&lease, "r2", "d2", &plan, &job, &[link(&job)]);
+    assert!(
+        matches!(&refused, Err(JobError::Invalid { why, .. }) if why.contains("pruned")),
+        "{refused:?}"
+    );
+    // The earlier retry's resend is still that retry; its claim holds.
+    let again = store
+        .create_retry_job(&lease, "r1", "d1", &plan, &retried, &[link(&retried)])
+        .unwrap();
+    assert!(again.existing);
+    assert_eq!(again.job_id, first.job_id);
+    let claimed: String = store
+        .hold()
+        .query_row(
+            "SELECT job_id FROM targets WHERE retry_of = ?1",
+            [format!("{retried}:0:1")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(claimed, first.job_id);
+    // The key still finds the job, or refuses another request.
+    let digest = digest(&["k"], Some("continue"));
+    assert_eq!(store.lookup("k", &digest).unwrap(), Some(job.clone()));
+    assert!(matches!(
+        store.lookup("k", "another"),
+        Err(JobError::KeyReused(_))
+    ));
+}
+
+/// Pruning goes in short batches, and a manager that lost the store prunes
+/// nothing.
+#[test]
+fn pruning_runs_in_batches_and_only_for_the_owner() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let jobs: Vec<_> = (0..3)
+        .map(|n| ended(&store, &lease, &format!("k{n}"), Disposition::Swapped))
+        .collect();
+    for job in &jobs {
+        age(&store, job, OLD);
+    }
+    let other = open(&dir);
+    let usurper = other.acquire(&me("b", 2), &gone).unwrap();
+    assert_eq!(
+        store.prune_evidence(&lease, CUTOFF, 2),
+        Err(JobError::Fenced)
+    );
+    assert!(jobs
+        .iter()
+        .all(|job| store.status(job).unwrap().evidence_pruned_at.is_none()));
+    assert_eq!(other.prune_evidence(&usurper, CUTOFF, 2).unwrap(), 2);
+    assert_eq!(other.prune_evidence(&usurper, CUTOFF, 2).unwrap(), 1);
+    assert_eq!(other.prune_evidence(&usurper, CUTOFF, 2).unwrap(), 0);
+}
+
+/// Run against a copy of a real journal (`MUXA_VERIFY_STORE` = the copy's
+/// path): migrate it, prune as if every job were old, and check each job
+/// still reads the same state, outcomes and uncertainty.
+#[test]
+#[ignore = "reads a journal copy named by MUXA_VERIFY_STORE"]
+fn verify_pruning_on_a_journal_copy() {
+    let path = PathBuf::from(std::env::var("MUXA_VERIFY_STORE").unwrap());
+    let store = SwapJobStore::open(&path).unwrap();
+    let lease = store.acquire(&me("verify", 1), &gone).unwrap();
+    let jobs: Vec<String> = {
+        let connection = store.hold();
+        let mut statement = connection.prepare("SELECT job_id FROM jobs").unwrap();
+        let rows = statement.query_map([], |row| row.get(0)).unwrap();
+        rows.collect::<Result<_, _>>().unwrap()
+    };
+    let shape = |status: &JobStatus| {
+        (
+            status.state.clone(),
+            status
+                .targets
+                .iter()
+                .map(|t| (t.disposition.clone(), t.uncertain_effects))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let before: Vec<_> = jobs
+        .iter()
+        .map(|j| shape(&store.status(j).unwrap()))
+        .collect();
+    let pruned = store
+        .prune_evidence(&lease, "9999-01-01T00:00:00Z", 1000)
+        .unwrap();
+    let after: Vec<_> = jobs
+        .iter()
+        .map(|j| shape(&store.status(j).unwrap()))
+        .collect();
+    assert_eq!(before, after);
+    for job in &jobs {
+        let status = store.status(job).unwrap();
+        let (effects, observations, targets) = rows(&store, job);
+        eprintln!(
+            "{job} {} pruned={} effects={effects} observations={observations} targets={targets} retry={}",
+            status.state,
+            status.evidence_pruned_at.is_some(),
+            match store.retry_sources(job) {
+                Ok(_) => "allowed".to_owned(),
+                Err(error) => error.to_string(),
+            }
+        );
+    }
+    eprintln!("pruned {pruned} of {} jobs", jobs.len());
 }

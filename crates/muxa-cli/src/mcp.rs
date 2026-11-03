@@ -5695,6 +5695,7 @@ mod tests {
                 expected_schema: 2,
                 fault: None,
                 jobs_running: 0,
+                maintenance: None,
             }
         }
         fn active(&self) -> Result<(), String> {

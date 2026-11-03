@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The swap job journal no longer grows without bound: the effects and
+  observations of jobs that ended cleanly more than 30 days ago are pruned,
+  at most once a day and in short batches, while every job and target row
+  (request key and digest, plan, outcomes, lineage, retry claims) is kept.
+  A pruned job says so in `--status` and cannot be retried; anything
+  uncertain or needing reconciliation is never pruned, and a failed run is
+  reported by `muxa doctor`. The journal moves to schema v3 in place; muxa
+  0.9.3 and older refuse a v3 journal (swap jobs are then unavailable until
+  upgraded) instead of misreading pruned jobs.
 - The daemon no longer keeps every finished swap job's full outcomes in
   memory for as long as it runs: running jobs keep theirs, and only the 64
   most recently ended jobs do too. An older job's status reads from its
