@@ -1890,18 +1890,36 @@ impl AutomationLedger {
 fn trim(entries: &mut Vec<AutomationLedgerEntry>) {
     let hour_ago = OffsetDateTime::now_utc() - time::Duration::hours(24);
     while entries.len() > MAX_LEDGER_ENTRIES {
-        let Some(index) = entries.iter().position(|entry| {
-            entry.fired_at <= hour_ago
-                || !matches!(
-                    entry.outcome,
-                    AutomationOutcome::Judging
-                        | AutomationOutcome::JudgeTest
-                        | AutomationOutcome::Admitted
-                )
-        }) else {
+        // An operation goes as a whole, its admission with its end, and
+        // never while nothing has ended it: its admission is its claim.
+        let ended: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry.outcome != AutomationOutcome::Admitted)
+            .filter_map(|entry| entry.operation.as_deref())
+            .collect();
+        let Some(index) = entries
+            .iter()
+            .position(|entry| match entry.operation.as_deref() {
+                Some(operation) => ended.contains(operation),
+                None => {
+                    entry.fired_at <= hour_ago
+                        || !matches!(
+                            entry.outcome,
+                            AutomationOutcome::Judging | AutomationOutcome::JudgeTest
+                        )
+                }
+            })
+        else {
             break;
         };
-        entries.remove(index);
+        match entries[index].operation.clone() {
+            Some(operation) => {
+                entries.retain(|entry| entry.operation.as_deref() != Some(operation.as_str()));
+            }
+            None => {
+                entries.remove(index);
+            }
+        }
     }
 }
 
@@ -3572,21 +3590,50 @@ waaait = "5m"
         assert!(ledger.reserve_operation(keyless, |_| Ok(())).await.is_err());
     }
 
-    /// Trimming keeps a recent admission, so its operation is still found.
+    /// Trimming takes an operation whole: one that ended goes with its
+    /// end (never leaving its admission to look pending again), and one
+    /// nothing ended is kept, however old.
     #[tokio::test]
-    async fn trimming_keeps_a_recent_admission() {
+    async fn trimming_takes_an_operation_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automation.json");
         let now = OffsetDateTime::now_utc();
-        let ledger = AutomationLedger::in_memory();
-        ledger
-            .reserve_operation(operation(now, AutomationOutcome::Admitted, "k"), |_| Ok(()))
-            .await
-            .unwrap();
+        let old = now - time::Duration::days(3);
+        let ledger = AutomationLedger::load(Some(path.clone()));
+        for (key, end) in [
+            ("fired", Some(AutomationOutcome::Fired)),
+            ("released", Some(AutomationOutcome::Skipped)),
+            ("pending", None),
+        ] {
+            ledger
+                .reserve_operation(operation(old, AutomationOutcome::Admitted, key), |_| Ok(()))
+                .await
+                .unwrap();
+            if let Some(end) = end {
+                ledger.append(operation(old, end, key)).await;
+            }
+        }
         for _ in 0..(MAX_LEDGER_ENTRIES + 10) {
             ledger
                 .append(entry("other", "%2", now, AutomationOutcome::Skipped))
                 .await;
         }
-        assert_eq!(ledger.unresolved_operations().await.len(), 1);
+        let reloaded = AutomationLedger::load(Some(path));
+        for ledger in [&ledger, &reloaded] {
+            let all = ledger.all().await;
+            for key in ["fired", "released"] {
+                assert!(
+                    !all.iter().any(|e| e.operation.as_deref() == Some(key)),
+                    "{key} must go whole"
+                );
+            }
+            let pending = ledger.unresolved_operations().await;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].operation.as_deref(), Some("pending"));
+            let guards = ledger.guard_state("swap", "%1", "Error@ep", now).await;
+            assert_eq!(guards.global_fired_last_hour, 0);
+            assert!(guards.episode_handled);
+        }
     }
 
     #[tokio::test]

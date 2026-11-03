@@ -955,9 +955,9 @@ const AUTOMATION_SWAP_WAIT: std::time::Duration = std::time::Duration::from_secs
 /// waits its turn. One per pane besides.
 const AUTOMATION_SWAP_CAPACITY: usize = 2;
 
-/// How long a swap firing that found no room waits before it is checked
-/// again.
-const AUTOMATION_SWAP_DEFER: time::Duration = time::Duration::seconds(5);
+/// How long a firing that found its pane busy, or no room for a swap,
+/// waits before it is checked again.
+const AUTOMATION_BUSY_DEFER: time::Duration = time::Duration::seconds(5);
 
 /// The longest pause between waits on an operation whose job or store does
 /// not answer.
@@ -967,6 +967,57 @@ const AUTOMATION_SWAP_BACKOFF_MAX: std::time::Duration = std::time::Duration::fr
 struct DaemonSwap {
     service: Arc<muxa::swap_service::SwapService>,
     node_id: String,
+    /// Automation submissions still able to accept a job, by key, for as
+    /// long as this daemon (and the service) lives.
+    submissions: Arc<Submissions>,
+}
+
+/// Which automation submissions could still accept a job. A key nothing is
+/// submitting under is settled: if no job has it, none will.
+#[derive(Default)]
+struct Submissions(std::sync::Mutex<HashMap<String, tokio::sync::watch::Receiver<bool>>>);
+
+/// Held by a submission's blocking call; dropping it, however the call
+/// ends, says that submission can accept nothing more.
+struct Submitting {
+    key: String,
+    registry: Arc<Submissions>,
+    done: tokio::sync::watch::Sender<bool>,
+}
+
+impl Submissions {
+    fn begin(self: &Arc<Self>, key: &str) -> Submitting {
+        let (done, watch) = tokio::sync::watch::channel(false);
+        if let Ok(mut submitting) = self.0.lock() {
+            submitting.insert(key.to_owned(), watch);
+        }
+        Submitting {
+            key: key.to_owned(),
+            registry: Arc::clone(self),
+            done,
+        }
+    }
+
+    /// Return once nothing is submitting under `key`.
+    async fn settled(&self, key: &str) {
+        let watch = self
+            .0
+            .lock()
+            .ok()
+            .and_then(|submitting| submitting.get(key).cloned());
+        if let Some(mut watch) = watch {
+            let _ = watch.wait_for(|done| *done).await;
+        }
+    }
+}
+
+impl Drop for Submitting {
+    fn drop(&mut self) {
+        if let Ok(mut submitting) = self.registry.0.lock() {
+            submitting.remove(&self.key);
+        }
+        let _ = self.done.send(true);
+    }
 }
 
 /// Open the swap job service off the reactor. A node identity that cannot
@@ -1005,6 +1056,7 @@ async fn open_swap_service(
         muxa::swap_service::SwapService::open(None, Arc::new(context)).map(|service| DaemonSwap {
             service: Arc::new(service),
             node_id,
+            submissions: Arc::default(),
         })
     })
     .await;
@@ -1081,21 +1133,22 @@ fn still_due_from(
 /// for as long as it runs: a wait that runs out is waited again, never
 /// taken for an end.
 async fn run_swap_operation(
-    service: Arc<muxa::swap_service::SwapService>,
+    swap: Arc<DaemonSwap>,
     key: String,
     start: Option<SwapStart>,
 ) -> SwapEnded {
+    let service = &swap.service;
     let released = |reason: String| SwapEnded {
         key: key.clone(),
         job: None,
         end: SwapEnd::Released(reason),
     };
     let job = match start {
-        Some(start) => match start_swap_job(&service, &key, start).await {
+        Some(start) => match start_swap_job(&swap, &key, start).await {
             Ok(job) => job,
             Err(reason) => return released(reason),
         },
-        None => match find_swap_job(&service, &key).await {
+        None => match find_swap_job(&swap, &key).await {
             Some(job) => job,
             None => return released("no job was accepted under its key".into()),
         },
@@ -1124,11 +1177,7 @@ async fn run_swap_operation(
 
 /// Take the pane, check the firing is still due, and start its job: the
 /// job's id, or why nothing was started.
-async fn start_swap_job(
-    service: &Arc<muxa::swap_service::SwapService>,
-    key: &str,
-    start: SwapStart,
-) -> Result<String, String> {
+async fn start_swap_job(swap: &DaemonSwap, key: &str, start: SwapStart) -> Result<String, String> {
     let SwapStart {
         firing,
         revision,
@@ -1175,32 +1224,37 @@ async fn start_swap_job(
         &firing,
         revision,
     );
-    let submit = Arc::clone(service);
+    let submit = Arc::clone(&swap.service);
     let submit_key = key.to_owned();
+    // Registered before the call is handed off, in the same step: whoever
+    // looks for this key later waits for the call, even if this task is
+    // gone by then.
+    let submitting = swap.submissions.begin(key);
     let accepted = tokio::task::spawn_blocking(move || {
+        let _submitting = submitting;
         submit.submit_automation(&submit_key, &overrides, guard, Some(still_due))
     })
     .await;
     match accepted {
         Ok(Ok(accepted)) => Ok(accepted.job_id),
         // Refused, or not known to have been: the key says which.
-        Ok(Err(error)) => find_swap_job(service, key).await.ok_or(error),
-        Err(error) => find_swap_job(service, key)
+        Ok(Err(error)) => find_swap_job(swap, key).await.ok_or(error),
+        Err(error) => find_swap_job(swap, key)
             .await
             .ok_or_else(|| error.to_string()),
     }
 }
 
-/// The job started under `key`, if one was. A store that does not answer
-/// is asked again: only "not found" says no job was accepted.
-async fn find_swap_job(
-    service: &Arc<muxa::swap_service::SwapService>,
-    key: &str,
-) -> Option<String> {
+/// The job started under `key`, if one was. Asked only once nothing is
+/// submitting under it any more (a submission still planning may yet
+/// accept one); a store that does not answer is asked again, and only "not
+/// found" then says no job was accepted.
+async fn find_swap_job(swap: &DaemonSwap, key: &str) -> Option<String> {
     use muxa::swap_service::SwapJobs as _;
     let mut pause = std::time::Duration::from_secs(1);
     loop {
-        let read = Arc::clone(service);
+        swap.submissions.settled(key).await;
+        let read = Arc::clone(&swap.service);
         let job = muxa::swap_service::JobRef::Key(key.to_owned());
         match tokio::task::spawn_blocking(move || read.status(&job)).await {
             Ok(Ok(view)) => return Some(view.job_id),
@@ -1545,6 +1599,14 @@ enum SwapEnd {
     Ended(muxa::swap_service::JobView),
 }
 
+/// What came of performing a firing's action.
+enum Performed {
+    Done,
+    Failed,
+    /// Its pane was busy; nothing was done, and it is tried again later.
+    Busy,
+}
+
 /// Where a swap firing stands after it asks to be admitted.
 enum Admission {
     Admitted,
@@ -1607,7 +1669,10 @@ impl AutomationEngine {
     /// How long to park before the next firing is due, bounded so a rule
     /// added at runtime is still picked up promptly.
     fn time_until_next_firing(&self) -> std::time::Duration {
-        let cap = std::time::Duration::from_secs(AUTOMATION_MAX_IDLE_SECONDS);
+        let mut cap = std::time::Duration::from_secs(AUTOMATION_MAX_IDLE_SECONDS);
+        if !self.deferred_judgments.is_empty() {
+            cap = cap.min(AUTOMATION_BUSY_DEFER.unsigned_abs());
+        }
         let Some(next) = self.pending.peek() else {
             return cap;
         };
@@ -1692,8 +1757,11 @@ impl AutomationEngine {
                 match Scheduler::arm(&config, rule, subject, guards, now, jitter_ratio()) {
                     Decision::Fire(firing) => {
                         if let Some(collaboration) = &self.collaboration {
-                            let Some(reservation) = collaboration
-                                .reserve_worker_automation(
+                            // A pane something is acting on (a swap may hold
+                            // it for minutes) is armed on a later pass, never
+                            // waited for here.
+                            let Some(Some(reservation)) = collaboration
+                                .try_reserve_worker_automation(
                                     &subject.agent_session_id,
                                     &pane,
                                     subject.socket.as_deref(),
@@ -1733,6 +1801,10 @@ impl AutomationEngine {
     /// Act on every firing whose time has come, re-checking each against
     /// the live store first.
     async fn fire_due(&mut self) {
+        // Judged firings that found no room or a busy pane, asked again.
+        for completed in std::mem::take(&mut self.deferred_judgments) {
+            self.finish_judgment(completed).await;
+        }
         let now = time::OffsetDateTime::now_utc();
         let mut due = Vec::new();
         while self
@@ -1826,7 +1898,14 @@ impl AutomationEngine {
                     self.fire_swap(*confirmed, rule, revision, key, now).await;
                     return;
                 }
-                let delivered = self.perform(&confirmed).await;
+                let delivered = match self.perform(&confirmed).await {
+                    Performed::Done => true,
+                    Performed::Failed => false,
+                    Performed::Busy => {
+                        self.requeue(*confirmed, rule, revision, now + AUTOMATION_BUSY_DEFER);
+                        return;
+                    }
+                };
                 let outcome = if delivered {
                     AutomationOutcome::Fired
                 } else {
@@ -1879,7 +1958,7 @@ impl AutomationEngine {
                 if let Some(drain) = drain {
                     self.drain_reservations.insert(key, drain);
                 }
-                self.requeue(confirmed, rule, revision, now + AUTOMATION_SWAP_DEFER);
+                self.requeue(confirmed, rule, revision, now + AUTOMATION_BUSY_DEFER);
             }
             Admission::Refused(reason) => {
                 ledger
@@ -2039,15 +2118,20 @@ impl AutomationEngine {
                         }
                     }
                 }
-                Ok(()) => {
-                    if self.perform(&completed.firing).await {
+                Ok(()) => match self.perform(&completed.firing).await {
+                    Performed::Done => {
                         execution = "fired".into();
                         outcome = AutomationOutcome::Fired;
-                    } else {
+                    }
+                    Performed::Failed => {
                         execution = "action_failed".into();
                         outcome = AutomationOutcome::Failed;
                     }
-                }
+                    Performed::Busy => {
+                        self.deferred_judgments.push_back(completed);
+                        return;
+                    }
+                },
                 Err(reason) => execution = reason,
             }
         }
@@ -2122,41 +2206,11 @@ impl AutomationEngine {
     /// Carry out one action. Every arm keeps the injection inside this
     /// function, so "what an automation can do to a pane" has exactly one
     /// place to read.
-    async fn perform(&mut self, firing: &PlannedFiring) -> bool {
-        let io_guard = if let Some(collaboration) = &self.collaboration {
-            let gate = collaboration.worker_action_guard(&firing.pane).await;
-            if collaboration
-                .worker_input_blocked(&firing.pane, firing.socket.as_deref())
-                .await
-            {
-                return false;
-            }
-            Some(Arc::new(gate))
-        } else {
-            None
-        };
+    async fn perform(&mut self, firing: &PlannedFiring) -> Performed {
         match firing.action {
-            AutomationAction::PressEnter => {
-                self.confirm_selected_yes(firing, io_guard.clone()).await
-            }
-            AutomationAction::SendPrompt => {
-                let Some(text) = firing.text.as_deref() else {
-                    return false;
-                };
-                if !send_automation_text(&self.backends, firing, text, io_guard.clone()).await {
-                    return false;
-                }
-                if !firing.submit {
-                    return true;
-                }
-                // Native hosts use explicit paste boundaries; only hosts
-                // without that support need a best-effort fallback delay.
-                tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
-                send_automation_text(&self.backends, firing, "\r", io_guard.clone()).await
-            }
-            // A notice, not a keystroke: nothing is typed into the pane. The
-            // ledger entry is the durable half, and `muxa automation log`
-            // is where an operator reads it back.
+            // A notice, not a keystroke: nothing is typed into the pane, so
+            // it takes no hold on it. The ledger entry is the durable half,
+            // and `muxa automation log` is where an operator reads it back.
             AutomationAction::Notify => {
                 tracing::warn!(
                     rule = %firing.rule,
@@ -2165,12 +2219,7 @@ impl AutomationEngine {
                     message = firing.text.as_deref().unwrap_or_default(),
                     "automation notice",
                 );
-                true
-            }
-            // ETX — the same byte `muxa agent control --action interrupt`
-            // writes into a native PTY session.
-            AutomationAction::Interrupt => {
-                send_automation_text(&self.backends, firing, "\u{3}", io_guard.clone()).await
+                return Performed::Done;
             }
             // Admitted, never performed here: see `admit_swap`.
             AutomationAction::SwapAccount => {
@@ -2179,8 +2228,56 @@ impl AutomationEngine {
                     pane = %firing.pane,
                     "an automation swap reached perform; it is admitted instead"
                 );
-                false
+                return Performed::Failed;
             }
+            _ => {}
+        }
+        // A pane something else is acting on is tried again later, never
+        // waited for: a swap can hold it for minutes.
+        let io_guard = if let Some(collaboration) = &self.collaboration {
+            let Some(gate) = collaboration.try_worker_action_guard(&firing.pane).await else {
+                return Performed::Busy;
+            };
+            if collaboration
+                .worker_input_blocked(&firing.pane, firing.socket.as_deref())
+                .await
+            {
+                return Performed::Failed;
+            }
+            Some(Arc::new(gate))
+        } else {
+            None
+        };
+        let done = match firing.action {
+            AutomationAction::PressEnter => {
+                self.confirm_selected_yes(firing, io_guard.clone()).await
+            }
+            AutomationAction::SendPrompt => {
+                let Some(text) = firing.text.as_deref() else {
+                    return Performed::Failed;
+                };
+                if !send_automation_text(&self.backends, firing, text, io_guard.clone()).await {
+                    return Performed::Failed;
+                }
+                if !firing.submit {
+                    return Performed::Done;
+                }
+                // Native hosts use explicit paste boundaries; only hosts
+                // without that support need a best-effort fallback delay.
+                tokio::time::sleep(muxa::backend::prompt_submit_grace(&firing.pane)).await;
+                send_automation_text(&self.backends, firing, "\r", io_guard.clone()).await
+            }
+            // ETX — the same byte `muxa agent control --action interrupt`
+            // writes into a native PTY session.
+            AutomationAction::Interrupt => {
+                send_automation_text(&self.backends, firing, "\u{3}", io_guard.clone()).await
+            }
+            AutomationAction::Notify | AutomationAction::SwapAccount => false,
+        };
+        if done {
+            Performed::Done
+        } else {
+            Performed::Failed
         }
     }
 
@@ -2274,12 +2371,10 @@ impl AutomationEngine {
         Admission::Admitted
     }
 
-    fn spawn_swap_task(&mut self, swap: &DaemonSwap, key: String, start: Option<SwapStart>) {
-        let task = self.swap_ops.spawn(run_swap_operation(
-            Arc::clone(&swap.service),
-            key.clone(),
-            start,
-        ));
+    fn spawn_swap_task(&mut self, swap: &Arc<DaemonSwap>, key: String, start: Option<SwapStart>) {
+        let task = self
+            .swap_ops
+            .spawn(run_swap_operation(Arc::clone(swap), key.clone(), start));
         self.swap_tasks.insert(task.id(), key);
     }
 
@@ -7505,7 +7600,7 @@ mod tests {
             only_if_still: muxa::automation::AutomationCondition::Idle,
             account: None,
         };
-        assert!(!engine.perform(&firing).await);
+        assert!(matches!(engine.perform(&firing).await, Performed::Failed));
         assert!(sends.lock().unwrap().is_empty());
     }
 
@@ -7738,12 +7833,20 @@ mod tests {
         agents: Vec<muxa::Agent>,
         snapshots: Counter,
         guards: Counter,
+        /// Closed: planning waits, as a slow one does.
+        planning: Arc<(Mutex<bool>, std::sync::Condvar)>,
     }
 
     impl muxa::swap_service::ContextProvider for FixtureContext {
         fn snapshot(&self) -> Result<muxa::swap_service::Snapshot, String> {
             self.snapshots
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let (open, turned) = &*self.planning;
+            let mut open = open.lock().unwrap();
+            while !*open {
+                open = turned.wait(open).unwrap();
+            }
+            drop(open);
             Ok(muxa::swap_service::Snapshot {
                 node_id: "node".into(),
                 agents: self.agents.clone(),
@@ -7773,8 +7876,10 @@ mod tests {
         automation: Arc<AutomationStore>,
         collaboration: Arc<CollaborationStore>,
         service: Arc<muxa::swap_service::SwapService>,
+        swap: Arc<DaemonSwap>,
         sends: RecordedSends,
         gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
+        planning: Arc<(Mutex<bool>, std::sync::Condvar)>,
         snapshots: Counter,
         guards: Counter,
         runs: Counter,
@@ -7801,6 +7906,7 @@ mod tests {
             });
             let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
             let gate = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
+            let planning = Arc::new((Mutex::new(true), std::sync::Condvar::new()));
             let (snapshots, guards, runs) =
                 (Counter::default(), Counter::default(), Counter::default());
             let dir = tempfile::tempdir().unwrap();
@@ -7812,6 +7918,7 @@ mod tests {
                         agents,
                         snapshots: Arc::clone(&snapshots),
                         guards: Arc::clone(&guards),
+                        planning: Arc::clone(&planning),
                     }),
                     Arc::new(move || {
                         ran.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -7826,10 +7933,12 @@ mod tests {
             );
             let mut engine = AutomationEngine::new(automation.clone(), store, backends);
             engine.collaboration = Some(Arc::clone(&collaboration));
-            engine.swap_service = Some(Arc::new(DaemonSwap {
+            let swap = Arc::new(DaemonSwap {
                 service: Arc::clone(&service),
                 node_id: "node".into(),
-            }));
+                submissions: Arc::default(),
+            });
+            engine.swap_service = Some(Arc::clone(&swap));
             let key = muxa::swap_service::automation_request_key(
                 "node",
                 "%1",
@@ -7843,8 +7952,10 @@ mod tests {
                 automation,
                 collaboration,
                 service,
+                swap,
                 sends,
                 gate,
+                planning,
                 snapshots,
                 guards,
                 runs,
@@ -7855,6 +7966,12 @@ mod tests {
 
         fn hold(&self, held: bool) {
             let (open, turned) = &*self.gate;
+            *open.lock().unwrap() = !held;
+            turned.notify_all();
+        }
+
+        fn hold_planning(&self, held: bool) {
+            let (open, turned) = &*self.planning;
             *open.lock().unwrap() = !held;
             turned.notify_all();
         }
@@ -7892,6 +8009,7 @@ mod tests {
     impl Drop for SwapFixture {
         fn drop(&mut self) {
             self.hold(false);
+            self.hold_planning(false);
         }
     }
 
@@ -8100,10 +8218,7 @@ mod tests {
             muxa::Store::shared(),
             Vec::new(),
         );
-        engine.swap_service = Some(Arc::new(DaemonSwap {
-            service: Arc::clone(&fixture.service),
-            node_id: "node".into(),
-        }));
+        engine.swap_service = Some(Arc::clone(&fixture.swap));
         engine.reattach_swaps().await;
         assert_eq!(engine.swap_inflight.len(), 1);
         // Reattaching twice follows it once.
@@ -8187,6 +8302,106 @@ mod tests {
         assert_eq!(detail["execution"], "no job was accepted under its key");
         assert_eq!(count(&fixture.runs), 0, "nothing was started again");
         assert!(fixture.engine.swap_inflight.is_empty());
+    }
+
+    /// An engine that stops while its swap's submission is still planning
+    /// does not take the job's absence for "nothing accepted": the next one
+    /// waits for that submission, then follows the job it made.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_reattached_operation_waits_for_a_submission_still_planning() {
+        let mut fixture = SwapFixture::new().await;
+        fixture.hold_planning(true);
+        fixture.engine.rescan().await;
+        fixture.engine.fire_due().await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while count(&fixture.snapshots) == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "planning never started"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        drop(fixture.take_engine());
+        // No job yet: the submission is still planning.
+        assert!(muxa::swap_service::SwapJobs::status(
+            fixture.service.as_ref(),
+            &muxa::swap_service::JobRef::Key(fixture.key.clone())
+        )
+        .is_err());
+        let mut engine = AutomationEngine::new(
+            fixture.automation.clone(),
+            muxa::Store::shared(),
+            Vec::new(),
+        );
+        engine.swap_service = Some(Arc::clone(&fixture.swap));
+        engine.reattach_swaps().await;
+        fixture.engine = engine;
+        // The follower waits instead of releasing it.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert_eq!(
+            fixture.outcomes().await.len(),
+            1,
+            "nothing may end it while its submission can still accept"
+        );
+        fixture.hold_planning(false);
+        fixture.settle().await;
+        let key = Some(fixture.key.clone());
+        assert_eq!(
+            fixture.outcomes().await,
+            vec![
+                (AutomationOutcome::Admitted, key.clone()),
+                (AutomationOutcome::Fired, key)
+            ]
+        );
+        assert_eq!(count(&fixture.runs), 1);
+    }
+
+    /// While a swap holds its pane, another rule on that pane neither
+    /// holds the engine nor waits: a notice goes out without the pane, a
+    /// keystroke waits its turn in the queue.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_pane_defers_other_actions_without_holding_the_engine() {
+        let mut fixture = SwapFixture::new().await;
+        let held = fixture.collaboration.worker_action_guard("%1").await;
+        let firing = |action: AutomationAction| PlannedFiring {
+            rule: "other".into(),
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            agent_session_id: "capped".into(),
+            agent: AgentKind::ClaudeCode,
+            episode: "episode".into(),
+            fire_at: OffsetDateTime::now_utc(),
+            action,
+            text: Some("continue".into()),
+            submit: true,
+            only_if_still: muxa::automation::AutomationCondition::Idle,
+            account: None,
+        };
+        let performed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            (
+                fixture
+                    .engine
+                    .perform(&firing(AutomationAction::Notify))
+                    .await,
+                fixture
+                    .engine
+                    .perform(&firing(AutomationAction::SendPrompt))
+                    .await,
+            )
+        })
+        .await
+        .expect("a held pane must not hold the engine");
+        assert!(matches!(performed.0, Performed::Done));
+        assert!(matches!(performed.1, Performed::Busy));
+        // Arming on the held pane is skipped, not waited for.
+        tokio::time::timeout(std::time::Duration::from_secs(2), fixture.engine.rescan())
+            .await
+            .expect("arming must not wait on a held pane");
+        assert!(fixture.engine.pending.is_empty());
+        drop(held);
+        fixture.engine.rescan().await;
+        assert_eq!(fixture.engine.pending.len(), 1);
+        assert!(fixture.sends.lock().unwrap().is_empty());
     }
 
     /// An admission whose job was never accepted is released on reattach,
