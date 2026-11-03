@@ -1590,3 +1590,57 @@ fn a_cancel_is_taken_while_draining() {
     assert_eq!(view.entries[1].reason.as_deref(), Some("cancelled"));
     assert!(h.service.cancel(&JobRef::Id("swap-nope".into())).is_err());
 }
+
+// --- automation still due ----------------------------------------------------
+
+/// A firing that went stale while its swap was planned is refused before
+/// any job exists, and its pane is let go.
+#[test]
+fn a_stale_automation_swap_is_refused_once_planned() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let refused = Service::submit_checked(
+        &h.service,
+        "auto",
+        &overrides(&["%1"]),
+        Origin::Automation,
+        None,
+        Some(Box::new(|| Err("the agent's state changed".into()))),
+    )
+    .unwrap_err();
+    assert!(refused.contains("no longer due"), "{refused}");
+    assert!(h.service.status(&JobRef::Key("auto".into())).is_err());
+    assert!(h
+        .service
+        .reserve(&endpoint_key("%1", Some("/tmp/tmux-1/default")), "next"));
+    assert!(h.executed.lock().unwrap().is_empty());
+}
+
+/// One that goes stale after acceptance steps back at its target, with
+/// nothing done.
+#[test]
+fn a_stale_automation_swap_steps_back_before_its_target_starts() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let asked = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&asked);
+    let job = Service::submit_checked(
+        &h.service,
+        "auto",
+        &overrides(&["%1"]),
+        Origin::Automation,
+        None,
+        Some(Box::new(move || {
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                Ok(())
+            } else {
+                Err("its condition no longer holds".into())
+            }
+        })),
+    )
+    .unwrap()
+    .job_id;
+    let view = settled(&h.service, &job);
+    assert_eq!(view.state, "done");
+    assert_eq!(view.entries[0].disposition.as_deref(), Some("skipped"));
+    assert!(h.executed.lock().unwrap().is_empty());
+    assert_eq!(asked.load(Ordering::SeqCst), 2);
+}
