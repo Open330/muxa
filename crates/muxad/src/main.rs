@@ -1005,6 +1005,43 @@ async fn open_swap_service(
     }
 }
 
+/// The automation's word, asked by the swap service from its own threads,
+/// that a firing is still wanted: the rule's configuration unchanged, the
+/// agent on the same pane and server in the same episode, its condition
+/// still holding. Asked after the plan is made and before the target starts.
+fn automation_still_due(
+    runtime: tokio::runtime::Handle,
+    store: muxa::SharedStore,
+    revision_now: tokio::sync::watch::Receiver<u64>,
+    firing: &PlannedFiring,
+    revision: u64,
+) -> muxa::swap_service::StillDue {
+    let session = firing.agent_session_id.clone();
+    let episode = firing.episode.clone();
+    let pane = firing.pane.clone();
+    let socket = firing.socket.clone();
+    let condition = firing.only_if_still;
+    Box::new(move || {
+        if *revision_now.borrow() != revision {
+            return Err("the automation configuration changed".into());
+        }
+        let agent = runtime
+            .block_on(store.by_session(&session))
+            .ok_or_else(|| "the agent is gone".to_owned())?;
+        let subject = AutomationSubject::from_agent(&agent);
+        if subject.pane.as_deref() != Some(pane.as_str()) || subject.socket != socket {
+            return Err("the agent moved".into());
+        }
+        if subject.episode() != episode {
+            return Err("the agent's state changed".into());
+        }
+        if !subject.satisfies(condition) {
+            return Err("its condition no longer holds".into());
+        }
+        Ok(())
+    })
+}
+
 /// Feed every agent prompt hook the store receives into `receipts`, its
 /// text dropped, for a swap follow-up's evidence. A lagging receiver only
 /// loses evidence, never claims any.
@@ -1802,10 +1839,17 @@ impl AutomationEngine {
                 _gate: gate,
             }) as Box<dyn muxa::swap_service::TargetGuard>
         });
+        let still_due = automation_still_due(
+            tokio::runtime::Handle::current(),
+            self.store.clone(),
+            self.automation.subscribe(),
+            firing,
+            revision,
+        );
         let service = Arc::clone(&swap.service);
         let submit_key = key.clone();
         let accepted = tokio::task::spawn_blocking(move || {
-            service.submit_automation(&submit_key, &overrides, guard)
+            service.submit_automation(&submit_key, &overrides, guard, Some(still_due))
         })
         .await;
         let job = match accepted {
@@ -7067,6 +7111,62 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(!receipts.prompt_after(cursor, AgentKind::ClaudeCode, "other", &endpoint));
+    }
+
+    /// The automation's still-due check follows the live store and the
+    /// configuration: a new prompt (another episode) or an edited rule makes
+    /// the firing stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_automation_swap_goes_stale_with_a_new_episode_or_config() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let agent = store.by_session("capped").await.unwrap();
+        let subject = AutomationSubject::from_agent(&agent);
+        let automation = AutomationStore::in_memory(resume_rule_config());
+        let firing = PlannedFiring {
+            rule: "resume-after-limit".into(),
+            pane: "%1".into(),
+            socket: subject.socket.clone(),
+            agent_session_id: "capped".into(),
+            agent: AgentKind::ClaudeCode,
+            episode: subject.episode(),
+            fire_at: OffsetDateTime::now_utc(),
+            action: AutomationAction::SwapAccount,
+            text: None,
+            submit: false,
+            only_if_still: muxa::automation::AutomationCondition::RateLimited,
+            account: None,
+        };
+        let revision = *automation.subscribe().borrow();
+        let check = |store: &muxa::SharedStore| {
+            automation_still_due(
+                tokio::runtime::Handle::current(),
+                store.clone(),
+                automation.subscribe(),
+                &firing,
+                revision,
+            )
+        };
+        let due = check(&store);
+        assert!(tokio::task::spawn_blocking(due).await.unwrap().is_ok());
+        // The rule edited: stale.
+        let edited = check(&store);
+        automation
+            .set_rule_enabled("resume-after-limit", false)
+            .await
+            .unwrap();
+        assert!(tokio::task::spawn_blocking(edited).await.unwrap().is_err());
+        // A new prompt: another episode, stale even under the old revision.
+        let (_unchanged, revision_now) = tokio::sync::watch::channel(revision);
+        let stale = automation_still_due(
+            tokio::runtime::Handle::current(),
+            store.clone(),
+            revision_now,
+            &firing,
+            revision,
+        );
+        add_agent(&store, "%1", "capped", AgentKind::ClaudeCode).await;
+        assert!(tokio::task::spawn_blocking(stale).await.unwrap().is_err());
     }
 
     #[test]

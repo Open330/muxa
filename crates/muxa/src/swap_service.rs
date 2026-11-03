@@ -700,18 +700,26 @@ impl SwapService {
     /// the target's input guard for. Unlike [`SwapJobs::submit`] it may act
     /// on a pane that runs its agent directly, exactly as automation always
     /// has, since it runs in the daemon's own environment either way.
+    ///
+    /// `still_due` is the automation's own word that the swap is still
+    /// wanted (same rule revision, same agent episode, condition still
+    /// holding). It is asked again once the plan is made, before the job is
+    /// accepted, and once more right before its target is started: a queue
+    /// or a slow plan never turns a stale firing into a stop.
     pub fn submit_automation(
         &self,
         request_key: &str,
         overrides: &SwapOverrides,
         guard: Option<Box<dyn TargetGuard>>,
+        still_due: Option<StillDue>,
     ) -> Result<Accepted, String> {
-        Service::submit(
+        Service::submit_checked(
             &self.inner,
             request_key,
             overrides,
             Origin::Automation,
             guard,
+            still_due,
         )
     }
 
@@ -728,6 +736,9 @@ impl SwapService {
         Service::drain(Arc::clone(&self.inner), timeout).await
     }
 }
+
+/// The automation's check that its swap is still wanted: `Err` says why not.
+pub type StillDue = Box<dyn Fn() -> Result<(), String> + Send>;
 
 /// What an IPC caller may do with swap jobs. Every request through it is a
 /// public one: it can never claim the daemon's own automation privileges.
@@ -1149,6 +1160,19 @@ impl<E: Engine> Service<E> {
         origin: Origin,
         guard: Option<Box<dyn TargetGuard>>,
     ) -> Result<Accepted, String> {
+        Self::submit_checked(this, request_key, overrides, origin, guard, None)
+    }
+
+    /// [`Self::submit`], with the caller's `still_due` asked once the plan
+    /// is made and again before the target starts.
+    pub(crate) fn submit_checked(
+        this: &Arc<Self>,
+        request_key: &str,
+        overrides: &SwapOverrides,
+        origin: Origin,
+        guard: Option<Box<dyn TargetGuard>>,
+        still_due: Option<StillDue>,
+    ) -> Result<Accepted, String> {
         validate_key(request_key)?;
         overrides.validate()?;
         let digest = request_digest(overrides);
@@ -1175,6 +1199,13 @@ impl<E: Engine> Service<E> {
         let (resolved, steps) = this.engine.prepare(&request, &snapshot);
 
         let (settled, notes, runs, taken) = this.split(request_key, steps, origin);
+        // Planning may have waited behind other submissions: still wanted?
+        if let Some(check) = &still_due {
+            if let Err(why) = check() {
+                this.release_all(&taken);
+                return Err(format!("no longer due: {why}"));
+            }
+        }
         // An adopted guard is for one pane: a job it does not cover exactly
         // would have to take that pane's guard again while holding it.
         if let Some(guard) = &guard {
@@ -1227,6 +1258,7 @@ impl<E: Engine> Service<E> {
             plan.targets.len(),
             &taken,
             notes,
+            still_due,
         )
     }
 
@@ -1241,6 +1273,7 @@ impl<E: Engine> Service<E> {
         targets: usize,
         taken: &[String],
         notes: Vec<(usize, SwapOutcome)>,
+        still_due: Option<StillDue>,
     ) -> Result<Accepted, String> {
         if let Err(error) = this.store.start(&this.lease, &job) {
             this.release_all(taken);
@@ -1258,7 +1291,7 @@ impl<E: Engine> Service<E> {
                 },
             );
         }
-        Self::spawn(this, &job, resolved, runs, guard, targets, taken)?;
+        Self::spawn(this, &job, resolved, runs, guard, targets, taken, still_due)?;
         let view = this.status(&JobRef::Id(job.clone()))?;
         Ok(Accepted {
             job_id: job,
@@ -1469,6 +1502,7 @@ impl<E: Engine> Service<E> {
             accepted.targets.len(),
             &taken,
             notes,
+            None,
         )
     }
 
@@ -1529,6 +1563,7 @@ impl<E: Engine> Service<E> {
 
     /// Hand an accepted job to its own thread. If the thread cannot start,
     /// every target ends with no effect and the job is recorded as ended.
+    #[allow(clippy::too_many_arguments)] // one accepted job's whole hand-over
     fn spawn(
         this: &Arc<Self>,
         job: &str,
@@ -1537,6 +1572,7 @@ impl<E: Engine> Service<E> {
         guard: Option<Box<dyn TargetGuard>>,
         targets: usize,
         taken: &[String],
+        still_due: Option<StillDue>,
     ) -> Result<(), String> {
         let worker = Arc::clone(this);
         let worker_job = job.to_owned();
@@ -1544,7 +1580,7 @@ impl<E: Engine> Service<E> {
             // A panic must not leave a job running under a manager that
             // still reports itself healthy.
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                worker.run(&worker_job, &request, runs, guard);
+                worker.run(&worker_job, &request, runs, guard, still_due.as_ref());
             }));
             if ran.is_err() {
                 worker.set_fault(format!(
@@ -1590,6 +1626,7 @@ impl<E: Engine> Service<E> {
         request: &SwapRequest,
         runs: Vec<(usize, TargetIdentity, E::Target)>,
         adopted: Option<Box<dyn TargetGuard>>,
+        still_due: Option<&StillDue>,
     ) {
         let mut adopted = adopted;
         for (target_id, (report_index, identity, target)) in runs.into_iter().enumerate() {
@@ -1632,6 +1669,20 @@ impl<E: Engine> Service<E> {
                     continue;
                 }
             };
+            // The pane is held: the last moment a stale automation firing
+            // can still step back, with nothing done.
+            if let Some(Err(why)) = still_due.map(|check| check()) {
+                self.settle(
+                    job,
+                    target_id,
+                    report_index,
+                    &identity,
+                    Disposition::Skipped,
+                    None,
+                    &format!("no longer due: {why}; nothing was done"),
+                );
+                continue;
+            }
             // The pane is held: start it, unless a cancel came first. From
             // here on it runs to its end.
             match self.boundary(job, target_id, true) {
