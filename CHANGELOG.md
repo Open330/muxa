@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- The daemon no longer keeps every finished swap job's full outcomes in
+  memory for as long as it runs: running jobs keep theirs, and only the 64
+  most recently ended jobs do too. An older job's status reads from its
+  journal, as it does after a restart.
 - A swap answers a relaunched agent's startup dialog only when the screen ends
   in that dialog (its footer, not the agent's own prompt) and only for the
   process resuming the planned conversation; a dialog's words quoted above the
