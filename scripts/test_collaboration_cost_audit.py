@@ -93,6 +93,26 @@ class CostAuditTests(unittest.TestCase):
             ledger.write_text(json.dumps(rows[-1]))
             self.assertIsNone(audit.summarize(ledger, [], since, 300)["ipc"][0]["extra_per_body_byte"])
 
+    def test_request_cost_uses_only_paired_wire_and_original_body_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "audit.ndjson"
+            base = {"at": "2026-10-20T01:00:00Z", "actor": {"client_kind": "mcp"},
+                    "operation": "send", "ok": True}
+            rows = [dict(base, message_bytes=999),  # No wire measurement: excluded.
+                    dict(base, request_bytes=200, message_bytes=20),
+                    dict(base, request_bytes=100, message_bytes=0),
+                    dict(base, request_bytes=True, message_bytes=0),
+                    dict(base, request_bytes=5, message_bytes=10)]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows))
+            since = dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc)
+            row = audit.summarize(ledger, [], since, 300)["ipc"][0]
+            self.assertEqual(row["request_cost_samples"], 2)
+            self.assertEqual(row["request_body_bytes"], 20)
+            self.assertEqual(row["request_extra_bytes"], 280)
+            self.assertEqual(row["request_extra_per_body_byte"], 14)
+            ledger.write_text(json.dumps(rows[2]))
+            self.assertIsNone(audit.summarize(ledger, [], since, 300)["ipc"][0]["request_extra_per_body_byte"])
+
     def test_missing_audit_and_source_mentions_do_not_invent_model_calls(self):
         self.assertIsNone(audit.muxa_call("Bash", {"command": "rg muxa src/main.rs"}))
         self.assertIsNone(audit.muxa_call("unrelated_muxa_room_context", {}))

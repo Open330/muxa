@@ -14,7 +14,10 @@ pub use contract::{
     EvidenceReference, TaskAttempt, TaskContract, TaskReport, TASK_CONTRACT_CAPABILITY,
 };
 mod mailbox_snapshot;
+mod open_counts;
+mod read_validator;
 pub use mailbox_snapshot::{MailboxSnapshot, MAILBOX_SNAPSHOT_CAPABILITY};
+pub use open_counts::{CollaborationOpenCounts, HUMAN_QUERY_CAPABILITY, OPEN_COUNTS_CAPABILITY};
 mod health;
 pub use health::{
     CollaborationHealth, COLLABORATION_HEALTH_CAPABILITY, FILTERED_EXPIRE_CAPABILITY,
@@ -1481,6 +1484,9 @@ impl CollaborationRequest {
 /// exclusive. Room matching is exact across host, socket and tmux window id.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CollaborationQuery {
+    /// Apply the canonical pending-human-response predicate before paging/counting.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub human_only: bool,
     /// Optional stored-payload budget per page, with at least one whole record.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_bytes: Option<usize>,
@@ -2374,6 +2380,9 @@ fn query_connection(
         clauses.push("kind = ?".to_string());
         values.push(Value::Text(request_kind_name(kind).to_string()));
     }
+    if query.human_only {
+        clauses.push("status IN ('queued', 'claimed') AND kind != 'notice' AND json_extract(payload, '$.to.console') = 1 AND json_extract(payload, '$.expects_reply') = 1".to_string());
+    }
     if let Some(status) = query.status {
         clauses.push("status = ?".to_string());
         values.push(Value::Text(request_status_name(status).to_string()));
@@ -2593,6 +2602,7 @@ fn request_matches_query(request: &CollaborationRequest, query: &CollaborationQu
             .is_none_or(|parent| request.parent_request_id.as_ref() == Some(parent))
         && query.kind.is_none_or(|kind| request.kind == kind)
         && query.status.is_none_or(|status| request.status == status)
+        && (!query.human_only || request.needs_human_response())
         && query
             .room
             .as_ref()
@@ -2678,6 +2688,7 @@ pub struct CollaborationStore {
     changes: watch::Sender<u64>,
     read_epoch: String,
     read_revision: AtomicU64,
+    read_validators: Mutex<read_validator::ReadValidators>,
 }
 
 impl CollaborationStore {
@@ -2709,6 +2720,7 @@ impl CollaborationStore {
             reply_wake_tokens: AtomicU64::new(1),
             read_epoch: uuid::Uuid::new_v4().to_string(),
             read_revision: AtomicU64::new(0),
+            read_validators: Mutex::new(read_validator::ReadValidators::default()),
             changes,
         })
     }
@@ -2806,6 +2818,7 @@ impl CollaborationStore {
             reply_wake_tokens: AtomicU64::new(1),
             read_epoch: uuid::Uuid::new_v4().to_string(),
             read_revision: AtomicU64::new(0),
+            read_validators: Mutex::new(read_validator::ReadValidators::default()),
             changes,
         });
         if let Some(days) = store.opts.retention_days {

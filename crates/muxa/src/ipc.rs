@@ -748,6 +748,11 @@ enum RequestBody {
         #[serde(default = "default_worker_idle_secs")]
         idle_threshold_secs: u64,
     },
+    CollaborationOpenCounts {
+        origin: CollaborationOrigin,
+        #[serde(default)]
+        scope: MailboxScope,
+    },
     CollaborationMailboxSnapshot {
         origin: CollaborationOrigin,
         #[serde(default)]
@@ -995,6 +1000,8 @@ const CAPABILITIES: &[&str] = &[
     "rate_limited",
     "collaboration_mailbox",
     collaboration::MAILBOX_SNAPSHOT_CAPABILITY,
+    collaboration::OPEN_COUNTS_CAPABILITY,
+    collaboration::HUMAN_QUERY_CAPABILITY,
     collaboration::HUMAN_PRIORITY_CAPABILITY,
     collaboration::WORKER_SPAWN_CAPABILITY,
     collaboration::WORKER_DRAIN_CAPABILITY,
@@ -1105,6 +1112,8 @@ pub struct Response {
     pub collaboration_page: Option<collaboration::CollaborationPage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_mailbox_snapshot: Option<collaboration::MailboxSnapshot>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_open_counts: Option<collaboration::CollaborationOpenCounts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_byte_budget: Option<usize>,
     /// Present only when the daemon can restart itself. It increments across
@@ -1269,6 +1278,7 @@ impl Response {
             collaboration_scope: None,
             collaboration_page: None,
             collaboration_mailbox_snapshot: None,
+            collaboration_open_counts: None,
             collaboration_byte_budget: None,
             generation: None,
             sessions: None,
@@ -5672,6 +5682,42 @@ async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::CollaborationOpenCounts { origin, scope } => {
+                    kind = "collaboration_open_counts";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::Counts,
+                        origin.clone(),
+                    );
+                    audit_context.scope = Some(scope);
+                    audit_context.read_view = Some(collaboration::CollaborationReadView::Metadata);
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    let response = match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration.open_counts_for(&current, scope).await {
+                            Ok(counts) => {
+                                let mut response = Response::ok();
+                                response.collaboration_open_counts = Some(counts);
+                                response.collaboration_scope = Some(scope);
+                                response
+                            }
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    pending_audit = Some(collaboration_audit_entry(
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    ));
+                    response
+                }
                 RequestBody::CollaborationMailboxSnapshot {
                     origin,
                     operator_only,
@@ -6384,6 +6430,7 @@ async fn handle(
         let bytes = encode_line(&resp, negotiated.unwrap_or(PROTOCOL_VERSION))?;
         if let Some(mut entry) = pending_audit {
             entry.response_bytes = Some(bytes.len());
+            entry.request_bytes = Some(n);
             if negotiated.unwrap_or(PROTOCOL_VERSION) == PROTOCOL_VERSION {
                 let body = response_cost::measure(&resp);
                 entry.response_body_bytes = Some(body.raw);
@@ -8260,6 +8307,24 @@ impl Client {
             .map_err(RuntimeError::Json)
     }
 
+    /// Small read model for dashboards; never execution instructions or claims.
+    pub async fn collaboration_open_counts(
+        &self,
+        origin: &CollaborationOrigin,
+        scope: MailboxScope,
+    ) -> Result<collaboration::CollaborationOpenCounts, RuntimeError> {
+        let mut response = self
+            .call_checked(&serde_json::json!({
+                "protocol": PROTOCOL_VERSION, "kind": "collaboration_open_counts",
+                "origin": origin, "scope": scope,
+            }))
+            .await?;
+        let value = response
+            .get_mut("collaboration_open_counts")
+            .map_or(serde_json::Value::Null, serde_json::Value::take);
+        serde_json::from_value(value).map_err(RuntimeError::Json)
+    }
+
     /// Atomically read a Fleet display snapshot, or validate its prior token.
     /// Legacy callers may opt into the bounded relay compatibility cache;
     /// every reuse still requires a fresh authorized response from the daemon.
@@ -10063,6 +10128,154 @@ mod tests {
             8,
             "a capped Fleet response must not claim requests it cannot return"
         );
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one live IPC fixture checks authorization, paging and measured wire cost
+    async fn summary_queries_enforce_scope_and_account_for_the_complete_request_line() {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("summary-query.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "caller", AgentKind::Codex).await;
+        let backend: SharedBackend =
+            CountingPaneBackend::new(HostKind::Tmux, vec![collaboration_test_pane("%1", "0")]);
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone())
+            .with_collaboration_audit(audit.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket.clone());
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+            exact_session: false,
+        };
+        let context = client.collaboration_context(&origin).await.unwrap();
+        let request = mailbox
+            .create(
+                context.peers[0].clone(),
+                context.current.clone(),
+                collaboration::NewRequest {
+                    body: "한글 요청".into(),
+                    kind: collaboration::RequestKind::Question,
+                    human_action: Some(collaboration::HumanAction::Choice),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let mut fixtures = vec![request.clone()];
+        for _ in 0..64 {
+            fixtures.push(
+                mailbox
+                    .create(
+                        context.peers[0].clone(),
+                        context.peers[0].clone(),
+                        collaboration::NewRequest {
+                            body: "large instruction body ".repeat(512),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let counts = client
+            .collaboration_open_counts(&origin, MailboxScope::All)
+            .await
+            .unwrap();
+        assert_eq!(
+            counts,
+            collaboration::CollaborationOpenCounts::from_requests(&fixtures)
+        );
+        let agent = CollaborationOrigin {
+            console: false,
+            ..origin.clone()
+        };
+        assert!(client
+            .collaboration_open_counts(&agent, MailboxScope::All)
+            .await
+            .is_err());
+        for status in [
+            collaboration::RequestStatus::Queued,
+            collaboration::RequestStatus::Claimed,
+        ] {
+            client
+                .collaboration_query_view(
+                    &origin,
+                    RequestMailbox::All,
+                    MailboxScope::All,
+                    &collaboration::CollaborationQuery {
+                        status: Some(status),
+                        limit: Some(500),
+                        ..Default::default()
+                    },
+                    0,
+                    collaboration::CollaborationReadView::Metadata,
+                )
+                .await
+                .unwrap();
+        }
+        let raw = format!(
+            "  {} \n",
+            serde_json::json!({
+                "protocol":PROTOCOL_VERSION, "kind":"collaboration_list", "origin":origin,
+                "mailbox":"all", "scope":"all", "metadata_only":true,
+                "query":{"human_only":true,"search":"한글","search_bodies":true,"limit":1}
+            })
+        );
+        let mut stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        stream.write_all(raw.as_bytes()).await.unwrap();
+        let mut reader = tokio::io::BufReader::new(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        let response: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["collaboration_page"]["total"], 1);
+        assert_eq!(response["collaboration_page"]["requests"][0]["body"], "");
+        let entries = audit.entries().await;
+        let entry = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.operation == CollaborationAuditOperation::List)
+            .unwrap();
+        assert_eq!(entry.request_bytes, Some(raw.len()));
+        assert_eq!(entry.response_bytes, Some(line.len()));
+        assert_eq!(entry.response_body_bytes, Some(0));
+        let lists: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.operation == CollaborationAuditOperation::List)
+            .collect();
+        let baseline: usize = lists[..2]
+            .iter()
+            .map(|entry| entry.response_bytes.unwrap())
+            .sum();
+        let summary_bytes = entries
+            .iter()
+            .find(|entry| entry.operation == CollaborationAuditOperation::Counts && entry.ok)
+            .unwrap()
+            .response_bytes
+            .unwrap();
+        assert!(baseline > summary_bytes * 10);
+        assert!(baseline > line.len() * 10);
+        if let Ok(path) = std::env::var("MUXA_QUERY_COST_REPORT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&serde_json::json!({
+                "scope":"real IPC response lines on synthetic requests; excludes hello exchanges; not model tokens",
+                "open_requests": fixtures.len(), "legacy_list_calls":2, "legacy_metadata_response_bytes":baseline,
+                "counts_calls":1, "counts_response_bytes":summary_bytes,
+                "human_calls":1, "human_response_bytes":line.len(),
+                "projected_body_bytes":0, "extra_body_ratio":null,
+                "human_request_wire_bytes":raw.len(),
+            })).unwrap()).unwrap();
+        }
         shutdown.send(()).unwrap();
         serving.await.unwrap();
     }

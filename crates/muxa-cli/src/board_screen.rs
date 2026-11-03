@@ -366,30 +366,24 @@ pub(crate) struct CollabSummary {
     pub(crate) open_from: usize,
 }
 
-/// Count unfinished requests to and from every agent of every Run of the
-/// Work, by exact agent session, each request once. A request between two of
-/// its own agents counts on both sides: it is both owed and awaited.
-pub(crate) fn collab_summary(
+/// Count already-aggregated traffic, by exact session across all runs.
+pub(crate) fn collab_summary_counts(
     work: &WorkSnapshotItem,
-    requests: &[muxa::collaboration::CollaborationRequest],
+    counts: &muxa::collaboration::CollaborationOpenCounts,
 ) -> CollabSummary {
     let sessions: std::collections::HashSet<&str> = agents(work)
         .map(|agent| agent.session_id.as_str())
         .collect();
-    let mut seen = std::collections::HashSet::new();
-    let mut summary = CollabSummary::default();
-    for request in requests {
-        if request.status.is_terminal() || !seen.insert(request.id.as_str()) {
-            continue;
-        }
-        if !request.to.console && sessions.contains(request.to.agent_session_id.as_str()) {
-            summary.open_to += 1;
-        }
-        if !request.from.console && sessions.contains(request.from.agent_session_id.as_str()) {
-            summary.open_from += 1;
-        }
+    CollabSummary {
+        open_to: sessions
+            .iter()
+            .map(|id| counts.incoming.get(*id).copied().unwrap_or(0))
+            .sum(),
+        open_from: sessions
+            .iter()
+            .map(|id| counts.outgoing.get(*id).copied().unwrap_or(0))
+            .sum(),
     }
-    summary
 }
 
 /// A Work's workers — agents muxa launched for peer work — and their flags.

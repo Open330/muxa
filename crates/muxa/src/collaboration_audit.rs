@@ -31,6 +31,7 @@ pub enum CollaborationAuditOperation {
     Send,
     Inbox,
     List,
+    Counts,
     Reply,
     Update,
     Get,
@@ -96,6 +97,9 @@ pub struct CollaborationAuditEntry {
     /// Encoded daemon IPC response size, including its newline; not model tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_bytes: Option<usize>,
+    /// Complete received IPC line, including whitespace and its delimiter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_body_bytes: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,6 +196,7 @@ impl CollaborationAuditContext {
             purpose: self.purpose,
             release_reason: self.release_reason,
             response_bytes: None,
+            request_bytes: None,
             response_body_bytes: None,
             response_body_json_bytes: None,
             response_unique_body_bytes: None,

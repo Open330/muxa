@@ -4,7 +4,7 @@ use super::{
     Participant, RequestMailbox,
 };
 use serde::{Deserialize, Serialize};
-use std::hash::{Hash, Hasher};
+use std::fmt::Write;
 use std::sync::atomic::Ordering;
 
 pub const MAILBOX_SNAPSHOT_CAPABILITY: &str = "collaboration_mailbox_snapshot_v1";
@@ -31,23 +31,26 @@ impl CollaborationStore {
             return Err(CollaborationError::ScopeDenied);
         }
         let _transaction = self.transaction_lock.lock().await;
-        let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
-        // Metadata only; includes resolved session/room/socket/role identity.
-        serde_json::to_vec(&(console, agent))?.hash(&mut fingerprint);
-        let token = format!(
-            "{}:{:x}:{:x}:{:x}",
-            self.read_epoch,
+        // A global change is a reason to revalidate, not proof this view changed.
+        let key = super::read_validator::fingerprint(&(console, agent))?;
+        let revision = (
             self.read_revision.load(Ordering::SeqCst),
             *self.changes.borrow(),
-            fingerprint.finish()
         );
-        if if_unchanged == Some(token.as_str()) {
-            return Ok(MailboxSnapshot {
-                token: Some(token),
-                unchanged: true,
-                incoming: Vec::new(),
-                sent: Vec::new(),
-            });
+        if let Some(token) = if_unchanged {
+            if self
+                .read_validators
+                .lock()
+                .await
+                .matches(key, revision, token)
+            {
+                return Ok(MailboxSnapshot {
+                    token: Some(token.to_owned()),
+                    unchanged: true,
+                    incoming: Vec::new(),
+                    sent: Vec::new(),
+                });
+            }
         }
         let query = CollaborationQuery {
             limit: Some(crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT),
@@ -94,9 +97,24 @@ impl CollaborationStore {
         sent.sort_by(newest_first);
         incoming.truncate(crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT);
         sent.truncate(crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT);
+        let digest =
+            super::read_validator::fingerprint(&(&self.read_epoch, key, &incoming, &sent))?;
+        let mut token = String::with_capacity(64);
+        for byte in digest {
+            write!(&mut token, "{byte:02x}").expect("write to String");
+        }
+        self.read_validators
+            .lock()
+            .await
+            .remember(key, revision, token.clone());
+        let unchanged = if_unchanged == Some(token.as_str());
+        if unchanged {
+            incoming.clear();
+            sent.clear();
+        }
         Ok(MailboxSnapshot {
             token: Some(token),
-            unchanged: false,
+            unchanged,
             incoming,
             sent,
         })
@@ -111,6 +129,84 @@ mod tests {
     fn participant(id: &str) -> Participant {
         serde_json::from_value(serde_json::json!({"agent_kind":"codex","agent_session_id":id,
             "pane":"%1","room":{"host":"tmux","socket":"default","window_id":"@1"},"state":"idle","launch_purpose":"worker"})).unwrap()
+    }
+
+    #[tokio::test]
+    async fn unrelated_changes_keep_the_same_token_without_retransmitting_the_view() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("sender");
+        let console = Participant::console(sender.room.clone());
+        let request = store
+            .create(
+                sender.clone(),
+                console.clone(),
+                NewRequest {
+                    body: "visible".into(),
+                    human_action: Some(HumanAction::Choice),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let first = store.mailbox_snapshot(&console, None, None).await.unwrap();
+        let mut elsewhere = sender.clone();
+        elsewhere.room.window_id = "@elsewhere".into();
+        elsewhere.agent_session_id = "elsewhere".into();
+        store
+            .create(
+                elsewhere.clone(),
+                elsewhere,
+                NewRequest {
+                    body: "irrelevant".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let unchanged = store
+            .mailbox_snapshot(&console, None, first.token.as_deref())
+            .await
+            .unwrap();
+        assert!(unchanged.unchanged);
+        assert_eq!(
+            unchanged.token, first.token,
+            "v1 clients require unchanged tokens to match exactly"
+        );
+        assert!(unchanged.incoming.is_empty() && unchanged.sent.is_empty());
+        assert!(
+            store
+                .mailbox_snapshot(&console, None, unchanged.token.as_deref())
+                .await
+                .unwrap()
+                .unchanged
+        );
+        // Eviction loses an optimization, never the meaning of the validator.
+        for n in 0..129 {
+            let mut other_console = console.clone();
+            other_console.room.window_id = format!("@{n}");
+            store
+                .mailbox_snapshot(&other_console, None, None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            store
+                .mailbox_snapshot(&console, None, first.token.as_deref())
+                .await
+                .unwrap()
+                .unchanged
+        );
+        store
+            .update_request(&sender, &request.id, "relevant".into())
+            .await
+            .unwrap();
+        let changed = store
+            .mailbox_snapshot(&console, None, first.token.as_deref())
+            .await
+            .unwrap();
+        assert!(!changed.unchanged);
+        assert_ne!(changed.token, first.token);
+        assert_eq!(changed.incoming[0].updates[0].body, "relevant");
     }
 
     #[tokio::test]
