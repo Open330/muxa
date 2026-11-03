@@ -283,8 +283,14 @@ pub struct JobView {
     pub revision: u64,
     pub reason: Option<String>,
     pub entries: Vec<EntryView>,
-    /// Why the service stopped taking work, if it did.
+    /// Why this job cannot go on: the service faulted while it was still
+    /// accepted or running. An ended job never carries one, whatever
+    /// happened to the service after it ended.
     pub fault: Option<String>,
+    /// Why the service stopped taking work, if it did: its health, not this
+    /// job's result.
+    #[serde(default)]
+    pub service_fault: Option<String>,
     /// A cancel was asked for: no target starts after it, and targets that
     /// never started read `cancelled`.
     #[serde(default)]
@@ -1895,6 +1901,7 @@ impl<E: Engine> Service<E> {
             });
         }
         entries.sort_by_key(|entry| entry.report_index);
+        let unfinished = matches!(status.state.as_str(), "accepted" | "running");
         Ok(JobView {
             job_id: status.job_id,
             node_id: status.node_id,
@@ -1902,7 +1909,8 @@ impl<E: Engine> Service<E> {
             revision: status.revision,
             reason: status.reason,
             entries,
-            fault: self.fault(),
+            fault: self.fault().filter(|_| unfinished),
+            service_fault: self.fault(),
             cancel_requested: status.cancel_requested,
         })
     }
