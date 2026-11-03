@@ -3043,6 +3043,8 @@ async fn automation_judge_test(
         outcome: AutomationOutcome::JudgeTest,
         detail: Some("Explicit Ask condition test; no action will be executed".into()),
         episode: None,
+        operation: None,
+        job: None,
     };
     ledger
         .reserve_judgment(reservation.clone(), max_per_hour, cooldown)
