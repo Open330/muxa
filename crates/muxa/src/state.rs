@@ -1744,13 +1744,6 @@ impl Store {
         self.agents.read().await.get(session_id).cloned()
     }
 
-    /// Hold the registry, so every read of it waits: for a daemon's tests of
-    /// what happens around a slow read. Never in a release.
-    #[cfg(feature = "test-support")]
-    pub async fn hold_for_test(&self) -> tokio::sync::RwLockWriteGuard<'_, HashMap<String, Agent>> {
-        self.agents.write().await
-    }
-
     /// Persist a best-effort recap observed outside the hook event stream.
     ///
     /// Codex's compacted rollout item is opaque, but its TUI renders a

@@ -1658,3 +1658,46 @@ fn a_stale_automation_swap_steps_back_before_its_target_starts() {
     assert!(h.executed.lock().unwrap().is_empty());
     assert_eq!(asked.load(Ordering::SeqCst), 2);
 }
+
+// --- fault scoping -----------------------------------------------------------
+
+/// A fault after a job ended changes nothing about it: its view carries no
+/// fault of its own, only the service's health beside it. The job the
+/// fault stopped still carries it.
+#[test]
+fn a_later_fault_does_not_rewrite_an_ended_job() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let h = harness(Box::new(move || {
+        vec![EngineStep::Run(FakeTarget {
+            identity: identity("%9", "/tmp/tmux-1/default"),
+            gate: Some(Arc::clone(&held)),
+        })]
+    }));
+    let _open = OpenOnDrop(Arc::clone(&gate));
+    // A: its own pane, run to its end first.
+    gate.open();
+    let a = Service::submit(&h.service, "a", &overrides(&["%9"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    let a_view = settled(&h.service, &a);
+    assert_eq!(a_view.state, "done");
+    // B faults the service.
+    h.service
+        .set_fault("job b: the journal could not record target 0".into());
+    let a_after = h.service.status(&JobRef::Id(a.clone())).unwrap();
+    assert_eq!(a_after.fault, None);
+    assert!(a_after.service_fault.is_some());
+    assert_eq!(a_after.state, "done");
+    assert_eq!(a_after.entries, a_view.entries);
+}
+
+/// A view from a daemon before the field reads as no service fault.
+#[test]
+fn a_job_view_without_service_fault_still_reads() {
+    let old = r#"{"job_id":"swap-1","node_id":"n","state":"done","revision":1,
+        "reason":null,"entries":[],"fault":null}"#;
+    let view: JobView = serde_json::from_str(old).unwrap();
+    assert_eq!(view.service_fault, None);
+    assert!(!view.cancel_requested);
+}
