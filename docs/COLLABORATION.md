@@ -850,12 +850,43 @@ visible rows on that response, clears tokens on reconnect/failure/unregistration
 and bypasses its token on explicit forced refresh.
 
 The token is an invalidation hint, never authority. The daemon resolves origin
-and scope on every call before comparing it. The token binds a random per-load
-epoch, the published revision, a separate read revision covering quiet wake
-reservations/settlements and delete attempts, and the resolved participant metadata.
-All pages and the token are read under the same transaction lock. A changed
-identity, room, server instance or mailbox forces a fresh snapshot. Failed writes
-may conservatively invalidate a token; they never make failed state look committed.
+and scope on every call. Tokens bind the random per-load epoch, resolved
+participant metadata and serialized visible rows. Global published/read revisions
+(including quiet reservations, settlements and delete attempts) trigger
+revalidation rather than unconditional transfer. An unrelated mutation keeps the
+same token if the visible result did not change. The server memoizes only 128
+fixed-size query fingerprints, revision pairs and 64-character tokens; no bodies.
+When the revision and token still match, it skips the query and hashing entirely.
+Eviction only loses this fast path; rebuilding the same view yields the same token.
+All pages and validator checks share the existing transaction lock.
+
+This follows the representation-validation principle of
+[RFC 9110 conditional requests](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.2)
+without adding an HTTP layer. Tokens remain opaque and unchanged hits retain the
+exact supplied token, preserving v1 clients. Stateless stamp/token rotation would
+break that contract. Per-room clocks and replayable delta/tombstone feeds add
+mutation bookkeeping, retention and recovery semantics that this read path does
+not need. A normal coalesced app event or post-send refresh now uses the token;
+explicit user refresh bypasses it and errors discard it.
+
+### Small summaries and filtered reads
+
+`collaboration_open_counts_v1` returns open incoming/outgoing counts by exact
+agent session in one authorized snapshot. It uses the already-loaded requests
+under one map read lock, never cloning or serializing bodies.
+Caller scope uses the same visibility predicate as a listing; Room/All require a
+console origin. Console endpoints are excluded from agent counts, terminal
+requests are excluded and each request ID counts once. The Work board consumes
+these counts instead of fetching two metadata lists. It still has no RPC work
+while the subscribed revision is unchanged. This is an aggregate read model for
+Work/agent dashboards, not a new event log or per-client body cache.
+
+`collaboration_human_query_v1` supports `query.human_only`: the canonical
+`needs_human_response` predicate is applied before total/counting/pagination in
+both SQLite and in-memory stores. Hidden mailbox badges fetch those metadata
+rows directly instead of reading all open requests and filtering afterward.
+The existing hello probe gates both capabilities. Old daemons keep the prior
+bounded metadata paths; errors from a supported summary are surfaced normally.
 
 Only a relay opts into a compatibility LRU for controllers that still expect full
 rows on every read: at most 32 origin/mode keys and 8 MiB of encoded snapshots.
@@ -871,7 +902,8 @@ projection and encoding, without copying body text or logging content hashes:
 
 | Field | Meaning |
 | --- | --- |
-| `response_bytes` | Complete IPC JSON line, including its newline |
+| `request_bytes` | Complete received IPC operation line, including whitespace and delimiter |
+| `response_bytes` | Complete IPC response line, including its newline |
 | `response_body_bytes` | Raw UTF-8 bytes of transported request, reply, update, late-report and decision body fields |
 | `response_unique_body_bytes` | Raw bodies counting each transported request ID once |
 | `response_duplicate_body_bytes` | Raw body bytes in additional copies of the same request record |
@@ -895,3 +927,20 @@ unmeasured rather than being treated as free. `read_view`, `query_limit`,
 `extra_per_body_byte` only when a nonzero raw-body denominator is available,
 and `extra_per_unique_body_byte` for the single-copy request-record baseline.
 These are IPC bytes, separate from final model input and billed tokens.
+
+Request-side accounting uses paired `request_bytes`/`message_bytes` samples:
+`request_extra_bytes = request_bytes - original UTF-8 body bytes` and
+`request_extra_per_body_byte = extra / body`. Missing legacy wire samples do not
+enter this denominator; zero-body ratios remain undefined. These measure
+operation messages, not the connection's separate hello exchange or streaming
+traffic. Fewer queries also avoid their connection/negotiation work, which these
+numbers do not count.
+
+At debug level the MCP stdio boundary emits numeric `mcp tool cost` diagnostics:
+`tool`, `input_body_bytes`, `request_json_bytes`, `response_wire_bytes` and
+`result_text_bytes`. No arguments, output text or hashes are logged. Request JSON
+excludes its input delimiter; response wire includes its delimiter. Result text
+is the sum of MCP text blocks before their outer JSON escaping, not billed tokens
+or useful-body bytes. A tool without a body argument has a zero input-body
+baseline, not a zero-cost output. No new cost ledger or cross-process tracing
+framework is introduced, and these diagnostics do no extra work when debug is off.

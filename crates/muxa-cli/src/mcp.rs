@@ -317,7 +317,11 @@ where
         let writer = Arc::clone(&writer);
         let config = Arc::clone(&config);
         tasks.spawn(async move {
-            let response = match serde_json::from_str::<Value>(&line) {
+            let parsed = serde_json::from_str::<Value>(&line);
+            let cost = tracing::enabled!(tracing::Level::DEBUG)
+                .then(|| parsed.as_ref().ok().and_then(tool_call_cost))
+                .flatten();
+            let response = match parsed {
                 Ok(req) => dispatch_with_config(&client, &req, &config).await,
                 // A line that isn't valid JSON at all: -32700, id unknown.
                 Err(e) => Some(error_response(
@@ -329,10 +333,20 @@ where
             // Notifications (and a parse error on what was meant to be a
             // notification) produce no response; only write when there is one.
             if let Some(resp) = response {
-                if let Err(e) = write_response(&writer, &resp).await {
-                    // stdout is gone (host closed the pipe): nothing left to do
-                    // for this response. The read loop will see EOF and exit.
-                    tracing::debug!(error = %e, "mcp: failed to write response");
+                match write_response(&writer, &resp).await {
+                    Ok(response_wire_bytes) => {
+                        if let Some((tool, input_body_bytes)) = cost {
+                            tracing::debug!(
+                                tool,
+                                input_body_bytes,
+                                request_json_bytes = line.len(),
+                                response_wire_bytes,
+                                result_text_bytes = result_text_bytes(&resp),
+                                "mcp tool cost"
+                            );
+                        }
+                    }
+                    Err(e) => tracing::debug!(error = %e, "mcp: failed to write response"),
                 }
             }
         });
@@ -346,10 +360,33 @@ where
     Ok(())
 }
 
+/// Numeric diagnostics only: never retain arguments or returned text.
+fn tool_call_cost(request: &Value) -> Option<(String, usize)> {
+    if request["method"].as_str()? != "tools/call" {
+        return None;
+    }
+    Some((
+        request["params"]["name"].as_str()?.to_owned(),
+        request["params"]["arguments"]["body"]
+            .as_str()
+            .map_or(0, str::len),
+    ))
+}
+
+fn result_text_bytes(response: &Value) -> usize {
+    response["result"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .map(str::len)
+        .sum()
+}
+
 /// Write one response object followed by a newline, holding the shared
 /// writer lock across the entire write so concurrent responses never
 /// interleave mid-line.
-async fn write_response<W>(writer: &Arc<Mutex<W>>, resp: &Value) -> std::io::Result<()>
+async fn write_response<W>(writer: &Arc<Mutex<W>>, resp: &Value) -> std::io::Result<usize>
 where
     W: AsyncWrite + Unpin,
 {
@@ -357,7 +394,8 @@ where
     bytes.push(b'\n');
     let mut guard = writer.lock().await;
     guard.write_all(&bytes).await?;
-    guard.flush().await
+    guard.flush().await?;
+    Ok(bytes.len())
 }
 
 /// Handle one parsed JSON-RPC message. Returns `Some(response)` for
@@ -5570,6 +5608,32 @@ mod tests {
         ] {
             assert!(swap_plan(&bad, None, None).is_err(), "{bad}");
         }
+    }
+
+    #[tokio::test]
+    async fn cost_counters_separate_original_utf8_text_from_encoded_wire() {
+        let body = "한글\n\"";
+        let request =
+            json!({"method":"tools/call","params":{"name":"muxa_reply","arguments":{"body":body}}});
+        assert_eq!(
+            tool_call_cost(&request),
+            Some(("muxa_reply".into(), body.len()))
+        );
+        assert!(tool_call_cost(&json!({"method":"initialize"})).is_none());
+        let response = json!({"id":7,"result":text_result(body)});
+        assert_eq!(result_text_bytes(&response), body.len());
+        let (writer, reader) = tokio::io::duplex(1024);
+        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+        let bytes = write_response(&writer, &response).await.unwrap();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        reader.read_line(&mut line).await.unwrap();
+        assert_eq!(bytes, line.len());
+        assert!(bytes > body.len());
+        assert_eq!(
+            serde_json::from_str::<Value>(&line).unwrap()["result"]["content"][0]["text"],
+            body
+        );
     }
 
     fn output(exit_code: i32, stdout: &str, stderr: &str) -> muxa::work_control::WorkCommandOutput {

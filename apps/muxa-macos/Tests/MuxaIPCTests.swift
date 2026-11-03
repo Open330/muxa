@@ -1981,6 +1981,30 @@ struct MuxaOperatorInboxRefreshTests {
     }
 
     @Test @MainActor
+    func inboxEventsCoalesceHostsAndRetainConditionalTokens() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [inboxSentRequest(id: "local-1", createdAt: "2026-09-02T10:00:00Z")])
+        probe.setMailbox(host: "dev", sent: [inboxSentRequest(id: "dev-1", createdAt: "2026-09-02T09:00:00Z")])
+        probe.setReadToken(host: "local", token: "local-v1")
+        probe.setReadToken(host: "dev", token: "dev-v1")
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        probe.resetReadLog()
+        for _ in 0..<20 {
+            model.scheduleInboxRefresh(host: "local", ifGeneration: 0)
+            model.scheduleInboxRefresh(host: "dev", ifGeneration: 0)
+        }
+        for _ in 0..<200 {
+            if probe.mailboxReadHosts().count == 2 { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        #expect(probe.mailboxReadHosts().sorted() == ["dev", "local"])
+        #expect(probe.requestedToken(host: "local") == "local-v1")
+        #expect(probe.requestedToken(host: "dev") == "dev-v1")
+        #expect(model.operatorMessages.map(\.id) == ["local:local-1", "dev:dev-1"])
+    }
+
+    @Test @MainActor
     func conditionalInboxFailureKeepsMessagesButDiscardsTokenBeforeRecovery() async throws {
         let probe = InboxMailboxProbe()
         probe.setMailbox(host: "local", sent: [inboxSentRequest(id: "local-1", createdAt: "2026-09-02T10:00:00Z")])

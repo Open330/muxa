@@ -632,7 +632,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func scheduleInboxRefresh(host: String, ifGeneration generation: UInt64) {
+    // Invalidations revalidate; only an explicit refresh needs the full snapshot.
+    func scheduleInboxRefresh(host: String, ifGeneration generation: UInt64) {
         pendingInboxHosts.insert(host)
         guard inboxEventTask == nil else { return }
         inboxEventTask = Task { [weak self] in
@@ -649,7 +650,7 @@ final class AppModel: ObservableObject {
                     try? await Task.sleep(for: .milliseconds(200))
                     continue
                 }
-                await refreshOperatorInbox(force: true, hostAliases: hosts)
+                await refreshOperatorInbox(force: false, hostAliases: hosts)
             }
         }
     }
@@ -1605,7 +1606,7 @@ final class AppModel: ObservableObject {
                     request: updated
                 )
             }
-            await refreshOperatorInbox(force: true, hostAliases: [message.host.alias])
+            await refreshOperatorInbox(force: false, hostAliases: [message.host.alias])
         } catch {
             inboxError = error.localizedDescription
         }

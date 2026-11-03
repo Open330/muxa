@@ -65,7 +65,7 @@ jobs:
             -destination 'platform=macOS' \
             CODE_SIGNING_ALLOWED=NO \
             test > "$RUNNER_TEMP/xcodebuild.log" 2>&1 && status=0 || status=$?
-          grep -E ': (error|warning): |Test Case .* failed|Executed [0-9]+ test|\*\* (TEST|BUILD) ' \
+          grep -E ': (error|warning): |Test Case .* failed|Executed [0-9]+ test|Test run with .* (passed|failed)|\*\* (TEST|BUILD) ' \
             "$RUNNER_TEMP/xcodebuild.log" | sort -u | head -200 || true
           exit "$status"
 

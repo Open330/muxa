@@ -1004,6 +1004,7 @@ fn collaboration_query_from_http(
         .map_err(|error| format!("invalid room; expected a JSON RoomId: {error}"))?;
     Ok((
         CollaborationQuery {
+            human_only: false,
             max_bytes: None,
             until_exclusive: false,
             window: None,

@@ -1038,6 +1038,14 @@ async fn restart_daemon_from_watch(client: &Client) -> std::result::Result<(), S
 async fn probe_version_skew(client: &Client, app: &mut App) {
     if let Ok(hello) = client.hello(Duration::from_secs(2)).await {
         app.version_skew = hello.version_skew();
+        app.open_counts_supported = hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == muxa::collaboration::OPEN_COUNTS_CAPABILITY);
+        app.human_query_supported = hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == muxa::collaboration::HUMAN_QUERY_CAPABILITY);
         app.exact_session_supported = hello
             .capabilities
             .iter()
@@ -3340,6 +3348,8 @@ pub(crate) struct App {
     /// exact-session origins). Board collaboration acts for one exact agent,
     /// so it is refused without this rather than risk a pane fallback.
     exact_session_supported: bool,
+    open_counts_supported: bool,
+    human_query_supported: bool,
     collaboration_composer: Option<CollaborationComposer>,
     /// Agents the operator marked with `Space`, to be addressed together.
     ///
@@ -3691,6 +3701,8 @@ impl App {
             board_collab_cache: BoardMailboxCache::default(),
             board_workers: BoardWorkers::default(),
             exact_session_supported: false,
+            open_counts_supported: false,
+            human_query_supported: false,
             pending_outcomes: Vec::new(),
             collaboration_composer: None,
             collaboration_marks: std::collections::HashSet::new(),
@@ -9448,7 +9460,7 @@ impl BoardStats {
 }
 
 /// Open-request metadata behind the per-Work summary; never bodies or claims.
-pub(crate) type BoardCollab = Background<Vec<CollaborationRequest>>;
+pub(crate) type BoardCollab = Background<muxa::collaboration::CollaborationOpenCounts>;
 const BOARD_COLLAB_INTERVAL: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Default)]
@@ -9487,8 +9499,19 @@ fn refresh_board_collaboration(client: &Client, app: &mut App) {
         console: true,
         ..origin
     };
-    app.board_collab
-        .start(async move { read_board_open_requests(&client, &origin).await });
+    let counts_supported = app.open_counts_supported;
+    app.board_collab.start(async move {
+        if counts_supported {
+            client
+                .collaboration_open_counts(&origin, MailboxScope::All)
+                .await
+                .map_err(|error| error.to_string())
+        } else {
+            read_board_open_requests(&client, &origin)
+                .await
+                .map(|rows| muxa::collaboration::CollaborationOpenCounts::from_requests(&rows))
+        }
+    });
 }
 
 async fn read_board_open_requests(
@@ -9546,7 +9569,7 @@ impl BoardCollab {
             None => "collab  …".into(),
             Some(Err(_)) => "collab  unavailable".into(),
             Some(Ok(requests)) => {
-                let summary = board_screen::collab_summary(work, requests);
+                let summary = board_screen::collab_summary_counts(work, requests);
                 format!(
                     "collab  {} open to its agents · {} open from them",
                     summary.open_to, summary.open_from
@@ -9724,6 +9747,43 @@ async fn open_watch_collaboration_mailbox(client: &Client, app: &mut App) {
     clamp_collaboration_mailbox(app);
 }
 
+async fn read_human_requests(
+    client: &Client,
+    origin: &CollaborationOrigin,
+    supported: bool,
+) -> Result<Vec<CollaborationRequest>, String> {
+    if !supported {
+        return read_board_open_requests(client, origin).await;
+    }
+    let mut query = muxa::collaboration::CollaborationQuery {
+        human_only: true,
+        limit: Some(500),
+        ..Default::default()
+    };
+    let mut requests = Vec::new();
+    loop {
+        let page = client
+            .collaboration_query_view(
+                origin,
+                RequestMailbox::All,
+                MailboxScope::All,
+                &query,
+                0,
+                muxa::collaboration::CollaborationReadView::Metadata,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        requests.extend(page.requests);
+        if !page.has_more {
+            return Ok(requests);
+        }
+        query.cursor = Some(
+            page.next_cursor
+                .ok_or("human-request page omitted its cursor")?,
+        );
+    }
+}
+
 async fn refresh_hidden_mailbox(
     client: &Client,
     app: &mut App,
@@ -9731,7 +9791,7 @@ async fn refresh_hidden_mailbox(
     origin: &CollaborationOrigin,
 ) {
     app.collaboration.room = Some(room);
-    match read_board_open_requests(client, origin).await {
+    match read_human_requests(client, origin, app.human_query_supported).await {
         Ok(open) => {
             app.collaboration.human = open
                 .into_iter()
@@ -30704,12 +30764,9 @@ sort = ["state"]
             .unwrap()
             .unwrap();
         assert_eq!(
-            rows.len(),
-            1,
-            "a queued-to-claimed page race must not duplicate a request"
+            rows,
+            muxa::collaboration::CollaborationOpenCounts::from_requests([&claimed])
         );
-        assert_eq!(rows[0].status, RequestStatus::Claimed);
-        assert!(rows[0].body.is_empty());
         app.board_collab.value = Some(Ok(rows));
         refresh_board_collaboration(&client, &mut app);
         assert!(
@@ -30726,7 +30783,104 @@ sort = ["state"]
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows,
+            muxa::collaboration::CollaborationOpenCounts::from_requests([&claimed])
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn board_summary_uses_one_aggregate_and_skips_idle_reads() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("board-counts.sock");
+        let counts =
+            muxa::collaboration::CollaborationOpenCounts::from_requests([&collab_request("%2")]);
+        let response = json!({"ok":true,"collaboration_open_counts":counts});
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![
+                (
+                    json!({"/kind":"collaboration_open_counts","/scope":"all"}),
+                    response.clone(),
+                ),
+                (
+                    json!({"/kind":"collaboration_open_counts","/scope":"all"}),
+                    response,
+                ),
+            ],
+        );
+        let client = Client::new(socket);
+        let mut app = collab_app("%2");
+        app.open_counts_supported = true;
+        app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        });
+        let (sender, changes) = tokio::sync::watch::channel(Some(7));
+        app.board_collab_cache.changes = Some(changes);
+        refresh_board_collaboration(&client, &mut app);
+        let first = app
+            .board_collab
+            .in_flight
+            .take()
+            .unwrap()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first, counts);
+        app.board_collab.value = Some(Ok(first));
+        refresh_board_collaboration(&client, &mut app);
+        assert!(app.board_collab.in_flight.is_none());
+        sender.send_replace(Some(8));
+        refresh_board_collaboration(&client, &mut app);
+        assert_eq!(
+            app.board_collab
+                .in_flight
+                .take()
+                .unwrap()
+                .await
+                .unwrap()
+                .unwrap(),
+            counts
+        );
+        server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn human_badges_push_the_filter_before_pagination() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("human-query.sock");
+        let mut human = collab_request("%2");
+        human.to = Participant::console(human.from.room.clone());
+        human.omit_list_bodies();
+        let server = crate::collaboration_output::mock_collaboration_responses(
+            &socket,
+            vec![(
+                json!({"/kind":"collaboration_list","/view":"metadata","/query/human_only":true}),
+                json!({"ok":true,"collaboration_scope":"all","collaboration_page":{"requests":[human.clone()],"total":1,"has_more":false}}),
+            )],
+        );
+        let origin = CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        };
+        assert_eq!(
+            read_human_requests(&Client::new(socket), &origin, true)
+                .await
+                .unwrap(),
+            vec![human]
+        );
         server.await.unwrap();
     }
 
@@ -31599,7 +31753,10 @@ sort = ["state"]
             request("r4", "elsewhere", "%2", RequestStatus::Completed),
             request("r5", "elsewhere", "other-work", RequestStatus::Queued),
         ];
-        let summary = board_screen::collab_summary(&work, &requests);
+        let summary = board_screen::collab_summary_counts(
+            &work,
+            &muxa::collaboration::CollaborationOpenCounts::from_requests(&requests),
+        );
         assert_eq!(
             (summary.open_to, summary.open_from),
             (2, 2),
@@ -31609,7 +31766,9 @@ sort = ["state"]
         assert_eq!(collab.line(&work), "collab  …");
         collab.value = Some(Err("refused".into()));
         assert_eq!(collab.line(&work), "collab  unavailable");
-        collab.value = Some(Ok(requests));
+        collab.value = Some(Ok(
+            muxa::collaboration::CollaborationOpenCounts::from_requests(&requests),
+        ));
         assert_eq!(
             collab.line(&work),
             "collab  2 open to its agents · 2 open from them"
