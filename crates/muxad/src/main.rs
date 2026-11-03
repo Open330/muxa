@@ -1022,24 +1022,47 @@ fn automation_still_due(
     let socket = firing.socket.clone();
     let condition = firing.only_if_still;
     Box::new(move || {
-        if *revision_now.borrow() != revision {
-            return Err("the automation configuration changed".into());
-        }
-        let agent = runtime
-            .block_on(store.by_session(&session))
-            .ok_or_else(|| "the agent is gone".to_owned())?;
-        let subject = AutomationSubject::from_agent(&agent);
-        if subject.pane.as_deref() != Some(pane.as_str()) || subject.socket != socket {
-            return Err("the agent moved".into());
-        }
-        if subject.episode() != episode {
-            return Err("the agent's state changed".into());
-        }
-        if !subject.satisfies(condition) {
-            return Err("its condition no longer holds".into());
-        }
-        Ok(())
+        let unchanged = || {
+            if *revision_now.borrow() == revision {
+                Ok(())
+            } else {
+                Err("the automation configuration changed".to_owned())
+            }
+        };
+        unchanged()?;
+        let agent = runtime.block_on(store.by_session(&session));
+        still_due_with(
+            agent.as_ref(),
+            &pane,
+            socket.as_deref(),
+            &episode,
+            condition,
+        )?;
+        // The store read can wait: a configuration change meanwhile counts.
+        unchanged()
     })
+}
+
+/// The agent half of [`automation_still_due`], read from its row.
+fn still_due_with(
+    agent: Option<&muxa::Agent>,
+    pane: &str,
+    socket: Option<&str>,
+    episode: &str,
+    condition: muxa::automation::AutomationCondition,
+) -> Result<(), String> {
+    let agent = agent.ok_or_else(|| "the agent is gone".to_owned())?;
+    let subject = AutomationSubject::from_agent(agent);
+    if subject.pane.as_deref() != Some(pane) || subject.socket.as_deref() != socket {
+        return Err("the agent moved".into());
+    }
+    if subject.episode() != episode {
+        return Err("the agent's state changed".into());
+    }
+    if !subject.satisfies(condition) {
+        return Err("its condition no longer holds".into());
+    }
+    Ok(())
 }
 
 /// Feed every agent prompt hook the store receives into `receipts`, its
@@ -7167,6 +7190,46 @@ mod tests {
         );
         add_agent(&store, "%1", "capped", AgentKind::ClaudeCode).await;
         assert!(tokio::task::spawn_blocking(stale).await.unwrap().is_err());
+    }
+
+    /// A configuration change that lands while the check waits on the store
+    /// still makes the firing stale: the revision is read again last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_change_during_the_store_read_is_seen() {
+        let store = muxa::Store::shared();
+        add_capped_agent(&store, "%1", "capped").await;
+        let agent = store.by_session("capped").await.unwrap();
+        let subject = AutomationSubject::from_agent(&agent);
+        let (bump, revision_now) = tokio::sync::watch::channel(0_u64);
+        let firing = PlannedFiring {
+            rule: "r".into(),
+            pane: "%1".into(),
+            socket: subject.socket.clone(),
+            agent_session_id: "capped".into(),
+            agent: AgentKind::ClaudeCode,
+            episode: subject.episode(),
+            fire_at: OffsetDateTime::now_utc(),
+            action: AutomationAction::SwapAccount,
+            text: None,
+            submit: false,
+            only_if_still: muxa::automation::AutomationCondition::RateLimited,
+            account: None,
+        };
+        let check = automation_still_due(
+            tokio::runtime::Handle::current(),
+            store.clone(),
+            revision_now,
+            &firing,
+            0,
+        );
+        // Hold the store so the check's read waits, change the revision,
+        // then let the read go.
+        let held = store.hold_for_test().await;
+        let running = tokio::task::spawn_blocking(check);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        bump.send(1).unwrap();
+        drop(held);
+        assert!(running.await.unwrap().is_err());
     }
 
     #[test]
