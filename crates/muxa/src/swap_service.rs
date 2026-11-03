@@ -295,6 +295,10 @@ pub struct JobView {
     /// never started read `cancelled`.
     #[serde(default)]
     pub cancel_requested: bool,
+    /// When this job's effects and observations were pruned, if they were:
+    /// details they held (follow-up, continuation) are expired, not absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence_pruned_at: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -340,6 +344,19 @@ const RECEIPTS_KEPT: usize = 512;
 /// Ended jobs whose rich outcomes stay in memory, newest kept. An older
 /// one reads as it would after a restart: its journal, without them.
 const LIVE_ENDED_KEPT: usize = 64;
+
+/// How long a cleanly ended job keeps its effects and observations. Its job
+/// and target rows are kept for good.
+const EVIDENCE_KEPT: time::Duration = time::Duration::days(30);
+
+/// Jobs pruned per transaction, so pruning never holds the store long.
+const PRUNE_BATCH: usize = 32;
+
+/// Transactions per pruning run; what is left waits for the next one.
+const PRUNE_BATCHES: usize = 64;
+
+/// How often ended jobs prompt a pruning run.
+const PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
 
 impl PromptReceipts {
     /// Receipts numbered by `source`, the store's [`crate::Store::prompt_sequence`]:
@@ -764,6 +781,10 @@ pub struct SwapHealth {
     pub fault: Option<String>,
     /// Jobs this manager is running now (not rows an earlier manager left).
     pub jobs_running: usize,
+    /// Why the last pruning of old jobs' evidence failed, if it did: upkeep,
+    /// not a fault; jobs are taken regardless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
@@ -832,6 +853,7 @@ impl SwapJobs for UnopenedSwap {
             expected_schema: crate::swap_job::SCHEMA_VERSION,
             fault: None,
             jobs_running: 0,
+            maintenance: None,
         }
     }
 
@@ -1030,6 +1052,10 @@ pub(crate) struct Service<E: Engine> {
     live: Mutex<HashMap<String, LiveJob>>,
     /// Ended jobs still in `live`, oldest first.
     ended_live: Mutex<std::collections::VecDeque<String>>,
+    /// When evidence was last pruned; held by the one run doing it.
+    pruned_at: Mutex<Option<std::time::Instant>>,
+    /// Why the last pruning failed, if it did.
+    maintenance: Mutex<Option<String>>,
     fault: Mutex<Option<String>>,
     spawner: Spawner,
     /// The ownership lock ([`ownership_lock`]). Owned here, where every
@@ -1055,7 +1081,7 @@ impl<E: Engine> Service<E> {
         let store = SwapJobStore::open(path)?;
         let lease = store.acquire(&me, liveness)?;
         store.recover(&lease)?;
-        Ok(Self {
+        let service = Self {
             store,
             lease,
             engine,
@@ -1064,12 +1090,18 @@ impl<E: Engine> Service<E> {
             reserved: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
             ended_live: Mutex::new(std::collections::VecDeque::new()),
+            pruned_at: Mutex::new(Some(std::time::Instant::now())),
+            maintenance: Mutex::new(None),
             fault: Mutex::new(None),
             spawner: thread_spawner(),
             ownership: None,
             done: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
-        })
+        };
+        // Upkeep a restart brings due at once: old evidence goes before any
+        // job is taken.
+        service.prune_evidence();
+        Ok(service)
     }
 
     /// Keep `lock` for as long as this service, and any job running under
@@ -1116,6 +1148,7 @@ impl<E: Engine> Service<E> {
             expected_schema: crate::swap_job::SCHEMA_VERSION,
             fault,
             jobs_running: self.done.lock().map_or(0, |done| done.len()),
+            maintenance: self.maintenance.lock().ok().and_then(|m| m.clone()),
         }
     }
 
@@ -1214,6 +1247,50 @@ impl<E: Engine> Service<E> {
                 let _ = sender.send(true);
             }
         }
+        // After the wake: upkeep never delays whoever waits on the job.
+        self.prune_when_due();
+    }
+
+    /// Prune old evidence if a day has passed since the last run and no
+    /// other run holds the claim.
+    fn prune_when_due(&self) {
+        let Ok(mut last) = self.pruned_at.try_lock() else {
+            return;
+        };
+        if last.is_some_and(|at| at.elapsed() < PRUNE_EVERY) {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+        self.prune_evidence();
+    }
+
+    /// Prune the evidence of jobs that ended cleanly more than
+    /// [`EVIDENCE_KEPT`] ago, in short batches. A failure is kept as the
+    /// service's maintenance health, never as a fault.
+    fn prune_evidence(&self) -> usize {
+        let cutoff = (time::OffsetDateTime::now_utc() - EVIDENCE_KEPT)
+            .format(&time::format_description::well_known::Rfc3339);
+        let mut pruned = 0;
+        let failure = match cutoff {
+            Err(error) => Some(error.to_string()),
+            Ok(cutoff) => (0..PRUNE_BATCHES)
+                .find_map(|_| {
+                    match self.store.prune_evidence(&self.lease, &cutoff, PRUNE_BATCH) {
+                        Ok(count) => {
+                            pruned += count;
+                            // A short batch: nothing is left.
+                            (count < PRUNE_BATCH).then_some(None)
+                        }
+                        Err(error) => Some(Some(error.to_string())),
+                    }
+                })
+                .flatten(),
+        };
+        if let Ok(mut maintenance) = self.maintenance.lock() {
+            *maintenance =
+                failure.map(|error| format!("pruning old swap job evidence failed: {error}"));
+        }
+        pruned
     }
 
     fn fault(&self) -> Option<String> {
@@ -2055,6 +2132,7 @@ impl<E: Engine> Service<E> {
             fault: self.fault().filter(|_| unfinished),
             service_fault: self.fault(),
             cancel_requested: status.cancel_requested,
+            evidence_pruned_at: status.evidence_pruned_at,
         })
     }
 }

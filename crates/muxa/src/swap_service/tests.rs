@@ -1825,3 +1825,67 @@ fn a_running_job_keeps_its_outcomes_while_others_end() {
     assert_eq!(view.state, "done");
     assert!(view.entries[0].outcome.is_some());
 }
+
+/// Old evidence is pruned by the service in upkeep: the job still reads
+/// done and swapped, says its detail was pruned, and a failed run is told
+/// as maintenance health, never a fault; a run is due once a day.
+#[test]
+fn the_service_prunes_old_evidence_as_upkeep() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let accepted =
+        Service::submit(&h.service, "key", &overrides(&["%1"]), Origin::Public, None).unwrap();
+    assert_eq!(settled(&h.service, &accepted.job_id).state, "done");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !h.service.done.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the job never ended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    h.service
+        .store
+        .hold()
+        .execute(
+            "UPDATE jobs SET updated_at = '2001-01-01T00:00:00Z' WHERE job_id = ?1",
+            [&accepted.job_id],
+        )
+        .unwrap();
+    // Not due yet: it ran when the service opened.
+    h.service.prune_when_due();
+    assert!(h
+        .service
+        .status(&JobRef::Id(accepted.job_id.clone()))
+        .unwrap()
+        .evidence_pruned_at
+        .is_none());
+    assert_eq!(h.service.prune_evidence(), 1);
+    let view = h
+        .service
+        .status(&JobRef::Id(accepted.job_id.clone()))
+        .unwrap();
+    assert_eq!(view.state, "done");
+    assert_eq!(view.entries[0].disposition.as_deref(), Some("swapped"));
+    assert!(view.evidence_pruned_at.is_some());
+    assert!(h.service.health().maintenance.is_none());
+    // Another manager takes the store: pruning fails, and says so.
+    let other =
+        crate::swap_job::SwapJobStore::open(&h.dir.path().join("swap-jobs.sqlite3")).unwrap();
+    other
+        .acquire(
+            &OwnerIdentity {
+                nonce: "second".into(),
+                pid: 2,
+                process_start: Some("2".into()),
+            },
+            &gone,
+        )
+        .unwrap();
+    h.service.prune_evidence();
+    let health = h.service.health();
+    assert!(
+        health
+            .maintenance
+            .as_deref()
+            .is_some_and(|m| m.contains("pruning")),
+        "{health:?}"
+    );
+    assert!(health.fault.is_none());
+}

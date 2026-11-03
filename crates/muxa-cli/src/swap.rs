@@ -1178,6 +1178,9 @@ fn print_job(view: &JobView, json: bool) -> Result<()> {
     } else {
         println!("job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(view)));
+        if let Some(at) = &view.evidence_pruned_at {
+            println!("(its journal detail was pruned at {at}; what it held is no longer known)");
+        }
     }
     Ok(())
 }
@@ -1481,6 +1484,9 @@ fn remote_job(
     } else {
         println!("{host}: job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
+        if let Some(at) = &view.evidence_pruned_at {
+            println!("(its journal detail was pruned at {at}; what it held is no longer known)");
+        }
     }
     // The host's own command reports its service's health on stderr, which
     // is forwarded above: said once, by the host.
@@ -2248,6 +2254,7 @@ mod tests {
             fault: fault.map(str::to_owned),
             service_fault: None,
             cancel_requested: false,
+            evidence_pruned_at: None,
         }
     }
 
