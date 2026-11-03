@@ -64,11 +64,16 @@ For each agent, muxa:
    (Claude) or `resume <id>` (Codex). Flags and their values are kept; the
    initial prompt is dropped so the task is not restarted;
 5. waits for the resumed agent to appear and its screen to settle, answering
-   the startup dialogs a new account brings up: Claude's folder trust and
-   auto-mode tour, Codex's folder trust, "Working directory · resume" (the
-   session's directory), "Resume goal", and "open in another app" (retried a
-   few times while the old process lets go). Any other dialog is reported and
-   nothing is typed into it;
+   the startup dialogs a new account brings up: Claude's folder trust, Codex's
+   folder trust, its update prompt (skipped, nothing installed), "Working
+   directory · resume" (the session's directory), "Resume goal", and "open in
+   another app" (retried a few times while the old process lets go). A dialog
+   is answered only when the screen ends in it, by its own menu row or last
+   line, and only for the relaunched process resuming the conversation.
+   Claude's bypass-permissions warning is accepted only when the stopped
+   agent and the relaunch both run with `--dangerously-skip-permissions`;
+   trusting a folder's settings, the auto-mode tour, and any other dialog are
+   left to you: the swap stops there, names it, and types nothing;
 6. sends the follow-up prompt when one applies.
 
 ## Choosing which agents
