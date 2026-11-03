@@ -1184,6 +1184,7 @@ async fn start_swap_job(swap: &DaemonSwap, key: &str, start: SwapStart) -> Resul
         revision_now,
         store,
         collaboration,
+        submitting,
     } = start;
     let gate = match &collaboration {
         Some(collaboration) => {
@@ -1226,10 +1227,8 @@ async fn start_swap_job(swap: &DaemonSwap, key: &str, start: SwapStart) -> Resul
     );
     let submit = Arc::clone(&swap.service);
     let submit_key = key.to_owned();
-    // Registered before the call is handed off, in the same step: whoever
-    // looks for this key later waits for the call, even if this task is
-    // gone by then.
-    let submitting = swap.submissions.begin(key);
+    // The claim moves into the call: whoever looks for this key later
+    // waits for the call, even if this task is gone by then.
     let accepted = tokio::task::spawn_blocking(move || {
         let _submitting = submitting;
         submit.submit_automation(&submit_key, &overrides, guard, Some(still_due))
@@ -1625,6 +1624,10 @@ struct SwapStart {
     revision_now: tokio::sync::watch::Receiver<u64>,
     store: muxa::SharedStore,
     collaboration: Option<Arc<CollaborationStore>>,
+    /// Its claim on the key, made before the operation was spawned and
+    /// owned until the submission ends or the operation is dropped short
+    /// of one: a later lookup by key waits for whichever comes first.
+    submitting: Submitting,
 }
 
 struct JudgedFiring {
@@ -2366,6 +2369,7 @@ impl AutomationEngine {
             revision_now: self.automation.subscribe(),
             store: self.store.clone(),
             collaboration: self.collaboration.clone(),
+            submitting: swap.submissions.begin(&key),
         };
         self.spawn_swap_task(&swap, key, Some(start));
         Admission::Admitted
@@ -8354,6 +8358,45 @@ mod tests {
             ]
         );
         assert_eq!(count(&fixture.runs), 1);
+    }
+
+    /// The claim on a key exists from admission, before the operation is
+    /// ever polled: an operation dropped short of its submission settles
+    /// the key only once it is gone, and then never submits.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_operation_dropped_before_its_submission_never_submits() {
+        let mut fixture = SwapFixture::new().await;
+        fixture.engine.rescan().await;
+        // Armed while free; held now, so the operation waits for the pane.
+        let held = fixture.collaboration.worker_action_guard("%1").await;
+        let key = fixture.key.clone();
+        fixture.engine.fire_due().await;
+        assert!(
+            fixture
+                .swap
+                .submissions
+                .0
+                .lock()
+                .unwrap()
+                .contains_key(&key),
+            "claimed at admission"
+        );
+        drop(fixture.take_engine());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            fixture.swap.submissions.settled(&key),
+        )
+        .await
+        .expect("the dropped operation releases its claim");
+        drop(held);
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(muxa::swap_service::SwapJobs::status(
+            fixture.service.as_ref(),
+            &muxa::swap_service::JobRef::Key(key)
+        )
+        .is_err());
+        assert_eq!(count(&fixture.snapshots), 0);
+        assert_eq!(count(&fixture.runs), 0);
     }
 
     /// While a swap holds its pane, another rule on that pane neither

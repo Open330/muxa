@@ -1890,17 +1890,23 @@ impl AutomationLedger {
 fn trim(entries: &mut Vec<AutomationLedgerEntry>) {
     let hour_ago = OffsetDateTime::now_utc() - time::Duration::hours(24);
     while entries.len() > MAX_LEDGER_ENTRIES {
-        // An operation goes as a whole, its admission with its end, and
-        // never while nothing has ended it: its admission is its claim.
+        // An operation goes as a whole, its admission with its end: never
+        // while nothing has ended it (its admission is its claim), nor
+        // within a day of its admission, which the guards still count.
         let ended: HashSet<&str> = entries
             .iter()
             .filter(|entry| entry.outcome != AutomationOutcome::Admitted)
             .filter_map(|entry| entry.operation.as_deref())
             .collect();
+        let recent: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry.fired_at > hour_ago)
+            .filter_map(|entry| entry.operation.as_deref())
+            .collect();
         let Some(index) = entries
             .iter()
             .position(|entry| match entry.operation.as_deref() {
-                Some(operation) => ended.contains(operation),
+                Some(operation) => ended.contains(operation) && !recent.contains(operation),
                 None => {
                     entry.fired_at <= hour_ago
                         || !matches!(
@@ -3588,6 +3594,46 @@ waaait = "5m"
         let mut keyless = operation(now, AutomationOutcome::Admitted, "x");
         keyless.operation = None;
         assert!(ledger.reserve_operation(keyless, |_| Ok(())).await.is_err());
+    }
+
+    /// A just-ended or just-released operation outlasts log churn: the
+    /// guards still count it, and still know its episode, after a reload.
+    #[tokio::test]
+    async fn trimming_keeps_a_recent_operation_for_its_guards() {
+        for (key, end) in [
+            ("fired", AutomationOutcome::Fired),
+            ("released", AutomationOutcome::Skipped),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("automation.json");
+            let now = OffsetDateTime::now_utc();
+            let ledger = AutomationLedger::load(Some(path.clone()));
+            ledger
+                .reserve_operation(operation(now, AutomationOutcome::Admitted, key), |_| Ok(()))
+                .await
+                .unwrap();
+            ledger.append(operation(now, end, key)).await;
+            let before = ledger.guard_state("swap", "%1", "Error@ep", now).await;
+            for _ in 0..(MAX_LEDGER_ENTRIES + 10) {
+                ledger
+                    .append(entry("other", "%2", now, AutomationOutcome::Skipped))
+                    .await;
+            }
+            let reloaded = AutomationLedger::load(Some(path));
+            for ledger in [&ledger, &reloaded] {
+                assert_eq!(
+                    ledger.guard_state("swap", "%1", "Error@ep", now).await,
+                    before,
+                    "{key}"
+                );
+                assert!(ledger.unresolved_operations().await.is_empty());
+            }
+            assert!(before.episode_handled);
+            assert_eq!(
+                before.global_fired_last_hour,
+                u32::from(end == AutomationOutcome::Fired)
+            );
+        }
     }
 
     /// Trimming takes an operation whole: one that ended goes with its
