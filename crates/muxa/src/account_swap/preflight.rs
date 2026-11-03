@@ -95,8 +95,11 @@ pub(super) fn run(
     checks.push(if direct {
         directory("cwd", io, cwd)
     } else {
+        // Read from the directory the shell is in, not from its name.
         match io.process_cwd(pane_pid) {
-            Some(path) => directory("cwd", io, &path),
+            Some(cwd) if cwd.removed => Check::new("cwd", Some(&cwd.path), Verdict::Fail)
+                .because("the pane's shell is in a directory that was removed"),
+            Some(cwd) => Check::new("cwd", Some(&cwd.path), Verdict::Pass),
             None => Check::new("cwd", None, Verdict::Unknown)
                 .because("the pane shell's directory could not be read"),
         }
@@ -138,7 +141,7 @@ fn directory(name: &str, io: &dyn SwapIo, path: &str) -> Check {
     match io.path_facts(path) {
         PathFacts::Directory => Check::new(name, Some(path), Verdict::Pass),
         PathFacts::Missing => Check::new(name, Some(path), Verdict::Fail).because("it is gone"),
-        PathFacts::File { .. } => {
+        PathFacts::File { .. } | PathFacts::Other => {
             Check::new(name, Some(path), Verdict::Fail).because("it is not a directory")
         }
         PathFacts::Unreadable => {
@@ -154,7 +157,7 @@ fn env_file(io: &dyn SwapIo, path: &str, planned: Option<&str>) -> Check {
                 let changed = planned.is_some_and(|planned| planned != digest);
                 let mut check = if changed {
                     Check::new("env_file", Some(path), Verdict::Fail)
-                        .because("it changed since the swap was planned")
+                        .because("it changed since the relaunch was built")
                 } else {
                     Check::new("env_file", Some(path), Verdict::Pass)
                 };
@@ -168,6 +171,9 @@ fn env_file(io: &dyn SwapIo, path: &str, planned: Option<&str>) -> Check {
         }
         PathFacts::Directory => {
             Check::new("env_file", Some(path), Verdict::Fail).because("it is a directory")
+        }
+        PathFacts::Other => {
+            Check::new("env_file", Some(path), Verdict::Fail).because("it is not a regular file")
         }
         PathFacts::Unreadable => {
             Check::new("env_file", Some(path), Verdict::Fail).because("it cannot be read")
@@ -205,6 +211,9 @@ fn program(stage: Stage, io: &dyn SwapIo, word: &str) -> Check {
         PathFacts::Missing => Check::new(name, Some(word), Verdict::Fail).because("it is gone"),
         PathFacts::Directory => {
             Check::new(name, Some(word), Verdict::Fail).because("it is a directory")
+        }
+        PathFacts::Other => {
+            Check::new(name, Some(word), Verdict::Fail).because("it is not a regular file")
         }
         PathFacts::Unreadable => {
             Check::new(name, Some(word), Verdict::Fail).because("it cannot be read")
@@ -269,8 +278,71 @@ mod tests {
             let cwd = io::process_cwd(child.id()).unwrap();
             let _ = child.kill();
             let _ = child.wait();
-            assert_eq!(cwd, gone.to_str().unwrap());
-            assert_eq!(io::path_facts(&cwd), PathFacts::Missing);
+            assert!(cwd.removed, "{cwd:?}");
         }
+    }
+
+    /// A process in `dir`, for as long as the returned child runs.
+    #[cfg(target_os = "linux")]
+    fn sleeping_in(dir: &std::path::Path) -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .current_dir(dir)
+            .spawn()
+            .unwrap()
+    }
+
+    /// The shell's directory is judged by the directory itself: removed and
+    /// another made under its name is still removed; a live one whose name
+    /// happens to end in " (deleted)" is still live.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_shell_directory_is_judged_by_itself_not_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = dir.path().join("work");
+        std::fs::create_dir(&old).unwrap();
+        let mut child = sleeping_in(&old);
+        std::fs::remove_dir(&old).unwrap();
+        std::fs::create_dir(&old).unwrap();
+        let replaced = io::process_cwd(child.id()).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(replaced.removed, "{replaced:?}");
+        let literal = dir.path().join("literal (deleted)");
+        std::fs::create_dir(&literal).unwrap();
+        let mut child = sleeping_in(&literal);
+        let live = io::process_cwd(child.id()).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!live.removed, "{live:?}");
+        assert_eq!(live.path, literal.to_str().unwrap());
+    }
+
+    /// A FIFO where a file is expected is named for what it is and never
+    /// opened for a read that would wait on a writer; an oversized file is
+    /// not digested.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_huge_file_is_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("env");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let path = fifo.to_str().unwrap().to_owned();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((io::path_facts(&path), io::file_digest(&path)));
+        });
+        let (facts, digest) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("reading a FIFO must not block");
+        assert_eq!(facts, PathFacts::Other);
+        assert!(digest.is_none());
+        let big = dir.path().join("big");
+        std::fs::write(&big, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+        assert!(io::file_digest(big.to_str().unwrap()).is_none());
     }
 }

@@ -49,7 +49,7 @@ struct FakeIo {
     /// What each path is; anything unlisted reads as a directory.
     paths: RefCell<HashMap<String, super::io::PathFacts>>,
     digests: RefCell<HashMap<String, String>>,
-    shell_cwd: RefCell<Option<String>>,
+    shell_cwd: RefCell<Option<super::io::ShellCwd>>,
     /// The line each respawn was given.
     respawned: RefCell<Vec<String>>,
 }
@@ -135,7 +135,7 @@ impl SwapIo for FakeIo {
         self.digests.borrow().get(path).cloned()
     }
 
-    fn process_cwd(&self, _pid: u32) -> Option<String> {
+    fn process_cwd(&self, _pid: u32) -> Option<super::io::ShellCwd> {
         self.shell_cwd.borrow().clone()
     }
 
@@ -1481,7 +1481,7 @@ mod preflight_tests {
         io.digests
             .borrow_mut()
             .insert("/acct/env".into(), "bb".into());
-        refused(&io, &target, "changed since the swap was planned");
+        refused(&io, &target, "changed since the relaunch was built");
         // Put back as planned: the same target goes through.
         io.digests
             .borrow_mut()
@@ -1494,11 +1494,15 @@ mod preflight_tests {
     fn a_directory_that_is_gone_refuses_before_anything() {
         // A typed line runs where the pane's shell is now.
         let io = FakeIo::new(CODEX_IDLE, codex_agent());
-        *io.shell_cwd.borrow_mut() = Some("/gone".into());
-        io.paths
-            .borrow_mut()
-            .insert("/gone".into(), PathFacts::Missing);
-        refused(&io, &target(AgentKind::Codex, false, false), "cwd /gone");
+        *io.shell_cwd.borrow_mut() = Some(super::super::io::ShellCwd {
+            path: "/gone (deleted)".into(),
+            removed: true,
+        });
+        refused(
+            &io,
+            &target(AgentKind::Codex, false, false),
+            "cwd /gone (deleted): the pane's shell is in a directory that was removed",
+        );
         // A respawn starts where it is told to.
         let io = FakeIo::new(CODEX_IDLE, codex_agent());
         io.paths
@@ -1529,6 +1533,18 @@ mod preflight_tests {
         let respawned = io.respawned.borrow();
         assert_eq!(respawned.len(), 1);
         assert!(respawned[0].contains("/opt/zsh"), "{respawned:?}");
+    }
+
+    /// A FIFO or device where a file should be is refused, never read.
+    #[test]
+    fn a_path_that_is_not_a_regular_file_is_refused() {
+        let io = FakeIo::new(CODEX_IDLE, codex_agent());
+        io.paths
+            .borrow_mut()
+            .insert("/acct/env".into(), PathFacts::Other);
+        let mut target = target(AgentKind::Codex, false, false);
+        with(&mut target, env_file("/acct/env", None));
+        refused(&io, &target, "not a regular file");
     }
 
     #[test]

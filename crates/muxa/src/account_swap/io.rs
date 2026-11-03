@@ -68,12 +68,13 @@ pub(super) trait SwapIo: Clock {
     fn prompt_cursor(&self) -> Option<u64>;
     /// Whether this target's own prompt hook arrived after `cursor`.
     fn prompt_seen_after(&self, cursor: u64) -> bool;
-    /// What is at `path` now, symlinks followed. Read-only.
+    /// What is at `path` now, symlinks followed. Read-only, and never
+    /// blocks: only a regular file's contents are read, and boundedly.
     fn path_facts(&self, path: &str) -> PathFacts;
-    /// The sha256 of the file at `path`, if it can be read.
+    /// The sha256 of the regular file at `path`, if it can be read.
     fn file_digest(&self, path: &str) -> Option<String>;
-    /// The working directory of process `pid`, if it can be read.
-    fn process_cwd(&self, pid: u32) -> Option<String>;
+    /// The working directory process `pid` is actually in.
+    fn process_cwd(&self, pid: u32) -> Option<ShellCwd>;
 }
 
 /// What a path names, as far as a launch cares.
@@ -81,6 +82,7 @@ pub(super) trait SwapIo: Clock {
 pub(super) enum PathFacts {
     Missing,
     Directory,
+    /// A regular file.
     File {
         /// Some execute bit is set. Not proof it runs (a `noexec` mount,
         /// another user's bit, a loader it lacks).
@@ -88,7 +90,48 @@ pub(super) enum PathFacts {
         /// A script's `#!` program.
         interpreter: Option<String>,
     },
+    /// Neither: a FIFO, socket or device. Never read.
+    Other,
     Unreadable,
+}
+
+/// A process's working directory, read from the directory itself rather
+/// than from its name: one removed since keeps the process in it, whatever
+/// now has its name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ShellCwd {
+    /// Its name as the kernel renders it, for the report only.
+    pub(super) path: String,
+    /// It no longer has a name: the process is in a removed directory.
+    pub(super) removed: bool,
+}
+
+/// The most of a file read for its digest.
+const DIGEST_LIMIT: u64 = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+const O_NONBLOCK: i32 = 0o4000;
+#[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+const O_NONBLOCK: i32 = 0x0004;
+
+/// `path` opened for reading only if it is a regular file, checked on the
+/// open handle: a FIFO put in its place never blocks the open or a read.
+fn open_regular(path: &str) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd"
+    ))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok().filter(std::fs::Metadata::is_file)?;
+    Some(file)
 }
 
 /// [`SwapIo::path_facts`] on the real filesystem.
@@ -100,6 +143,9 @@ pub(super) fn path_facts(path: &str) -> PathFacts {
     };
     if metadata.is_dir() {
         return PathFacts::Directory;
+    }
+    if !metadata.is_file() {
+        return PathFacts::Other;
     }
     #[cfg(unix)]
     let executable = {
@@ -118,26 +164,46 @@ pub(super) fn path_facts(path: &str) -> PathFacts {
 fn shebang(path: &str) -> Option<String> {
     use std::io::Read;
     let mut head = [0_u8; 256];
-    let read = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    let read = open_regular(path)?.read(&mut head).ok()?;
     let line = head[..read].strip_prefix(b"#!")?;
     let line = line.split(|byte| *byte == b'\n').next()?;
     let text = std::str::from_utf8(line).ok()?;
     text.split_whitespace().next().map(str::to_owned)
 }
 
-/// [`SwapIo::file_digest`] on the real filesystem.
+/// [`SwapIo::file_digest`] on the real filesystem; `None` for anything but
+/// a readable regular file of at most [`DIGEST_LIMIT`] bytes.
 pub(super) fn file_digest(path: &str) -> Option<String> {
     use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path).ok()?;
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    open_regular(path)?
+        .take(DIGEST_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() as u64 > DIGEST_LIMIT {
+        return None;
+    }
     Some(format!("{:x}", Sha256::digest(bytes)))
 }
 
-/// [`SwapIo::process_cwd`] from `/proc`.
-pub(super) fn process_cwd(pid: u32) -> Option<String> {
-    let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-    let path = link.to_str()?;
-    // A removed directory still reads, marked; it is not there to run in.
-    Some(path.strip_suffix(" (deleted)").unwrap_or(path).to_owned())
+/// [`SwapIo::process_cwd`] from `/proc`: the directory itself, followed
+/// through the link, says whether it was removed.
+pub(super) fn process_cwd(pid: u32) -> Option<ShellCwd> {
+    let link = format!("/proc/{pid}/cwd");
+    let path = std::fs::read_link(&link).ok()?.to_str()?.to_owned();
+    let metadata = std::fs::metadata(&link).ok()?;
+    #[cfg(unix)]
+    let removed = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() == 0
+    };
+    #[cfg(not(unix))]
+    let removed = false;
+    Some(ShellCwd {
+        path,
+        removed: removed || !metadata.is_dir(),
+    })
 }
 
 /// The pane and processes of a real target.
@@ -166,7 +232,7 @@ impl SwapIo for LiveIo<'_> {
         file_digest(path)
     }
 
-    fn process_cwd(&self, pid: u32) -> Option<String> {
+    fn process_cwd(&self, pid: u32) -> Option<ShellCwd> {
         process_cwd(pid)
     }
 

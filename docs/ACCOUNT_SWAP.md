@@ -320,10 +320,13 @@ swap checks what its relaunch will need and journals the result, and refuses
 the target with nothing done (`preflight_failed: …`, retryable once fixed) if
 any of it is not there:
 
-- the directory the relaunch runs in: where the pane's shell is now, or for a
-  pane that runs its agent directly the directory its respawn is given;
-- a configured account's `env_file`: there, readable, and unchanged since the
-  swap was planned (only its digest is recorded, never its contents);
+- the directory the relaunch runs in: the one the pane's shell is actually in
+  (a removed one fails, even if another now has its name), or for a pane that
+  runs its agent directly the directory its respawn is given;
+- a configured account's `env_file`: a regular file, readable, and unchanged
+  since the relaunch line was built for this target, just before the checks
+  (a change made while the swap waited in a queue is not caught); only its
+  digest is recorded, never its contents;
 - for a directly-run pane, the shell it is respawned through, which is the
   very one then used;
 - any program the line names by an absolute path, and the interpreter of a
