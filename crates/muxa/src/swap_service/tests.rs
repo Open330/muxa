@@ -1658,3 +1658,170 @@ fn a_stale_automation_swap_steps_back_before_its_target_starts() {
     assert!(h.executed.lock().unwrap().is_empty());
     assert_eq!(asked.load(Ordering::SeqCst), 2);
 }
+
+// --- health -------------------------------------------------------------------
+
+/// Health reads the service's state and nothing else.
+#[test]
+fn health_reports_ready_draining_and_halted() {
+    let h = harness(Box::new(Vec::new));
+    let health = h.service.health();
+    assert_eq!(health.readiness, SwapReadiness::Ready);
+    assert_eq!(health.schema, Some(health.expected_schema));
+    assert_eq!(health.jobs_running, 0);
+    h.service.set_fault("journal".into());
+    let halted = h.service.health();
+    assert_eq!(halted.readiness, SwapReadiness::Halted);
+    assert_eq!(halted.fault.as_deref(), Some("journal"));
+    h.service.draining.store(true, Ordering::SeqCst);
+    assert_eq!(h.service.health().readiness, SwapReadiness::Draining);
+    assert_eq!(h.dry_runs.load(Ordering::SeqCst), 0);
+}
+
+/// A service that never opened keeps its reason: refused with it, and
+/// reported by health, with no store schema to claim.
+#[test]
+fn an_unopened_service_reports_why() {
+    let unopened = UnopenedSwap::new("swap jobs are owned by another live manager".into());
+    assert!(!unopened.exists());
+    let health = unopened.health();
+    assert_eq!(health.readiness, SwapReadiness::Unavailable);
+    assert_eq!(health.schema, None);
+    assert!(health.reason.unwrap().contains("another live manager"));
+    assert!(unopened
+        .status(&JobRef::Key("k".into()))
+        .unwrap_err()
+        .contains("another live manager"));
+}
+
+// --- fault scoping -----------------------------------------------------------
+
+/// A fault after a job ended changes nothing about it: its view carries no
+/// fault of its own, only the service's health beside it. The job the
+/// fault stopped still carries it.
+#[test]
+fn a_later_fault_does_not_rewrite_an_ended_job() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let h = harness(Box::new(move || {
+        vec![EngineStep::Run(FakeTarget {
+            identity: identity("%9", "/tmp/tmux-1/default"),
+            gate: Some(Arc::clone(&held)),
+        })]
+    }));
+    let _open = OpenOnDrop(Arc::clone(&gate));
+    // A: its own pane, run to its end first.
+    gate.open();
+    let a = Service::submit(&h.service, "a", &overrides(&["%9"]), Origin::Public, None)
+        .unwrap()
+        .job_id;
+    let a_view = settled(&h.service, &a);
+    assert_eq!(a_view.state, "done");
+    // B faults the service.
+    h.service
+        .set_fault("job b: the journal could not record target 0".into());
+    let a_after = h.service.status(&JobRef::Id(a.clone())).unwrap();
+    assert_eq!(a_after.fault, None);
+    assert!(a_after.service_fault.is_some());
+    assert_eq!(a_after.state, "done");
+    assert_eq!(a_after.entries, a_view.entries);
+}
+
+/// A view from a daemon before the field reads as no service fault.
+#[test]
+fn a_job_view_without_service_fault_still_reads() {
+    let old = r#"{"job_id":"swap-1","node_id":"n","state":"done","revision":1,
+        "reason":null,"entries":[],"fault":null}"#;
+    let view: JobView = serde_json::from_str(old).unwrap();
+    assert_eq!(view.service_fault, None);
+    assert!(!view.cancel_requested);
+}
+
+/// Only the newest ended jobs keep their rich outcomes in memory; an older
+/// one still reads from its journal, as it would after a restart.
+#[test]
+fn ended_jobs_let_their_outcomes_go_beyond_a_bound() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    let mut jobs = Vec::new();
+    for n in 0..=LIVE_ENDED_KEPT {
+        let accepted = Service::submit(
+            &h.service,
+            &format!("key-{n}"),
+            &overrides(&["%1"]),
+            Origin::Public,
+            None,
+        )
+        .unwrap();
+        assert_eq!(settled(&h.service, &accepted.job_id).state, "done");
+        // Ended, its waiters woken, before the next one.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !h.service.done.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the job never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        jobs.push(accepted.job_id);
+    }
+    assert_eq!(h.service.live.lock().unwrap().len(), LIVE_ENDED_KEPT);
+    let oldest = h.service.status(&JobRef::Id(jobs[0].clone())).unwrap();
+    assert_eq!(oldest.state, "done");
+    assert_eq!(oldest.entries[0].disposition.as_deref(), Some("swapped"));
+    assert!(oldest.entries[0].outcome.is_none());
+    let newest = h
+        .service
+        .status(&JobRef::Id(jobs.last().unwrap().clone()))
+        .unwrap();
+    assert!(newest.entries[0].outcome.is_some());
+}
+
+/// A job still running keeps its place however many others end meanwhile:
+/// only ended jobs are ever let go.
+#[test]
+fn a_running_job_keeps_its_outcomes_while_others_end() {
+    let gate = Arc::new(Gate::default());
+    let held = Arc::clone(&gate);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let h = harness(Box::new(move || {
+        let call = calls.fetch_add(1, Ordering::SeqCst);
+        vec![EngineStep::Run(FakeTarget {
+            identity: identity(&format!("%{}", call + 100), "default"),
+            gate: (call == 0).then(|| Arc::clone(&held)),
+        })]
+    }));
+    let running = Service::submit(
+        &h.service,
+        "held",
+        &overrides(&["%100"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
+    gate.until_reached();
+    for n in 0..=LIVE_ENDED_KEPT {
+        let accepted = Service::submit(
+            &h.service,
+            &format!("key-{n}"),
+            &overrides(&[&format!("%{}", n + 101)]),
+            Origin::Public,
+            None,
+        )
+        .unwrap();
+        assert_eq!(settled(&h.service, &accepted.job_id).state, "done");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while h
+            .service
+            .done
+            .lock()
+            .unwrap()
+            .contains_key(&accepted.job_id)
+        {
+            assert!(Instant::now() < deadline, "the job never ended");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    assert!(h.service.live.lock().unwrap().contains_key(&running.job_id));
+    assert_eq!(h.service.live.lock().unwrap().len(), LIVE_ENDED_KEPT + 1);
+    gate.open();
+    let view = settled(&h.service, &running.job_id);
+    assert_eq!(view.state, "done");
+    assert!(view.entries[0].outcome.is_some());
+}

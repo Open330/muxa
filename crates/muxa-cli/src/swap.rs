@@ -157,6 +157,15 @@ pub struct Args {
     /// relays a swap to this host so it can find the job again.
     #[arg(long, hide = true, value_name = "KEY")]
     request_key: Option<String>,
+    /// With `--status` or `--cancel`: wait at most this many seconds
+    /// (0-120) for the job to end, then report it as it is. Without it,
+    /// they wait for the end.
+    #[arg(
+        long,
+        value_name = "SECS",
+        value_parser = clap::value_parser!(u64).range(0..=120)
+    )]
+    wait_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -278,11 +287,14 @@ pub(crate) async fn run(
         return run_remote(client, &args, host).await;
     }
     // Reading a job never depends on the service taking new ones.
+    if args.wait_secs.is_some() && args.status.is_none() && args.cancel.is_none() {
+        bail!("--wait-secs goes with --status or --cancel");
+    }
     if let Some(job) = &args.status {
-        return show_status(client, job, args.json).await;
+        return show_status(client, job, args.json, args.wait_secs).await;
     }
     if let Some(job) = &args.cancel {
-        return run_cancel(client, job, args.json).await;
+        return run_cancel(client, job, args.json, args.wait_secs).await;
     }
     if let Some(parent) = &args.retry {
         return run_retry(client, &args, parent, explicit_config).await;
@@ -629,6 +641,7 @@ async fn run_retry(
     };
     let outcomes = job_outcomes(&view);
     report(&outcomes, args.json)?;
+    service_notice(&view);
     job_verdict(&view, &key, false)
 }
 
@@ -636,25 +649,27 @@ async fn run_retry(
 /// one.
 fn request_key(args: &Args) -> Result<String> {
     match &args.request_key {
-        Some(key) => {
-            let plain = key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
-            if key.is_empty() || key.len() > 128 || !plain {
-                bail!("--request-key: 1-128 characters of letters, digits and -_.:@");
-            }
-            Ok(key.clone())
-        }
+        Some(key) if plain_request_key(key) => Ok(key.clone()),
+        Some(_) => bail!("--request-key: 1-128 characters of letters, digits and -_.:@"),
         None => Ok(format!("cli-{}", uuid::Uuid::new_v4())),
     }
 }
 
+/// A request key as the job store takes one.
+pub(crate) fn plain_request_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.len() <= 128
+        && key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c))
+}
+
 /// What `--detach` prints once the daemon accepted the job.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct DetachedAck {
-    request_key: String,
-    job_id: String,
-    state: String,
+pub(crate) struct DetachedAck {
+    pub(crate) request_key: String,
+    pub(crate) job_id: String,
+    pub(crate) state: String,
 }
 
 /// Start, and return as soon as the job is known accepted.
@@ -695,7 +710,7 @@ async fn detach(
 /// `--cancel`: ask the job to start no further target, then follow it to
 /// its end. A job that ends cleanly after the cancel is a success here,
 /// unlike for whoever was waiting for the whole swap.
-async fn run_cancel(client: &Client, text: &str, json: bool) -> Result<()> {
+async fn run_cancel(client: &Client, text: &str, json: bool, wait: Option<u64>) -> Result<()> {
     let first = job_ref(text);
     let asked = match client.swap_job_cancel(&first).await {
         Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
@@ -717,20 +732,27 @@ async fn run_cancel(client: &Client, text: &str, json: bool) -> Result<()> {
             asked.job_id
         );
     }
-    let cancel = async {
-        let _ = tokio::signal::ctrl_c().await;
+    let view = match wait {
+        Some(0) => asked,
+        Some(wait) => follow_bounded(client, asked, Duration::from_secs(wait), ctrl_c(), POLL)
+            .await
+            .map_err(|()| anyhow!("stopped waiting; the cancel stands"))?,
+        None => {
+            let cancel = ctrl_c();
+            tokio::pin!(cancel);
+            match follow_from(client, asked, cancel, POLL).await {
+                JobEnd::Ended(view) => view,
+                JobEnd::Interrupted => bail!("stopped waiting; the cancel stands"),
+                JobEnd::Unknown(error) | JobEnd::Refused(error) => bail!("{error}"),
+            }
+        }
     };
-    tokio::pin!(cancel);
-    let view = match follow_from(client, asked, cancel, POLL).await {
-        JobEnd::Ended(view) => view,
-        JobEnd::Interrupted => bail!("stopped waiting; the cancel stands"),
-        JobEnd::Unknown(error) | JobEnd::Refused(error) => bail!("{error}"),
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
-    } else {
-        println!("job {}  {}", view.job_id, view.state);
-        print!("{}", render(&job_outcomes(&view)));
+    print_job(&view, json)?;
+    service_notice(&view);
+    if !settled(&view) {
+        // The cancel is recorded; the target already started finishes.
+        eprintln!("muxa swap: job {} is still {}", view.job_id, view.state);
+        return Ok(());
     }
     job_verdict(&view, text, true)
 }
@@ -818,6 +840,7 @@ async fn run_routed(
     };
     let outcomes = merge(daemon_half, &direct, local);
     report(&outcomes, args.json)?;
+    service_notice(&view);
     job_verdict(&view, &key, false)?;
     if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
         bail!("some agents could not be swapped");
@@ -977,6 +1000,19 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
 }
 
 /// An error unless the job ended cleanly.
+/// The daemon's swap service health, once per command and apart from the
+/// job's own result: a fault that came after a job ended does not change
+/// what that job did.
+fn service_notice(view: &JobView) {
+    if let Some(fault) = view
+        .service_fault
+        .as_deref()
+        .filter(|_| view.fault.is_none())
+    {
+        eprintln!("muxa swap: the daemon's swap service is halted: {fault}");
+    }
+}
+
 /// `cancel_expected`: the caller asked for the cancel, so targets it kept
 /// from starting are not a failure; for anyone else they are.
 fn job_verdict(view: &JobView, key: &str, cancel_expected: bool) -> Result<()> {
@@ -1090,24 +1126,104 @@ async fn watch_job(
     Watch::Settled(view)
 }
 
-/// `--status`: follow the job to its end and report it.
-async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
-    let cancel = async {
-        let _ = tokio::signal::ctrl_c().await;
+/// `--status`: follow the job to its end (or for at most `wait` seconds)
+/// and report it.
+async fn show_status(client: &Client, text: &str, json: bool, wait: Option<u64>) -> Result<()> {
+    let view = match wait {
+        Some(0) => read_job(client, text).await?,
+        Some(wait) => {
+            // One budget for every read, the first one included.
+            let started = tokio::time::Instant::now();
+            let budget = Duration::from_secs(wait);
+            let first = tokio::time::timeout(budget, read_job(client, text))
+                .await
+                .map_err(|_| anyhow!("swap job {text}: no answer within {wait}s"))??;
+            let left = budget.saturating_sub(started.elapsed());
+            follow_bounded(client, first, left, ctrl_c(), POLL)
+                .await
+                .map_err(|()| anyhow!("stopped waiting"))?
+        }
+        None => match watch_job(client, text, ctrl_c(), POLL).await {
+            Watch::Settled(view) => view,
+            Watch::Interrupted(Some(job)) => bail!("stopped waiting; swap job {job} runs on"),
+            Watch::Interrupted(None) => bail!("stopped waiting"),
+            Watch::Failed(error) => bail!("{error}"),
+        },
     };
-    let view = match watch_job(client, text, cancel, POLL).await {
-        Watch::Settled(view) => view,
-        Watch::Interrupted(Some(job)) => bail!("stopped waiting; swap job {job} runs on"),
-        Watch::Interrupted(None) => bail!("stopped waiting"),
-        Watch::Failed(error) => bail!("{error}"),
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&view)?);
-    } else {
-        println!("job {}  {}", view.job_id, view.state);
-        print!("{}", render(&job_outcomes(&view)));
+    print_job(&view, json)?;
+    service_notice(&view);
+    if !settled(&view) {
+        // A bounded read of a job still at work: a status, not a failure.
+        eprintln!("muxa swap: job {} is still {}", view.job_id, view.state);
+        return Ok(());
     }
     job_verdict(&view, text, false)
+}
+
+/// The job named by `text` (an id not found is tried as a key), as it is.
+async fn read_job(client: &Client, text: &str) -> Result<JobView> {
+    let first = job_ref(text);
+    match client.swap_job_status(&first).await {
+        Err(error) if matches!(first, JobRef::Id(_)) && not_found(&error) => {
+            client.swap_job_status(&JobRef::Key(text.to_owned())).await
+        }
+        read => read,
+    }
+    .map_err(|error| anyhow!("{error}"))
+}
+
+fn print_job(view: &JobView, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(view)?);
+    } else {
+        println!("job {}  {}", view.job_id, view.state);
+        print!("{}", render(&job_outcomes(view)));
+    }
+    Ok(())
+}
+
+async fn ctrl_c() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
+/// Follow `view` for at most `budget`, every read inside it, and return the
+/// last view seen once it runs out: a slow store never stretches the wait,
+/// nor costs the view already in hand. `Err` only for `cancel` (Ctrl-C).
+async fn follow_bounded(
+    daemon: &impl SwapDaemon,
+    mut view: JobView,
+    budget: Duration,
+    cancel: impl Future<Output = ()>,
+    poll: Duration,
+) -> std::result::Result<JobView, ()> {
+    tokio::pin!(cancel);
+    let deadline = tokio::time::Instant::now() + budget;
+    let job = JobRef::Id(view.job_id.clone());
+    while !settled(&view) {
+        let read = async {
+            tokio::time::sleep(poll).await;
+            daemon.status(&job).await
+        };
+        tokio::select! {
+            biased;
+            () = &mut cancel => return Err(()),
+            read = tokio::time::timeout_at(deadline, read) => match read {
+                Ok(Ok(next)) => view = next,
+                // A read that failed: the last view stands, said to be one.
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "muxa swap: could not read job {} again ({error}); showing it as last \
+                         seen, {}",
+                        view.job_id, view.state
+                    );
+                    return Ok(view);
+                }
+                // Out of time: the last view is the answer.
+                Err(_) => return Ok(view),
+            },
+        }
+    }
+    Ok(view)
 }
 
 /// The same swap as a `muxa swap … --json` argv for a Fleet host, every
@@ -1149,6 +1265,12 @@ fn remote_argv(args: &Args) -> Vec<String> {
     }
     if let Some(job) = &args.cancel {
         words.push(format!("--cancel={job}"));
+    }
+    if let Some(wait) = args.wait_secs {
+        words.push(format!("--wait-secs={wait}"));
+    }
+    if let Some(key) = &args.request_key {
+        words.push(format!("--request-key={key}"));
     }
     if let Some(bare) = args.bare {
         words.push(format!(
@@ -1254,10 +1376,19 @@ async fn run_remote(relay: &impl Relay, args: &Args, host: &str) -> Result<()> {
     // is sent: if the answer is lost, the job is still found by it. An
     // explicitly in-process run makes no job and gets none.
     let starts = !args.dry_run && !args.local && args.status.is_none() && args.cancel.is_none();
-    let key = starts.then(|| format!("cli-{}", uuid::Uuid::new_v4()));
+    // A caller's own key (an agent's, through MCP) is kept; else one is
+    // minted here.
+    let minted = args.request_key.is_none();
+    let key = starts.then(|| {
+        args.request_key
+            .clone()
+            .unwrap_or_else(|| format!("cli-{}", uuid::Uuid::new_v4()))
+    });
     let mut words = remote_argv(args);
-    if let Some(key) = &key {
+    if let Some(key) = key.as_ref().filter(|_| minted) {
         words.push(format!("--request-key={key}"));
+    }
+    if let Some(key) = &key {
         eprintln!(
             "muxa swap: request {key} on {host} (see it with `muxa swap --host {host} \
              --status {key}`)"
@@ -1350,6 +1481,14 @@ fn remote_job(
     } else {
         println!("{host}: job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
+    }
+    // The host's own command reports its service's health on stderr, which
+    // is forwarded above: said once, by the host.
+    // A bounded read of a job still at work, answered cleanly by the host,
+    // is a status, as it is there.
+    if args.wait_secs.is_some() && !settled(&view) && output.exit_code == 0 {
+        eprintln!("{host}: job {} is still {}", view.job_id, view.state);
+        return Ok(());
     }
     job_verdict(&view, &format!("on {host}"), args.cancel.is_some())?;
     if output.exit_code != 0 {
@@ -1816,6 +1955,37 @@ mod tests {
             .starts_with("cli-"));
     }
 
+    /// An ended job is judged by what it did, whatever the service's health
+    /// now: done is a success, a failed row a failure, a stopped job (still
+    /// running under a fault) a stop.
+    #[test]
+    fn an_ended_job_is_judged_apart_from_the_service_health() {
+        let mut done = view("done", None);
+        done.service_fault = Some("job b faulted".into());
+        assert!(job_verdict(&done, "k", false).is_ok());
+        let mut failed = done.clone();
+        failed.entries.push(EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("failed".into()),
+            reason: None,
+            uncertain_effects: 0,
+            outcome: None,
+            continuation: None,
+            follow_up: None,
+        });
+        let err = job_verdict(&failed, "k", false).unwrap_err().to_string();
+        assert!(err.contains("could not be swapped"), "{err}");
+        assert!(!err.contains("faulted"), "{err}");
+        let mut stuck = view("running", Some("journal"));
+        stuck.service_fault = Some("journal".into());
+        assert!(settled(&stuck));
+        assert!(job_verdict(&stuck, "k", false)
+            .unwrap_err()
+            .to_string()
+            .contains("faulted"));
+    }
+
     /// A cancelled job is a failure for whoever waited for the whole swap,
     /// and not for whoever asked for the cancel.
     #[test]
@@ -1996,6 +2166,45 @@ mod tests {
         assert!(local_half_withheld(&view("needs_reconciliation", None)).is_some());
     }
 
+    /// A bounded read reaches a host as one word, and a relayed key survives
+    /// the canonical argv.
+    #[test]
+    fn a_bounded_read_and_a_relayed_key_reach_a_host() {
+        let words = |w: &[&str]| w.iter().map(|w| (*w).to_owned()).collect::<Vec<_>>();
+        let argv = checked_argv(&words(&["--status", "k", "--wait-secs", "0"])).unwrap();
+        assert!(argv.contains(&"--wait-secs=0".to_owned()), "{argv:?}");
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+        assert!(checked_argv(&words(&["--status", "k", "--wait-secs", "121"])).is_err());
+        let argv = checked_argv(&words(&["%5", "--request-key", "agent-1"])).unwrap();
+        assert!(
+            argv.contains(&"--request-key=agent-1".to_owned()),
+            "{argv:?}"
+        );
+        muxa::work_control::validate_swap_argv(&argv).unwrap();
+        assert!(plain_request_key("a:b@c-1_2.3"));
+        assert!(!plain_request_key(""));
+        assert!(!plain_request_key("a b"));
+    }
+
+    /// A caller's own key on a relayed swap is the one sent and named.
+    #[tokio::test]
+    async fn a_relayed_swap_keeps_the_callers_key() {
+        let fake = relay(|_| Err(RuntimeError::Disconnected));
+        let cli = Cli::parse_from(["swap", "%5", "--host", "rtzr", "--request-key", "agent-9"]);
+        let error = format!(
+            "{:#}",
+            run_remote(&fake, &cli.args, "rtzr").await.unwrap_err()
+        );
+        let calls = fake.calls.borrow();
+        assert_eq!(calls.len(), 1);
+        let sent: Vec<_> = calls[0]
+            .iter()
+            .filter(|w| w.starts_with("--request-key="))
+            .collect();
+        assert_eq!(sent, ["--request-key=agent-9"]);
+        assert!(error.contains("--status agent-9"), "{error}");
+    }
+
     #[test]
     fn status_takes_no_action_flags() {
         for argv in [
@@ -2037,6 +2246,7 @@ mod tests {
             reason: None,
             entries: Vec::new(),
             fault: fault.map(str::to_owned),
+            service_fault: None,
             cancel_requested: false,
         }
     }
@@ -2191,6 +2401,61 @@ mod tests {
             .await
             .expect("Ctrl-C must end a held read");
         assert!(matches!(ended, Watch::Interrupted(None)));
+    }
+
+    /// A read that never answers costs the wait its budget, not more, and
+    /// the view already in hand is what it returns.
+    #[tokio::test]
+    async fn a_bounded_follow_returns_the_last_view_when_a_read_hangs() {
+        struct Held;
+        impl SwapDaemon for Held {
+            fn status(
+                &self,
+                _: &JobRef,
+            ) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
+                std::future::pending()
+            }
+        }
+        let started = std::time::Instant::now();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            follow_bounded(
+                &Held,
+                view("running", None),
+                Duration::from_millis(50),
+                std::future::pending(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the budget must bound a hung read");
+        assert_eq!(ended.unwrap().state, "running");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A host's bounded status or cancel of a job still at work, answered
+    /// cleanly, is a status; unbounded, or answered with a failure, it is not.
+    #[tokio::test]
+    async fn a_remote_bounded_read_of_a_running_job_succeeds() {
+        let running = serde_json::to_string(&view("running", None)).unwrap();
+        for action in ["--status", "--cancel"] {
+            let answer = running.clone();
+            let fake = relay(move |_| Ok(output(0, &answer, "")));
+            let cli = Cli::parse_from(["swap", action, "k", "--host", "rtzr", "--wait-secs", "1"]);
+            run_remote(&fake, &cli.args, "rtzr").await.unwrap();
+            assert!(
+                fake.calls.borrow()[0].contains(&"--wait-secs=1".to_owned()),
+                "{:?}",
+                fake.calls.borrow()
+            );
+            let answer = running.clone();
+            let fake = relay(move |_| Ok(output(1, &answer, "")));
+            let cli = Cli::parse_from(["swap", action, "k", "--host", "rtzr", "--wait-secs", "1"]);
+            assert!(run_remote(&fake, &cli.args, "rtzr").await.is_err());
+        }
+        let fake = relay(move |_| Ok(output(0, &running, "")));
+        let cli = Cli::parse_from(["swap", "--status", "k", "--host", "rtzr"]);
+        assert!(run_remote(&fake, &cli.args, "rtzr").await.is_err());
     }
 
     /// An id that is not found is read as a key; any other error is final.

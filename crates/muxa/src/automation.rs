@@ -39,7 +39,7 @@
 //! the live store at fire time. Every decision — fired, skipped, failed —
 //! is appended to the ledger.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1499,6 +1499,10 @@ pub enum AutomationOutcome {
     Skipped,
     /// The action was attempted and the backend refused it.
     Failed,
+    /// A swap job was admitted for this firing and runs on its own; its
+    /// end follows as another entry under the same `operation`. It is
+    /// charged to the guards from here, once.
+    Admitted,
 }
 
 /// One line of the durable firing record.
@@ -1519,6 +1523,89 @@ pub struct AutomationLedgerEntry {
     /// survive a daemon restart, since the in-memory in-flight set does not.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub episode: Option<String>,
+    /// The request key of the swap job an `admitted` entry stands for, on
+    /// it and on the entry that ends it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<String>,
+    /// That job's id, once one is known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+}
+
+impl AutomationLedgerEntry {
+    /// The entry that ends an admitted operation.
+    fn ends(&self, operation: &str) -> bool {
+        self.operation.as_deref() == Some(operation)
+            && matches!(
+                self.outcome,
+                AutomationOutcome::Fired | AutomationOutcome::Failed | AutomationOutcome::Skipped
+            )
+    }
+}
+
+/// Which entries count against the guards: a firing that acted, and an
+/// admitted operation unless it was released before it was accepted. An
+/// operation's own end is not charged again, so long as its admission is
+/// still on record.
+fn charged(entries: &[AutomationLedgerEntry]) -> impl Iterator<Item = &AutomationLedgerEntry> {
+    let mut admitted = HashSet::new();
+    let mut released = HashSet::new();
+    for entry in entries {
+        match (entry.outcome, entry.operation.as_deref()) {
+            (AutomationOutcome::Admitted, Some(op)) => {
+                admitted.insert(op);
+            }
+            (AutomationOutcome::Skipped, Some(op)) => {
+                released.insert(op);
+            }
+            _ => {}
+        }
+    }
+    entries.iter().filter(
+        move |entry| match (entry.outcome, entry.operation.as_deref()) {
+            (AutomationOutcome::Admitted, Some(op)) => !released.contains(op),
+            (AutomationOutcome::Fired, Some(op)) => !admitted.contains(op),
+            (outcome, _) => outcome == AutomationOutcome::Fired,
+        },
+    )
+}
+
+/// [`AutomationLedger::guard_state`] over `entries`.
+fn guard_from(
+    entries: &[AutomationLedgerEntry],
+    rule: &str,
+    pane: &str,
+    episode: &str,
+    now: OffsetDateTime,
+) -> GuardState {
+    let hour_ago = now - time::Duration::hours(1);
+    let mut state = GuardState::default();
+    for entry in charged(entries) {
+        if entry.fired_at >= hour_ago {
+            state.global_fired_last_hour = state.global_fired_last_hour.saturating_add(1);
+        }
+        if entry.rule != rule || entry.pane != pane {
+            continue;
+        }
+        if entry.fired_at >= hour_ago {
+            state.fired_last_hour = state.fired_last_hour.saturating_add(1);
+        }
+        state.last_fired_at = Some(
+            state
+                .last_fired_at
+                .map_or(entry.fired_at, |current| current.max(entry.fired_at)),
+        );
+    }
+    // A failed attempt still consumed the episode: retrying it would
+    // re-send the same keystrokes into a pane that may have taken the first
+    // ones. So does an admitted swap, whatever became of it.
+    state.episode_handled = entries.iter().any(|entry| {
+        entry.rule == rule
+            && entry.pane == pane
+            && entry.outcome != AutomationOutcome::Skipped
+            && entry.episode.as_deref() == Some(episode)
+    });
+    state
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -1672,38 +1759,64 @@ impl AutomationLedger {
         episode: &str,
         now: OffsetDateTime,
     ) -> GuardState {
-        let entries = self.entries.read().await;
-        let hour_ago = now - time::Duration::hours(1);
-        let mut state = GuardState::default();
-        for entry in entries.iter() {
-            let fired = entry.outcome == AutomationOutcome::Fired;
-            if fired && entry.fired_at >= hour_ago {
-                state.global_fired_last_hour = state.global_fired_last_hour.saturating_add(1);
-            }
-            if entry.rule != rule || entry.pane != pane {
-                continue;
-            }
-            // A failed attempt still consumed the episode: retrying it would
-            // re-send the same keystrokes into a pane that may have taken
-            // the first ones.
-            if entry.outcome != AutomationOutcome::Skipped
-                && entry.episode.as_deref() == Some(episode)
-            {
-                state.episode_handled = true;
-            }
-            if !fired {
-                continue;
-            }
-            if entry.fired_at >= hour_ago {
-                state.fired_last_hour = state.fired_last_hour.saturating_add(1);
-            }
-            state.last_fired_at = Some(
-                state
-                    .last_fired_at
-                    .map_or(entry.fired_at, |current| current.max(entry.fired_at)),
+        guard_from(&self.entries.read().await, rule, pane, episode, now)
+    }
+
+    /// Record `entry`, an `admitted` operation, if no entry already names
+    /// its `operation` and `check` still passes on the guards read under the
+    /// same lock: what is admitted is charged at once, and a key is admitted
+    /// once.
+    pub async fn reserve_operation(
+        &self,
+        entry: AutomationLedgerEntry,
+        check: impl FnOnce(GuardState) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let _guard = self.write_lock.lock().await;
+        if self.recovery_failed {
+            return Err(
+                "Automation ledger could not be recovered; repair it and restart muxad".into(),
             );
         }
-        state
+        let operation = entry
+            .operation
+            .clone()
+            .ok_or_else(|| "an admitted operation needs its key".to_owned())?;
+        {
+            let mut entries = self.entries.write().await;
+            if entries
+                .iter()
+                .any(|previous| previous.operation.as_deref() == Some(operation.as_str()))
+            {
+                return Err(format!("operation {operation} is already on record"));
+            }
+            let guards = guard_from(
+                &entries,
+                &entry.rule,
+                &entry.pane,
+                entry.episode.as_deref().unwrap_or_default(),
+                entry.fired_at,
+            );
+            check(guards)?;
+            entries.push(entry);
+            trim(&mut entries);
+        }
+        self.persist_checked().await
+    }
+
+    /// Admitted operations nothing has ended yet, oldest first.
+    pub async fn unresolved_operations(&self) -> Vec<AutomationLedgerEntry> {
+        let entries = self.entries.read().await;
+        entries
+            .iter()
+            .filter(|entry| entry.outcome == AutomationOutcome::Admitted)
+            .filter(|entry| {
+                entry
+                    .operation
+                    .as_deref()
+                    .is_some_and(|op| !entries.iter().any(|other| other.ends(op)))
+            })
+            .cloned()
+            .collect()
     }
 
     /// `(fired-in-the-last-hour, last-fired-at)` per rule, for the list view.
@@ -1714,10 +1827,7 @@ impl AutomationLedger {
         let entries = self.entries.read().await;
         let hour_ago = now - time::Duration::hours(1);
         let mut activity: HashMap<String, (u32, OffsetDateTime)> = HashMap::new();
-        for entry in entries.iter() {
-            if entry.outcome != AutomationOutcome::Fired {
-                continue;
-            }
+        for entry in charged(&entries) {
             let slot = activity
                 .entry(entry.rule.clone())
                 .or_insert((0, entry.fired_at));
@@ -1780,16 +1890,42 @@ impl AutomationLedger {
 fn trim(entries: &mut Vec<AutomationLedgerEntry>) {
     let hour_ago = OffsetDateTime::now_utc() - time::Duration::hours(24);
     while entries.len() > MAX_LEDGER_ENTRIES {
-        let Some(index) = entries.iter().position(|entry| {
-            entry.fired_at <= hour_ago
-                || !matches!(
-                    entry.outcome,
-                    AutomationOutcome::Judging | AutomationOutcome::JudgeTest
-                )
-        }) else {
+        // An operation goes as a whole, its admission with its end: never
+        // while nothing has ended it (its admission is its claim), nor
+        // within a day of its admission, which the guards still count.
+        let ended: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry.outcome != AutomationOutcome::Admitted)
+            .filter_map(|entry| entry.operation.as_deref())
+            .collect();
+        let recent: HashSet<&str> = entries
+            .iter()
+            .filter(|entry| entry.fired_at > hour_ago)
+            .filter_map(|entry| entry.operation.as_deref())
+            .collect();
+        let Some(index) = entries
+            .iter()
+            .position(|entry| match entry.operation.as_deref() {
+                Some(operation) => ended.contains(operation) && !recent.contains(operation),
+                None => {
+                    entry.fired_at <= hour_ago
+                        || !matches!(
+                            entry.outcome,
+                            AutomationOutcome::Judging | AutomationOutcome::JudgeTest
+                        )
+                }
+            })
+        else {
             break;
         };
-        entries.remove(index);
+        match entries[index].operation.clone() {
+            Some(operation) => {
+                entries.retain(|entry| entry.operation.as_deref() != Some(operation.as_str()));
+            }
+            None => {
+                entries.remove(index);
+            }
+        }
     }
 }
 
@@ -3341,6 +3477,8 @@ waaait = "5m"
             outcome,
             detail: None,
             episode: Some("Error@ep".into()),
+            operation: None,
+            job: None,
         }
     }
 
@@ -3364,6 +3502,184 @@ waaait = "5m"
         assert_eq!(all.len(), MAX_LEDGER_ENTRIES);
         // The oldest are the ones dropped.
         assert_eq!(all[0].fired_at, NOW + time::Duration::seconds(25));
+    }
+
+    fn operation(
+        at: OffsetDateTime,
+        outcome: AutomationOutcome,
+        key: &str,
+    ) -> AutomationLedgerEntry {
+        AutomationLedgerEntry {
+            action: AutomationAction::SwapAccount,
+            operation: Some(key.into()),
+            ..entry("swap", "%1", at, outcome)
+        }
+    }
+
+    /// An admitted operation is charged once, from its admission: its end
+    /// is not charged again, a release before acceptance is not charged at
+    /// all, and either way the episode was handled.
+    #[tokio::test]
+    async fn an_admitted_operation_is_charged_once() {
+        let now = OffsetDateTime::now_utc();
+        let ledger = AutomationLedger::in_memory();
+        ledger
+            .reserve_operation(
+                operation(now, AutomationOutcome::Admitted, "k1"),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        let guards = ledger.guard_state("swap", "%1", "Error@ep", now).await;
+        assert_eq!(guards.fired_last_hour, 1);
+        assert_eq!(guards.global_fired_last_hour, 1);
+        assert_eq!(guards.last_fired_at, Some(now));
+        assert!(guards.episode_handled);
+        assert_eq!(ledger.unresolved_operations().await.len(), 1);
+        ledger
+            .append(operation(now, AutomationOutcome::Fired, "k1"))
+            .await;
+        let guards = ledger.guard_state("swap", "%1", "Error@ep", now).await;
+        assert_eq!(guards.fired_last_hour, 1);
+        assert_eq!(guards.global_fired_last_hour, 1);
+        assert_eq!(ledger.rule_activity(now).await["swap"].0, 1);
+        assert!(ledger.unresolved_operations().await.is_empty());
+        // Released: nothing charged, the episode still handled.
+        ledger
+            .reserve_operation(
+                operation(now, AutomationOutcome::Admitted, "k2"),
+                |_| Ok(()),
+            )
+            .await
+            .unwrap();
+        ledger
+            .append(operation(now, AutomationOutcome::Skipped, "k2"))
+            .await;
+        let guards = ledger.guard_state("swap", "%1", "Error@ep", now).await;
+        assert_eq!(guards.global_fired_last_hour, 1);
+        assert!(guards.episode_handled);
+        assert!(ledger.unresolved_operations().await.is_empty());
+    }
+
+    /// A key is admitted once, and only while the guards read under the
+    /// ledger's lock still pass.
+    #[tokio::test]
+    async fn an_operation_is_reserved_once_and_only_past_its_guards() {
+        let now = OffsetDateTime::now_utc();
+        let ledger = AutomationLedger::in_memory();
+        ledger
+            .reserve_operation(operation(now, AutomationOutcome::Admitted, "k"), |_| Ok(()))
+            .await
+            .unwrap();
+        assert!(ledger
+            .reserve_operation(operation(now, AutomationOutcome::Admitted, "k"), |_| Ok(()))
+            .await
+            .unwrap_err()
+            .contains("already on record"));
+        let seen = std::cell::Cell::new(None);
+        let refused = ledger
+            .reserve_operation(
+                operation(now, AutomationOutcome::Admitted, "k3"),
+                |guards| {
+                    seen.set(Some(guards));
+                    Err("cap".into())
+                },
+            )
+            .await;
+        assert_eq!(refused.unwrap_err(), "cap");
+        assert_eq!(seen.get().unwrap().global_fired_last_hour, 1);
+        assert!(seen.get().unwrap().episode_handled);
+        assert_eq!(ledger.all().await.len(), 1);
+        // No key, no admission.
+        let mut keyless = operation(now, AutomationOutcome::Admitted, "x");
+        keyless.operation = None;
+        assert!(ledger.reserve_operation(keyless, |_| Ok(())).await.is_err());
+    }
+
+    /// A just-ended or just-released operation outlasts log churn: the
+    /// guards still count it, and still know its episode, after a reload.
+    #[tokio::test]
+    async fn trimming_keeps_a_recent_operation_for_its_guards() {
+        for (key, end) in [
+            ("fired", AutomationOutcome::Fired),
+            ("released", AutomationOutcome::Skipped),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("automation.json");
+            let now = OffsetDateTime::now_utc();
+            let ledger = AutomationLedger::load(Some(path.clone()));
+            ledger
+                .reserve_operation(operation(now, AutomationOutcome::Admitted, key), |_| Ok(()))
+                .await
+                .unwrap();
+            ledger.append(operation(now, end, key)).await;
+            let before = ledger.guard_state("swap", "%1", "Error@ep", now).await;
+            for _ in 0..(MAX_LEDGER_ENTRIES + 10) {
+                ledger
+                    .append(entry("other", "%2", now, AutomationOutcome::Skipped))
+                    .await;
+            }
+            let reloaded = AutomationLedger::load(Some(path));
+            for ledger in [&ledger, &reloaded] {
+                assert_eq!(
+                    ledger.guard_state("swap", "%1", "Error@ep", now).await,
+                    before,
+                    "{key}"
+                );
+                assert!(ledger.unresolved_operations().await.is_empty());
+            }
+            assert!(before.episode_handled);
+            assert_eq!(
+                before.global_fired_last_hour,
+                u32::from(end == AutomationOutcome::Fired)
+            );
+        }
+    }
+
+    /// Trimming takes an operation whole: one that ended goes with its
+    /// end (never leaving its admission to look pending again), and one
+    /// nothing ended is kept, however old.
+    #[tokio::test]
+    async fn trimming_takes_an_operation_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("automation.json");
+        let now = OffsetDateTime::now_utc();
+        let old = now - time::Duration::days(3);
+        let ledger = AutomationLedger::load(Some(path.clone()));
+        for (key, end) in [
+            ("fired", Some(AutomationOutcome::Fired)),
+            ("released", Some(AutomationOutcome::Skipped)),
+            ("pending", None),
+        ] {
+            ledger
+                .reserve_operation(operation(old, AutomationOutcome::Admitted, key), |_| Ok(()))
+                .await
+                .unwrap();
+            if let Some(end) = end {
+                ledger.append(operation(old, end, key)).await;
+            }
+        }
+        for _ in 0..(MAX_LEDGER_ENTRIES + 10) {
+            ledger
+                .append(entry("other", "%2", now, AutomationOutcome::Skipped))
+                .await;
+        }
+        let reloaded = AutomationLedger::load(Some(path));
+        for ledger in [&ledger, &reloaded] {
+            let all = ledger.all().await;
+            for key in ["fired", "released"] {
+                assert!(
+                    !all.iter().any(|e| e.operation.as_deref() == Some(key)),
+                    "{key} must go whole"
+                );
+            }
+            let pending = ledger.unresolved_operations().await;
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].operation.as_deref(), Some("pending"));
+            let guards = ledger.guard_state("swap", "%1", "Error@ep", now).await;
+            assert_eq!(guards.global_fired_last_hour, 0);
+            assert!(guards.episode_handled);
+        }
     }
 
     #[tokio::test]

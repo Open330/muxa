@@ -346,7 +346,7 @@ fn no_prompt_launch_registers_the_observed_provider_immediately() {
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(result["prompt_supplied"], false);
         let registered = recv
-            .recv_timeout(Duration::from_secs(6))
+            .recv_timeout(Duration::from_secs(LISTEN_WINDOW_SECS + 1))
             .unwrap_or_else(|error| {
                 panic!(
                     "launcher must register without waiting for a hook: {error}; panes: {}",
@@ -372,6 +372,9 @@ fn no_prompt_launch_registers_the_observed_provider_immediately() {
     }
 }
 
+/// How long the stand-in daemon listens for the launcher's registration.
+const LISTEN_WINDOW_SECS: u64 = 30;
+
 fn registration_listener(
     socket: &Path,
 ) -> (
@@ -385,7 +388,9 @@ fn registration_listener(
     listener.set_nonblocking(true).unwrap();
     let (send, recv) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // Counted from before the CLI starts: a loaded CI runner can take
+        // seconds to launch the pane before the registration arrives.
+        let deadline = Instant::now() + Duration::from_secs(LISTEN_WINDOW_SECS);
         while Instant::now() < deadline {
             let Ok((mut stream, _)) = listener.accept() else {
                 std::thread::sleep(Duration::from_millis(10));

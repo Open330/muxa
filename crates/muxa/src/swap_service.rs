@@ -283,8 +283,14 @@ pub struct JobView {
     pub revision: u64,
     pub reason: Option<String>,
     pub entries: Vec<EntryView>,
-    /// Why the service stopped taking work, if it did.
+    /// Why this job cannot go on: the service faulted while it was still
+    /// accepted or running. An ended job never carries one, whatever
+    /// happened to the service after it ended.
     pub fault: Option<String>,
+    /// Why the service stopped taking work, if it did: its health, not this
+    /// job's result.
+    #[serde(default)]
+    pub service_fault: Option<String>,
     /// A cancel was asked for: no target starts after it, and targets that
     /// never started read `cancelled`.
     #[serde(default)]
@@ -330,6 +336,10 @@ struct Receipt {
 
 /// More than enough for every pane's hooks within one follow-up's wait.
 const RECEIPTS_KEPT: usize = 512;
+
+/// Ended jobs whose rich outcomes stay in memory, newest kept. An older
+/// one reads as it would after a restart: its journal, without them.
+const LIVE_ENDED_KEPT: usize = 64;
 
 impl PromptReceipts {
     /// Receipts numbered by `source`, the store's [`crate::Store::prompt_sequence`]:
@@ -740,6 +750,96 @@ impl SwapService {
 /// The automation's check that its swap is still wanted: `Err` says why not.
 pub type StillDue = Box<dyn Fn() -> Result<(), String> + Send>;
 
+/// Whether the swap service takes jobs now, and if not why: read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapHealth {
+    pub readiness: SwapReadiness,
+    /// Why it is not `ready`.
+    pub reason: Option<String>,
+    /// The job store's schema, once one was opened; `None` if it never was.
+    pub schema: Option<i64>,
+    /// The schema this build writes and reads.
+    pub expected_schema: i64,
+    /// The fault that halted it, if one did (apart from other reasons).
+    pub fault: Option<String>,
+    /// Jobs this manager is running now (not rows an earlier manager left).
+    pub jobs_running: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SwapReadiness {
+    Ready,
+    /// Shutting down: no new job.
+    Draining,
+    /// A fault stopped it; it takes nothing until the daemon restarts.
+    Halted,
+    /// It never opened, or its store is no longer its own.
+    Unavailable,
+}
+
+/// The swap service a daemon could not open, kept for its reason: every
+/// request is refused with it, and health reports it.
+pub struct UnopenedSwap {
+    reason: String,
+}
+
+impl UnopenedSwap {
+    #[must_use]
+    pub fn new(reason: String) -> Self {
+        Self { reason }
+    }
+
+    fn refused<T>(&self) -> Result<T, String> {
+        Err(format!(
+            "swap jobs are unavailable on this daemon: {}",
+            self.reason
+        ))
+    }
+}
+
+impl SwapJobs for UnopenedSwap {
+    fn active(&self) -> Result<(), String> {
+        self.refused()
+    }
+
+    fn plan(&self, _: &SwapOverrides) -> Result<PlanView, String> {
+        self.refused()
+    }
+
+    fn submit(&self, _: &str, _: &SwapOverrides) -> Result<Accepted, String> {
+        self.refused()
+    }
+
+    fn retry(&self, _: &str, _: &JobRef, _: &RetryOverrides) -> Result<Accepted, String> {
+        self.refused()
+    }
+
+    fn cancel(&self, _: &JobRef) -> Result<JobView, String> {
+        self.refused()
+    }
+
+    fn status(&self, _: &JobRef) -> Result<JobView, String> {
+        self.refused()
+    }
+
+    fn health(&self) -> SwapHealth {
+        SwapHealth {
+            readiness: SwapReadiness::Unavailable,
+            reason: Some(self.reason.clone()),
+            schema: None,
+            expected_schema: crate::swap_job::SCHEMA_VERSION,
+            fault: None,
+            jobs_running: 0,
+        }
+    }
+
+    fn exists(&self) -> bool {
+        false
+    }
+}
+
 /// What an IPC caller may do with swap jobs. Every request through it is a
 /// public one: it can never claim the daemon's own automation privileges.
 pub trait SwapJobs: Send + Sync {
@@ -755,6 +855,13 @@ pub trait SwapJobs: Send + Sync {
     /// Ask a job to start no further target; accepted whatever the
     /// service's health.
     fn cancel(&self, job: &JobRef) -> Result<JobView, String>;
+    /// How the service is, read-only: never plans, never touches a pane.
+    fn health(&self) -> SwapHealth;
+    /// A service that opened (it can have jobs), as opposed to the reason
+    /// one did not.
+    fn exists(&self) -> bool {
+        true
+    }
     /// Readable whatever state the service is in, so a halted or recovered
     /// job can always be inspected.
     fn status(&self, job: &JobRef) -> Result<JobView, String>;
@@ -784,6 +891,10 @@ impl SwapJobs for SwapService {
 
     fn cancel(&self, job: &JobRef) -> Result<JobView, String> {
         self.inner.cancel(job)
+    }
+
+    fn health(&self) -> SwapHealth {
+        self.inner.health()
     }
 
     fn status(&self, job: &JobRef) -> Result<JobView, String> {
@@ -917,6 +1028,8 @@ pub(crate) struct Service<E: Engine> {
     /// effect is uncertain stays reserved until the daemon restarts.
     reserved: Mutex<HashMap<String, String>>,
     live: Mutex<HashMap<String, LiveJob>>,
+    /// Ended jobs still in `live`, oldest first.
+    ended_live: Mutex<std::collections::VecDeque<String>>,
     fault: Mutex<Option<String>>,
     spawner: Spawner,
     /// The ownership lock ([`ownership_lock`]). Owned here, where every
@@ -950,6 +1063,7 @@ impl<E: Engine> Service<E> {
             submit: Mutex::new(()),
             reserved: Mutex::new(HashMap::new()),
             live: Mutex::new(HashMap::new()),
+            ended_live: Mutex::new(std::collections::VecDeque::new()),
             fault: Mutex::new(None),
             spawner: thread_spawner(),
             ownership: None,
@@ -981,6 +1095,28 @@ impl<E: Engine> Service<E> {
         self.store
             .check(&self.lease)
             .map_err(|error| format!("swap jobs are unavailable: {error}"))
+    }
+
+    /// How the service is now, read-only.
+    pub(crate) fn health(&self) -> SwapHealth {
+        let fault = self.fault();
+        let (readiness, reason) = if self.draining.load(Ordering::SeqCst) {
+            (SwapReadiness::Draining, Some("shutting down".to_owned()))
+        } else if let Some(fault) = &fault {
+            (SwapReadiness::Halted, Some(fault.clone()))
+        } else if let Err(error) = self.store.check(&self.lease) {
+            (SwapReadiness::Unavailable, Some(error.to_string()))
+        } else {
+            (SwapReadiness::Ready, None)
+        };
+        SwapHealth {
+            readiness,
+            reason,
+            schema: Some(crate::swap_job::SCHEMA_VERSION),
+            expected_schema: crate::swap_job::SCHEMA_VERSION,
+            fault,
+            jobs_running: self.done.lock().map_or(0, |done| done.len()),
+        }
     }
 
     pub(crate) async fn wait(
@@ -1058,8 +1194,21 @@ impl<E: Engine> Service<E> {
         )
     }
 
-    /// The job ended, however it ended: wake whoever waits on it.
+    /// The job ended, however it ended: wake whoever waits on it, and let
+    /// the oldest ended job's outcomes go once more than
+    /// [`LIVE_ENDED_KEPT`] have.
     fn ended(&self, job: &str) {
+        // The cache settles first: whoever is woken reads it as it stays.
+        if let (Ok(mut ended), Ok(mut live)) = (self.ended_live.lock(), self.live.lock()) {
+            if live.contains_key(job) && !ended.iter().any(|kept| kept == job) {
+                ended.push_back(job.to_owned());
+            }
+            while ended.len() > LIVE_ENDED_KEPT {
+                if let Some(oldest) = ended.pop_front() {
+                    live.remove(&oldest);
+                }
+            }
+        }
         if let Ok(mut done) = self.done.lock() {
             if let Some(sender) = done.remove(job) {
                 let _ = sender.send(true);
@@ -1895,6 +2044,7 @@ impl<E: Engine> Service<E> {
             });
         }
         entries.sort_by_key(|entry| entry.report_index);
+        let unfinished = matches!(status.state.as_str(), "accepted" | "running");
         Ok(JobView {
             job_id: status.job_id,
             node_id: status.node_id,
@@ -1902,7 +2052,8 @@ impl<E: Engine> Service<E> {
             revision: status.revision,
             reason: status.reason,
             entries,
-            fault: self.fault(),
+            fault: self.fault().filter(|_| unfinished),
+            service_fault: self.fault(),
             cancel_requested: status.cancel_requested,
         })
     }

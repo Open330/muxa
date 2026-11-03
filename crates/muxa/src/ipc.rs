@@ -256,6 +256,8 @@ enum RequestBody {
     SwapPlan {
         overrides: crate::swap_service::SwapOverrides,
     },
+    /// `swap_health_v1`: how the swap service is, read-only.
+    SwapHealth,
     /// `swap_cancel_v1`: ask a job to start no further target.
     SwapJobCancel {
         job: crate::swap_service::JobRef,
@@ -3057,6 +3059,8 @@ async fn automation_judge_test(
         outcome: AutomationOutcome::JudgeTest,
         detail: Some("Explicit Ask condition test; no action will be executed".into()),
         episode: None,
+        operation: None,
+        job: None,
     };
     ledger
         .reserve_judgment(reservation.clone(), max_per_hour, cooldown)
@@ -3627,6 +3631,33 @@ const SWAP_CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
 pub const SWAP_JOBS_CAPABILITY: &str = "swap_jobs_v1";
 /// `swap_plan_v1`: `swap_plan`.
 pub const SWAP_PLAN_CAPABILITY: &str = "swap_plan_v1";
+/// `swap_health_v1`: `swap_health`, answered whatever the service's state,
+/// including one that never opened.
+pub const SWAP_HEALTH_CAPABILITY: &str = "swap_health_v1";
+
+/// How long `swap_health` waits on the service before saying so.
+const SWAP_HEALTH_ANSWER: Duration = Duration::from_secs(2);
+
+/// The swap service's health, off the reactor and bounded: a check that
+/// cannot answer in time is reported as such, never waited on.
+async fn swap_health_response(swap: Option<&Arc<dyn crate::swap_service::SwapJobs>>) -> Response {
+    let Some(swap) = swap.cloned() else {
+        return Response::err("swap jobs are not offered by this daemon".to_owned());
+    };
+    let check = tokio::task::spawn_blocking(move || swap.health());
+    match tokio::time::timeout(SWAP_HEALTH_ANSWER, check).await {
+        Ok(Ok(health)) => match serde_json::to_value(&health) {
+            Ok(value) => Response::with_swap(value),
+            Err(error) => Response::err(error.to_string()),
+        },
+        Ok(Err(error)) => Response::err(format!("swap health check failed: {error}")),
+        Err(_) => Response::err(format!(
+            "swap health check did not answer within {}s",
+            SWAP_HEALTH_ANSWER.as_secs()
+        )),
+    }
+}
+
 /// `swap_cancel_v1`: `swap_job_cancel`. Advertised whenever this daemon has
 /// a swap service, healthy or not: a job can always be told to stop.
 pub const SWAP_CANCEL_CAPABILITY: &str = "swap_cancel_v1";
@@ -3898,7 +3929,8 @@ async fn handle(
                         // advertised; status stays served regardless.
                         if let Some(capabilities) = r.capabilities.as_mut() {
                             capabilities.push(SWAP_SERVICE_CAPABILITY);
-                            if swap.is_some() {
+                            capabilities.push(SWAP_HEALTH_CAPABILITY);
+                            if swap.as_ref().is_some_and(|swap| swap.exists()) {
                                 capabilities.push(SWAP_CANCEL_CAPABILITY);
                             }
                         }
@@ -4099,6 +4131,10 @@ async fn handle(
                             .and_then(|accepted| to_swap_value(&accepted))
                     })
                     .await
+                }
+                RequestBody::SwapHealth => {
+                    kind = "swap_health";
+                    swap_health_response(swap.as_ref()).await
                 }
                 RequestBody::SwapJobCancel { job } => {
                     kind = "swap_job_cancel";
@@ -7224,6 +7260,15 @@ impl Client {
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_job_status",
             "job": job,
+        });
+        self.swap_request(&req).await
+    }
+
+    /// `swap_health_v1`: how the daemon's swap service is.
+    pub async fn swap_health(&self) -> Result<crate::swap_service::SwapHealth, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "swap_health",
         });
         self.swap_request(&req).await
     }
@@ -13305,6 +13350,7 @@ mod tests {
                 reason: None,
                 entries: Vec::new(),
                 fault: None,
+                service_fault: None,
                 cancel_requested: false,
             }
         }
@@ -13316,6 +13362,25 @@ mod tests {
     }
 
     impl crate::swap_service::SwapJobs for FakeSwap {
+        fn health(&self) -> crate::swap_service::SwapHealth {
+            if self.slow_health {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            let ready = self.healthy.load(std::sync::atomic::Ordering::SeqCst);
+            crate::swap_service::SwapHealth {
+                readiness: if ready {
+                    crate::swap_service::SwapReadiness::Ready
+                } else {
+                    crate::swap_service::SwapReadiness::Halted
+                },
+                reason: (!ready).then(|| "halted".to_owned()),
+                schema: Some(2),
+                expected_schema: 2,
+                fault: (!ready).then(|| "halted".to_owned()),
+                jobs_running: 0,
+            }
+        }
+
         fn cancel(
             &self,
             job: &crate::swap_service::JobRef,
@@ -13502,6 +13567,69 @@ mod tests {
         assert!(!plan.executable);
         assert!(plan.unavailable.is_some());
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    /// Health answers in every state: ready, halted, a service that never
+    /// opened (its reason, and no cancel offered), none at all, and a check
+    /// too slow to wait for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn swap_health_answers_in_every_state() {
+        let swap = FakeSwap::new(true);
+        let (_dir, client, tx, handle) = swap_server(Some(
+            Arc::clone(&swap) as Arc<dyn crate::swap_service::SwapJobs>
+        ))
+        .await;
+        let hello = client.hello(Duration::from_secs(2)).await.unwrap();
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|c| c == SWAP_HEALTH_CAPABILITY));
+        let ready = client.swap_health().await.unwrap();
+        assert_eq!(ready.readiness, crate::swap_service::SwapReadiness::Ready);
+        swap.healthy
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let halted = client.swap_health().await.unwrap();
+        assert_eq!(halted.readiness, crate::swap_service::SwapReadiness::Halted);
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+
+        let unopened: Arc<dyn crate::swap_service::SwapJobs> = Arc::new(
+            crate::swap_service::UnopenedSwap::new("schema 9, this build reads 2".into()),
+        );
+        let (_dir, client, tx, handle) = swap_server(Some(unopened)).await;
+        let hello = client.hello(Duration::from_secs(2)).await.unwrap();
+        assert!(hello
+            .capabilities
+            .iter()
+            .any(|c| c == SWAP_HEALTH_CAPABILITY));
+        assert!(!hello
+            .capabilities
+            .iter()
+            .any(|c| c == SWAP_CANCEL_CAPABILITY));
+        let health = client.swap_health().await.unwrap();
+        assert_eq!(
+            health.readiness,
+            crate::swap_service::SwapReadiness::Unavailable
+        );
+        assert!(health.reason.unwrap().contains("schema 9"));
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+
+        let (_dir, client, tx, handle) = swap_server(None).await;
+        assert!(client.swap_health().await.is_err());
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+
+        let mut slow = FakeSwap::new(true);
+        Arc::get_mut(&mut slow).unwrap().slow_health = true;
+        let (_dir, client, tx, handle) =
+            swap_server(Some(slow as Arc<dyn crate::swap_service::SwapJobs>)).await;
+        let started = std::time::Instant::now();
+        let error = client.swap_health().await.unwrap_err().to_string();
+        assert!(error.contains("did not answer"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
         tx.send(()).unwrap();
         handle.await.unwrap();
     }

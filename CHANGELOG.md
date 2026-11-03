@@ -7,8 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa doctor` reports the daemon's swap service: taking jobs, shutting down,
+  halted by a fault, or unavailable with the reason it did not open (store
+  owned by another manager, an incompatible store schema, no node identity),
+  read through a new read-only, bounded `swap_health` request.
+- The `muxa_swap_account` MCP tool can `retry`, read (`status`) and `cancel` a
+  swap job and `detach` from one. A start or retry runs under a request key
+  (the caller's own or one minted before anything is sent) that every result
+  carries, errors included, with the call to read the job again; nothing is
+  sent twice. `muxa swap --status`/`--cancel` take `--wait-secs` (0-120) to
+  return the job as it is rather than wait for its end.
+
 ### Fixed
 
+- The daemon no longer keeps every finished swap job's full outcomes in
+  memory for as long as it runs: running jobs keep theirs, and only the 64
+  most recently ended jobs do too. An older job's status reads from its
+  journal, as it does after a restart.
 - A swap answers a relaunched agent's startup dialog only when the screen ends
   in that dialog (its footer, not the agent's own prompt) and only for the
   process resuming the planned conversation; a dialog's words quoted above the
@@ -34,6 +51,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- An automation `swap_account` no longer holds the automation engine while
+  it waits for its pane, plans, or runs: it is admitted (at most two at a
+  time, one per pane), recorded as `admitted` and charged to the guards at
+  once, and its job's end is recorded under the same `operation` key when it
+  comes. A wait that runs out is waited again rather than recorded as a
+  failure, and a restarted daemon follows unfinished admitted swaps to their
+  end without starting them again.
 - A swap's follow-up is reported as what the transport said (`delivered`,
   `refused`, `unconfirmed`) and, separately, what followed within 20s: the
   agent's own prompt hook, screen activity, or nothing seen. The old "picked
