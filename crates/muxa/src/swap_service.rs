@@ -1198,11 +1198,7 @@ impl<E: Engine> Service<E> {
     /// the oldest ended job's outcomes go once more than
     /// [`LIVE_ENDED_KEPT`] have.
     fn ended(&self, job: &str) {
-        if let Ok(mut done) = self.done.lock() {
-            if let Some(sender) = done.remove(job) {
-                let _ = sender.send(true);
-            }
-        }
+        // The cache settles first: whoever is woken reads it as it stays.
         if let (Ok(mut ended), Ok(mut live)) = (self.ended_live.lock(), self.live.lock()) {
             if live.contains_key(job) && !ended.iter().any(|kept| kept == job) {
                 ended.push_back(job.to_owned());
@@ -1211,6 +1207,11 @@ impl<E: Engine> Service<E> {
                 if let Some(oldest) = ended.pop_front() {
                     live.remove(&oldest);
                 }
+            }
+        }
+        if let Ok(mut done) = self.done.lock() {
+            if let Some(sender) = done.remove(job) {
+                let _ = sender.send(true);
             }
         }
     }
