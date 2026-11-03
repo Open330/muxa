@@ -1790,12 +1790,26 @@ private final class InboxMailboxProbe: @unchecked Sendable {
     private var failureByHost: [String: String] = [:]
     private var mailboxReads: [String] = []
     private var getReads: [String] = []
+    private var readTokens: [String: String] = [:]
+    private var requestedTokens: [String: String] = [:]
 
     func setMailbox(host: String, sent: [[String: Any]], incoming: [[String: Any]] = []) {
         lock.lock()
         defer { lock.unlock() }
         sentByHost[host] = sent
         incomingByHost[host] = incoming
+    }
+
+    func setReadToken(host: String, token: String?) {
+        lock.lock()
+        defer { lock.unlock() }
+        readTokens[host] = token
+    }
+
+    func requestedToken(host: String) -> String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return requestedTokens[host]
     }
 
     /// `nil` restores a healthy host.
@@ -1841,17 +1855,24 @@ private final class InboxMailboxProbe: @unchecked Sendable {
         defer { lock.unlock() }
         if kind == "collaboration_mailbox" {
             mailboxReads.append(host)
+            requestedTokens[host] = operation["if_unchanged"] as? String
             if let failure = failureByHost[host] {
                 return try JSONSerialization.data(withJSONObject: ["ok": false, "error": failure])
             }
-            return try JSONSerialization.data(withJSONObject: [
-                "ok": true,
-                "fleet_result": [
-                    "accepted": true,
-                    "collaboration_incoming": incomingByHost[host] ?? [],
-                    "collaboration_sent": sentByHost[host] ?? [],
-                ],
-            ])
+            var result: [String: Any] = [
+                "accepted": true,
+                "collaboration_incoming": incomingByHost[host] ?? [],
+                "collaboration_sent": sentByHost[host] ?? [],
+            ]
+            if let token = readTokens[host] {
+                result["collaboration_read_token"] = token
+                if operation["if_unchanged"] as? String == token {
+                    result["collaboration_unchanged"] = true
+                    result["collaboration_incoming"] = [[String: Any]]()
+                    result["collaboration_sent"] = [[String: Any]]()
+                }
+            }
+            return try JSONSerialization.data(withJSONObject: ["ok": true, "fleet_result": result])
         }
 
         // collaboration_get: like muxad's `get_for`, the sender reading a
@@ -1936,6 +1957,46 @@ private func decodeInboxRequest(_ object: [String: Any]) throws -> MuxaCollabora
 
 struct MuxaOperatorInboxRefreshTests {
     private static let sshHiccup = "remote request_failed: reading collaboration mailbox"
+
+    @Test @MainActor
+    func conditionalInboxPreservesDisplayedRowsAndRefreshesChangedHostWithoutWaitingForTheGlobalPoll() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [inboxSentRequest(id: "local-1", createdAt: "2026-09-02T10:00:00Z")])
+        probe.setMailbox(host: "dev", sent: [inboxSentRequest(id: "dev-1", createdAt: "2026-09-02T09:00:00Z")])
+        probe.setReadToken(host: "local", token: "local-v1")
+        probe.setReadToken(host: "dev", token: "dev-v1")
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        probe.resetReadLog()
+        await model.refreshOperatorInbox(force: false, hostAliases: ["local"])
+        #expect(probe.requestedToken(host: "local") == "local-v1")
+        #expect(probe.mailboxReadHosts() == ["local"])
+        #expect(model.operatorMessages.map(\.id) == ["local:local-1", "dev:dev-1"])
+        probe.setMailbox(host: "local", sent: [inboxSentRequest(id: "local-2", createdAt: "2026-09-02T11:00:00Z")])
+        probe.setReadToken(host: "local", token: "local-v2")
+        await model.refreshOperatorInbox(force: false, hostAliases: ["local"])
+        #expect(model.operatorMessages.map(\.id) == ["local:local-2", "dev:dev-1"])
+        await model.refreshOperatorInbox(force: true, hostAliases: ["local"])
+        #expect(probe.requestedToken(host: "local") == nil)
+    }
+
+    @Test @MainActor
+    func conditionalInboxFailureKeepsMessagesButDiscardsTokenBeforeRecovery() async throws {
+        let probe = InboxMailboxProbe()
+        probe.setMailbox(host: "local", sent: [inboxSentRequest(id: "local-1", createdAt: "2026-09-02T10:00:00Z")])
+        probe.setReadToken(host: "local", token: "local-v1")
+        let model = try await makeInboxModel(probe: probe)
+        await model.refreshOperatorInbox(force: true)
+        probe.setFailure(host: "local", message: Self.sshHiccup)
+        await model.refreshOperatorInbox(force: false, hostAliases: ["local"])
+        #expect(model.operatorMessages.first?.id == "local:local-1")
+        #expect(model.inboxHostFailures["local"] != nil)
+        probe.setFailure(host: "local", message: nil)
+        await model.refreshOperatorInbox(force: false, hostAliases: ["local"])
+        #expect(probe.requestedToken(host: "local") == nil)
+        #expect(model.inboxHostFailures["local"] == nil)
+        #expect(model.operatorMessages.first?.id == "local:local-1")
+    }
 
     @Test @MainActor
     func hostFailureKeepsThatHostsMessagesAndClearsWhenItRecovers() async throws {

@@ -190,6 +190,7 @@ final class AppModel: ObservableObject {
     private var pendingInboxHosts = Set<String>()
     private var shellNumber = 1
     private var lastInboxRefresh = Date.distantPast
+    private var inboxReadTokens: [String: String] = [:]
 
     var isConnected: Bool {
         connectionState == .connected
@@ -276,6 +277,7 @@ final class AppModel: ObservableObject {
         askRefreshPending = false
         pipelineRefreshPending = false
         pendingInboxHosts.removeAll()
+        inboxReadTokens.removeAll()
         connectionGeneration &+= 1
         let generation = connectionGeneration
         connectionState = .connecting
@@ -1395,7 +1397,8 @@ final class AppModel: ObservableObject {
         hostAliases: Set<String>?
     ) async {
         guard !isRefreshingInbox else { return }
-        if !force, Date().timeIntervalSince(lastInboxRefresh) < 4 { return }
+        if !force, hostAliases == nil, Date().timeIntervalSince(lastInboxRefresh) < 4 { return }
+        let generation = connectionGeneration
         isRefreshingInbox = true
         if hostAliases == nil { lastInboxRefresh = Date() }
         inboxError = nil
@@ -1418,17 +1421,20 @@ final class AppModel: ObservableObject {
             if !registered.isEmpty {
                 messagesByHost = messagesByHost.filter { registered.contains($0.key) }
                 failures = failures.filter { registered.contains($0.key) }
+                inboxReadTokens = inboxReadTokens.filter { registered.contains($0.key) }
             }
         }
 
         let results = await withTaskGroup(of: MuxaInboxFetch.self) { group in
             for target in targets {
+                let token = force ? nil : inboxReadTokens[target.host.alias]
                 group.addTask { [client] in
                     do {
                         let mailbox = try await client.collaborationMailbox(
                             host: target.host,
                             pane: target.pane,
-                            operatorOnly: true
+                            operatorOnly: true,
+                            ifUnchanged: token
                         )
                         return MuxaInboxFetch(target: target, mailbox: mailbox, error: nil)
                     } catch {
@@ -1445,9 +1451,15 @@ final class AppModel: ObservableObject {
             return fetched
         }
 
+        guard connectionGeneration == generation else { return }
         for result in results {
             let target = result.target
             if let mailbox = result.mailbox {
+                inboxReadTokens[target.host.alias] = mailbox.readToken
+                if mailbox.unchanged {
+                    failures[target.host.alias] = nil
+                    continue
+                }
                 var seen = Set<String>()
                 let humanRequests = mailbox.incoming.filter { $0.to.console == true && $0.from.console != true }
                 messagesByHost[target.host.alias] = (humanRequests + mailbox.sent).compactMap { request in
@@ -1460,6 +1472,7 @@ final class AppModel: ObservableObject {
                 }
                 failures[target.host.alias] = nil
             } else if let error = result.error {
+                inboxReadTokens[target.host.alias] = nil
                 // Leave messagesByHost[alias] untouched: the last successful
                 // read stays visible while the host is unreachable.
                 failures[target.host.alias] = error

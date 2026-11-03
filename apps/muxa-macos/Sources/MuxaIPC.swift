@@ -915,6 +915,15 @@ struct MuxaCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
 struct MuxaCollaborationMailbox: Sendable {
     let incoming: [MuxaCollaborationRequest]
     let sent: [MuxaCollaborationRequest]
+    let readToken: String?
+    let unchanged: Bool
+
+    init(incoming: [MuxaCollaborationRequest], sent: [MuxaCollaborationRequest], readToken: String? = nil, unchanged: Bool = false) {
+        self.incoming = incoming
+        self.sent = sent
+        self.readToken = readToken
+        self.unchanged = unchanged
+    }
 }
 
 private struct MuxaFleetCommandResult: Decodable, Sendable {
@@ -925,6 +934,8 @@ private struct MuxaFleetCommandResult: Decodable, Sendable {
     let collaborationRequest: MuxaCollaborationRequest?
     let collaborationIncoming: [MuxaCollaborationRequest]?
     let collaborationSent: [MuxaCollaborationRequest]?
+    let collaborationReadToken: String?
+    let collaborationUnchanged: Bool?
 
     enum CodingKeys: String, CodingKey {
         case accepted, message, capture
@@ -932,6 +943,8 @@ private struct MuxaFleetCommandResult: Decodable, Sendable {
         case collaborationRequest = "collaboration_request"
         case collaborationIncoming = "collaboration_incoming"
         case collaborationSent = "collaboration_sent"
+        case collaborationReadToken = "collaboration_read_token"
+        case collaborationUnchanged = "collaboration_unchanged"
     }
 }
 
@@ -1605,20 +1618,33 @@ actor MuxaIPCClient {
     func collaborationMailbox(
         host: MuxaFleetHostIdentity,
         pane: MuxaPaneInfo,
-        operatorOnly: Bool = false
+        operatorOnly: Bool = false,
+        ifUnchanged: String? = nil
     ) async throws -> MuxaCollaborationMailbox {
+        var operation: [String: Any] = [
+            "kind": "collaboration_mailbox",
+            "operator_only": operatorOnly,
+            "pane": Self.paneKey(pane),
+        ]
+        if let ifUnchanged { operation["if_unchanged"] = ifUnchanged }
         let result = try await fleetCommand(
             host: host,
-            operation: [
-                "kind": "collaboration_mailbox",
-                "operator_only": operatorOnly,
-                "pane": Self.paneKey(pane),
-            ],
+            operation: operation,
             requestTransport: fleetReadTransport(for: host.alias)
         )
+        let unchanged = result.collaborationUnchanged == true
+        if unchanged {
+            guard let ifUnchanged, result.collaborationReadToken == ifUnchanged,
+                  (result.collaborationIncoming ?? []).isEmpty,
+                  (result.collaborationSent ?? []).isEmpty else {
+                throw MuxaIPCError.missingField("valid conditional mailbox token")
+            }
+        }
         return MuxaCollaborationMailbox(
             incoming: result.collaborationIncoming ?? [],
-            sent: result.collaborationSent ?? []
+            sent: result.collaborationSent ?? [],
+            readToken: result.collaborationReadToken,
+            unchanged: unchanged
         )
     }
 

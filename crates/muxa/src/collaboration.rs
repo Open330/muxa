@@ -13,6 +13,8 @@ pub use contract::{
     task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,
     EvidenceReference, TaskAttempt, TaskContract, TaskReport, TASK_CONTRACT_CAPABILITY,
 };
+mod mailbox_snapshot;
+pub use mailbox_snapshot::{MailboxSnapshot, MAILBOX_SNAPSHOT_CAPABILITY};
 mod health;
 pub use health::{
     CollaborationHealth, COLLABORATION_HEALTH_CAPABILITY, FILTERED_EXPIRE_CAPABILITY,
@@ -2674,6 +2676,8 @@ pub struct CollaborationStore {
     /// latest revision and wakes every subscriber, avoiding both lost
     /// notifications and broadcast-lag recovery machinery.
     changes: watch::Sender<u64>,
+    read_epoch: String,
+    read_revision: AtomicU64,
 }
 
 impl CollaborationStore {
@@ -2703,10 +2707,13 @@ impl CollaborationStore {
             transaction_lock: Mutex::new(()),
             missing_recipients: Mutex::new(HashMap::new()),
             reply_wake_tokens: AtomicU64::new(1),
+            read_epoch: uuid::Uuid::new_v4().to_string(),
+            read_revision: AtomicU64::new(0),
             changes,
         })
     }
 
+    #[allow(clippy::too_many_lines)] // durable load and fresh read epoch form one initialization boundary
     pub async fn load(options: CollaborationOptions) -> Result<Arc<Self>, CollaborationError> {
         let (legacy, configured_path_is_database) = if let Some(path) = options.path.as_ref() {
             if has_database_extension(path) {
@@ -2797,6 +2804,8 @@ impl CollaborationStore {
             transaction_lock: Mutex::new(()),
             missing_recipients: Mutex::new(HashMap::new()),
             reply_wake_tokens: AtomicU64::new(1),
+            read_epoch: uuid::Uuid::new_v4().to_string(),
+            read_revision: AtomicU64::new(0),
             changes,
         });
         if let Some(days) = store.opts.retention_days {
@@ -3981,6 +3990,18 @@ impl CollaborationStore {
             return Err(CollaborationError::ScopeDenied);
         }
         let _transaction = self.transaction_lock.lock().await;
+        self.query_for_offset_locked(caller, mailbox, scope, query, offset)
+            .await
+    }
+
+    async fn query_for_offset_locked(
+        &self,
+        caller: &Participant,
+        mailbox: RequestMailbox,
+        scope: MailboxScope,
+        query: &CollaborationQuery,
+        offset: usize,
+    ) -> Result<CollaborationPage, CollaborationError> {
         if let Some(database) = &self.database {
             return database.with_connection(|connection| {
                 query_connection(
@@ -4515,6 +4536,9 @@ impl CollaborationStore {
         &self,
         requests: &[CollaborationRequest],
     ) -> Result<(), CollaborationError> {
+        if !requests.is_empty() {
+            self.read_revision.fetch_add(1, Ordering::SeqCst);
+        }
         let Some(database) = &self.database else {
             return Ok(());
         };
@@ -4552,6 +4576,9 @@ impl CollaborationStore {
     }
 
     fn delete_requests(&self, request_ids: &[String]) -> Result<(), CollaborationError> {
+        if !request_ids.is_empty() {
+            self.read_revision.fetch_add(1, Ordering::SeqCst);
+        }
         let Some(database) = &self.database else {
             return Ok(());
         };

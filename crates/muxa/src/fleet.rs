@@ -551,6 +551,8 @@ pub enum RelayRequest {
         /// Console-only reads do not require this pane to host an agent.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         operator_only: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_unchanged: Option<String>,
     },
     CollaborationGet {
         request_id: String,
@@ -682,6 +684,8 @@ pub enum FleetOperation {
         pane: PaneKey,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         operator_only: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_unchanged: Option<String>,
     },
     CollaborationGet {
         pane: PaneKey,
@@ -745,6 +749,10 @@ pub struct FleetCommandResult {
     pub collaboration_incoming: Vec<CollaborationRequest>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub collaboration_sent: Vec<CollaborationRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub collaboration_read_token: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub collaboration_unchanged: bool,
     /// Exit code of a `work_command` child; absent for every other operation
     /// and in replies from a relay that predates the operation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -768,6 +776,8 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
@@ -786,6 +796,8 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
@@ -806,6 +818,8 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
@@ -824,6 +838,8 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
@@ -842,6 +858,8 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
@@ -860,10 +878,20 @@ impl FleetCommandResult {
             collaboration_request: Some(Box::new(request)),
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
         }
+    }
+
+    #[must_use]
+    pub fn collaboration_snapshot(snapshot: crate::collaboration::MailboxSnapshot) -> Self {
+        let mut result = Self::collaboration_mailbox(snapshot.incoming, snapshot.sent);
+        result.collaboration_read_token = snapshot.token;
+        result.collaboration_unchanged = snapshot.unchanged;
+        result
     }
 
     #[must_use]
@@ -890,6 +918,8 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: incoming,
             collaboration_sent: sent,
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
@@ -909,6 +939,8 @@ impl FleetCommandResult {
             collaboration_request: None,
             collaboration_incoming: Vec::new(),
             collaboration_sent: Vec::new(),
+            collaboration_read_token: None,
+            collaboration_unchanged: false,
             command_exit_code: Some(output.exit_code),
             command_stdout: Some(output.stdout),
             command_stderr: Some(output.stderr),

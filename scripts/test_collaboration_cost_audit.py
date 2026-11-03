@@ -69,6 +69,26 @@ class CostAuditTests(unittest.TestCase):
             self.assertEqual(row["elapsed_us"], 6000)
             self.assertEqual(row["max_elapsed_us"], 4000)
 
+    def test_body_relative_cost_has_coverage_and_zero_body_is_not_a_ratio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "audit.ndjson"
+            base = {"at": "2026-10-20T01:00:00Z", "actor": {"client_kind": "cli"}, "operation": "list", "ok": True}
+            rows = [base, dict(base, response_bytes=300, response_body_bytes=100,
+                              response_extra_bytes=200, response_structure_bytes=180,
+                              response_body_json_bytes=120, response_escape_bytes=20, conditional_unchanged=False),
+                    dict(base, response_bytes=60, response_body_bytes=0, response_extra_bytes=60,
+                         response_structure_bytes=60, response_body_json_bytes=0,
+                         response_escape_bytes=0, conditional_unchanged=True)]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows))
+            since = dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc)
+            row = audit.summarize(ledger, [], since, 300)["ipc"][0]
+            self.assertEqual(row["response_body_bytes_samples"], 2)
+            self.assertEqual(row["response_extra_bytes"], 260)
+            self.assertEqual(row["extra_per_body_byte"], 2.6)
+            self.assertEqual(row["conditional_hits"], 1)
+            ledger.write_text(json.dumps(rows[-1]))
+            self.assertIsNone(audit.summarize(ledger, [], since, 300)["ipc"][0]["extra_per_body_byte"])
+
     def test_missing_audit_and_source_mentions_do_not_invent_model_calls(self):
         self.assertIsNone(audit.muxa_call("Bash", {"command": "rg muxa src/main.rs"}))
         self.assertIsNone(audit.muxa_call("unrelated_muxa_room_context", {}))

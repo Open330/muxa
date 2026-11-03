@@ -19,8 +19,13 @@
 //! can call `Store::apply` afterwards, so the daemon's final flush
 //! captures every state change the user actually triggered.
 
+mod mailbox_cache;
+mod response_cost;
+#[cfg(all(test, unix))]
+mod snapshot_tests;
 #[path = "worker_drain_control.rs"]
 mod worker_drain_control;
+
 use crate::ask::{
     AskConversation, AskCredential, AskEntry, AskProviderAdd, AskProviderEdit, AskProviderInfo,
     AskStore,
@@ -741,6 +746,13 @@ enum RequestBody {
         #[serde(default = "default_worker_idle_secs")]
         idle_threshold_secs: u64,
     },
+    CollaborationMailboxSnapshot {
+        origin: CollaborationOrigin,
+        #[serde(default)]
+        operator_only: bool,
+        #[serde(default)]
+        if_unchanged: Option<String>,
+    },
     CollaborationList {
         origin: CollaborationOrigin,
         #[serde(default)]
@@ -980,6 +992,7 @@ const CAPABILITIES: &[&str] = &[
     "needs_choice",
     "rate_limited",
     "collaboration_mailbox",
+    collaboration::MAILBOX_SNAPSHOT_CAPABILITY,
     collaboration::HUMAN_PRIORITY_CAPABILITY,
     collaboration::WORKER_SPAWN_CAPABILITY,
     collaboration::WORKER_DRAIN_CAPABILITY,
@@ -1088,6 +1101,8 @@ pub struct Response {
     pub collaboration_scope: Option<MailboxScope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_page: Option<collaboration::CollaborationPage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_mailbox_snapshot: Option<collaboration::MailboxSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_byte_budget: Option<usize>,
     /// Present only when the daemon can restart itself. It increments across
@@ -1251,6 +1266,7 @@ impl Response {
             version: None,
             collaboration_scope: None,
             collaboration_page: None,
+            collaboration_mailbox_snapshot: None,
             collaboration_byte_budget: None,
             generation: None,
             sessions: None,
@@ -3550,7 +3566,13 @@ fn collaboration_audit_entry(
                 .as_ref()
                 .map(|page| page.requests.len())
         })
-        .or_else(|| response.collaboration_request.as_ref().map(|_| 1));
+        .or_else(|| response.collaboration_request.as_ref().map(|_| 1))
+        .or_else(|| {
+            response
+                .collaboration_mailbox_snapshot
+                .as_ref()
+                .map(|s| s.incoming.len() + s.sent.len())
+        });
     let provenance = actor.provenance(&context.represented_origin);
     context.finish(
         provenance,
@@ -5614,6 +5636,60 @@ async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::CollaborationMailboxSnapshot {
+                    origin,
+                    operator_only,
+                    if_unchanged,
+                } => {
+                    kind = "collaboration_mailbox_snapshot";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let mut audit_context = CollaborationAuditContext::new(
+                        CollaborationAuditOperation::List,
+                        origin.clone(),
+                    );
+                    audit_context.mailbox = Some(RequestMailbox::All);
+                    audit_context.read_view = Some(collaboration::CollaborationReadView::Full);
+                    audit_context.query_limit = Some(crate::fleet::FLEET_MAILBOX_REQUEST_LIMIT);
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    let response = async {
+                        if !origin.console {
+                            return Err(collaboration::CollaborationError::ScopeDenied);
+                        }
+                        let console = topology.resolve_origin(&origin)?;
+                        let agent = if operator_only {
+                            None
+                        } else {
+                            Some(topology.resolve_origin(&CollaborationOrigin {
+                                console: false,
+                                ..origin.clone()
+                            })?)
+                        };
+                        let snapshot = collaboration
+                            .mailbox_snapshot(&console, agent.as_ref(), if_unchanged.as_deref())
+                            .await?;
+                        let mut response = Response::ok();
+                        response.collaboration_mailbox_snapshot = Some(snapshot);
+                        Ok::<_, collaboration::CollaborationError>(response)
+                    }
+                    .await;
+                    let response = match response {
+                        Ok(response) => response,
+                        Err(error) => Response::err(error.to_string()),
+                    };
+                    pending_audit = Some(collaboration_audit_entry(
+                        &collaboration_actor,
+                        audit_context,
+                        &response,
+                    ));
+                    response
+                }
                 RequestBody::CollaborationList {
                     mut origin,
                     mailbox,
@@ -5631,6 +5707,14 @@ async fn handle(
                         origin.clone(),
                     );
                     audit_context.mailbox = Some(mailbox);
+                    audit_context.read_view = Some(if query.is_none() {
+                        collaboration::CollaborationReadView::Full
+                    } else if metadata_only {
+                        collaboration::CollaborationReadView::Metadata
+                    } else {
+                        view
+                    });
+                    audit_context.query_limit = query.as_ref().and_then(|q| q.limit);
                     // Only the widened listings are worth a ledger line of
                     // their own — a caller-scoped list is the norm and says
                     // nothing about reach.
@@ -6264,6 +6348,21 @@ async fn handle(
         let bytes = encode_line(&resp, negotiated.unwrap_or(PROTOCOL_VERSION))?;
         if let Some(mut entry) = pending_audit {
             entry.response_bytes = Some(bytes.len());
+            if negotiated.unwrap_or(PROTOCOL_VERSION) == PROTOCOL_VERSION {
+                let body = response_cost::measure(&resp);
+                entry.response_body_bytes = Some(body.raw);
+                entry.response_body_json_bytes = Some(body.json);
+                entry.response_extra_bytes = Some(bytes.len().saturating_sub(body.raw));
+                entry.response_structure_bytes = Some(bytes.len().saturating_sub(body.json));
+                entry.response_escape_bytes = Some(body.json.saturating_sub(body.raw));
+            }
+            entry.conditional_unchanged = resp
+                .collaboration_mailbox_snapshot
+                .as_ref()
+                .map(|s| s.unchanged);
+            if entry.read_view.is_none() {
+                entry.read_view = Some(response_view);
+            }
             entry.elapsed_us =
                 Some(u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX));
             collaboration_audit.append(entry).await;
@@ -6422,6 +6521,7 @@ pub struct CollaborationQueryResult {
 pub struct Client {
     socket_path: PathBuf,
     collaboration_client_kind: CollaborationClientKind,
+    mailbox_cache: Option<Arc<tokio::sync::Mutex<mailbox_cache::MailboxCache>>>,
 }
 
 /// Identity and feature information returned by the daemon's `hello` method.
@@ -6753,6 +6853,7 @@ impl Client {
         Self {
             socket_path,
             collaboration_client_kind: CollaborationClientKind::Unknown,
+            mailbox_cache: None,
         }
     }
 
@@ -6772,6 +6873,20 @@ impl Client {
     pub fn with_collaboration_client_kind(mut self, kind: CollaborationClientKind) -> Self {
         self.collaboration_client_kind = kind;
         self
+    }
+
+    /// Only relay compatibility paths need to retain full display rows.
+    /// Ordinary daemon clients and token-aware controllers retain none here.
+    #[must_use]
+    pub fn with_mailbox_compat_cache(mut self) -> Self {
+        self.mailbox_cache = Some(Arc::default());
+        self
+    }
+
+    async fn forget_mailbox_cache(&self, key: &str) {
+        if let Some(cache) = &self.mailbox_cache {
+            cache.lock().await.remove(key);
+        }
     }
 
     pub async fn ingest(&self, event: &AgentEvent) -> Result<(), RuntimeError> {
@@ -8095,6 +8210,101 @@ impl Client {
         let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_overview","origin":origin})).await?;
         serde_json::from_value(response["collaboration_overview"].clone())
             .map_err(RuntimeError::Json)
+    }
+
+    /// Atomically read a Fleet display snapshot, or validate its prior token.
+    /// Legacy callers may opt into the bounded relay compatibility cache;
+    /// every reuse still requires a fresh authorized response from the daemon.
+    pub async fn collaboration_mailbox_snapshot(
+        &self,
+        origin: &CollaborationOrigin,
+        operator_only: bool,
+        if_unchanged: Option<&str>,
+    ) -> Result<collaboration::MailboxSnapshot, RuntimeError> {
+        let key = serde_json::to_string(&(origin, operator_only)).map_err(RuntimeError::Json)?;
+        let cached = if if_unchanged.is_none() {
+            if let Some(cache) = &self.mailbox_cache {
+                cache.lock().await.get(&key)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let token = if_unchanged.or_else(|| cached.as_ref().and_then(|s| s.token.as_deref()));
+        let result = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_mailbox_snapshot","origin":origin,"operator_only":operator_only,"if_unchanged":token})).await;
+        match result {
+            Ok(mut response) => {
+                let value = response
+                    .get_mut("collaboration_mailbox_snapshot")
+                    .map_or(serde_json::Value::Null, serde_json::Value::take);
+                let snapshot: collaboration::MailboxSnapshot = match serde_json::from_value(value) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        self.forget_mailbox_cache(&key).await;
+                        return Err(RuntimeError::Json(error));
+                    }
+                };
+                if snapshot.unchanged {
+                    if token.is_none()
+                        || snapshot.token.as_deref() != token
+                        || !snapshot.incoming.is_empty()
+                        || !snapshot.sent.is_empty()
+                    {
+                        self.forget_mailbox_cache(&key).await;
+                        return Err(RuntimeError::Daemon(
+                            "invalid conditional mailbox response".into(),
+                        ));
+                    }
+                    if if_unchanged.is_none() {
+                        return cached.ok_or_else(|| {
+                            RuntimeError::Daemon(
+                                "conditional mailbox cache was not available".into(),
+                            )
+                        });
+                    }
+                    return Ok(snapshot);
+                }
+                if let Some(cache) = &self.mailbox_cache {
+                    cache.lock().await.put(key, &snapshot);
+                }
+                Ok(snapshot)
+            }
+            Err(RuntimeError::Daemon(error))
+                if error.contains("unknown variant")
+                    && error.contains("collaboration_mailbox_snapshot") =>
+            {
+                self.forget_mailbox_cache(&key).await;
+                // Unsupported reads may fall back; origin/data failures never do.
+                let agent = CollaborationOrigin {
+                    console: false,
+                    ..origin.clone()
+                };
+                let (mut incoming, sent, human) = tokio::try_join!(
+                    async {
+                        if operator_only {
+                            Ok(Vec::new())
+                        } else {
+                            self.collaboration_recent_mailbox(&agent, RequestMailbox::Incoming)
+                                .await
+                        }
+                    },
+                    self.collaboration_recent_mailbox(origin, RequestMailbox::Sent),
+                    self.collaboration_recent_mailbox(origin, RequestMailbox::Incoming)
+                )?;
+                incoming.extend(human);
+                Ok(collaboration::MailboxSnapshot {
+                    token: None,
+                    unchanged: false,
+                    incoming,
+                    sent,
+                })
+            }
+            Err(error) => {
+                self.forget_mailbox_cache(&key).await;
+                Err(error)
+            }
+        }
     }
 
     /// One participant's mailbox — the caller's own.
@@ -9805,6 +10015,117 @@ mod tests {
             8,
             "a capped Fleet response must not claim requests it cannot return"
         );
+        shutdown.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // one real IPC lifecycle with byte accounting and cache invalidation
+    async fn conditional_mailbox_reuses_legacy_display_rows_but_never_resends_bodies_or_skips_scope(
+    ) {
+        let dir = tempdir().unwrap();
+        let socket = dir.path().join("conditional-mailbox.sock");
+        let store = Store::shared();
+        add_collaboration_agent(&store, "%1", "caller", AgentKind::Codex).await;
+        add_collaboration_agent(&store, "%2", "peer", AgentKind::ClaudeCode).await;
+        let backend: SharedBackend = CountingPaneBackend::new(
+            HostKind::Tmux,
+            vec![
+                collaboration_test_pane("%1", "0"),
+                collaboration_test_pane("%2", "1"),
+            ],
+        );
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        let audit = CollaborationAuditLog::in_memory();
+        let server = Server::new(socket.clone(), store)
+            .with_backends(vec![backend])
+            .with_collaboration(mailbox.clone())
+            .with_collaboration_audit(audit.clone());
+        let (shutdown, rx) = broadcast::channel(1);
+        let serving = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&socket).await;
+        let client = Client::new(socket).with_mailbox_compat_cache();
+        let origin = CollaborationOrigin {
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+            exact_session: false,
+        };
+        let context = client.collaboration_context(&origin).await.unwrap();
+        let body = "한글\n\"".repeat(1000);
+        let request = mailbox
+            .create(
+                context.current.clone(),
+                context.peers[0].clone(),
+                collaboration::NewRequest {
+                    body: body.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let first = client
+            .collaboration_mailbox_snapshot(&origin, true, None)
+            .await
+            .unwrap();
+        assert_eq!(first.sent[0].body, body);
+        let cached = client
+            .collaboration_mailbox_snapshot(&origin, true, None)
+            .await
+            .unwrap();
+        assert!(
+            !cached.unchanged,
+            "legacy callers still receive their existing full display contract"
+        );
+        assert_eq!(cached.sent, first.sent);
+        let hit = client
+            .collaboration_mailbox_snapshot(&origin, true, first.token.as_deref())
+            .await
+            .unwrap();
+        assert!(hit.unchanged && hit.sent.is_empty());
+        let agent = CollaborationOrigin {
+            console: false,
+            ..origin.clone()
+        };
+        assert!(client
+            .collaboration_mailbox_snapshot(&agent, true, first.token.as_deref())
+            .await
+            .is_err());
+        mailbox
+            .update_request(&context.current, &request.id, "changed guidance".into())
+            .await
+            .unwrap();
+        let fresh = client
+            .collaboration_mailbox_snapshot(&origin, true, first.token.as_deref())
+            .await
+            .unwrap();
+        assert!(!fresh.unchanged);
+        assert_eq!(fresh.sent[0].updates[0].body, "changed guidance");
+        let entries = audit.entries().await;
+        let reads: Vec<_> = entries
+            .iter()
+            .filter(|e| e.operation == CollaborationAuditOperation::List && e.ok)
+            .collect();
+        assert_eq!(reads.len(), 4);
+        assert_eq!(reads[0].response_body_bytes, Some(body.len()));
+        let encoded = serde_json::to_vec(&body).unwrap().len() - 2;
+        assert_eq!(reads[0].response_body_json_bytes, Some(encoded));
+        assert_eq!(
+            reads[0].response_extra_bytes,
+            Some(reads[0].response_bytes.unwrap() - body.len())
+        );
+        assert_eq!(reads[1].conditional_unchanged, Some(true));
+        assert_eq!(reads[1].response_body_bytes, Some(0));
+        assert!(reads[1].response_bytes.unwrap() < 300);
+        assert!(reads[0].response_bytes.unwrap() > reads[1].response_bytes.unwrap() * 20);
+        assert_eq!(
+            reads[3].response_body_bytes,
+            Some(body.len() + "changed guidance".len())
+        );
+        assert!(!serde_json::to_string(&entries)
+            .unwrap()
+            .contains("changed guidance"));
         shutdown.send(()).unwrap();
         serving.await.unwrap();
     }
