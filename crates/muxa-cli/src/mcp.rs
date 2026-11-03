@@ -5386,7 +5386,9 @@ fn swap_reply(
     output: &muxa::work_control::WorkCommandOutput,
 ) -> Value {
     let call = plan.call(host);
-    let payload = serde_json::from_str::<Value>(&output.stdout).ok();
+    // The payload as the action's own type: anything else (null, another
+    // shape, an acknowledgement without its fields) is no result at all.
+    let payload = typed_payload(plan, &output.stdout);
     let mut fields = call.fields();
     fields.insert("exit_code".into(), json!(output.exit_code));
     if !output.stderr.trim().is_empty() {
@@ -5405,7 +5407,7 @@ fn swap_reply(
             .as_ref()
             .and_then(|p| p.get("request_key"))
             .and_then(Value::as_str)
-            != plan.request_key.as_deref();
+            .is_some_and(|key| Some(key) != plan.request_key.as_deref());
     let failed_rows = payload
         .as_ref()
         .and_then(Value::as_array)
@@ -5419,6 +5421,11 @@ fn swap_reply(
         fields.insert(field.into(), payload);
     }
     let ok = payload.is_some() && output.exit_code == 0 && !failed_rows && !mismatch;
+    if !ok && !output.stdout.trim().is_empty() {
+        // What the host printed may explain what happened.
+        let raw: String = output.stdout.trim().chars().take(4000).collect();
+        fields.insert("stdout".into(), json!(raw));
+    }
     if !ok {
         if plan.request_key.is_some() {
             fields.insert("recovery".into(), recovery(&call));
@@ -5440,6 +5447,29 @@ fn swap_reply(
         fields.remove("request_key");
     }
     json_result(&Value::Object(fields))
+}
+
+/// `stdout` read as the action's result type, back to JSON; `None` if it is
+/// not one.
+fn typed_payload(plan: &SwapPlan, stdout: &str) -> Option<Value> {
+    match plan.action {
+        SwapAction::Status | SwapAction::Cancel => {
+            serde_json::from_str::<muxa::swap_service::JobView>(stdout)
+                .ok()
+                .and_then(|view| serde_json::to_value(view).ok())
+        }
+        _ if plan.detach => serde_json::from_str::<crate::swap::DetachedAck>(stdout)
+            .ok()
+            .filter(|ack| {
+                [&ack.request_key, &ack.job_id, &ack.state]
+                    .iter()
+                    .all(|field| !field.trim().is_empty())
+            })
+            .and_then(|ack| serde_json::to_value(ack).ok()),
+        _ => serde_json::from_str::<Vec<muxa::account_swap::SwapOutcome>>(stdout)
+            .ok()
+            .and_then(|outcomes| serde_json::to_value(outcomes).ok()),
+    }
 }
 
 /// How to find a job that may exist: never by sending it again.
@@ -5610,10 +5640,63 @@ mod tests {
             .contains("another request key"));
     }
 
+    /// Output that is not the action's own result type is no result, and
+    /// what the host printed is kept with the way to find the job.
+    #[test]
+    fn a_swap_reply_of_the_wrong_shape_is_no_result() {
+        let swap = swap_plan(
+            &json!({"targets": ["%5"], "request_key": "k-3"}),
+            None,
+            None,
+        )
+        .unwrap();
+        let status = swap_plan(&json!({"action": "status", "job": "k"}), None, None).unwrap();
+        let detach = swap_plan(&json!({"detach": true, "request_key": "k-4"}), None, None).unwrap();
+        let cases = [
+            (&swap, "null"),
+            (&swap, "{}"),
+            (&status, "null"),
+            (&status, "[]"),
+            (&status, r#"{"job_id":"swap-1"}"#),
+            (&detach, "{}"),
+            (&detach, r#"{"request_key":"k-4","job_id":"swap-9"}"#),
+            (
+                &detach,
+                r#"{"request_key":"k-4","job_id":"","state":"running"}"#,
+            ),
+        ];
+        for (plan, stdout) in cases {
+            let (error, fields) = reply_fields(&swap_reply(plan, None, &output(0, stdout, "")));
+            assert!(error, "{stdout} was taken as a result");
+            assert_eq!(fields["stdout"], stdout);
+            assert!(fields["error"]
+                .as_str()
+                .unwrap()
+                .contains("not proof nothing started"));
+            if plan.request_key.is_some() {
+                assert_eq!(fields["recovery"]["arguments"]["action"], "status");
+            }
+        }
+        // A failure's raw output is bounded.
+        let long = "x".repeat(10_000);
+        let (_, fields) = reply_fields(&swap_reply(&swap, None, &output(1, &long, "")));
+        assert_eq!(fields["stdout"].as_str().unwrap().len(), 4000);
+    }
+
     /// A daemon whose one job planned pane `%9`.
     struct OneJob;
 
     impl muxa::swap_service::SwapJobs for OneJob {
+        fn health(&self) -> muxa::swap_service::SwapHealth {
+            muxa::swap_service::SwapHealth {
+                readiness: muxa::swap_service::SwapReadiness::Ready,
+                reason: None,
+                schema: Some(2),
+                expected_schema: 2,
+                fault: None,
+                jobs_running: 0,
+            }
+        }
         fn active(&self) -> Result<(), String> {
             Ok(())
         }

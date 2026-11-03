@@ -666,10 +666,10 @@ pub(crate) fn plain_request_key(key: &str) -> bool {
 
 /// What `--detach` prints once the daemon accepted the job.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct DetachedAck {
-    request_key: String,
-    job_id: String,
-    state: String,
+pub(crate) struct DetachedAck {
+    pub(crate) request_key: String,
+    pub(crate) job_id: String,
+    pub(crate) state: String,
 }
 
 /// Start, and return as soon as the job is known accepted.
@@ -732,21 +732,19 @@ async fn run_cancel(client: &Client, text: &str, json: bool, wait: Option<u64>) 
             asked.job_id
         );
     }
-    let job_id = asked.job_id.clone();
-    let view = if wait == Some(0) {
-        asked
-    } else {
-        let deadline = Deadline::new(wait);
-        let cancel = deadline.or_ctrl_c();
-        tokio::pin!(cancel);
-        match follow_from(client, asked, cancel, POLL).await {
-            JobEnd::Ended(view) => view,
-            JobEnd::Interrupted if deadline.passed() => client
-                .swap_job_status(&JobRef::Id(job_id))
-                .await
-                .map_err(|error| anyhow!("{error}"))?,
-            JobEnd::Interrupted => bail!("stopped waiting; the cancel stands"),
-            JobEnd::Unknown(error) | JobEnd::Refused(error) => bail!("{error}"),
+    let view = match wait {
+        Some(0) => asked,
+        Some(wait) => follow_bounded(client, asked, Duration::from_secs(wait), ctrl_c(), POLL)
+            .await
+            .map_err(|()| anyhow!("stopped waiting; the cancel stands"))?,
+        None => {
+            let cancel = ctrl_c();
+            tokio::pin!(cancel);
+            match follow_from(client, asked, cancel, POLL).await {
+                JobEnd::Ended(view) => view,
+                JobEnd::Interrupted => bail!("stopped waiting; the cancel stands"),
+                JobEnd::Unknown(error) | JobEnd::Refused(error) => bail!("{error}"),
+            }
         }
     };
     print_job(&view, json)?;
@@ -1131,20 +1129,26 @@ async fn watch_job(
 /// `--status`: follow the job to its end (or for at most `wait` seconds)
 /// and report it.
 async fn show_status(client: &Client, text: &str, json: bool, wait: Option<u64>) -> Result<()> {
-    let view = if wait == Some(0) {
-        read_job(client, text).await?
-    } else {
-        let deadline = Deadline::new(wait);
-        match watch_job(client, text, deadline.or_ctrl_c(), POLL).await {
-            Watch::Settled(view) => view,
-            Watch::Interrupted(Some(job)) if deadline.passed() => client
-                .swap_job_status(&JobRef::Id(job))
+    let view = match wait {
+        Some(0) => read_job(client, text).await?,
+        Some(wait) => {
+            // One budget for every read, the first one included.
+            let started = tokio::time::Instant::now();
+            let budget = Duration::from_secs(wait);
+            let first = tokio::time::timeout(budget, read_job(client, text))
                 .await
-                .map_err(|error| anyhow!("{error}"))?,
+                .map_err(|_| anyhow!("swap job {text}: no answer within {wait}s"))??;
+            let left = budget.saturating_sub(started.elapsed());
+            follow_bounded(client, first, left, ctrl_c(), POLL)
+                .await
+                .map_err(|()| anyhow!("stopped waiting"))?
+        }
+        None => match watch_job(client, text, ctrl_c(), POLL).await {
+            Watch::Settled(view) => view,
             Watch::Interrupted(Some(job)) => bail!("stopped waiting; swap job {job} runs on"),
             Watch::Interrupted(None) => bail!("stopped waiting"),
             Watch::Failed(error) => bail!("{error}"),
-        }
+        },
     };
     print_job(&view, json)?;
     service_notice(&view);
@@ -1178,41 +1182,39 @@ fn print_job(view: &JobView, json: bool) -> Result<()> {
     Ok(())
 }
 
-/// A wait that ends at Ctrl-C, or once `wait` seconds have passed.
-struct Deadline {
-    wait: Option<Duration>,
-    passed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+async fn ctrl_c() {
+    let _ = tokio::signal::ctrl_c().await;
 }
 
-impl Deadline {
-    fn new(wait: Option<u64>) -> Self {
-        Self {
-            wait: wait.map(Duration::from_secs),
-            passed: std::sync::Arc::default(),
+/// Follow `view` for at most `budget`, every read inside it, and return the
+/// last view seen once it runs out: a slow store never stretches the wait,
+/// nor costs the view already in hand. `Err` only for `cancel` (Ctrl-C).
+async fn follow_bounded(
+    daemon: &impl SwapDaemon,
+    mut view: JobView,
+    budget: Duration,
+    cancel: impl Future<Output = ()>,
+    poll: Duration,
+) -> std::result::Result<JobView, ()> {
+    tokio::pin!(cancel);
+    let deadline = tokio::time::Instant::now() + budget;
+    let job = JobRef::Id(view.job_id.clone());
+    while !settled(&view) {
+        let read = async {
+            tokio::time::sleep(poll).await;
+            daemon.status(&job).await
+        };
+        tokio::select! {
+            biased;
+            () = &mut cancel => return Err(()),
+            read = tokio::time::timeout_at(deadline, read) => match read {
+                Ok(Ok(next)) => view = next,
+                // Out of time, or a read that failed: the last view stands.
+                Ok(Err(_)) | Err(_) => return Ok(view),
+            },
         }
     }
-
-    fn or_ctrl_c(&self) -> impl Future<Output = ()> + use<> {
-        let wait = self.wait;
-        let passed = std::sync::Arc::clone(&self.passed);
-        async move {
-            match wait {
-                Some(wait) => tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {}
-                    () = tokio::time::sleep(wait) => {
-                        passed.store(true, std::sync::atomic::Ordering::SeqCst);
-                    }
-                },
-                None => {
-                    let _ = tokio::signal::ctrl_c().await;
-                }
-            }
-        }
-    }
-
-    fn passed(&self) -> bool {
-        self.passed.load(std::sync::atomic::Ordering::SeqCst)
-    }
+    Ok(view)
 }
 
 /// The same swap as a `muxa swap … --json` argv for a Fleet host, every
@@ -1473,6 +1475,12 @@ fn remote_job(
     }
     // The host's own command reports its service's health on stderr, which
     // is forwarded above: said once, by the host.
+    // A bounded read of a job still at work, answered cleanly by the host,
+    // is a status, as it is there.
+    if args.wait_secs.is_some() && !settled(&view) && output.exit_code == 0 {
+        eprintln!("{host}: job {} is still {}", view.job_id, view.state);
+        return Ok(());
+    }
     job_verdict(&view, &format!("on {host}"), args.cancel.is_some())?;
     if output.exit_code != 0 {
         bail!("{host}: {}", output.stderr.trim());
@@ -2384,6 +2392,61 @@ mod tests {
             .await
             .expect("Ctrl-C must end a held read");
         assert!(matches!(ended, Watch::Interrupted(None)));
+    }
+
+    /// A read that never answers costs the wait its budget, not more, and
+    /// the view already in hand is what it returns.
+    #[tokio::test]
+    async fn a_bounded_follow_returns_the_last_view_when_a_read_hangs() {
+        struct Held;
+        impl SwapDaemon for Held {
+            fn status(
+                &self,
+                _: &JobRef,
+            ) -> impl Future<Output = Result<JobView, RuntimeError>> + Send {
+                std::future::pending()
+            }
+        }
+        let started = std::time::Instant::now();
+        let ended = tokio::time::timeout(
+            Duration::from_secs(5),
+            follow_bounded(
+                &Held,
+                view("running", None),
+                Duration::from_millis(50),
+                std::future::pending(),
+                Duration::from_millis(1),
+            ),
+        )
+        .await
+        .expect("the budget must bound a hung read");
+        assert_eq!(ended.unwrap().state, "running");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A host's bounded status or cancel of a job still at work, answered
+    /// cleanly, is a status; unbounded, or answered with a failure, it is not.
+    #[tokio::test]
+    async fn a_remote_bounded_read_of_a_running_job_succeeds() {
+        let running = serde_json::to_string(&view("running", None)).unwrap();
+        for action in ["--status", "--cancel"] {
+            let answer = running.clone();
+            let fake = relay(move |_| Ok(output(0, &answer, "")));
+            let cli = Cli::parse_from(["swap", action, "k", "--host", "rtzr", "--wait-secs", "1"]);
+            run_remote(&fake, &cli.args, "rtzr").await.unwrap();
+            assert!(
+                fake.calls.borrow()[0].contains(&"--wait-secs=1".to_owned()),
+                "{:?}",
+                fake.calls.borrow()
+            );
+            let answer = running.clone();
+            let fake = relay(move |_| Ok(output(1, &answer, "")));
+            let cli = Cli::parse_from(["swap", action, "k", "--host", "rtzr", "--wait-secs", "1"]);
+            assert!(run_remote(&fake, &cli.args, "rtzr").await.is_err());
+        }
+        let fake = relay(move |_| Ok(output(0, &running, "")));
+        let cli = Cli::parse_from(["swap", "--status", "k", "--host", "rtzr"]);
+        assert!(run_remote(&fake, &cli.args, "rtzr").await.is_err());
     }
 
     /// An id that is not found is read as a key; any other error is final.
