@@ -1209,8 +1209,17 @@ async fn follow_bounded(
             () = &mut cancel => return Err(()),
             read = tokio::time::timeout_at(deadline, read) => match read {
                 Ok(Ok(next)) => view = next,
-                // Out of time, or a read that failed: the last view stands.
-                Ok(Err(_)) | Err(_) => return Ok(view),
+                // A read that failed: the last view stands, said to be one.
+                Ok(Err(error)) => {
+                    eprintln!(
+                        "muxa swap: could not read job {} again ({error}); showing it as last \
+                         seen, {}",
+                        view.job_id, view.state
+                    );
+                    return Ok(view);
+                }
+                // Out of time: the last view is the answer.
+                Err(_) => return Ok(view),
             },
         }
     }
