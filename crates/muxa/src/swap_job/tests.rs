@@ -1229,3 +1229,38 @@ fn verify_pruning_on_a_journal_copy() {
     }
     eprintln!("pruned {pruned} of {} jobs", jobs.len());
 }
+
+/// A pruned job's follow-up is expired: never rebuilt from the effects
+/// that pruning kept.
+#[test]
+fn a_pruned_follow_up_is_not_rebuilt_from_kept_effects() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("a", 1), &alive).unwrap();
+    let job = running(&store, &lease, "k", 1);
+    let typed = Effect {
+        group: 7,
+        purpose: Purpose::FollowUp,
+        op: Op::Text { chars: 8 },
+    };
+    let submit = Effect {
+        group: 7,
+        purpose: Purpose::FollowUp,
+        op: Op::Key(Key::Enter),
+    };
+    let mut journal = store.journal(&lease, &job, 0, 1);
+    journal.before(&typed).unwrap();
+    journal.after(&typed, Transport::Unconfirmed).unwrap();
+    journal.before(&submit).unwrap();
+    journal.after(&submit, Transport::Refused).unwrap();
+    store
+        .finish_target(&lease, &job, 0, 1, Disposition::Swapped)
+        .unwrap();
+    store.finish(&lease, &job).unwrap();
+    assert!(store.status(&job).unwrap().targets[0].follow_up.is_some());
+    age(&store, &job, OLD);
+    assert_eq!(store.prune_evidence(&lease, CUTOFF, 32).unwrap(), 1);
+    let status = store.status(&job).unwrap();
+    assert!(status.evidence_pruned_at.is_some());
+    assert!(status.targets[0].follow_up.is_none());
+}

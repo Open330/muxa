@@ -1397,7 +1397,9 @@ impl SwapJobStore {
                 })?
                 .collect::<Result<Vec<TargetStatus>, _>>()?;
             let mut targets = targets;
-            for target in &mut targets {
+            // A pruned job's follow-up is expired, never pieced together
+            // from the effects that were kept.
+            for target in targets.iter_mut().filter(|_| evidence_pruned_at.is_none()) {
                 if target.follow_up.is_none() {
                     target.follow_up =
                         follow_up_from_effects(connection, job, target.target_id, target.attempt)?;
