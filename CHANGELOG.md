@@ -13,6 +13,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   halted by a fault, or unavailable with the reason it did not open (store
   owned by another manager, an incompatible store schema, no node identity),
   read through a new read-only, bounded `swap_health` request.
+- The `muxa_swap_account` MCP tool can `retry`, read (`status`) and `cancel` a
+  swap job and `detach` from one. A start or retry runs under a request key
+  (the caller's own or one minted before anything is sent) that every result
+  carries, errors included, with the call to read the job again; nothing is
+  sent twice. `muxa swap --status`/`--cancel` take `--wait-secs` (0-120) to
+  return the job as it is rather than wait for its end.
 
 ### Fixed
 
