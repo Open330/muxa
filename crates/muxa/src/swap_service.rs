@@ -746,6 +746,96 @@ impl SwapService {
 /// The automation's check that its swap is still wanted: `Err` says why not.
 pub type StillDue = Box<dyn Fn() -> Result<(), String> + Send>;
 
+/// Whether the swap service takes jobs now, and if not why: read-only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SwapHealth {
+    pub readiness: SwapReadiness,
+    /// Why it is not `ready`.
+    pub reason: Option<String>,
+    /// The job store's schema, once one was opened; `None` if it never was.
+    pub schema: Option<i64>,
+    /// The schema this build writes and reads.
+    pub expected_schema: i64,
+    /// The fault that halted it, if one did (apart from other reasons).
+    pub fault: Option<String>,
+    /// Jobs this manager is running now (not rows an earlier manager left).
+    pub jobs_running: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
+#[serde(rename_all = "snake_case")]
+#[strum(serialize_all = "snake_case")]
+pub enum SwapReadiness {
+    Ready,
+    /// Shutting down: no new job.
+    Draining,
+    /// A fault stopped it; it takes nothing until the daemon restarts.
+    Halted,
+    /// It never opened, or its store is no longer its own.
+    Unavailable,
+}
+
+/// The swap service a daemon could not open, kept for its reason: every
+/// request is refused with it, and health reports it.
+pub struct UnopenedSwap {
+    reason: String,
+}
+
+impl UnopenedSwap {
+    #[must_use]
+    pub fn new(reason: String) -> Self {
+        Self { reason }
+    }
+
+    fn refused<T>(&self) -> Result<T, String> {
+        Err(format!(
+            "swap jobs are unavailable on this daemon: {}",
+            self.reason
+        ))
+    }
+}
+
+impl SwapJobs for UnopenedSwap {
+    fn active(&self) -> Result<(), String> {
+        self.refused()
+    }
+
+    fn plan(&self, _: &SwapOverrides) -> Result<PlanView, String> {
+        self.refused()
+    }
+
+    fn submit(&self, _: &str, _: &SwapOverrides) -> Result<Accepted, String> {
+        self.refused()
+    }
+
+    fn retry(&self, _: &str, _: &JobRef, _: &RetryOverrides) -> Result<Accepted, String> {
+        self.refused()
+    }
+
+    fn cancel(&self, _: &JobRef) -> Result<JobView, String> {
+        self.refused()
+    }
+
+    fn status(&self, _: &JobRef) -> Result<JobView, String> {
+        self.refused()
+    }
+
+    fn health(&self) -> SwapHealth {
+        SwapHealth {
+            readiness: SwapReadiness::Unavailable,
+            reason: Some(self.reason.clone()),
+            schema: None,
+            expected_schema: crate::swap_job::SCHEMA_VERSION,
+            fault: None,
+            jobs_running: 0,
+        }
+    }
+
+    fn exists(&self) -> bool {
+        false
+    }
+}
+
 /// What an IPC caller may do with swap jobs. Every request through it is a
 /// public one: it can never claim the daemon's own automation privileges.
 pub trait SwapJobs: Send + Sync {
@@ -761,6 +851,13 @@ pub trait SwapJobs: Send + Sync {
     /// Ask a job to start no further target; accepted whatever the
     /// service's health.
     fn cancel(&self, job: &JobRef) -> Result<JobView, String>;
+    /// How the service is, read-only: never plans, never touches a pane.
+    fn health(&self) -> SwapHealth;
+    /// A service that opened (it can have jobs), as opposed to the reason
+    /// one did not.
+    fn exists(&self) -> bool {
+        true
+    }
     /// Readable whatever state the service is in, so a halted or recovered
     /// job can always be inspected.
     fn status(&self, job: &JobRef) -> Result<JobView, String>;
@@ -790,6 +887,10 @@ impl SwapJobs for SwapService {
 
     fn cancel(&self, job: &JobRef) -> Result<JobView, String> {
         self.inner.cancel(job)
+    }
+
+    fn health(&self) -> SwapHealth {
+        self.inner.health()
     }
 
     fn status(&self, job: &JobRef) -> Result<JobView, String> {
@@ -987,6 +1088,28 @@ impl<E: Engine> Service<E> {
         self.store
             .check(&self.lease)
             .map_err(|error| format!("swap jobs are unavailable: {error}"))
+    }
+
+    /// How the service is now, read-only.
+    pub(crate) fn health(&self) -> SwapHealth {
+        let fault = self.fault();
+        let (readiness, reason) = if self.draining.load(Ordering::SeqCst) {
+            (SwapReadiness::Draining, Some("shutting down".to_owned()))
+        } else if let Some(fault) = &fault {
+            (SwapReadiness::Halted, Some(fault.clone()))
+        } else if let Err(error) = self.store.check(&self.lease) {
+            (SwapReadiness::Unavailable, Some(error.to_string()))
+        } else {
+            (SwapReadiness::Ready, None)
+        };
+        SwapHealth {
+            readiness,
+            reason,
+            schema: Some(crate::swap_job::SCHEMA_VERSION),
+            expected_schema: crate::swap_job::SCHEMA_VERSION,
+            fault,
+            jobs_running: self.done.lock().map_or(0, |done| done.len()),
+        }
     }
 
     pub(crate) async fn wait(

@@ -38,7 +38,7 @@ use std::sync::Mutex;
 
 /// The schema this build writes and reads. Any other version is refused
 /// without being touched.
-const SCHEMA_VERSION: i64 = 2;
+pub(crate) const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE owner (

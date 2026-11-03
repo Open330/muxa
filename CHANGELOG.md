@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `muxa doctor` reports the daemon's swap service: taking jobs, shutting down,
+  halted by a fault, or unavailable with the reason it did not open (store
+  owned by another manager, an incompatible store schema, no node identity),
+  read through a new read-only, bounded `swap_health` request.
+
 ### Fixed
 
 - A swap answers a relaunched agent's startup dialog only when the screen ends

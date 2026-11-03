@@ -1659,6 +1659,41 @@ fn a_stale_automation_swap_steps_back_before_its_target_starts() {
     assert_eq!(asked.load(Ordering::SeqCst), 2);
 }
 
+// --- health -------------------------------------------------------------------
+
+/// Health reads the service's state and nothing else.
+#[test]
+fn health_reports_ready_draining_and_halted() {
+    let h = harness(Box::new(Vec::new));
+    let health = h.service.health();
+    assert_eq!(health.readiness, SwapReadiness::Ready);
+    assert_eq!(health.schema, Some(health.expected_schema));
+    assert_eq!(health.jobs_running, 0);
+    h.service.set_fault("journal".into());
+    let halted = h.service.health();
+    assert_eq!(halted.readiness, SwapReadiness::Halted);
+    assert_eq!(halted.fault.as_deref(), Some("journal"));
+    h.service.draining.store(true, Ordering::SeqCst);
+    assert_eq!(h.service.health().readiness, SwapReadiness::Draining);
+    assert_eq!(h.dry_runs.load(Ordering::SeqCst), 0);
+}
+
+/// A service that never opened keeps its reason: refused with it, and
+/// reported by health, with no store schema to claim.
+#[test]
+fn an_unopened_service_reports_why() {
+    let unopened = UnopenedSwap::new("swap jobs are owned by another live manager".into());
+    assert!(!unopened.exists());
+    let health = unopened.health();
+    assert_eq!(health.readiness, SwapReadiness::Unavailable);
+    assert_eq!(health.schema, None);
+    assert!(health.reason.unwrap().contains("another live manager"));
+    assert!(unopened
+        .status(&JobRef::Key("k".into()))
+        .unwrap_err()
+        .contains("another live manager"));
+}
+
 // --- fault scoping -----------------------------------------------------------
 
 /// A fault after a job ended changes nothing about it: its view carries no
