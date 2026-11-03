@@ -629,7 +629,7 @@ async fn run_retry(
     };
     let outcomes = job_outcomes(&view);
     report(&outcomes, args.json)?;
-    service_notice(&view, None);
+    service_notice(&view);
     job_verdict(&view, &key, false)
 }
 
@@ -733,7 +733,7 @@ async fn run_cancel(client: &Client, text: &str, json: bool) -> Result<()> {
         println!("job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
     }
-    service_notice(&view, None);
+    service_notice(&view);
     job_verdict(&view, text, true)
 }
 
@@ -820,7 +820,7 @@ async fn run_routed(
     };
     let outcomes = merge(daemon_half, &direct, local);
     report(&outcomes, args.json)?;
-    service_notice(&view, None);
+    service_notice(&view);
     job_verdict(&view, &key, false)?;
     if outcomes.iter().any(|o| o.status == SwapStatus::Failed) {
         bail!("some agents could not be swapped");
@@ -983,14 +983,13 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
 /// The daemon's swap service health, once per command and apart from the
 /// job's own result: a fault that came after a job ended does not change
 /// what that job did.
-fn service_notice(view: &JobView, host: Option<&str>) {
+fn service_notice(view: &JobView) {
     if let Some(fault) = view
         .service_fault
         .as_deref()
         .filter(|_| view.fault.is_none())
     {
-        let at = host.map_or_else(String::new, |host| format!(" on {host}"));
-        eprintln!("muxa swap: the daemon's swap service{at} is halted: {fault}");
+        eprintln!("muxa swap: the daemon's swap service is halted: {fault}");
     }
 }
 
@@ -1124,7 +1123,7 @@ async fn show_status(client: &Client, text: &str, json: bool) -> Result<()> {
         println!("job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
     }
-    service_notice(&view, None);
+    service_notice(&view);
     job_verdict(&view, text, false)
 }
 
@@ -1369,7 +1368,8 @@ fn remote_job(
         println!("{host}: job {}  {}", view.job_id, view.state);
         print!("{}", render(&job_outcomes(&view)));
     }
-    service_notice(&view, Some(host));
+    // The host's own command reports its service's health on stderr, which
+    // is forwarded above: said once, by the host.
     job_verdict(&view, &format!("on {host}"), args.cancel.is_some())?;
     if output.exit_code != 0 {
         bail!("{host}: {}", output.stderr.trim());
