@@ -11,6 +11,16 @@
         }
       }
     },
+    " on %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : " (%@)"
+          }
+        }
+      }
+    },
     "#%@ · %lld panes" : {
       "localizations" : {
         "en" : {
@@ -76,6 +86,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ CLI를 PATH와 일반적인 설치 폴더에서 찾지 못했습니다."
+          }
+        }
+      }
+    },
+    "%@ hit its usage limit" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@이(가) 사용 한도에 도달했습니다"
           }
         }
       }
@@ -359,6 +379,22 @@
         }
       }
     },
+    "%@ · %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$@ · %2$@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ · %2$@"
+          }
+        }
+      }
+    },
     "%@ · %lld comments" : {
       "localizations" : {
         "en" : {
@@ -471,6 +507,26 @@
         }
       }
     },
+    "%@ → best account" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ → 최적 계정"
+          }
+        }
+      }
+    },
+    "%@ → spread" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ → 분산"
+          }
+        }
+      }
+    },
     "%@'s config could not be read" : {
       "localizations" : {
         "ko" : {
@@ -511,6 +567,16 @@
         }
       }
     },
+    "%lld limited agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "제한된 에이전트 %lld개"
+          }
+        }
+      }
+    },
     "%lld more in Explore › Needs attention" : {
       "localizations" : {
         "ko" : {
@@ -527,6 +593,32 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "새 항목 %lld"
+          }
+        }
+      }
+    },
+    "%lld switched" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 전환됨"
+          }
+        }
+      }
+    },
+    "%lld switched, %lld failed" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "%1$lld switched, %2$lld failed"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld개 전환됨, %2$lld개 실패"
           }
         }
       }
@@ -1600,6 +1692,26 @@
         }
       }
     },
+    "%lld%%" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld%%"
+          }
+        }
+      }
+    },
+    "%lld%% left" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld%% 남음"
+          }
+        }
+      }
+    },
     "%lld-token context" : {
       "localizations" : {
         "ko" : {
@@ -1864,6 +1976,16 @@
         }
       }
     },
+    "A decision does not automatically restart or reassign work." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정을 내려도 작업이 자동으로 다시 시작되거나 재배정되지 않습니다."
+          }
+        }
+      }
+    },
     "A detached tmux session named after the folder." : {
       "localizations" : {
         "ko" : {
@@ -1890,16 +2012,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이벤트 후 고정 지연"
-          }
-        }
-      }
-    },
-    "A fresh install ships none, so nothing fires until you add one. Add the session-limit rule to resume a capped agent when its window reopens." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "새로 설치하면 규칙이 하나도 없어서 아무것도 실행되지 않습니다. 세션 한도 규칙을 추가하면 한도에 걸린 에이전트를 한도가 풀릴 때 다시 이어서 진행합니다."
           }
         }
       }
@@ -2035,6 +2147,106 @@
         }
       }
     },
+    "aas account" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aas 계정"
+          }
+        }
+      }
+    },
+    "Account" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정"
+          }
+        }
+      }
+    },
+    "Account must be one aas account name, such as work@claude, or empty for the best account with quota left." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정은 work@claude 같은 aas 계정 이름 하나여야 합니다. 비워 두면 사용량이 남은 최적 계정을 고릅니다."
+          }
+        }
+      }
+    },
+    "Account Switches" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환"
+          }
+        }
+      }
+    },
+    "Account switches started from Muxa or by automation" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa나 자동화가 시작한 계정 전환"
+          }
+        }
+      }
+    },
+    "Accounts are read on %@. Leave this on Best account to let aas there choose." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정은 %@에서 읽습니다. 그곳의 aas가 고르게 하려면 최적 계정으로 두세요."
+          }
+        }
+      }
+    },
+    "After the relaunch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 실행한 뒤"
+          }
+        }
+      }
+    },
+    "Agent Actions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 작업"
+          }
+        }
+      }
+    },
+    "Agent actions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 작업"
+          }
+        }
+      }
+    },
+    "Agents: Switch limited agents to another account…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트: 한도에 걸린 에이전트를 다른 계정으로 전환…"
+          }
+        }
+      }
+    },
     "AIR 1 traces describe a claude or codex run; @%@ runs %@." : {
       "localizations" : {
         "en" : {
@@ -2113,6 +2325,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "AIR은 아직 표준 설치 위치가 없습니다. AIR 체크아웃에서 scripts/air.mjs가 들어 있는 air-workbench 폴더를 지정해 주세요."
+          }
+        }
+      }
+    },
+    "Also stop agents that are mid-turn" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 중인 에이전트도 멈추기"
+          }
+        }
+      }
+    },
+    "An aas account such as work@claude. Leave empty to let aas pick the best-ranked account of the same provider that still has quota." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "work@claude 같은 aas 계정입니다. 비워 두면 aas가 같은 제공자 중 사용량이 남은 가장 좋은 계정을 고릅니다."
+          }
+        }
+      }
+    },
+    "Another account…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다른 계정…"
           }
         }
       }
@@ -2389,16 +2631,6 @@
         }
       }
     },
-    "Add the Session-Limit Rule" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "세션 한도 규칙 추가"
-          }
-        }
-      }
-    },
     "Add to Library" : {
       "localizations" : {
         "ko" : {
@@ -2612,6 +2844,7 @@
       }
     },
     "Agents in this window" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -2832,6 +3065,7 @@
       }
     },
     "An automation can resume this agent when the limit resets." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -3204,16 +3438,6 @@
         }
       }
     },
-    "Auto-Resume…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "자동 재개…"
-          }
-        }
-      }
-    },
     "Automatic splits along the pane's longer side, so a growing line-up stays readable" : {
       "localizations" : {
         "ko" : {
@@ -3260,6 +3484,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "자동화가 일시 정지됨"
+          }
+        }
+      }
+    },
+    "Automations are paused, so nothing happens on its own until they resume." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동화가 일시 중지되어 있어 다시 시작할 때까지 아무것도 자동으로 일어나지 않습니다."
           }
         }
       }
@@ -3330,6 +3564,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "동작 방식"
+          }
+        }
+      }
+    },
+    "Best account with quota left" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사용량이 남은 최적 계정"
           }
         }
       }
@@ -3430,6 +3674,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work 플랜을 만드는 중…"
+          }
+        }
+      }
+    },
+    "Cannot read this host. SSH and Python 3 are required." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 호스트를 읽을 수 없습니다. SSH와 Python 3가 필요합니다."
+          }
+        }
+      }
+    },
+    "Capped agents count as needing you and send a notification." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한도에 걸린 에이전트를 확인이 필요한 항목으로 세고 알림을 보냅니다."
+          }
+        }
+      }
+    },
+    "Choose a draft, edit it, then Reply. This records your decision only." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초안을 골라 고친 뒤 답장하세요. 결정만 기록됩니다."
+          }
+        }
+      }
+    },
+    "Clear Finished" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "끝난 항목 지우기"
           }
         }
       }
@@ -3843,6 +4127,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "화면 지우기"
+          }
+        }
+      }
+    },
+    "Click to dismiss" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "클릭하면 닫힙니다"
           }
         }
       }
@@ -4411,6 +4705,16 @@
         }
       }
     },
+    "Conversation flow · latest 20 requests" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "대화 흐름 · 최근 요청 20개"
+          }
+        }
+      }
+    },
     "Conversations" : {
       "localizations" : {
         "ko" : {
@@ -4749,6 +5053,22 @@
         }
       }
     },
+    "Decision (%@): %@" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Decision (%1$@): %2$@"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정 (%1$@): %2$@"
+          }
+        }
+      }
+    },
     "Declined" : {
       "localizations" : {
         "ko" : {
@@ -4765,6 +5085,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "기본값"
+          }
+        }
+      }
+    },
+    "default" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기본"
           }
         }
       }
@@ -5059,6 +5389,16 @@
         }
       }
     },
+    "Did not start" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시작하지 못함"
+          }
+        }
+      }
+    },
     "Directory" : {
       "localizations" : {
         "ko" : {
@@ -5115,6 +5455,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "연결 끊김"
+          }
+        }
+      }
+    },
+    "Display" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "표시"
           }
         }
       }
@@ -6187,12 +6537,82 @@
         }
       }
     },
+    "Follow Switch" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전환 따라가기"
+          }
+        }
+      }
+    },
     "Follow this agent's pane in Live Watch" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Live Watch에서 이 에이전트의 페인을 따라갑니다"
+          }
+        }
+      }
+    },
+    "Follow-up" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "후속 프롬프트"
+          }
+        }
+      }
+    },
+    "Follow-up refused" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "후속 프롬프트 거부됨"
+          }
+        }
+      }
+    },
+    "Follow-up sent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "후속 프롬프트 보냄"
+          }
+        }
+      }
+    },
+    "Follow-up sent; no activity seen yet" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "후속 프롬프트 보냄, 아직 반응 없음"
+          }
+        }
+      }
+    },
+    "Follow-up sent; the agent carried on" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "후속 프롬프트 보냄, 에이전트가 이어서 작업함"
+          }
+        }
+      }
+    },
+    "Follow-up unconfirmed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "후속 프롬프트 확인 안 됨"
           }
         }
       }
@@ -6887,6 +7307,16 @@
         }
       }
     },
+    "Invalid file response." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일 응답이 올바르지 않습니다."
+          }
+        }
+      }
+    },
     "It has no content yet (0 bytes)." : {
       "localizations" : {
         "ko" : {
@@ -7003,6 +7433,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트로 이동 — 확인이 필요한 에이전트가 먼저 나옵니다"
+          }
+        }
+      }
+    },
+    "Just tell me" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "알리기만 하기"
           }
         }
       }
@@ -7344,6 +7784,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "라이트"
+          }
+        }
+      }
+    },
+    "Limit Policy…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한도 정책…"
           }
         }
       }
@@ -7788,6 +8238,16 @@
         }
       }
     },
+    "More in Automations…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동화에서 더 보기…"
+          }
+        }
+      }
+    },
     "Most changes apply when muxad restarts. Saving checks the file has not changed underneath and refuses a document muxa cannot parse." : {
       "localizations" : {
         "ko" : {
@@ -7818,6 +8278,26 @@
         }
       }
     },
+    "Move to" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "옮길 계정"
+          }
+        }
+      }
+    },
+    "Move to Another Account…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다른 계정으로 옮기기…"
+          }
+        }
+      }
+    },
     "Move up" : {
       "localizations" : {
         "ko" : {
@@ -7838,12 +8318,52 @@
         }
       }
     },
+    "Muxa is not connected" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 연결되어 있지 않습니다"
+          }
+        }
+      }
+    },
     "Muxa Module" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa 모듈"
+          }
+        }
+      }
+    },
+    "Muxa relaunches the same conversation on the aas account with the most quota left and carries the cut-off turn on. Needs aas and a second account." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 사용량이 가장 많이 남은 aas 계정에서 같은 대화를 다시 실행하고 끊긴 작업을 이어 갑니다. aas와 두 번째 계정이 필요합니다."
+          }
+        }
+      }
+    },
+    "muxa swap exited with %d" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "muxa swap이 %d 코드로 종료되었습니다"
+          }
+        }
+      }
+    },
+    "Muxa types continue two minutes after the limit resets (or after 20 minutes when no reset time is known)." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한도가 초기화되고 2분 뒤에 continue를 입력합니다(초기화 시각을 모르면 20분 뒤)."
           }
         }
       }
@@ -8148,6 +8668,16 @@
         }
       }
     },
+    "Need you %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인 필요 %lld"
+          }
+        }
+      }
+    },
     "Needs Action" : {
       "localizations" : {
         "ko" : {
@@ -8159,6 +8689,7 @@
       }
     },
     "Needs Attention" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -8469,6 +9000,36 @@
         }
       }
     },
+    "no aas account" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aas 계정 없음"
+          }
+        }
+      }
+    },
+    "No agent is at its usage limit" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사용 한도에 걸린 에이전트가 없습니다"
+          }
+        }
+      }
+    },
+    "No agent matches. Agents started without aas, or that are not Claude Code or Codex, cannot be switched." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "해당하는 에이전트가 없습니다. aas 없이 시작했거나 Claude Code, Codex가 아닌 에이전트는 전환할 수 없습니다."
+          }
+        }
+      }
+    },
     "No Hosts" : {
       "localizations" : {
         "ko" : {
@@ -8479,12 +9040,32 @@
         }
       }
     },
+    "No messages in this mailbox." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 메일함에 메시지가 없습니다."
+          }
+        }
+      }
+    },
     "No pipelines yet. Muxa ships presets for one, two, and three agents." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "아직 파이프라인이 없습니다. 에이전트 1~3개용 프리셋이 준비되어 있습니다."
+          }
+        }
+      }
+    },
+    "No requests need your response." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "응답이 필요한 요청이 없습니다."
           }
         }
       }
@@ -8680,6 +9261,7 @@
       }
     },
     "No incoming requests for this agent." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -8890,6 +9472,7 @@
       }
     },
     "No requests sent from the operator in this room." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -9069,6 +9652,16 @@
         }
       }
     },
+    "NodeId" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "NodeId"
+          }
+        }
+      }
+    },
     "None" : {
       "localizations" : {
         "ko" : {
@@ -9170,6 +9763,7 @@
       }
     },
     "Not set up" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -9205,6 +9799,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@와(과) 다른 점이 없습니다."
+          }
+        }
+      }
+    },
+    "Nothing fires until a rule is added and switched on. Choose a limit policy above to handle capped agents without writing one." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "규칙을 추가하고 켜기 전에는 아무것도 실행되지 않습니다. 규칙을 직접 쓰지 않고 한도에 걸린 에이전트를 처리하려면 위에서 한도 정책을 고르세요."
           }
         }
       }
@@ -9461,11 +10065,28 @@
       }
     },
     "On" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "켜짐"
+          }
+        }
+      }
+    },
+    "On %@ (%lld)" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "On %1$@ (%2$lld)"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ (%2$lld)"
           }
         }
       }
@@ -10117,6 +10738,16 @@
         }
       }
     },
+    "Original request: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "원래 요청: %@"
+          }
+        }
+      }
+    },
     "Others in this window" : {
       "localizations" : {
         "ko" : {
@@ -10284,6 +10915,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@까지 일시 정지됨"
+          }
+        }
+      }
+    },
+    "Peer interrupted: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "동료 중단됨: %@"
+          }
+        }
+      }
+    },
+    "Peer interruption cleared" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "동료 중단 해제됨"
           }
         }
       }
@@ -10782,6 +11433,16 @@
         }
       }
     },
+    "Reading aas accounts…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "aas 계정을 읽는 중…"
+          }
+        }
+      }
+    },
     "Reading git status…" : {
       "localizations" : {
         "ko" : {
@@ -10892,6 +11553,16 @@
         }
       }
     },
+    "Recovery decision: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "복구 결정: %@"
+          }
+        }
+      }
+    },
     "Recreate %lld Sessions" : {
       "localizations" : {
         "ko" : {
@@ -10904,16 +11575,16 @@
     },
     "Recreate %lld, Fill In %lld" : {
       "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%1$lld개 다시 만들기, %2$lld개 채우기"
-          }
-        },
         "en" : {
           "stringUnit" : {
             "state" : "new",
             "value" : "Recreate %1$lld, Fill In %2$lld"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld개 다시 만들기, %2$lld개 채우기"
           }
         }
       }
@@ -11145,6 +11816,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "적용하려면 Muxa를 다시 실행하세요"
+          }
+        }
+      }
+    },
+    "Relaunch the capped agents on aas accounts with quota left and carry their turns on" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한도에 걸린 에이전트를 사용량이 남은 aas 계정에서 다시 실행하고 작업을 이어 갑니다"
+          }
+        }
+      }
+    },
+    "Relaunch this conversation on an aas account with quota left and carry the interrupted turn on" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사용량이 남은 aas 계정에서 이 대화를 다시 실행하고 끊긴 작업을 이어 갑니다"
+          }
+        }
+      }
+    },
+    "Relaunch this conversation on another aas account" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다른 aas 계정에서 이 대화를 다시 실행합니다"
           }
         }
       }
@@ -11500,12 +12201,32 @@
         }
       }
     },
+    "Repository" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장소"
+          }
+        }
+      }
+    },
     "Request" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "요청"
+          }
+        }
+      }
+    },
+    "Request arrows point to recipients; dashed replies return to senders. Orange requests need your response." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청 화살표는 받는 쪽을 가리키고, 점선 답장은 보낸 쪽으로 돌아갑니다. 주황색 요청은 응답이 필요합니다."
           }
         }
       }
@@ -11546,6 +12267,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "미리보기 초기화"
+          }
+        }
+      }
+    },
+    "Reset: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초기화: %@"
+          }
+        }
+      }
+    },
+    "Resets at %@. Switch it to another account to carry on now." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에 초기화됩니다. 지금 이어 가려면 다른 계정으로 전환하세요."
           }
         }
       }
@@ -11702,6 +12443,36 @@
         }
       }
     },
+    "Resumes and carries on" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "재개하고 이어서 작업"
+          }
+        }
+      }
+    },
+    "Resumes; no follow-up" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "재개, 후속 프롬프트 없음"
+          }
+        }
+      }
+    },
+    "Retries only agents that failed before their relaunch and still run as planned" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 실행 전에 실패했고 계획대로 아직 실행 중인 에이전트만 다시 시도합니다"
+          }
+        }
+      }
+    },
     "Retry" : {
       "localizations" : {
         "ko" : {
@@ -11718,6 +12489,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "연결 다시 시도"
+          }
+        }
+      }
+    },
+    "Retry Failed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실패한 항목 다시 시도"
+          }
+        }
+      }
+    },
+    "Retry: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 시도: %@"
           }
         }
       }
@@ -12022,6 +12813,46 @@
         }
       }
     },
+    "Safe handoff" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "안전한 인계"
+          }
+        }
+      }
+    },
+    "Send a follow-up so the agent carries on" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 이어서 작업하도록 후속 프롬프트 보내기"
+          }
+        }
+      }
+    },
+    "Send “continue”" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "“continue” 보내기"
+          }
+        }
+      }
+    },
+    "Short worker requests inline" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "짧은 작업자 요청은 바로 전달"
+          }
+        }
+      }
+    },
     "Show all %lld" : {
       "localizations" : {
         "ko" : {
@@ -12048,6 +12879,46 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "더 보기"
+          }
+        }
+      }
+    },
+    "Show this switch's progress and result in the status bar's Account Switches" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 전환의 진행 상황과 결과를 상태 표시줄의 계정 전환에서 보여 줍니다"
+          }
+        }
+      }
+    },
+    "Small read-only worker requests arrive in one turn; other agent requests stay in the mailbox." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽기 전용인 짧은 작업자 요청은 한 턴에 바로 도착하고, 다른 에이전트 요청은 메일함에 남습니다."
+          }
+        }
+      }
+    },
+    "Some effects were not confirmed; check the pane" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일부 동작이 확인되지 않았습니다. pane을 확인하세요"
+          }
+        }
+      }
+    },
+    "Spread across accounts with quota" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사용량이 남은 계정에 나눠 배치"
           }
         }
       }
@@ -12331,6 +13202,7 @@
       }
     },
     "Search sessions, windows, panes, shells, work, agents" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -12714,16 +13586,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "사용 가능한 세션과 작업이 여기에 표시됩니다."
-          }
-        }
-      }
-    },
-    "Set Up Auto-Resume…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "자동 재개 설정…"
           }
         }
       }
@@ -13158,6 +14020,7 @@
       }
     },
     "Start Claude, Codex, Gemini, or OpenCode in a folder; each opens as a tab." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -13349,12 +14212,32 @@
         }
       }
     },
+    "Starting…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시작하는 중…"
+          }
+        }
+      }
+    },
     "Starts first" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "먼저 시작"
+          }
+        }
+      }
+    },
+    "Starts no further agent; the one being switched finishes" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 이상 다른 에이전트를 시작하지 않고, 전환 중인 에이전트는 끝까지 진행합니다"
           }
         }
       }
@@ -13525,12 +14408,68 @@
         }
       }
     },
+    "Stop After Current" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 항목 후 중지"
+          }
+        }
+      }
+    },
+    "Stop attempt" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "시도 중지"
+          }
+        }
+      }
+    },
     "Stopped" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "중지됨"
+          }
+        }
+      }
+    },
+    "Stopping after the current agent…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 에이전트 후 중지하는 중…"
+          }
+        }
+      }
+    },
+    "Stops %@%@, relaunches the same conversation on another aas account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped." : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Stops %1$@%2$@, relaunches the same conversation on another aas account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped."
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@%2$@을(를) 멈추고 다른 aas 계정에서 같은 대화를 다시 실행해 끊긴 작업을 이어 갑니다. 대화는 멈춘 곳에서 그대로 재개되므로 잃는 것이 없습니다."
+          }
+        }
+      }
+    },
+    "Stops the agent, relaunches the same conversation on another aas account, and types the follow-up so it carries on." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트를 멈추고 다른 aas 계정에서 같은 대화를 다시 실행한 뒤, 이어서 작업하도록 후속 프롬프트를 입력합니다."
           }
         }
       }
@@ -13575,6 +14514,36 @@
         }
       }
     },
+    "Swap needs a look" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 확인 필요"
+          }
+        }
+      }
+    },
+    "Swap started" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 시작됨"
+          }
+        }
+      }
+    },
+    "Swaps" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환"
+          }
+        }
+      }
+    },
     "Switch %@ to %@" : {
       "localizations" : {
         "en" : {
@@ -13607,6 +14576,76 @@
         }
       }
     },
+    "Switch %lld Agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 %lld개 전환"
+          }
+        }
+      }
+    },
+    "Switch Account and Resume" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 후 재개"
+          }
+        }
+      }
+    },
+    "Switch account and resume" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 후 재개"
+          }
+        }
+      }
+    },
+    "Switch Account and Resume…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 후 재개…"
+          }
+        }
+      }
+    },
+    "Switch Account…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환…"
+          }
+        }
+      }
+    },
+    "Switch All…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모두 전환…"
+          }
+        }
+      }
+    },
+    "Switch and Resume" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전환 후 재개"
+          }
+        }
+      }
+    },
     "Switch Changes to a split view and tick files as Viewed; a mark clears when the file changes again." : {
       "localizations" : {
         "ko" : {
@@ -13633,6 +14672,62 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "켜면 설치되어 있는지 확인합니다."
+          }
+        }
+      }
+    },
+    "Switch it to another account to carry on now." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 이어 가려면 다른 계정으로 전환하세요."
+          }
+        }
+      }
+    },
+    "Switch to another account and continue" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다른 계정으로 전환해 계속하기"
+          }
+        }
+      }
+    },
+    "Switching %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 전환 중"
+          }
+        }
+      }
+    },
+    "Switching %lld of %lld…" : {
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "new",
+            "value" : "Switching %1$lld of %2$lld…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%2$lld개 중 %1$lld개 전환 중…"
+          }
+        }
+      }
+    },
+    "Switching Account…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 중…"
           }
         }
       }
@@ -13844,6 +14939,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@ 한도를 다 썼습니다. 초기화 시각은 보고되지 않았습니다."
+          }
+        }
+      }
+    },
+    "The [swap] follow-up from config.toml" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "config.toml의 [swap] 후속 프롬프트"
           }
         }
       }
@@ -14308,6 +15413,7 @@
       }
     },
     "The strip on the left edge switches between Work, Explore, Inbox, Ask, and Shells." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -14487,6 +15593,16 @@
         }
       }
     },
+    "This host has no valid SSH target." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 호스트에 올바른 SSH 대상이 없습니다."
+          }
+        }
+      }
+    },
     "This host is available in observe mode only" : {
       "localizations" : {
         "ko" : {
@@ -14534,6 +15650,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 muxad는 앱에서 설정을 편집할 수 없습니다. 파일에서 [automation] enabled를 바꾼 뒤 muxad를 다시 로드하세요."
+          }
+        }
+      }
+    },
+    "This muxad cannot run automations; update muxa to choose." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 muxad는 자동화를 실행할 수 없습니다. 고르려면 muxa를 업데이트하세요."
           }
         }
       }
@@ -14814,6 +15940,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "명령 입력"
+          }
+        }
+      }
+    },
+    "Type continue into the agent and press Return" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트에 continue를 입력하고 Return을 누릅니다"
+          }
+        }
+      }
+    },
+    "Typed after the conversation resumes on the new account, so the turn the limit cut off carries on." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 계정에서 대화가 재개된 뒤 입력되어, 한도로 끊긴 작업을 이어 갑니다."
+          }
+        }
+      }
+    },
+    "Typed only into a relaunch confirmed to be on the same conversation, and only for agents whose turn was cut off." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "같은 대화로 다시 실행된 것이 확인된 경우에만, 작업이 끊긴 에이전트에게만 입력합니다."
           }
         }
       }
@@ -15236,6 +16392,16 @@
         }
       }
     },
+    "View: Show Files" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 파일 표시"
+          }
+        }
+      }
+    },
     "View: Show Inbox" : {
       "localizations" : {
         "ko" : {
@@ -15302,6 +16468,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "대기"
+          }
+        }
+      }
+    },
+    "Wait and recheck" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기다렸다가 다시 확인"
+          }
+        }
+      }
+    },
+    "Wait for the reset, then continue" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초기화를 기다린 뒤 계속하기"
           }
         }
       }
@@ -15528,6 +16714,16 @@
         }
       }
     },
+    "What will happen" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "진행될 내용"
+          }
+        }
+      }
+    },
     "What's New in Muxa" : {
       "localizations" : {
         "ko" : {
@@ -15554,6 +16750,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트 상태와 무관하게"
+          }
+        }
+      }
+    },
+    "When an agent hits its usage limit" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 사용 한도에 도달하면"
           }
         }
       }
@@ -15659,6 +16865,16 @@
         }
       }
     },
+    "Without this, an agent that is working is left alone. With it, its current turn is cut off and, when follow-ups are on, carried on after the relaunch." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "끄면 작업 중인 에이전트는 그대로 둡니다. 켜면 현재 작업을 끊고, 후속 프롬프트가 켜져 있으면 다시 실행한 뒤 이어 갑니다."
+          }
+        }
+      }
+    },
     "Work" : {
       "localizations" : {
         "ko" : {
@@ -15750,6 +16966,16 @@
         }
       }
     },
+    "Work: Dispatch Work to a host…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업: 호스트에 작업 배포…"
+          }
+        }
+      }
+    },
     "Work: Open Command Center" : {
       "localizations" : {
         "ko" : {
@@ -15791,11 +17017,22 @@
       }
     },
     "Working Agents" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "작업 중인 에이전트"
+          }
+        }
+      }
+    },
+    "Working out the plan…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계획을 세우는 중…"
           }
         }
       }
@@ -17317,6 +18554,7 @@
       }
     },
     "Placement preview" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -17327,6 +18565,7 @@
       }
     },
     "Assigned work" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -17467,6 +18706,7 @@
       }
     },
     "Retry same request" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -17477,6 +18717,7 @@
       }
     },
     "Dispatch Work" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -17766,82 +19007,82 @@
         }
       }
     },
-    "View worker": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "작업 호스트 보기"
+    "View worker" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 호스트 보기"
           }
         }
       }
     },
-    "Node labels": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "노드 태그"
+    "Node labels" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "노드 태그"
           }
         }
       }
     },
-    "Edit labels": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 편집"
+    "Edit labels" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 편집"
           }
         }
       }
     },
-    "Label key": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 키"
+    "Label key" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 키"
           }
         }
       }
     },
-    "Label value": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 값"
+    "Label value" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 값"
           }
         }
       }
     },
-    "Remove label": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 삭제"
+    "Remove label" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 삭제"
           }
         }
       }
     },
-    "Save label": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그 저장"
+    "Save label" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그 저장"
           }
         }
       }
     },
-    "Labels are used by workspace and request selectors. System-managed labels cannot be changed.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "태그는 workspace와 요청의 노드 선택 조건에 사용됩니다. 시스템이 관리하는 태그는 변경할 수 없습니다."
+    "Labels are used by workspace and request selectors. System-managed labels cannot be changed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "태그는 workspace와 요청의 노드 선택 조건에 사용됩니다. 시스템이 관리하는 태그는 변경할 수 없습니다."
           }
         }
       }
@@ -17887,6 +19128,7 @@
       }
     },
     "Enter an absolute path or a path starting with ~/." : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -17897,6 +19139,7 @@
       }
     },
     "File host" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -17917,6 +19160,7 @@
       }
     },
     "Files on this Mac" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -17967,6 +19211,7 @@
       }
     },
     "Folder path" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -18047,6 +19292,7 @@
       }
     },
     "Open Folder" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -18067,6 +19313,7 @@
       }
     },
     "Open Preview" : {
+      "extractionState" : "stale",
       "localizations" : {
         "ko" : {
           "stringUnit" : {
@@ -18246,102 +19493,103 @@
         }
       }
     },
-    "EXPLORER": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "탐색기"
+    "EXPLORER" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "탐색기"
           }
         }
       }
     },
-    "Go to Folder…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "폴더로 이동…"
+    "Go to Folder…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더로 이동…"
           }
         }
       }
     },
-    "Go to Folder": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "폴더로 이동"
+    "Go to Folder" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "폴더로 이동"
           }
         }
       }
     },
-    "↑ ↓ Select · Tab Complete · Return Open": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "↑ ↓ 선택 · Tab 자동완성 · Return 열기"
+    "↑ ↓ Select · Tab Complete · Return Open" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "↑ ↓ 선택 · Tab 자동완성 · Return 열기"
           }
         }
       }
     },
-    "This Mac · ~ / Documents / …": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이 Mac · ~ / Documents / …"
+    "This Mac · ~ / Documents / …" : {
+      "extractionState" : "stale",
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac · ~ / Documents / …"
           }
         }
       }
     },
-    "Loading…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "불러오는 중…"
+    "Loading…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "불러오는 중…"
           }
         }
       }
     },
-    "Search files, sessions, work and agents": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "파일, 세션, Work, 에이전트 검색"
+    "Search files, sessions, work and agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파일, 세션, Work, 에이전트 검색"
           }
         }
       }
     },
-    "Searching workspace files…": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "작업 폴더의 파일을 검색하는 중…"
+    "Searching workspace files…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 폴더의 파일을 검색하는 중…"
           }
         }
       }
     },
-    "Some folders were skipped or the search limit was reached. Open a narrower folder to search further.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "읽지 못한 폴더가 있거나 검색 한도에 도달했습니다. 하위 폴더를 열어 더 검색하세요."
+    "Some folders were skipped or the search limit was reached. Open a narrower folder to search further." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽지 못한 폴더가 있거나 검색 한도에 도달했습니다. 하위 폴더를 열어 더 검색하세요."
           }
         }
       }
     },
-    "This image could not be decoded.": {
-      "localizations": {
-        "ko": {
-          "stringUnit": {
-            "state": "translated",
-            "value": "이미지를 해석할 수 없습니다."
+    "This image could not be decoded." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미지를 해석할 수 없습니다."
           }
         }
       }

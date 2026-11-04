@@ -70,6 +70,7 @@ struct MuxaAttentionTracking: ViewModifier {
             }
             .onChange(of: attention.pendingHumanMessageID) { _ in openHumanPending() }
             .onChange(of: attention.pendingOpen) { _ in openPending() }
+            .onChange(of: attention.pendingSwitch) { _ in openPendingSwitch() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 updateVisibility()
             }
@@ -103,7 +104,18 @@ struct MuxaAttentionTracking: ViewModifier {
         guard let id = attention.pendingHumanMessageID else { return }
         attention.pendingHumanMessageID = nil
         model.pendingOperatorMessageID = id
-        model.show(.inbox)
+        // Open the Inbox editor, not just its side bar: the message is
+        // shown there.
+        model.select(.inbox)
+    }
+
+    private func openPendingSwitch() {
+        guard let pane = attention.pendingSwitch else { return }
+        attention.pendingSwitch = nil
+        guard let watch = model.executionSnapshot.watchPane(id: pane),
+              let target = MuxaAgentActionTarget(watch) else { return }
+        open(pane)
+        model.swaps.present(target.swapSheetTarget)
     }
 
     private func openPending() {

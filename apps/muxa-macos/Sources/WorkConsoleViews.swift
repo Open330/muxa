@@ -481,7 +481,8 @@ struct WorkCommandCenterView: View {
     /// needing attention (it also counts unread ones).
     private var attentionAgents: [MuxaHostedAgent] {
         model.hostedAgents
-            .filter { $0.agent.status.needsAttention }
+            // Capped agents have their own row (with Switch All).
+            .filter { $0.agent.status.needsAttention && !$0.agent.status.isLimited }
             .sorted { $0.agent.status.priority < $1.agent.status.priority }
     }
 
@@ -536,7 +537,7 @@ struct WorkCommandCenterView: View {
                         ForEach(humanRequests) { message in
                             Button {
                                 model.pendingOperatorMessageID = message.id
-                                model.show(.inbox)
+                                model.select(.inbox)
                             } label: {
                                 HStack {
                                     Text(verbatim: "\(message.host.alias) · \(message.counterpart.label)").fontWeight(.medium)
@@ -1006,6 +1007,7 @@ private struct CommandCenterStatusLine: View {
 /// need them, worst first, each with what it last said. Rate-limited agents
 /// follow on one line each, with when they resume.
 private struct CommandCenterAttentionList: View {
+    @EnvironmentObject private var model: AppModel
     let attention: [MuxaHostedAgent]
     let limited: [MuxaHostedAgent]
     let open: (MuxaHostedAgent) -> Void
@@ -1024,12 +1026,21 @@ private struct CommandCenterAttentionList: View {
                     }
                     if attention.count > Self.limit {
                         Divider()
-                        Text("\(attention.count - Self.limit) more in Explore › Needs attention")
+                        Button {
+                            model.show(.watch)
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text("\(attention.count - Self.limit) more in Explore › Needs attention")
+                                Image(systemName: "arrow.right").font(.system(size: 9, weight: .semibold))
+                            }
                             .font(MuxaType.detail)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(Color.accentColor)
                             .frame(maxWidth: .infinity, alignment: .leading)
                             .padding(.horizontal, 14)
                             .padding(.vertical, 9)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
                     }
                     if !limited.isEmpty {
                         if !attention.isEmpty { Divider() }
@@ -1084,9 +1095,13 @@ private struct CommandCenterAttentionList: View {
                 .foregroundStyle(.purple)
                 .frame(width: 26)
             VStack(alignment: .leading, spacing: 6) {
-                Text(verbatim: "\(String(localized: "Limited")) · \(limited.count)")
-                    .font(MuxaType.detail.weight(.semibold))
-                    .foregroundStyle(.purple)
+                HStack(spacing: 8) {
+                    Text(verbatim: "\(String(localized: "Limited")) · \(limited.count)")
+                        .font(MuxaType.detail.weight(.semibold))
+                        .foregroundStyle(.purple)
+                    Spacer(minLength: 0)
+                    MuxaSwitchLimitedButton(model: model, limited: limited)
+                }
                 LimitedAgentLinks(agents: limited, open: open)
             }
         }
@@ -1098,6 +1113,7 @@ private struct CommandCenterAttentionList: View {
 
 /// Rate-limited agents as `@name → 15:45 host` links, wrapping as needed.
 private struct LimitedAgentLinks: View {
+    @EnvironmentObject private var model: AppModel
     let agents: [MuxaHostedAgent]
     let open: (MuxaHostedAgent) -> Void
 
@@ -1121,16 +1137,18 @@ private struct LimitedAgentLinks: View {
                 }
                 .buttonStyle(.plain)
                 .help(Text(verbatim: commandCenterAgentLocation(hosted)))
+                .contextMenu {
+                    Button("Open") { open(hosted) }
+                    Divider()
+                    MuxaAgentActionMenuItems(model: model, target: MuxaAgentActionTarget(hosted))
+                }
             }
         }
     }
 }
 
 private func commandCenterAgentTitle(_ hosted: MuxaHostedAgent) -> String {
-    hosted.pane?.agentAlias.map { "@\($0)" }
-        ?? hosted.agent.aiTitle?.nonEmpty
-        ?? hosted.pane?.title.nonEmpty
-        ?? hosted.agent.kind.replacingOccurrences(of: "_", with: " ")
+    hosted.displayTitle
 }
 
 private func commandCenterAgentLocation(_ hosted: MuxaHostedAgent) -> String {
@@ -1325,7 +1343,10 @@ private struct FleetPaneWorkspace: View {
             breadcrumbs
                 .layoutPriority(-1)
             Spacer(minLength: 8)
-            MuxaPaneUsageAccessory(agent: pane.agent) // WS-C usage
+            MuxaPaneUsageAccessory(agent: pane.agent, target: MuxaAgentActionTarget(pane)) // WS-C usage
+            if let target = MuxaAgentActionTarget(pane) {
+                MuxaAgentActionBar(model: model, target: target)
+            }
             // WS-D: the Changes tab carries the pending review comment count.
             MuxaTextTabs(items: PaneModule.allCases, selection: $module) {
                 $0 == .changes ? ChangesTab.title(for: pane, drafts: reviewDrafts) : $0.title
@@ -3631,6 +3652,7 @@ private struct WatchWindowTree: View {
 }
 
 private struct WatchPaneRow: View {
+    @EnvironmentObject private var model: AppModel
     let pane: MuxaWatchPane
     let highlight: WatchTreeHighlight
     let depth: Int
@@ -3677,6 +3699,10 @@ private struct WatchPaneRow: View {
         .contextMenu {
             Button("Open") { selectPane(pane.id) }
             Button("Open Pinned") { openPinnedPane(pane.id) }
+            if let target = MuxaAgentActionTarget(pane) {
+                Divider()
+                MuxaAgentActionMenuItems(model: model, target: target)
+            }
         }
     }
 }
@@ -3747,6 +3773,7 @@ func firstReadableLine(_ text: String) -> String {
 /// host and tmux path in the row, so removing host grouping does not remove the
 /// context needed to identify the pane.
 struct WatchFlatPaneRow: View {
+    @EnvironmentObject private var model: AppModel
     let pane: MuxaWatchPane
     let highlight: WatchTreeHighlight
     let selectPane: (MuxaWatchPaneIdentity) -> Void
@@ -3809,6 +3836,10 @@ struct WatchFlatPaneRow: View {
         .contextMenu {
             Button("Open") { selectPane(pane.id) }
             Button("Open Pinned") { openPinnedPane(pane.id) }
+            if let target = MuxaAgentActionTarget(pane) {
+                Divider()
+                MuxaAgentActionMenuItems(model: model, target: target)
+            }
         }
     }
 }

@@ -22,6 +22,67 @@ import Testing
     #expect(reloaded.wireObject["notification"] as? String == pattern)
 }
 
+@Test func automationEditingPreservesSwapAccountPayload() throws {
+    // An `automation_rules` row as muxad renders a swap rule: `submit` is
+    // always present (resolved), `account` and `text` only when named.
+    let row = """
+    {"name":"swap-on-limit","on":"rate_limited","enabled":true,"action":"swap_account",
+     "account":"jelly@claude","text":"keep going","submit":true,"wait":"0s",
+     "fallback":"15m","jitter":"15s","cooldown":"2m","max_per_hour":3,
+     "only_if_still":"rate_limited"}
+    """
+    let rule = try JSONDecoder().decode(MuxaAutomationRule.self, from: Data(row.utf8))
+    #expect(rule.action == .swapAccount)
+    #expect(rule.account == "jelly@claude")
+
+    // Load into the editor, save untouched: nothing the rule named is lost,
+    // and `submit` — refused on a swap — is never sent back.
+    let draft = MuxaAutomationRuleDraft.draft(editing: rule)
+    #expect(draft.isReady(existingNames: ["swap-on-limit"]))
+    let wire = draft.rule.wireObject
+    #expect(wire["action"] as? String == "swap_account")
+    #expect(wire["account"] as? String == "jelly@claude")
+    #expect(wire["text"] as? String == "keep going")
+    #expect(wire["submit"] == nil)
+    #expect(wire["message"] == nil)
+    #expect(draft.rule.tomlSnippet.contains("account = \"jelly@claude\""))
+    #expect(!draft.rule.tomlSnippet.contains("submit"))
+
+    // `auto` and no follow-up are both valid: the daemon picks the account
+    // and falls back to the `[swap]` follow-up.
+    var auto = draft
+    auto.account = ""
+    auto.text = ""
+    #expect(auto.isReady(existingNames: ["swap-on-limit"]))
+    #expect(auto.rule.wireObject["account"] == nil)
+    #expect(auto.rule.wireObject["text"] == nil)
+    // A swap fires on the cap, not at its reset, unless told otherwise.
+    auto.wait = ""
+    #expect(auto.timing == .delay(0))
+
+    var spaced = draft
+    spaced.account = "two words"
+    #expect(spaced.issues(existingNames: ["swap-on-limit"]) == [.invalidAccount])
+
+    // Switching the action away drops the account the daemon would refuse.
+    var prompt = draft
+    prompt.action = .sendPrompt
+    #expect(prompt.rule.wireObject["account"] == nil)
+    #expect(prompt.rule.wireObject["submit"] as? Bool == true)
+}
+
+@Test func automationLogDecodesSwapAdmission() throws {
+    let line = """
+    {"rule":"swap-on-limit","pane":"%3","agent":"claude_code","fired_at":"2026-11-04T01:02:03Z",
+     "action":"swap_account","outcome":"admitted","operation":"auto:abc","job":"j-1"}
+    """
+    let entry = try JSONDecoder().decode(MuxaAutomationLogEntry.self, from: Data(line.utf8))
+    #expect(entry.action == .swapAccount)
+    #expect(entry.outcome == .admitted)
+    #expect(entry.operation == "auto:abc")
+    #expect(entry.job == "j-1")
+}
+
 @Test func automationAskConditionDefaultsAndRoundTrips() throws {
     let data = Data(#"{"name":"judge","on":"error","action":"interrupt","ask_condition":{"prompt":"  Is the task done?\nQuote: \"yes\"  ","provider":"team-openai"}}"#.utf8)
     let rule = try JSONDecoder().decode(MuxaAutomationRule.self, from: data)

@@ -77,6 +77,7 @@ struct MuxaUsagePopover: View {
     let openPane: (MuxaWatchPaneIdentity) -> Void
 
     @ObservedObject private var automations = AutomationStore.shared
+    @EnvironmentObject private var model: AppModel
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -121,10 +122,15 @@ struct MuxaUsagePopover: View {
                 windowRow(window)
             }
             if !group.capped.isEmpty {
-                Text("Rate limited")
-                    .font(MuxaType.detail.weight(.semibold))
-                    .foregroundStyle(.red)
-                    .padding(.top, 2)
+                HStack {
+                    Text("Rate limited")
+                        .font(MuxaType.detail.weight(.semibold))
+                        .foregroundStyle(.purple)
+                    Spacer(minLength: 8)
+                    MuxaSwitchLimitedButton(model: model, limited: group.capped.map(\.agent))
+                        .controlSize(.small)
+                }
+                .padding(.top, 2)
                 ForEach(group.capped) { capped in
                     cappedRow(capped, showsHost: group.isShared)
                 }
@@ -231,23 +237,19 @@ struct MuxaUsagePopover: View {
     private var autoResumeFooter: some View {
         HStack {
             MuxaOpenSettingsButton(tab: .automations) {
-                Text("Auto-Resume…")
+                Text("Limit Policy…")
             }
             .buttonStyle(.muxaGhost)
             Spacer(minLength: 8)
             // Only reflect what is already loaded: the status bar should not
             // start an automation IPC round-trip just to label a button.
-            if automations.hasLoaded, automations.isSupported {
-                Text(autoResumeConfigured ? "On" : "Not set up")
+            if let policy = automations.limitPolicy {
+                Label(policy.title, systemImage: policy.systemImage)
                     .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
         }
-    }
-
-    private var autoResumeConfigured: Bool {
-        automations.masterEnabled
-            && automations.rules.contains { $0.enabled && $0.on == .rateLimited }
     }
 }
 
@@ -291,10 +293,15 @@ struct MuxaContextMeter: View {
     }
 }
 
-/// `Limited until 14:05` on a capped agent. Clicking it explains that an
-/// automation can resume the agent and opens Settings › Automations.
+/// `Limited until 14:05` on a capped agent. Clicking it offers what can be
+/// done now (switch the agent to another account) and what Muxa should do
+/// next time (the limit policy).
 struct MuxaRateLimitBadge: View {
+    @EnvironmentObject private var model: AppModel
     let agent: MuxaAgent
+    /// Where the agent runs, so the popover can act on it; nil shows only
+    /// the explanation and the policy.
+    var target: MuxaAgentActionTarget? = nil
 
     @State private var showsDetails = false
 
@@ -306,11 +313,11 @@ struct MuxaRateLimitBadge: View {
                 } label: {
                     Label(MuxaUsageFormat.capText(cap, now: context.date), systemImage: "hourglass")
                         .font(MuxaType.meta.weight(.medium))
-                        .foregroundStyle(.red)
+                        .foregroundStyle(.purple)
                         .lineLimit(1)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
-                        .background(Color.red.opacity(0.14), in: Capsule())
+                        .background(Color.purple.opacity(0.14), in: Capsule())
                         .contentShape(Capsule())
                 }
                 .buttonStyle(.plain)
@@ -334,16 +341,20 @@ struct MuxaRateLimitBadge: View {
             } else {
                 Text("No reset time was reported.")
             }
-            Text("An automation can resume this agent when the limit resets.")
-                .foregroundStyle(.secondary)
-            MuxaOpenSettingsButton(tab: .automations) {
-                Text("Set Up Auto-Resume…")
+            if let target, target.canSwitchAccount {
+                MuxaAgentPrimaryActionButton(model: model, target: target)
+                    .simultaneousGesture(TapGesture().onEnded { showsDetails = false })
             }
-            .buttonStyle(.muxaSecondary)
+            Divider()
+            MuxaLimitPolicyPicker(model: model, compact: true)
+            MuxaOpenSettingsButton(tab: .automations) {
+                Text("More in Automations…")
+            }
+            .buttonStyle(.muxaGhost)
         }
         .font(.callout)
         .padding(14)
-        .frame(width: 300, alignment: .leading)
+        .frame(width: 320, alignment: .leading)
     }
 }
 
@@ -351,11 +362,12 @@ struct MuxaRateLimitBadge: View {
 /// badge, both absent when the agent reports neither.
 struct MuxaPaneUsageAccessory: View {
     let agent: MuxaAgent?
+    var target: MuxaAgentActionTarget? = nil
 
     var body: some View {
         if let agent {
             HStack(spacing: 8) {
-                MuxaRateLimitBadge(agent: agent)
+                MuxaRateLimitBadge(agent: agent, target: target)
                 if let context = agent.contextUsedPercent {
                     MuxaContextMeter(percent: context)
                 }

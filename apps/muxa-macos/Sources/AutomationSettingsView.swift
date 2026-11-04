@@ -23,6 +23,7 @@ struct AutomationSettingsPane: View {
                     unsupportedCard
                 } else {
                     switchesCard
+                    limitPolicyCard
                     safetyCard
                     rulesCard
                     logCard
@@ -206,18 +207,21 @@ struct AutomationSettingsPane: View {
 
     // MARK: Rules
 
+    /// The limit policy: the common case, as one choice, above the rules
+    /// that implement it.
+    private var limitPolicyCard: some View {
+        MuxaLimitPolicyPicker(model: model, store: store)
+            .padding(14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
     private var rulesCard: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Label("Rules", systemImage: "list.bullet.rectangle")
                     .font(.headline)
                 Spacer()
-                Button {
-                    editorTarget = AutomationRuleEditorTarget(MuxaAutomationRuleDraft.sessionLimitDraft)
-                } label: {
-                    Label("Add the Session-Limit Rule", systemImage: "sparkles")
-                }
-                .disabled(store.existingNames.contains(MuxaAutomationRule.sessionLimitRecommendation.name))
                 Button {
                     editorTarget = AutomationRuleEditorTarget(MuxaAutomationRuleDraft())
                 } label: {
@@ -231,7 +235,7 @@ struct AutomationSettingsPane: View {
             if store.rules.isEmpty {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("No rules yet").font(.callout.weight(.semibold))
-                    Text("A fresh install ships none, so nothing fires until you add one. Add the session-limit rule to resume a capped agent when its window reopens.")
+                    Text("Nothing fires until a rule is added and switched on. Choose a limit policy above to handle capped agents without writing one.")
                         .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
                 }
@@ -287,7 +291,7 @@ struct AutomationSettingsPane: View {
                 VStack(spacing: 0) {
                     ForEach(Array(store.log.enumerated()), id: \.offset) { index, entry in
                         if index > 0 { Divider() }
-                        AutomationLogRow(entry: entry)
+                        AutomationLogRow(entry: entry, model: model)
                     }
                 }
             }
@@ -592,12 +596,14 @@ private struct AutomationBadge: View {
 
 private struct AutomationLogRow: View {
     let entry: MuxaAutomationLogEntry
+    var model: AppModel? = nil
 
     private var symbol: String {
         switch entry.outcome {
         case .fired: "checkmark.circle.fill"
         case .failed: "exclamationmark.triangle.fill"
         case .skipped: "minus.circle"
+        case .admitted: "arrow.triangle.2.circlepath"
         case .other: "circle"
         }
     }
@@ -606,6 +612,7 @@ private struct AutomationLogRow: View {
         switch entry.outcome {
         case .fired: .green
         case .failed: .red
+        case .admitted: .blue
         case .skipped, .other: .secondary
         }
     }
@@ -633,6 +640,20 @@ private struct AutomationLogRow: View {
                     }
                     if let agent = entry.agent, !agent.isEmpty {
                         AutomationTokenChips(title: "Agent", tokens: [agent], style: .agent)
+                    }
+                    // A swap the automation started runs as its own job:
+                    // follow it where the app follows every account switch.
+                    if entry.action == .swapAccount, let key = entry.operation, let model {
+                        Button("Follow Switch") {
+                            model.swaps.follow(
+                                requestKey: key,
+                                host: nil,
+                                title: String(localized: "\(entry.rule) · \(entry.pane ?? "")")
+                            )
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .help("Show this switch's progress and result in the status bar's Account Switches")
                     }
                 }
                 detailLine
@@ -992,7 +1013,18 @@ struct AutomationRuleEditor: View {
                     Text(automationActionDetail(draft.action))
                         .font(MuxaType.detail)
                         .foregroundStyle(.secondary)
-                    if draft.action.needsText {
+                    if draft.action.carriesAccount {
+                        TextField("Account", text: $draft.account, prompt: Text("Best account with quota left"))
+                            .font(.callout.monospaced())
+                        Text("An aas account such as work@claude. Leave empty to let aas pick the best-ranked account of the same provider that still has quota.")
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.secondary)
+                        TextField("Follow-up", text: $draft.text, prompt: Text("The [swap] follow-up from config.toml"))
+                            .font(.callout.monospaced())
+                        Text("Typed after the conversation resumes on the new account, so the turn the limit cut off carries on.")
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.secondary)
+                    } else if draft.action.needsText {
                         TextField("Text", text: $draft.text, prompt: Text(verbatim: "continue"))
                             .font(.callout.monospaced())
                         Toggle("Press Enter after typing", isOn: $draft.submit)
@@ -1376,6 +1408,7 @@ func automationActionTitle(_ action: MuxaAutomationAction) -> String {
     case .notify: String(localized: "Notify")
     case .interrupt: String(localized: "Interrupt")
     case .pressEnter: String(localized: "Confirm selected Yes")
+    case .swapAccount: String(localized: "Switch account and resume")
     case .other(let raw): raw
     }
 }
@@ -1390,6 +1423,8 @@ func automationActionDetail(_ action: MuxaAutomationAction) -> String {
         String(localized: "Presses Enter only while waiting on a selected Yes or Proceed confirmation.")
     case .interrupt:
         String(localized: "Sends the agent an interrupt, as Escape would.")
+    case .swapAccount:
+        String(localized: "Stops the agent, relaunches the same conversation on another aas account, and types the follow-up so it carries on.")
     case .other:
         String(localized: "An action this build of Muxa does not know.")
     }
@@ -1411,6 +1446,7 @@ func automationOutcomeTitle(_ outcome: MuxaAutomationOutcome) -> String {
     case .fired: String(localized: "Fired")
     case .skipped: String(localized: "Skipped")
     case .failed: String(localized: "Failed")
+    case .admitted: String(localized: "Swap started")
     case .other("judging"): String(localized: "Judging condition")
     case .other("judged"): String(localized: "Condition judged")
     case .other("judge_test"): String(localized: "Ask condition test")

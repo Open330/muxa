@@ -34,6 +34,7 @@ enum MuxaAutomationRuleIssue: Hashable, Sendable {
     case nameTooLong
     case duplicateName
     case missingText
+    case invalidAccount
     case textNotTerminalSafe
     case textTooLong
     case missingMessage
@@ -62,6 +63,8 @@ enum MuxaAutomationRuleIssue: Hashable, Sendable {
             String(localized: "A rule with this name already exists.")
         case .missingText:
             String(localized: "Send prompt needs the text to type.")
+        case .invalidAccount:
+            String(localized: "Account must be one aas account name, such as work@claude, or empty for the best account with quota left.")
         case .textNotTerminalSafe:
             String(localized: "Text may not contain terminal control characters — it is typed into a live agent. Tabs and newlines are fine.")
         case .textTooLong:
@@ -114,6 +117,8 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
     var text = ""
     var message = ""
     var submit = true
+    /// `swap_account`'s target; empty means `auto`.
+    var account = ""
     var maxPerHour = MuxaAutomationRule.defaultMaxPerHour
     var cooldown = MuxaAutomationRule.defaultCooldown
     /// nil keeps the daemon's default: the condition that armed the rule.
@@ -216,10 +221,13 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
     /// The action's payload is exclusive: `send_prompt` carries `text` and
     /// `submit`, `notify` carries `message`, `interrupt` carries neither.
     private var actionIssues: [MuxaAutomationRuleIssue] {
-        if action.needsText {
+        if action.carriesText {
             let text = self.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            if text.isEmpty { return [.missingText] }
             var issues: [MuxaAutomationRuleIssue] = []
+            if action.carriesAccount, !Self.isValidAccount(account) {
+                issues.append(.invalidAccount)
+            }
+            if text.isEmpty { return action.needsText ? issues + [.missingText] : issues }
             if self.text.utf8.count > MuxaAutomationRule.maximumTextBytes {
                 issues.append(.textTooLong)
             }
@@ -250,6 +258,13 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
         return seconds > MuxaAutomationDuration.maximumSeconds ? [.durationTooLong(field)] : []
     }
 
+    /// Empty (`auto`) or one aas account name: the daemon refuses blank
+    /// and whitespace-bearing names.
+    static func isValidAccount(_ account: String) -> Bool {
+        let trimmed = account.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty || !trimmed.contains(where: \.isWhitespace)
+    }
+
     func isReady(existingNames: Set<String>) -> Bool {
         issues(existingNames: existingNames).isEmpty
     }
@@ -259,7 +274,11 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
     /// rule that names no `wait` fires when the cap resets.
     var timing: MuxaAutomationWait? {
         let trimmed = wait.trimmingCharacters(in: .whitespaces)
-        if trimmed.isEmpty { return event.defaultWait }
+        if trimmed.isEmpty {
+            // Another account is the way around the cap, not a reason to
+            // wait it out: a swap fires on the event unless told otherwise.
+            return action == .swapAccount ? .delay(0) : event.defaultWait
+        }
         return MuxaAutomationWaitText.parse(trimmed)
     }
 
@@ -311,9 +330,12 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             fallback: event.supportsResetTiming ? fallback : nil,
             jitter: jitter,
             action: action,
-            text: action.needsText ? text : nil,
+            text: action.carriesText ? text : nil,
             message: action.needsMessage ? message : nil,
             submit: submit,
+            account: action.carriesAccount
+                ? account.trimmingCharacters(in: .whitespacesAndNewlines)
+                : nil,
             maxPerHour: maxPerHour,
             cooldown: cooldown.trimmingCharacters(in: .whitespaces).isEmpty
                 ? MuxaAutomationRule.defaultCooldown
@@ -344,6 +366,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             text: rule.text ?? "",
             message: rule.message ?? "",
             submit: rule.submit,
+            account: rule.account ?? "",
             maxPerHour: rule.maxPerHour,
             cooldown: rule.cooldown,
             onlyIfStill: rule.onlyIfStill,
@@ -584,11 +607,15 @@ final class AutomationStore: ObservableObject {
     /// What the run log section shows, and what `automation_log` is asked for.
     static let logLimit = 50
 
-    @Published private(set) var snapshot = MuxaAutomationSnapshot.empty
+    @Published private(set) var snapshot = MuxaAutomationSnapshot.empty {
+        didSet { publishLimitCoverage() }
+    }
     @Published private(set) var log: [MuxaAutomationLogEntry] = []
     @Published private(set) var isSupported = false
     @Published private(set) var isAskSupported = false
-    @Published private(set) var hasLoaded = false
+    @Published private(set) var hasLoaded = false {
+        didSet { publishLimitCoverage() }
+    }
     @Published private(set) var isLoading = false
     @Published private(set) var isMutating = false
     @Published private(set) var loadError: String?
@@ -601,6 +628,29 @@ final class AutomationStore: ObservableObject {
     @Published private(set) var isTesting = false
 
     init() {}
+
+    /// Tell every agent status whether capped agents are taken care of.
+    /// Only a daemon that answered counts: before that, stay covered.
+    private func publishLimitCoverage() {
+        guard hasLoaded || !snapshot.rules.isEmpty else { return }
+        MuxaLimitCoverage.isCovered = coversLimitedAgents
+    }
+
+    /// Re-read just the rules (no run log): cheap enough for the app's
+    /// reconciliation loop, so the limit policy follows edits made in
+    /// `config.toml` or by the CLI.
+    func refreshRules(model: AppModel) async {
+        guard !isMutating, !isLoading else { return }
+        guard await model.client.supports(MuxaIPCClient.automationCapability) else {
+            isSupported = false
+            return
+        }
+        isSupported = true
+        if let snapshot = try? await model.client.automationList() {
+            hasLoaded = true
+            if self.snapshot != snapshot { self.snapshot = snapshot }
+        }
+    }
 
     var rules: [MuxaAutomationRule] {
         snapshot.rules.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }

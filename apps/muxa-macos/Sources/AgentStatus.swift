@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 /// What an agent's state means to the person watching it.
 ///
@@ -57,11 +58,13 @@ enum MuxaAgentStatus: Hashable, Sendable {
         return false
     }
 
-    /// Something the person should act on now. A rate limit is not: it lifts
-    /// on its own, and an automation can resume the agent.
+    /// Something the person should act on now. A rate limit is only when no
+    /// limit policy will act on it (`MuxaLimitCoverage`): otherwise the
+    /// agent switches account or resumes at the reset on its own.
     var needsAttention: Bool {
         switch self {
         case .error, .needsInput: true
+        case .limited: !MuxaLimitCoverage.isCovered
         default: false
         }
     }
@@ -166,5 +169,21 @@ struct AgentStatusTag: View {
         .fixedSize()
         .accessibilityElement(children: .combine)
         .accessibilityLabel(status.label())
+    }
+}
+
+/// Whether a limit policy (an enabled `rate_limited` rule that switches
+/// account or resumes) will act on capped agents. Read by every status, on
+/// any thread, so it is a lock-guarded value rather than published state;
+/// `AutomationStore` sets it whenever its rules change.
+///
+/// It starts covered: until the rules are read, a capped agent is not
+/// worth a launch-time notification storm.
+enum MuxaLimitCoverage {
+    private static let state = OSAllocatedUnfairLock(initialState: true)
+
+    static var isCovered: Bool {
+        get { state.withLock { $0 } }
+        set { state.withLock { $0 = newValue } }
     }
 }

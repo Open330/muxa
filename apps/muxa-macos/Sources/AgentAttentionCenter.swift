@@ -42,6 +42,8 @@ enum MuxaNotificationRules {
     enum Event: Equatable, Sendable {
         case attention(String)
         case finished
+        /// Stopped by a usage cap that no limit policy will handle.
+        case limited
     }
 
     /// muxad's notifier uses the same window (`crates/muxa/src/notify.rs`).
@@ -88,12 +90,15 @@ enum MuxaNotificationActions {
     static let open = "muxa.action.open"
     static let markRead = "muxa.action.mark-read"
     static let reply = "muxa.action.reply"
+    static let switchAccount = "muxa.action.switch-account"
     /// Open and Mark as Read.
     static let agentCategory = "muxa.agent"
     /// Open, Reply…, and Mark as Read: only an agent waiting for free-form
     /// input can take typed text; a choice needs its menu, and an error or a
     /// finished turn is better answered from the pane.
     static let inputCategory = "muxa.agent.input"
+    /// Switch Account…, Open, and Mark as Read: a cap no policy handles.
+    static let limitedCategory = "muxa.agent.limited"
     /// `UNNotificationDefaultActionIdentifier`: the notification body itself.
     static let defaultAction = "com.apple.UNNotificationDefaultActionIdentifier"
     /// Fleet host states that can take a prompt from the Mac.
@@ -103,17 +108,23 @@ enum MuxaNotificationActions {
         case open
         case markRead
         case reply(String)
+        case switchAccount
         case ignore
     }
 
     static func category(for event: MuxaNotificationRules.Event) -> String {
-        event == .attention("waiting_input") ? inputCategory : agentCategory
+        switch event {
+        case .attention("waiting_input"): inputCategory
+        case .limited: limitedCategory
+        default: agentCategory
+        }
     }
 
     static func route(action: String, userText: String?) -> Route {
         switch action {
         case defaultAction, open: return .open
         case markRead: return .markRead
+        case switchAccount: return .switchAccount
         case reply:
             // An empty reply would only press Return in the agent's prompt.
             let text = userText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -174,6 +185,8 @@ final class MuxaAgentAttentionCenter: ObservableObject {
     private var humanNotified: [String: Date] = [:]
     static let humanPersistenceKey = "muxa.attention.human-notified.v1"
     /// A pane a notification click asked to open; the workbench consumes it.
+    /// A notification's Switch Account… asked for this pane's swap sheet.
+    @Published var pendingSwitch: MuxaWatchPaneIdentity?
     @Published var pendingOpen: MuxaWatchPaneIdentity? {
         didSet { pendingOpenAt = pendingOpen == nil ? nil : Date() }
     }
@@ -419,14 +432,19 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             let state = hosted.agent.state
             current[hosted.id] = state
             guard let previous = previousStates[hosted.id],
-                  let event = MuxaNotificationRules.event(from: previous, to: state) else { continue }
+                  let observed = MuxaNotificationRules.event(from: previous, to: state) else { continue }
             // A turn stopped by a rate limit reports `error`, but there is
             // nothing to fix: the rate-limit automation, not this alert,
             // handles it.
-            if case .attention = event, hosted.agent.status.isLimited { continue }
+            // A cap can arrive as either event (`error`, or working → idle).
+            // When a limit policy covers it, the policy acts and this stays
+            // quiet; otherwise it is the person's to handle, and says so.
+            let limited = hosted.agent.status.isLimited
+            if limited, MuxaLimitCoverage.isCovered { continue }
+            let event: MuxaNotificationRules.Event = limited ? .limited : observed
             let settings = settings()
             switch event {
-            case .attention: guard settings.notifyAttention else { continue }
+            case .attention, .limited: guard settings.notifyAttention else { continue }
             case .finished: guard settings.notifyFinished else { continue }
             }
             let pane = Self.paneIdentity(for: hosted)
@@ -467,6 +485,13 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             title = String(localized: "\(name) finished")
             body = MuxaNotificationRules.body(agent.lastResponse)
                 ?? MuxaNotificationRules.body(agent.recap)
+        case .limited:
+            title = String(localized: "\(name) hit its usage limit")
+            if case .limited(let cap) = agent.status, let until = cap.until {
+                body = String(localized: "Resets at \(MuxaUsageFormat.clock(until)). Switch it to another account to carry on now.")
+            } else {
+                body = String(localized: "Switch it to another account to carry on now.")
+            }
         }
         let location = hosted.pane.map { pane in
             let window = pane.windowName.isEmpty ? pane.stableWindowID : pane.windowName

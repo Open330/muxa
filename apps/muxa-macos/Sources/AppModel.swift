@@ -170,10 +170,15 @@ final class AppModel: ObservableObject {
     @Published var isPresentingHostRegistration = false
     @Published private(set) var isRegisteringHost = false
     @Published private(set) var hostRegistrationError: String?
+    /// The last agent action (send continue, …) that failed after its
+    /// control was clicked; the status bar shows it until dismissed.
+    @Published var agentActionError: String?
 
     let client: MuxaIPCClient
     // WS-A: unread state and macOS notifications for agent transitions.
     let attention: MuxaAgentAttentionCenter
+    /// Swaps the app started or follows (switch account and resume).
+    let swaps = MuxaSwapCenter()
     private let daemon = DaemonManager()
     private var refreshTask: Task<Void, Never>?
     private var fleetRefreshTask: Task<Void, Never>?
@@ -219,6 +224,7 @@ final class AppModel: ObservableObject {
 
     init(client: MuxaIPCClient = MuxaIPCClient()) {
         self.client = client
+        defer { swaps.attach(self) }
         // WS-A: tests get an in-memory center that never touches
         // UserDefaults, the notification center, or the Dock.
         if Self.isRunningTests() {
@@ -303,6 +309,13 @@ final class AppModel: ObservableObject {
                 // changes arrive through per-host mailbox revision events.
                 Task { [weak self] in await self?.refreshOperatorInbox(force: true) }
                 Task { [weak self] in await self?.loadAllWorkOptions() }
+                // The limit policy decides whether a capped agent needs the
+                // person, so the rules are read up front, not on first
+                // visit to Settings.
+                Task { [weak self] in
+                    guard let self else { return }
+                    await AutomationStore.shared.refreshRules(model: self)
+                }
                 async let events: Void = runFleetSubscription(ifGeneration: generation)
                 async let askEvents: Void = runAskSubscription(ifGeneration: generation)
                 async let pipelineEvents: Void = runPipelineSubscription(ifGeneration: generation)
@@ -480,6 +493,9 @@ final class AppModel: ObservableObject {
                 return
             }
             await refresh(ifGeneration: generation)
+            if !isDisconnected {
+                await AutomationStore.shared.refreshRules(model: self)
+            }
         }
     }
 

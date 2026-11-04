@@ -96,6 +96,7 @@ struct ContentView: View {
             PipelineEditorView(target: target, model: model)
         }
         .muxaNewAgentPresentation(model: model, openEditor: openEditor) // WS-B: new agent
+        .muxaSwapSheet(model: model)
         .task {
             model.activateEditor(tabs.focusedSelection)
             model.start()
@@ -520,6 +521,13 @@ struct ContentView: View {
             // WS-F: snapshot
             case .saveSnapshot: model.presentSessionSnapshots(.save)
             case .restoreSnapshot: model.presentSessionSnapshots(.restore)
+            case .switchLimitedAgents:
+                let limited = model.hostedAgents.filter { $0.agent.status.isLimited }
+                if let target = MuxaSwitchLimitedButton.sheetTarget(for: limited) {
+                    model.swaps.present(target)
+                }
+            case .fleetDispatch: model.isPresentingFleetDispatch = true
+            case .showFiles: editorCommands.showFiles?()
             }
         }
     }
@@ -1817,8 +1825,8 @@ private struct MuxaSidebar: View {
 
     /// Agents that need the reader, errors first. The topology tree
     /// scatters them across hosts and sessions, so the host view repeats
-    /// them in one place above it. Rate-limited agents stay in the tree:
-    /// they resume on their own.
+    /// them in one place above it. Rate-limited agents join them only when
+    /// no limit policy will resume them.
     private var pinnedAttentionPanes: [MuxaWatchPane] {
         filteredWatchPanes
             .filter(\.needsAttention)
@@ -2162,7 +2170,18 @@ private struct WorkbenchStatusBar: View {
 
             HStack(spacing: 14) {
                 // WS-C usage: hidden while unhealthy, when the figures are stale.
+                if let error = model.agentActionError {
+                    Button {
+                        model.agentActionError = nil
+                    } label: {
+                        Label(error, systemImage: "exclamationmark.triangle.fill")
+                            .foregroundStyle(.orange)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Click to dismiss")
+                }
                 if healthy {
+                    MuxaSwapStatusItem(swaps: model.swaps, openPane: openPane)
                     MuxaUsageStatusItems(agents: model.hostedAgents, openPane: openPane)
                 }
                 Label("\(model.fleetHosts.count) hosts", systemImage: "server.rack")
@@ -2875,9 +2894,14 @@ private struct FleetAgentDetailView: View {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(title)
                             .font(.system(size: 22, weight: .semibold))
-                        Text(participant.agent.status.label())
-                            .foregroundStyle(participant.agent.status.color)
-                        MuxaRateLimitBadge(agent: participant.agent) // WS-C usage
+                        // A cap is said once, by the badge, which also
+                        // explains it; any other status by its label.
+                        if participant.agent.status.isLimited {
+                            MuxaRateLimitBadge(agent: participant.agent, target: MuxaAgentActionTarget(participant)) // WS-C usage
+                        } else {
+                            Text(participant.agent.status.label())
+                                .foregroundStyle(participant.agent.status.color)
+                        }
                         Text(participant.agent.agentSessionID)
                             .font(MuxaType.detail.monospaced())
                             .foregroundStyle(.secondary)
@@ -2885,6 +2909,7 @@ private struct FleetAgentDetailView: View {
                     }
                     Spacer(minLength: 12)
                     VStack(alignment: .trailing, spacing: 6) {
+                        MuxaAgentActionBar(model: model, target: MuxaAgentActionTarget(participant))
                         if !needsAttention {
                             Button {
                                 model.openInLiveWatch(participant)

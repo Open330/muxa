@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Muxa.app acts on agents where it shows them. A rate-limited Claude Code or
+  Codex agent offers **Switch Account and Resume…** in its pane header, agent
+  detail, Explore context menu, Command Center (with **Switch All…** for every
+  capped agent on a host), the usage popover and its rate-limit badge. The
+  sheet previews exactly what `muxa swap` will do to each agent (from which
+  account to which, and whether the cut-off turn is carried on) before it
+  starts, and runs the swap as a daemon job on the agent's own host, local or
+  Fleet. Other agents offer **Move to Another Account…** and, when blocked or
+  failed, **Send "continue"**.
+- Account switches the app started, or an automation started ("Follow
+  Switch" in the run log), appear in the status bar while they run, with each
+  agent's outcome and follow-up delivery, **Stop After Current** and **Retry
+  Failed**.
+- A **limit policy** — switch to another account and continue, wait for the
+  reset and continue, or just tell me — is one choice in the rate-limit
+  popover, the usage popover and Settings › Automations, written as the
+  automation rules muxad already runs.
+- The command palette gains switching limited agents, Fleet Dispatch and
+  Show Files.
+
 - A swap checks what a target's relaunch needs before it touches the agent:
   the directory it runs in, a configured account's `env_file` (a regular
   file, unchanged since its relaunch was built), a directly-run pane's respawn shell (the one
@@ -17,6 +37,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of stopping an agent that cannot be relaunched; the checks are
   journalled. Programs resolved through the pane's own PATH are recorded as
   unknown, not certified.
+
+### Fixed
+
+- Muxa.app no longer rewrites a `swap_account` automation rule when it is
+  edited: its `account` and follow-up `text` were dropped on save. The rule
+  editor offers the action, and the run log names admitted swaps.
+- A rate-limited agent counts as needing attention, and notifies (with a
+  **Switch Account…** action), when no limit policy will act on it; before,
+  capped agents were silenced on the assumption that an automation would
+  resume them, while every resume rule ships disabled.
+- "Add the Session-Limit Rule" was permanently disabled by the starter rule
+  of the same name; the limit policy replaces it.
+- "Your decision needed" and human-request notifications open the message in
+  the Inbox instead of only switching the side bar, and "N more in Explore"
+  is a link.
 
 ## [0.9.4] - 2026-11-03
 
