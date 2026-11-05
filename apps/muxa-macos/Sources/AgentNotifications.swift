@@ -113,7 +113,18 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
             textInputButtonTitle: String(localized: "Send"),
             textInputPlaceholder: String(localized: "Message for the agent")
         )
+        let switchAccount = UNNotificationAction(
+            identifier: MuxaNotificationActions.switchAccount,
+            title: String(localized: "Switch Account…"),
+            options: [.foreground]
+        )
         return [
+            UNNotificationCategory(
+                identifier: MuxaNotificationActions.limitedCategory,
+                actions: [switchAccount, open, markRead],
+                intentIdentifiers: [],
+                options: []
+            ),
             UNNotificationCategory(
                 identifier: MuxaNotificationActions.agentCategory,
                 actions: [open, markRead],
@@ -206,6 +217,11 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
             open(pane)
             return
         }
+        if route == .switchAccount {
+            MuxaWorkbenchPresenter.present()
+            if let pane, let attention { attention.pendingSwitch = pane }
+            return
+        }
         guard let pane, route != .ignore else { return }
         if let attention {
             await perform(route, for: pane, in: attention)
@@ -222,7 +238,7 @@ final class MuxaUserNotifications: NSObject, MuxaNotificationPosting {
         switch route {
         case .markRead: await attention.markRead(pane)
         case .reply(let text): await attention.reply(text, to: pane)
-        case .open, .ignore: break
+        case .open, .switchAccount, .ignore: break
         }
     }
 

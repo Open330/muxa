@@ -67,9 +67,11 @@ struct MuxaAttentionTracking: ViewModifier {
             .onChange(of: model.workspaceRevision) { _ in
                 updateVisibility()
                 openPending()
+                openPendingSwitch()
             }
             .onChange(of: attention.pendingHumanMessageID) { _ in openHumanPending() }
             .onChange(of: attention.pendingOpen) { _ in openPending() }
+            .onChange(of: attention.pendingSwitch) { _ in openPendingSwitch() }
             .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
                 updateVisibility()
             }
@@ -103,7 +105,27 @@ struct MuxaAttentionTracking: ViewModifier {
         guard let id = attention.pendingHumanMessageID else { return }
         attention.pendingHumanMessageID = nil
         model.pendingOperatorMessageID = id
-        model.show(.inbox)
+        // Open the Inbox editor, not just its side bar: the message is
+        // shown there.
+        model.select(.inbox)
+    }
+
+    private func openPendingSwitch() {
+        guard let pane = attention.pendingSwitch else { return }
+        guard let watch = model.executionSnapshot.watchPane(id: pane),
+              let target = MuxaAgentActionTarget(watch) else {
+            // A click can launch the app: give the pane the same grace a
+            // plain open gets, then say what happened instead of nothing.
+            if let at = attention.pendingSwitchAt,
+               Date().timeIntervalSince(at) > MuxaAgentAttentionCenter.pendingOpenLifetime {
+                attention.pendingSwitch = nil
+                model.reportAgentActionError(String(localized: "That agent is no longer running, so there is nothing to switch."))
+            }
+            return
+        }
+        attention.pendingSwitch = nil
+        open(pane)
+        model.swaps.present(target.swapSheetTarget)
     }
 
     private func openPending() {

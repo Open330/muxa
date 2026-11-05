@@ -49,6 +49,9 @@ struct SessionSnapshotSheetHost: View {
             if await model.client.supports(MuxaIPCClient.muxSnapshotPlanCapability) {
                 viewModel.markCanFillRunningSessions()
             }
+            if await model.client.supports(MuxaIPCClient.muxSnapshotContinueCapability) {
+                viewModel.markCanContinueInterrupted()
+            }
             if sheet == .restore {
                 await viewModel.load()
             }
@@ -328,6 +331,17 @@ struct SessionSnapshotRestoreSheet: View {
                 Text(SessionSnapshotTree.summaryLine(plan))
                     .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
+            }
+            if viewModel.canContinueInterrupted, viewModel.midTurnAgents > 0, viewModel.phase != .finished {
+                Toggle(isOn: $viewModel.continueInterrupted) {
+                    Text(viewModel.midTurnAgents == 1
+                        ? "Tell the agent that was mid-turn to continue"
+                        : "Tell the \(viewModel.midTurnAgents) agents that were mid-turn to continue")
+                }
+                .toggleStyle(.checkbox)
+                .font(.system(size: 12))
+                .disabled(viewModel.isBusy || !viewModel.supported)
+                .help("Once each resumed agent's screen settles, type continue so it picks its interrupted turn back up")
             }
             HStack(spacing: 10) {
                 if viewModel.canFillRunningSessions {

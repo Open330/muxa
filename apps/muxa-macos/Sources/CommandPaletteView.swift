@@ -42,6 +42,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
     case showChanges // WS-D
     case newAgent, newDefaultAgent // WS-B: new agent
     case saveSnapshot, restoreSnapshot // WS-F: snapshot
+    case switchLimitedAgents, fleetDispatch, showFiles
 
     var id: Self { self }
 
@@ -74,6 +75,9 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .newDefaultAgent: String(localized: "Agent: New default agent here")
         case .saveSnapshot: String(localized: "Session: Save snapshot") // WS-F: snapshot
         case .restoreSnapshot: String(localized: "Session: Restore snapshot…") // WS-F: snapshot
+        case .switchLimitedAgents: String(localized: "Agents: Switch limited agents to another account…")
+        case .fleetDispatch: String(localized: "Work: Dispatch Work to a host…")
+        case .showFiles: String(localized: "View: Show Files")
         }
     }
 
@@ -103,6 +107,8 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .showWork, .showWatch, .showShells, .refresh: nil
         case .markAllRead: nil // WS-A
         case .saveSnapshot, .restoreSnapshot: nil // WS-F: snapshot
+        case .switchLimitedAgents, .fleetDispatch: nil
+        case .showFiles: "⇧⌘E"
         }
     }
 
@@ -132,6 +138,9 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .newDefaultAgent: "sparkle"
         case .saveSnapshot: "camera" // WS-F: snapshot
         case .restoreSnapshot: "clock.arrow.circlepath" // WS-F: snapshot
+        case .switchLimitedAgents: "arrow.triangle.2.circlepath"
+        case .fleetDispatch: "paperplane"
+        case .showFiles: "folder"
         }
     }
 
@@ -149,8 +158,13 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .newAgent, .newDefaultAgent: // WS-B: new agent
             guard model.isConnected else { return String(localized: "Daemon is not connected") }
             if model.isStartingAgent { return String(localized: "An agent is starting") }
-        case .saveSnapshot, .restoreSnapshot: // WS-F: snapshot
+        case .saveSnapshot, .restoreSnapshot, .fleetDispatch: // WS-F: snapshot
             guard model.isConnected else { return String(localized: "Daemon is not connected") }
+        case .switchLimitedAgents:
+            guard model.isConnected else { return String(localized: "Daemon is not connected") }
+            if MuxaSwitchLimitedButton.sheetTarget(for: model.hostedAgents.filter { $0.agent.status.isLimited }) == nil {
+                return String(localized: "No agent is at its usage limit")
+            }
         case .closeEditor, .previousEditor, .nextEditor, .splitEditor, .pinEditor:
             guard let selection = model.sidebarSelection, model.isSelectionAvailable(selection) else {
                 return String(localized: "No active editor")

@@ -245,10 +245,34 @@ struct MuxSnapshotPlan: Decodable, Hashable, Sendable {
         let note: String?
         let result: PaneResult?
         let error: String?
+        /// The agent was mid-turn when the snapshot was taken and resumes
+        /// its conversation; nil from a CLI that predates the flag.
+        let midTurn: Bool?
 
         enum CodingKeys: String, CodingKey {
             case index, path, action, state, command, note, result, error
             case agentKind = "agent_kind"
+            case midTurn = "mid_turn"
+        }
+    }
+
+    /// Agents this restore relaunches that were mid-turn: the ones
+    /// `continue` would tell to carry on. A running session's panes count
+    /// only when the restore adds them.
+    func midTurnAgents(onlyMissing: Bool) -> Int {
+        sessions.reduce(0) { total, session in
+            let acted: Bool
+            switch session.action {
+            case .create: acted = true
+            case .fillMissing: acted = !onlyMissing
+            case .skip, .unknown: acted = false
+            }
+            guard acted else { return total }
+            return total + session.windows.lazy.flatMap(\.panes).filter { pane in
+                guard pane.midTurn == true else { return false }
+                if session.action == .create { return true }
+                return pane.state == .missing
+            }.count
         }
     }
 
@@ -454,11 +478,17 @@ final class MuxaSessionSnapshotClient: Sendable {
         )
     }
 
-    func restore(id: String, layoutOnly: Bool, onlyMissing: Bool = true) async throws -> MuxSnapshotOperation {
-        try await operation(Self.requestObject(
-            "mux_snapshot_restore",
-            ["id": id, "layout_only": layoutOnly, "only_missing": onlyMissing]
-        ))
+    /// `continueText` needs `mux_snapshot_continue_v1`; it is sent only when
+    /// set, so an older muxad sees the request it always did.
+    func restore(
+        id: String, layoutOnly: Bool, onlyMissing: Bool = true, continueText: String? = nil
+    ) async throws -> MuxSnapshotOperation {
+        var fields: [String: Any] = ["id": id, "layout_only": layoutOnly, "only_missing": onlyMissing]
+        if let continueText, !layoutOnly {
+            let text = continueText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !text.isEmpty { fields["continue"] = text }
+        }
+        return try await operation(Self.requestObject("mux_snapshot_restore", fields))
     }
 
     func status(operationID: String) async throws -> MuxSnapshotOperation {
@@ -496,6 +526,8 @@ extension MuxaIPCClient {
     static let muxSnapshotCapability = "mux_snapshot_v1"
     /// Plans and restores that may fill running sessions (`only_missing`).
     static let muxSnapshotPlanCapability = "mux_snapshot_plan_v1"
+    /// Restores that tell mid-turn agents to carry on (`continue`).
+    static let muxSnapshotContinueCapability = "mux_snapshot_continue_v1"
 
     /// A snapshot client bound to this daemon's socket.
     nonisolated func makeSessionSnapshotClient() -> MuxaSessionSnapshotClient {

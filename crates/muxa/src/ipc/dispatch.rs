@@ -486,9 +486,13 @@ pub(super) async fn handle(
                     id,
                     layout_only,
                     only_missing,
+                    continue_text,
                 } => {
                     kind = "mux_snapshot_restore";
-                    match mux_snapshots.restore(&id, layout_only, only_missing).await {
+                    match mux_snapshots
+                        .restore(&id, layout_only, only_missing, continue_text.as_deref())
+                        .await
+                    {
                         Ok(operation) => Response::with_mux_snapshot_operation(operation),
                         Err(error) => Response::err(error.to_string()),
                     }

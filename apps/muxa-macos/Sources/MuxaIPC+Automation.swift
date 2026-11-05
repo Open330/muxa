@@ -158,9 +158,14 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
     case notify
     case interrupt
     case pressEnter
+    /// Move the agent onto another `aas` account and resume its
+    /// conversation, then type `text` (or the `[swap]` follow-up).
+    case swapAccount
     case other(String)
 
-    static let pickable: [MuxaAutomationAction] = [.sendPrompt, .notify, .interrupt, .pressEnter]
+    static let pickable: [MuxaAutomationAction] = [
+        .sendPrompt, .swapAccount, .notify, .interrupt, .pressEnter,
+    ]
 
     init(rawValue: String) {
         switch rawValue {
@@ -168,6 +173,7 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
         case "notify": self = .notify
         case "interrupt": self = .interrupt
         case "press_enter": self = .pressEnter
+        case "swap_account": self = .swapAccount
         default: self = .other(rawValue)
         }
     }
@@ -178,6 +184,7 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
         case .notify: "notify"
         case .interrupt: "interrupt"
         case .pressEnter: "press_enter"
+        case .swapAccount: "swap_account"
         case .other(let raw): raw
         }
     }
@@ -191,10 +198,17 @@ enum MuxaAutomationAction: Hashable, Sendable, Codable {
         try container.encode(rawValue)
     }
 
-    /// `send_prompt` is the only action that types into the agent, so it is
-    /// the only one that carries `text` and `submit`.
+    /// `send_prompt` and `swap_account` both type `text` into the agent:
+    /// the prompt itself, or the follow-up after the relaunch.
+    var carriesText: Bool { self == .sendPrompt || self == .swapAccount }
+    /// `send_prompt` cannot run without its text; a swap falls back to the
+    /// `[swap]` follow-up when it names none.
     var needsText: Bool { self == .sendPrompt }
+    /// Only `send_prompt` may leave its text unsent; the daemon refuses
+    /// `submit` anywhere else.
     var usesSubmit: Bool { self == .sendPrompt }
+    /// `swap_account` alone names a target account.
+    var carriesAccount: Bool { self == .swapAccount }
     /// `notify` carries `message` and nothing else.
     var needsMessage: Bool { self == .notify }
 }
@@ -277,6 +291,9 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
     var text: String?
     var message: String?
     var submit: Bool
+    /// `swap_account`'s target: an aas account name, or nil (`auto`) for
+    /// the best-ranked account with quota left.
+    var account: String?
 
     // Timing and guards, defaults already resolved on the way in.
     var wait: String?
@@ -325,6 +342,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         text: String? = nil,
         message: String? = nil,
         submit: Bool = true,
+        account: String? = nil,
         maxPerHour: Int = MuxaAutomationRule.defaultMaxPerHour,
         cooldown: String = MuxaAutomationRule.defaultCooldown,
         onlyIfStill: MuxaAutomationCondition? = nil,
@@ -345,6 +363,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         self.text = text
         self.message = message
         self.submit = submit
+        self.account = account
         self.wait = wait
         self.fallback = fallback
         self.jitter = jitter
@@ -360,7 +379,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
     enum CodingKeys: String, CodingKey {
         case name, on, enabled, action
         case agent, workspace, work, pane, host, notification, scope
-        case text, message, submit
+        case text, message, submit, account
         case wait, fallback, jitter, cooldown, filters
         case idleFor = "for"
         case maxPerHour = "max_per_hour"
@@ -387,6 +406,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         text = try values.decodeIfPresent(String.self, forKey: .text)
         message = try values.decodeIfPresent(String.self, forKey: .message)
         submit = try values.decodeIfPresent(Bool.self, forKey: .submit) ?? true
+        account = try values.decodeIfPresent(String.self, forKey: .account)
         wait = try values.decodeIfPresent(String.self, forKey: .wait)
         fallback = try values.decodeIfPresent(String.self, forKey: .fallback)
         jitter = try values.decodeIfPresent(String.self, forKey: .jitter)
@@ -423,10 +443,9 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         Self.put(wait, key: "wait", in: &object)
         if on.supportsResetTiming { Self.put(fallback, key: "fallback", in: &object) }
         Self.put(jitter, key: "jitter", in: &object)
-        if action.needsText {
-            Self.put(text, key: "text", in: &object)
-            object["submit"] = submit
-        }
+        if action.carriesText { Self.put(text, key: "text", in: &object) }
+        if action.usesSubmit { object["submit"] = submit }
+        if action.carriesAccount { Self.put(account, key: "account", in: &object) }
         if action.needsMessage { Self.put(message, key: "message", in: &object) }
         if let onlyIfStill { object["only_if_still"] = onlyIfStill.rawValue }
         if let askCondition { object["ask_condition"] = askCondition.wireObject }
@@ -469,9 +488,12 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
             lines.append("jitter = \(Self.tomlString(value))")
         }
         lines.append("action = \(Self.tomlString(action.rawValue))")
-        if action.needsText, let value = text, !value.isEmpty {
+        if action.carriesText, let value = text, !value.isEmpty {
             lines.append("text = \(Self.tomlString(value))")
-            lines.append("submit = \(submit)")
+            if action.usesSubmit { lines.append("submit = \(submit)") }
+        }
+        if action.carriesAccount, let value = Self.trimmed(account) {
+            lines.append("account = \(Self.tomlString(value))")
         }
         if action.needsMessage, let value = Self.trimmed(message) {
             lines.append("message = \(Self.tomlString(value))")
@@ -605,6 +627,9 @@ enum MuxaAutomationOutcome: Hashable, Sendable {
     case fired
     case skipped
     case failed
+    /// A swap job was admitted for the firing and runs on its own; its end
+    /// follows as another entry under the same `operation`.
+    case admitted
     case other(String)
 
     init(rawValue: String) {
@@ -612,6 +637,7 @@ enum MuxaAutomationOutcome: Hashable, Sendable {
         case "fired": self = .fired
         case "skipped": self = .skipped
         case "failed": self = .failed
+        case "admitted": self = .admitted
         default: self = .other(rawValue)
         }
     }
@@ -621,6 +647,7 @@ enum MuxaAutomationOutcome: Hashable, Sendable {
         case .fired: "fired"
         case .skipped: "skipped"
         case .failed: "failed"
+        case .admitted: "admitted"
         case .other(let raw): raw
         }
     }
@@ -638,9 +665,14 @@ struct MuxaAutomationLogEntry: Decodable, Hashable, Sendable {
     let detail: String?
     /// The arming episode, so one cap fires a rule once across restarts.
     let episode: String?
+    /// The request key of the swap job an `admitted` entry stands for, on
+    /// it and on the entry that ends it.
+    let operation: String?
+    /// That swap job's id, once one is known.
+    let job: String?
 
     enum CodingKeys: String, CodingKey {
-        case rule, pane, agent, action, outcome, detail, episode
+        case rule, pane, agent, action, outcome, detail, episode, operation, job
         case firedAt = "fired_at"
     }
 
@@ -656,6 +688,8 @@ struct MuxaAutomationLogEntry: Decodable, Hashable, Sendable {
         )
         detail = try values.decodeIfPresent(String.self, forKey: .detail)
         episode = try values.decodeIfPresent(String.self, forKey: .episode)
+        operation = try values.decodeIfPresent(String.self, forKey: .operation)
+        job = try values.decodeIfPresent(String.self, forKey: .job)
     }
 
     var firedDate: Date? { MuxaAutomationTime.parse(firedAt) }

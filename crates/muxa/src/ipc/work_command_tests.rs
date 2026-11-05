@@ -381,6 +381,7 @@ fn mux_snapshot_requests_decode_the_documented_shapes() {
             id,
             layout_only,
             only_missing,
+            continue_text,
         } => {
             assert_eq!(id, "1790000000");
             assert!(!layout_only, "restores the commands unless asked not to");
@@ -388,9 +389,17 @@ fn mux_snapshot_requests_decode_the_documented_shapes() {
                 only_missing,
                 "a mux_snapshot_v1 client never fills live sessions"
             );
+            assert_eq!(continue_text, None, "nothing is typed unless asked");
         }
         other => panic!("unexpected {other:?}"),
     }
+    assert!(matches!(
+        decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1","continue":"go on"}"#),
+        RequestBody::MuxSnapshotRestore {
+            continue_text: Some(text),
+            ..
+        } if text == "go on"
+    ));
     assert!(matches!(
         decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1","only_missing":false}"#),
         RequestBody::MuxSnapshotRestore {
@@ -410,6 +419,7 @@ fn mux_snapshot_requests_decode_the_documented_shapes() {
     ));
     assert!(CAPABILITIES.contains(&"mux_snapshot_v1"));
     assert!(CAPABILITIES.contains(&"mux_snapshot_plan_v1"));
+    assert!(CAPABILITIES.contains(&"mux_snapshot_continue_v1"));
     let plain = serde_json::to_value(Response::ok()).unwrap();
     assert!(plain.get("mux_snapshot").is_none());
     assert!(plain.get("mux_snapshot_operation").is_none());

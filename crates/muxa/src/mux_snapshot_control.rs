@@ -199,12 +199,15 @@ impl MuxSnapshotControl {
 
     /// Start `muxa restore <id> --only-missing --run --json` and return the
     /// running operation. Without `only_missing` (`mux_snapshot_plan_v1`),
-    /// existing sessions also get the windows and panes they lack.
+    /// existing sessions also get the windows and panes they lack. With
+    /// `continue_text` (`mux_snapshot_continue_v1`), agents the snapshot
+    /// caught mid-turn are told to carry on once they are back.
     pub async fn restore(
         self: &Arc<Self>,
         id: &str,
         layout_only: bool,
         only_missing: bool,
+        continue_text: Option<&str>,
     ) -> Result<MuxSnapshotOperation, MuxSnapshotError> {
         let dir = self.dir(id)?;
         let mut operations = self.operations.lock().await;
@@ -248,6 +251,10 @@ impl MuxSnapshotControl {
         args.extend(["--run".to_owned(), "--json".to_owned()]);
         if layout_only {
             args.push("--layout-only".to_owned());
+        } else if let Some(text) = continue_text.map(str::trim).filter(|text| !text.is_empty()) {
+            // One `--continue=TEXT` word: the flag's value is optional, so a
+            // separate word would be read as the snapshot directory.
+            args.push(format!("--continue={text}"));
         }
         let control = Arc::clone(self);
         tokio::spawn(async move {
@@ -404,7 +411,7 @@ mod tests {
         };
         // Let the save get counted in before the restore asks.
         tokio::time::sleep(Duration::from_millis(200)).await;
-        let refused = control.restore("1790000000", false, true).await;
+        let refused = control.restore("1790000000", false, true, None).await;
         assert!(
             matches!(refused, Err(MuxSnapshotError::SaveRunning)),
             "{refused:?}"
@@ -485,10 +492,13 @@ mod tests {
             binary,
             Some(PathBuf::from("/snapshots")),
         );
-        let running = control.restore("1790000000", true, true).await.unwrap();
+        let running = control
+            .restore("1790000000", true, true, Some("continue"))
+            .await
+            .unwrap();
         assert_eq!(running.state, MuxSnapshotOperationState::Running);
         assert!(matches!(
-            control.restore("1790000000", false, true).await,
+            control.restore("1790000000", false, true, None).await,
             Err(MuxSnapshotError::RestoreRunning)
         ));
         assert!(matches!(
@@ -512,6 +522,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_continue_text_travels_as_one_word() {
+        let dir = tempfile::tempdir().unwrap();
+        let binary = fake_cli(dir.path(), "echo '{\"totals\":{}}'");
+        let control = MuxSnapshotControl::with_parts(
+            dir.path().join("muxad.sock"),
+            binary,
+            Some(PathBuf::from("/snapshots")),
+        );
+        let running = control
+            .restore("1000", false, false, Some(" keep going "))
+            .await
+            .unwrap();
+        settle(&control, &running.operation_id).await;
+        let blank = control
+            .restore("1000", false, true, Some("  "))
+            .await
+            .unwrap();
+        settle(&control, &blank.operation_id).await;
+        assert_eq!(
+            argv(dir.path()),
+            "restore /snapshots/1000 --run --json --continue=keep going\n\
+             restore /snapshots/1000 --only-missing --run --json\n"
+        );
+    }
+
+    #[tokio::test]
     async fn a_failed_restore_keeps_the_partial_report() {
         let dir = tempfile::tempdir().unwrap();
         let binary = fake_cli(
@@ -523,7 +559,7 @@ mod tests {
             binary,
             Some(PathBuf::from("/snapshots")),
         );
-        let running = control.restore("1000", false, true).await.unwrap();
+        let running = control.restore("1000", false, true, None).await.unwrap();
         let done = settle(&control, &running.operation_id).await;
         assert_eq!(done.state, MuxSnapshotOperationState::Failed);
         assert_eq!(done.message, "creating session work");

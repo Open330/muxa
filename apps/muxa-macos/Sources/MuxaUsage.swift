@@ -114,6 +114,15 @@ struct MuxaRateLimitCap: Hashable, Sendable {
     /// When the cap lifts; nil when the source (a 429 `StopFailure`) carried
     /// no reset time.
     let until: Date?
+    /// A limit policy will act on it (`MuxaLimitCoverage`), so it does not
+    /// need the person.
+    var covered = false
+
+    init(scope: MuxaUsageWindowKind?, until: Date?, covered: Bool = false) {
+        self.scope = scope
+        self.until = until
+        self.covered = covered
+    }
 
     /// Mirrors the CLI's `is_currently_capped`: every `RateLimited` event
     /// sets the scope, so the scope is what marks a cap, and a known reset

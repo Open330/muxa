@@ -114,6 +114,11 @@ pub(super) struct PanePlan {
     pub command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_kind: Option<String>,
+    /// The agent was mid-turn when the snapshot was taken and resumes its
+    /// conversation, so `--continue` would tell it to carry on. Absent
+    /// when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub mid_turn: bool,
     /// What a person has to do, for a pane muxa cannot relaunch itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
@@ -479,6 +484,8 @@ pub(super) fn plan(
                                 state: None,
                                 command,
                                 agent_kind: pane.agent.as_ref().map(|agent| agent.kind.clone()),
+                                mid_turn: action == PaneAction::Resume
+                                    && pane.agent.as_ref().is_some_and(|agent| agent.working),
                                 note: if action == PaneAction::ResumeByHand {
                                     resume_hint(pane)
                                 } else {
@@ -926,9 +933,29 @@ mod tests {
         assert_eq!(pane["action"], "resume");
         assert_eq!(pane["command"], "claude --resume abc");
         assert_eq!(pane["agent_kind"], "claude_code");
+        assert!(
+            pane.get("mid_turn").is_none(),
+            "an idle agent is not mid-turn"
+        );
         assert!(pane.get("target").is_none(), "internal key stays internal");
         assert!(pane.get("result").is_none(), "no results in a dry run");
         assert!(value.get("totals").is_none());
+    }
+
+    #[test]
+    fn a_resumed_agent_that_was_working_is_marked_mid_turn() {
+        let mut busy = snapshot();
+        busy.panes[1].agent.as_mut().unwrap().working = true;
+        let live = BTreeSet::new();
+        let resumed = &plan(&busy, &live, true, false)[0].windows[0].panes[1];
+        assert!(resumed.mid_turn);
+        assert_eq!(
+            serde_json::to_value(resumed).unwrap()["mid_turn"],
+            serde_json::json!(true)
+        );
+        // An empty shell carries no turn on.
+        let shell = &plan(&busy, &live, true, true)[0].windows[0].panes[1];
+        assert!(!shell.mid_turn);
     }
 
     #[test]

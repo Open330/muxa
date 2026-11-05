@@ -153,6 +153,11 @@ pub(super) enum RequestBody {
         layout_only: bool,
         #[serde(default = "mux_snapshot_only_missing")]
         only_missing: bool,
+        /// `mux_snapshot_continue_v1`: after the relaunch, type this into
+        /// every agent the snapshot caught mid-turn (`muxa restore
+        /// --continue`). Absent or blank sends nothing.
+        #[serde(default, rename = "continue")]
+        continue_text: Option<String>,
     },
     MuxSnapshotRestoreStatus {
         operation_id: String,
@@ -884,6 +889,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "agent_start_v1",  // WS-B: new agent
     "mux_snapshot_v1", // WS-F: snapshot
     "mux_snapshot_plan_v1",
+    "mux_snapshot_continue_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",

@@ -21,7 +21,8 @@ and encodes user input.
   `muxa snapshot` / `muxa restore --only-missing --json`; the restore
   preview compares the snapshot with what runs now, and with
   `mux_snapshot_plan_v1` "Only missing sessions" can be turned off to also
-  fill in running sessions; and
+  fill in running sessions, and with `mux_snapshot_continue_v1` agents the
+  snapshot caught mid-turn can be told to `continue` once resumed; and
 - provides both a main window and a menu-bar control.
 
 External tmux, cmux, rmux, herdr, and zellij surfaces remain execution
@@ -178,9 +179,12 @@ the tab while another Work, Agent, Host, or Shell is inspected. `Command-Shift-P
 opens the workspace command palette, and each sidebar context supports text and
 status filters (`All`, `Attention`, `Active`); in Ask, Active is a
 conversation still being answered and Attention one whose last turn failed.
-The Inbox activity badge keeps agent attention, waiting commands, and unread
-replies visible even when another context is selected, and the Ask badge
-counts questions still being answered. Editor tab
+Every attention count reads one summary (`MuxaAttentionSummary`). The Inbox
+badge, the menu bar and Command Center's "Need attention" show what needs the
+person — agents that need them, peers' requests for a decision, and unread
+replies — even when another context is selected; commands still waiting on an
+agent are listed but not counted. Explore's badge counts unread panes, the
+Dock both (each once), and the Ask badge questions still being answered. Editor tab
 close controls and all Explorer disclosure/row targets use full-size hit areas
 rather than relying on the visible glyph alone.
 
@@ -623,6 +627,39 @@ be revealed in Finder or opened in their default application.
 preview has keyboard focus. It keeps an empty workbench open. **⇧⌘W** closes the
 window, **⇧⌘T** reopens the last closed tab, and **⌃Tab / ⌃⇧Tab** move between
 tabs. Live Watch uses **⌃⌘W** so it does not conflict with Close Window.
+
+## Agent actions and account switching
+
+Wherever an agent is shown — pane header, agent detail, Explore's context
+menu, Command Center, the usage popover and the rate-limit badge — the same
+actions appear under the same names, the one its state calls for first:
+
+- a rate-limited Claude Code or Codex agent: **Switch Account and Resume…**;
+- a blocked or failed agent: **Send "continue"** and **Move to Another
+  Account…**;
+- any other Claude Code or Codex agent: **Move to Another Account…**.
+
+The switch sheet runs `muxa swap … --json` on the agent's own host (local or
+Fleet) through muxad's `work_command`, so it uses the CLI's swap logic, daemon
+jobs and request keys unchanged. Before starting it shows the `--dry-run` plan
+per agent: from which `aas` account to which, and whether the interrupted turn
+is carried on. Running and finished switches appear in the status bar with
+**Stop After Current** and **Retry Failed**; a switch an automation started
+can be followed from the run log. When the local swap service cannot take a
+job, the sheet and Settings › Automations say why (`swap_health`).
+
+**When an agent hits its usage limit** is one choice — switch to another
+account and continue, wait for the reset and continue, or just tell me — in
+the rate-limit popover, the usage popover and Settings › Automations. It is
+written as ordinary automation rules (`swap-on-limit`, the
+`resume-after-limit` starter), so the CLI and `config.toml` see the same
+thing. The policy covers this Mac's agents (the rules run in its muxad); a
+capped agent counts as needing the person, and notifies with a **Switch
+Account…** action, unless a rule of its own host's daemon will act on it — so
+a capped agent on a Fleet host always asks.
+
+Restoring a snapshot can also tell the agents it caught mid-turn to
+`continue` once resumed (`mux_snapshot_continue_v1`).
 
 ## Explicit requests for a person
 

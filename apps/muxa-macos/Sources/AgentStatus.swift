@@ -1,4 +1,5 @@
 import SwiftUI
+import os
 
 /// What an agent's state means to the person watching it.
 ///
@@ -29,7 +30,8 @@ enum MuxaAgentStatus: Hashable, Sendable {
         // agent's next start or turn end, so on a running agent, or one now
         // waiting for input, the cap is history and must not hide it.
         if Self.cappableStates.contains(state),
-           let cap = MuxaRateLimitCap.current(for: agent, now: now) {
+           var cap = MuxaRateLimitCap.current(for: agent, now: now) {
+            cap.covered = MuxaLimitCoverage.covers(agent, now: now)
             self = .limited(cap)
             return
         }
@@ -57,11 +59,13 @@ enum MuxaAgentStatus: Hashable, Sendable {
         return false
     }
 
-    /// Something the person should act on now. A rate limit is not: it lifts
-    /// on its own, and an automation can resume the agent.
+    /// Something the person should act on now. A rate limit is only when no
+    /// limit policy will act on it (`MuxaLimitCoverage`): otherwise the
+    /// agent switches account or resumes at the reset on its own.
     var needsAttention: Bool {
         switch self {
         case .error, .needsInput: true
+        case .limited(let cap): !cap.covered
         default: false
         }
     }
@@ -166,5 +170,99 @@ struct AgentStatusTag: View {
         .fixedSize()
         .accessibilityElement(children: .combine)
         .accessibilityLabel(status.label())
+    }
+}
+
+/// Which capped agents a limit policy takes care of, so they need not ask
+/// for the person.
+///
+/// Automation rules run in the daemon that owns the pane, so the app's own
+/// muxad covers only its own agents: a capped agent on a Fleet host always
+/// counts as the person's. A rule covers the agent kinds and limit scopes
+/// it names (all when it names none); a rule with any other filter covers
+/// nothing, since the app cannot tell which panes it matches. A switch rule
+/// covers only Claude Code and Codex, and nothing while the swap service
+/// says it cannot take a job. A pause covers nothing until it ends.
+enum MuxaLimitCoverage {
+    struct Grant: Hashable, Sendable {
+        /// Agent kinds; nil for every kind.
+        var kinds: Set<String>?
+        /// Limit scopes (`five_hour`, …); nil for every scope.
+        var scopes: Set<String>?
+        /// It acts by switching account, so needs the swap service.
+        var switches: Bool
+    }
+
+    struct State: Equatable, Sendable {
+        var grants: [Grant] = []
+        var pausedUntil: Date?
+        var swapAvailable = true
+        /// `agent_session_id`s on the app's own host.
+        var localAgents: Set<String> = []
+    }
+
+    private static let state = OSAllocatedUnfairLock(initialState: State())
+    /// Posted when the rules, pause or swap availability change, so counts
+    /// that depend on them are worked out again.
+    static let didChange = Notification.Name("MuxaLimitCoverageDidChange")
+
+    static func covers(_ agent: MuxaAgent, now: Date = .now) -> Bool {
+        covers(agent, in: state.withLock { $0 }, now: now)
+    }
+
+    static func covers(_ agent: MuxaAgent, in state: State, now: Date = .now) -> Bool {
+        guard state.localAgents.contains(agent.agentSessionID) else { return false }
+        if let until = state.pausedUntil, until > now { return false }
+        return state.grants.contains { grant in
+            if grant.switches && !state.swapAvailable { return false }
+            if let kinds = grant.kinds, !kinds.contains(agent.kind) { return false }
+            if let scopes = grant.scopes {
+                guard let scope = agent.rateLimitScope, scopes.contains(scope) else { return false }
+            }
+            return true
+        }
+    }
+
+    /// What the local daemon's live rules cover.
+    static func grants(enabled: Bool, rules: [MuxaAutomationRule]) -> [Grant] {
+        guard enabled else { return [] }
+        return rules.compactMap { rule in
+            guard rule.enabled, rule.on == .rateLimited,
+                  rule.action == .swapAccount || rule.action == .sendPrompt,
+                  rule.workspace == nil, rule.work == nil, rule.pane == nil,
+                  rule.host == nil, rule.notification == nil else { return nil }
+            let named = rule.agent.isEmpty ? nil : Set(rule.agent)
+            let switches = rule.action == .swapAccount
+            var kinds = named
+            if switches {
+                kinds = (named ?? MuxaAgentActionTarget.switchableKinds)
+                    .intersection(MuxaAgentActionTarget.switchableKinds)
+                if kinds?.isEmpty == true { return nil }
+            }
+            return Grant(kinds: kinds, scopes: rule.scope.isEmpty ? nil : Set(rule.scope), switches: switches)
+        }
+    }
+
+    static func setRules(_ grants: [Grant], pausedUntil: Date?) {
+        update { $0.grants = grants; $0.pausedUntil = pausedUntil }
+    }
+
+    static func setSwapAvailable(_ available: Bool) {
+        update { $0.swapAvailable = available }
+    }
+
+    /// The agents on the app's own host; set before each snapshot is
+    /// counted, so it posts nothing.
+    static func setLocalAgents(_ ids: Set<String>) {
+        state.withLock { $0.localAgents = ids }
+    }
+
+    private static func update(_ change: @Sendable (inout State) -> Void) {
+        let changed = state.withLock { current -> Bool in
+            let before = current
+            change(&current)
+            return current != before
+        }
+        if changed { NotificationCenter.default.post(name: didChange, object: nil) }
     }
 }
