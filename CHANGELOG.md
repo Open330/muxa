@@ -66,6 +66,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - "Your decision needed" and human-request notifications open the message in
   the Inbox instead of only switching the side bar, and "N more in Explore"
   is a link.
+- `muxa agent start` registers an agent launched without a prompt even when
+  its CLI shows up in the pane a moment after the window does: it looks for
+  it for up to 5 seconds rather than reading the pane once and silently
+  leaving it to periodic discovery.
 
 ## [0.9.4] - 2026-11-03
 
