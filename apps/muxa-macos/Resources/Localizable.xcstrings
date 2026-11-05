@@ -1188,34 +1188,6 @@
         }
       }
     },
-    "%lld need attention" : {
-      "localizations" : {
-        "en" : {
-          "variations" : {
-            "plural" : {
-              "one" : {
-                "stringUnit" : {
-                  "state" : "translated",
-                  "value" : "%lld needs attention"
-                }
-              },
-              "other" : {
-                "stringUnit" : {
-                  "state" : "translated",
-                  "value" : "%lld need attention"
-                }
-              }
-            }
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%lld개가 주의를 필요로 합니다"
-          }
-        }
-      }
-    },
     "%lld new since snapshot" : {
       "localizations" : {
         "ko" : {
@@ -19755,6 +19727,226 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "답변하기…"
+          }
+        }
+      }
+    },
+    "%@ Restart muxad to take swaps again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 다시 전환하려면 muxad를 재시작하세요."
+          }
+        }
+      }
+    },
+    "%lld agents hit their usage limit: Switch…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 %lld개가 사용 한도에 도달함: 전환…"
+          }
+        }
+      }
+    },
+    "%lld agents need you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인이 필요한 에이전트 %lld개"
+          }
+        }
+      }
+    },
+    "%lld decisions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정 %lld건"
+          }
+        }
+      }
+    },
+    "%lld switches running" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전환 %lld건 진행 중"
+          }
+        }
+      }
+    },
+    "%lld unread replies" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽지 않은 답장 %lld건"
+          }
+        }
+      }
+    },
+    "1 agent hit its usage limit: Switch Account…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 1개가 사용 한도에 도달함: 계정 전환…"
+          }
+        }
+      }
+    },
+    "1 agent needs you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인이 필요한 에이전트 1개"
+          }
+        }
+      }
+    },
+    "1 decision" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정 1건"
+          }
+        }
+      }
+    },
+    "1 switch running" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전환 1건 진행 중"
+          }
+        }
+      }
+    },
+    "1 unread reply" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "읽지 않은 답장 1건"
+          }
+        }
+      }
+    },
+    "Account switching is ready" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환을 사용할 수 있습니다"
+          }
+        }
+      }
+    },
+    "Account switching is shutting down" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 서비스가 종료되는 중입니다"
+          }
+        }
+      }
+    },
+    "Account switching is unavailable" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환을 사용할 수 없습니다"
+          }
+        }
+      }
+    },
+    "Account switching stopped after a fault" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오류로 계정 전환이 중단되었습니다"
+          }
+        }
+      }
+    },
+    "Account switching: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환: %@"
+          }
+        }
+      }
+    },
+    "Cleanup of old swap records failed: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오래된 전환 기록을 정리하지 못했습니다: %@"
+          }
+        }
+      }
+    },
+    "Couldn't check account switching: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "계정 전환 상태를 확인하지 못했습니다: %@"
+          }
+        }
+      }
+    },
+    "Once each resumed agent's screen settles, type continue so it picks its interrupted turn back up" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "재개된 에이전트 화면이 안정되면 continue를 입력해 중단된 작업을 이어 가게 합니다"
+          }
+        }
+      }
+    },
+    "Open the Inbox" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inbox 열기"
+          }
+        }
+      }
+    },
+    "Tell the %lld agents that were mid-turn to continue" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 중이던 에이전트 %lld개에 continue 보내기"
+          }
+        }
+      }
+    },
+    "Tell the agent that was mid-turn to continue" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 중이던 에이전트에 continue 보내기"
           }
         }
       }

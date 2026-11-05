@@ -178,10 +178,14 @@ protocol MuxaNotificationPosting: AnyObject {
 @MainActor
 final class MuxaAgentAttentionCenter: ObservableObject {
     @Published private(set) var unreadPanes: Set<MuxaWatchPaneIdentity> = []
-    /// Agents needing attention plus unread panes, for the Dock badge.
-    @Published private(set) var dockCount = 0
+    /// What needs the person: the source of every badge and count.
+    @Published private(set) var summary = MuxaAttentionSummary()
+    /// Needs-you plus unread, each once: the Dock badge.
+    var dockCount: Int { summary.dock }
     @Published var pendingHumanMessageID: String?
     private var humanRequests: Set<String> = []
+    private var messages: [MuxaOperatorMessage] = []
+    private var coverageObserver: NSObjectProtocol?
     private var humanNotified: [String: Date] = [:]
     static let humanPersistenceKey = "muxa.attention.human-notified.v1"
     /// A pane a notification click asked to open; the workbench consumes it.
@@ -237,6 +241,13 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         } else {
             seen = [:]
         }
+        // A limit policy chosen or dropped changes whether capped agents
+        // need the person, with no new snapshot to say so.
+        coverageObserver = NotificationCenter.default.addObserver(
+            forName: MuxaLimitCoverage.didChange, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.recompute() }
+        }
     }
 
     static func key(_ pane: MuxaWatchPaneIdentity) -> String {
@@ -281,6 +292,7 @@ final class MuxaAgentAttentionCenter: ObservableObject {
     /// and the pane currently visible. Every Fleet client can read the same
     /// request; notification receipts are local to this Mac.
     func ingestHumanRequests(_ messages: [MuxaOperatorMessage]) {
+        self.messages = messages
         let pending = messages.filter { $0.isHumanRequest && $0.request.needsHumanResponse }
         let active = Set(pending.map(\.id))
         poster?.removeDelivered(identifiers: humanRequests.subtracting(active).map { "human:\($0)" })
@@ -416,13 +428,14 @@ final class MuxaAgentAttentionCenter: ObservableObject {
                 unread.insert(pane.id)
             }
         }
-        var needing = Set(unread.map(Self.key))
-        needing.formUnion(humanRequests.map { "human:\($0)" })
-        for hosted in snapshot.hostedAgents where hosted.agent.status.needsAttention {
-            needing.insert(Self.paneIdentity(for: hosted).map(Self.key) ?? "agent:\(hosted.id)")
-        }
+        let summary = MuxaAttentionSummary.make(
+            agents: snapshot.hostedAgents,
+            messages: messages,
+            unread: Set(unread.map(Self.key)),
+            paneKey: { Self.paneIdentity(for: $0).map(Self.key) ?? "agent:\($0.id)" }
+        )
         if unreadPanes != unread { unreadPanes = unread }
-        if dockCount != needing.count { dockCount = needing.count }
+        if self.summary != summary { self.summary = summary }
         refreshDockBadge()
     }
 

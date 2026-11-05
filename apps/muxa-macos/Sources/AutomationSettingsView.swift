@@ -210,7 +210,13 @@ struct AutomationSettingsPane: View {
     /// The limit policy: the common case, as one choice, above the rules
     /// that implement it.
     private var limitPolicyCard: some View {
-        MuxaLimitPolicyPicker(model: model, store: store)
+        VStack(alignment: .leading, spacing: 10) {
+            MuxaLimitPolicyPicker(model: model, store: store)
+            if store.limitPolicy == .switchAccount {
+                Divider()
+                MuxaSwapHealthSection(swaps: model.swaps)
+            }
+        }
             .padding(14)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))

@@ -51,6 +51,32 @@ final class SessionSnapshotViewModel: ObservableObject {
     @Published private(set) var onlyMissing = true
     /// Whether this muxad plans and restores without `--only-missing`.
     @Published private(set) var canFillRunningSessions = false
+    /// Whether this muxad can tell mid-turn agents to carry on after a
+    /// restore (`mux_snapshot_continue_v1`).
+    @Published private(set) var canContinueInterrupted = false
+    /// Type `continue` into the agents the snapshot caught mid-turn. Off
+    /// unless the person turned it on before: an old snapshot's turn may no
+    /// longer be wanted.
+    @Published var continueInterrupted: Bool = SessionSnapshotViewModel.storedContinueChoice {
+        didSet { SessionSnapshotViewModel.storedContinueChoice = continueInterrupted }
+    }
+
+    private static let continueChoiceKey = "MuxaRestoreContinuesInterruptedAgents"
+    private static var storedContinueChoice: Bool {
+        get { UserDefaults.standard.bool(forKey: continueChoiceKey) }
+        set { UserDefaults.standard.set(newValue, forKey: continueChoiceKey) }
+    }
+
+    /// Agents the selected plan relaunches that were mid-turn.
+    var midTurnAgents: Int {
+        guard let plan, !plan.run, !layoutOnly else { return 0 }
+        return plan.midTurnAgents(onlyMissing: onlyMissing)
+    }
+
+    /// What the restore will type, or nil for nothing.
+    var continueText: String? {
+        canContinueInterrupted && continueInterrupted && midTurnAgents > 0 ? "continue" : nil
+    }
 
     private let client: MuxaSessionSnapshotClient
     private let pollInterval: Duration
@@ -99,6 +125,11 @@ final class SessionSnapshotViewModel: ObservableObject {
     /// The daemon advertises `mux_snapshot_plan_v1`.
     func markCanFillRunningSessions() {
         canFillRunningSessions = true
+    }
+
+    /// The daemon advertises `mux_snapshot_continue_v1`.
+    func markCanContinueInterrupted() {
+        canContinueInterrupted = true
     }
 
     /// Switch between leaving running sessions alone and filling in what
@@ -185,7 +216,9 @@ final class SessionSnapshotViewModel: ObservableObject {
         restoreStartedAt = Date()
         statusMessage = String(localized: "Restoring…")
         do {
-            var operation = try await client.restore(id: id, layoutOnly: layoutOnly, onlyMissing: onlyMissing)
+            var operation = try await client.restore(
+                id: id, layoutOnly: layoutOnly, onlyMissing: onlyMissing, continueText: continueText
+            )
             while operation.state == .running {
                 try await Task.sleep(for: pollInterval)
                 operation = try await client.status(operationID: operation.operationID)

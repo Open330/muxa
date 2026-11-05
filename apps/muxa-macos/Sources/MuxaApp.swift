@@ -421,7 +421,19 @@ private struct MuxaEditorMenuCommands: Commands {
 
 private struct MenuBarContent: View {
     @ObservedObject var model: AppModel
+    @ObservedObject private var attention: MuxaAgentAttentionCenter
     @Environment(\.openWindow) private var openWindow
+
+    init(model: AppModel) {
+        self.model = model
+        attention = model.attention
+    }
+
+    private func openMain(_ then: () -> Void = {}) {
+        then()
+        openWindow(id: "main")
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     private var liveSessionCount: Int {
         model.sessions.lazy.filter { !$0.exited }.count
@@ -431,19 +443,35 @@ private struct MenuBarContent: View {
         model.agents.lazy.filter { $0.state != "stopped" }.count
     }
 
-    private var attentionCount: Int {
-        model.agents.lazy.filter { $0.status.needsAttention }.count
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text("Muxa")
                 .font(.headline)
             Text("\(liveAgentCount) agents · \(model.pipelineRuns.count) work items")
                 .foregroundStyle(.secondary)
-            if attentionCount > 0 {
-                Label("\(attentionCount) need attention", systemImage: "exclamationmark.circle.fill")
-                    .foregroundStyle(.orange)
+            if let line = attention.summary.needsYouLine {
+                // The same count as the Inbox badge; opens the Inbox.
+                Button {
+                    openMain { model.select(.inbox) }
+                } label: {
+                    Label(line, systemImage: "exclamationmark.circle.fill")
+                        .foregroundStyle(.orange)
+                }
+                .buttonStyle(.plain)
+                .help("Open the Inbox")
+            }
+            if attention.summary.uncoveredLimited > 0,
+               let target = MuxaSwitchLimitedButton.sheetTarget(
+                   for: model.hostedAgents.filter { $0.agent.status.isLimited }
+               ) {
+                Button {
+                    openMain { model.swaps.present(target) }
+                } label: {
+                    Label(attention.summary.uncoveredLimited == 1
+                        ? "1 agent hit its usage limit: Switch Account…"
+                        : "\(attention.summary.uncoveredLimited) agents hit their usage limit: Switch…",
+                        systemImage: "arrow.triangle.2.circlepath")
+                }
             }
             Text("\(liveSessionCount) native shells")
                 .font(MuxaType.detail)

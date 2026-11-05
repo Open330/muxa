@@ -235,3 +235,69 @@ private func rule(_ name: String, action: MuxaAutomationAction, enabled: Bool, o
     #expect(MuxaNotificationActions.route(action: MuxaNotificationActions.switchAccount, userText: nil) == .switchAccount)
     #expect(MuxaNotificationActions.category(for: .attention("waiting_input")) == MuxaNotificationActions.inputCategory)
 }
+
+// MARK: - Attention summary
+
+@MainActor
+@Test func oneSummaryCountsEachThingOnce() throws {
+    let host = MuxaFleetHostIdentity(alias: "local", local: true, state: "online", mode: "control")
+    let blocked = MuxaHostedAgent(host: host, agent: try agent(["state": "waiting_input"], id: "a"), pane: nil)
+    let busy = MuxaHostedAgent(host: host, agent: try agent(["state": "working"], id: "b"), pane: nil)
+    let capped = MuxaHostedAgent(host: host, agent: try agent(capped, id: "c"), pane: nil)
+    let key: (MuxaHostedAgent) -> String = { "agent:\($0.agent.agentSessionID)" }
+
+    let previous = MuxaLimitCoverage.isCovered
+    defer { MuxaLimitCoverage.isCovered = previous }
+
+    // No policy acts on caps: the capped agent needs the person.
+    MuxaLimitCoverage.isCovered = false
+    var summary = MuxaAttentionSummary.make(
+        agents: [blocked, busy, capped], messages: [], unread: ["agent:a", "pane:x"], paneKey: key
+    )
+    #expect(summary.agents == 2)
+    #expect(summary.limited == 1)
+    #expect(summary.uncoveredLimited == 1)
+    #expect(summary.needsYou == 2)
+    #expect(summary.unreadPanes == 2)
+    // `a` is both blocked and unread: once on the Dock.
+    #expect(summary.dock == 3)
+    #expect(summary.needsYouLine == "2 agents need you")
+
+    // A policy acts: the cap is still counted as limited, not as needing you.
+    MuxaLimitCoverage.isCovered = true
+    summary = MuxaAttentionSummary.make(agents: [blocked, busy, capped], messages: [], unread: [], paneKey: key)
+    #expect(summary.agents == 1)
+    #expect(summary.limited == 1)
+    #expect(summary.uncoveredLimited == 0)
+
+    #expect(MuxaAttentionSummary().needsYouLine == nil)
+}
+
+// MARK: - Swap health
+
+@Test func swapHealthSaysWhyItCannotSwitch() throws {
+    let halted = try JSONDecoder().decode(MuxaSwapHealth.self, from: Data(#"""
+    {"readiness":"halted","reason":"store lost","schema":3,"expected_schema":3,"fault":"store lost","jobs_running":0}
+    """#.utf8))
+    #expect(!halted.isReady)
+    #expect(halted.readiness == .halted)
+    #expect(halted.detail?.hasPrefix("store lost") == true)
+
+    let ready = try JSONDecoder().decode(MuxaSwapHealth.self, from: Data(#"""
+    {"readiness":"ready","reason":null,"schema":3,"expected_schema":3,"fault":null,"jobs_running":2}
+    """#.utf8))
+    #expect(ready.isReady)
+    #expect(ready.jobsRunning == 2)
+    #expect(ready.detail == nil)
+
+    let future = try JSONDecoder().decode(MuxaSwapHealth.self, from: Data(#"{"readiness":"warming","expected_schema":3}"#.utf8))
+    #expect(future.readiness == .unknown("warming"))
+}
+
+@Test func aSwapFieldOfAnotherShapeDoesNotFailTheReply() throws {
+    struct Reply: Decodable { let swap: MuxaLenient<MuxaSwapHealth>? }
+    let job = try JSONDecoder().decode(Reply.self, from: Data(#"{"swap":{"job_id":"j1","state":"running"}}"#.utf8))
+    #expect(job.swap?.value == nil)
+    let health = try JSONDecoder().decode(Reply.self, from: Data(#"{"swap":{"readiness":"ready","jobs_running":0}}"#.utf8))
+    #expect(health.swap?.value?.isReady == true)
+}

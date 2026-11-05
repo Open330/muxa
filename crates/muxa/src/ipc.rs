@@ -310,6 +310,11 @@ enum RequestBody {
         layout_only: bool,
         #[serde(default = "mux_snapshot_only_missing")]
         only_missing: bool,
+        /// `mux_snapshot_continue_v1`: after the relaunch, type this into
+        /// every agent the snapshot caught mid-turn (`muxa restore
+        /// --continue`). Absent or blank sends nothing.
+        #[serde(default, rename = "continue")]
+        continue_text: Option<String>,
     },
     MuxSnapshotRestoreStatus {
         operation_id: String,
@@ -1041,6 +1046,7 @@ const CAPABILITIES: &[&str] = &[
     "agent_start_v1",  // WS-B: new agent
     "mux_snapshot_v1", // WS-F: snapshot
     "mux_snapshot_plan_v1",
+    "mux_snapshot_continue_v1",
     "handle_namespace_v1",
     "session_bytes_v1",
     "session_attachment_identity_v1",
@@ -4203,9 +4209,13 @@ async fn handle(
                     id,
                     layout_only,
                     only_missing,
+                    continue_text,
                 } => {
                     kind = "mux_snapshot_restore";
-                    match mux_snapshots.restore(&id, layout_only, only_missing).await {
+                    match mux_snapshots
+                        .restore(&id, layout_only, only_missing, continue_text.as_deref())
+                        .await
+                    {
                         Ok(operation) => Response::with_mux_snapshot_operation(operation),
                         Err(error) => Response::err(error.to_string()),
                     }
@@ -16644,6 +16654,7 @@ mod work_command_tests {
                 id,
                 layout_only,
                 only_missing,
+                continue_text,
             } => {
                 assert_eq!(id, "1790000000");
                 assert!(!layout_only, "restores the commands unless asked not to");
@@ -16651,9 +16662,17 @@ mod work_command_tests {
                     only_missing,
                     "a mux_snapshot_v1 client never fills live sessions"
                 );
+                assert_eq!(continue_text, None, "nothing is typed unless asked");
             }
             other => panic!("unexpected {other:?}"),
         }
+        assert!(matches!(
+            decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1","continue":"go on"}"#),
+            RequestBody::MuxSnapshotRestore {
+                continue_text: Some(text),
+                ..
+            } if text == "go on"
+        ));
         assert!(matches!(
             decode(r#"{"protocol":6,"kind":"mux_snapshot_restore","id":"1","only_missing":false}"#),
             RequestBody::MuxSnapshotRestore {
@@ -16673,6 +16692,7 @@ mod work_command_tests {
         ));
         assert!(CAPABILITIES.contains(&"mux_snapshot_v1"));
         assert!(CAPABILITIES.contains(&"mux_snapshot_plan_v1"));
+        assert!(CAPABILITIES.contains(&"mux_snapshot_continue_v1"));
         let plain = serde_json::to_value(Response::ok()).unwrap();
         assert!(plain.get("mux_snapshot").is_none());
         assert!(plain.get("mux_snapshot_operation").is_none());

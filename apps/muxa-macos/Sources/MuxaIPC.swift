@@ -971,9 +971,12 @@ private struct MuxaIPCResponse: Decodable, Sendable {
     let askEnabled: Bool?
     let askProviders: [MuxaAskProvider]?
     let workCommand: MuxaWorkCommandOutput?
+    /// `swap_health`'s answer. Swap job requests also answer in `swap`,
+    /// with another shape: that reads as nil rather than failing the reply.
+    let swap: MuxaLenient<MuxaSwapHealth>?
 
     enum CodingKeys: String, CodingKey {
-        case ok, error, capabilities, agents, sessions, session, output, capture, fleet
+        case ok, error, capabilities, agents, sessions, session, output, capture, fleet, swap
         case minProtocol = "min_protocol"
         case maxProtocol = "max_protocol"
         case fleetResult = "fleet_result"
@@ -987,6 +990,15 @@ private struct MuxaIPCResponse: Decodable, Sendable {
         case askAgent = "ask_agent"
         case askEnabled = "ask_enabled"
         case askProviders = "ask_providers"
+    }
+}
+
+/// A field decoded when it has the expected shape and nil otherwise.
+struct MuxaLenient<Value: Decodable & Sendable>: Decodable, Sendable {
+    let value: Value?
+
+    init(from decoder: Decoder) throws {
+        value = try? Value(from: decoder)
     }
 }
 
@@ -1261,6 +1273,17 @@ actor MuxaIPCClient {
         }
         return output
     }
+
+    /// How this daemon's swap service is (`swap_health_v1`); nil from a
+    /// daemon without swap jobs or without the health check.
+    func swapHealth() async throws -> MuxaSwapHealth? {
+        guard capabilities.contains(Self.swapHealthCapability) else { return nil }
+        let response = try await call(["protocol": Self.protocolVersion, "kind": "swap_health"])
+        guard let health = response.swap?.value else { throw MuxaIPCError.missingField("swap") }
+        return health
+    }
+
+    static let swapHealthCapability = "swap_health_v1"
 
     func workOperation(id: String) async throws -> MuxaWorkOperation {
         let response = try await call([

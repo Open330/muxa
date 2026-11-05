@@ -181,9 +181,18 @@ struct AgentStatusTag: View {
 /// worth a launch-time notification storm.
 enum MuxaLimitCoverage {
     private static let state = OSAllocatedUnfairLock(initialState: true)
+    /// Posted when `isCovered` changes, so counts that depend on it are
+    /// worked out again.
+    static let didChange = Notification.Name("MuxaLimitCoverageDidChange")
 
     static var isCovered: Bool {
         get { state.withLock { $0 } }
-        set { state.withLock { $0 = newValue } }
+        set {
+            let changed = state.withLock { current -> Bool in
+                defer { current = newValue }
+                return current != newValue
+            }
+            if changed { NotificationCenter.default.post(name: didChange, object: nil) }
+        }
     }
 }

@@ -1828,7 +1828,12 @@ final class AppModel: ObservableObject {
         case .inbox: sidebarMode = .inbox
         case .ask: sidebarMode = .ask
         case .work: sidebarMode = .work
-        case .agent: sidebarMode = .inbox
+        case .agent(let id):
+            // An agent opened from Explore (its pane is in the tree) keeps
+            // Explore showing; anywhere else the Inbox lists it.
+            let listedInExplore = sidebarMode == .watch
+                && hostedAgents.contains { $0.id == id && $0.pane != nil }
+            if !listedInExplore { sidebarMode = .inbox }
         case .host: sidebarMode = .watch
         case .fleetSession: sidebarMode = .watch
         case .fleetWindow: sidebarMode = .watch

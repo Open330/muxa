@@ -1,6 +1,6 @@
 # Muxa.app UX redesign: from "where things are" to "what needs doing"
 
-Status: steps 1–4 shipped in the first PR; see Delivery.
+Status: every step shipped; see Delivery.
 
 ## Why
 
@@ -110,10 +110,19 @@ agent is only "taken care of" when a policy will actually act on it.
 
 ### 4. One attention summary
 
-`MuxaAttentionSummary` (needs-you agents, human decisions, unreplied messages,
-uncovered limited agents, unread panes) feeds the Inbox badge, Dock badge,
-Command Center status line and menu bar. Every count that looks clickable is a
-button that opens the matching list.
+`MuxaAttentionSummary`, computed once per change by the attention center,
+feeds every count:
+
+- **Needs you** — agents whose state needs the person (blocked, errored, or
+  capped with no limit policy acting), peers' requests for a decision, and
+  unread replies. The Inbox badge, the menu bar, Command Center's "Need
+  attention".
+- **Unread** — agent panes with a turn or a wait not yet seen. Explore's
+  badge.
+- **Dock** — both, each item once.
+
+Commands still waiting on an agent are listed but never counted. Every count
+that looks clickable is a button that opens the matching list.
 
 ### 5. Navigation fixes
 
@@ -137,10 +146,11 @@ sheet and Settings, so "why didn't it switch?" has an answer in the app.
 | 2. Agent actions, swap sheet, swap activity | done |
 | 3. Limit policy, policy-aware attention, limited notifications with Switch Account | done |
 | 4. Navigation fixes (Inbox routing, "N more" link), palette commands | done |
-| 4b. Split the touched surfaces out of `ContentView.swift` / `WorkConsoleViews.swift` | next |
-| 5. Restore with continue (needs a `continue` field on `mux_snapshot_restore`) | next |
-| 6. One attention summary feeding every badge and count | next |
+| 4b. Split the touched surfaces out of `ContentView.swift` / `WorkConsoleViews.swift` | done: Command Center, Ask, Inbox, Explore, side bar, workbench chrome and detail views each have a file |
+| 5. Restore with continue (`continue` on `mux_snapshot_restore`, `mid_turn` in the plan) | done |
+| 6. One attention summary feeding every badge and count | done (`MuxaAttentionSummary`) |
+| 7. `swap_health` in the swap sheet and Settings | done (local daemon) |
 
 Not yet covered by the app: per-agent account identity on the wire (the
-daemon reports none; the swap plan names `from`/`to` per agent), and
-`swap_health` in Settings.
+daemon reports none; the swap plan names `from`/`to` per agent), and a
+remote host's swap health (its swaps report their own refusals).

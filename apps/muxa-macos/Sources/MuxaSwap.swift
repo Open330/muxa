@@ -323,6 +323,24 @@ final class MuxaSwapCenter: ObservableObject {
     @Published private(set) var activities: [MuxaSwapActivity] = []
     /// The sheet's target, when one is open.
     @Published var sheet: MuxaSwapSheetTarget?
+    /// The local daemon's swap service, from the last check; nil until
+    /// checked or on a daemon that cannot say.
+    @Published private(set) var health: MuxaSwapHealth?
+    /// Why the last check could not answer.
+    @Published private(set) var healthError: String?
+
+    /// Ask the local daemon how its swap service is. Remote hosts are not
+    /// asked: their swaps report their own refusals.
+    func refreshHealth() async {
+        guard let model else { return }
+        do {
+            health = try await model.client.swapHealth()
+            healthError = nil
+        } catch {
+            health = nil
+            healthError = error.localizedDescription
+        }
+    }
 
     private weak var model: AppModel?
     private var pollTask: Task<Void, Never>?
@@ -499,4 +517,79 @@ struct MuxaSwapSheetTarget: Identifiable, Hashable, Sendable {
     let interruptsWork: Bool
 
     var id: String { "\(host ?? "local")|\(label)" }
+}
+
+// MARK: - Health
+
+/// `swap_health`: whether the daemon's swap service takes jobs, and if not
+/// why. Read-only.
+struct MuxaSwapHealth: Decodable, Equatable, Sendable {
+    enum Readiness: Equatable, Sendable {
+        case ready, draining, halted, unavailable, unknown(String)
+
+        init(raw: String) {
+            switch raw {
+            case "ready": self = .ready
+            case "draining": self = .draining
+            case "halted": self = .halted
+            case "unavailable": self = .unavailable
+            default: self = .unknown(raw)
+            }
+        }
+    }
+
+    let readiness: Readiness
+    let reason: String?
+    let fault: String?
+    let jobsRunning: Int
+    /// Upkeep that failed; jobs are still taken.
+    let maintenance: String?
+
+    enum CodingKeys: String, CodingKey {
+        case readiness, reason, fault, maintenance
+        case jobsRunning = "jobs_running"
+    }
+
+    init(readiness: Readiness, reason: String? = nil, fault: String? = nil, jobsRunning: Int = 0, maintenance: String? = nil) {
+        self.readiness = readiness
+        self.reason = reason
+        self.fault = fault
+        self.jobsRunning = jobsRunning
+        self.maintenance = maintenance
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        readiness = Readiness(raw: try values.decode(String.self, forKey: .readiness))
+        reason = try values.decodeIfPresent(String.self, forKey: .reason)
+        fault = try values.decodeIfPresent(String.self, forKey: .fault)
+        jobsRunning = try values.decodeIfPresent(Int.self, forKey: .jobsRunning) ?? 0
+        maintenance = try values.decodeIfPresent(String.self, forKey: .maintenance)
+    }
+
+    var isReady: Bool { readiness == .ready }
+
+    var title: String {
+        switch readiness {
+        case .ready: String(localized: "Account switching is ready")
+        case .draining: String(localized: "Account switching is shutting down")
+        case .halted: String(localized: "Account switching stopped after a fault")
+        case .unavailable: String(localized: "Account switching is unavailable")
+        case .unknown(let raw): String(localized: "Account switching: \(raw)")
+        }
+    }
+
+    /// Why it is not ready, and what to do about it.
+    var detail: String? {
+        switch readiness {
+        case .ready:
+            return maintenance.map { String(localized: "Cleanup of old swap records failed: \($0)") }
+        case .halted:
+            let cause = fault ?? reason ?? ""
+            return String(localized: "\(cause) Restart muxad to take swaps again.")
+                .trimmingCharacters(in: .whitespaces)
+        case .draining, .unavailable, .unknown:
+            return reason
+        }
+    }
 }

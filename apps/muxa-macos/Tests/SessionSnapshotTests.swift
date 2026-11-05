@@ -357,3 +357,38 @@ private final class MuxSnapshotRequestLog: @unchecked Sendable {
     #expect(MuxaPaletteCommand.saveSnapshot.shortcut == nil)
     #expect(MuxaPaletteCommand.restoreSnapshot.title == "Session: Restore snapshot…")
 }
+
+@Test func restoreSendsContinueOnlyWhenAsked() async throws {
+    let sent = MuxSnapshotRequestLog()
+    let handler: MuxaIPCRequestHandler = { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        sent.append((object["continue"] as? String) ?? "-")
+        return Data(#"{"ok":true,"mux_snapshot_operation":{"operation_id":"op","state":"running","id":"1","message":""}}"#.utf8)
+    }
+    let client = MuxaSessionSnapshotClient(socketPath: "/tmp/muxa-snapshot-test.sock", request: handler)
+    _ = try await client.restore(id: "1", layoutOnly: false)
+    _ = try await client.restore(id: "1", layoutOnly: false, continueText: " continue ")
+    _ = try await client.restore(id: "1", layoutOnly: false, continueText: "  ")
+    // Empty shells have no turn to carry on.
+    _ = try await client.restore(id: "1", layoutOnly: true, continueText: "continue")
+    #expect(sent.entries == ["-", "continue", "-", "-"])
+}
+
+@Test func midTurnAgentsCountOnlyPanesTheRestoreRelaunches() throws {
+    let json = #"""
+    {"id":"1","server_reachable":true,"only_missing":false,"run":false,"sessions":[
+      {"name":"gone","action":"create","state":"missing","windows":[{"index":"0","name":"w","panes":[
+        {"index":"0","path":"/","action":"resume","mid_turn":true},
+        {"index":"1","path":"/","action":"resume"}]}]},
+      {"name":"live","action":"fill_missing","state":"present","windows":[{"index":"0","name":"w","panes":[
+        {"index":"0","path":"/","action":"resume","state":"present","mid_turn":true},
+        {"index":"1","path":"/","action":"resume","state":"missing","mid_turn":true}]}]},
+      {"name":"kept","action":"skip","state":"present","windows":[{"index":"0","name":"w","panes":[
+        {"index":"0","path":"/","action":"resume","mid_turn":true}]}]}
+    ]}
+    """#
+    let plan = try JSONDecoder().decode(MuxSnapshotPlan.self, from: Data(json.utf8))
+    #expect(plan.midTurnAgents(onlyMissing: true) == 1)
+    // Filling running sessions adds only the pane they lack.
+    #expect(plan.midTurnAgents(onlyMissing: false) == 2)
+}

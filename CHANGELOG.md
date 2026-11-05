@@ -28,6 +28,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   automation rules muxad already runs.
 - The command palette gains switching limited agents, Fleet Dispatch and
   Show Files.
+- Restoring a snapshot can tell the agents it caught mid-turn to carry on:
+  the restore sheet offers "Tell the N agents that were mid-turn to
+  continue" (off until turned on, then remembered). muxad's
+  `mux_snapshot_restore` takes a `continue` text (`mux_snapshot_continue_v1`)
+  and passes it to `muxa restore --continue`; the plan marks those panes
+  `mid_turn`.
+- One attention summary feeds every count: the Inbox badge, the menu bar and
+  Command Center's "Need attention" show the same number (agents that need
+  you, peers' decisions and unread replies), Explore's badge counts unread
+  panes, and the Dock both, each once. Commands still waiting on an agent no
+  longer count. Command Center's counts open their lists, and the menu bar
+  offers switching capped agents.
+- Settings › Automations and the swap sheet show the swap service's health
+  (`swap_health`) and why it cannot switch, when it cannot.
 
 - A swap checks what a target's relaunch needs before it touches the agent:
   the directory it runs in, a configured account's `env_file` (a regular

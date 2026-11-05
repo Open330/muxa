@@ -21,7 +21,8 @@ and encodes user input.
   `muxa snapshot` / `muxa restore --only-missing --json`; the restore
   preview compares the snapshot with what runs now, and with
   `mux_snapshot_plan_v1` "Only missing sessions" can be turned off to also
-  fill in running sessions; and
+  fill in running sessions, and with `mux_snapshot_continue_v1` agents the
+  snapshot caught mid-turn can be told to `continue` once resumed; and
 - provides both a main window and a menu-bar control.
 
 External tmux, cmux, rmux, herdr, and zellij surfaces remain execution

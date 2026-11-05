@@ -104,6 +104,11 @@ struct MuxaSwapSheet: View {
             header
             Divider()
             Form {
+                if isLocal, let health = model.swaps.health, !health.isReady {
+                    Section {
+                        MuxaSwapHealthRow(health: health)
+                    }
+                }
                 accountSection
                 followUpSection
                 if target.interruptsWork || isMany {
@@ -124,7 +129,10 @@ struct MuxaSwapSheet: View {
         .frame(minHeight: 520)
         .task {
             if target.interruptsWork { force = true }
-            if isLocal { await accounts.refresh() }
+            if isLocal {
+                await model.swaps.refreshHealth()
+                await accounts.refresh()
+            }
         }
         .task(id: request) {
             // Debounce typing in the account and follow-up fields.
@@ -591,5 +599,53 @@ struct MuxaSwapActivityRow: View {
         case .skipped, .cancelled: .secondary
         case .failed: .red
         }
+    }
+}
+
+/// The swap service's state with its reason: in the swap sheet when it
+/// cannot take a job, and always in Settings › Automations.
+struct MuxaSwapHealthRow: View {
+    let health: MuxaSwapHealth
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: health.isReady ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(health.isReady ? Color.green : Color.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(health.title)
+                    .font(MuxaType.detail.weight(.medium))
+                if let detail = health.detail, !detail.isEmpty {
+                    Text(detail)
+                        .font(MuxaType.meta)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if health.jobsRunning > 0 {
+                    Text(health.jobsRunning == 1 ? "1 switch running" : "\(health.jobsRunning) switches running")
+                        .font(MuxaType.meta)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
+/// Settings › Automations: the local swap service's health, checked when
+/// shown, so "why didn't it switch?" has an answer in the app.
+struct MuxaSwapHealthSection: View {
+    @ObservedObject var swaps: MuxaSwapCenter
+
+    var body: some View {
+        Group {
+            if let health = swaps.health {
+                MuxaSwapHealthRow(health: health)
+            } else if let error = swaps.healthError {
+                Label(String(localized: "Couldn't check account switching: \(error)"), systemImage: "questionmark.circle")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .task { await swaps.refreshHealth() }
     }
 }
