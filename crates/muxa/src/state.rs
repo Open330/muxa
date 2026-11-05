@@ -820,11 +820,18 @@ fn mutate_for_event(
             // A fresh session means whatever wall the previous turn ran
             // into has been cleared (or the user is starting over) —
             // drop the active-cap marker so the watch row stops glowing
-            // red. Rolling utilization fields stay so the new session
-            // can keep counting against the same window.
+            // red. Utilization goes too: a session resumed on another
+            // account (a swap) would otherwise carry the old account's
+            // usage, which account routing would credit to the new one.
+            // The new process reports its own on its next statusline or
+            // rollout update.
             agent.rate_limited_until = None;
             agent.rate_limit_scope = None;
             agent.rate_limit_source = None;
+            agent.rate_limit_5h_pct = None;
+            agent.rate_limit_5h_resets_at = None;
+            agent.rate_limit_7d_pct = None;
+            agent.rate_limit_7d_resets_at = None;
         }
         AgentEvent::PromptSubmitted { prompt, .. } => {
             agent.last_prompt = Some(prompt.clone());
@@ -4571,6 +4578,43 @@ mod tests {
             store.by_session("s").await.unwrap().state,
             AgentState::Stopped
         );
+    }
+
+    /// A session resumed on another account (a swap) must not carry the old
+    /// account's usage: account routing would credit it to the new one.
+    #[tokio::test]
+    async fn a_new_session_drops_the_previous_accounts_usage() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-29 10:00:00 UTC);
+        let resets_at = datetime!(2026-04-29 15:00:00 UTC);
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("s"),
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(97.0),
+                rate_limit_5h_resets_at: Some(resets_at),
+                rate_limit_7d_pct: Some(40.0),
+                rate_limit_7d_resets_at: Some(resets_at),
+                at: t0,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("s").await.unwrap().rate_limit_5h_pct,
+            Some(97.0)
+        );
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0 + time::Duration::minutes(1),
+            })
+            .await;
+        let resumed = store.by_session("s").await.unwrap();
+        assert_eq!(resumed.rate_limit_5h_pct, None);
+        assert_eq!(resumed.rate_limit_5h_resets_at, None);
+        assert_eq!(resumed.rate_limit_7d_pct, None);
+        assert_eq!(resumed.rate_limit_7d_resets_at, None);
     }
 
     /// End-to-end composition: walk the full rate-limit lifecycle the

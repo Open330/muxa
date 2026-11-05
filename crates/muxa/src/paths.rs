@@ -94,6 +94,14 @@ pub fn default_state_file() -> Option<PathBuf> {
     xdg_dir("XDG_DATA_HOME", dirs::data_dir).map(|d| d.join(CONFIG_DIRNAME).join(STATE_FILENAME))
 }
 
+/// Account limit ledger: `$XDG_DATA_HOME/muxa/account-limits.json`. What
+/// each configured account's agents last reported about its limits, kept
+/// after those agents are gone.
+pub fn default_account_ledger_file() -> Option<PathBuf> {
+    xdg_dir("XDG_DATA_HOME", dirs::data_dir)
+        .map(|d| d.join(CONFIG_DIRNAME).join("account-limits.json"))
+}
+
 /// Default directory for workspace snapshots:
 /// `$XDG_DATA_HOME/muxa/snapshots`. A snapshot is user-recoverable content —
 /// the shape of a workspace plus what each pane was running — so it belongs

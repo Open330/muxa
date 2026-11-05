@@ -54,6 +54,8 @@ mod synthetic;
 const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 /// Cadence at which the GC task scans for evictable agents.
 const GC_SWEEP_INTERVAL_SECONDS: u64 = 60;
+/// How often account usage is folded into the account ledger between caps.
+const ACCOUNT_LEDGER_SECONDS: u64 = 60;
 const PANE_SESSION_CACHE_INTERVAL_SECONDS: u64 = 5;
 const SHUTDOWN_TASK_TIMEOUT_SECONDS: u64 = 2;
 /// Slow safety-net scan for collaboration wake delivery. Normal delivery is
@@ -342,6 +344,8 @@ async fn run() -> Result<()> {
     )
     .await;
     let gc_handle = spawn_gc_task(&store, &shutdown_tx);
+    let account_ledger_handle =
+        spawn_account_ledger_task(&store, cfg.accounts.clone(), &shutdown_tx);
     let directory_max_age = if cfg.reconciler.enabled {
         cfg.reconciler.interval_secs.saturating_add(2)
     } else {
@@ -610,6 +614,7 @@ async fn run() -> Result<()> {
         }
     }
     await_shutdown_task("gc", Some(gc_handle)).await;
+    await_shutdown_task("account ledger", account_ledger_handle).await;
     await_shutdown_task("reconciler", reconciler_handle).await;
     await_shutdown_task("binary watch", binary_watch_handle).await;
     await_shutdown_task("herdr bridge", herdr_bridge_handle).await;
@@ -3584,6 +3589,58 @@ fn spawn_gc_task(
             }
         }
     })
+}
+
+/// Keep what configured accounts' agents report about their limits after
+/// those agents are gone ([`muxa::account_provider::record`]): a capped
+/// account stays capped until its reset even once its last agent is stopped
+/// or swapped away. Recorded when an agent hits a cap, while its process
+/// still runs, and periodically for usage. Nothing runs without
+/// `[[accounts.*]]`.
+fn spawn_account_ledger_task(
+    store: &muxa::SharedStore,
+    accounts: muxa::accounts::AccountsConfig,
+    shutdown_tx: &broadcast::Sender<()>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    if accounts.claude.is_empty() && accounts.codex.is_empty() {
+        return None;
+    }
+    let path = muxa::account_provider::default_ledger_path()?;
+    let store = store.clone();
+    let mut transitions = store.subscribe();
+    let mut shutdown_rx = shutdown_tx.subscribe();
+    let accounts = Arc::new(accounts);
+    Some(tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_secs(ACCOUNT_LEDGER_SECONDS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = interval.tick() => {}
+                transition = transitions.recv() => match transition {
+                    // Only a new cap needs recording before the next tick.
+                    Ok(t) if !muxa::account_swap::is_rate_limited(&t.agent) => continue,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = shutdown_rx.recv() => break,
+            }
+            let agents = store.snapshot().await;
+            let (path, accounts) = (path.clone(), Arc::clone(&accounts));
+            let recorded = tokio::task::spawn_blocking(move || {
+                muxa::account_provider::record(
+                    &path,
+                    &accounts,
+                    &agents,
+                    time::OffsetDateTime::now_utc(),
+                )
+            })
+            .await;
+            if let Ok(Err(error)) = recorded {
+                tracing::warn!(%error, "account ledger: could not record account limits");
+            }
+        }
+    }))
 }
 
 fn install_shutdown_signal_handler(restart: Arc<RestartController>) {

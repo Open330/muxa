@@ -914,6 +914,25 @@ fn argv_session_id(cmdline: &str, kind: AgentKind) -> Option<String> {
     None
 }
 
+/// Does process `pid` provably run the `kind` session `session_id`? Claude's
+/// own `sessions/<pid>.json` decides where it can be read; otherwise only a
+/// command line naming the session (`--resume <id>`, `resume <id>`) does.
+/// Anything weaker, such as being the pane's first agent process, is not a
+/// binding: a pane can run nested agents on different accounts.
+#[must_use]
+pub(crate) fn process_runs_session(pid: u32, kind: AgentKind, session_id: &str) -> bool {
+    if kind == AgentKind::ClaudeCode {
+        match crate::agent_conversation::claude_conversation(pid) {
+            crate::agent_conversation::Conversation::Verified(id) => return id == session_id,
+            crate::agent_conversation::Conversation::Unknown(_) => {}
+            _ => return false,
+        }
+    }
+    process_command(pid)
+        .and_then(|cmdline| argv_session_id(&cmdline, kind))
+        .is_some_and(|id| id == session_id)
+}
+
 /// Find the `kind` agent under the pane process `pane_pid`, and the `aas`
 /// wrapper above it when there is one.
 #[must_use]
@@ -1971,12 +1990,18 @@ fn profile_steps(
         .filter(|(p, _)| is_rate_limited(&p.agent))
         .filter_map(|(_, account)| account.as_deref())
         .collect();
+    // What the daemon recorded about each account (a cap outlives the
+    // agent that hit it), with what live agents report now folded in.
+    let ledger = crate::account_provider::default_ledger_path()
+        .map(|path| crate::account_provider::AccountLedger::load(&path))
+        .unwrap_or_default();
     let ranked = crate::account_provider::rank(
         provider,
         profiles,
         observed,
         time::OffsetDateTime::now_utc(),
         |agent| crate::account_provider::identify(&resolved, agent),
+        &ledger,
     );
     let ranked = mark_capped(ranked, &capped);
     let choice = match &request.to {
@@ -6152,7 +6177,14 @@ mod tests {
             account("c", "K", "3"),
         ];
         let now = time::OffsetDateTime::now_utc();
-        let unranked = crate::account_provider::rank("claude", &profiles, &[], now, |_| None);
+        let unranked = crate::account_provider::rank(
+            "claude",
+            &profiles,
+            &[],
+            now,
+            |_| None,
+            &crate::account_provider::AccountLedger::default(),
+        );
         let ranked = mark_capped(unranked, &["b"]);
         assert_eq!(
             ranked
@@ -6254,16 +6286,20 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let spawn = |account: &str| {
+        // Each process names its conversation on its command line, which is
+        // what binds it to that session (a shell stays alive under `;`).
+        const SESSION_A: &str = "11111111-1111-4111-8111-111111111111";
+        const SESSION_B: &str = "22222222-2222-4222-8222-222222222222";
+        let spawn = |account: &str, session: &str| {
             Child(
-                std::process::Command::new("sleep")
-                    .arg("30")
+                std::process::Command::new("sh")
+                    .args(["-c", "sleep 30; :", "sh", "--resume", session])
                     .env("MUXA_TEST_ACCOUNT", account)
                     .spawn()
                     .unwrap(),
             )
         };
-        let (on_a, on_b) = (spawn("a"), spawn("b"));
+        let (on_a, on_b) = (spawn("a", SESSION_A), spawn("b", SESSION_B));
         // Wait until both environments are readable.
         for child in [&on_a, &on_b] {
             for _ in 0..100 {
@@ -6279,15 +6315,19 @@ mod tests {
                 .to_vec(),
             codex: Vec::new(),
         };
-        let mut target = limited("%1", "sid-1");
-        target.pid = Some(on_a.0.id());
-        let mut elsewhere = limited("%2", "sid-2");
-        elsewhere.pid = Some(on_b.0.id());
+        let mut target = limited("%1", SESSION_A);
+        target.workload.primary_pid = Some(on_a.0.id());
+        let mut elsewhere = limited("%2", SESSION_B);
+        elsewhere.workload.primary_pid = Some(on_b.0.id());
+        // The other agent's pane process runs a different conversation: no
+        // binding, so it would say nothing about `b`.
+        let mut unbound = limited("%3", "33333333-3333-4333-8333-333333333333");
+        unbound.workload.primary_pid = Some(on_b.0.id());
         elsewhere.rate_limited_until =
             Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
         let planned = Planned {
             agent: target.clone(),
-            session_id: "sid-1".into(),
+            session_id: SESSION_A.into(),
             source: SessionIdSource::Registry,
             verified: false,
             unverified_reason: None,
@@ -6306,7 +6346,7 @@ mod tests {
             vec![planned],
             &SwapConfig::default(),
             &accounts,
-            &[target, elsewhere],
+            &[target.clone(), elsewhere],
         );
         let [Step::Run(prepared)] = steps.as_slice() else {
             panic!("the target must be planned to run");
@@ -6314,6 +6354,37 @@ mod tests {
         assert_eq!(prepared.profile_from.as_deref(), Some("a"));
         // `a` is where it is capped, `b` is capped by the other agent.
         assert_eq!(prepared.account.as_deref(), Ok("c"));
+
+        // A row whose pane process runs another session is not evidence.
+        let planned = Planned {
+            agent: target.clone(),
+            session_id: SESSION_A.into(),
+            source: SessionIdSource::Registry,
+            verified: false,
+            unverified_reason: None,
+            process_start: None,
+            launch: PaneLaunch {
+                agent_pid: on_a.0.id(),
+                top_pid: on_a.0.id(),
+                line: LaunchLine::bare("claude"),
+                resumed_id: None,
+            },
+            pane: test_pane("%1"),
+            backend: crate::backend::default_backend(),
+        };
+        let mut far = unbound;
+        far.rate_limited_until = Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+        let steps = assign_accounts(
+            &request(SwapScope::All),
+            vec![planned],
+            &SwapConfig::default(),
+            &accounts,
+            &[target, far],
+        );
+        let [Step::Run(prepared)] = steps.as_slice() else {
+            panic!("the target must be planned to run");
+        };
+        assert_eq!(prepared.account.as_deref(), Ok("b"));
     }
 
     /// An account capped by an agent that is not being swapped has no quota
@@ -6339,7 +6410,14 @@ mod tests {
         elsewhere.rate_limited_until = Some(now + time::Duration::hours(1));
         let on_b = |agent: &Agent| (agent.session_id == "worker-on-b").then(|| "b".to_owned());
         let ranked = mark_capped(
-            crate::account_provider::rank("claude", &profiles, &[elsewhere], now, on_b),
+            crate::account_provider::rank(
+                "claude",
+                &profiles,
+                &[elsewhere],
+                now,
+                on_b,
+                &crate::account_provider::AccountLedger::default(),
+            ),
             // The target itself was capped on `a`.
             &["a"],
         );

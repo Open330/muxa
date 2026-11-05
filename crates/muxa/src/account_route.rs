@@ -417,8 +417,16 @@ mod tests {
         let never = |_: &str, _: &str| -> Result<Vec<Candidate>, String> {
             panic!("aas must not be queried")
         };
-        let in_order =
-            || crate::account_provider::rank("claude", &route.profiles, &[], NOW, |_| None);
+        let in_order = || {
+            crate::account_provider::rank(
+                "claude",
+                &route.profiles,
+                &[],
+                NOW,
+                |_| None,
+                &crate::account_provider::AccountLedger::default(),
+            )
+        };
         let auto = decide_with(&route, never, in_order).unwrap();
         assert_eq!(auto.account, "work");
         assert_eq!(
@@ -464,8 +472,16 @@ mod tests {
         let on_work = |agent: &crate::state::Agent| {
             (agent.session_id == "on-work").then(|| "work".to_owned())
         };
-        let ranked =
-            || crate::account_provider::rank("claude", &route.profiles, &observed, NOW, on_work);
+        let ranked = || {
+            crate::account_provider::rank(
+                "claude",
+                &route.profiles,
+                &observed,
+                NOW,
+                on_work,
+                &crate::account_provider::AccountLedger::default(),
+            )
+        };
         let routed = decide_with(&route, never, ranked).unwrap();
         assert_eq!(routed.account, "home");
         assert_eq!(
@@ -477,7 +493,14 @@ mod tests {
         let on_either =
             |agent: &crate::state::Agent| agent.session_id.strip_prefix("on-").map(str::to_owned);
         let reason = decide_with(&route, never, || {
-            crate::account_provider::rank("claude", &route.profiles, &observed, NOW, on_either)
+            crate::account_provider::rank(
+                "claude",
+                &route.profiles,
+                &observed,
+                NOW,
+                on_either,
+                &crate::account_provider::AccountLedger::default(),
+            )
         })
         .unwrap_err();
         assert!(
