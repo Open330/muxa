@@ -30,8 +30,11 @@ Rules that keep the layers honest:
    their existing panes gets the full Attention layer: no Work, no
    collaboration config, no MCP.
 2. **Everything Runtime does is visible to Attention.** A worker, a peer
-   request, a Fleet node, or a pipeline run that needs a human surfaces through
-   the same attention state, `attend`, and notifications.
+   request, a Fleet node, or a pipeline run that needs a human should surface
+   through the same attention state, `attend`, and notifications. Today this
+   holds for agent-backed state; Runtime failures without an agent row (for
+   example a pipeline Run that fails before any pane exists) are not yet in
+   `attend`, and closing that gap is part of this direction.
 3. **Runtime never takes over what it did not start.** muxa does not kill,
    rename, or adopt unmanaged multiplexer objects as Work.
 
@@ -44,9 +47,10 @@ Rules that keep the layers honest:
 
 Both modes stay supported. Owning the process is what makes reliable prompt
 delivery, recovery, and account routing possible; adopting is what keeps
-muxa zero-cost to try. Open question tracked in #89: whether muxa-launched
-agents default to a muxad-owned PTY instead of a managed tmux pane. That
-choice only changes the default for **Own**; it never removes **Adopt**.
+muxa zero-cost to try. Standalone native (muxad-owned PTY) launches already
+exist; #89 tracks the remaining rollout — host-neutral managed Work on native
+execution and whether that becomes the default for **Own**. Whatever the
+default, it never removes **Adopt**.
 
 ## Principles
 
@@ -76,11 +80,18 @@ deterministic source whenever one exists:
 4. the exact process tree and its environment.
 
 Screen detection, pane-capture parsing, and timing-based inference are
-**fallbacks** for when none of those exist. They are labeled as heuristic in
-state, and a heuristic alone never triggers a destructive action (stop,
-prune, swap, interrupt). Support for a backend or provider is claimed only at
-the depth where its signals are deterministic. See
-[proposals/DETERMINISTIC_FIRST.md](proposals/DETERMINISTIC_FIRST.md).
+**fallbacks** for when none of those exist. The policy is that heuristic
+signals are labeled as such in state and that a heuristic alone never
+triggers a destructive action (stop, prune, swap, interrupt). Support for a
+backend or provider is claimed only at the depth where its signals are
+deterministic.
+
+This is the target, not yet fully enforced: some current paths still act on
+heuristic evidence (for example screen-prompt correlation of paneless Codex
+sessions), and a unified provenance tag does not exist yet. The inventory and
+conversion backlog live in
+[proposals/DETERMINISTIC_FIRST.md](proposals/DETERMINISTIC_FIRST.md); new code
+follows the policy from the start.
 
 ## Feature tiers
 
@@ -89,7 +100,7 @@ whether the feature matters.
 
 | Tier | Bar | Members |
 | --- | --- | --- |
-| **Core** | No regression ships; covered by live tour + tests | Attention layer, Work/Run model, collaboration mailbox, MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
+| **Core** | Regressions block release; live tour + tests required | Attention layer, Work/Run model, collaboration mailbox, MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
 | **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, muxad-owned PTYs, Muxa for Mac, dashboard, account routing and usage-limit recovery |
 | **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts, `graph` |
 
