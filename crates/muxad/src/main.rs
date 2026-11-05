@@ -3594,9 +3594,10 @@ fn spawn_gc_task(
 /// Keep what configured accounts' agents report about their limits after
 /// those agents are gone ([`muxa::account_provider::record`]): a capped
 /// account stays capped until its reset even once its last agent is stopped
-/// or swapped away. Recorded when an agent hits a cap, while its process
-/// still runs, and periodically for usage. Nothing runs without
-/// `[[accounts.*]]`.
+/// or swapped away. Recorded the moment an agent hits a cap (from the
+/// transition itself, so an agent that stops right after still counts) or a
+/// window fills, periodically for usage, and once more at shutdown. Nothing
+/// runs without `[[accounts.*]]`.
 fn spawn_account_ledger_task(
     store: &muxa::SharedStore,
     accounts: muxa::accounts::AccountsConfig,
@@ -3606,41 +3607,86 @@ fn spawn_account_ledger_task(
         return None;
     }
     let path = muxa::account_provider::default_ledger_path()?;
-    let store = store.clone();
+    Some(tokio::spawn(record_account_ledger(
+        store.clone(),
+        Arc::new(accounts),
+        path,
+        std::time::Duration::from_secs(ACCOUNT_LEDGER_SECONDS),
+        shutdown_tx.subscribe(),
+    )))
+}
+
+/// The agents whose rows say their account is spent: capped, or a window
+/// full. When this set changes the ledger is recorded at once.
+fn spent(agents: &[muxa::Agent]) -> std::collections::BTreeSet<String> {
+    agents
+        .iter()
+        .filter(|agent| {
+            muxa::account_swap::is_rate_limited(agent)
+                || [agent.rate_limit_5h_pct, agent.rate_limit_7d_pct]
+                    .into_iter()
+                    .flatten()
+                    .any(|pct| pct >= 100.0)
+        })
+        .map(|agent| agent.session_id.clone())
+        .collect()
+}
+
+async fn record_account_ledger(
+    store: muxa::SharedStore,
+    accounts: Arc<muxa::accounts::AccountsConfig>,
+    path: std::path::PathBuf,
+    period: std::time::Duration,
+    mut shutdown_rx: broadcast::Receiver<()>,
+) {
     let mut transitions = store.subscribe();
-    let mut shutdown_rx = shutdown_tx.subscribe();
-    let accounts = Arc::new(accounts);
-    Some(tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(std::time::Duration::from_secs(ACCOUNT_LEDGER_SECONDS));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {}
-                transition = transitions.recv() => match transition {
-                    // Only a new cap needs recording before the next tick.
-                    Ok(t) if !muxa::account_swap::is_rate_limited(&t.agent) => continue,
-                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                _ = shutdown_rx.recv() => break,
+    let mut changes = store.subscribe_changes();
+    let mut interval = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_spent = spent(&store.snapshot().await);
+    loop {
+        // The capped row as it was when it capped: by the time the snapshot
+        // is taken the agent may have stopped.
+        let mut capped: Option<Arc<muxa::Agent>> = None;
+        let mut last = false;
+        tokio::select! {
+            biased;
+            _ = shutdown_rx.recv() => last = true,
+            transition = transitions.recv() => match transition {
+                Ok(t) if muxa::account_swap::is_rate_limited(&t.agent) => capped = Some(t.agent),
+                Ok(_) => continue,
+                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Closed) => last = true,
+            },
+            signal = changes.changed() => {
+                if signal.is_err() {
+                    last = true;
+                } else if spent(&store.snapshot().await) == last_spent {
+                    continue;
+                }
             }
-            let agents = store.snapshot().await;
-            let (path, accounts) = (path.clone(), Arc::clone(&accounts));
-            let recorded = tokio::task::spawn_blocking(move || {
-                muxa::account_provider::record(
-                    &path,
-                    &accounts,
-                    &agents,
-                    time::OffsetDateTime::now_utc(),
-                )
-            })
-            .await;
-            if let Ok(Err(error)) = recorded {
-                tracing::warn!(%error, "account ledger: could not record account limits");
-            }
+            _ = interval.tick() => {}
         }
-    }))
+        let mut agents = store.snapshot().await;
+        last_spent = spent(&agents);
+        agents.extend(capped.map(|agent| (*agent).clone()));
+        let (path, accounts) = (path.clone(), Arc::clone(&accounts));
+        let recorded = tokio::task::spawn_blocking(move || {
+            muxa::account_provider::record(
+                &path,
+                &accounts,
+                &agents,
+                time::OffsetDateTime::now_utc(),
+            )
+        })
+        .await;
+        if let Ok(Err(error)) = recorded {
+            tracing::warn!(%error, "account ledger: could not record account limits");
+        }
+        if last {
+            break;
+        }
+    }
 }
 
 fn install_shutdown_signal_handler(restart: Arc<RestartController>) {
@@ -4425,6 +4471,7 @@ async fn enrich_from_history(
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            rate_limits_at: None,
             started_at: entry.at,
             last_activity_at: entry.at,
             state_entered_at: entry.at,
@@ -4793,6 +4840,73 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
     use time::OffsetDateTime;
+
+    /// A limit reported after the last record and before the next tick is
+    /// still recorded: shutdown records once more before the task ends.
+    #[tokio::test]
+    async fn the_account_ledger_is_recorded_at_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("account-limits.json");
+        let now = OffsetDateTime::now_utc();
+        muxa::account_provider::update(&path, |ledger| {
+            ledger.bind(muxa::account_provider::AccountBinding {
+                provider: "claude".into(),
+                account: "a".into(),
+                session_id: Some("s".into()),
+                pane: None,
+                socket: None,
+                bound_at: now - time::Duration::hours(1),
+            });
+            true
+        })
+        .unwrap();
+        let store = muxa::Store::shared();
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: AgentId {
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "s".into(),
+                    surface: None,
+                    pane: None,
+                    tmux_socket: None,
+                    cwd: None,
+                },
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: Some(100.0),
+                rate_limit_5h_resets_at: Some(now + time::Duration::hours(2)),
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: now,
+            })
+            .await;
+        let accounts = muxa::accounts::AccountsConfig {
+            claude: ["a", "b"]
+                .map(|name| muxa::accounts::AccountProfile {
+                    name: name.into(),
+                    env: std::collections::BTreeMap::new(),
+                    env_file: None,
+                })
+                .to_vec(),
+            codex: Vec::new(),
+        };
+        let profiles = accounts.claude.clone();
+        let (shutdown_tx, _) = broadcast::channel(1);
+        let task = tokio::spawn(record_account_ledger(
+            store,
+            Arc::new(accounts),
+            path.clone(),
+            std::time::Duration::from_secs(3600),
+            shutdown_tx.subscribe(),
+        ));
+        shutdown_tx.send(()).unwrap();
+        task.await.unwrap();
+        let ledger = muxa::account_provider::AccountLedger::load(&path);
+        let ranked = muxa::account_provider::rank_observed("claude", &profiles, &[], now, &ledger);
+        assert_eq!(ranked[0].name, "b");
+        assert!(!ranked[1].eligible, "{}", ranked[1].reason);
+    }
 
     fn room_participant(
         pane: &str,

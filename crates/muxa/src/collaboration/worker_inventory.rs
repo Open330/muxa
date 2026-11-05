@@ -402,6 +402,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            rate_limits_at: None,
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,

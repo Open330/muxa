@@ -189,6 +189,7 @@ pub fn decide(
                 &route.profiles,
                 observed,
                 time::OffsetDateTime::now_utc(),
+                &crate::account_provider::default_ledger(),
             )
         },
     )
@@ -224,6 +225,31 @@ fn decide_found(
         SpawnAccount::Auto => choose(&candidates, &route.provider)?,
     };
     Ok(RoutedLaunch::via_aas(aas, account))
+}
+
+/// Record that a launch put the agent in `pane` (on `socket`) on its routed
+/// configured account, as of `bound_at`, a moment before it was started.
+/// That binding is what attributes the agent's reported limits to the
+/// account. Accounts routed through `aas` are not muxa's to rank, so they
+/// are not bound.
+pub fn bind_launch(
+    route: &AccountRoute,
+    routed: &RoutedLaunch,
+    pane: &str,
+    socket: Option<String>,
+    bound_at: time::OffsetDateTime,
+) {
+    if route.profiles.is_empty() {
+        return;
+    }
+    crate::account_provider::bind_default(crate::account_provider::AccountBinding {
+        provider: route.provider.clone(),
+        account: routed.account.clone(),
+        session_id: None,
+        pane: Some(pane.to_owned()),
+        socket,
+        bound_at,
+    });
 }
 
 /// [`decide`], folded into what the launch result reports.

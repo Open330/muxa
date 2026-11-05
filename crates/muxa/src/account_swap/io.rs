@@ -75,6 +75,20 @@ pub(super) trait SwapIo: Clock {
     fn file_digest(&self, path: &str) -> Option<String>;
     /// The working directory process `pid` is actually in.
     fn process_cwd(&self, pid: u32) -> Option<ShellCwd>;
+    /// Record a step of the target's move between configured accounts in
+    /// the account ledger, synchronously. A ledger that cannot be written
+    /// does not stop the swap.
+    fn record_account(&self, step: AccountStep);
+}
+
+/// A step of a swap between configured accounts, as the account ledger
+/// records it ([`super::Handoff`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AccountStep {
+    /// About to stop the agent: what it reported is its account's.
+    Leaving,
+    /// About to start it on the account it moves to.
+    Bound,
 }
 
 /// What a path names, as far as a launch cares.
@@ -234,6 +248,20 @@ impl SwapIo for LiveIo<'_> {
 
     fn process_cwd(&self, pid: u32) -> Option<ShellCwd> {
         process_cwd(pid)
+    }
+
+    fn record_account(&self, step: AccountStep) {
+        let (Some(handoff), Some(path)) = (
+            self.target.handoff.as_ref(),
+            crate::account_provider::default_ledger_path(),
+        ) else {
+            return;
+        };
+        if let Err(error) =
+            handoff.record(&path, self.target, step, time::OffsetDateTime::now_utc())
+        {
+            tracing::warn!(%error, ?step, "account ledger: could not record a swap");
+        }
     }
 
     fn capture(&self) -> Option<String> {

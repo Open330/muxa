@@ -812,6 +812,9 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             &muxa::collaboration::WorkerSpawnAction::Begin,
         )?;
     }
+    // Before the agent can start: what it reports from now on is the
+    // routed account's.
+    let bound_at = time::OffsetDateTime::now_utc();
     let output = crate::mux_control::ambient_command_with_args(&args)?
         .output()
         .context("run tmux agent launcher")?;
@@ -940,7 +943,10 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // Hooks may not fire until the first prompt. Register the observed CLI
     // now, using discovery's placeholder so a later real hook replaces it.
     // Missing/older daemons remain supported; periodic discovery retries.
-    register_launched_agent(&request, &pane);
+    let socket = register_launched_agent(&request, &pane);
+    if let (Some(route), Some(Ok(routed))) = (request.account.as_ref(), routed.as_ref()) {
+        muxa::account_route::bind_launch(route, routed, &pane, socket, bound_at);
+    }
     if request.purpose == muxa::collaboration::LaunchPurpose::Worker {
         if let Err(error) = register_worker_purpose(&request, &pane, &launch_id) {
             crate::tmux_work::cleanup_pane(&pane);
@@ -1048,10 +1054,10 @@ fn register_worker_purpose(request: &StartRequest, pane: &str, launch_id: &str) 
     Ok(())
 }
 
-fn register_launched_agent(request: &StartRequest, pane: &str) {
-    let Some(discovered) = launched_agent(request, pane, LAUNCH_SIGHTING) else {
-        return;
-    };
+/// Register the launched agent with the daemon, once it is seen in `pane`.
+/// Returns the pane's server as discovery saw it there.
+fn register_launched_agent(request: &StartRequest, pane: &str) -> Option<String> {
+    let discovered = launched_agent(request, pane, LAUNCH_SIGHTING)?;
     let event = muxa::discovery::synthesize_started(&discovered, time::OffsetDateTime::now_utc());
     let _ = muxa::ipc::blocking_call(
         &request.socket,
@@ -1062,6 +1068,7 @@ fn register_launched_agent(request: &StartRequest, pane: &str) {
         }),
         std::time::Duration::from_secs(2),
     );
+    discovered.pane.socket
 }
 
 /// How long a launch looks for its agent in the pane: the pane's shell may

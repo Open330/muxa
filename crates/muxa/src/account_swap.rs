@@ -914,23 +914,18 @@ fn argv_session_id(cmdline: &str, kind: AgentKind) -> Option<String> {
     None
 }
 
-/// Does process `pid` provably run the `kind` session `session_id`? Claude's
-/// own `sessions/<pid>.json` decides where it can be read; otherwise only a
-/// command line naming the session (`--resume <id>`, `resume <id>`) does.
-/// Anything weaker, such as being the pane's first agent process, is not a
-/// binding: a pane can run nested agents on different accounts.
+/// Does process `pid` provably run the `kind` session `session_id`? Only a
+/// provider's own record says so: Claude's `sessions/<pid>.json`. A command
+/// line is not proof (a prompt can contain `resume <id>`), nor is being the
+/// pane's first agent process (a pane can run nested agents), so any other
+/// provider is never proven this way.
 #[must_use]
 pub(crate) fn process_runs_session(pid: u32, kind: AgentKind, session_id: &str) -> bool {
-    if kind == AgentKind::ClaudeCode {
-        match crate::agent_conversation::claude_conversation(pid) {
-            crate::agent_conversation::Conversation::Verified(id) => return id == session_id,
-            crate::agent_conversation::Conversation::Unknown(_) => {}
-            _ => return false,
-        }
-    }
-    process_command(pid)
-        .and_then(|cmdline| argv_session_id(&cmdline, kind))
-        .is_some_and(|id| id == session_id)
+    kind == AgentKind::ClaudeCode
+        && matches!(
+            crate::agent_conversation::claude_conversation(pid),
+            crate::agent_conversation::Conversation::Verified(id) if id == session_id
+        )
 }
 
 /// Find the `kind` agent under the pane process `pane_pid`, and the `aas`
@@ -1737,6 +1732,7 @@ pub(crate) fn prepare(
     // Every live agent, not only the scoped ones: an account capped by an
     // agent elsewhere has no quota to give either.
     let observed = agents;
+    let ledger = crate::account_provider::default_ledger();
     let (resolved, agents, outcomes) = scoped(request, agents, backends);
     let mut steps: Vec<Step> = outcomes.into_iter().map(Step::Done).collect();
     let (mut chosen, skipped) = select(&agents, &resolved);
@@ -1748,7 +1744,7 @@ pub(crate) fn prepare(
     let planned = plan(chosen, backends, &mut outcomes);
     steps.extend(outcomes.into_iter().map(Step::Done));
     steps.extend(assign_accounts(
-        &resolved, planned, config, accounts, observed,
+        &resolved, planned, config, accounts, observed, &ledger,
     ));
     (resolved, steps)
 }
@@ -1770,6 +1766,7 @@ pub(crate) fn execute_target(
         target.account.clone(),
         &target.candidates,
         profiles,
+        target.profile_from.as_deref(),
         observer,
         probe,
     );
@@ -1892,14 +1889,15 @@ fn plan(
 
 /// Pick an account for each planned agent, provider by provider, in the
 /// order they were planned. Each provider's accounts come from its
-/// [`crate::account_provider::Backend`]; `observed` are the live agents
-/// that rank configured accounts.
+/// [`crate::account_provider::Backend`]; `ledger` and the live agents
+/// `observed` rank configured accounts.
 fn assign_accounts(
     request: &SwapRequest,
     planned: Vec<Planned>,
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
     observed: &[Agent],
+    ledger: &crate::account_provider::AccountLedger,
 ) -> Vec<Step> {
     use crate::account_provider::Backend;
     // One backend (and one `aas candidates`) per provider, shared by that
@@ -1926,7 +1924,9 @@ fn assign_accounts(
             .collect();
         let candidates = match backend {
             Backend::Accounts(profiles) => {
-                steps.extend(profile_steps(request, group, &profiles, provider, observed));
+                steps.extend(profile_steps(
+                    request, group, &profiles, provider, observed, ledger,
+                ));
                 continue;
             }
             Backend::Aas(aas) => match request.to {
@@ -1976,6 +1976,7 @@ fn profile_steps(
     profiles: &[crate::accounts::AccountProfile],
     provider: &str,
     observed: &[Agent],
+    ledger: &crate::account_provider::AccountLedger,
 ) -> Vec<Step> {
     let resolved = crate::accounts::ResolvedAccounts::new(profiles);
     let current: Vec<Option<String>> = group
@@ -1990,18 +1991,14 @@ fn profile_steps(
         .filter(|(p, _)| is_rate_limited(&p.agent))
         .filter_map(|(_, account)| account.as_deref())
         .collect();
-    // What the daemon recorded about each account (a cap outlives the
+    // What the ledger recorded about each account (a cap outlives the
     // agent that hit it), with what live agents report now folded in.
-    let ledger = crate::account_provider::default_ledger_path()
-        .map(|path| crate::account_provider::AccountLedger::load(&path))
-        .unwrap_or_default();
-    let ranked = crate::account_provider::rank(
+    let ranked = crate::account_provider::rank_observed(
         provider,
         profiles,
         observed,
         time::OffsetDateTime::now_utc(),
-        |agent| crate::account_provider::identify(&resolved, agent),
-        &ledger,
+        ledger,
     );
     let ranked = mark_capped(ranked, &capped);
     let choice = match &request.to {
@@ -2044,6 +2041,7 @@ fn mark_capped(mut ranked: Vec<Candidate>, capped: &[&str]) -> Vec<Candidate> {
 
 /// Carry one planned target through to its outcome.
 #[allow(clippy::too_many_lines)] // one target's whole swap, in the order it happens
+#[allow(clippy::too_many_arguments)] // one target's whole planning context
 fn swap_one(
     request: &SwapRequest,
     planned: &Planned,
@@ -2053,6 +2051,7 @@ fn swap_one(
         &[crate::accounts::AccountProfile],
         &crate::accounts::ResolvedAccounts,
     )>,
+    profile_from: Option<&str>,
     observer: &mut dyn effects::EffectObserver,
     probe: Option<&dyn TurnProbe>,
 ) -> SwapOutcome {
@@ -2150,6 +2149,15 @@ fn swap_one(
             crate::process_snapshot::process_argv(launch.agent_pid).as_deref(),
             BYPASS_SWITCH,
         ),
+        handoff: profiles
+            .and(provider_name(agent.kind))
+            .map(|provider| Handoff {
+                provider,
+                from: profile_from.map(str::to_owned),
+                to: account.clone(),
+                agent: agent.clone(),
+                verified: *verified,
+            }),
     };
     // The relaunch must land on the account it was meant for, checked before
     // any follow-up starts work on the wrong one.
@@ -2714,6 +2722,52 @@ struct Target {
     ran_with_bypass: bool,
     /// What the relaunch needs, checked before anything is done.
     prerequisites: preflight::Prerequisites,
+    /// The move between configured accounts, recorded in the account
+    /// ledger as it happens. `None` for `aas` accounts.
+    handoff: Option<Handoff>,
+}
+
+/// A target's move between configured accounts: the cap it leaves behind
+/// and the account it is bound to from its relaunch on.
+#[derive(Debug, Clone)]
+struct Handoff {
+    provider: &'static str,
+    /// The account it leaves, as its own process's environment says.
+    from: Option<String>,
+    to: String,
+    /// The agent as planned: what it reported on `from`.
+    agent: Agent,
+    /// Its conversation was read from that process itself, so the process
+    /// (and its environment) provably is this agent.
+    verified: bool,
+}
+
+impl Handoff {
+    /// Record `step` in the ledger at `path`.
+    fn record(
+        &self,
+        path: &std::path::Path,
+        target: &Target,
+        step: io::AccountStep,
+        now: time::OffsetDateTime,
+    ) -> std::io::Result<bool> {
+        crate::account_provider::update(path, |ledger| match step {
+            io::AccountStep::Leaving => self.from.as_deref().is_some_and(|from| {
+                ledger.leave(self.provider, from, &self.agent, self.verified, now)
+            }),
+            io::AccountStep::Bound => {
+                ledger.bind(crate::account_provider::AccountBinding {
+                    provider: self.provider.to_owned(),
+                    account: self.to.clone(),
+                    session_id: Some(target.session_id.clone()),
+                    pane: Some(target.pane.clone()),
+                    socket: target.socket.clone(),
+                    bound_at: now,
+                });
+                true
+            }
+        })
+    }
 }
 
 /// Stop the agent, type `command` into the pane's shell, wait for the
@@ -2754,6 +2808,9 @@ fn execute(
         .capture()
         .and_then(|screen| composer_draft(&screen, target.kind))
         .filter(|_| target.restore_draft);
+    // The cap it leaves is its account's, recorded while it is known: the
+    // agent may be gone before the daemon next records.
+    record_handoff(io, target, io::AccountStep::Leaving);
     enter(runner, Phase::Stopping)?;
     stop_agent(
         runner,
@@ -2764,6 +2821,8 @@ fn execute(
         &mut answered,
     )?;
     enter(runner, Phase::Launching)?;
+    // From here on what it reports is the new account's.
+    record_handoff(io, target, io::AccountStep::Bound);
     if target.direct {
         relaunch_in_place(runner, target, command)?;
     } else {
@@ -2830,6 +2889,14 @@ fn execute(
         &answered,
         &checked,
     ))
+}
+
+/// Record `step` of the target's move between configured accounts; an
+/// `aas` swap has none to record.
+fn record_handoff(io: &dyn io::SwapIo, target: &Target, step: io::AccountStep) {
+    if target.handoff.is_some() {
+        io.record_account(step);
+    }
 }
 
 /// Checks which account the relaunched agent (the process bound to the
@@ -5339,6 +5406,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            rate_limits_at: None,
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,
@@ -6255,6 +6323,7 @@ mod tests {
             &config,
             &crate::accounts::AccountsConfig::default(),
             &[agent],
+            &crate::account_provider::AccountLedger::default(),
         );
         let [Step::Done(outcome)] = steps.as_slice() else {
             panic!("no account backend must settle the target without running it");
@@ -6273,12 +6342,41 @@ mod tests {
         assert_eq!(outcome.to, None);
     }
 
-    /// The planning path itself ranks from live agents: each agent's account
-    /// is read from its real process environment, and an account capped by
-    /// an agent that is not a target is passed over.
+    /// A command line is not proof of which conversation a process runs: a
+    /// prompt (or any argument) can spell `resume <id>` or `--resume <id>`.
+    /// Only the provider's own record is.
     #[cfg(target_os = "linux")]
     #[test]
-    fn swap_planning_reads_accounts_from_live_processes_and_skips_capped_ones() {
+    fn a_command_line_naming_a_session_proves_nothing() {
+        const SESSION: &str = "44444444-4444-4444-8444-444444444444";
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; :", "sh"])
+            .args([&format!("please resume {SESSION} later"), "resume", SESSION])
+            .args(["--resume", SESSION, &format!("--resume={SESSION}")])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        for _ in 0..100 {
+            if process_command(pid).is_some_and(|line| line.contains("--resume=")) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(process_command(pid).is_some_and(|line| line.contains(SESSION)));
+        let proven = [AgentKind::Codex, AgentKind::ClaudeCode]
+            .map(|kind| process_runs_session(pid, kind, SESSION));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(proven, [false, false]);
+    }
+
+    /// The planning path ranks from the ledger and every live agent: the
+    /// target's own account is read from its real process environment, an
+    /// agent muxa bound to an account caps it, and an agent that is not
+    /// bound (and has no provider record) says nothing about any account.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn swap_planning_reads_accounts_from_its_process_and_bindings_and_skips_capped_ones() {
         struct Child(std::process::Child);
         impl Drop for Child {
             fn drop(&mut self) {
@@ -6286,28 +6384,20 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        // Each process names its conversation on its command line, which is
-        // what binds it to that session (a shell stays alive under `;`).
         const SESSION_A: &str = "11111111-1111-4111-8111-111111111111";
         const SESSION_B: &str = "22222222-2222-4222-8222-222222222222";
-        let spawn = |account: &str, session: &str| {
-            Child(
-                std::process::Command::new("sh")
-                    .args(["-c", "sleep 30; :", "sh", "--resume", session])
-                    .env("MUXA_TEST_ACCOUNT", account)
-                    .spawn()
-                    .unwrap(),
-            )
-        };
-        let (on_a, on_b) = (spawn("a", SESSION_A), spawn("b", SESSION_B));
-        // Wait until both environments are readable.
-        for child in [&on_a, &on_b] {
-            for _ in 0..100 {
-                if !crate::accounts::process_environ(child.0.id()).is_empty() {
-                    break;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+        let on_a = Child(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .env("MUXA_TEST_ACCOUNT", "a")
+                .spawn()
+                .unwrap(),
+        );
+        for _ in 0..100 {
+            if !crate::accounts::process_environ(on_a.0.id()).is_empty() {
+                break;
             }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let accounts = crate::accounts::AccountsConfig {
             claude: ["a", "b", "c"]
@@ -6315,17 +6405,21 @@ mod tests {
                 .to_vec(),
             codex: Vec::new(),
         };
-        let mut target = limited("%1", SESSION_A);
-        target.workload.primary_pid = Some(on_a.0.id());
+        let now = time::OffsetDateTime::now_utc();
+        let target = limited("%1", SESSION_A);
         let mut elsewhere = limited("%2", SESSION_B);
-        elsewhere.workload.primary_pid = Some(on_b.0.id());
-        // The other agent's pane process runs a different conversation: no
-        // binding, so it would say nothing about `b`.
-        let mut unbound = limited("%3", "33333333-3333-4333-8333-333333333333");
-        unbound.workload.primary_pid = Some(on_b.0.id());
-        elsewhere.rate_limited_until =
-            Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
-        let planned = Planned {
+        elsewhere.rate_limited_until = Some(now + time::Duration::hours(1));
+        elsewhere.rate_limits_at = Some(now);
+        let mut ledger = crate::account_provider::AccountLedger::default();
+        ledger.bind(crate::account_provider::AccountBinding {
+            provider: "claude".into(),
+            account: "b".into(),
+            session_id: Some(SESSION_B.into()),
+            pane: Some("%2".into()),
+            socket: None,
+            bound_at: now - time::Duration::hours(1),
+        });
+        let planned = || Planned {
             agent: target.clone(),
             session_id: SESSION_A.into(),
             source: SessionIdSource::Registry,
@@ -6343,43 +6437,27 @@ mod tests {
         };
         let steps = assign_accounts(
             &request(SwapScope::All),
-            vec![planned],
+            vec![planned()],
             &SwapConfig::default(),
             &accounts,
-            &[target.clone(), elsewhere],
+            &[target.clone(), elsewhere.clone()],
+            &ledger,
         );
         let [Step::Run(prepared)] = steps.as_slice() else {
             panic!("the target must be planned to run");
         };
         assert_eq!(prepared.profile_from.as_deref(), Some("a"));
-        // `a` is where it is capped, `b` is capped by the other agent.
+        // `a` is where it is capped, `b` is capped by the agent bound to it.
         assert_eq!(prepared.account.as_deref(), Ok("c"));
 
-        // A row whose pane process runs another session is not evidence.
-        let planned = Planned {
-            agent: target.clone(),
-            session_id: SESSION_A.into(),
-            source: SessionIdSource::Registry,
-            verified: false,
-            unverified_reason: None,
-            process_start: None,
-            launch: PaneLaunch {
-                agent_pid: on_a.0.id(),
-                top_pid: on_a.0.id(),
-                line: LaunchLine::bare("claude"),
-                resumed_id: None,
-            },
-            pane: test_pane("%1"),
-            backend: crate::backend::default_backend(),
-        };
-        let mut far = unbound;
-        far.rate_limited_until = Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+        // Unbound, the same capped row is not evidence about `b`.
         let steps = assign_accounts(
             &request(SwapScope::All),
-            vec![planned],
+            vec![planned()],
             &SwapConfig::default(),
             &accounts,
-            &[target, far],
+            &[target, elsewhere],
+            &crate::account_provider::AccountLedger::default(),
         );
         let [Step::Run(prepared)] = steps.as_slice() else {
             panic!("the target must be planned to run");

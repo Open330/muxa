@@ -49,7 +49,7 @@ fn best_listing<'p>(listings: impl Iterator<Item = &'p PaneInfo>) -> Option<&'p 
     })
 }
 
-fn is_synthetic(session_id: &str) -> bool {
+pub(crate) fn is_synthetic(session_id: &str) -> bool {
     session_id.starts_with(SYNTHETIC_SESSION_PREFIX)
 }
 
@@ -294,6 +294,16 @@ pub struct Agent {
     /// over would keep its row glowing red forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_source: Option<RateLimitSource>,
+    /// When the rate-limit fields above were read at their source: the
+    /// statusline or hook report, or the Codex rollout record. Account
+    /// ranking credits a reading to the account muxa bound the agent to only
+    /// when it was taken after that binding. Additive on the wire.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub rate_limits_at: Option<OffsetDateTime>,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -388,6 +398,7 @@ impl Agent {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            rate_limits_at: None,
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,
@@ -820,18 +831,11 @@ fn mutate_for_event(
             // A fresh session means whatever wall the previous turn ran
             // into has been cleared (or the user is starting over) —
             // drop the active-cap marker so the watch row stops glowing
-            // red. Utilization goes too: a session resumed on another
-            // account (a swap) would otherwise carry the old account's
-            // usage, which account routing would credit to the new one.
-            // The new process reports its own on its next statusline or
-            // rollout update.
+            // red. Rolling utilization fields stay so the new session
+            // can keep counting against the same window.
             agent.rate_limited_until = None;
             agent.rate_limit_scope = None;
             agent.rate_limit_source = None;
-            agent.rate_limit_5h_pct = None;
-            agent.rate_limit_5h_resets_at = None;
-            agent.rate_limit_7d_pct = None;
-            agent.rate_limit_7d_resets_at = None;
         }
         AgentEvent::PromptSubmitted { prompt, .. } => {
             agent.last_prompt = Some(prompt.clone());
@@ -1035,11 +1039,20 @@ fn apply_heartbeat(agent: &mut Agent, ev: &AgentEvent) {
         rate_limit_5h_resets_at,
         rate_limit_7d_pct,
         rate_limit_7d_resets_at,
+        at,
         ..
     } = ev
     else {
         return;
     };
+    if agent.kind == AgentKind::Codex
+        || rate_limit_5h_pct.is_some()
+        || rate_limit_5h_resets_at.is_some()
+        || rate_limit_7d_pct.is_some()
+        || rate_limit_7d_resets_at.is_some()
+    {
+        agent.rate_limits_at = Some(*at);
+    }
     if let Some(m) = model {
         agent.model = Some(m.clone());
     }
@@ -1137,11 +1150,13 @@ fn apply_rate_limited(agent: &mut Agent, ev: &AgentEvent) {
         source,
         resets_at,
         message,
+        at,
         ..
     } = ev
     else {
         return;
     };
+    agent.rate_limits_at = Some(*at);
     // Don't let an `Unknown` scope from a coarse source (StopFailure 429)
     // clobber a richer scope already learned from statusline / transcript
     // — that would make the watch badge regress from `5h …` to a bare
@@ -3127,6 +3142,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            rate_limits_at: None,
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,
@@ -4578,43 +4594,6 @@ mod tests {
             store.by_session("s").await.unwrap().state,
             AgentState::Stopped
         );
-    }
-
-    /// A session resumed on another account (a swap) must not carry the old
-    /// account's usage: account routing would credit it to the new one.
-    #[tokio::test]
-    async fn a_new_session_drops_the_previous_accounts_usage() {
-        let store = Store::shared();
-        let t0 = datetime!(2026-04-29 10:00:00 UTC);
-        let resets_at = datetime!(2026-04-29 15:00:00 UTC);
-        store
-            .apply(&AgentEvent::Heartbeat {
-                id: id("s"),
-                model: None,
-                context_used_pct: None,
-                cost_usd: None,
-                rate_limit_5h_pct: Some(97.0),
-                rate_limit_5h_resets_at: Some(resets_at),
-                rate_limit_7d_pct: Some(40.0),
-                rate_limit_7d_resets_at: Some(resets_at),
-                at: t0,
-            })
-            .await;
-        assert_eq!(
-            store.by_session("s").await.unwrap().rate_limit_5h_pct,
-            Some(97.0)
-        );
-        store
-            .apply(&AgentEvent::Started {
-                id: id("s"),
-                at: t0 + time::Duration::minutes(1),
-            })
-            .await;
-        let resumed = store.by_session("s").await.unwrap();
-        assert_eq!(resumed.rate_limit_5h_pct, None);
-        assert_eq!(resumed.rate_limit_5h_resets_at, None);
-        assert_eq!(resumed.rate_limit_7d_pct, None);
-        assert_eq!(resumed.rate_limit_7d_resets_at, None);
     }
 
     /// End-to-end composition: walk the full rate-limit lifecycle the
@@ -6839,6 +6818,7 @@ mod tests {
                     rate_limited_until: None,
                     rate_limit_scope: None,
                     rate_limit_source: None,
+                    rate_limits_at: None,
                     started_at: mid,
                     last_activity_at: mid,
                     state_entered_at: mid,
@@ -6875,6 +6855,7 @@ mod tests {
                     rate_limited_until: None,
                     rate_limit_scope: None,
                     rate_limit_source: None,
+                    rate_limits_at: None,
                     started_at: new,
                     last_activity_at: new,
                     state_entered_at: new,
@@ -6940,6 +6921,7 @@ mod tests {
                         rate_limited_until: None,
                         rate_limit_scope: None,
                         rate_limit_source: None,
+                        rate_limits_at: None,
                         started_at: at,
                         last_activity_at: at,
                         state_entered_at: at,
@@ -7010,6 +6992,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            rate_limits_at: None,
             started_at: t0,
             last_activity_at: t0,
             state_entered_at: t0,

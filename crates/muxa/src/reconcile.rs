@@ -469,7 +469,11 @@ impl<L: LivenessSource> Reconciler<L> {
                         rate_limit_5h_resets_at: five.and_then(|w| w.resets_at),
                         rate_limit_7d_pct: seven.map(|w| w.used_percent),
                         rate_limit_7d_resets_at: seven.and_then(|w| w.resets_at),
-                        at: now,
+                        // When Codex wrote the reading, not when it was read
+                        // again: a reading from before a swap is the previous
+                        // account's, which account ranking must not credit to
+                        // the account the conversation moved to.
+                        at: rl.at.unwrap_or(now),
                     })
                     .await;
             }
@@ -1578,6 +1582,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            rate_limits_at: None,
             started_at: t0,
             last_activity_at: t0,
             state_entered_at: t0,
@@ -1934,6 +1939,101 @@ mod tests {
         assert_eq!(row.state, AgentState::Idle);
         assert_eq!(row.last_response.as_deref(), Some("Done"));
         assert_eq!(row.last_activity_at, capped_at);
+    }
+
+    /// A swap resumes a Codex conversation on account `b`, and its rollout
+    /// still ends with the window Codex wrote on `a`. Re-applied from the
+    /// unchanged file on the next poll, the reading keeps the time Codex
+    /// wrote it, so it predates the binding to `b` and does not cap `b`.
+    #[tokio::test]
+    async fn reconcile_codex_rollout_reading_from_before_a_swap_does_not_cap_the_new_account() {
+        use crate::account_provider::{rank_observed, AccountBinding, AccountLedger};
+        let store = Store::shared();
+        let now = OffsetDateTime::now_utc();
+        let written = now - time::Duration::minutes(5);
+        let started = codex_started("moved", "%8", now - time::Duration::minutes(10));
+        store.apply(&started).await;
+        let root = tempfile::tempdir().unwrap();
+        write_codex_rollout(root.path(), "moved", 100.0, "null");
+        let path = codex_rollout::locate_rollout(root.path(), "moved", now, 0).unwrap();
+        let stamp = written
+            .replace_nanosecond(0)
+            .unwrap()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let resets = (now + time::Duration::hours(3)).unix_timestamp();
+        std::fs::write(
+            &path,
+            format!(
+                "{}\n",
+                serde_json::json!({"timestamp": stamp, "type": "event_msg", "payload": {
+                    "type": "token_count", "rate_limits": {
+                        "primary": {"used_percent": 100.0, "window_minutes": 300, "resets_at": resets},
+                        "secondary": null, "rate_limit_reached_type": null}}})
+            ),
+        )
+        .unwrap();
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(2))
+            .unwrap();
+        let mut p = pane("%8");
+        p.current_command = "codex".into();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            FakeLiveness::new(vec![p]),
+            Duration::from_millis(10),
+        )
+        .with_codex_sessions_root(Some(root.path().to_path_buf()));
+        reconciler.reconcile_once().await;
+        let read_at = Some(written.replace_nanosecond(0).unwrap());
+        assert_eq!(
+            store.by_session("moved").await.unwrap().rate_limits_at,
+            read_at
+        );
+
+        // The swap binds the conversation to `b`, then resumes it. Something
+        // clears the row's windows (older daemons did, on `Started`), so the
+        // next poll applies the cached reading again.
+        let mut ledger = AccountLedger::default();
+        ledger.bind(AccountBinding {
+            provider: "codex".into(),
+            account: "b".into(),
+            session_id: Some("moved".into()),
+            pane: Some("%8".into()),
+            socket: None,
+            bound_at: now - time::Duration::minutes(1),
+        });
+        store.apply(&codex_started("moved", "%8", now)).await;
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: started.id().clone(),
+                model: None,
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: None,
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: now,
+            })
+            .await;
+        reconciler.reconcile_once().await;
+        let row = store.by_session("moved").await.unwrap();
+        assert_eq!(
+            row.rate_limit_5h_pct,
+            Some(100.0),
+            "the cached reading is back"
+        );
+        assert_eq!(row.rate_limits_at, read_at);
+
+        let profiles = ["a", "b"].map(|name| crate::accounts::AccountProfile {
+            name: name.into(),
+            env: std::collections::BTreeMap::new(),
+            env_file: None,
+        });
+        let ranked = rank_observed("codex", &profiles, &[row], now, &ledger);
+        assert!(ranked.iter().all(|c| c.eligible), "{ranked:?}");
     }
 
     /// Appended telemetry invalidates the cached reading, and a session that

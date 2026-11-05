@@ -50,22 +50,27 @@ only the agents being moved, and not only agents that are still running:
   has not reset yet (`rate_limited_until`), or a 5-hour / 7-day window at
   100% until that window's reset. A cap or full window reported without a
   reset time is waited out for an hour from when it was first seen;
-- the cap belongs to the account, not to the agent: muxad records it, and
-  each account's last reported usage, in `$XDG_DATA_HOME/muxa/account-limits.json`
-  (its own file, not configuration) as limits are reported. An account stays
-  capped after its last agent is stopped or swapped away, until its reset;
+- the cap belongs to the account, not to the agent: it is kept, with each
+  account's last reported usage, in `$XDG_DATA_HOME/muxa/account-limits.json`
+  (its own file, not configuration). An account stays capped after its last
+  agent is stopped or swapped away, until its reset. muxad records it the
+  moment an agent caps or a window fills, every minute, and at shutdown; a
+  swap records the cap its agent leaves before stopping it;
 - accounts with quota left come first, the least used first (an account
   nobody has reported on counts as unused), ties in the listed order; capped
   accounts follow, the soonest to reset first;
-- an agent's account is read from the environment of a process that
-  provably runs that agent's session: Claude's own `sessions/<pid>.json`, or
-  a command line naming the session (`--resume <id>`, `resume <id>`). A
-  pane's first agent process alone is not enough, since a pane can run a
-  nested agent on another account. An agent whose binding is uncertain, or
-  whose environment cannot be read (macOS hides it for Apple-signed
-  binaries), says nothing about any account;
-- a session that starts afresh (including one resumed by a swap) drops the
-  previous session's usage, so the account it moved to does not inherit it.
+- an agent's reports count for an account only when muxa knows the agent
+  runs on it. muxa binds an agent to an account when it puts it there: a
+  launch binds the pane it starts in (the first agent of that provider to
+  start there afterwards), a swap binds the conversation it resumes. Only
+  reports taken after that binding count, so a reading from before a swap
+  (Codex's rollout still ends with the old account's window) counts for
+  neither account. An agent muxa did not start is attributed only by its
+  provider's own record: Claude's `sessions/<pid>.json` naming its session,
+  and that process's environment. Nothing weaker counts (a pane's first
+  process, a command line naming a session, which a prompt can contain), so
+  such an agent, and any Codex agent muxa did not start or swap, says
+  nothing about any account.
 
 Once a provider lists accounts, its swaps use only those: an `aas` name is
 not one of them, and `--bare` no longer applies, since an agent started bare

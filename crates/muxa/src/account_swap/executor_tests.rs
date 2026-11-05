@@ -6,7 +6,7 @@
 use super::effects::{
     Effect, EffectObserver, Key, NoObserver, ObserverError, Op, Purpose, Runner, Transport,
 };
-use super::io::{AgentArgv, Clock, SwapIo};
+use super::io::{AccountStep, AgentArgv, Clock, SwapIo};
 use super::{execute, AccountVerdict, LaunchLine, PaneLaunch, Refusal, Target};
 use crate::event::AgentKind;
 use crate::swap_job::{
@@ -220,6 +220,10 @@ impl SwapIo for FakeIo {
     fn submit_grace(&self) -> Duration {
         Duration::from_millis(100)
     }
+
+    fn record_account(&self, step: super::io::AccountStep) {
+        self.record(format!("account {step:?}"));
+    }
 }
 
 fn target(kind: AgentKind, direct: bool, busy: bool) -> Target {
@@ -240,6 +244,7 @@ fn target(kind: AgentKind, direct: bool, busy: bool) -> Target {
             respawn_shell: Some("/bin/sh".into()),
             ..super::preflight::Prerequisites::default()
         },
+        handoff: None,
     }
 }
 
@@ -353,6 +358,80 @@ fn a_codex_swap_stops_relaunches_and_sends_the_follow_up_in_order() {
     assert!(log.iter().any(
         |(effect, _)| effect.op == Op::Text { chars: 8 } && effect.purpose == Purpose::Relaunch
     ));
+}
+
+/// A Codex row capped on account `a`, moving to `b`, its conversation read
+/// from its own process.
+fn handoff() -> super::Handoff {
+    let now = time::OffsetDateTime::now_utc();
+    let mut agent: crate::state::Agent = serde_json::from_value(serde_json::json!({
+        "kind": "codex",
+        "session_id": "S",
+        "pane": "%1",
+        "state": "error",
+        "started_at": "2026-11-05T11:00:00Z",
+        "last_activity_at": "2026-11-05T11:00:00Z",
+        "state_entered_at": "2026-11-05T11:00:00Z"
+    }))
+    .unwrap();
+    agent.rate_limit_scope = Some(crate::event::RateLimitScope::FiveHour);
+    agent.rate_limited_until = Some(now + time::Duration::hours(2));
+    agent.rate_limits_at = Some(now);
+    super::Handoff {
+        provider: "codex",
+        from: Some("a".into()),
+        to: "b".into(),
+        agent,
+        verified: true,
+    }
+}
+
+/// Between configured accounts, the cap the agent leaves is recorded before
+/// it is stopped (it may be gone before the daemon records again), and the
+/// account it moves to before it is relaunched.
+#[test]
+fn a_swap_records_the_cap_it_leaves_before_stopping_and_its_binding_before_relaunching() {
+    let io = FakeIo::new(CODEX_IDLE, codex_agent());
+    let mut target = target(AgentKind::Codex, false, false);
+    target.handoff = Some(handoff());
+    let (result, _, halted) = run(&io, &target, &launch(), Some("continue"), &mut NoObserver);
+    result.unwrap();
+    assert!(halted.is_none());
+    assert_eq!(
+        io.sent()[..4],
+        [
+            "account Leaving",
+            "signal TERM [10]",
+            "account Bound",
+            "text \"RELAUNCH\"",
+        ]
+    );
+}
+
+/// What those two steps write: `a` stays capped with no agent reporting it,
+/// and the conversation is `b`'s from the relaunch on.
+#[test]
+fn a_handoff_writes_the_cap_left_and_the_new_binding_to_the_ledger() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("account-limits.json");
+    let mut target = target(AgentKind::Codex, false, false);
+    target.handoff = Some(handoff());
+    let handoff = target.handoff.as_ref().unwrap();
+    let now = time::OffsetDateTime::now_utc();
+    for step in [AccountStep::Leaving, AccountStep::Bound] {
+        assert!(handoff.record(&path, &target, step, now).unwrap());
+    }
+    let ledger = crate::account_provider::AccountLedger::load(&path);
+    let profiles = ["a", "b"].map(|name| crate::accounts::AccountProfile {
+        name: name.into(),
+        env: std::collections::BTreeMap::new(),
+        env_file: None,
+    });
+    let ranked = crate::account_provider::rank_observed("codex", &profiles, &[], now, &ledger);
+    assert_eq!(ranked[0].name, "b");
+    assert!(!ranked[1].eligible, "{}", ranked[1].reason);
+    let binding = ledger.binding_for(&handoff.agent, &[]).unwrap();
+    assert_eq!((binding.account.as_str(), binding.bound_at), ("b", now));
 }
 
 /// The scheduled-task refusal is a skip that still typed into the pane:
