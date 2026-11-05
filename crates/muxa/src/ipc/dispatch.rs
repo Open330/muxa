@@ -1393,7 +1393,9 @@ pub(super) async fn handle(
                     origin,
                     target,
                     mut request,
+                    view,
                 } => {
+                    response_view = view;
                     kind = "collaboration_send";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(
@@ -1899,9 +1901,13 @@ pub(super) async fn handle(
                         _ => Response::err("worker pane endpoint is absent or ambiguous"),
                     }
                 }
-                RequestBody::CollaborationSubscribe => {
+                RequestBody::CollaborationSubscribe { requests_only } => {
                     kind = "collaboration_subscribe";
                     let changes = collaboration.subscribe();
+                    // Capture before ACK: a mutation after this baseline stays dirty,
+                    // even when it races the caller's first history snapshot.
+                    let mut request_revision = collaboration.request_revision();
+                    let request_store = collaboration.clone();
                     let stream_proto = negotiated.unwrap_or(PROTOCOL_VERSION);
                     let ack_bytes = encode_line(&Response::ok(), stream_proto)?;
                     if !write_subscription_ack(&mut writer, &ack_bytes, &mut stopping).await? {
@@ -1915,7 +1921,17 @@ pub(super) async fn handle(
                     );
                     return until_server_shutdown(
                         &mut stopping,
-                        stream_revision_updates(writer, changes, stream_proto),
+                        stream_revision_updates_filtered(
+                            writer,
+                            changes,
+                            stream_proto,
+                            move || {
+                                let current = request_store.request_revision();
+                                let dirty = current != request_revision;
+                                request_revision = current;
+                                !requests_only || dirty
+                            },
+                        ),
                     )
                     .await
                     .unwrap_or(Ok(()));
@@ -2448,7 +2464,12 @@ pub(super) async fn handle(
                     ));
                     response
                 }
-                RequestBody::CollaborationCancel { origin, request_id } => {
+                RequestBody::CollaborationCancel {
+                    origin,
+                    request_id,
+                    view,
+                } => {
+                    response_view = view;
                     kind = "collaboration_cancel";
                     collaboration_actor.observe_pane(&backends).await;
                     let mut audit_context = CollaborationAuditContext::new(

@@ -353,9 +353,20 @@ pub(super) async fn stream_fleet_updates(
 /// no request content or participant identity; it is safe to propagate
 /// through Fleet as a cache invalidation while mailbox reads remain scoped.
 pub(super) async fn stream_revision_updates(
+    writer: WriteHalf,
+    changes: watch::Receiver<u64>,
+    protocol: u32,
+) -> Result<(), RuntimeError> {
+    stream_revision_updates_filtered(writer, changes, protocol, || true).await
+}
+
+/// Drop invalidations unrelated to the consumer while retaining keepalives.
+/// The predicate must be initialized before the subscription acknowledgement.
+pub(super) async fn stream_revision_updates_filtered(
     mut writer: WriteHalf,
     mut changes: watch::Receiver<u64>,
     protocol: u32,
+    mut should_send: impl FnMut() -> bool,
 ) -> Result<(), RuntimeError> {
     let mut keepalive = tokio::time::interval(STREAM_KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -366,7 +377,11 @@ pub(super) async fn stream_revision_updates(
                 if signal.is_err() {
                     return Ok(());
                 }
-                let frame = serde_json::json!({ "revision": *changes.borrow_and_update() });
+                let revision = *changes.borrow_and_update();
+                if !should_send() {
+                    continue;
+                }
+                let frame = serde_json::json!({ "revision": revision });
                 let bytes = encode_line(&frame, protocol)?;
                 if writer.write_all(&bytes).await.is_err()
                     || writer.flush().await.is_err()

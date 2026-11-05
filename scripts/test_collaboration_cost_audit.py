@@ -113,6 +113,40 @@ class CostAuditTests(unittest.TestCase):
             ledger.write_text(json.dumps(rows[2]))
             self.assertIsNone(audit.summarize(ledger, [], since, 300)["ipc"][0]["request_extra_per_body_byte"])
 
+    def test_shapes_separate_preview_badges_and_waits_with_latency_coverage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "audit.ndjson"
+            base = {"at": "2026-10-20T01:00:00Z", "actor": {"client_kind": "watch"}, "operation": "list"}
+            rows = [dict(base, read_view="preview", query_limit=500, response_bytes=9000, elapsed_us=20000),
+                    dict(base, read_view="metadata", query_limit=500, response_bytes=100, elapsed_us=1000),
+                    dict(base, read_view="metadata", query_limit=500, response_bytes=110, elapsed_us=2000),
+                    dict(base, read_view="metadata", query_limit=500, elapsed_us=True),
+                    dict(base, operation="wait", read_view="outcome", response_bytes=80, elapsed_us=30000000)]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows))
+            report = audit.summarize(ledger, [], dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc), 300)
+            preview, badges, wait = report["ipc_shapes"]
+            self.assertEqual(preview["view"], "preview")
+            self.assertEqual(badges["calls"], 3)
+            self.assertEqual(badges["response_bytes_samples"], 2)
+            self.assertEqual(badges["elapsed_us_samples"], 2)
+            self.assertEqual((badges["p50_elapsed_us"], badges["p95_elapsed_us"]), (1000, 2000))
+            self.assertFalse(badges["elapsed_includes_wait"])
+            self.assertTrue(wait["elapsed_includes_wait"])
+
+    def test_shape_filters_do_not_merge_queued_claimed_and_all_scope_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "audit.ndjson"
+            base = {"at": "2026-10-20T01:00:00Z", "actor": {"client_kind": "watch"},
+                    "operation": "list", "read_view": "metadata", "query_limit": 500}
+            rows = [dict(base, status="queued", scope="all"),
+                    dict(base, status="claimed", scope="all"), dict(base, scope="caller")]
+            ledger.write_text("\n".join(json.dumps(row) for row in rows))
+            shapes = audit.summarize(ledger, [], dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc), 300)["ipc_shapes"]
+            self.assertEqual(len(shapes), 3)
+            self.assertEqual({(row["status"], row["scope"]) for row in shapes},
+                             {("queued", "all"), ("claimed", "all"), (None, "caller")})
+            self.assertTrue(all(row["p95_elapsed_us"] is None for row in shapes))
+
     def test_missing_audit_and_source_mentions_do_not_invent_model_calls(self):
         self.assertIsNone(audit.muxa_call("Bash", {"command": "rg muxa src/main.rs"}))
         self.assertIsNone(audit.muxa_call("unrelated_muxa_room_context", {}))

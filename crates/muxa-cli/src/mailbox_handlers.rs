@@ -396,7 +396,7 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                 .await
                 .map_err(anyhow::Error::msg)?;
             let request = client
-                .collaboration_send(
+                .collaboration_send_view(
                     &origin,
                     "human",
                     &NewRequest {
@@ -406,6 +406,11 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         ))?),
                         notify: Some(true),
                         ..NewRequest::default()
+                    },
+                    if full {
+                        muxa::collaboration::CollaborationReadView::Full
+                    } else {
+                        muxa::collaboration::CollaborationReadView::Metadata
                     },
                 )
                 .await?;
@@ -450,7 +455,7 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             let kind = collaboration_request_kind(&kind)?;
             let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
-                .collaboration_send(
+                .collaboration_send_view(
                     &origin,
                     &target,
                     &NewRequest {
@@ -490,6 +495,11 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         links,
                         withdraw_reply_wakes: withdraw,
                         recipient_slot: None,
+                    },
+                    if full {
+                        muxa::collaboration::CollaborationReadView::Full
+                    } else {
+                        muxa::collaboration::CollaborationReadView::Metadata
                     },
                 )
                 .await?;
@@ -634,7 +644,17 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             json,
             full,
         } => {
-            let request = client.collaboration_cancel(&origin, &request_id).await?;
+            let request = client
+                .collaboration_cancel_view(
+                    &origin,
+                    &request_id,
+                    if full {
+                        muxa::collaboration::CollaborationReadView::Full
+                    } else {
+                        muxa::collaboration::CollaborationReadView::Metadata
+                    },
+                )
+                .await?;
             print_collaboration_receipt(&request, json, full);
         }
         MsgCmd::Withdraw { request_ids, json } => {

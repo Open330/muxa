@@ -2152,7 +2152,12 @@ fn spawn_collaboration_broadcast(
                     let origin = fleet_watch_console_origin(&target.recipient.pane);
                     let wire_target = format!("pane:{}", target.recipient.pane.pane_id);
                     client
-                        .collaboration_send(&origin, &wire_target, &request)
+                        .collaboration_send_view(
+                            &origin,
+                            &wire_target,
+                            &request,
+                            muxa::collaboration::CollaborationReadView::Metadata,
+                        )
                         .await
                         .map(|sent| sent.id)
                         .map_err(|error| error.to_string())

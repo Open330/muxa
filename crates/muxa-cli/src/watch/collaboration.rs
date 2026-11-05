@@ -167,7 +167,7 @@ pub(super) fn collaboration_revision_updates(
 ) -> tokio::sync::watch::Receiver<Option<u64>> {
     let (sender, receiver) = tokio::sync::watch::channel(None);
     tokio::spawn(async move {
-        let Ok(mut stream) = client.collaboration_subscribe().await else {
+        let Ok(mut stream) = client.collaboration_requests_subscribe().await else {
             return;
         };
         sender.send_replace(Some(0));
@@ -1349,7 +1349,12 @@ async fn run_watch_collaboration_broadcast(
             recipient_slot: None,
         };
         let outcome = client
-            .collaboration_send(origin, &format!("pane:{pane}"), &request)
+            .collaboration_send_view(
+                origin,
+                &format!("pane:{pane}"),
+                &request,
+                muxa::collaboration::CollaborationReadView::Metadata,
+            )
             .await
             .map(|sent| short_collaboration_request_id(&sent.id).clone())
             .map_err(|error| error.to_string());
@@ -1417,7 +1422,15 @@ async fn run_watch_collaboration_single(
                 withdraw_reply_wakes: Vec::new(),
                 recipient_slot: None,
             };
-            match client.collaboration_send(&origin, &target, &request).await {
+            match client
+                .collaboration_send_view(
+                    &origin,
+                    &target,
+                    &request,
+                    muxa::collaboration::CollaborationReadView::Metadata,
+                )
+                .await
+            {
                 Ok(request) => ActionOutcome::Ok(format!(
                     "sent {} to {} ({})",
                     short_collaboration_request_id(&request.id),

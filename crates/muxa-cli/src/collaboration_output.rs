@@ -465,12 +465,27 @@ mod tests {
         value["attempt"] =
             json!({"id":"attempt-id","task_id":"review","basis_revision":"a".repeat(40)});
         value["status"] = json!("cancelled");
+        value["human_action"] = json!("choice");
+        value["thread_id"] = json!("thread");
+        value["parent_request_id"] = json!("parent");
+        value["updates"] = json!([
+            {"sequence":1,"body":"private-first-update","author":value["from"],"at":"2026-10-14T00:00:01Z"},
+            {"sequence":2,"body":"private-last-update","author":value["from"],"at":"2026-10-14T00:00:02Z"}
+        ]);
+        value["interruption"] = json!({"request_id":"req-test","reason":"stopped","active":true,
+            "action_request_id":"decision","observed_at":"2026-10-14T00:00:03Z"});
         value["superseded_by"] = json!("new-request");
         value["late_replies"] = json!([{"status":"completed","body":"private-late-result","report":{"attempt_id":"attempt-id","basis_revision":"a".repeat(40),"criteria":[],"evidence":[{"kind":"agent_event","locator":"private-evidence"}]},"at":"2026-10-14T00:01:00Z"}]);
         let request: CollaborationRequest = serde_json::from_value(value).unwrap();
         let mut metadata = request.clone();
         muxa::collaboration::CollaborationReadView::Metadata.apply(&mut metadata);
         let compact = mutation_receipt(&metadata);
+        assert_eq!(compact, mutation_receipt(&request));
+        assert_eq!(receipt(&metadata), receipt(&request));
+        assert_eq!(
+            acknowledgement(&metadata, false),
+            acknowledgement(&request, false)
+        );
         assert_eq!(compact["result_applicability"], "superseded");
         assert_eq!(compact["late_reply_count"], 1);
         assert_eq!(

@@ -47,8 +47,9 @@ impl Client {
 
     pub(super) async fn revision_subscribe_inner(
         &self,
-        kind: &str,
+        request: &serde_json::Value,
     ) -> Result<CollaborationUpdateStream, RuntimeError> {
+        let kind = request["kind"].as_str().unwrap_or("subscribe");
         let stream =
             Stream::connect(&self.socket_path)
                 .await
@@ -62,10 +63,7 @@ impl Client {
         let mut reader = BufReader::new(reader);
         self.send_hello(&mut reader, &mut writer).await?;
 
-        let mut request = serde_json::to_vec(&serde_json::json!({
-            "protocol": PROTOCOL_VERSION,
-            "kind": kind,
-        }))?;
+        let mut request = serde_json::to_vec(request)?;
         request.push(b'\n');
         writer.write_all(&request).await?;
         writer.flush().await?;

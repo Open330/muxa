@@ -2854,6 +2854,14 @@ impl CollaborationStore {
         self.changes.subscribe()
     }
 
+    /// Invalidation generation for stored request rows, excluding worker/identity state.
+    /// This is a hint to re-read authorized data, never evidence of task completion.
+    /// Every history-visible mutation must call `persist_requests` or `delete_requests`
+    /// before publishing; subscribers use that invariant to suppress unrelated events.
+    pub fn request_revision(&self) -> u64 {
+        self.read_revision.load(Ordering::SeqCst)
+    }
+
     fn publish_change(&self) {
         self.changes
             .send_modify(|revision| *revision = revision.wrapping_add(1));
