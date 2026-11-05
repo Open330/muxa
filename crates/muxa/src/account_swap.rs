@@ -1,12 +1,15 @@
-//! Move a running agent onto another `aas` account and resume its
-//! conversation in place.
+//! Move a running agent onto another account and resume its conversation
+//! in place.
 //!
 //! When one account's usage cap is spent, the conversation itself is still
-//! good: `aas` profiles share `projects/` (Claude) and `sessions/` (Codex),
-//! so the same provider session id resumes under any account. A swap stops
-//! the agent in its pane, types `aas e <next> … --resume <id>` back into the
-//! pane's shell, and optionally sends a follow-up prompt so the interrupted
-//! turn carries on.
+//! good as long as the accounts share the provider's conversation store
+//! (`projects/` for Claude, `sessions/` for Codex), so the same provider
+//! session id resumes under any account. A swap stops the agent in its
+//! pane, types the relaunch (`env CLAUDE_CONFIG_DIR=… claude --resume <id>`
+//! for a configured account, `aas e <next> … --resume <id>` through `aas`)
+//! back into the pane's shell, and optionally sends a follow-up prompt so the
+//! interrupted turn carries on. Where the accounts come from is
+//! [`crate::account_provider`]'s business.
 //!
 //! The module splits into a pure half — which agents to touch, what command
 //! line to type, which account each gets — and [`execute`], the one place
@@ -60,9 +63,11 @@ pub struct SwapConfig {
     pub continue_when: ContinueWhen,
     /// What a relaunch must show before the follow-up is typed into it.
     pub continue_evidence: ContinueEvidence,
-    /// The `aas` binary muxa queries for candidates. The daemon may not
-    /// inherit the login shell's `PATH`, so a bare `aas` is also looked for
-    /// in the usual install locations.
+    /// The `aas` binary, an optional account backend used when a provider
+    /// lists no `[[accounts.<provider>]]`. The daemon may not inherit the
+    /// login shell's `PATH`, so a bare `aas` is also looked for in the
+    /// usual install locations; when it is not found, swaps have no
+    /// account to move to and launches start bare.
     pub aas: String,
 }
 
@@ -518,33 +523,6 @@ fn profile_account(
             .map(|name| crate::accounts::bare_name(name, provider).to_owned());
     }
     resolved.identify(&environ).map(str::to_owned)
-}
-
-/// Configured accounts as ranked candidates, in config order; `capped` ones
-/// are ineligible.
-fn profile_candidates(
-    profiles: &[crate::accounts::AccountProfile],
-    provider: &str,
-    capped: &[&str],
-) -> Vec<Candidate> {
-    profiles
-        .iter()
-        .map(|profile| {
-            let is_capped = capped.contains(&profile.name.as_str());
-            Candidate {
-                name: profile.name.clone(),
-                provider: provider.to_owned(),
-                eligible: !is_capped,
-                active: false,
-                reason: if is_capped {
-                    "rate limited here".into()
-                } else {
-                    "configured".into()
-                },
-                remaining_pct: None,
-            }
-        })
-        .collect()
 }
 
 /// Where a relaunched agent turned out to run.
@@ -1737,6 +1715,9 @@ pub(crate) fn prepare(
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
 ) -> (SwapRequest, Vec<Step>) {
+    // Every live agent, not only the scoped ones: an account capped by an
+    // agent elsewhere has no quota to give either.
+    let observed = agents;
     let (resolved, agents, outcomes) = scoped(request, agents, backends);
     let mut steps: Vec<Step> = outcomes.into_iter().map(Step::Done).collect();
     let (mut chosen, skipped) = select(&agents, &resolved);
@@ -1747,7 +1728,9 @@ pub(crate) fn prepare(
     let mut outcomes = Vec::new();
     let planned = plan(chosen, backends, &mut outcomes);
     steps.extend(outcomes.into_iter().map(Step::Done));
-    steps.extend(assign_accounts(&resolved, planned, config, accounts));
+    steps.extend(assign_accounts(
+        &resolved, planned, config, accounts, observed,
+    ));
     (resolved, steps)
 }
 
@@ -1889,35 +1872,31 @@ fn plan(
 }
 
 /// Pick an account for each planned agent, provider by provider, in the
-/// order they were planned.
+/// order they were planned. Each provider's accounts come from its
+/// [`crate::account_provider::Backend`]; `observed` are the live agents
+/// that rank configured accounts.
 fn assign_accounts(
     request: &SwapRequest,
     planned: Vec<Planned>,
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
+    observed: &[Agent],
 ) -> Vec<Step> {
-    // One `aas candidates` per provider, shared by that provider's targets.
-    let mut by_provider: Vec<(&'static str, Result<Vec<Candidate>, String>)> = Vec::new();
+    use crate::account_provider::Backend;
+    // One backend (and one `aas candidates`) per provider, shared by that
+    // provider's targets.
+    let mut by_provider: Vec<(&'static str, Backend)> = Vec::new();
     for Planned { agent, .. } in &planned {
         let provider = provider_name(agent.kind).unwrap_or_default();
         if !by_provider.iter().any(|(name, _)| *name == provider) {
-            let candidates = if accounts.for_provider(provider).is_empty() {
-                match request.to {
-                    // A named account needs no ranking.
-                    AccountChoice::Named(_) => Ok(Vec::new()),
-                    _ => query_candidates(&config.aas, provider),
-                }
-            } else {
-                // Configured accounts: ranked below, from what muxa sees.
-                Ok(Vec::new())
-            };
-            by_provider.push((provider, candidates));
+            let backend = crate::account_provider::backend(provider, accounts, &config.aas);
+            by_provider.push((provider, backend));
         }
     }
 
     let mut remaining: Vec<Option<Planned>> = planned.into_iter().map(Some).collect();
     let mut steps = Vec::new();
-    for (provider, candidates) in by_provider {
+    for (provider, backend) in by_provider {
         let group: Vec<Planned> = remaining
             .iter_mut()
             .filter(|slot| {
@@ -1926,6 +1905,18 @@ fn assign_accounts(
             })
             .filter_map(Option::take)
             .collect();
+        let candidates = match backend {
+            Backend::Accounts(profiles) => {
+                steps.extend(profile_steps(request, group, &profiles, provider, observed));
+                continue;
+            }
+            Backend::Aas(aas) => match request.to {
+                // A named account needs no ranking.
+                AccountChoice::Named(_) => Ok(Vec::new()),
+                _ => query_candidates(&aas, provider),
+            },
+            Backend::Unavailable(reason) => Err(reason),
+        };
         let candidates = match candidates {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -1939,11 +1930,6 @@ fn assign_accounts(
                 continue;
             }
         };
-        let profiles = accounts.for_provider(provider);
-        if !profiles.is_empty() {
-            steps.extend(profile_steps(request, group, profiles, provider));
-            continue;
-        }
         let current: Vec<Option<String>> = group
             .iter()
             .map(|p| current_account(&p.launch.line, &candidates))
@@ -1970,20 +1956,29 @@ fn profile_steps(
     group: Vec<Planned>,
     profiles: &[crate::accounts::AccountProfile],
     provider: &str,
+    observed: &[Agent],
 ) -> Vec<Step> {
     let resolved = crate::accounts::ResolvedAccounts::new(profiles);
     let current: Vec<Option<String>> = group
         .iter()
         .map(|p| profile_account(&resolved, &p.launch, provider))
         .collect();
-    // An account an agent here was capped on has no quota to give.
+    // An account an agent here was capped on has no quota to give, even
+    // when its environment could only be read from the launch line.
     let capped: Vec<&str> = group
         .iter()
         .zip(&current)
         .filter(|(p, _)| is_rate_limited(&p.agent))
         .filter_map(|(_, account)| account.as_deref())
         .collect();
-    let ranked = profile_candidates(profiles, provider, &capped);
+    let ranked = crate::account_provider::rank(
+        provider,
+        profiles,
+        observed,
+        time::OffsetDateTime::now_utc(),
+        |agent| crate::account_provider::identify(&resolved, agent),
+    );
+    let ranked = mark_capped(ranked, &capped);
     let choice = match &request.to {
         AccountChoice::Named(name) => {
             AccountChoice::Named(crate::accounts::bare_name(name, provider).to_owned())
@@ -2007,6 +2002,19 @@ fn profile_steps(
             }))
         })
         .collect()
+}
+
+/// `ranked` with each of `capped` made ineligible, moved behind the
+/// eligible accounts with their order otherwise kept.
+fn mark_capped(mut ranked: Vec<Candidate>, capped: &[&str]) -> Vec<Candidate> {
+    for candidate in &mut ranked {
+        if candidate.eligible && capped.contains(&candidate.name.as_str()) {
+            candidate.eligible = false;
+            candidate.reason = "rate limited here".into();
+        }
+    }
+    ranked.sort_by_key(|candidate| !candidate.eligible);
+    ranked
 }
 
 /// Carry one planned target through to its outcome.
@@ -2379,7 +2387,7 @@ pub(crate) struct Planned {
 /// Why each account was passed over, for a "nothing left" report.
 fn unavailable(candidates: &[Candidate]) -> String {
     if candidates.is_empty() {
-        return "aas lists no accounts for this provider".into();
+        return "no accounts are listed for this provider".into();
     }
     candidates
         .iter()
@@ -6143,13 +6151,200 @@ mod tests {
             account("b", "K", "2"),
             account("c", "K", "3"),
         ];
-        let ranked = profile_candidates(&profiles, "claude", &["b"]);
+        let now = time::OffsetDateTime::now_utc();
+        let unranked = crate::account_provider::rank("claude", &profiles, &[], now, |_| None);
+        let ranked = mark_capped(unranked, &["b"]);
         assert_eq!(
-            ranked.iter().map(|c| c.eligible).collect::<Vec<_>>(),
-            [true, false, true]
+            ranked
+                .iter()
+                .map(|c| (c.name.as_str(), c.eligible))
+                .collect::<Vec<_>>(),
+            [("a", true), ("c", true), ("b", false)]
         );
         let moves = assign(&[Some("a".to_owned()), None], &ranked, &AccountChoice::Auto);
         assert_eq!(moves, vec![Ok("c".to_owned()), Ok("a".to_owned())]);
+    }
+
+    fn test_pane(pane_id: &str) -> crate::tmux::PaneInfo {
+        crate::tmux::PaneInfo {
+            session_group: None,
+            agent_program: None,
+            worker_launch_id: None,
+            agent_role: None,
+            agent_alias: None,
+            workspace_id: None,
+            work_id: None,
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "work".into(),
+            window_id: "@1".into(),
+            window_name: "task".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            current_path: "/repo".into(),
+            pane_pid: 70,
+            socket: None,
+        }
+    }
+
+    /// No accounts configured and no `aas`: a capped agent is left exactly
+    /// where it is, so the `resume-after-limit` rule can resume it on its
+    /// reset. Nothing is stopped or typed.
+    #[test]
+    fn with_no_account_backend_a_swap_leaves_the_agent_for_resume_after_limit() {
+        let agent = limited("%7", "sid-7");
+        let pane = test_pane("%7");
+        let planned = Planned {
+            agent: agent.clone(),
+            session_id: "sid-7".into(),
+            source: SessionIdSource::Registry,
+            verified: false,
+            unverified_reason: None,
+            process_start: None,
+            launch: PaneLaunch {
+                agent_pid: 71,
+                top_pid: 71,
+                line: LaunchLine::bare("claude"),
+                resumed_id: None,
+            },
+            pane,
+            backend: crate::backend::default_backend(),
+        };
+        let config = SwapConfig {
+            aas: "/nonexistent/muxa-test/aas".into(),
+            ..SwapConfig::default()
+        };
+        let steps = assign_accounts(
+            &request(SwapScope::All),
+            vec![planned],
+            &config,
+            &crate::accounts::AccountsConfig::default(),
+            &[agent],
+        );
+        let [Step::Done(outcome)] = steps.as_slice() else {
+            panic!("no account backend must settle the target without running it");
+        };
+        assert_eq!(outcome.status, SwapStatus::Failed);
+        assert!(
+            outcome.note.contains("[[accounts.claude]]"),
+            "{}",
+            outcome.note
+        );
+        assert!(
+            outcome.note.contains("resume-after-limit"),
+            "{}",
+            outcome.note
+        );
+        assert_eq!(outcome.to, None);
+    }
+
+    /// The planning path itself ranks from live agents: each agent's account
+    /// is read from its real process environment, and an account capped by
+    /// an agent that is not a target is passed over.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn swap_planning_reads_accounts_from_live_processes_and_skips_capped_ones() {
+        struct Child(std::process::Child);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let spawn = |account: &str| {
+            Child(
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .env("MUXA_TEST_ACCOUNT", account)
+                    .spawn()
+                    .unwrap(),
+            )
+        };
+        let (on_a, on_b) = (spawn("a"), spawn("b"));
+        // Wait until both environments are readable.
+        for child in [&on_a, &on_b] {
+            for _ in 0..100 {
+                if !crate::accounts::process_environ(child.0.id()).is_empty() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let accounts = crate::accounts::AccountsConfig {
+            claude: ["a", "b", "c"]
+                .map(|name| account(name, "MUXA_TEST_ACCOUNT", name))
+                .to_vec(),
+            codex: Vec::new(),
+        };
+        let mut target = limited("%1", "sid-1");
+        target.pid = Some(on_a.0.id());
+        let mut elsewhere = limited("%2", "sid-2");
+        elsewhere.pid = Some(on_b.0.id());
+        elsewhere.rate_limited_until =
+            Some(time::OffsetDateTime::now_utc() + time::Duration::hours(1));
+        let planned = Planned {
+            agent: target.clone(),
+            session_id: "sid-1".into(),
+            source: SessionIdSource::Registry,
+            verified: false,
+            unverified_reason: None,
+            process_start: None,
+            launch: PaneLaunch {
+                agent_pid: on_a.0.id(),
+                top_pid: on_a.0.id(),
+                line: LaunchLine::bare("claude"),
+                resumed_id: None,
+            },
+            pane: test_pane("%1"),
+            backend: crate::backend::default_backend(),
+        };
+        let steps = assign_accounts(
+            &request(SwapScope::All),
+            vec![planned],
+            &SwapConfig::default(),
+            &accounts,
+            &[target, elsewhere],
+        );
+        let [Step::Run(prepared)] = steps.as_slice() else {
+            panic!("the target must be planned to run");
+        };
+        assert_eq!(prepared.profile_from.as_deref(), Some("a"));
+        // `a` is where it is capped, `b` is capped by the other agent.
+        assert_eq!(prepared.account.as_deref(), Ok("c"));
+    }
+
+    /// An account capped by an agent that is not being swapped has no quota
+    /// either: the swap ranks from every live agent, not only its targets.
+    #[test]
+    fn a_swap_skips_an_account_another_live_agent_reports_capped() {
+        let profiles = vec![
+            account("a", "K", "1"),
+            account("b", "K", "2"),
+            account("c", "K", "3"),
+        ];
+        let now = time::OffsetDateTime::now_utc();
+        let mut elsewhere: Agent = serde_json::from_value(serde_json::json!({
+            "kind": "claude_code",
+            "session_id": "worker-on-b",
+            "state": "error",
+            "rate_limit_scope": "five_hour",
+            "started_at": "2026-11-05T11:00:00Z",
+            "last_activity_at": "2026-11-05T11:00:00Z",
+            "state_entered_at": "2026-11-05T11:00:00Z"
+        }))
+        .unwrap();
+        elsewhere.rate_limited_until = Some(now + time::Duration::hours(1));
+        let on_b = |agent: &Agent| (agent.session_id == "worker-on-b").then(|| "b".to_owned());
+        let ranked = mark_capped(
+            crate::account_provider::rank("claude", &profiles, &[elsewhere], now, on_b),
+            // The target itself was capped on `a`.
+            &["a"],
+        );
+        let moves = assign(&[Some("a".to_owned())], &ranked, &AccountChoice::Auto);
+        assert_eq!(moves, vec![Ok("c".to_owned())]);
     }
 
     #[test]

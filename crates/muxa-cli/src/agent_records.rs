@@ -176,7 +176,7 @@ pub fn definitions() -> Vec<Value> {
             "name":"muxa_agent_search",
             "description":"Search local Claude/Codex conversation and command evidence using a Korean/English natural-language question, identifiers, or keywords. Uses transparent local keyword/intent expansion, not embeddings or a model. Returns the interpreted terms/time range, ranked excerpts, event_ids, source lines, and coverage. Dates refer to event timestamps, never file creation dates. To investigate broadly, follow hits with muxa_agent_read, vary terms/time/session filters, and inspect calls AND results. No match is not proof of absence; repeat when indexing is incomplete. Read-only on provider files; builds a private disposable local index. No network calls.",
             "inputSchema":{"type":"object","properties":{
-                "query":{"type":"string","description":"Question, e.g. 2026.10.22 11:54 KST에 callabo-internal 버킷을 우리가 만들었는지. Date + time means ±15 minutes; date alone means that day. Explicit from/to override inferred bounds."},
+                "query":{"type":"string","description":"Question, e.g. 2026.10.22 11:54 KST에 app-internal 버킷을 우리가 만들었는지. Date + time means ±15 minutes; date alone means that day. Explicit from/to override inferred bounds."},
                 "terms":{"type":"array","items":{"type":"string"},"maxItems":24,"description":"Supplement with alternate literal terms; OR retrieval allows broader investigation."},
                 "from":{"type":"string","description":"Inclusive RFC3339 event timestamp with timezone."},
                 "to":{"type":"string","description":"Exclusive RFC3339 event timestamp with timezone."},

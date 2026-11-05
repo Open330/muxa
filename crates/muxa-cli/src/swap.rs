@@ -1,4 +1,4 @@
-//! `muxa swap` — move agents onto another `aas` account and resume them.
+//! `muxa swap` — move agents onto another account and resume them.
 //!
 //! A daemon that runs swaps as jobs gets the request: it plans, journals and
 //! runs it under the same exclusion its automation uses, and this module
@@ -21,22 +21,23 @@ use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
 
-/// Move agents whose account ran out onto another `aas` account, resuming
-/// each conversation in place.
+/// Move agents whose account ran out onto another account, resuming each
+/// conversation in place.
 ///
 /// With no target, swaps every agent stopped by a usage cap. Each agent is
-/// stopped, its launch line is typed back into the pane's shell as
-/// `aas e <next> … --resume <id>`, and a follow-up prompt carries the
-/// cut-off turn on. Defaults come from `[swap]` in config.toml.
+/// stopped, relaunched in its pane on the next account (a configured
+/// `[[accounts.<provider>]]` environment, or `aas e <next>` when `aas`
+/// provides the accounts) with `--resume <id>`, and a follow-up prompt
+/// carries the cut-off turn on. Defaults come from `[swap]` in config.toml.
 #[derive(Debug, ClapArgs)]
 #[command(after_help = "Examples:
   muxa swap                     swap every rate-limited agent (auto-picked account)
-  muxa swap %5 --to jelly@claude
+  muxa swap %5 --to work
   muxa swap --all --spread      move every idle agent, spread across accounts
   muxa swap --all --force --provider codex
   muxa swap --dry-run           show the plan, touch nothing
   muxa swap --status cli-…      follow a swap the daemon is running or ran
-  muxa swap --host rtzr --to work@claude   swap on a Fleet host")]
+  muxa swap --host build --to work   swap on a Fleet host")]
 #[allow(clippy::struct_excessive_bools)] // independent CLI switches
 pub struct Args {
     /// Panes (`%5`, `herdr:p9`) or provider session ids to swap.
@@ -51,7 +52,7 @@ pub struct Args {
     /// Only this provider's agents.
     #[arg(long, value_enum)]
     provider: Option<Provider>,
-    /// Account to move to: an `aas` name, or `auto` (the default) for the
+    /// Account to move to: an account name, or `auto` (the default) for the
     /// best-ranked account with quota left.
     #[arg(long, value_name = "ACCOUNT", conflicts_with = "spread")]
     to: Option<String>,

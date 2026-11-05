@@ -94,20 +94,28 @@
 # [agent.codex]
 # options = ["--model", "gpt-5-codex", "--search"]
 #
-# `account` (claude / codex) starts new agents on an account: one of
-# [[accounts.<provider>]] below when any are listed, else through
-# `aas e <account>` ("auto" = best-ranked aas account with quota left).
-# Unset, or nothing usable -> the bare CLI, as before.
+# `account` (claude / codex) starts new agents on an account: "auto" for
+# the best-ranked one with quota left, or an account name. The accounts are
+# [[accounts.<provider>]] below, ranked from the rate limits muxa already
+# observes (no extra tool). With none listed, an installed `aas` provides
+# them instead; with neither, or nothing usable -> the bare CLI, as before.
+# See docs/ACCOUNT_SWAP.md.
 # [agent.claude]
 # account = "auto"
 #
-# Accounts without aas: the environment that selects each one. Host-local.
+# Accounts: the environment that selects each one, in preference order.
+# Host-local. Accounts must share the provider's conversation store (e.g. a
+# symlinked `projects/` for Claude, `sessions/` for Codex) for a swap to
+# resume the same conversation.
 # [[accounts.claude]]
 # name = "work"
 # env = { CLAUDE_CONFIG_DIR = "~/.claude-work" }
 # [[accounts.claude]]
 # name = "personal"
 # env_file = "~/.secrets/claude-personal.env"   # CLAUDE_CODE_OAUTH_TOKEN=...
+# [[accounts.codex]]
+# name = "work"
+# env = { CODEX_HOME = "~/.codex-work" }
 
 # Durable request/reply collaboration between top-level agents in the same
 # tmux window. Opt-in: idle_only delivery types only at a hook-authoritative
@@ -224,13 +232,14 @@
 # categories = ["pipeline", "skills", "automation"]   # default: all
 # ignore     = ["pipeline.solo", "ticket"]
 
-# Moving agents onto another `aas` account (`muxa swap`, and the
-# `swap_account` automation action). See docs/ACCOUNT_SWAP.md.
+# Moving agents onto another account (`muxa swap`, and the `swap_account`
+# automation action). Accounts come from [[accounts.<provider>]] above, or an
+# installed aas when none are listed. See docs/ACCOUNT_SWAP.md.
 [swap]
-# bare          = "skip"             # skip | wrap: agents started without aas
+# bare          = "skip"             # skip | wrap: agents started without aas (aas backend only)
 # continue_text = "continue"         # follow-up after the resume; "" sends none
 # continue_when = "limited"          # limited | always | never
-# aas           = "aas"              # aas binary (also found in /opt/homebrew/bin, ~/.cargo/bin)
+# aas           = "aas"              # optional aas backend binary (also found in /opt/homebrew/bin, ~/.cargo/bin)
 
 # Workspace snapshots. muxad takes an automatic one every
 # `auto_interval_minutes` when the workspace changed since the last snapshot
@@ -482,7 +491,7 @@
 #
 # One command takes a ticket id and leaves you with a staffed tmux window:
 #
-#     muxa work up cal-1234
+#     muxa work up proj-1234
 #
 # It resolves the ticket, routes it to a workspace/session, and creates
 # whichever agent panes the pipeline declares but the window does not have
@@ -493,7 +502,7 @@
 # `muxa_call_peer` takes one — `--skill` expands a [message.skills] entry,
 # then `--body`, then `--context`:
 #
-#     muxa work up cal-1234 --body "fix the double reap"
+#     muxa work up proj-1234 --body "fix the double reap"
 #
 # and the same request is delivered two ways depending on what exists: into
 # the launch prompt of an agent that has no pane yet, and typed into the
@@ -523,7 +532,7 @@
 # around it is fine, and `{"like":"this"}` in the prompt is left alone because
 # only `{{double}}` braces are substituted.
 # [ticket.source.linear]
-# match  = '^cal-\d+$'
+# match  = '^proj-\d+$'
 # prompt = '''
 # Look up Linear issue {{id}} using the linear skill and answer with one JSON
 # object and nothing else:
@@ -539,14 +548,14 @@
 # route, `muxa work up --pipeline <name>` still works and uses the current
 # directory.
 # [[route]]
-# match     = '^cal-'
-# workspace = 'callabo'          # the tmux session
+# match     = '^proj-'
+# workspace = 'acme'          # the tmux session
 # pipeline  = 'triad'
 # # Give each work item its own git worktree so three agents in one window
 # # cannot trip over each other in a shared checkout. Omit to share a
 # # checkout and use `cwd` instead.
 # [route.worktree]
-# repo   = '~/workspace/callabo'
+# repo   = '~/workspace/acme'
 # branch = '{{id}}'              # default: {{id}}
 # # path = '~/worktrees/{{id}}'  # default: <repo>/../<repo-name>-worktrees/{{id}}
 # # base = 'origin/main'         # default: the repo's origin/HEAD

@@ -5,15 +5,24 @@ long as the accounts share `projects/` (Claude) and `sessions/` (Codex), the
 same provider session id resumes under any account. `muxa swap` moves agents
 onto another account and resumes each one in its own pane.
 
-Accounts come from one of two places, per provider:
+Accounts come from an *account provider*, chosen per provider (Claude,
+Codex) in this order:
 
-- **`[[accounts.<provider>]]` in `config.toml`** (no external tool). Each
-  account is a name and the environment that selects it. muxa launches with
-  that environment and recognises a running agent's account from its own
-  environment, however it was started.
-- **`aas`** (Agent Account Switcher), used for a provider with no
-  `[[accounts]]` entries: candidates from `aas candidates --json`, launches
-  through `aas e <account>`.
+1. **`[[accounts.<provider>]]` in `config.toml`** — no external tool. Each
+   account is a name and the environment that selects it. muxa launches with
+   that environment, recognises a running agent's account from its own
+   environment however it was started, and ranks the accounts from the rate
+   limits it already observes (hook and statusline reports, Codex rollout
+   files).
+2. **`aas`** (Agent Account Switcher), optional: used only for a provider
+   with no `[[accounts]]` entries, and only when the `aas` binary is
+   installed (or `[swap].aas` names one). Candidates come from
+   `aas candidates --json`, launches go through `aas e <account>`.
+3. **None.** New agents start on whatever account the CLI is logged into,
+   and a swap reports that there is no account to move to and touches
+   nothing. A capped agent is still recovered: the `resume-after-limit` rule
+   (see [Automation](AUTOMATION.md)) waits for its reset and resumes it, and
+   needs no accounts at all.
 
 ```toml
 [[accounts.claude]]
@@ -31,9 +40,23 @@ env = { CODEX_HOME = "~/.codex-work" }
 
 `env_file` is sourced by a small `sh` wrapper at launch, so a token never
 appears on the typed command line or in shell history; it is read again only
-to recognise the account. `auto` tries accounts in the listed order and skips
-one an agent here was capped on. `[accounts]` is host-local: config sync
-never copies it.
+to recognise the account. `[accounts]` is host-local: config sync never
+copies it.
+
+`auto` ranks configured accounts from every live agent, not only the ones
+being moved:
+
+- an account is **capped** while any of its agents reports a cap that has not
+  reset yet (`rate_limited_until`), or a 5-hour / 7-day window at 100% until
+  that window's reset. A cap reported without a reset time is waited out for
+  an hour;
+- accounts with quota left come first, the least used first (the highest
+  5-hour / 7-day usage any of its agents reports; an account nobody is on
+  counts as unused), ties in the listed order; capped accounts follow, the
+  soonest to reset first;
+- an agent's account is read from its process environment, so muxa needs no
+  record of how it was started. Where that cannot be read (macOS hides it for
+  Apple-signed binaries), the agent says nothing about its account.
 
 Once a provider lists accounts, its swaps use only those: an `aas` name is
 not one of them, and `--bare` no longer applies, since an agent started bare
@@ -42,18 +65,20 @@ must be an absolute or `~/` path.
 
 ```console
 $ muxa swap --dry-run
-planned  %1         claude_code e-ed@claude -> jelly@claude
-         $ aas e jelly@claude --dangerously-skip-permissions --resume 090b45a6-…
+planned  %1         claude_code work -> personal
+         $ sh -c 'set -a; . "$0"; set +a; exec "$@"' ~/.secrets/claude-personal.env claude --dangerously-skip-permissions --resume 090b45a6-…
          then send "continue"
 ```
 
 For each agent, muxa:
 
-1. reads how the agent was started from its pane's process tree (`aas e
-   <account> …`, or a bare `claude` / `codex`);
-2. picks the next account (`aas candidates --json`, or `--to <account>`). A
-   bare agent counts as being on the account `aas` marks active, so `auto`
-   never "moves" it onto the account it is already spending;
+1. reads how the agent was started from its pane's process tree (a bare
+   `claude` / `codex`, `env … claude`, or `aas e <account> …`) and which
+   account it runs on (its environment, for configured accounts);
+2. picks the next account (`auto` ranking above, `aas candidates --json`
+   with the `aas` backend, or `--to <account>`). Under `aas`, a bare agent
+   counts as being on the account `aas` marks active, so `auto` never
+   "moves" it onto the account it is already spending;
 3. stops the agent and waits for the pane's shell. Claude gets `/exit` (after
    an Escape when it is mid-turn), the way a person quits it, and its exit
    dialogs are answered so nothing is lost: background work is moved out of
@@ -117,22 +142,24 @@ example a Codex with a nested Claude child).
 
 | Flag | Account |
 | ---- | ------- |
-| `--to auto` (default) | The best-ranked account `aas candidates` marks eligible, other than the agent's current one. |
-| `--to jelly@claude` | This account. |
+| `--to auto` (default) | The best-ranked account with quota left, other than the agent's current one (configured accounts: ranked as above; `aas`: as `aas candidates` ranks them). |
+| `--to personal` | This account (`personal@claude` is accepted too). |
 | `--spread` | Round-robin over every eligible account, so a batch does not drain one account at once. |
 
 When no other account has quota left, the agent is skipped and the report says
-why each account was passed over.
+why each account was passed over. When the provider has no account backend at
+all, the swap fails for that agent with nothing done and says how to configure
+one; `resume-after-limit` still resumes it after its reset.
 
 ## Options and `[swap]`
 
 ```toml
 [swap]
-bare = "skip"            # skip | wrap: agents started without aas
+bare = "skip"            # skip | wrap: agents started without aas (aas backend only)
 continue_text = "continue"
 continue_when = "limited" # limited | always | never
 continue_evidence = "binding" # binding | verified
-aas = "aas"              # the aas binary; the daemon also looks in /opt/homebrew/bin etc.
+aas = "aas"              # optional aas backend; the daemon also looks in /opt/homebrew/bin etc.
 ```
 
 | Flag | Overrides |
@@ -273,7 +300,7 @@ the swap there, which may still be stopping and relaunching agents. Check
 the host before running it again.
 
 ```console
-$ muxa swap --host rtzr --to work --dry-run
+$ muxa swap --host build --to work --dry-run
 ```
 
 ## Automatic swap
@@ -286,7 +313,7 @@ next account as soon as the cap is seen, instead of waiting for its reset:
 name = "swap-on-limit"
 on = "rate_limited"
 action = "swap_account"
-# account = "jelly@claude"   # default: auto
+# account = "personal"       # default: auto
 # text = "continue"          # default: [swap] continue_text / continue_when
 ```
 
@@ -310,8 +337,18 @@ swap it finds unfinished to its job's end; it never starts one again.
 
 `muxa swap` moves agents that are already running. To keep new ones off a
 capped account in the first place, set `[agent.<program>].account = "auto"`
-(see [Configuration](CONFIGURATION.md#starting-on-an-aas-account)): every muxa
-launch then starts `aas e <best eligible account> …` instead of the bare CLI.
+(see [Configuration](CONFIGURATION.md#starting-on-an-account)): every muxa
+launch then starts on the best-ranked account with quota left (the
+configured account's environment, or `aas e <account>` with the `aas`
+backend) instead of the bare CLI. With no backend it starts the bare CLI and
+says why.
+
+## Configuration compatibility
+
+Account routing adds no configuration keys: existing `[agent.*].account`,
+`[[accounts.*]]` and `[swap]` settings keep their meaning, and a config that
+uses them loads in older muxa builds unchanged. `aas` users need to change
+nothing; it is still used for any provider that lists no accounts.
 
 ## Before the agent is stopped
 
@@ -356,7 +393,7 @@ checks is not a promise the launch works.
   it (`--resume <id>` / `resume <id>`).
 - On macOS, `ps` reports a command line joined, so a flag value containing a
   space (`--append-system-prompt "be brief"`) is relaunched split.
-- Codex keeps its thread index per `aas` profile, but `codex resume <id>`
+- Codex keeps its thread index per account (`CODEX_HOME`), but `codex resume <id>`
   finds the thread's rollout in the shared `sessions/`, so it resumes under an
   account that never ran it. If the pane's shell is no longer in the thread's
   directory, Codex first asks which directory to use; muxa keeps the

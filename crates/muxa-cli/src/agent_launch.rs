@@ -144,12 +144,31 @@ impl NativeLaunch {
 /// created. A skipped route is reported, not fatal: the agent still starts.
 fn route_account(
     route: Option<&muxa::account_route::AccountRoute>,
+    socket: &Path,
 ) -> Option<std::result::Result<muxa::account_route::RoutedLaunch, String>> {
-    let outcome = muxa::account_route::decide(route?);
+    let route = route?;
+    let observed = if route.needs_observation() {
+        live_agents(socket)
+    } else {
+        Vec::new()
+    };
+    let outcome = muxa::account_route::decide(route, &observed);
     if let Err(reason) = &outcome {
         eprintln!("muxa: starting without an account: {reason}");
     }
     Some(outcome)
+}
+
+/// The daemon's live agents, which rank configured accounts by the limits
+/// they report. Without a daemon the accounts are tried in config order.
+fn live_agents(socket: &Path) -> Vec<muxa::Agent> {
+    muxa::ipc::blocking_call(
+        socket,
+        &serde_json::json!({"protocol": muxa::event::PROTOCOL_VERSION, "kind": "snapshot"}),
+        std::time::Duration::from_secs(2),
+    )
+    .and_then(|response| serde_json::from_value(response["agents"].clone()).ok())
+    .unwrap_or_default()
 }
 
 /// Execution host selection for the user-facing agent launcher.
@@ -398,7 +417,7 @@ pub struct StartRequest {
     /// room — or, with no daemon on the default socket at all, failed and
     /// rolled the whole launch back.
     pub socket: PathBuf,
-    /// `[agent.<program>].account`: which `aas` account the agent starts
+    /// `[agent.<program>].account`: which account the agent starts
     /// on. `None` runs the bare provider CLI.
     pub account: Option<muxa::account_route::AccountRoute>,
 }
@@ -593,7 +612,7 @@ async fn run_native(
     // tmux one does: which surface a session lands on says nothing about
     // which model it should run.
     let options = cfg.launch_options(args.agent.label(), explicit_options(&args.options));
-    let routed = route_account(cfg.account_route(args.agent.label()).as_ref());
+    let routed = route_account(cfg.account_route(args.agent.label()).as_ref(), socket_path);
     let launch = args
         .agent
         .native_launch(&options, prompt)
@@ -761,8 +780,8 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         request.creator = crate::spawn_provenance::resolve_creator(&request.socket);
     }
     // Before prepare_launch: it can create sessions and windows, and a slow
-    // or failed `aas` must not leave them behind.
-    let routed = route_account(request.account.as_ref());
+    // or failed account query must not leave them behind.
+    let routed = route_account(request.account.as_ref(), &request.socket);
     let PreparedLaunch {
         cwd,
         workspace,

@@ -163,28 +163,34 @@ shows is what the launch will use.
 
 ```toml
 [agent.claude]
-account = "auto"          # or a pinned account: "jelly@claude"
+account = "auto"          # or a pinned account: "work"
 ```
 
-With [`aas`](ACCOUNT_SWAP.md) managing several accounts, a bare `claude` lands
-on whichever account `aas active` names, even while that one is capped.
-`account` makes every launch path above start `aas e <account> …` instead.
-`auto` takes the best-ranked eligible account from `aas candidates` (it never
-changes `aas active`); a name pins one of that provider's accounts, used even
-when capped. `claude` and `codex` only.
+Without it, a bare `claude` starts on whichever account the CLI is logged
+into, even while that one is capped. `account` makes every launch path above
+start on a chosen account instead. `auto` takes the best-ranked account with
+quota left; a name pins one of that provider's accounts, used even when
+capped. `claude` and `codex` only.
 
-With `[[accounts.claude]]` / `[[accounts.codex]]` entries (see
-[Account swap](ACCOUNT_SWAP.md)), the account is one of those instead and the
-launch is `env K=V … claude …`, with no external tool: `auto` takes the first
-listed account, a name pins one.
+The accounts come from an account provider (see [Account
+swap](ACCOUNT_SWAP.md)):
 
-`aas` stays optional: it is run, never linked, and only when `account` is set
-and the provider lists no `[[accounts]]`.
-When it is missing, takes longer than 5 seconds, or has no account with quota
-left, the agent starts bare as before, which may still be the capped account.
-The reason goes to stderr and to the `account` field of `muxa agent start
---json`. The binary is `[swap].aas`. An agent already capped mid-run is
-[`muxa swap`](ACCOUNT_SWAP.md)'s job.
+- `[[accounts.claude]]` / `[[accounts.codex]]` entries, with no external
+  tool: the launch is `env K=V … claude …`, and `auto` ranks the accounts
+  from the rate limits muxa observes on live agents (an account capped now is
+  skipped until its reset; the least used comes first; ties in the listed
+  order);
+- otherwise [`aas`](ACCOUNT_SWAP.md), when it is installed: the launch is
+  `aas e <account> …`, `auto` takes the best-ranked eligible account from
+  `aas candidates` (it never changes `aas active`). The binary is
+  `[swap].aas`; it is run, never linked.
+
+When there is no provider, `aas` takes longer than 5 seconds, or no account
+has quota left, the agent starts bare as before, which may still be the
+capped account. The reason goes to stderr and to the `account` field of
+`muxa agent start --json`. An agent already capped mid-run is
+[`muxa swap`](ACCOUNT_SWAP.md)'s job, and with no accounts at all the
+`resume-after-limit` rule resumes it after its reset.
 
 ### Advanced launch options form
 

@@ -354,7 +354,7 @@ pub enum AutomationAction {
     Interrupt,
     /// Press Enter only on a visibly selected Yes/Proceed confirmation.
     PressEnter,
-    /// Move the agent onto another `aas` account (`account`, default the
+    /// Move the agent onto another account (`account`, default the
     /// best-ranked one with quota left) and resume its conversation; then
     /// type `text`, or the `[swap]` follow-up, so the cut-off turn carries
     /// on. See [`crate::account_swap`].
@@ -568,8 +568,8 @@ pub struct AutomationRule {
     /// Whether `send_prompt` commits the line with Enter. Default `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submit: Option<bool>,
-    /// `swap_account` target: an `aas` account name, or `auto` (the
-    /// default) for the best-ranked account with quota left.
+    /// `swap_account` target: an account name, or `auto` (the default) for
+    /// the best-ranked account with quota left.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 
@@ -877,9 +877,7 @@ impl AutomationRule {
                 }
                 if let Some(account) = &self.account {
                     if account.trim().is_empty() || account.contains(char::is_whitespace) {
-                        return Err(named(format!(
-                            "account {account:?} is not an aas account name"
-                        )));
+                        return Err(named(format!("account {account:?} is not an account name")));
                     }
                 }
                 if let Some(text) = &self.text {

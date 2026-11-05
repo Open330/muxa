@@ -28,7 +28,7 @@ impl ScopeExclusions {
         session_name: Option<&str>,
     ) -> bool {
         // A `~view~` client of a grouped session is that session: excluding
-        // `callabo` must also drop records labelled `callabo~view~N`.
+        // `acme` must also drop records labelled `acme~view~N`.
         pane.is_some_and(|pane| matches_any(&self.pane_patterns, pane))
             || session_name.is_some_and(|name| {
                 matches_any(&self.session_patterns, name)

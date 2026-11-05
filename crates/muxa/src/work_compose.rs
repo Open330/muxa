@@ -39,15 +39,15 @@ cache_secs = 900              # 0 disables the cache
 additional_dirs = ["/path"]   # extra roots the resolver may read
 
 [ticket.source.<name>]        # tried in sorted-key order, first match wins
-match = '^cal-\d+$'           # regex against the work id, case-insensitive
+match = '^proj-\d+$'          # regex against the work id, case-insensitive
 prompt = '''...'''            # asks an agent to answer with ticket JSON.
                               # {{id}} is the lowercased work id. muxa reads
                               # id/identifier/key, title/name/summary,
                               # body/description, url, state, branch.
 
 [[route]]                     # REQUIRED: ordered, first match wins
-match     = '^cal-'           # regex against the work id
-workspace = 'callabo'         # the tmux session; defaults to the cwd name
+match     = '^proj-'          # regex against the work id
+workspace = 'acme'          # the tmux session; defaults to the cwd name
 pipeline  = 'triad'           # must name a [pipeline.*] below
 cwd       = '~/src/{{id}}'    # optional; omit to use the current directory
 prepare   = 'mk-ws {{id}} {{ticket.branch}}'
