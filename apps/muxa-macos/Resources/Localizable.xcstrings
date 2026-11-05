@@ -12435,16 +12435,6 @@
         }
       }
     },
-    "Retries only agents that failed before their relaunch and still run as planned" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "다시 실행 전에 실패했고 계획대로 아직 실행 중인 에이전트만 다시 시도합니다"
-          }
-        }
-      }
-    },
     "Retry" : {
       "localizations" : {
         "ko" : {
@@ -19947,6 +19937,86 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "작업 중이던 에이전트에 continue 보내기"
+          }
+        }
+      }
+    },
+    "A new switch for the agents that failed: ones that failed before their relaunch are switched again, ones already relaunched are only checked" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실패한 에이전트로 새 전환을 시작합니다. 재실행 전에 실패한 에이전트는 다시 전환하고, 이미 재실행된 에이전트는 상태만 확인합니다"
+          }
+        }
+      }
+    },
+    "Applies to agents on this Mac. Fleet hosts follow their own muxad's rules, so a capped agent there still asks for you." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac의 에이전트에만 적용됩니다. Fleet 호스트는 그 호스트 muxad의 규칙을 따르므로, 거기서 한도에 걸린 에이전트는 계속 확인을 요청합니다."
+          }
+        }
+      }
+    },
+    "Couldn't read its progress: %@. Trying again…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "진행 상황을 읽지 못했습니다: %@. 다시 시도하는 중…"
+          }
+        }
+      }
+    },
+    "Muxa stopped checking: %@. The switch may still be running on its host; `muxa swap --status=%@` there shows it." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 확인을 멈췄습니다: %@. 전환은 해당 호스트에서 아직 진행 중일 수 있으며, 그 호스트에서 `muxa swap --status=%@`로 확인할 수 있습니다."
+          }
+        }
+      }
+    },
+    "Progress unknown" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "진행 상황 알 수 없음"
+          }
+        }
+      }
+    },
+    "Resets at %@." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에 초기화됩니다."
+          }
+        }
+      }
+    },
+    "Sent “continue” to %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에 “continue”를 보냈습니다"
+          }
+        }
+      }
+    },
+    "That agent is no longer running, so there is nothing to switch." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "해당 에이전트가 더 이상 실행 중이 아니어서 전환할 대상이 없습니다."
           }
         }
       }

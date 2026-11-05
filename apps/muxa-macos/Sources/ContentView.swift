@@ -522,10 +522,9 @@ struct ContentView: View {
             case .saveSnapshot: model.presentSessionSnapshots(.save)
             case .restoreSnapshot: model.presentSessionSnapshots(.restore)
             case .switchLimitedAgents:
-                let limited = model.hostedAgents.filter { $0.agent.status.isLimited }
-                if let target = MuxaSwitchLimitedButton.sheetTarget(for: limited) {
-                    model.swaps.present(target)
-                }
+                MuxaSwitchLimitedButton.presentSwitch(
+                    for: model.hostedAgents.filter { $0.agent.status.isLimited }, model: model
+                )
             case .fleetDispatch: model.isPresentingFleetDispatch = true
             case .showFiles: editorCommands.showFiles?()
             }

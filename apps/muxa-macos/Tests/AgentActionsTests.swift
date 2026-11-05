@@ -241,36 +241,111 @@ private func rule(_ name: String, action: MuxaAutomationAction, enabled: Bool, o
 @MainActor
 @Test func oneSummaryCountsEachThingOnce() throws {
     let host = MuxaFleetHostIdentity(alias: "local", local: true, state: "online", mode: "control")
-    let blocked = MuxaHostedAgent(host: host, agent: try agent(["state": "waiting_input"], id: "a"), pane: nil)
-    let busy = MuxaHostedAgent(host: host, agent: try agent(["state": "working"], id: "b"), pane: nil)
-    let capped = MuxaHostedAgent(host: host, agent: try agent(capped, id: "c"), pane: nil)
+    // Ids no other test registers as local, so the shared coverage state
+    // cannot leak between tests.
+    let blocked = MuxaHostedAgent(host: host, agent: try agent(["state": "waiting_input"], id: "sum-a"), pane: nil)
+    let busy = MuxaHostedAgent(host: host, agent: try agent(["state": "working"], id: "sum-b"), pane: nil)
+    let capped = MuxaHostedAgent(host: host, agent: try agent(capped, id: "sum-c"), pane: nil)
     let key: (MuxaHostedAgent) -> String = { "agent:\($0.agent.agentSessionID)" }
 
-    let previous = MuxaLimitCoverage.isCovered
-    defer { MuxaLimitCoverage.isCovered = previous }
-
-    // No policy acts on caps: the capped agent needs the person.
-    MuxaLimitCoverage.isCovered = false
+    // `sum-c` is not a local agent: no policy reaches it.
     var summary = MuxaAttentionSummary.make(
-        agents: [blocked, busy, capped], messages: [], unread: ["agent:a", "pane:x"], paneKey: key
+        agents: [blocked, busy, capped], messages: [], unread: ["agent:sum-a", "pane:x"], paneKey: key
     )
     #expect(summary.agents == 2)
     #expect(summary.limited == 1)
     #expect(summary.uncoveredLimited == 1)
     #expect(summary.needsYou == 2)
     #expect(summary.unreadPanes == 2)
-    // `a` is both blocked and unread: once on the Dock.
+    // `sum-a` is both blocked and unread: once on the Dock.
     #expect(summary.dock == 3)
     #expect(summary.needsYouLine == "2 agents need you")
-
-    // A policy acts: the cap is still counted as limited, not as needing you.
-    MuxaLimitCoverage.isCovered = true
-    summary = MuxaAttentionSummary.make(agents: [blocked, busy, capped], messages: [], unread: [], paneKey: key)
-    #expect(summary.agents == 1)
-    #expect(summary.limited == 1)
-    #expect(summary.uncoveredLimited == 0)
-
     #expect(MuxaAttentionSummary().needsYouLine == nil)
+}
+
+// MARK: - Limit coverage
+
+private func capRule(_ action: MuxaAutomationAction, agents: [String] = [], scope: [String] = []) -> MuxaAutomationRule {
+    var rule = MuxaAutomationRule(name: "r", on: .rateLimited, action: action)
+    rule.agent = agents
+    rule.scope = scope
+    return rule
+}
+
+@Test func coverageReachesOnlyLocalAgentsTheRulesName() throws {
+    let claude = try agent(capped, id: "cov-1")
+    let gemini = try agent(capped, id: "cov-2", kind: "gemini")
+    let remote = try agent(capped, id: "cov-3")
+    var state = MuxaLimitCoverage.State()
+    state.localAgents = ["cov-1", "cov-2"]
+
+    // A switch rule reaches Claude Code and Codex only.
+    state.grants = MuxaLimitCoverage.grants(enabled: true, rules: [capRule(.swapAccount)])
+    #expect(MuxaLimitCoverage.covers(claude, in: state))
+    #expect(!MuxaLimitCoverage.covers(gemini, in: state))
+    // An agent on a Fleet host follows its own daemon's rules.
+    #expect(!MuxaLimitCoverage.covers(remote, in: state))
+
+    // …and nothing while the swap service takes no job.
+    state.swapAvailable = false
+    #expect(!MuxaLimitCoverage.covers(claude, in: state))
+    state.swapAvailable = true
+
+    // A resume rule reaches every kind; a pause covers nothing until it ends.
+    state.grants = MuxaLimitCoverage.grants(enabled: true, rules: [capRule(.sendPrompt)])
+    #expect(MuxaLimitCoverage.covers(gemini, in: state))
+    let now = Date()
+    state.pausedUntil = now.addingTimeInterval(60)
+    #expect(!MuxaLimitCoverage.covers(gemini, in: state, now: now))
+    #expect(MuxaLimitCoverage.covers(gemini, in: state, now: now.addingTimeInterval(120)))
+    state.pausedUntil = nil
+
+    // Scopes and kinds narrow a rule; any other filter makes it unknowable.
+    state.grants = MuxaLimitCoverage.grants(enabled: true, rules: [capRule(.sendPrompt, agents: ["codex"])])
+    #expect(!MuxaLimitCoverage.covers(claude, in: state))
+    state.grants = MuxaLimitCoverage.grants(enabled: true, rules: [capRule(.sendPrompt, scope: ["seven_day"])])
+    #expect(!MuxaLimitCoverage.covers(claude, in: state), "the fixture is capped on five_hour")
+    var filtered = capRule(.sendPrompt)
+    filtered.workspace = "api"
+    #expect(MuxaLimitCoverage.grants(enabled: true, rules: [filtered]).isEmpty)
+    #expect(MuxaLimitCoverage.grants(enabled: false, rules: [capRule(.sendPrompt)]).isEmpty)
+}
+
+// MARK: - Swap activity
+
+@Test func aSwapTheDaemonTookKeepsRunningThroughFailedReads() {
+    var activity = MuxaSwapActivity(requestKey: "k", host: "mini", startedAt: Date(), title: "t")
+    activity.targets = ["abc"]
+    #expect(activity.isRunning, "started, no status yet")
+    activity.statusError = "host unreachable"
+    activity.statusFailures = 3
+    #expect(activity.isRunning, "a failed read is not a failed swap")
+    #expect(!activity.needsLook)
+    activity.statusFailures = MuxaSwapCenter.maxStatusFailures
+    #expect(activity.lostTrack)
+    #expect(!activity.isRunning, "polling stops")
+    #expect(activity.needsLook)
+
+    var refused = MuxaSwapActivity(requestKey: "k2", host: nil, startedAt: Date(), title: "t")
+    refused.error = "the daemon refused this swap"
+    #expect(!refused.isRunning)
+}
+
+@Test func onlyRecentAdmittedSwapsAreFollowed() throws {
+    func entry(_ outcome: String, op: String?, at: String) throws -> MuxaAutomationLogEntry {
+        var object: [String: Any] = ["rule": "swap-on-limit", "action": "swap_account", "outcome": outcome, "fired_at": at]
+        if let op { object["operation"] = op }
+        return try JSONDecoder().decode(MuxaAutomationLogEntry.self, from: JSONSerialization.data(withJSONObject: object))
+    }
+    let now = try #require(MuxaAutomationTime.parse("2026-11-05T10:00:00Z"))
+    let entries = [
+        try entry("admitted", op: "auto-1", at: "2026-11-05T09:58:00Z"),
+        try entry("admitted", op: "auto-2", at: "2026-11-05T08:00:00Z"),
+        try entry("admitted", op: "auto-3", at: "2026-11-05T09:59:00Z"),
+        try entry("skipped", op: nil, at: "2026-11-05T09:59:30Z"),
+    ]
+    let follow = AutomationStore.swapsToFollow(entries, followed: ["auto-3"], now: now)
+    #expect(follow.compactMap(\.operation) == ["auto-1"])
 }
 
 // MARK: - Swap health

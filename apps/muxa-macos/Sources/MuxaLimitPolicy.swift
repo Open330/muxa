@@ -121,13 +121,6 @@ extension AutomationStore {
         return MuxaLimitPolicy.current(enabled: masterEnabled, rules: snapshot.rules)
     }
 
-    /// True when Muxa will act on a capped agent by itself, so it need not
-    /// ask for the person's attention.
-    var coversLimitedAgents: Bool {
-        guard let policy = limitPolicy else { return false }
-        return policy != .tellMe && !snapshot.isPaused()
-    }
-
     /// Make `policy` the limit policy.
     @discardableResult
     func apply(_ policy: MuxaLimitPolicy, model: AppModel) async -> Bool {
@@ -171,6 +164,10 @@ struct MuxaLimitPolicyPicker: View {
                 ForEach(MuxaLimitPolicy.allCases) { policy in
                     row(policy)
                 }
+                Text("Applies to agents on this Mac. Fleet hosts follow their own muxad's rules, so a capped agent there still asks for you.")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 if store.snapshot.isPaused() {
                     Label("Automations are paused, so nothing happens on its own until they resume.", systemImage: "pause.circle")
                         .font(MuxaType.meta)

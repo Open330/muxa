@@ -67,6 +67,7 @@ struct MuxaAttentionTracking: ViewModifier {
             .onChange(of: model.workspaceRevision) { _ in
                 updateVisibility()
                 openPending()
+                openPendingSwitch()
             }
             .onChange(of: attention.pendingHumanMessageID) { _ in openHumanPending() }
             .onChange(of: attention.pendingOpen) { _ in openPending() }
@@ -111,9 +112,18 @@ struct MuxaAttentionTracking: ViewModifier {
 
     private func openPendingSwitch() {
         guard let pane = attention.pendingSwitch else { return }
-        attention.pendingSwitch = nil
         guard let watch = model.executionSnapshot.watchPane(id: pane),
-              let target = MuxaAgentActionTarget(watch) else { return }
+              let target = MuxaAgentActionTarget(watch) else {
+            // A click can launch the app: give the pane the same grace a
+            // plain open gets, then say what happened instead of nothing.
+            if let at = attention.pendingSwitchAt,
+               Date().timeIntervalSince(at) > MuxaAgentAttentionCenter.pendingOpenLifetime {
+                attention.pendingSwitch = nil
+                model.reportAgentActionError(String(localized: "That agent is no longer running, so there is nothing to switch."))
+            }
+            return
+        }
+        attention.pendingSwitch = nil
         open(pane)
         model.swaps.present(target.swapSheetTarget)
     }

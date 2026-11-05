@@ -94,7 +94,13 @@ final class AppModel: ObservableObject {
     @Published private(set) var pipelineRuns: [MuxaPipelineRun] = []
     @Published private(set) var executionSnapshot = MuxaExecutionSnapshot.empty {
         // WS-A: every snapshot, from either refresh path, updates unread state.
-        didSet { attention.ingest(executionSnapshot) }
+        didSet {
+            // Limit policies cover only this Mac's own agents.
+            MuxaLimitCoverage.setLocalAgents(Set(
+                executionSnapshot.hostedAgents.lazy.filter(\.host.local).map(\.agent.agentSessionID)
+            ))
+            attention.ingest(executionSnapshot)
+        }
     }
     @Published private(set) var workGroups: [MuxaWorkGroup] = []
     @Published private(set) var hostedAgents: [MuxaHostedAgent] = []
@@ -173,6 +179,8 @@ final class AppModel: ObservableObject {
     /// The last agent action (send continue, …) that failed after its
     /// control was clicked; the status bar shows it until dismissed.
     @Published var agentActionError: String?
+    /// A short confirmation that an agent action went through.
+    @Published var agentActionNotice: String?
 
     let client: MuxaIPCClient
     // WS-A: unread state and macOS notifications for agent transitions.
@@ -315,6 +323,7 @@ final class AppModel: ObservableObject {
                 Task { [weak self] in
                     guard let self else { return }
                     await AutomationStore.shared.refreshRules(model: self)
+                await swaps.refreshHealthIfStale()
                 }
                 async let events: Void = runFleetSubscription(ifGeneration: generation)
                 async let askEvents: Void = runAskSubscription(ifGeneration: generation)
@@ -495,6 +504,7 @@ final class AppModel: ObservableObject {
             await refresh(ifGeneration: generation)
             if !isDisconnected {
                 await AutomationStore.shared.refreshRules(model: self)
+                await swaps.refreshHealthIfStale()
             }
         }
     }
@@ -1829,11 +1839,17 @@ final class AppModel: ObservableObject {
         case .ask: sidebarMode = .ask
         case .work: sidebarMode = .work
         case .agent(let id):
-            // An agent opened from Explore (its pane is in the tree) keeps
-            // Explore showing; anywhere else the Inbox lists it.
-            let listedInExplore = sidebarMode == .watch
-                && hostedAgents.contains { $0.id == id && $0.pane != nil }
-            if !listedInExplore { sidebarMode = .inbox }
+            // The side bar stays where the agent is listed — Explore when
+            // its pane is in the tree, Work when it takes part in a Work —
+            // and otherwise the Inbox lists it.
+            let listed: Bool
+            switch sidebarMode {
+            case .watch: listed = hostedAgents.contains { $0.id == id && $0.pane != nil }
+            case .work: listed = workGroups.contains { $0.participants.contains { $0.id == id } }
+            case .inbox: listed = true
+            case .ask, .shells, .files: listed = false
+            }
+            if !listed { sidebarMode = .inbox }
         case .host: sidebarMode = .watch
         case .fleetSession: sidebarMode = .watch
         case .fleetWindow: sidebarMode = .watch

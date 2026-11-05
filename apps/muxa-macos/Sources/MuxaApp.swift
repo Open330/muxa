@@ -461,11 +461,13 @@ private struct MenuBarContent: View {
                 .help("Open the Inbox")
             }
             if attention.summary.uncoveredLimited > 0,
-               let target = MuxaSwitchLimitedButton.sheetTarget(
-                   for: model.hostedAgents.filter { $0.agent.status.isLimited }
-               ) {
+               MuxaSwitchLimitedButton.hostCount(for: model.hostedAgents.filter { $0.agent.status.isLimited }) > 0 {
                 Button {
-                    openMain { model.swaps.present(target) }
+                    openMain {
+                        MuxaSwitchLimitedButton.presentSwitch(
+                            for: model.hostedAgents.filter { $0.agent.status.isLimited }, model: model
+                        )
+                    }
                 } label: {
                     Label(attention.summary.uncoveredLimited == 1
                         ? "1 agent hit its usage limit: Switch Account…"

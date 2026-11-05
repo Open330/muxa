@@ -429,6 +429,10 @@ struct WorkbenchStatusBar: View {
                     }
                     .buttonStyle(.plain)
                     .help("Click to dismiss")
+                } else if let notice = model.agentActionNotice {
+                    Label(notice, systemImage: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .lineLimit(1)
                 }
                 if healthy {
                     MuxaSwapStatusItem(swaps: model.swaps, openPane: openPane)

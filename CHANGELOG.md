@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   offers switching capped agents.
 - Settings › Automations and the swap sheet show the swap service's health
   (`swap_health`) and why it cannot switch, when it cannot.
+- Switches automation starts appear in the status bar on their own, like the
+  ones started from the sheet.
 
 - A swap checks what a target's relaunch needs before it touches the agent:
   the directory it runs in, a configured account's `env_file` (a regular

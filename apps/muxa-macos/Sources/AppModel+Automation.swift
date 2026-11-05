@@ -629,11 +629,13 @@ final class AutomationStore: ObservableObject {
 
     init() {}
 
-    /// Tell every agent status whether capped agents are taken care of.
-    /// Only a daemon that answered counts: before that, stay covered.
+    /// Tell every agent status which capped agents are taken care of.
+    /// Until a daemon answers, none are.
     private func publishLimitCoverage() {
-        guard hasLoaded || !snapshot.rules.isEmpty else { return }
-        MuxaLimitCoverage.isCovered = coversLimitedAgents
+        MuxaLimitCoverage.setRules(
+            MuxaLimitCoverage.grants(enabled: masterEnabled, rules: snapshot.rules),
+            pausedUntil: snapshot.pausedUntil
+        )
     }
 
     /// Re-read just the rules (no run log): cheap enough for the app's
@@ -643,12 +645,48 @@ final class AutomationStore: ObservableObject {
         guard !isMutating, !isLoading else { return }
         guard await model.client.supports(MuxaIPCClient.automationCapability) else {
             isSupported = false
+            // Nothing acts on a cap here, whatever an earlier daemon had.
+            if snapshot != .empty { snapshot = .empty }
             return
         }
         isSupported = true
         if let snapshot = try? await model.client.automationList() {
             hasLoaded = true
             if self.snapshot != snapshot { self.snapshot = snapshot }
+        }
+        await followAutomationSwaps(model: model)
+    }
+
+    /// Swaps this daemon's automations started, already followed.
+    private var followedSwapOperations: Set<String> = []
+    /// How far back a newly seen admitted swap is still worth showing.
+    nonisolated static let followSwapsFiredWithin: TimeInterval = 15 * 60
+
+    /// Every account switch shows in the status bar, the ones automation
+    /// starts too: a recent admitted `swap_account` firing is followed like
+    /// a switch started from the sheet. Read only while a switch rule is on.
+    private func followAutomationSwaps(model: AppModel, now: Date = Date()) async {
+        guard snapshot.enabled, snapshot.rules.contains(where: { $0.enabled && $0.action == .swapAccount }),
+              let entries = try? await model.client.automationLog(limit: 20) else { return }
+        for entry in Self.swapsToFollow(entries, followed: followedSwapOperations, now: now) {
+            guard let key = entry.operation else { continue }
+            followedSwapOperations.insert(key)
+            model.swaps.follow(
+                requestKey: key,
+                host: nil,
+                title: String(localized: "\(entry.rule) · \(entry.pane ?? "")")
+            )
+        }
+    }
+
+    nonisolated static func swapsToFollow(
+        _ entries: [MuxaAutomationLogEntry], followed: Set<String>, now: Date
+    ) -> [MuxaAutomationLogEntry] {
+        entries.filter { entry in
+            guard entry.outcome == .admitted, entry.action == .swapAccount,
+                  let key = entry.operation, !followed.contains(key),
+                  let fired = MuxaAutomationTime.parse(entry.firedAt) else { return false }
+            return now.timeIntervalSince(fired) <= followSwapsFiredWithin
         }
     }
 

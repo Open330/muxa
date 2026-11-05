@@ -190,7 +190,10 @@ final class MuxaAgentAttentionCenter: ObservableObject {
     static let humanPersistenceKey = "muxa.attention.human-notified.v1"
     /// A pane a notification click asked to open; the workbench consumes it.
     /// A notification's Switch Account… asked for this pane's swap sheet.
-    @Published var pendingSwitch: MuxaWatchPaneIdentity?
+    @Published var pendingSwitch: MuxaWatchPaneIdentity? {
+        didSet { pendingSwitchAt = pendingSwitch == nil ? nil : Date() }
+    }
+    private(set) var pendingSwitchAt: Date?
     @Published var pendingOpen: MuxaWatchPaneIdentity? {
         didSet { pendingOpenAt = pendingOpen == nil ? nil : Date() }
     }
@@ -452,8 +455,9 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             // A cap can arrive as either event (`error`, or working → idle).
             // When a limit policy covers it, the policy acts and this stays
             // quiet; otherwise it is the person's to handle, and says so.
-            let limited = hosted.agent.status.isLimited
-            if limited, MuxaLimitCoverage.isCovered { continue }
+            let status = hosted.agent.status
+            let limited = status.isLimited
+            if limited, !status.needsAttention { continue }
             let event: MuxaNotificationRules.Event = limited ? .limited : observed
             let settings = settings()
             switch event {
@@ -498,6 +502,14 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             title = String(localized: "\(name) finished")
             body = MuxaNotificationRules.body(agent.lastResponse)
                 ?? MuxaNotificationRules.body(agent.recap)
+        case .limited where !MuxaAgentActionTarget.switchableKinds.contains(agent.kind):
+            // aas cannot relaunch this kind: no switch to offer.
+            title = String(localized: "\(name) hit its usage limit")
+            if case .limited(let cap) = agent.status, let until = cap.until {
+                body = String(localized: "Resets at \(MuxaUsageFormat.clock(until)).")
+            } else {
+                body = nil
+            }
         case .limited:
             title = String(localized: "\(name) hit its usage limit")
             if case .limited(let cap) = agent.status, let until = cap.until {
@@ -517,7 +529,9 @@ final class MuxaAgentAttentionCenter: ObservableObject {
             body: body,
             pane: pane,
             sound: sound,
-            category: MuxaNotificationActions.category(for: event)
+            category: event == .limited && !MuxaAgentActionTarget.switchableKinds.contains(agent.kind)
+                ? MuxaNotificationActions.agentCategory
+                : MuxaNotificationActions.category(for: event)
         )
     }
 

@@ -91,6 +91,8 @@ struct MuxaSwapSheet: View {
 
     private var canStart: Bool {
         guard !isStarting, !isPlanning, planError == nil, let plan else { return false }
+        // The service said it takes no job: Start would only be refused.
+        if isLocal, let health = swaps.health, !health.isReady { return false }
         if case .typed = choice,
            typedAccount.trimmingCharacters(in: .whitespaces).isEmpty
             || typedAccount.contains(where: \.isWhitespace) {
@@ -138,6 +140,7 @@ struct MuxaSwapSheet: View {
             // Debounce typing in the account and follow-up fields.
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
+            startError = nil
             await loadPlan()
         }
     }
@@ -290,18 +293,30 @@ struct MuxaSwapSheet: View {
     }
 
     private func loadPlan() async {
+        let asked = request
         isPlanning = true
         defer { isPlanning = false }
+        let result: Result<[MuxaSwapOutcome], Error>
         do {
-            plan = try await swaps.plan(request, host: target.host)
-            planError = nil
+            result = .success(try await swaps.plan(asked, host: target.host))
         } catch {
+            result = .failure(error)
+        }
+        // A plan for what the fields said before the last edit is not this
+        // request's plan: the next one is already on its way.
+        guard !Task.isCancelled, asked == request else { return }
+        switch result {
+        case .success(let outcomes):
+            plan = outcomes
+            planError = nil
+        case .failure(let error):
             plan = nil
             planError = error.localizedDescription
         }
     }
 
     private func start() async {
+        startError = nil
         isStarting = true
         defer { isStarting = false }
         do {
@@ -482,6 +497,14 @@ struct MuxaSwapActivityRow: View {
                     .font(MuxaType.detail)
                     .foregroundStyle(.red)
                     .fixedSize(horizontal: false, vertical: true)
+            } else if let statusError = activity.statusError {
+                Text(activity.lostTrack
+                    ? "Muxa stopped checking: \(statusError). The switch may still be running on its host; `muxa swap --status=\(activity.requestKey)` there shows it."
+                    : "Couldn't read its progress: \(statusError). Trying again…")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.orange)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
             if let job = activity.job {
                 ForEach(job.entries) { entry in
@@ -500,7 +523,7 @@ struct MuxaSwapActivityRow: View {
                 if !activity.isRunning, (activity.job?.failedCount ?? 0) > 0 {
                     Button("Retry Failed") { Task { await swaps.retry(activity) } }
                         .buttonStyle(.muxaSecondary)
-                        .help("Retries only agents that failed before their relaunch and still run as planned")
+                        .help("A new switch for the agents that failed: ones that failed before their relaunch are switched again, ones already relaunched are only checked")
                 }
             }
         }
@@ -520,8 +543,11 @@ struct MuxaSwapActivityRow: View {
 
     private var stateText: String {
         guard let job = activity.job else {
-            return activity.error == nil ? String(localized: "Starting…") : String(localized: "Did not start")
+            if activity.error != nil { return String(localized: "Did not start") }
+            if activity.lostTrack { return String(localized: "Progress unknown") }
+            return String(localized: "Starting…")
         }
+        if activity.lostTrack { return String(localized: "Progress unknown") }
         if job.isRunning {
             return job.cancelRequested
                 ? String(localized: "Stopping after the current agent…")

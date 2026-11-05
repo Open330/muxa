@@ -326,15 +326,19 @@ private let weekly: TimeInterval = 3 * 86_400
 }
 
 /// A rate-limited agent usually reports `error` (its turn stopped on a 429);
-/// it reads as limited and does not count as needing attention.
+/// it reads as limited, and needs the person only when no limit policy on
+/// its own host acts on it.
 @Test func agentStatusSeparatesRateLimitsFromErrors() throws {
     let capped = try usageAgent([
         "state": "error", "rate_limit_scope": "five_hour", "rate_limited_until": stamp(600),
     ])
     let status = MuxaAgentStatus(agent: capped, now: now)
     #expect(status.isLimited)
-    #expect(!status.needsAttention)
+    #expect(status.needsAttention, "no policy covers it")
     #expect(status.priority == 2)
+    var covered = MuxaRateLimitCap(scope: .fiveHour, until: nil)
+    covered.covered = true
+    #expect(!MuxaAgentStatus.limited(covered).needsAttention)
 
     // Once the reset time passes, the leftover error is a real error.
     let lifted = MuxaAgentStatus(agent: capped, now: now.addingTimeInterval(601))

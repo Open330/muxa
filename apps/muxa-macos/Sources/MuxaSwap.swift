@@ -304,15 +304,28 @@ struct MuxaSwapActivity: Identifiable, Hashable, Sendable {
     let startedAt: Date
     /// A short description of what was asked ("@api → work@claude").
     let title: String
+    /// Agents the request named, so a swap shows as in progress for them
+    /// before the job reports per-agent outcomes; empty for `--limited`.
+    var targets: Set<String> = []
     var job: MuxaSwapJobView?
+    /// The swap could not be started: nothing was handed to the daemon.
     var error: String?
+    /// The last status read failed; the job may still be running.
+    var statusError: String?
+    /// Status reads failed in a row.
+    var statusFailures = 0
     var acknowledged = false
 
     var id: String { "\(host ?? "local")|\(requestKey)" }
-    var isRunning: Bool { job?.isRunning ?? (error == nil) }
+    /// Status reads stopped answering long enough to stop asking.
+    var lostTrack: Bool { statusFailures >= MuxaSwapCenter.maxStatusFailures }
+    var isRunning: Bool {
+        if error != nil || lostTrack { return false }
+        return job?.isRunning ?? true
+    }
     var needsLook: Bool {
         guard !isRunning else { return false }
-        return error != nil || (job?.failedCount ?? 0) > 0
+        return error != nil || lostTrack || (job?.failedCount ?? 0) > 0
     }
 }
 
@@ -325,14 +338,26 @@ final class MuxaSwapCenter: ObservableObject {
     @Published var sheet: MuxaSwapSheetTarget?
     /// The local daemon's swap service, from the last check; nil until
     /// checked or on a daemon that cannot say.
-    @Published private(set) var health: MuxaSwapHealth?
+    @Published private(set) var health: MuxaSwapHealth? {
+        // A switch policy covers nothing while swaps cannot be taken.
+        didSet { MuxaLimitCoverage.setSwapAvailable(health?.isReady ?? true) }
+    }
     /// Why the last check could not answer.
     @Published private(set) var healthError: String?
+
+    private var healthCheckedAt: Date?
+
+    /// `refreshHealth` at most once a minute: for the app's reconcile loop.
+    func refreshHealthIfStale(now: Date = Date()) async {
+        if let checked = healthCheckedAt, now.timeIntervalSince(checked) < 60 { return }
+        await refreshHealth()
+    }
 
     /// Ask the local daemon how its swap service is. Remote hosts are not
     /// asked: their swaps report their own refusals.
     func refreshHealth() async {
         guard let model else { return }
+        healthCheckedAt = Date()
         do {
             health = try await model.client.swapHealth()
             healthError = nil
@@ -345,6 +370,9 @@ final class MuxaSwapCenter: ObservableObject {
     private weak var model: AppModel?
     private var pollTask: Task<Void, Never>?
     static let pollInterval: Duration = .seconds(2)
+    /// Failed status reads in a row (about a minute) before the app stops
+    /// following a swap and says it lost track of it.
+    nonisolated static let maxStatusFailures = 30
     /// How many ended swaps the activity list keeps.
     static let keptEnded = 8
 
@@ -369,6 +397,7 @@ final class MuxaSwapCenter: ObservableObject {
         guard let model else { throw MuxaIPCError.server(String(localized: "Muxa is not connected")) }
         let key = MuxaSwapRequest.mintRequestKey()
         var activity = MuxaSwapActivity(requestKey: key, host: host, startedAt: Date(), title: title)
+        if case .agents(let ids) = request.scope { activity.targets = Set(ids) }
         insert(activity)
         do {
             let output = try await run(model, host: host, arguments: request.startArguments(requestKey: key))
@@ -443,7 +472,8 @@ final class MuxaSwapCenter: ObservableObject {
     /// shows it instead of offering a second swap.
     func runningSwap(for agentSessionID: String) -> MuxaSwapActivity? {
         running.first { activity in
-            activity.job?.entries.contains { $0.outcome?.agentSessionID == agentSessionID } ?? false
+            activity.targets.contains(agentSessionID)
+                || activity.job?.entries.contains { $0.outcome?.agentSessionID == agentSessionID } == true
         }
     }
 
@@ -476,14 +506,17 @@ final class MuxaSwapCenter: ObservableObject {
             guard var current = activities.first(where: { $0.id == id }) else { return }
             let finished = (current.job?.isRunning ?? true) && !view.isRunning
             current.job = view
-            current.error = nil
+            current.statusError = nil
+            current.statusFailures = 0
             update(current)
             if finished { await model.refresh() }
         } catch {
             guard var current = activities.first(where: { $0.id == id }) else { return }
-            // A status read that fails once is not the job failing; keep
-            // following it and only show the error while no view exists.
-            if current.job == nil { current.error = error.localizedDescription }
+            // The daemon took the job, so a failed read is not the swap
+            // failing: keep following it, and stop only after a minute of
+            // silence (a Fleet host gone away), saying so.
+            current.statusError = error.localizedDescription
+            current.statusFailures += 1
             update(current)
         }
     }
@@ -492,7 +525,7 @@ final class MuxaSwapCenter: ObservableObject {
         guard pollTask == nil else { return }
         pollTask = Task { [weak self] in
             while let self, !Task.isCancelled {
-                let ids = self.running.filter { $0.job != nil || $0.error == nil }.map(\.id)
+                let ids = self.running.map(\.id)
                 if ids.isEmpty { break }
                 for id in ids { await self.refresh(id: id) }
                 try? await Task.sleep(for: Self.pollInterval)

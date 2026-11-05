@@ -155,6 +155,7 @@ enum MuxaAgentActions {
                 do {
                     // Prompt text, not UI chrome: typed into the agent.
                     try await model.client.sendFleetPrompt(host: target.host, pane: pane, text: "continue")
+                    model.reportAgentActionDone(String(localized: "Sent “continue” to \(target.title)"))
                 } catch {
                     model.reportAgentActionError(error.localizedDescription)
                 }
@@ -167,7 +168,27 @@ extension AppModel {
     /// Surfaces an agent action that failed after its control was clicked.
     /// The status bar shows the message until the next action.
     func reportAgentActionError(_ message: String) {
+        agentActionNotice = nil
         agentActionError = message
+        clearAgentActionMessage(after: .seconds(20)) { $0.agentActionError == message ? \.agentActionError : nil }
+    }
+
+    /// Confirms an action in the status bar for a few seconds.
+    func reportAgentActionDone(_ message: String) {
+        agentActionError = nil
+        agentActionNotice = message
+        clearAgentActionMessage(after: .seconds(4)) { $0.agentActionNotice == message ? \.agentActionNotice : nil }
+    }
+
+    private func clearAgentActionMessage(
+        after delay: Duration,
+        _ field: @escaping @MainActor (AppModel) -> ReferenceWritableKeyPath<AppModel, String?>?
+    ) {
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(for: delay)
+            guard let self, let path = field(self) else { return }
+            self[keyPath: path] = nil
+        }
     }
 }
 
@@ -311,6 +332,29 @@ struct MuxaSwitchLimitedButton: View {
 
     private func present(_ host: MuxaFleetHostIdentity, _ agents: [MuxaHostedAgent]) {
         model.swaps.present(Self.sheetTarget(host: host, agents: agents))
+    }
+
+    /// Hosts with switchable capped agents: a swap moves one host's agents,
+    /// so with more than one, Command Center's per-host menu is the place.
+    static func hostCount(for limited: [MuxaHostedAgent]) -> Int {
+        Set(limited.filter { MuxaAgentActionTarget.switchableKinds.contains($0.agent.kind) }.map(\.host.alias)).count
+    }
+
+    /// Open the switch sheet when one host has capped agents, else Command
+    /// Center, which offers one switch per host. False when none can be
+    /// switched.
+    @MainActor
+    @discardableResult
+    static func presentSwitch(for limited: [MuxaHostedAgent], model: AppModel) -> Bool {
+        switch hostCount(for: limited) {
+        case 0: return false
+        case 1:
+            guard let target = sheetTarget(for: limited) else { return false }
+            model.swaps.present(target)
+        default:
+            model.select(.workBoard)
+        }
+        return true
     }
 
     /// The sheet for the host with the most switchable capped agents (the

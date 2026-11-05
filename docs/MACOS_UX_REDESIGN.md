@@ -72,11 +72,14 @@ capabilities. The same list drives:
 
 | State | Primary | Also |
 |---|---|---|
-| Limited | **Switch Account & Resume** | Resume at reset (policy), Open |
-| Needs input | Open & Reply | Send "continue" |
-| Error | Open | Send "continue" |
-| Idle / Done | Send Prompt… | Move to Account… |
-| Working | Open | Move to Account… (forces a stop; warned) |
+| Limited (Claude Code / Codex) | **Switch Account and Resume…** | the limit policy, in the rate-limit badge |
+| Needs input / Error | — (the row and header already open the agent) | Send "continue", Move to Another Account… |
+| Working / Idle / Done | — | Move to Another Account… (forces a stop when working; warned) |
+
+Opening and replying stay where they already are — the row itself, and the
+pane's prompt composer — rather than being repeated as actions. A capped agent
+of another kind has no action: `aas` cannot relaunch it, and its notification
+offers none.
 
 ### 2. Swap: switch account and resume
 
@@ -106,7 +109,12 @@ rate-limit popover, the usage popover and Settings › Automations:
   and notify.
 
 Attention suppression for limited agents now depends on this policy: a capped
-agent is only "taken care of" when a policy will actually act on it.
+agent is only "taken care of" when a policy will actually act on it. Rules run
+in the daemon that owns the pane, so the app's policy covers only this Mac's
+agents, of the kinds and limit scopes the rules name; a rule with any other
+filter covers nothing; a switch rule covers nothing while `swap_health` says
+the service takes no job; a pause covers nothing until it ends. A capped agent
+on a Fleet host always counts as the person's.
 
 ### 4. One attention summary
 
@@ -126,12 +134,13 @@ that looks clickable is a button that opens the matching list.
 
 ### 5. Navigation fixes
 
-- Opening an agent keeps the current side bar unless it was opened from the
-  side bar itself.
+- Opening an agent keeps the side bar where the agent is listed (Explore
+  when its pane is in the tree, Work when it takes part in a Work), else the
+  Inbox.
 - "Your decision needed" and human-request notifications open the message.
 - "N more …" rows are buttons.
-- The palette gains Fleet Dispatch, Show Ask, Show Files, Settings, Usage,
-  Swap and the per-agent actions.
+- The palette gains Fleet Dispatch, Show Files and switching limited agents
+  (one host: the switch sheet; several: Command Center's per-host menu).
 
 ### 6. Health
 
