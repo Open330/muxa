@@ -1,10 +1,12 @@
 # Architecture
 
-`muxa` is intentionally small: one daemon, one CLI, local files, and an
+`muxa` keeps few moving parts: one daemon, one CLI, local files, and an
 embedded SQLite collaboration store. No external database service is required.
+For the two product layers (Attention and Runtime) and feature tiers, see
+[DIRECTION.md](DIRECTION.md).
 
 For the proposed execution-runtime improvements and their staged rollout, see
-[Agent runtime review and integrated plan (한국어)](AGENT_RUNTIME_PLAN.ko.md).
+[Agent runtime review and integrated plan (한국어)](proposals/AGENT_RUNTIME_PLAN.ko.md).
 That document tracks rollout progress; unfinished items are proposals rather
 than the current runtime contract.
 

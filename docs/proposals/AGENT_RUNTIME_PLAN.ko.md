@@ -76,9 +76,9 @@ takeover, 읽지 않는 클라이언트의 쓰기 정체를 다룬다. 단순히
 daemon의 Work 요청은 CLI를 실행하고, CLI는 다시 daemon IPC로 상태를 갱신한다.
 daemon의 pipeline reconciler도 `muxa work reconcile --all`을 실행한다.
 
-- 근거: [work_control.rs](../crates/muxa/src/work_control.rs),
-  [work_up.rs](../crates/muxa-cli/src/work_up.rs),
-  [pipeline_reconciler.rs](../crates/muxad/src/pipeline_reconciler.rs).
+- 근거: [work_control.rs](../../crates/muxa/src/work_control.rs),
+  [work_up.rs](../../crates/muxa-cli/src/work_up.rs),
+  [pipeline_reconciler.rs](../../crates/muxad/src/pipeline_reconciler.rs).
 - 현재 코드를 재사용한다는 장점은 있다. 그러나 명령의 생명주기, 취소,
   배포된 CLI 버전, 재시도 책임이 여러 계층에 걸친다.
 - 기존 background reconciler는 `.output().await`에 명시적 timeout이 없었다.
@@ -100,9 +100,9 @@ Work snapshot의 execution identity는 host/socket/session/window로 구성된�
 mailbox에 run_id 필드는 있지만, pipeline 실행 전체를 연결하는 독립적 Run/Attempt
 이력과 동일한 것은 아니다.
 
-- 근거: [ipc.rs](../crates/muxa/src/ipc.rs)의 `WorkUpManager`,
-  [pipeline_run.rs](../crates/muxa/src/pipeline_run.rs)의 `Inner`, `register`,
-  [work.rs](../crates/muxa/src/work.rs)의 `ExecutionIdentity`.
+- 근거: [ipc.rs](../../crates/muxa/src/ipc.rs)의 `WorkUpManager`,
+  [pipeline_run.rs](../../crates/muxa/src/pipeline_run.rs)의 `Inner`, `register`,
+  [work.rs](../../crates/muxa/src/work.rs)의 `ExecutionIdentity`.
 - 개선: 영속 `run_id`, 단계별 `attempt_id`, 명령별 `operation_id`를 구분한다.
   generation은 낡은 결과를 거부하는 용도로 유지하고 식별자의 대체물로 쓰지 않는다.
 - Work 시작 재호출은 활성 Run으로 수렴한다. 명시적 새 실행은 새 Run,
@@ -118,7 +118,7 @@ mailbox에 run_id 필드는 있지만, pipeline 실행 전체를 연결하는 �
 뒤 순서대로 실행한다. 동일 generation에서 이전 실행자가 느리게 살아 있는 동안
 예약이 재획득되면, 이전 report를 구별할 수 없는 구조다.
 
-- 근거: [pipeline_run.rs](../crates/muxa/src/pipeline_run.rs)의
+- 근거: [pipeline_run.rs](../../crates/muxa/src/pipeline_run.rs)의
   `CLAIM_LEASE_SECONDS`, `claim_ready`, `report`, `claimable`.
 - 기존 `recover_unreported_alias`는 생성 후 report 전에 죽은 pane을 재발견한다.
   따라서 중복 방지와 복구가 전혀 없다는 평가는 틀리다.
@@ -136,9 +136,9 @@ mailbox에 run_id 필드는 있지만, pipeline 실행 전체를 연결하는 �
 실행 여부를 확인한 뒤 완료로 기록하며 검증 명령을 실행하지 않는다.
 관리형 런처는 주요 provider에 권한 우회 플래그를 기본 추가한다.
 
-- 근거: [work_pipeline_spec.rs](../crates/muxa/src/work_pipeline_spec.rs),
-  [pipeline_run.rs](../crates/muxa/src/pipeline_run.rs)의 `done`,
-  [agent_launch.rs](../crates/muxa-cli/src/agent_launch.rs)의 `native_launch`.
+- 근거: [work_pipeline_spec.rs](../../crates/muxa/src/work_pipeline_spec.rs),
+  [pipeline_run.rs](../../crates/muxa/src/pipeline_run.rs)의 `done`,
+  [agent_launch.rs](../../crates/muxa-cli/src/agent_launch.rs)의 `native_launch`.
 - 개선: 기존 TOML의 agent 형식은 유지하되 내부에 AgentAttempt와
   VerificationAttempt를 구분한다. 초기에는 agent에 딸린 선택적 검증이면 충분하다.
   범용 workflow DSL은 만들지 않는다.

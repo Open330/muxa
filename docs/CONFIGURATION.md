@@ -856,4 +856,4 @@ prompts to oh-my-prompt. See [SINKS.md](SINKS.md).
 ordered comma-separated set, for example `MUXA_HOSTS=rmux,tmux`. rmux's native
 `RMUX` variables take precedence over the `TMUX` compatibility variables it
 also exports. See [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
-[ZELLIJ.md](ZELLIJ.md).
+[ZELLIJ.md](proposals/ZELLIJ.md).

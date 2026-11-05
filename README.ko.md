@@ -2,11 +2,12 @@
 
 <img src="assets/logo.svg" alt="Muxa 로고" width="144" />
 
-**tmux에서 돌리는 코딩 에이전트 중 지금 나를 기다리는 것을 알려 주고, 바로 데려다 줍니다.**
+**코딩 에이전트 팀을 위한 운영 플랫폼.**
 
-래퍼도, 새 터미널도 필요 없습니다. 이미 tmux에서 돌리고 있는 Claude Code,
-Codex, Gemini CLI 세션을 지켜보다가 어느 에이전트가 나를 기다리는지 알려 주고
-그 pane으로 옮겨 줍니다. watch에서 동료에게 리뷰를 요청하고 답장을 확인할 수도 있습니다.
+나를 기다리는 에이전트를 알려 주고 바로 데려다 줍니다. 그리고 팀 전체를 Work로
+운영합니다. 에이전트를 띄우고, 서로 리뷰하게 하고, 여러 호스트에 걸쳐 따라갑니다.
+이미 tmux에서 돌리는 Claude Code, Codex, Gemini CLI 세션에 설정 없이 붙어 시작하고,
+더 필요할 때 Muxa가 에이전트를 직접 띄우고 소유하게 할 수 있습니다.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
@@ -77,6 +78,10 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 ```
 
 ## 왜 Muxa인가
+
+Muxa는 두 층으로 되어 있습니다. **Attention** 층은 이미 돌리는 에이전트에 붙고,
+**Runtime** 층은 Muxa가 띄운 에이전트를 Work로 조직합니다. Attention은 Runtime 없이도
+동작합니다. [Direction](docs/DIRECTION.md)을 참고하세요.
 
 - **지금 환경을 그대로 둡니다.** Claude Code, Codex, Gemini CLI(후속인
   Antigravity CLI `agy` 포함)의 hook에서 에이전트 상태를 읽고(hook이 없는
@@ -433,7 +438,7 @@ muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | --- | --- | --- |
 | tmux | 전체 | 기본 백엔드. |
 | [herdr](https://herdr.dev) | 전체 | herdr 소켓 API 경유; [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI 기본 | 플러그인 경로 예정; [docs/ZELLIJ.md](docs/ZELLIJ.md). |
+| zellij | CLI 기본 | 플러그인 경로 예정; [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md). |
 
 여러 호스트 동시 관측은 [docs/MULTI_HOST.md](docs/MULTI_HOST.md) 참고.
 
@@ -452,7 +457,7 @@ muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | 설정 레퍼런스 | [docs/CONFIGURATION.ko.md](docs/CONFIGURATION.ko.md) |
 | Web dashboard | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |
-| Zellij 계획 | [docs/ZELLIJ.md](docs/ZELLIJ.md) |
+| Zellij 계획 | [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md) |
 | Architecture와 개발 | [docs/ARCHITECTURE.ko.md](docs/ARCHITECTURE.ko.md) |
 | Agent 간 협업 | [docs/COLLABORATION.ko.md](docs/COLLABORATION.ko.md) |
 

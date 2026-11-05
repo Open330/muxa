@@ -130,7 +130,8 @@ limits and cooldown still apply.
 
 ## Switch accounts instead of waiting
 
-With several `aas` (Agent Account Switcher) accounts, a capped agent
+With several accounts (configured under `[accounts]`, or through the optional
+`aas` provider), a capped agent
 does not have to wait for its reset: `swap_account` moves it onto the next
 account with quota left and resumes the same conversation.
 
@@ -224,7 +225,7 @@ Closed set.
 | `notify` | `message` (required) | Emits a daemon-side notice and a ledger entry. Types nothing. |
 | `interrupt` | — | Sends the pane's interrupt (`Ctrl-C`). Types no prompt. |
 | `press_enter` | — | Checks the selected affirmative confirmation and live waiting state, then sends Enter. |
-| `swap_account` | `account` (default `auto`), `text` (default `[swap]`) | Moves the agent onto another `aas` account and resumes its conversation, then types the follow-up. Fires immediately by default. See [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md). |
+| `swap_account` | `account` (default `auto`), `text` (default `[swap]`) | Moves the agent onto another account and resumes its conversation, then types the follow-up. Fires immediately by default. See [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md). |
 
 `text` is refused at load time if it contains terminal control sequences.
 An automation types into a live TUI; escape sequences reaching one are how

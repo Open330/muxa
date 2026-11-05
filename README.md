@@ -2,11 +2,12 @@
 
 <img src="assets/logo.svg" alt="Muxa logo" width="144" />
 
-**Know which tmux coding agent is waiting on you — and jump to it.**
+**The operations platform for your team of coding agents.**
 
-No wrapper, no new terminal. Muxa watches the Claude Code, Codex, and
-Gemini CLI sessions you already run in tmux, tells you which one needs
-you, and takes you there. Ask a peer for a review and read its reply in watch.
+See which agent is waiting on you and jump to it — then run the whole team as
+Work: launch agents, let them review each other, and follow them across hosts.
+Start with zero setup on the Claude Code, Codex, and Gemini CLI sessions you
+already run in tmux; let Muxa launch and own agents when you want more.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
@@ -80,6 +81,10 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 
 ## Why muxa
 
+Muxa has two layers. **Attention** works on agents you already run; **Runtime**
+organizes the agents Muxa launches into Work. Attention never requires Runtime.
+See [Direction](docs/DIRECTION.md).
+
 - **Keeps your setup.** Reads agent state from Claude Code, Codex, and
   Gemini CLI (and its Antigravity successor) hooks, with screen detection
   for hook-less agents, and maps it onto the tmux panes you already have.
@@ -114,7 +119,7 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 | `muxa timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
 | `muxa stats activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | `muxa automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
-| `muxa swap` | Move agents onto another `aas` account and resume them in place — the rate-limited ones, named panes, or all. See [docs/ACCOUNT_SWAP.md](docs/ACCOUNT_SWAP.md). |
+| `muxa swap` | Move agents onto another account (configured accounts, or the optional `aas` provider) and resume them in place — the rate-limited ones, named panes, or all. See [docs/ACCOUNT_SWAP.md](docs/ACCOUNT_SWAP.md). |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Muxa for Mac | Native workbench for Work, Explore, Inbox, Ask, Shells, and Files, with a libghostty terminal and notifications; native PTYs remain owned by `muxad`. |
 | Dashboard | Optional loopback HTTP UI with live updates, timeline, collaboration graphs, and [OIDC pane/window sharing](docs/DASHBOARD.md#invite-someone-to-a-pane) with view or prompt permissions. |
@@ -504,7 +509,7 @@ several at once (e.g. during a tmux→herdr migration):
 | tmux | Full | The default backend. |
 | [rmux](https://rmux.io) | Initial CLI backend | Pane discovery, capture, focus, and targeted input; see [docs/RMUX.md](docs/RMUX.md). The host on native Windows — see [docs/WINDOWS.md](docs/WINDOWS.md). |
 | [herdr](https://herdr.dev) | Full | Via herdr's socket API; see [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/ZELLIJ.md). |
+| zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md). |
 
 See [docs/MULTI_HOST.md](docs/MULTI_HOST.md) for observing multiple hosts
 simultaneously.
@@ -531,7 +536,7 @@ simultaneously.
 | Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | Web dashboard | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |
-| Zellij plan | [docs/ZELLIJ.md](docs/ZELLIJ.md) |
+| Zellij plan | [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md) |
 | Architecture and development | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Agent collaboration | [docs/COLLABORATION.md](docs/COLLABORATION.md) |
 

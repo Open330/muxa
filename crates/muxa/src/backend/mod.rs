@@ -9,7 +9,7 @@
 //! `tmux list-panes -F`.
 //!
 //! This module pulls the surface up into a [`PaneBackend`] trait so a
-//! second host (zellij — see [`docs/ZELLIJ.md`](../../../../docs/ZELLIJ.md))
+//! second host (zellij — see [`docs/proposals/ZELLIJ.md`](../../../../docs/proposals/ZELLIJ.md))
 //! can plug in without forking the daemon. The tmux implementation in
 //! [`tmux::TmuxBackend`] is a thin delegating wrapper around the existing
 //! `crate::tmux::*` free functions; nothing about the production code path
@@ -611,7 +611,7 @@ pub trait PaneBackend: Send + Sync + 'static {
     /// Ingest a wholesale pane snapshot pushed by an out-of-process
     /// source — today the zellij WASM plugin, which forwards zellij
     /// `PaneUpdate` events to the daemon over the `BackendPaneSnapshot`
-    /// IPC command (see [`docs/ZELLIJ.md`](../../../../docs/ZELLIJ.md)
+    /// IPC command (see [`docs/proposals/ZELLIJ.md`](../../../../docs/proposals/ZELLIJ.md)
     /// Step 2). Default no-op: backends that enumerate panes themselves
     /// (tmux) ignore external pushes; the zellij backend overrides this
     /// to replace its cached snapshot.
