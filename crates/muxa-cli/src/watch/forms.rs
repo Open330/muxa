@@ -271,10 +271,10 @@ impl SpawnAgent {
 
     /// The interactive launch line, first prompt included, so the agent
     /// boots already working — no fragile "wait for the REPL, then type"
-    /// timing. Mirrors callabo-resolve's launcher matrix, bypass flags
-    /// included: a spawned session is fire-and-forget by construction, and
-    /// an agent parked on its first permission prompt in a window nobody
-    /// is watching never runs the command it was created for.
+    /// timing. Bypass flags are included on purpose: a spawned session is
+    /// fire-and-forget by construction, and an agent parked on its first
+    /// permission prompt in a window nobody is watching never runs the
+    /// command it was created for.
     pub(super) fn launch_command(self, prompt: &str) -> String {
         let quoted = muxa::shell::Dialect::native().quote(prompt);
         match self {

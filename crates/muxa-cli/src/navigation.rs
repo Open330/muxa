@@ -150,7 +150,7 @@ pub(super) fn jump_to_topology_pane(key: &muxa::PaneKey) {
 ///
 /// `<session_id>:<window_id>` closes the gap. Both are backend-native ids, so
 /// neither can prefix-match a neighbouring object the way session *names* do
-/// (`callabo` against `callabo-set`), and together they name exactly one
+/// (`app` against `app-set`), and together they name exactly one
 /// window in exactly one session. Falls back to the bare pane id when no
 /// session id is known, which is the behaviour every jump had before.
 pub(super) fn window_target(session_id: Option<&str>, window_id: &str, pane_id: &str) -> String {
@@ -166,7 +166,7 @@ pub(super) fn window_target(session_id: Option<&str>, window_id: &str, pane_id: 
 /// carried one, else the session name.
 ///
 /// Ids are exact. Names match by prefix unless anchored with `=`, and real
-/// session sets collide — `callabo` also matches `callabo-set`, so a
+/// session sets collide — `app` also matches `app-set`, so a
 /// name-targeted attach can hand the terminal to the wrong workspace. The
 /// name stays as a fallback only because a row parsed from an older
 /// `PANE_FMT` has no session id to use.
@@ -367,7 +367,7 @@ pub(super) fn jump_to_pane_tmux(pane_id: &str) {
         // never asked to move, in a terminal they were not even looking at.
         // The name-based target is its own hazard, because tmux matches
         // session names by prefix unless anchored with `=`, and real
-        // session sets collide (`callabo` against `callabo-set`). And
+        // session sets collide (`app` against `app-set`). And
         // without `-c`, tmux picks "the current client" from recent
         // activity, which with two terminals attached is routinely the
         // other one.
@@ -410,7 +410,7 @@ pub(super) fn jump_to_pane_tmux(pane_id: &str) {
         run_tmux(&["select-pane", "-t", pane_id]);
         // Bare shell — hand our terminal to a fresh tmux attach-session.
         // Target the session by id: names match by prefix unless anchored,
-        // and real session sets collide (`callabo` against `callabo-set`).
+        // and real session sets collide (`app` against `app-set`).
         // `.status()` waits for tmux to exit; on detach the user is back at
         // this shell prompt, which is the least-surprising behaviour.
         match interactive_child::run_interactive(muxa::tmux::tmux_command().args([

@@ -425,7 +425,7 @@ enum Cmd {
     /// Reload MCP connections or snapshot/restart/restore the multiplexer
     Reload(reload::ReloadArgs),
 
-    /// Move agents onto another `aas` account and resume them in place
+    /// Move agents onto another account (`aas` is optional) and resume them in place
     Swap(swap::Args),
 
     /// Update muxa from the source repo: `git pull` → cargo install
