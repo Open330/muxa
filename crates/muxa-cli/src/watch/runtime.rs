@@ -1496,16 +1496,22 @@ pub async fn run(
                                 }
                             }
                             ConfirmAction::CancelCollaboration { origin, request_id } => {
-                                let outcome =
-                                    match client.collaboration_cancel(&origin, &request_id).await {
-                                        Ok(request) => ActionOutcome::Ok(format!(
-                                            "cancelled {}",
-                                            short_collaboration_request_id(&request.id)
-                                        )),
-                                        Err(error) => ActionOutcome::Err(format!(
-                                            "collaboration cancel failed: {error}"
-                                        )),
-                                    };
+                                let outcome = match client
+                                    .collaboration_cancel_view(
+                                        &origin,
+                                        &request_id,
+                                        muxa::collaboration::CollaborationReadView::Metadata,
+                                    )
+                                    .await
+                                {
+                                    Ok(request) => ActionOutcome::Ok(format!(
+                                        "cancelled {}",
+                                        short_collaboration_request_id(&request.id)
+                                    )),
+                                    Err(error) => ActionOutcome::Err(format!(
+                                        "collaboration cancel failed: {error}"
+                                    )),
+                                };
                                 apply_outcome_to_app(&mut app, outcome);
                                 refresh_watch_collaboration(client, &mut app).await;
                                 clamp_collaboration_mailbox(&mut app);

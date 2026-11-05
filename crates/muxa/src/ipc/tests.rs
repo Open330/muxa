@@ -730,3 +730,6 @@ async fn serve<B: PaneBackend>(
 mod agents_and_collaboration;
 mod protocol_and_pane_control;
 mod server_lifecycle_and_services;
+
+mod history_invalidations;
+mod mutation_views;

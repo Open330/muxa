@@ -340,6 +340,8 @@ pub(super) enum RequestBody {
         origin: CollaborationOrigin,
         target: String,
         request: Box<NewRequest>,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
     },
     /// Queue a headless question. Returns the pending entry immediately;
     /// the answer lands in the store when the agent exits.
@@ -585,7 +587,10 @@ pub(super) enum RequestBody {
     /// Long-lived, content-free durable-mailbox invalidation stream. Reading
     /// actual requests still goes through the normal participant/operator
     /// authorization paths.
-    CollaborationSubscribe,
+    CollaborationSubscribe {
+        #[serde(default)]
+        requests_only: bool,
+    },
     CollaborationOverview {
         origin: CollaborationOrigin,
     },
@@ -679,6 +684,8 @@ pub(super) enum RequestBody {
     CollaborationCancel {
         origin: CollaborationOrigin,
         request_id: String,
+        #[serde(default)]
+        view: collaboration::CollaborationReadView,
     },
     /// Stop waking the caller for replies to its own listed requests.
     /// Releases notification interest only; see

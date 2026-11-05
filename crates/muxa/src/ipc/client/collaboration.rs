@@ -9,11 +9,27 @@ impl Client {
             .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
     }
 
+    /// Invalidate request-history caches without reacting to worker lifecycle metadata.
+    /// Older daemons ignore the filter and retain safe, broader invalidations.
+    pub async fn collaboration_requests_subscribe(
+        &self,
+    ) -> Result<CollaborationUpdateStream, RuntimeError> {
+        tokio::time::timeout(
+            CLIENT_CALL_TIMEOUT,
+            self.revision_subscribe_inner(&serde_json::json!({"protocol":PROTOCOL_VERSION,
+                "kind":"collaboration_subscribe","requests_only":true})),
+        )
+        .await
+        .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?
+    }
+
     pub(super) async fn collaboration_subscribe_inner(
         &self,
     ) -> Result<CollaborationUpdateStream, RuntimeError> {
-        self.revision_subscribe_inner("collaboration_subscribe")
-            .await
+        self.revision_subscribe_inner(
+            &serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_subscribe"}),
+        )
+        .await
     }
 
     /// Execute an exact operation on one configured host. Mutations are
@@ -227,8 +243,25 @@ impl Client {
         target: &str,
         request: &NewRequest,
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_send_view(
+            origin,
+            target,
+            request,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+    }
+
+    pub async fn collaboration_send_view(
+        &self,
+        origin: &CollaborationOrigin,
+        target: &str,
+        request: &NewRequest,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
+            "view": view,
             "kind": if request.task_contract.is_some() || request.supersedes_request_id.is_some() { "collaboration_send_contract" } else { "collaboration_send" },
             "origin": origin,
             "target": target,
@@ -997,8 +1030,23 @@ impl Client {
         origin: &CollaborationOrigin,
         request_id: &str,
     ) -> Result<CollaborationRequest, RuntimeError> {
+        self.collaboration_cancel_view(
+            origin,
+            request_id,
+            collaboration::CollaborationReadView::Full,
+        )
+        .await
+    }
+
+    pub async fn collaboration_cancel_view(
+        &self,
+        origin: &CollaborationOrigin,
+        request_id: &str,
+        view: collaboration::CollaborationReadView,
+    ) -> Result<CollaborationRequest, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
+            "view": view,
             "kind": "collaboration_cancel",
             "origin": origin,
             "request_id": request_id,

@@ -1233,10 +1233,11 @@ async fn first_history_snapshot_waits_for_subscription_and_keeps_racing_updates(
         for kind in ["hello", "collaboration_subscribe"] {
             let mut line = String::new();
             reader.read_line(&mut line).await.unwrap();
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(&line).unwrap()["kind"],
-                kind
-            );
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["kind"], kind);
+            if kind == "collaboration_subscribe" {
+                assert_eq!(request["requests_only"], true);
+            }
             subscription.write_all(b"{\"ok\":true}\n").await.unwrap();
         }
         // First snapshot, then a refresh whose read races an invalidation,

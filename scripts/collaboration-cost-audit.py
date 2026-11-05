@@ -10,6 +10,7 @@ import collections
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -89,6 +90,7 @@ def summarize(audit, sessions, since, repeat_seconds):
     ipc_failed = collections.Counter()
     ipc_metrics = collections.defaultdict(collections.Counter)
     unknown_at = 0
+    shapes = {}
     if audit.exists():
         for row in records(audit):
             at = timestamp(row.get("at"))
@@ -97,6 +99,26 @@ def summarize(audit, sessions, since, repeat_seconds):
             client = row.get("actor", {}).get("client_kind", "unknown")
             key = (client, row.get("operation", "unknown"))
             ipc[key] += 1
+            # Split response shapes: a large preview must not hide small badge reads.
+            view = row.get("read_view")
+            view = next(iter(view), "unknown") if isinstance(view, dict) else view
+            view = view if isinstance(view, str) else "unknown"
+            limit = row.get("query_limit")
+            limit = limit if isinstance(limit, int) and not isinstance(limit, bool) and limit >= 0 else None
+            status, scope = row.get("status"), row.get("scope")
+            status = status if isinstance(status, str) else None
+            scope = scope if isinstance(scope, str) else None
+            shape_key = (client, key[1], view, limit, status, scope)
+            shape = shapes.setdefault(shape_key, {"client": client, "operation": key[1],
+                "view": view, "query_limit": limit, "status": status, "scope": scope, "calls": 0, "response_bytes": 0,
+                "response_bytes_samples": 0, "elapsed_samples": []})
+            shape["calls"] += 1
+            wire, elapsed = row.get("response_bytes"), row.get("elapsed_us")
+            if isinstance(wire, int) and not isinstance(wire, bool) and wire >= 0:
+                shape["response_bytes"] += wire
+                shape["response_bytes_samples"] += 1
+            if isinstance(elapsed, int) and not isinstance(elapsed, bool) and elapsed >= 0:
+                shape["elapsed_samples"].append(elapsed)
             for field in ("request_bytes", "response_bytes", "elapsed_us", "message_bytes", "response_body_bytes", "response_body_json_bytes", "response_unique_body_bytes", "response_duplicate_body_bytes", "response_extra_unique_bytes",
                           "response_extra_bytes", "response_structure_bytes", "response_escape_bytes"):
                 value = row.get(field)
@@ -171,6 +193,14 @@ def summarize(audit, sessions, since, repeat_seconds):
             metrics["extra_per_unique_body_byte"] = metrics.get("response_extra_unique_bytes", 0) / unique if unique else None
         ipc_rows.append({"client": client, "operation": operation, "calls": count,
                          "failed": ipc_failed[(client, operation)], **metrics})
+    shape_rows = []
+    for shape in shapes.values():
+        elapsed = sorted(shape.pop("elapsed_samples"))
+        shape["elapsed_us_samples"] = len(elapsed)
+        shape["p50_elapsed_us"] = elapsed[math.ceil(len(elapsed) * .5) - 1] if elapsed else None
+        shape["p95_elapsed_us"] = elapsed[math.ceil(len(elapsed) * .95) - 1] if elapsed else None
+        shape["elapsed_includes_wait"] = shape["operation"] == "wait"
+        shape_rows.append(shape)
     return {
         "since": since.isoformat(),
         "units": "UTF-8 bytes of recorded tool results; not billed tokens",
@@ -181,9 +211,11 @@ def summarize(audit, sessions, since, repeat_seconds):
                     "extra_per_body_byte compares total IPC bytes beyond raw body text to raw body bytes; metadata is not inherently waste. Zero-body responses have no ratio.",
                     "Legacy or downgraded responses without body counters are unmeasured, not zero-cost.",
                     "Identical short-window results are candidates for review, not proven waste.",
-                    "Only supplied session files are measured; provider caching/tokenization is unknown."],
+                    "Only supplied session files are measured; provider caching/tokenization is unknown.",
+                    "IPC shapes use recorded view, limit, status and scope; human_only and cursor/page position are not recorded."],
         "audit_available": audit.exists(),
         "ipc": ipc_rows,
+        "ipc_shapes": sorted(shape_rows, key=lambda row: row["response_bytes"], reverse=True),
         "sessions_scanned": len(seen_files),
         "unmeasured_calls_without_timestamp": unknown_at,
         "tool_results": sorted(stats.values(), key=lambda s: s["output_bytes"], reverse=True),
@@ -221,6 +253,13 @@ def main():
         if row.get("elapsed_us_samples"):
             print(f"    request elapsed: mean {row['elapsed_us'] / row['elapsed_us_samples'] / 1000:.2f} ms, "
                   f"max {row['max_elapsed_us'] / 1000:.2f} ms / {row['elapsed_us_samples']} measured calls")
+    print("Largest IPC response shapes (request elapsed includes long-poll waiting):")
+    for row in report["ipc_shapes"][:10]:
+        p95 = row["p95_elapsed_us"]
+        latency = f"{p95 / 1000:.2f} ms" if p95 is not None else "unmeasured"
+        print(f"  {row['client']}/{row['operation']} view={row['view']} limit={row['query_limit']} status={row['status']} scope={row['scope']}: "
+              f"{row['calls']} calls, {row['response_bytes']} bytes "
+              f"({row['response_bytes_samples']} measured), p95 {latency}")
     print(f"Tool results from {report['sessions_scanned']} supplied sessions:")
     for row in report["tool_results"]:
         print(f"  {row['tool']}: {row['calls']} calls, {row['output_bytes']} bytes, "

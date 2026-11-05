@@ -1838,7 +1838,15 @@ async fn call_tool_inner(
                 return Ok(error_result(&error));
             }
             Ok(
-                match client.collaboration_send(&origin, target, &request).await {
+                match client
+                    .collaboration_send_view(
+                        &origin,
+                        target,
+                        &request,
+                        muxa::collaboration::CollaborationReadView::Metadata,
+                    )
+                    .await
+                {
                     Ok(request) => json_result(&request_ack(&request)),
                     Err(error) => error_result(&format!("send_message failed: {error}")),
                 },
@@ -2080,7 +2088,14 @@ async fn call_tool_inner(
                 Err(error) => return Ok(error_result(&error)),
             };
             Ok(
-                match client.collaboration_cancel(&origin, request_id).await {
+                match client
+                    .collaboration_cancel_view(
+                        &origin,
+                        request_id,
+                        muxa::collaboration::CollaborationReadView::Metadata,
+                    )
+                    .await
+                {
                     Ok(request) => {
                         json_result(&crate::collaboration_output::mutation_receipt(&request))
                     }
@@ -2715,9 +2730,13 @@ async fn send_peer_call(
     logical: bool,
     pane_selector: Option<&str>,
     request: &NewRequest,
+    view: muxa::collaboration::CollaborationReadView,
 ) -> Result<muxa::collaboration::CollaborationRequest, muxa::ipc::RuntimeError> {
     if logical {
-        match client.collaboration_send(origin, target, request).await {
+        match client
+            .collaboration_send_view(origin, target, request, view)
+            .await
+        {
             Ok(sent) => return Ok(sent),
             // Only an explicit refusal proves nothing was stored. After a
             // lost or garbled response the request may exist, and a second
@@ -2727,7 +2746,9 @@ async fn send_peer_call(
         }
     }
     let selector = pane_selector.unwrap_or(target);
-    client.collaboration_send(origin, selector, request).await
+    client
+        .collaboration_send_view(origin, selector, request, view)
+        .await
 }
 
 /// One high-level colleague call behind the conversational `@peer` protocol.
@@ -2935,6 +2956,9 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
     // context-bound call must stay with the exact session it selected.
     let logical =
         !context_bound && (path_target || (worker_program.is_none() && names_a_slot(target)));
+    // Adaptive synchronous output needs the exact instruction to classify short calls.
+    let adaptive_reply =
+        config.collaboration.wake_payload == muxa::config::CollaborationWakePayload::Adaptive;
     let sent = match send_peer_call(
         client,
         &origin,
@@ -2942,6 +2966,11 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         logical,
         pane_selector.as_deref(),
         &request,
+        if args.get("wait").and_then(Value::as_bool).unwrap_or(true) && adaptive_reply {
+            muxa::collaboration::CollaborationReadView::Full
+        } else {
+            muxa::collaboration::CollaborationReadView::Metadata
+        },
     )
     .await
     {
@@ -2987,9 +3016,8 @@ async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config)
         return json_result(&payload);
     }
 
-    let compact_short_reply = config.collaboration.wake_payload
-        == muxa::config::CollaborationWakePayload::Adaptive
-        && muxa::collaboration::instruction::short_inline_prompt(&sent).is_some();
+    let compact_short_reply =
+        adaptive_reply && muxa::collaboration::instruction::short_inline_prompt(&sent).is_some();
     let timeout_secs = args
         .get("timeout_secs")
         .and_then(Value::as_u64)
@@ -6267,6 +6295,7 @@ mod tests {
             true,
             Some("pane:%2"),
             &request,
+            muxa::collaboration::CollaborationReadView::Full,
         )
         .await;
         assert!(result.is_err());
@@ -6290,6 +6319,7 @@ mod tests {
             true,
             Some("pane:%2"),
             &request,
+            muxa::collaboration::CollaborationReadView::Full,
         )
         .await;
         assert_eq!(*seen.lock().unwrap(), ["role:reviewer", "pane:%2"]);

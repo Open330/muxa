@@ -8,7 +8,9 @@ impl Client {
     pub async fn pipeline_subscribe(&self) -> Result<CollaborationUpdateStream, RuntimeError> {
         tokio::time::timeout(
             CLIENT_CALL_TIMEOUT,
-            self.revision_subscribe_inner("pipeline_subscribe"),
+            self.revision_subscribe_inner(
+                &serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"pipeline_subscribe"}),
+            ),
         )
         .await
         .map_err(|_| RuntimeError::Timeout(CLIENT_CALL_TIMEOUT))?

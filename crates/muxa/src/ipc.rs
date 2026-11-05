@@ -175,8 +175,8 @@ pub use server::*;
 mod framing;
 use framing::{
     encode_line, is_client_disconnect, read_limited_line, stream_agent_changes,
-    stream_fleet_updates, stream_revision_updates, stream_transitions, until_server_shutdown,
-    write_line_or_closed, write_subscription_ack,
+    stream_fleet_updates, stream_revision_updates, stream_revision_updates_filtered,
+    stream_transitions, until_server_shutdown, write_line_or_closed, write_subscription_ack,
 };
 
 mod topology;
