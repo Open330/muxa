@@ -31,6 +31,11 @@
 //!   archive and its `.sha256` sidecar, verify, atomically swap `muxa` and
 //!   `muxad` in place (previous binaries kept as `.bak`), restart.
 //!
+//! Every channel first runs the *new* `muxa config check` against the live
+//! config and stops (old binaries in place, daemon untouched) when the new
+//! build cannot load it (#300). Homebrew replaces files in place, so there the
+//! check can only hold back the restart.
+//!
 //! The daemon restart + socket verification tail is shared by all three.
 //! The running daemon is asked to drain and re-exec itself first; the native
 //! service manager is retained as a compatibility fallback for an older or
@@ -40,7 +45,7 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// CLI flags for `muxa upgrade`. See module docstring for the
@@ -71,7 +76,7 @@ pub struct Args {
 /// Async because the shared restart tail performs bounded IPC round trips.
 /// Build/install commands remain blocking: this command is interactive and
 /// has no other useful work to schedule while they run.
-pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
+pub async fn run(args: Args, socket: PathBuf, config: Option<PathBuf>) -> Result<()> {
     let _ = cliclack::intro("muxa upgrade");
 
     // Locate the muxa source tree. We walk *up* from cwd so users can
@@ -82,7 +87,7 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
     let Some(repo) = find_repo_root(&cwd) else {
         // No checkout in sight — most users. Resolve the channel from the
         // running binary instead of sending them off to clone a repo.
-        return run_without_repo(&args, &socket).await;
+        return run_without_repo(&args, &socket, config.as_deref()).await;
     };
     let _ = cliclack::log::info(format!("repo: {}", repo.display()));
 
@@ -107,11 +112,10 @@ pub async fn run(args: Args, socket: PathBuf) -> Result<()> {
         let _ = cliclack::log::info("git pull skipped (--no-pull)");
     }
 
-    let _ = cliclack::log::step("building muxad");
-    cargo_install(&repo, "crates/muxad").context("cargo install muxad")?;
-
-    let _ = cliclack::log::step("building muxa-cli");
-    cargo_install(&repo, "crates/muxa-cli").context("cargo install muxa-cli")?;
+    let staging = std::env::temp_dir().join(format!("muxa-upgrade-build-{}", std::process::id()));
+    build_check_install(&staging, config.as_deref(), |rel, root| {
+        cargo_install(&repo, rel, root)
+    })?;
 
     let restart = if plan.do_restart {
         let _ = cliclack::log::step("restarting daemon");
@@ -172,7 +176,7 @@ fn report_after_upgrade(snapshot: Option<&Path>) {
 
 /// Upgrade without a source checkout: Homebrew delegation or GitHub
 /// release self-update, chosen from where the running binary lives.
-async fn run_without_repo(args: &Args, socket: &Path) -> Result<()> {
+async fn run_without_repo(args: &Args, socket: &Path, config: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe().context("resolving current executable")?;
     let exe = exe.canonicalize().unwrap_or(exe);
 
@@ -182,6 +186,7 @@ async fn run_without_repo(args: &Args, socket: &Path) -> Result<()> {
             let _ = cliclack::note(
                 "Plan",
                 "brew upgrade muxa
+check the live config with the new muxa (no restart if it fails)
 ask muxad to re-exec itself (service-manager fallback for an older/stopped daemon)
 verify IPC generation/socket",
             );
@@ -192,6 +197,14 @@ verify IPC generation/socket",
         let _ = cliclack::log::step("brew upgrade muxa");
         run_streaming(Command::new("brew").args(["upgrade", "muxa"]))
             .context("brew upgrade muxa")?;
+        // brew has already swapped the files; what is left to protect is the
+        // running daemon, which must not be restarted onto this build.
+        check_config_with(
+            &homebrew_bin(&exe).unwrap_or(exe),
+            config,
+            "brew has installed the new build, but muxad was NOT restarted and keeps \
+             running the previous one. Fix the config, then run `muxa daemon restart`.",
+        )?;
         return finish_with_restart(
             args,
             socket,
@@ -221,8 +234,8 @@ verify IPC generation/socket",
     let _ = cliclack::log::step("checking latest release");
     let latest = latest_release_tag().context("querying the latest GitHub release")?;
     let current = format!("v{}", env!("CARGO_PKG_VERSION"));
-    if latest == current {
-        let _ = cliclack::outro(format!("already up to date ({current})"));
+    if !is_newer_release(&latest, &current) {
+        let _ = cliclack::outro(format!("up to date ({current}; latest release {latest})"));
         return Ok(());
     }
     let _ = cliclack::log::info(format!("{current} → {latest}"));
@@ -233,6 +246,7 @@ verify IPC generation/socket",
             format!(
                 "download muxa-{latest}-{triple}.tar.gz + .sha256
 verify checksum
+check the live config with the new muxa (abort before replacing if it fails)
 replace muxa + muxad in {}
 ask muxad to re-exec itself (service-manager fallback for an older/stopped daemon)
 verify IPC generation/socket",
@@ -272,18 +286,126 @@ verify IPC generation/socket",
     )
     .context("extracting release archive")?;
 
-    let _ = cliclack::log::step(format!("installing into {}", install_dir.display()));
-    for bin in ["muxa", "muxad"] {
-        let fresh = staging.join(&stem).join(bin);
-        if !fresh.is_file() {
-            return Err(anyhow!("release archive is missing `{bin}`"));
-        }
-        replace_binary(&fresh, &install_dir.join(bin))
-            .with_context(|| format!("installing {bin}"))?;
-    }
+    let installed = install_release(&staging.join(&stem), &install_dir, config);
     let _ = std::fs::remove_dir_all(&staging);
+    installed?;
 
     finish_with_restart(args, socket, &latest, before.as_deref()).await
+}
+
+/// Whether release `latest` is strictly newer than `current` (both `vX.Y.Z`).
+/// A build ahead of the newest published release — a source or combined
+/// install of an unreleased version — must not be "upgraded" back down to it:
+/// that is how #300 put a v0.9.1 binary under a v0.9.2 config. Tags that do
+/// not parse fall back to "different means newer".
+fn is_newer_release(latest: &str, current: &str) -> bool {
+    fn parse(tag: &str) -> Option<Vec<u64>> {
+        tag.trim_start_matches('v')
+            .split('.')
+            .map(|part| part.parse().ok())
+            .collect()
+    }
+    match (parse(latest), parse(current)) {
+        (Some(latest), Some(current)) => latest > current,
+        _ => latest != current,
+    }
+}
+
+/// Swap the unpacked release binaries in `staged` into `install_dir`, but only
+/// once the new `muxa` has accepted the live config. On refusal nothing is
+/// replaced, and the caller's `?` keeps the daemon restart from running.
+fn install_release(staged: &Path, install_dir: &Path, config: Option<&Path>) -> Result<()> {
+    for bin in ["muxa", "muxad"] {
+        if !staged.join(bin).is_file() {
+            return Err(anyhow!("release archive is missing `{bin}`"));
+        }
+    }
+    check_config_with(&staged.join("muxa"), config, NOTHING_CHANGED)?;
+
+    let _ = cliclack::log::step(format!("installing into {}", install_dir.display()));
+    for bin in ["muxa", "muxad"] {
+        replace_binary(&staged.join(bin), &install_dir.join(bin))
+            .with_context(|| format!("installing {bin}"))?;
+    }
+    Ok(())
+}
+
+/// Source channel: `cargo install` writes straight over the live binaries, so
+/// build into the `staging` root first and check the config there. The real
+/// install reruns `cargo install` on the same workspace target dir, so it
+/// reuses that build instead of compiling again. `install(rel, root)` is
+/// `cargo install --path <rel> [--root <root>]`.
+fn build_check_install(
+    staging: &Path,
+    config: Option<&Path>,
+    mut install: impl FnMut(&str, Option<&Path>) -> Result<()>,
+) -> Result<()> {
+    let mut staged = || -> Result<()> {
+        let _ = cliclack::log::step("building muxad");
+        install("crates/muxad", Some(staging)).context("cargo install muxad")?;
+        let _ = cliclack::log::step("building muxa-cli");
+        install("crates/muxa-cli", Some(staging)).context("cargo install muxa-cli")?;
+        let muxa = staging
+            .join("bin")
+            .join(format!("muxa{}", std::env::consts::EXE_SUFFIX));
+        check_config_with(&muxa, config, NOTHING_CHANGED)
+    };
+    let staged = staged();
+    let _ = std::fs::remove_dir_all(staging);
+    staged?;
+
+    let _ = cliclack::log::step("installing muxad");
+    install("crates/muxad", None).context("cargo install muxad")?;
+    let _ = cliclack::log::step("installing muxa-cli");
+    install("crates/muxa-cli", None).context("cargo install muxa-cli")
+}
+
+const NOTHING_CHANGED: &str = "Nothing was replaced and muxad was not restarted. Update the \
+     config so the new build accepts it (or drop the key it rejects), then rerun `muxa upgrade`.";
+
+/// Ask the new build's own parser whether it can load the live config:
+/// `<new_muxa> --config <path> config check --from <path>`. A missing file
+/// means the daemon runs on defaults, so there is nothing to check. On refusal
+/// the error carries the new build's diagnostic plus `consequence`.
+fn check_config_with(new_muxa: &Path, config: Option<&Path>, consequence: &str) -> Result<()> {
+    let Some(config) = config.filter(|path| path.exists()) else {
+        let _ = cliclack::log::info("no config file; nothing to check");
+        return Ok(());
+    };
+    let _ = cliclack::log::step(format!("checking {} with the new build", config.display()));
+    let out = Command::new(new_muxa)
+        .arg("--config")
+        .arg(config)
+        .args(["config", "check", "--from"])
+        .arg(config)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("running `{} config check`", new_muxa.display()))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let detail = [stderr.trim(), stdout.trim()]
+        .into_iter()
+        .find(|text| !text.is_empty())
+        .map_or_else(|| format!("exited with {}", out.status), str::to_owned);
+    Err(anyhow!(
+        "the new build cannot load {}:\n{detail}\n\n{consequence}",
+        config.display()
+    ))
+}
+
+/// `<prefix>/bin/muxa` for a binary under `<prefix>/Cellar/…`: the link brew
+/// repoints at the version it just installed.
+fn homebrew_bin(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .find(|dir| {
+            dir.file_name()
+                .is_some_and(|name| name.eq_ignore_ascii_case("Cellar"))
+        })
+        .and_then(Path::parent)
+        .map(|prefix| prefix.join("bin").join("muxa"))
 }
 
 /// Shared tail: restart the daemon (unless opted out), verify the
@@ -486,6 +608,9 @@ fn render_plan_for_os(plan: &Plan, os: &str) -> String {
     } else {
         lines.push("git pull (skipped)".into());
     }
+    lines.push("cargo install --path crates/muxad --locked --force --root <staging>".into());
+    lines.push("cargo install --path crates/muxa-cli --locked --force --root <staging>".into());
+    lines.push("check the live config with <staging>/bin/muxa (abort if it fails)".into());
     lines.push("cargo install --path crates/muxad --locked --force".into());
     lines.push("cargo install --path crates/muxa-cli --locked --force".into());
     if plan.do_restart {
@@ -537,12 +662,13 @@ fn is_muxa_workspace_manifest(manifest: &Path) -> bool {
     s.contains("[workspace]") && s.contains("crates/muxa-cli") && s.contains("crates/muxad")
 }
 
-/// `cargo install --path <rel> --locked --force`, streaming output
-/// to the user's terminal. The caller logs the "building X" step
-/// banner — we just exec.
-fn cargo_install(repo: &Path, rel_path: &str) -> Result<()> {
+/// `cargo install --path <rel> --locked --force [--root <root>]`,
+/// streaming output to the user's terminal. The caller logs the
+/// "building X" step banner — we just exec.
+fn cargo_install(repo: &Path, rel_path: &str, root: Option<&Path>) -> Result<()> {
     let abs = repo.join(rel_path);
-    if cfg!(windows) {
+    // Only the real install overwrites the binaries that may be running.
+    if cfg!(windows) && root.is_none() {
         let program = if rel_path.ends_with("muxad") {
             "muxad"
         } else {
@@ -550,14 +676,16 @@ fn cargo_install(repo: &Path, rel_path: &str) -> Result<()> {
         };
         park_running_binary(program);
     }
-    run_streaming(
-        Command::new("cargo")
-            .arg("install")
-            .arg("--path")
-            .arg(&abs)
-            .arg("--locked")
-            .arg("--force"),
-    )
+    let mut cmd = Command::new("cargo");
+    cmd.arg("install")
+        .arg("--path")
+        .arg(&abs)
+        .arg("--locked")
+        .arg("--force");
+    if let Some(root) = root {
+        cmd.arg("--root").arg(root);
+    }
+    run_streaming(&mut cmd)
 }
 
 /// Windows refuses to overwrite an executable while it runs — this very
@@ -1016,6 +1144,166 @@ version = "0.1.0"
         let s = render_plan(&plan);
         assert!(s.contains("git pull (skipped)"));
         assert!(s.contains("restart (skipped)"));
+    }
+
+    /// A stand-in `muxa` that accepts exactly the preflight invocation
+    /// (`--config <p> config check --from <p>`) and then exits with `code`.
+    fn fake_muxa(path: &Path, code: i32) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(
+            path,
+            format!(
+                "#!/bin/sh\n[ \"$1 $3 $4 $5\" = \"--config config check --from\" ] && [ \"$2\" = \"$6\" ] || exit 99\n\
+                 [ {code} -eq 0 ] || echo \"unknown field \\`account\\`, expected \\`options\\`\" >&2\nexit {code}\n"
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn config_check_reports_the_new_builds_refusal() {
+        let dir = tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[agent.claude]\naccount = \"auto\"\n").unwrap();
+        let good = dir.path().join("good");
+        let bad = dir.path().join("bad");
+        fake_muxa(&good, 0);
+        fake_muxa(&bad, 1);
+
+        check_config_with(&good, Some(&config), "HINT").unwrap();
+        let error = check_config_with(&bad, Some(&config), "HINT")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unknown field `account`"), "{error}");
+        assert!(error.contains("HINT"), "{error}");
+        assert!(error.contains(&config.display().to_string()), "{error}");
+    }
+
+    #[test]
+    fn config_check_is_skipped_without_a_config_file() {
+        let dir = tempdir().unwrap();
+        let bad = dir.path().join("bad");
+        fake_muxa(&bad, 1);
+        check_config_with(&bad, None, "HINT").unwrap();
+        check_config_with(&bad, Some(&dir.path().join("absent.toml")), "HINT").unwrap();
+    }
+
+    fn release_fixture(new_muxa_exit: i32) -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let dir = tempdir().unwrap();
+        let staged = dir.path().join("staged");
+        let install = dir.path().join("bin");
+        fs::create_dir_all(&staged).unwrap();
+        fs::create_dir_all(&install).unwrap();
+        fake_muxa(&staged.join("muxa"), new_muxa_exit);
+        fs::write(staged.join("muxad"), "new muxad").unwrap();
+        fs::write(install.join("muxa"), "old muxa").unwrap();
+        fs::write(install.join("muxad"), "old muxad").unwrap();
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[agent.claude]\naccount = \"auto\"\n").unwrap();
+        (dir, staged, install, config)
+    }
+
+    #[test]
+    fn release_install_keeps_the_old_binaries_when_the_config_is_refused() {
+        let (_dir, staged, install, config) = release_fixture(1);
+
+        let error = install_release(&staged, &install, Some(&config)).unwrap_err();
+        assert!(
+            error.to_string().contains("Nothing was replaced"),
+            "{error}"
+        );
+        assert_eq!(
+            fs::read_to_string(install.join("muxa")).unwrap(),
+            "old muxa"
+        );
+        assert_eq!(
+            fs::read_to_string(install.join("muxad")).unwrap(),
+            "old muxad"
+        );
+        assert!(!install.join("muxa.bak").exists());
+        assert!(!install.join("muxad.bak").exists());
+    }
+
+    #[test]
+    fn release_install_replaces_once_the_config_is_accepted() {
+        let (_dir, staged, install, config) = release_fixture(0);
+
+        install_release(&staged, &install, Some(&config)).unwrap();
+        assert_eq!(
+            fs::read_to_string(install.join("muxad")).unwrap(),
+            "new muxad"
+        );
+        assert_eq!(
+            fs::read_to_string(install.join("muxad.bak")).unwrap(),
+            "old muxad"
+        );
+    }
+
+    /// Drives `build_check_install` with a fake `cargo install` that drops a
+    /// `muxa` exiting `new_muxa_exit` into the staging root, and returns the
+    /// root of every install it was asked for (`None` = the live install).
+    fn source_install(new_muxa_exit: i32) -> (Result<()>, Vec<Option<PathBuf>>, PathBuf) {
+        let dir = tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "[agent.claude]\naccount = \"auto\"\n").unwrap();
+        let mut roots = Vec::new();
+        let result = build_check_install(&staging, Some(&config), |rel, root| {
+            roots.push(root.map(Path::to_path_buf));
+            if let Some(root) = root.filter(|_| rel == "crates/muxa-cli") {
+                fs::create_dir_all(root.join("bin")).unwrap();
+                fake_muxa(&root.join("bin").join("muxa"), new_muxa_exit);
+            }
+            Ok(())
+        });
+        (result, roots, staging)
+    }
+
+    #[test]
+    fn source_install_never_touches_the_live_binaries_when_the_config_is_refused() {
+        let (result, roots, staging) = source_install(1);
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `account`"),
+            "{error}"
+        );
+        assert!(
+            roots.iter().all(Option::is_some),
+            "only staging installs may run: {roots:?}"
+        );
+        assert_eq!(roots.len(), 2);
+        assert!(!staging.exists(), "staging root is cleaned up");
+    }
+
+    #[test]
+    fn source_install_stages_checks_then_installs() {
+        let (result, roots, staging) = source_install(0);
+        result.unwrap();
+        assert_eq!(
+            roots,
+            vec![Some(staging.clone()), Some(staging.clone()), None, None]
+        );
+        assert!(!staging.exists(), "staging root is cleaned up");
+    }
+
+    #[test]
+    fn release_channel_never_downgrades() {
+        assert!(is_newer_release("v0.9.4", "v0.9.3"));
+        assert!(is_newer_release("v0.10.0", "v0.9.9"));
+        assert!(!is_newer_release("v0.9.4", "v0.9.4"));
+        // #300: an unreleased 0.9.2 build against a latest release of v0.9.1.
+        assert!(!is_newer_release("v0.9.1", "v0.9.2"));
+        assert!(is_newer_release("v1.0.0-rc1", "v0.9.2"));
+    }
+
+    #[test]
+    fn homebrew_bin_is_the_prefix_link() {
+        assert_eq!(
+            homebrew_bin(Path::new("/opt/homebrew/Cellar/muxa/0.9.1/bin/muxa")),
+            Some(PathBuf::from("/opt/homebrew/bin/muxa"))
+        );
+        assert_eq!(homebrew_bin(Path::new("/home/june/.cargo/bin/muxa")), None);
     }
 
     async fn serve_at_generation(

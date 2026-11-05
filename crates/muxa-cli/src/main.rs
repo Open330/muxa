@@ -1868,7 +1868,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
-        Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket).await,
+        Cmd::Upgrade(upgrade_args) => upgrade::run(upgrade_args, socket, config_path).await,
         Cmd::Prune(prune) => cmd_prune(&client, &prune.older_than, prune.all, prune.yes).await,
     };
     if invalidates_directory {
