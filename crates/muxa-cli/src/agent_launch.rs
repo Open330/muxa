@@ -1050,34 +1050,44 @@ fn register_launched_agent(request: &StartRequest, pane: &str) {
 const LAUNCH_SIGHTING: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The launched agent as discovery sees it in `pane`, once the pane runs
-/// the requested CLI, looked for until `within` runs out.
+/// the requested CLI, looked for until `within` runs out. A read that sees
+/// nothing (the pane not listed) is tried again too: a backend reports a
+/// failed or timed-out listing the same way as a missing pane.
 fn launched_agent(
     request: &StartRequest,
     pane: &str,
     within: std::time::Duration,
 ) -> Option<muxa::discovery::Discovered> {
     use muxa::backend::PaneBackend;
-    let deadline = std::time::Instant::now() + within;
     let wanted = muxa::discovery::classify_command(request.agent.label());
-    loop {
+    look_for(within, std::time::Duration::from_millis(100), || {
         let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
             rmux.resolve_pane(&format!("rmux:{pane}"))
         } else {
             muxa::TmuxBackend::new().resolve_pane(pane)
-        };
-        // A pane that is gone will not come back.
-        let observed = observed?;
-        if let Some(discovered) = muxa::discovery::discover_from_panes(&[observed])
+        }?;
+        muxa::discovery::discover_from_panes(&[observed])
             .into_iter()
             .next()
             .filter(|discovered| wanted == Some(discovered.kind))
-        {
-            return Some(discovered);
+    })
+}
+
+/// `look` until it finds something or `within` runs out, `every` apart.
+fn look_for<T>(
+    within: std::time::Duration,
+    every: std::time::Duration,
+    mut look: impl FnMut() -> Option<T>,
+) -> Option<T> {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if let Some(found) = look() {
+            return Some(found);
         }
         if std::time::Instant::now() >= deadline {
             return None;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(every);
     }
 }
 
@@ -1438,6 +1448,30 @@ fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A read that sees nothing (a listing that failed, a pane not shown
+    /// yet) does not end the look; only the deadline does.
+    #[test]
+    fn a_launch_keeps_looking_past_an_empty_read() {
+        use std::time::Duration;
+        let mut reads = [None, None, Some("codex")].into_iter();
+        assert_eq!(
+            super::look_for(Duration::from_secs(5), Duration::ZERO, || reads
+                .next()
+                .flatten()),
+            Some("codex")
+        );
+        let mut seen = 0;
+        let started = std::time::Instant::now();
+        let never: Option<()> =
+            super::look_for(Duration::from_millis(50), Duration::from_millis(5), || {
+                seen += 1;
+                None
+            });
+        assert!(never.is_none());
+        assert!(seen > 1, "looked {seen} times");
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
     use super::*;
 
     /// The socket a launch reserves its alias against is the caller's.
