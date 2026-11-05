@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="Muxa 로고" width="144" />
 
-**코딩 에이전트 팀을 위한 control plane.**
+**코딩 에이전트 팀을 위한 운영 플랫폼.**
 
 나를 기다리는 에이전트를 알려 주고 바로 데려다 줍니다. 그리고 팀 전체를 Work로
 운영합니다. 에이전트를 띄우고, 서로 리뷰하게 하고, 여러 호스트에 걸쳐 따라갑니다.
@@ -438,7 +438,7 @@ muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | --- | --- | --- |
 | tmux | 전체 | 기본 백엔드. |
 | [herdr](https://herdr.dev) | 전체 | herdr 소켓 API 경유; [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI 기본 | 플러그인 경로 예정; [docs/ZELLIJ.md](docs/ZELLIJ.md). |
+| zellij | CLI 기본 | 플러그인 경로 예정; [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md). |
 
 여러 호스트 동시 관측은 [docs/MULTI_HOST.md](docs/MULTI_HOST.md) 참고.
 
@@ -457,7 +457,7 @@ muxa는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | 설정 레퍼런스 | [docs/CONFIGURATION.ko.md](docs/CONFIGURATION.ko.md) |
 | Web dashboard | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |
-| Zellij 계획 | [docs/ZELLIJ.md](docs/ZELLIJ.md) |
+| Zellij 계획 | [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md) |
 | Architecture와 개발 | [docs/ARCHITECTURE.ko.md](docs/ARCHITECTURE.ko.md) |
 | Agent 간 협업 | [docs/COLLABORATION.ko.md](docs/COLLABORATION.ko.md) |
 

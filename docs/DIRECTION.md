@@ -7,38 +7,39 @@ the runtime.
 
 ## What muxa is
 
-**muxa is the control plane for a team of coding agents.** It knows what every
-agent is doing, gets you to the one that needs you, and lets agents and humans
-run work together across terminals and hosts.
+**muxa is an operations platform for a team of coding agents.** It knows what
+every agent is doing, gets you to the one that needs you, and runs agents as
+Work: launching, coordinating, recovering, and following them across terminals
+and hosts.
 
-muxa started as the first half of that sentence: a thin layer that tells you
-which tmux agent is waiting and jumps to it. Running many agents every day grew
-the second half: a Work model, agent-to-agent collaboration, Fleet, and a
-daemon-owned runtime. Both halves are the product.
+muxa started as a thin layer that told you which tmux agent was waiting and
+jumped to it. Running many agents every day grew it into the platform it is
+now. That origin survives as the Attention layer and stays a first-class,
+standalone entry point.
 
 ## Two layers, both first-class
 
 | Layer | Promise | Surfaces |
 | --- | --- | --- |
-| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks + screen detection, `status-line`, `peek`, `watch`, `attend`, notifications, BarShelf, stats/timeline |
-| **Runtime** | Agents are launched, organized, coordinated, and recovered as Work, not as loose panes. | Work/Run model, `work`/`workspace`/`agent`, muxad-owned PTYs and Muxa for Mac, collaboration mailbox and `@peer`, workers, Fleet, snapshot/restore, MCP |
+| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks, `status-line`, `peek`, `watch`, `attend`, notifications, BarShelf, stats/timeline |
+| **Runtime** | Agents are launched, organized, coordinated, and recovered as Work, not as loose panes. | Work/Run model, `work`/`workspace`/`agent`, muxad-owned PTYs and Muxa for Mac, collaboration mailbox and `@peer`, workers, Fleet, snapshot/restore, usage-limit recovery, MCP |
 
 Rules that keep the layers honest:
 
 1. **Attention never requires Runtime.** A user who only installs hooks on
-   their existing tmux panes gets the full Attention layer. No Work, no
+   their existing panes gets the full Attention layer: no Work, no
    collaboration config, no MCP.
 2. **Everything Runtime does is visible to Attention.** A worker, a peer
    request, a Fleet node, or a pipeline run that needs a human surfaces through
    the same attention state, `attend`, and notifications.
 3. **Runtime never takes over what it did not start.** muxa does not kill,
-   rename, or adopt unmanaged tmux objects as Work.
+   rename, or adopt unmanaged multiplexer objects as Work.
 
 ## Two execution modes
 
 | Mode | Who starts the agent | Binding |
 | --- | --- | --- |
-| **Adopt** | You, in any supported multiplexer | muxa observes via hooks or screen detection |
+| **Adopt** | You, in any supported multiplexer | muxa observes via hooks and provider records |
 | **Own** | muxa (`muxa work`, `muxa agent`, Muxa for Mac, workers) | managed tmux pane or a muxad-owned PTY |
 
 Both modes stay supported. Owning the process is what makes reliable prompt
@@ -46,6 +47,40 @@ delivery, recovery, and account routing possible; adopting is what keeps
 muxa zero-cost to try. Open question tracked in #89: whether muxa-launched
 agents default to a muxad-owned PTY instead of a managed tmux pane. That
 choice only changes the default for **Own**; it never removes **Adopt**.
+
+## Principles
+
+### General product, no personal dependencies
+
+muxa is built by heavy daily use, but it ships for everyone. Nothing in Core
+or Runtime may require a tool, account layout, or workflow that only one user
+has.
+
+- Account routing and usage-limit recovery (swap-on-limit, resume-after-limit)
+  solve a problem every heavy Claude/Codex user hits. They work with plain
+  configuration; `aas` is one optional provider, not a prerequisite.
+- No product default, preset, or code path assumes a specific organization or
+  project (for example Callabo). Personal workflows live in user config and
+  user skills, not in muxa.
+
+### Deterministic first
+
+Every fact muxa acts on (who an agent is, which pane it is in, what state it is
+in, whether a prompt landed, whether it hit a limit) is established by a
+deterministic source whenever one exists:
+
+1. hook events and provider session/transcript records,
+2. provider APIs (app-server, JSON-RPC) and provider-supplied ids such as
+   `CODEX_THREAD_ID`,
+3. marks muxa set itself at launch (pane options, env, owned PTYs),
+4. the exact process tree and its environment.
+
+Screen detection, pane-capture parsing, and timing-based inference are
+**fallbacks** for when none of those exist. They are labeled as heuristic in
+state, and a heuristic alone never triggers a destructive action (stop,
+prune, swap, interrupt). Support for a backend or provider is claimed only at
+the depth where its signals are deterministic. See
+[proposals/DETERMINISTIC_FIRST.md](proposals/DETERMINISTIC_FIRST.md).
 
 ## Feature tiers
 
@@ -55,8 +90,8 @@ whether the feature matters.
 | Tier | Bar | Members |
 | --- | --- | --- |
 | **Core** | No regression ships; covered by live tour + tests | Attention layer, Work/Run model, collaboration mailbox, MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
-| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, muxad-owned PTYs, Muxa for Mac, dashboard |
-| **Labs** | Off by default or clearly marked; may change or be removed | account `swap` and `aas` routing, `automation` rules, pipelines, `ask`, collaboration contracts, `graph` |
+| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, muxad-owned PTYs, Muxa for Mac, dashboard, account routing and usage-limit recovery |
+| **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts, `graph` |
 
 A Labs feature graduates when it has a written contract, a recovery path, and
 evidence (from `muxa stats` or issues) that it is used outside a single
@@ -73,7 +108,7 @@ radius.
 - CLI/daemon protocol skew is detected and reported, never shown as
   "no active agents".
 - Any rule that mutates or stops agents is dry-run against live state after
-  every change.
+  every change, and acts only on deterministic signals.
 - Release builds come from the tagged commit; the release workflow is
   restored or `scripts/release-local.sh` is the documented path.
 - `main` requires green CI before merge.
@@ -81,9 +116,9 @@ radius.
 **Structure.** Large single files slow review and collide when several agents
 edit the tree at once.
 
-- Split `crates/muxa-cli/src/watch.rs` by screen (tree, inspector, mailbox,
-  board, forms) and `crates/muxa/src/ipc.rs` by request family.
-- Keep new subsystems as modules from their first commit.
+- Split `crates/muxa-cli/src/watch.rs` by screen and `crates/muxa/src/ipc.rs`
+  by request family; keep `main.rs` files thin.
+- New subsystems start as modules; no source file grows past ~3,000 lines.
 
-**Docs.** Docs describe current behavior. Proposals and plans live under
-`docs/proposals/`, so a reader can tell a contract from an intention.
+**Docs.** See [docs/README.md](README.md): docs describe current behavior,
+proposals live under `docs/proposals/`, dated audits under `docs/validation/`.

@@ -2,7 +2,7 @@
 
 <img src="assets/logo.svg" alt="Muxa logo" width="144" />
 
-**The control plane for your team of coding agents.**
+**The operations platform for your team of coding agents.**
 
 See which agent is waiting on you and jump to it — then run the whole team as
 Work: launch agents, let them review each other, and follow them across hosts.
@@ -509,7 +509,7 @@ several at once (e.g. during a tmux→herdr migration):
 | tmux | Full | The default backend. |
 | [rmux](https://rmux.io) | Initial CLI backend | Pane discovery, capture, focus, and targeted input; see [docs/RMUX.md](docs/RMUX.md). The host on native Windows — see [docs/WINDOWS.md](docs/WINDOWS.md). |
 | [herdr](https://herdr.dev) | Full | Via herdr's socket API; see [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/ZELLIJ.md). |
+| zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md). |
 
 See [docs/MULTI_HOST.md](docs/MULTI_HOST.md) for observing multiple hosts
 simultaneously.
@@ -536,7 +536,7 @@ simultaneously.
 | Configuration reference | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) |
 | Web dashboard | [docs/DASHBOARD.md](docs/DASHBOARD.md) |
 | External sinks | [docs/SINKS.md](docs/SINKS.md) |
-| Zellij plan | [docs/ZELLIJ.md](docs/ZELLIJ.md) |
+| Zellij plan | [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md) |
 | Architecture and development | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) |
 | Agent collaboration | [docs/COLLABORATION.md](docs/COLLABORATION.md) |
 

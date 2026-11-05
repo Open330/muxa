@@ -55,12 +55,12 @@ MCP 재연결 시 새 schema를 읽는다. 실행 중인 다른 에이전트는 
 Clippy에 맞춰 기존 복구 테스트의 기본값 초기화를 정리한 후 해당 테스트를
 다시 통과시켰다. 이 마지막 수정은 테스트 코드에만 해당한다.
 
-- [배포 전 관측](validation/quiet-notices-runtime/baseline.json)
-- [배포 후 관측과 요청 ID](validation/quiet-notices-runtime/after.json)
-- [MCP 호환성 검사](validation/quiet-notices-runtime/schema-comparison.json)
-- [배포 경로 및 바이너리 SHA-256](validation/quiet-notices-runtime/deployment.json)
-- [정리 결과](validation/quiet-notices-runtime/cleanup.json)
-- [사용한 하네스 기록](validation/quiet-notices-runtime/probe.py.txt)
+- [배포 전 관측](quiet-notices-runtime/baseline.json)
+- [배포 후 관측과 요청 ID](quiet-notices-runtime/after.json)
+- [MCP 호환성 검사](quiet-notices-runtime/schema-comparison.json)
+- [배포 경로 및 바이너리 SHA-256](quiet-notices-runtime/deployment.json)
+- [정리 결과](quiet-notices-runtime/cleanup.json)
+- [사용한 하네스 기록](quiet-notices-runtime/probe.py.txt)
 
 하네스 기록은 이번 실행의 소켓·전용 Work·세션 좌표를 담은 감사용 사본이다.
 테스트 Workspace는 이미 닫았으므로 그대로 다시 실행하는 재사용 스크립트가 아니다.
