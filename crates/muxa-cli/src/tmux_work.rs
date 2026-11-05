@@ -1016,9 +1016,9 @@ pub async fn run_work_done(
     let pane = args
         .pane
         .clone()
-        .or_else(|| std::env::var("TMUX_PANE").ok())
+        .or_else(crate::mcp::own_tmux_pane)
         .filter(|pane| !pane.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("no pane to read; run inside tmux or pass --pane"))?;
+        .ok_or_else(|| anyhow::anyhow!("no pane to read; pass --pane (outside tmux, or under a shared Codex app-server whose TMUX_PANE names another pane)"))?;
     validate_pane_id(&pane)?;
     let alias = match args.alias.clone() {
         Some(alias) => alias,
@@ -1784,11 +1784,7 @@ fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
     let target = target
         .filter(|target| !target.trim().is_empty())
         .map(str::to_string)
-        .or_else(|| {
-            std::env::var("TMUX_PANE")
-                .ok()
-                .filter(|pane| !pane.trim().is_empty())
-        })
+        .or_else(crate::mcp::own_tmux_pane)
         .ok_or_else(|| {
             anyhow::anyhow!("window target is required outside tmux; pass --window @N")
         })?;
