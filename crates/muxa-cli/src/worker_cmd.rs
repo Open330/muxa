@@ -78,7 +78,7 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
         return prune(client, idle_hours, error, execute, json).await;
     }
     if let Some(Action::Release { launch_id, reason }) = args.action {
-        let origin = crate::watch::watch_collaboration_origin(std::env::var("TMUX_PANE").ok());
+        let origin = crate::watch::watch_collaboration_origin(crate::mcp::own_tmux_pane());
         client
             .collaboration_worker_spawn_release(&origin, &launch_id, &reason)
             .await
@@ -657,7 +657,7 @@ async fn prune(
     json: bool,
 ) -> Result<()> {
     use muxa::collaboration::{WorkerDrainAcquire, WorkerDrainPolicy, WorkerDrainTarget};
-    let origin = crate::watch::watch_collaboration_origin(std::env::var("TMUX_PANE").ok());
+    let origin = crate::watch::watch_collaboration_origin(crate::mcp::own_tmux_pane());
     let policy = WorkerDrainPolicy {
         min_observed_idle_secs: idle_hours.saturating_mul(3600),
         allow_error,
