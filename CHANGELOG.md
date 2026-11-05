@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   journalled. Programs resolved through the pane's own PATH are recorded as
   unknown, not certified.
 
+### Fixed
+
+- `muxa agent start` registers an agent launched without a prompt even when
+  its CLI shows up in the pane a moment after the window does: it looks for
+  it for up to 5 seconds rather than reading the pane once and silently
+  leaving it to periodic discovery.
+
 ## [0.9.4] - 2026-11-03
 
 ### Added
