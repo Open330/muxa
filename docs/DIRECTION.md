@@ -1,0 +1,89 @@
+# Direction
+
+This document states what muxa is, how its parts relate, and what has to hold
+before 1.0. It is a contract for scoping decisions, not a feature list; see
+[README](../README.md) for the surfaces and [ARCHITECTURE](ARCHITECTURE.md) for
+the runtime.
+
+## What muxa is
+
+**muxa is the control plane for a team of coding agents.** It knows what every
+agent is doing, gets you to the one that needs you, and lets agents and humans
+run work together across terminals and hosts.
+
+muxa started as the first half of that sentence: a thin layer that tells you
+which tmux agent is waiting and jumps to it. Running many agents every day grew
+the second half: a Work model, agent-to-agent collaboration, Fleet, and a
+daemon-owned runtime. Both halves are the product.
+
+## Two layers, both first-class
+
+| Layer | Promise | Surfaces |
+| --- | --- | --- |
+| **Attention** | Nothing that needs you goes unnoticed, and getting there is one key. | hooks + screen detection, `status-line`, `peek`, `watch`, `attend`, notifications, BarShelf, stats/timeline |
+| **Runtime** | Agents are launched, organized, coordinated, and recovered as Work, not as loose panes. | Work/Run model, `work`/`workspace`/`agent`, muxad-owned PTYs and Muxa for Mac, collaboration mailbox and `@peer`, workers, Fleet, snapshot/restore, MCP |
+
+Rules that keep the layers honest:
+
+1. **Attention never requires Runtime.** A user who only installs hooks on
+   their existing tmux panes gets the full Attention layer. No Work, no
+   collaboration config, no MCP.
+2. **Everything Runtime does is visible to Attention.** A worker, a peer
+   request, a Fleet node, or a pipeline run that needs a human surfaces through
+   the same attention state, `attend`, and notifications.
+3. **Runtime never takes over what it did not start.** muxa does not kill,
+   rename, or adopt unmanaged tmux objects as Work.
+
+## Two execution modes
+
+| Mode | Who starts the agent | Binding |
+| --- | --- | --- |
+| **Adopt** | You, in any supported multiplexer | muxa observes via hooks or screen detection |
+| **Own** | muxa (`muxa work`, `muxa agent`, Muxa for Mac, workers) | managed tmux pane or a muxad-owned PTY |
+
+Both modes stay supported. Owning the process is what makes reliable prompt
+delivery, recovery, and account routing possible; adopting is what keeps
+muxa zero-cost to try. Open question tracked in #89: whether muxa-launched
+agents default to a muxad-owned PTY instead of a managed tmux pane. That
+choice only changes the default for **Own**; it never removes **Adopt**.
+
+## Feature tiers
+
+Every surface belongs to one tier. The tier decides the stability bar, not
+whether the feature matters.
+
+| Tier | Bar | Members |
+| --- | --- | --- |
+| **Core** | No regression ships; covered by live tour + tests | Attention layer, Work/Run model, collaboration mailbox, MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
+| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, muxad-owned PTYs, Muxa for Mac, dashboard |
+| **Labs** | Off by default or clearly marked; may change or be removed | account `swap` and `aas` routing, `automation` rules, pipelines, `ask`, collaboration contracts, `graph` |
+
+A Labs feature graduates when it has a written contract, a recovery path, and
+evidence (from `muxa stats` or issues) that it is used outside a single
+workflow. A feature with no use over a release cycle is a removal candidate;
+the Work board replacing the card dashboard is the model.
+
+## Before 1.0
+
+**Safety.** muxa controls running agents, so its failures have a large blast
+radius.
+
+- `muxa upgrade` validates the live config with the new binary before
+  replacing anything (#300).
+- CLI/daemon protocol skew is detected and reported, never shown as
+  "no active agents".
+- Any rule that mutates or stops agents is dry-run against live state after
+  every change.
+- Release builds come from the tagged commit; the release workflow is
+  restored or `scripts/release-local.sh` is the documented path.
+- `main` requires green CI before merge.
+
+**Structure.** Large single files slow review and collide when several agents
+edit the tree at once.
+
+- Split `crates/muxa-cli/src/watch.rs` by screen (tree, inspector, mailbox,
+  board, forms) and `crates/muxa/src/ipc.rs` by request family.
+- Keep new subsystems as modules from their first commit.
+
+**Docs.** Docs describe current behavior. Proposals and plans live under
+`docs/proposals/`, so a reader can tell a contract from an intention.

@@ -2,11 +2,12 @@
 
 <img src="assets/logo.svg" alt="Muxa logo" width="144" />
 
-**Know which tmux coding agent is waiting on you — and jump to it.**
+**The control plane for your team of coding agents.**
 
-No wrapper, no new terminal. Muxa watches the Claude Code, Codex, and
-Gemini CLI sessions you already run in tmux, tells you which one needs
-you, and takes you there. Ask a peer for a review and read its reply in watch.
+See which agent is waiting on you and jump to it — then run the whole team as
+Work: launch agents, let them review each other, and follow them across hosts.
+Start with zero setup on the Claude Code, Codex, and Gemini CLI sessions you
+already run in tmux; let Muxa launch and own agents when you want more.
 
 [![CI](https://github.com/Open330/muxa/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/muxa/actions/workflows/ci.yml)
 ![MSRV](https://img.shields.io/badge/MSRV-1.89-informational)
@@ -79,6 +80,10 @@ curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.s
 ```
 
 ## Why muxa
+
+Muxa has two layers. **Attention** works on agents you already run; **Runtime**
+organizes the agents Muxa launches into Work. Attention never requires Runtime.
+See [Direction](docs/DIRECTION.md).
 
 - **Keeps your setup.** Reads agent state from Claude Code, Codex, and
   Gemini CLI (and its Antigravity successor) hooks, with screen detection
