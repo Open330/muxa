@@ -1,17 +1,18 @@
-//! Start a new agent on an `aas` account that still has quota.
+//! Start a new agent on a chosen account.
 //!
-//! Without this, a muxa launch runs the bare provider CLI and the `aas`
-//! shim puts it on whichever account `aas active` names — even while that
-//! account is capped, so every new worker starts already stopped.
-//! `[agent.<program>].account` lets muxa choose instead: `auto` takes the
-//! best-ranked eligible account from `aas candidates`, a name pins one of
-//! that provider's accounts.
+//! Without this, a muxa launch runs the bare provider CLI on whichever
+//! account it happens to be logged into, even while that account is capped,
+//! so every new worker starts already stopped. `[agent.<program>].account`
+//! lets muxa choose instead: `auto` takes the first configured account (or
+//! `aas`'s best-ranked one with quota left), a name pins one of that
+//! provider's accounts.
 //!
-//! `aas` stays optional. It is never linked, only run, and only when the
-//! provider's config asks for it; when it is missing, slow, or has nothing
-//! eligible, the agent starts bare exactly as it would without the setting.
-//! The decision is made before any pane exists, so a failed query never
-//! leaves half-built layout behind.
+//! The accounts come from [`crate::account_provider`]: configured
+//! `[[accounts.<provider>]]` in config order, else `aas` when it is
+//! installed. Neither is required. When there is no backend,
+//! or it is slow or has nothing eligible, the agent starts bare exactly as it
+//! would without the setting. The decision is made before any pane exists,
+//! so a failed query never leaves half-built layout behind.
 //!
 //! Already-running agents are [`crate::account_swap`]'s business.
 
@@ -23,15 +24,16 @@ use std::time::Duration;
 /// answers from its usage cache, so this only trips when it hangs.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The providers `aas` can run.
+/// The providers accounts are routed for.
 pub const PROVIDERS: &[&str] = &["claude", "codex"];
 
 /// Which account a new agent starts on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpawnAccount {
-    /// The best-ranked eligible account from `aas candidates`.
+    /// The first configured account, or `aas`'s best-ranked one with quota
+    /// left.
     Auto,
-    /// This account, by its `aas` name.
+    /// This account, by name (`work`, or `work@claude` as `aas` spells it).
     Named(String),
 }
 
@@ -56,7 +58,7 @@ pub struct AccountRoute {
     /// The configured `aas` binary (`[swap].aas`), used when the provider
     /// lists no [`Self::profiles`].
     pub aas: String,
-    /// The provider's `[[accounts.<provider>]]`, in `auto` order. When
+    /// The provider's `[[accounts.<provider>]]`, in config order. When
     /// present, routing needs no external tool.
     pub profiles: Vec<crate::accounts::AccountProfile>,
 }
@@ -99,8 +101,9 @@ impl RoutedLaunch {
     }
 }
 
-/// A configured account, by name or the first one for `auto`. There is no
-/// quota to rank by at launch; a swap moves the agent on when it is capped.
+/// A configured account, by name or the first one for `auto`. Configured
+/// accounts are not ranked by quota yet; a swap moves the agent on when it
+/// is capped.
 fn from_profiles(route: &AccountRoute) -> Result<RoutedLaunch, String> {
     let provider = route.provider.as_str();
     if cfg!(windows) {
@@ -122,7 +125,7 @@ fn from_profiles(route: &AccountRoute) -> Result<RoutedLaunch, String> {
     })
 }
 
-/// The first eligible `provider` account, in `aas`'s own ranking.
+/// The first eligible `provider` account, in the backend's ranking.
 pub fn choose(candidates: &[Candidate], provider: &str) -> Result<String, String> {
     candidates
         .iter()
@@ -135,7 +138,7 @@ pub fn choose(candidates: &[Candidate], provider: &str) -> Result<String, String
                 .map(|c| format!("{}: {}", c.name, c.reason))
                 .collect();
             if passed.is_empty() {
-                format!("aas has no {provider} account")
+                format!("no {provider} account is available")
             } else {
                 format!(
                     "no {provider} account has quota left ({})",
@@ -170,10 +173,24 @@ fn decide_with(
     route: &AccountRoute,
     query: impl FnOnce(&str, &str) -> Result<Vec<Candidate>, String>,
 ) -> Result<RoutedLaunch, String> {
+    decide_found(route, find_aas, query)
+}
+
+fn decide_found(
+    route: &AccountRoute,
+    find: impl FnOnce(&str) -> Option<String>,
+    query: impl FnOnce(&str, &str) -> Result<Vec<Candidate>, String>,
+) -> Result<RoutedLaunch, String> {
     if !route.profiles.is_empty() {
         return from_profiles(route);
     }
-    let aas = find_aas(&route.aas).ok_or_else(|| format!("`{}` not found", route.aas))?;
+    let aas = find(&route.aas).ok_or_else(|| {
+        if route.aas == crate::account_swap::SwapConfig::default().aas {
+            crate::account_provider::no_accounts(&route.provider)
+        } else {
+            format!("`{}` not found", route.aas)
+        }
+    })?;
     let candidates = query(&aas, &route.provider)?;
     let account = match &route.choice {
         SpawnAccount::Named(name) => pinned(&candidates, name, &route.provider)?,
@@ -260,7 +277,7 @@ mod tests {
         assert!(!reason.contains("cx@codex"), "{reason}");
         assert_eq!(
             choose(&[], "codex").unwrap_err(),
-            "aas has no codex account"
+            "no codex account is available"
         );
     }
 
@@ -315,6 +332,16 @@ mod tests {
         );
         let outcome = decide_with(&route(SpawnAccount::Auto), |_, _| Err("timed out".into()));
         assert_eq!(report(&outcome).skipped.as_deref(), Some("timed out"));
+    }
+
+    #[test]
+    fn no_accounts_and_no_aas_starts_bare_and_says_how_to_configure_one() {
+        let mut bare = route(SpawnAccount::Auto);
+        // The default `aas`, not installed: muxa needs no external tool.
+        bare.aas = crate::account_swap::SwapConfig::default().aas;
+        let reason = decide_found(&bare, |_| None, |_, _| unreachable!()).unwrap_err();
+        assert!(reason.contains("[[accounts.claude]]"), "{reason}");
+        assert!(reason.contains("resume-after-limit"), "{reason}");
     }
 
     #[test]

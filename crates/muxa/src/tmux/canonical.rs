@@ -1,7 +1,7 @@
 //! One row per physical pane.
 //!
-//! A session group (two terminals on one workspace: `callabo` plus client
-//! sessions `callabo~view~N`) shares one window list, so `list-panes -a`
+//! A session group (two terminals on one workspace: `acme` plus client
+//! sessions `acme~view~N`) shares one window list, so `list-panes -a`
 //! reports every pane once per member session. Those rows name the same pane
 //! — same server, same pane id — and differ only in the session they were
 //! listed under. A view row can also lack the workspace metadata, because

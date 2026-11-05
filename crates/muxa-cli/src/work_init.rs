@@ -8,7 +8,7 @@
 //! used at all.
 //!
 //! So muxa does here what it already does for tickets: it asks an agent.
-//! The operator says "callabo tickets get a codex planner, a codex
+//! The operator says "acme tickets get a codex planner, a codex
 //! implementer and a claude reviewer", one headless turn turns that into
 //! TOML, and muxa's job is to be the part that does *not* trust the answer
 //! — parse it, compile every regex, check every pipeline a route names
