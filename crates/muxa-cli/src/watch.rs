@@ -7828,14 +7828,22 @@ fn request_refresh(app: &mut App, wake_tx: &mpsc::Sender<()>) {
     app.refresh_pending = true;
 }
 
+/// Initialize after the scaffold paint, before the first collaboration read.
+async fn initialize_watch_collaboration(client: &Client, app: &mut App) {
+    probe_version_skew(client, app).await;
+    refresh_watch_collaboration(client, app).await;
+    sync_collab_screen_from_cache(app);
+}
+
 /// Entry point for `muxa watch`.
 ///
 /// Returns the exact topology pane (or a legacy raw pane target from an old
 /// overlay) when the user presses Enter. The caller (`main.rs`) runs
 /// the actual tmux switch-client invocation *after* this returns so the
 /// terminal is already restored by the time we hand off control.
-#[allow(clippy::too_many_lines)] // mostly setup + action dispatch — extracting a helper
-                                 // for three preview-related arms hurts readability more than it helps
+#[allow(clippy::too_many_lines)]
+// mostly setup + action dispatch — extracting a helper
+// for three preview-related arms hurts readability more than it helps
 pub async fn run(
     client: &Client,
     watch_cfg: WatchConfig,
@@ -7908,12 +7916,8 @@ pub async fn run(
         .terminal_mut()
         .draw(|f| render(f, &mut app))
         .map_err(anyhow::Error::from)?;
-    refresh_watch_collaboration(client, &mut app).await;
-    sync_collab_screen_from_cache(&mut app);
-    // After the first paint, so a stale daemon delays nothing the user sees,
-    // and before the loop, so the bar is up on the very first frame that has
-    // data on it.
-    probe_version_skew(client, &mut app).await;
+    // The scaffold stays immediate; negotiate before any capability-dependent read.
+    initialize_watch_collaboration(client, &mut app).await;
 
     // Background refresh task owns its own Client clone so the borrowed
     // `client: &Client` doesn't have to outlive the task. The clone is
@@ -30645,6 +30649,123 @@ sort = ["state"]
         assert_eq!(full[0].updates[0].body, "new update");
         assert_eq!(full[1].body, COLLAB_FIXTURE_BODY);
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watch_startup_negotiates_before_the_first_badge_and_board_reads() {
+        use serde_json::json;
+        for supported in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("startup.sock");
+            let mut human = collab_request("%2");
+            human.to = Participant::console(human.from.room.clone());
+            human.omit_list_bodies();
+            let room = RoomContext {
+                current: human.to.clone(),
+                peers: vec![human.from.clone()],
+                unread: 1,
+                unread_replies: 0,
+            };
+            let page = |rows: Vec<CollaborationRequest>| {
+                json!({
+                    "ok":true,"collaboration_scope":"all",
+                    "collaboration_page":{"total":rows.len(),"requests":rows,"has_more":false}
+                })
+            };
+            let capabilities = if supported {
+                vec![
+                    muxa::collaboration::HUMAN_QUERY_CAPABILITY,
+                    muxa::collaboration::OPEN_COUNTS_CAPABILITY,
+                ]
+            } else {
+                vec![]
+            };
+            let mut calls = vec![
+                (
+                    json!({"/kind":"hello"}),
+                    json!({"ok":true,"protocol":muxa::event::PROTOCOL_VERSION,
+                    "version":env!("CARGO_PKG_VERSION"),"capabilities":capabilities}),
+                ),
+                (
+                    json!({"/kind":"collaboration_context"}),
+                    json!({"ok":true,"room":room}),
+                ),
+            ];
+            if supported {
+                calls.push((json!({"/kind":"collaboration_list","/query/human_only":true,"/view":"metadata"}),page(vec![human.clone(), collab_request("%3")])));
+                calls.push((json!({"/kind":"collaboration_open_counts","/scope":"all"}),json!({
+                    "ok":true,"collaboration_open_counts":muxa::collaboration::CollaborationOpenCounts::from_requests([&human])
+                })));
+            } else {
+                for _ in 0..2 {
+                    calls.push((
+                        json!({"/kind":"collaboration_list","/query/status":"queued"}),
+                        page(vec![human.clone()]),
+                    ));
+                    calls.push((
+                        json!({"/kind":"collaboration_list","/query/status":"claimed"}),
+                        page(vec![]),
+                    ));
+                }
+            }
+            let server = crate::collaboration_output::mock_collaboration_responses(&socket, calls);
+            let client = Client::new(socket);
+            let mut app = collab_app("%2");
+            app.apply_screen(WatchScreen::Board);
+            app.collaboration.origin = Some(CollaborationOrigin {
+                exact_session: false,
+                pane: "%1".into(),
+                socket: Some("default".into()),
+                console: true,
+                agent_session_id: None,
+            });
+            // Exercise production initialization, without setting capability flags in the test.
+            initialize_watch_collaboration(&client, &mut app).await;
+            assert_eq!(app.human_query_supported, supported);
+            assert_eq!(app.open_counts_supported, supported);
+            assert_eq!(app.collaboration.human, vec![human.clone()]);
+            assert!(app.collaboration.unavailable.is_none());
+            assert!(app.version_skew.is_none());
+            let (_sender, changes) = tokio::sync::watch::channel(Some(1));
+            app.board_collab_cache.changes = Some(changes);
+            refresh_board_collaboration(&client, &mut app);
+            assert_eq!(
+                app.board_collab
+                    .in_flight
+                    .take()
+                    .unwrap()
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                muxa::collaboration::CollaborationOpenCounts::from_requests([&human])
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn watch_startup_with_unreachable_daemon_stays_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = Client::new(dir.path().join("absent.sock"));
+        let mut app = collab_app("%2");
+        app.collaboration.origin = Some(CollaborationOrigin {
+            exact_session: false,
+            pane: "%1".into(),
+            socket: Some("default".into()),
+            console: true,
+            agent_session_id: None,
+        });
+        tokio::time::timeout(
+            Duration::from_secs(3),
+            initialize_watch_collaboration(&client, &mut app),
+        )
+        .await
+        .expect("startup must return when the daemon is unreachable");
+        assert!(!app.human_query_supported);
+        assert!(!app.open_counts_supported);
+        assert!(app.collaboration.unavailable.is_some());
     }
 
     #[cfg(unix)]
