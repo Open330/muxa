@@ -1,8 +1,8 @@
 use super::*;
 use crate::ipc::framing::downgrade_wire;
 use crate::ipc::framing::lagged_marker_bytes;
-use crate::ipc::identity::observed_pane_in_scan;
 use crate::ipc::identity::RequestPaneScan;
+use crate::ipc::identity::{observed_pane_in_scan, observed_unless_borrowed};
 
 fn promote_topology(panes: &[(&str, &str)]) -> CollaborationTopology {
     CollaborationTopology {
