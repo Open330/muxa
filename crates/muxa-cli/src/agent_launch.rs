@@ -1030,22 +1030,9 @@ fn register_worker_purpose(request: &StartRequest, pane: &str, launch_id: &str) 
 }
 
 fn register_launched_agent(request: &StartRequest, pane: &str) {
-    use muxa::backend::PaneBackend;
-    let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
-        rmux.resolve_pane(&format!("rmux:{pane}"))
-    } else {
-        muxa::TmuxBackend::new().resolve_pane(pane)
-    };
-    let Some(observed) = observed else { return };
-    let Some(discovered) = muxa::discovery::discover_from_panes(&[observed])
-        .into_iter()
-        .next()
-    else {
+    let Some(discovered) = launched_agent(request, pane, LAUNCH_SIGHTING) else {
         return;
     };
-    if muxa::discovery::classify_command(request.agent.label()) != Some(discovered.kind) {
-        return;
-    }
     let event = muxa::discovery::synthesize_started(&discovered, time::OffsetDateTime::now_utc());
     let _ = muxa::ipc::blocking_call(
         &request.socket,
@@ -1056,6 +1043,42 @@ fn register_launched_agent(request: &StartRequest, pane: &str) {
         }),
         std::time::Duration::from_secs(2),
     );
+}
+
+/// How long a launch looks for its agent in the pane: the pane's shell may
+/// not have started it yet when the window appears.
+const LAUNCH_SIGHTING: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The launched agent as discovery sees it in `pane`, once the pane runs
+/// the requested CLI, looked for until `within` runs out.
+fn launched_agent(
+    request: &StartRequest,
+    pane: &str,
+    within: std::time::Duration,
+) -> Option<muxa::discovery::Discovered> {
+    use muxa::backend::PaneBackend;
+    let deadline = std::time::Instant::now() + within;
+    let wanted = muxa::discovery::classify_command(request.agent.label());
+    loop {
+        let observed = if let Some(rmux) = crate::mux_control::ambient_rmux() {
+            rmux.resolve_pane(&format!("rmux:{pane}"))
+        } else {
+            muxa::TmuxBackend::new().resolve_pane(pane)
+        };
+        // A pane that is gone will not come back.
+        let observed = observed?;
+        if let Some(discovered) = muxa::discovery::discover_from_panes(&[observed])
+            .into_iter()
+            .next()
+            .filter(|discovered| wanted == Some(discovered.kind))
+        {
+            return Some(discovered);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 struct PreparedLaunch {

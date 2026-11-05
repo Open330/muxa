@@ -275,12 +275,39 @@ fn a_bare_session_name_can_resolve_to_a_neighbour() {
 /// an initial prompt. Its process name stays codex/claude for discovery.
 #[test]
 fn no_prompt_launch_registers_the_observed_provider_immediately() {
-    use std::time::Duration;
     if !tmux_installed() || Command::new("cc").arg("--version").output().is_err() {
         eprintln!("skipping: tmux and cc are required");
         return;
     }
     for program in ["codex", "claude"] {
+        launch_registers(program, false);
+    }
+}
+
+/// A CLI that shows up in its pane only after a moment (its shell still
+/// starting it, a loaded machine) is registered all the same: the launcher
+/// looks for it rather than reading the pane once.
+#[test]
+fn a_launch_whose_agent_starts_late_is_still_registered() {
+    if !tmux_installed()
+        || Command::new("cc").arg("--version").output().is_err()
+        || Command::new("bash").arg("--version").output().is_err()
+    {
+        eprintln!("skipping: tmux, cc and bash are required");
+        return;
+    }
+    launch_registers("codex", true);
+}
+
+/// Launch `program` with `muxa agent start` and expect its registration;
+/// `late` puts a second's wait in front of the agent.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real launch, start to registration"
+)]
+fn launch_registers(program: &str, late: bool) {
+    use std::time::Duration;
+    {
         let server = Server::start();
         server.session("no-prompt");
         server
@@ -296,13 +323,35 @@ fn no_prompt_launch_registers_the_observed_provider_immediately() {
             "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
         )
         .unwrap();
+        let binary = if late {
+            stub_bin.join("agent-bin")
+        } else {
+            stub_bin.join(program)
+        };
         assert!(Command::new("cc")
             .arg(&source)
             .arg("-o")
-            .arg(stub_bin.join(program))
+            .arg(&binary)
             .status()
             .unwrap()
             .success());
+        if late {
+            // The pane runs `sleep` first, then the agent under its name.
+            let script = stub_bin.join(program);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/usr/bin/env bash\nsleep 1\nexec -a {program} {}\n",
+                    binary.display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                &script,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
+        }
         // tmux starts the child's shell with its server-side PATH.
         server
             .tmux(&[
