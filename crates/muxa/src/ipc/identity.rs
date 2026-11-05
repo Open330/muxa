@@ -270,13 +270,32 @@ pub(super) fn observed_process_pane(
     backends: &[SharedBackend],
     scan: &RequestPaneScan,
 ) -> Option<(String, CollaborationPaneEvidence)> {
-    observed_pane_in_scan(
-        process_environment_pane(pid),
-        pid,
-        backends,
-        scan,
-        crate::adapters::proc_ancestry::parent_pid,
+    observed_unless_borrowed(
+        crate::adapters::proc_ancestry::under_shared_codex_app_server(pid),
+        || {
+            observed_pane_in_scan(
+                process_environment_pane(pid),
+                pid,
+                backends,
+                scan,
+                crate::adapters::proc_ancestry::parent_pid,
+            )
+        },
     )
+}
+
+/// A caller under a shared Codex app-server has no pane of its own: both its
+/// inherited `TMUX_PANE` and its process ancestry lead to whichever pane
+/// started that server. Report no evidence (the provenance then reads
+/// `Unverifiable`) rather than another thread's pane.
+pub(super) fn observed_unless_borrowed(
+    shared_app_server: bool,
+    observe: impl FnOnce() -> Option<(String, CollaborationPaneEvidence)>,
+) -> Option<(String, CollaborationPaneEvidence)> {
+    if shared_app_server {
+        return None;
+    }
+    observe()
 }
 
 pub(super) fn observed_pane_in_scan(

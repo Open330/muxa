@@ -1131,6 +1131,22 @@ fn scanned_caller_evidence_matches_native_resolution_and_rejects_stale_panes() {
 }
 
 #[test]
+fn shared_codex_app_server_caller_has_no_pane_evidence() {
+    // The env pane and the ancestry both resolve, but under a shared
+    // app-server they name the server's first pane, not the caller's.
+    let tmux: SharedBackend = CountingPaneBackend::new(HostKind::Tmux, vec![pid_pane("%3", 300)]);
+    let backends = vec![tmux];
+    let scan = scan_of(&backends);
+    let parent = |pid| (pid == 7).then_some(300);
+    let observe = || observed_pane_in_scan(Some("%3".into()), 7, &backends, &scan, parent);
+    assert_eq!(
+        observed_unless_borrowed(false, observe),
+        Some(("%3".into(), CollaborationPaneEvidence::ProcessEnvironment))
+    );
+    assert_eq!(observed_unless_borrowed(true, observe), None);
+}
+
+#[test]
 fn scanned_evidence_keeps_backend_specific_resolution() {
     // rmux lists namespaced ids; a bare TMUX_PANE resolves through them.
     let rmux: SharedBackend =

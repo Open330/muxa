@@ -4233,6 +4233,13 @@ pub(crate) fn own_tmux_pane() -> Option<String> {
     own_pane_from(std::env::var("TMUX_PANE").ok(), pane_env_is_borrowed)
 }
 
+/// The backend's current pane (`$TMUX_PANE`, then `$TMUX`, `$ZELLIJ_PANE_ID`,
+/// …), under the same rule as [`own_tmux_pane`]: `None` when the pane env was
+/// inherited from a shared Codex app-server.
+pub(crate) fn own_current_pane() -> Option<String> {
+    own_pane_from(muxa::default_backend().current_pane(), pane_env_is_borrowed)
+}
+
 fn own_pane_from(pane: Option<String>, borrowed: impl FnOnce() -> bool) -> Option<String> {
     let pane = pane.filter(|pane| !pane.trim().is_empty())?;
     (!borrowed()).then_some(pane)

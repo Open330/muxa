@@ -316,7 +316,7 @@ pub(super) async fn cmd_status_line(
     }
 
     let backend = muxa::default_backend();
-    let pane = pane.or_else(|| backend.current_pane());
+    let pane = pane.or_else(crate::mcp::own_current_pane);
     let agents = match &pane {
         Some(p) => client
             .by_pane_with_timeout(p, STATUS_LINE_IPC_TIMEOUT)
@@ -367,8 +367,8 @@ pub(super) async fn cmd_recap(
     all: bool,
 ) -> Result<()> {
     let pane = pane
-        .or_else(|| muxa::default_backend().current_pane())
-        .context("no pane given and could not determine current pane (set $TMUX_PANE / $ZELLIJ_PANE_ID, or pass --pane)")?;
+        .or_else(crate::mcp::own_current_pane)
+        .context("no pane given and could not determine current pane (set $TMUX_PANE / $ZELLIJ_PANE_ID, or pass --pane; under a shared Codex app-server the inherited pane belongs to another thread)")?;
 
     let agents = client.by_pane(&pane).await?;
     let history_limit = if all { Some(0) } else { Some(limit) };
