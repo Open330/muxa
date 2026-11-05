@@ -60,9 +60,10 @@ the receipt PID's session.
 
 ### Codex: exact PID to an open rollout fd (stage 3 spike)
 
-The review supplied these live observations: all three sampled private
-`codex --no-daemon` processes held their own rollout JSONL open, while sampled
-shared `app-server daemon` processes held no rollout fds. These are evidence for
+The review supplied these live observations: one private `codex --no-daemon`
+process held exactly one rollout JSONL fd (its own) in 3 of 3 samples taken
+one second apart, while three shared `app-server daemon` processes held no
+rollout fds. These are evidence for
 a spike, **not yet a lifetime guarantee**. The repository already knows the
 `rollout-…-<threadId>.jsonl` naming scheme, but currently locates files by
 session-ID/date scans ([crates/muxa/src/adapters/codex_rollout.rs:534–550](https://github.com/Open330/muxa/blob/c619904ab8e803e99573cec5f15c517e8592f3e8/crates/muxa/src/adapters/codex_rollout.rs#L534-L550)).
