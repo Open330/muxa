@@ -158,11 +158,13 @@ fn classify_transcript_line(line: &str) -> Option<TurnOutcome> {
     // Form 1: an assistant entry tagged with `error:"rate_limit"` and/or
     // `apiErrorStatus:429`. This is the canonical shape Claude Code
     // writes when the in-flight request 429s.
+    //
+    // `isApiErrorMessage` alone is NOT a limit: Claude Code sets it on every
+    // synthetic API-error turn (`authentication_failed`, `server_error` 529,
+    // `invalid_request`, …). Treating it as one put logged-out or overloaded
+    // sessions into a rate-limited `Error`, which arms resume/swap rules.
     let is_rate_limited = v.get("error").and_then(serde_json::Value::as_str) == Some("rate_limit")
-        || v.get("apiErrorStatus").and_then(serde_json::Value::as_i64) == Some(429)
-        || v.get("isApiErrorMessage")
-            .and_then(serde_json::Value::as_bool)
-            == Some(true);
+        || v.get("apiErrorStatus").and_then(serde_json::Value::as_i64) == Some(429);
 
     if v.get("type")?.as_str()? == "assistant" {
         let text = extract_assistant_text(line)?;
@@ -379,6 +381,25 @@ mod tests {
                 assert!(text.contains("You've hit your limit"));
             }
             other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    /// Other synthetic API errors carry `isApiErrorMessage` too; only the
+    /// structured `rate_limit` / 429 tags mean a limit. Shapes copied from
+    /// real Claude Code transcripts.
+    #[test]
+    fn other_api_errors_are_not_rate_limits() {
+        for line in [
+            r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"Not logged in · Please run /login"}]},"error":"authentication_failed","isApiErrorMessage":true}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"API Error: 529 Overloaded."}]},"error":"server_error","isApiErrorMessage":true,"apiErrorStatus":529}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"API Error: Connection lost mid-response."}]},"error":"server_error","isApiErrorMessage":true}"#,
+            r#"{"type":"assistant","message":{"model":"<synthetic>","role":"assistant","content":[{"type":"text","text":"API Error: request flagged"}]},"error":"invalid_request","isApiErrorMessage":true}"#,
+        ] {
+            let f = write(&[line]);
+            assert!(
+                matches!(last_turn_outcome(f.path()), Some(TurnOutcome::Response(_))),
+                "{line}"
+            );
         }
     }
 

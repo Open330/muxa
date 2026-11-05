@@ -4225,6 +4225,19 @@ pub(crate) fn pane_env_is_borrowed() -> bool {
     })
 }
 
+/// This process's own `$TMUX_PANE`, or `None` when the pane env was inherited
+/// from a shared Codex app-server and so names whichever pane started that
+/// server. CLI defaults read the caller's pane through this so a command run
+/// from a Codex thread never acts on (or places next to) another pane.
+pub(crate) fn own_tmux_pane() -> Option<String> {
+    own_pane_from(std::env::var("TMUX_PANE").ok(), pane_env_is_borrowed)
+}
+
+fn own_pane_from(pane: Option<String>, borrowed: impl FnOnce() -> bool) -> Option<String> {
+    let pane = pane.filter(|pane| !pane.trim().is_empty())?;
+    (!borrowed()).then_some(pane)
+}
+
 /// Resolve collaboration identity at the daemon, where the current session
 /// binding is authoritative. Shared app-server pane variables belong to another
 /// conversation: never copy them, cache a physical pane, or transfer a full
@@ -5965,6 +5978,20 @@ mod tests {
         assert_eq!(
             message_view(&request, &json!({"after_update":0,"full":true})),
             json!(request)
+        );
+    }
+
+    #[test]
+    fn own_pane_drops_a_borrowed_shared_app_server_pane() {
+        assert_eq!(
+            own_pane_from(Some("%3".into()), || false).as_deref(),
+            Some("%3")
+        );
+        assert_eq!(own_pane_from(Some("%3".into()), || true), None);
+        assert_eq!(own_pane_from(Some("  ".into()), || false), None);
+        assert_eq!(
+            own_pane_from(None, || panic!("no pane, no ancestry walk")),
+            None
         );
     }
 

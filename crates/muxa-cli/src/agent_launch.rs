@@ -284,7 +284,7 @@ pub struct StartArgs {
     /// Create a split pane (default), window, or independent session.
     #[arg(long, value_enum, default_value = "pane")]
     pub placement: Placement,
-    /// tmux pane/window target. Defaults to `TMUX_PANE`; unused for session placement.
+    /// tmux pane/window target. Defaults to `TMUX_PANE` (ignored under a shared Codex app-server); unused for session placement.
     #[arg(long)]
     pub target: Option<String>,
     /// Working directory. Defaults to the current directory.
@@ -1217,9 +1217,11 @@ fn resolve_placement_target(request: &mut StartRequest, cwd: &Path) -> Result<()
         let target = request
             .target
             .clone()
-            .or_else(|| std::env::var("TMUX_PANE").ok())
+            .or_else(crate::mcp::own_tmux_pane)
             .filter(|target| !target.trim().is_empty())
-            .ok_or_else(|| anyhow::anyhow!("window placement needs --target or TMUX_PANE"))?;
+            .ok_or_else(|| {
+                anyhow::anyhow!("window placement needs --target or this pane's own TMUX_PANE")
+            })?;
         request.target = Some(resolve_window_session(&target)?);
     }
     if request.placement == Placement::Session {
@@ -1322,11 +1324,11 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
         request
             .target
             .clone()
-            .or_else(|| std::env::var("TMUX_PANE").ok())
+            .or_else(crate::mcp::own_tmux_pane)
             .filter(|target| !target.trim().is_empty())
             .ok_or_else(|| {
                 anyhow::anyhow!(
-                    "{} placement needs --target or TMUX_PANE",
+                    "{} placement needs --target or this pane's own TMUX_PANE",
                     match request.placement {
                         Placement::Pane => "pane",
                         Placement::Window => "window",
