@@ -6565,6 +6565,11 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(PROBE, "1")
+                // The probe drives an in-process daemon, MCP dispatch and
+                // `cmd_msg` on one 2 MiB test thread; unoptimized frames sit
+                // near that limit, so an unrelated new CLI command can tip it
+                // into a stack overflow. Size the probe's stack explicitly.
+                .env("RUST_MIN_STACK", "8388608")
                 .env_remove("MUXA_HOST")
                 .env_remove("MUXA_HOSTS")
                 .env_remove("RMUX")

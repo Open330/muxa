@@ -39,6 +39,7 @@ mod peek;
 mod peer_cli;
 mod relay;
 mod reload;
+mod review_cmd;
 mod sidebar;
 mod spawn_provenance;
 mod stale_agents;
@@ -151,8 +152,9 @@ enum Cmd {
         pane: Option<String>,
         /// Emit a GLOBAL attention summary (`⚠ N need you`) counting every
         /// tracked agent that's blocked on a human, instead of the per-pane
-        /// detail. Prints an empty line when nothing is blocked, so the tmux
-        /// segment disappears when all-clear. Ignores `--pane`.
+        /// detail, followed by open review items (`◇ N to review · age`).
+        /// Prints an empty line when nothing is blocked or awaiting review,
+        /// so the tmux segment disappears when all-clear. Ignores `--pane`.
         #[arg(long)]
         needs_attention: bool,
     },
@@ -230,6 +232,9 @@ enum Cmd {
     /// Worker agents muxa launched for peer work, across every room: state,
     /// observed idle time, open requests, and what is left behind.
     Workers(worker_cmd::Args),
+    /// Results someone asked to have reviewed, kept visible until accepted,
+    /// returned or withdrawn.
+    Review(Box<review_cmd::Args>),
     /// Former name of `muxa fleet host`. Muxa.app still invokes it, and an
     /// app may run against an older or newer CLI, so keep this alias.
     #[command(hide = true)]

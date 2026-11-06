@@ -361,7 +361,7 @@ fn attend_queue_widths(terminal_width: usize) -> (usize, usize) {
 
 /// Compact elapsed-time label: `42s`, `7m`, `3h`, `2d`. Coarse on purpose —
 /// this is a "how stale is this" hint, not a stopwatch.
-fn humanize_since(then: OffsetDateTime, now: OffsetDateTime) -> String {
+pub(crate) fn humanize_since(then: OffsetDateTime, now: OffsetDateTime) -> String {
     let secs = (now - then).whole_seconds().max(0);
     if secs < 60 {
         format!("{secs}s")

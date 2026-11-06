@@ -303,15 +303,29 @@ pub(super) async fn cmd_status_line(
     // tight IPC deadline + empty-on-timeout contract of the status-line
     // path so a slow daemon can never stall the tmux status bar.
     if needs_attention {
-        let agents = client
-            .snapshot_with_timeout(STATUS_LINE_IPC_TIMEOUT)
-            .await
-            .unwrap_or_default();
+        // Both requests share the one deadline (run concurrently), and a
+        // daemon without review items simply contributes nothing.
+        let (agents, reviews) = tokio::join!(
+            client.snapshot_with_timeout(STATUS_LINE_IPC_TIMEOUT),
+            client.review_summary_with_timeout(STATUS_LINE_IPC_TIMEOUT),
+        );
         let count = agents
+            .unwrap_or_default()
             .iter()
             .filter(|a| attend::needs_attention(a.state))
             .count();
-        println!("{}", attention_segment(count));
+        let segments: Vec<String> = [
+            attention_segment(count),
+            reviews
+                .map(|summary| {
+                    super::review_cmd::review_segment(&summary, OffsetDateTime::now_utc())
+                })
+                .unwrap_or_default(),
+        ]
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .collect();
+        println!("{}", segments.join(" "));
         return Ok(());
     }
 
