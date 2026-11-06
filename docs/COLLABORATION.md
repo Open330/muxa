@@ -116,11 +116,19 @@ When the user tells an agent to deliver to a primary, the agent adds
 `user_authorized=true`). The primary then takes the request without anyone
 accepting it, and an exact primary target is kept rather than rerouted to a
 worker. muxad never types such a request into the human's terminal, where it
-could merge with an unsent draft. The session's provider hook hands it over
-at the next turn boundary instead: at the end of the current turn the agent
-continues with it (Claude Code and Codex `Stop` hooks), or it rides along
-with the user's next prompt (`UserPromptSubmit`). A primary that is idle with
-no turn coming keeps the request queued until then. The flag asserts the
+could merge with an unsent draft. The session's provider hook *offers* it at
+the next turn boundary instead: at the end of the current turn the agent
+continues with the offer (Claude Code and Codex `Stop` hooks), or the offer
+rides along with the user's next prompt (`UserPromptSubmit`). An offer
+consumes nothing; the agent claims the request by id before acting and acts
+on what the claim returns, so a lost hook response or a request cancelled in
+between is never executed from stale text. A request is offered through
+`Stop` at most three times, five minutes apart, so an agent that ignores it
+cannot loop its own turn; after that, and for quiet notices or
+`wake = "never"`, only a turn the user starts carries it. Offer attempts are
+recorded on the request (`turn_offer`); they are attempts, not proof of
+delivery. A primary that is idle with no turn coming keeps the request queued
+until then. The flag asserts the
 user's instruction to deliver that request; it grants no execute authority.
 Fleet sends refuse the flag until relay and destination negotiate it. The protection exists to stop
 unsolicited agent work, not to second-guess the user, so nobody has to accept

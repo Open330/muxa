@@ -11,9 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A user-authorized request to a human's primary session is no longer typed
   into its terminal, where it could merge with an unsent draft and be
-  submitted with it. The session's Claude Code or Codex hook hands it over
-  at the next turn boundary instead: the end of the current turn, or the
-  user's next prompt.
+  submitted with it. The session's Claude Code or Codex hook offers it at
+  the next turn boundary instead (the end of the current turn, or the
+  user's next prompt), and the agent claims it before acting, so a lost
+  offer is never lost work. Stop continuations are capped at three per
+  request, five minutes apart, and honour quiet notices and
+  `wake = "never"`. Clients require `collaboration_user_authorized_v2`, so
+  they refuse 0.9.7 daemons that still typed the request in.
 - Fleet sends refuse `user_authorized` until relay and destination can
   negotiate it, instead of silently dropping the flag.
 - The macOS release fails when the first notarization submission fails,

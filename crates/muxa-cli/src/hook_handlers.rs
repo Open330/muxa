@@ -217,89 +217,81 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
     Ok(())
 }
 
-/// Budget for handing user-authorized work to a human primary at its turn
-/// boundary. This runs inside the agent's Stop / `UserPromptSubmit` hook, so a
-/// slow daemon must cost the request one turn of delay, never the agent its
-/// turn.
+/// Budget for asking muxad for turn-boundary offers. This runs inside the
+/// agent's Stop / `UserPromptSubmit` hook, so a slow daemon must cost an offer
+/// one boundary of delay, never the agent its turn. Nothing is consumed by
+/// the call, so a timeout loses nothing.
 const TURN_BOUNDARY_IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 
-/// The hook output that hands queued user-authorized requests to this
-/// session at a turn boundary, or `None` when there is nothing to hand over.
+/// Hook output offering queued user-authorized requests to this session at a
+/// turn boundary, or `None` when there is nothing to offer.
 ///
 /// muxad never types such a request into a human primary's terminal, where
-/// it could merge with an unsent draft. Instead the provider's own hook
-/// carries it: at `stop` the turn continues with the request (Stop
-/// `decision: block`), at `user_prompt_submit` it rides along with the
-/// user's prompt as additional context. Nothing is written to the composer.
+/// it could merge with an unsent draft. The provider's own hook carries an
+/// offer instead: at `stop` the turn continues with it (Stop `decision:
+/// block`), at `user_prompt_submit` it rides along with the user's prompt as
+/// additional context. The model claims each request by id before acting, so
+/// nothing is consumed until it does.
 pub(super) async fn turn_boundary_delivery(
     client: &Client,
     ev: &muxa::event::AgentEvent,
     event: &str,
 ) -> Option<String> {
-    if event != "stop" && event != "user_prompt_submit" {
-        return None;
-    }
-    let requests = tokio::time::timeout(
+    let boundary = match event {
+        "stop" => muxa::collaboration::turn_offer::TurnBoundaryEvent::Stop,
+        "user_prompt_submit" => muxa::collaboration::turn_offer::TurnBoundaryEvent::PromptSubmit,
+        _ => return None,
+    };
+    let origin = turn_boundary_origin(ev.id())?;
+    let offers = tokio::time::timeout(
         TURN_BOUNDARY_IPC_TIMEOUT,
-        claim_turn_boundary_requests(client, ev.id()),
+        client.collaboration_turn_boundary_offer(&origin, boundary),
     )
     .await
-    .ok()
-    .flatten()?;
-    turn_boundary_output(event, &requests)
+    .ok()?
+    .ok()?;
+    turn_boundary_output(event, &offers)
 }
 
-async fn claim_turn_boundary_requests(
-    client: &Client,
+/// The exact session this hook speaks for. A Codex shared app-server hook has
+/// no trustworthy pane (inherited pane variables may name another thread), so
+/// it is addressed by session alone and muxad resolves only a live binding.
+fn turn_boundary_origin(
     id: &muxa::event::AgentId,
-) -> Option<Vec<muxa::collaboration::CollaborationRequest>> {
-    let pane = id.pane.clone()?;
-    // No capability probe on the agent's critical path: an older daemon
-    // never stores `user_authorized`, so it has nothing to hand over here.
-    let socket = id
-        .tmux_socket
-        .as_deref()
-        .map(|path| muxa::backend::pane_endpoint_identity(Some(&pane), path));
-    let origin = muxa::collaboration::CollaborationOrigin {
+) -> Option<muxa::collaboration::CollaborationOrigin> {
+    if id.session_id.trim().is_empty() {
+        return None;
+    }
+    let pane = id.pane.clone().unwrap_or_default();
+    let socket = (!pane.is_empty())
+        .then(|| {
+            id.tmux_socket
+                .as_deref()
+                .map(|path| muxa::backend::pane_endpoint_identity(Some(&pane), path))
+        })
+        .flatten();
+    Some(muxa::collaboration::CollaborationOrigin {
         exact_session: true,
         pane,
         socket,
         console: false,
         agent_session_id: Some(id.session_id.clone()),
-    };
-    let incoming = client
-        .collaboration_list(&origin, muxa::collaboration::RequestMailbox::Incoming)
-        .await
-        .ok()?;
-    let mut claimed = Vec::new();
-    for request in incoming.iter().filter(|request| {
-        request.status == muxa::collaboration::RequestStatus::Queued
-            && request.awaits_turn_boundary(&request.to)
-    }) {
-        if let Ok(requests) = client.collaboration_claim(&origin, &request.id).await {
-            claimed.extend(requests.into_iter().filter(|r| r.id == request.id));
-        }
-    }
-    (!claimed.is_empty()).then_some(claimed)
+    })
 }
 
-fn turn_boundary_output(
-    event: &str,
-    requests: &[muxa::collaboration::CollaborationRequest],
-) -> Option<String> {
-    if requests.is_empty() {
+fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<String> {
+    if offers.is_empty() {
         return None;
     }
-    let instructions: Vec<_> = requests
-        .iter()
-        .map(muxa::collaboration::instruction::inbox_instruction)
-        .collect();
     let text = format!(
-        "Muxa delivered {} request(s) the user authorized for this session. Each is already claimed for you: \
-         handle it within its kind, work_mode and paths, and when expects_reply is true reply exactly once \
-         (muxa_reply or `muxa msg reply REQUEST_ID`). Requests: {}",
-        requests.len(),
-        serde_json::Value::Array(instructions)
+        "Muxa is offering {} request(s) the user authorized for this session. These are offers, not \
+         claimed instructions. For each one, first claim it with muxa_inbox(request_id=ID) (CLI: \
+         `muxa msg accept ID --json`), then act only on what the claim returns: its current body, \
+         kind, work_mode, paths and contract. If the claim is refused because the request was \
+         cancelled, superseded or already handled, do not act on the offered text. When the claimed \
+         request expects a reply, reply exactly once. Offers: {}",
+        offers.len(),
+        serde_json::Value::Array(offers.to_vec())
     );
     let output = if event == "stop" {
         serde_json::json!({"decision": "block", "reason": text})
@@ -316,23 +308,20 @@ fn turn_boundary_output(
 mod turn_boundary_tests {
     use super::turn_boundary_output;
 
-    fn request() -> muxa::collaboration::CollaborationRequest {
-        let mut request = crate::collaboration_output::fixture();
-        request.id = "req_1".into();
-        request.body = "plan the import".into();
-        request.user_authorized = true;
-        request
-    }
-
     #[test]
     fn stop_continues_the_turn_and_prompt_submit_adds_context() {
-        let requests = [request()];
+        let offers = [
+            serde_json::json!({"request_id": "req_1", "body": "plan the import",
+                                          "offer": "claim_before_acting"}),
+        ];
         let stop: serde_json::Value =
-            serde_json::from_str(&turn_boundary_output("stop", &requests).unwrap()).unwrap();
+            serde_json::from_str(&turn_boundary_output("stop", &offers).unwrap()).unwrap();
         assert_eq!(stop["decision"], "block");
-        assert!(stop["reason"].as_str().unwrap().contains("plan the import"));
+        let reason = stop["reason"].as_str().unwrap();
+        assert!(reason.contains("plan the import"));
+        assert!(reason.contains("first claim it"));
         let submit: serde_json::Value =
-            serde_json::from_str(&turn_boundary_output("user_prompt_submit", &requests).unwrap())
+            serde_json::from_str(&turn_boundary_output("user_prompt_submit", &offers).unwrap())
                 .unwrap();
         assert_eq!(
             submit["hookSpecificOutput"]["hookEventName"],

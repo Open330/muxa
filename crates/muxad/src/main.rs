@@ -783,6 +783,7 @@ async fn build_collaboration(cfg: &Config) -> Result<Arc<CollaborationStore>> {
                     "agent collaboration enabled",
                 );
             }
+            store.set_turn_continuation(cfg.collaboration.wake != CollaborationWake::Never);
             Ok(store)
         }
         Err(error @ muxa::collaboration::CollaborationError::UnsupportedSchema(_)) => {

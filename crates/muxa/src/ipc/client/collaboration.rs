@@ -271,6 +271,20 @@ impl Client {
         serde_json::from_value(resp["collaboration_request"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Ask for turn-boundary offers of user-authorized work for `origin`.
+    /// Nothing is claimed; the recipient model claims each offer by id.
+    pub async fn collaboration_turn_boundary_offer(
+        &self,
+        origin: &CollaborationOrigin,
+        event: collaboration::turn_offer::TurnBoundaryEvent,
+    ) -> Result<Vec<serde_json::Value>, RuntimeError> {
+        let resp = self
+            .call_checked(&serde_json::json!({"protocol": PROTOCOL_VERSION,
+            "kind":"collaboration_turn_boundary_offer", "origin":origin, "event":event}))
+            .await?;
+        serde_json::from_value(resp["turn_boundary_offers"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn collaboration_claim(
         &self,
         origin: &CollaborationOrigin,

@@ -612,6 +612,7 @@ mod tests {
 
     fn request(id: &str, from: Participant, to: Participant, body: &str) -> CollaborationRequest {
         CollaborationRequest {
+            turn_offer: None,
             user_authorized: false,
             task_contract: None,
             attempt: None,
