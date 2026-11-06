@@ -53,13 +53,15 @@ impl LaunchReceipt {
         endpoint: Option<String>,
         rmux: bool,
     ) -> Option<Self> {
-        let line = output.lines().find(|line| line.starts_with('%'))?;
+        let line = output
+            .lines()
+            .find(|line| line.trim_start().starts_with('%'))?;
         let fields: Vec<_> = line.split('\t').collect();
-        let pane = fields[0];
+        let pane = line.split_whitespace().next()?;
         if !pane.strip_prefix('%')?.chars().all(|c| c.is_ascii_digit()) || pane.len() < 2 {
             return None;
         }
-        let fields_valid = fields.len() == 4;
+        let fields_valid = fields.len() == 4 && fields[0] == pane;
         Some(Self {
             launch_id: launch_id.into(),
             pane: if rmux {
@@ -332,6 +334,9 @@ struct Claim {
     conflict: bool,
 }
 impl LaunchIdentities {
+    pub(crate) fn at_capacity(&self) -> bool {
+        self.claims.len() >= MAX_CLAIMS
+    }
     pub fn observe(&mut self, id: &AgentId, launch_id: &str, stopped: bool) {
         if stopped {
             self.claims.remove(&id.session_id);
@@ -626,6 +631,30 @@ mod tests {
         early.snapshot_with(&store.snapshot().await, directory.path(), &Fake::default());
         assert!(early.claims.is_empty());
     }
+    #[tokio::test]
+    async fn full_claim_registry_reclaims_removed_rows_before_observing_a_live_one() {
+        let store = crate::Store::shared();
+        for i in 0..MAX_CLAIMS {
+            let event = AgentEvent::Started {
+                id: id(&format!("removed-{i}")),
+                at: time::OffsetDateTime::now_utc(),
+            };
+            store.apply(&event).await;
+            store.observe_launch_claim(&event, Some(LAUNCH)).await;
+            assert!(store.forget_agent(&event.id().session_id).await);
+        }
+        let live = AgentEvent::Started {
+            id: id(SESSION),
+            at: time::OffsetDateTime::now_utc(),
+        };
+        store.apply(&live).await;
+        store.observe_launch_claim(&live, Some(LAUNCH)).await;
+        let identities = store
+            .launch_identity_snapshot(&store.snapshot().await)
+            .await;
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[SESSION].launch_id, LAUNCH);
+    }
     #[test]
     fn archives_are_additive_exclusive_and_reject_replacement_or_path_traversal() {
         let directory = tempfile::tempdir().unwrap();
@@ -686,12 +715,13 @@ mod tests {
             "%4\t#{pane_pid}\t#{pid}\t#{start_time}",
             "%4\twrong\t0\tno",
             "%4 123 123 123",
+            "  %4 123 123 123",
+            "  %4\t123\t123\t123",
         ] {
-            let receipt = LaunchReceipt::parse(bad, LAUNCH, None, true);
-            if let Some(receipt) = receipt {
-                assert!(receipt.process.is_none());
-                assert!(!receipt.marked);
-            }
+            let receipt = LaunchReceipt::parse(bad, LAUNCH, None, true).unwrap();
+            assert_eq!(receipt.pane, "rmux:%4");
+            assert!(receipt.process.is_none());
+            assert!(!receipt.marked);
         }
         assert!(LaunchReceipt::parse("not a pane", LAUNCH, None, false).is_none());
     }

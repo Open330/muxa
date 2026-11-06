@@ -34,6 +34,8 @@ pub trait HookAdapter {
 
 /// An optional transport claim; never an `AgentId` or ownership assertion.
 pub fn launch_claim(kind: AgentKind) -> Option<String> {
+    let value = std::env::var("MUXA_LAUNCH_ID").ok()?;
+    uuid::Uuid::parse_str(&value).ok()?;
     if std::env::var_os(crate::ask::ASK_ENV_MARKER).is_some()
         || std::env::var_os("MUXA_SESSION_ID").is_some()
         || (kind == AgentKind::Codex
@@ -41,8 +43,6 @@ pub fn launch_claim(kind: AgentKind) -> Option<String> {
     {
         return None;
     }
-    let value = std::env::var("MUXA_LAUNCH_ID").ok()?;
-    uuid::Uuid::parse_str(&value).ok()?;
     Some(value)
 }
 

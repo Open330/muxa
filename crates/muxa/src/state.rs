@@ -1724,6 +1724,12 @@ impl Store {
 
     /// Display-only claims never alter operational Agent fields or emit transitions.
     pub async fn observe_launch_claim(&self, event: &AgentEvent, launch_id: Option<&str>) {
+        if launch_id.is_some() && self.launch_identities.lock().unwrap().at_capacity() {
+            // Rows can disappear through forget/reaping without a Stopped event.
+            // Reclaim their slots before deciding whether to drop a new claim.
+            let agents = self.snapshot().await;
+            self.launch_identities.lock().unwrap().retain_live(&agents);
+        }
         let stopped = self
             .agents
             .read()
