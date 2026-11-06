@@ -684,6 +684,55 @@ mod tests {
         assert_eq!(store.claim_for(&recipient).await.unwrap()[0].id, request.id);
     }
 
+    #[tokio::test]
+    async fn user_authorized_agent_work_reaches_a_primary_without_acceptance() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let sender = participant("sender");
+        let recipient = participant("recipient");
+        let unauthorized = store
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "held".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let authorized = store
+            .create(
+                sender,
+                recipient.clone(),
+                NewRequest {
+                    body: "the user asked for this".into(),
+                    user_authorized: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(authorized.user_authorized);
+        assert!(authorized.bypasses_primary_protection());
+        assert!(!unauthorized.bypasses_primary_protection());
+        assert!(store
+            .prepare_direct_wake(&recipient, &authorized.id)
+            .await
+            .unwrap()
+            .is_some());
+        let inbox = store.claim_for(&recipient).await.unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].id, authorized.id);
+        assert_eq!(
+            store
+                .peek_for(&recipient, &unauthorized.id)
+                .await
+                .unwrap()
+                .status,
+            RequestStatus::Queued
+        );
+    }
+
     #[test]
     fn process_identity_is_stable_and_missing_process_has_no_grant() {
         assert!(process_birth(0).is_none());

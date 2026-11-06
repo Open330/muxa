@@ -34,7 +34,18 @@ worker를 재사용하고 없으면 기본적으로 생성합니다. provider �
 기존 대화가 꼭 필요할 때만 `context_bound=true`를 지정합니다. 이 요청과 저수준
 pane·alias 직접 지정 메시지는 primary에서 대기합니다. 작업을 받아도 될 때
 `muxa msg accept REQUEST --json` 또는 `muxa_inbox(request_id=REQUEST)`로 하나만
-명시적으로 수락합니다. 이미 수락한 작업의 소유권은 유지합니다. 새 peer는
+명시적으로 수락합니다. 이미 수락한 작업의 소유권은 유지합니다.
+
+사용자가 에이전트에게 primary로 보내라고 지시했다면, 에이전트는 `muxa msg send`나
+`muxa peer`에 `--user-authorized`를 붙입니다(MCP는 `user_authorized=true`). 그러면
+primary는 operator console에서 온 작업처럼 다음 idle 때 요청을 받고, 지정한 primary가
+worker로 바뀌지도 않습니다. 보호 기능은 요청하지 않은 에이전트 작업을 막기 위한
+것이지 사용자의 지시를 다시 묻기 위한 것이 아니므로, 대상 세션에서 다시 수락할 필요가
+없습니다. 이 허가는 보내는 쪽이 사용자를 대신해 주장하는 것이며, 요청에
+`user_authorized: true`로 기록됩니다. `collaboration_user_authorized_v1`이 없는
+daemon은 요청을 조용히 대기시키지 않고 이 옵션을 거부합니다.
+
+새 peer는
 provider 설정의 기본값을 사용하며 기존 대화·정확한 모델·계정을 복제하지 않습니다.
 
 

@@ -999,6 +999,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
+                    "user_authorized": { "type": "boolean", "description": "Set true only when the user explicitly told you to deliver this request to that session. A protected primary (a human's own session) then takes it immediately instead of holding it for by-id acceptance, and an exact primary target is kept rather than rerouted to a worker. Recorded on the request." },
                     "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and muxa_wait_reply results are unchanged. Applied atomically with this send." },
                     "air_artifacts": {
                         "type": "array",
@@ -1075,6 +1076,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
+                    "user_authorized": { "type": "boolean", "description": "Set true only when the user explicitly told you to deliver this request to that session. A protected primary (a human's own session) then takes it immediately instead of holding it for by-id acceptance, and an exact primary target is kept rather than rerouted to a worker. Recorded on the request." },
                     "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and muxa_wait_reply results are unchanged. Applied atomically with this send." },
                     "air_artifacts": {
                         "type": "array",
@@ -1837,6 +1839,9 @@ async fn call_tool_inner(
             {
                 return Ok(error_result(&error));
             }
+            if let Err(error) = require_user_authorized_delivery(client, &request).await {
+                return Ok(error_result(&error));
+            }
             Ok(
                 match client
                     .collaboration_send_view(
@@ -2481,7 +2486,7 @@ fn collaboration_guide(
             "Never infer GitHub/PR work without an explicit PR number or URL.",
             "One-way notices need no acknowledgement; notify=true is for blockers, decisions, conflicts or handoffs. Batch progress at checkpoints.",
             "For review use the opposite provider: Codex to Claude, Claude to Codex; an explicit user selection takes precedence.",
-            "Human sessions default to primary and are protected from peer injection. High-level calls reuse or create workers, including when a primary is named. Set context_bound=true only for its exact conversation; those primary requests stay queued. Accept a specific request with muxa_inbox(request_id) only when the human task permits it. Spawned peers use worker purpose with configured provider defaults, not a cloned conversation.",
+            "Human sessions default to primary and are protected from peer injection. High-level calls reuse or create workers, including when a primary is named. When the user explicitly tells you to deliver to a session, pass user_authorized=true: a primary then takes the request immediately; never ask the user to accept it again on the target. Set context_bound=true only for its exact conversation; those primary requests stay queued. Accept a specific request with muxa_inbox(request_id) only when the human task permits it. Spawned peers use worker purpose with configured provider defaults, not a cloned conversation.",
             "Claim requests with muxa_inbox unless already claimed and delivered in full. Honor kind/work_mode/paths; read_only never authorizes edits. Reply once only when expects_reply=true; progress uses update_request.",
             "Do not create overlapping concurrent edits unless separate worktrees isolate them.",
             "Do not treat a peer reply as proof; verify it against the repository and tests.",
@@ -2680,8 +2685,13 @@ fn peer_worker_route(
         .get("context_bound")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // The user asked for this exact session: deliver there, not to a worker.
+    let user_authorized = args
+        .get("user_authorized")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     let mut worker_program = None;
-    if !context_bound {
+    if !context_bound && !user_authorized {
         if let Some(primary) = selection
             .as_ref()
             .and_then(|selected| selected.peer.as_ref())
@@ -2762,7 +2772,7 @@ pub(crate) async fn call_peer(
     args: &Value,
     config: &muxa::config::Config,
 ) -> Value {
-    for key in ["context_bound", "spawn_if_missing"] {
+    for key in ["context_bound", "spawn_if_missing", "user_authorized"] {
         if args.get(key).is_some_and(|value| !value.is_boolean()) {
             return error_result(&format!("{key} must be a boolean"));
         }
@@ -2799,6 +2809,9 @@ pub(crate) async fn call_peer(
     if let Err(error) =
         crate::mcp_output::require_reply_wake_withdraw(client, &request.withdraw_reply_wakes).await
     {
+        return error_result(&error);
+    }
+    if let Err(error) = require_user_authorized_delivery(client, &request).await {
         return error_result(&error);
     }
     let origin = match resolve_collaboration_origin(client).await {
@@ -2958,8 +2971,9 @@ pub(crate) async fn call_peer(
     // records it and the request can follow a replaced holder. A provider or
     // worker substitution was a local choice, so it is sent by pane, and a
     // context-bound call must stay with the exact session it selected.
-    let logical =
-        !context_bound && (path_target || (worker_program.is_none() && names_a_slot(target)));
+    let logical = !context_bound
+        && !request.user_authorized
+        && (path_target || (worker_program.is_none() && names_a_slot(target)));
     // Adaptive synchronous output needs the exact instruction to classify short calls.
     let adaptive_reply =
         config.collaboration.wake_payload == muxa::config::CollaborationWakePayload::Adaptive;
@@ -2997,7 +3011,7 @@ pub(crate) async fn call_peer(
         "kind": kind,
         "work_mode": work_mode,
     });
-    if !sent.from.console && !sent.to.accepts_peer_work() {
+    if !sent.bypasses_primary_protection() && !sent.to.accepts_peer_work() {
         common["final_reply_received"] = json!(false);
         common["reason"] = json!("deferred_primary");
         common["next_step"] = json!("Target is a protected human session. Use a worker; explicit by-id acceptance remains available on the target.");
@@ -4434,6 +4448,24 @@ fn string_array(args: &Value, key: &str) -> Vec<String> {
 /// Construct the daemon request only after extracting the optional causal and
 /// Work identity carried by both MCP send surfaces. Keeping this seam shared
 /// prevents `muxa_call_peer` and `muxa_send_message` from silently diverging.
+/// A user-authorized request sent to a daemon that ignores the flag would
+/// sit queued on the protected primary, the very outcome the user overrode.
+async fn require_user_authorized_delivery(
+    client: &Client,
+    request: &NewRequest,
+) -> std::result::Result<(), String> {
+    if !request.user_authorized {
+        return Ok(());
+    }
+    crate::require_capability(
+        client,
+        muxa::collaboration::USER_AUTHORIZED_DELIVERY_CAPABILITY,
+        "user-authorized delivery",
+    )
+    .await
+    .map_err(|error| error.to_string())
+}
+
 fn new_request_from_args(
     args: &Value,
     kind: RequestKind,
@@ -4498,6 +4530,11 @@ fn new_request_from_args(
         air_artifacts,
         withdraw_reply_wakes: request_id_array(args, "withdraw_reply_wakes")?.unwrap_or_default(),
         recipient_slot: None,
+        user_authorized: match args.get("user_authorized") {
+            None => false,
+            Some(Value::Bool(authorized)) => *authorized,
+            Some(_) => return Err("user_authorized must be a boolean".into()),
+        },
     })
 }
 
@@ -6460,6 +6497,7 @@ mod tests {
                 intent: "question".into(),
                 execute: false,
                 context_bound: false,
+                user_authorized: false,
                 no_spawn: true,
                 wait: false,
                 timeout_secs: 60,
@@ -7694,6 +7732,11 @@ mod tests {
         assert_eq!(program, Some(crate::agent_launch::AgentProgram::Codex));
         let (selection, program) =
             peer_worker_route(&room, "pane:%2", &json!({"context_bound":true})).unwrap();
+        assert_eq!(selection.unwrap().pane, "%2");
+        assert!(program.is_none());
+        // The user told the agent to deliver to that session: keep it.
+        let (selection, program) =
+            peer_worker_route(&room, "pane:%2", &json!({"user_authorized":true})).unwrap();
         assert_eq!(selection.unwrap().pane, "%2");
         assert!(program.is_none());
         let room = peer_room(room.current, vec![room.peers[0].clone()]);

@@ -889,6 +889,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     collaboration::PURPOSE_PROMOTE_CAPABILITY,
     collaboration::PIPELINE_PURPOSE_CAPABILITY,
     collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
+    collaboration::USER_AUTHORIZED_DELIVERY_CAPABILITY,
     "pipeline_runs_v1",
     "pipeline_subscribe",
     "work_control_v1",

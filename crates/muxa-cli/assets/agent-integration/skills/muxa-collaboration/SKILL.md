@@ -67,6 +67,11 @@ use `context_bound=true` only when that exact conversation is required. Those
 primary requests and low-level exact-pane messages stay queued. Inspect IDs
 with message lists and accept just one with `muxa_inbox(request_id=...)` only when
 the human task permits it; do not promote a human session merely to drain inbox.
+When the user explicitly tells you to deliver to a primary session, pass
+`user_authorized=true` (CLI `--user-authorized`): the primary takes the request
+on its next idle turn, an exact primary target is kept instead of rerouted, and
+the flag is recorded on the request. Never ask the user to accept it again on
+the target.
 
 For requests addressed to you, claim/read with `muxa_inbox` unless already
 claimed and delivered in full. Honor kind/work_mode/paths. Only when
@@ -168,6 +173,7 @@ routing as `muxa_call_peer`, including primary-to-worker substitution, and
 returns a durable request id without waiting by default. Use `--wait
 --timeout-secs 60` when needed, or `muxa msg wait REQUEST` later. Use
 `--context-bound` only for that exact conversation; it keeps primary acceptance.
+`--user-authorized` delivers to the named primary when the user asked for it.
 Do not substitute `muxa msg send %N` for generic peer work: that is an exact
 mailbox delivery and can remain queued on a protected primary.
 CLI mailbox equivalents are usable
