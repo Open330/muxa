@@ -830,8 +830,12 @@ final class AppModel: ObservableObject {
     }
 
     /// Hosts that can start Work: the local host plus control-mode hosts.
-    var workCapableHosts: [MuxaFleetHost] {
-        fleetHosts.filter { $0.local || $0.mode == "control" }
+    /// A host the operator disabled stays out: it is never contacted, so
+    /// offering it would only produce "not configured or is disabled".
+    var workCapableHosts: [MuxaFleetHost] { Self.workCapable(fleetHosts) }
+
+    nonisolated static func workCapable(_ hosts: [MuxaFleetHost]) -> [MuxaFleetHost] {
+        hosts.filter { $0.local || ($0.mode == "control" && $0.state != "disabled") }
             .sorted { left, right in
                 if left.local != right.local { return left.local }
                 return left.alias.localizedStandardCompare(right.alias) == .orderedAscending
