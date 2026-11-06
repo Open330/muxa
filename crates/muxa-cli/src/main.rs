@@ -624,7 +624,8 @@ enum MsgCmd {
         #[arg(long = "withdraw", value_name = "REQUEST")]
         withdraw: Vec<String>,
         /// The user told you to deliver this: a protected primary (a human's
-        /// own session) takes it now instead of holding it for `msg accept`.
+        /// own session) takes it at its next turn boundary, through its
+        /// provider hook, instead of holding it for `msg accept`.
         /// Use only on the user's explicit instruction; it is recorded on
         /// the request.
         #[arg(long)]

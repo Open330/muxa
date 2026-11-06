@@ -879,6 +879,7 @@ fn collaboration_request(
     status: RequestStatus,
 ) -> CollaborationRequest {
     CollaborationRequest {
+        turn_offer: None,
         user_authorized: false,
         task_contract: None,
         attempt: None,

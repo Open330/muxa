@@ -733,6 +733,18 @@ async fn unavailable_mailbox_refuses_writes_with_the_initialization_reason() {
 }
 
 #[test]
+fn fleet_refuses_user_authorized_delivery_until_negotiated() {
+    let request = super::NewRequest {
+        user_authorized: true,
+        ..Default::default()
+    };
+    assert!(request
+        .validate_fleet_contract()
+        .unwrap_err()
+        .contains("not supported over Fleet"));
+}
+
+#[test]
 fn fleet_contract_attribution_cannot_be_silently_omitted() {
     let mut value = input();
     assert!(value.validate_fleet_contract().is_err());

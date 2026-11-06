@@ -521,6 +521,16 @@ pub(super) enum RequestBody {
         rule: AutomationRule,
         pane: String,
     },
+    /// Offer queued user-authorized work to a primary at a turn boundary;
+    /// see [`collaboration::turn_offer`]. Answers in `turn_boundary_offers`.
+    CollaborationTurnBoundaryOffer {
+        origin: CollaborationOrigin,
+        event: collaboration::turn_offer::TurnBoundaryEvent,
+        #[serde(default)]
+        max_requests: Option<usize>,
+        #[serde(default)]
+        max_bytes: Option<usize>,
+    },
     #[serde(alias = "collaboration_accept")]
     CollaborationInbox {
         origin: CollaborationOrigin,
@@ -1029,6 +1039,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_requests: Option<Vec<CollaborationRequest>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_boundary_offers: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_overview: Option<collaboration::CollaborationOverview>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_health: Option<collaboration::CollaborationHealth>,
@@ -1159,6 +1171,7 @@ impl Response {
             room: None,
             handle: None,
             collaboration_requests: None,
+            turn_boundary_offers: None,
             collaboration_overview: None,
             collaboration_health: None,
             worker_drain_plan: None,
@@ -1335,6 +1348,11 @@ impl Response {
     pub(super) fn with_room(room: RoomContext) -> Self {
         let mut r = Self::ok();
         r.room = Some(room);
+        r
+    }
+    pub(super) fn with_turn_boundary_offers(offers: Vec<serde_json::Value>) -> Self {
+        let mut r = Self::ok();
+        r.turn_boundary_offers = Some(offers);
         r
     }
     pub(super) fn with_collaboration_requests(requests: Vec<CollaborationRequest>) -> Self {

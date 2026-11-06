@@ -715,11 +715,13 @@ mod tests {
         assert!(authorized.user_authorized);
         assert!(authorized.bypasses_primary_protection());
         assert!(!unauthorized.bypasses_primary_protection());
+        // Never typed into the human's terminal; its hook claims it at the
+        // next turn boundary instead.
         assert!(store
             .prepare_direct_wake(&recipient, &authorized.id)
             .await
             .unwrap()
-            .is_some());
+            .is_none());
         let inbox = store.claim_for(&recipient).await.unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].id, authorized.id);

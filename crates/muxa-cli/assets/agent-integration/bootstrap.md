@@ -7,7 +7,8 @@ If MCP is unavailable, use `muxa peer codex "BOUNDED REQUEST"` (or claude/auto)
 for new peer work; it reuses or creates a dedicated worker. `muxa msg send %N`
 is exact mailbox delivery and stays queued on a protected primary, unless the
 user told you to deliver it there: then add `--user-authorized` (MCP
-`user_authorized=true`) and it is delivered now. Keep the
+`user_authorized=true`) and it is handed over at that session's next turn
+boundary without anyone accepting it. Keep the
 request id; use `muxa msg wait REQUEST` for its reply, not a duplicate request.
 Never derive your session/window/pane from $TMUX_PANE or tmux commands.
 These instructions apply to Muxa work;
