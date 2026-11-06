@@ -477,12 +477,14 @@ pub struct StartResult {
 
 /// Stable `muxa agent start --json` envelope across execution hosts.
 ///
-/// Host-specific coordinates remain optional, but every key is serialized so
-/// consumers can parse one schema and branch only on `host`. `StartResult`
-/// remains the tmux lifecycle result used by managed Work/MCP internals.
+/// Host-specific coordinates remain nullable so consumers can branch on `host`.
+/// Additive launch provenance is omitted when unavailable. `StartResult` remains
+/// the tmux lifecycle result used by managed Work/MCP internals.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct AgentStartOutput {
+    #[serde(skip_serializing_if = "Option::is_none")]
     launch_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     launch_receipt: Option<Box<muxa::launch_identity::LaunchReceipt>>,
     schema_version: u8,
     host: LaunchHost,
@@ -771,25 +773,42 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // Before prepare_launch: it can create sessions and windows, and a slow
     // or failed account query must not leave them behind.
     let routed = route_account(request.account.as_ref());
-    let archive =
-        muxa::launch_identity::archive_directory().context("no launch archive directory")?;
+    let archive = muxa::launch_identity::archive_directory();
     let expected_session = if request.agent == AgentProgram::Claude {
         claude_session_options(&mut request.options)
     } else {
         None
     };
-    muxa::launch_identity::prepare(
-        &archive,
-        &muxa::launch_identity::LaunchRecord {
-            launch_id: launch_id.clone(),
-            provider: muxa::discovery::classify_command(request.agent.label()),
-            expected_session,
-            wrapper_forks: routed.as_ref().is_some_and(std::result::Result::is_ok),
-            no_exec: cfg!(windows),
-            ..Default::default()
-        },
-    )
-    .context("persist launch intent before create")?;
+    let archive = if let Some(directory) = archive {
+        match muxa::launch_identity::prepare(
+            &directory,
+            &muxa::launch_identity::LaunchRecord {
+                launch_id: launch_id.clone(),
+                provider: muxa::discovery::classify_command(request.agent.label()),
+                expected_session,
+                wrapper_forks: routed.as_ref().is_some_and(std::result::Result::is_ok),
+                no_exec: cfg!(windows),
+                ..Default::default()
+            },
+        ) {
+            Ok(()) => Some(directory),
+            // An existing attempt must still never create a second physical process.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::AlreadyExists
+                    && directory.join(format!("{launch_id}.json")).exists() =>
+            {
+                return Err(error)
+                    .context("launch attempt already recorded; refusing duplicate create");
+            }
+            Err(error) => {
+                eprintln!("warning: cannot prepare launch identity: {error}");
+                None
+            }
+        }
+    } else {
+        eprintln!("warning: no launch archive directory; launch identity unavailable");
+        None
+    };
     let PreparedLaunch {
         cwd,
         workspace,
@@ -829,7 +848,9 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if create_was_rejected(&output) {
-            let _ = muxa::launch_identity::failed(&archive, &launch_id);
+            if let Some(directory) = &archive {
+                let _ = muxa::launch_identity::failed(directory, &launch_id);
+            }
             if let Some(ticket) = &request.worker_spawn {
                 // Only a completed, unsuccessful single create command with
                 // no pane ID is definite. A missing reply or partial output
@@ -898,9 +919,13 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     .ok()
     .and_then(|mut command| command.status().ok())
     .is_some_and(|status| status.success());
-    muxa::launch_identity::complete(&archive, receipt.clone())
-        .context("archive launch receipt; created pane left in place")?;
-    register_launch_receipt(&request.socket, &receipt);
+    if let Some(directory) = &archive {
+        if let Err(error) = muxa::launch_identity::complete(directory, receipt.clone()) {
+            // Provenance failure must not skip worker stamps or ordinary registration
+            // after the physical create has already succeeded.
+            eprintln!("warning: cannot archive launch receipt: {error}");
+        }
+    }
 
     if request.worker_spawn.is_some() {
         // Launching was persisted before creation. A crash in the small
@@ -1055,31 +1080,6 @@ fn claude_session_options(options: &mut Vec<String>) -> Option<String> {
     let id = uuid::Uuid::new_v4().to_string();
     options.extend(["--session-id".into(), id.clone()]);
     Some(id)
-}
-
-fn register_launch_receipt(socket: &Path, receipt: &muxa::launch_identity::LaunchReceipt) {
-    let hello = muxa::ipc::blocking_call(
-        socket,
-        &serde_json::json!({
-            "protocol":muxa::event::PROTOCOL_VERSION,"kind":"hello","client":"muxa-cli"
-        }),
-        std::time::Duration::from_secs(1),
-    );
-    if !hello.is_some_and(|response| {
-        response["capabilities"].as_array().is_some_and(|caps| {
-            caps.iter()
-                .any(|cap| cap == muxa::launch_identity::CAPABILITY)
-        })
-    }) {
-        return;
-    }
-    let _ = muxa::ipc::blocking_call(
-        socket,
-        &serde_json::json!({
-            "protocol":muxa::event::PROTOCOL_VERSION,"kind":"ingest","launch_receipt":receipt
-        }),
-        std::time::Duration::from_secs(1),
-    );
 }
 
 /// ` on <account>` for a routed launch's one-line report.
@@ -1924,6 +1924,8 @@ mod tests {
         assert!(native["pane"].is_null());
         assert_eq!(native["session"], "pty-7");
         assert_eq!(native["placement"], "session");
+        assert!(native.get("launch_id").is_none());
+        assert!(native.get("launch_receipt").is_none());
     }
 
     #[test]

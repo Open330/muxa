@@ -70,6 +70,9 @@ impl Scratch {
         String::from_utf8(out.stdout).unwrap().trim().into()
     }
     fn cli(&self, args: &[&str]) -> serde_json::Value {
+        self.cli_with_stderr(args).0
+    }
+    fn cli_with_stderr(&self, args: &[&str]) -> (serde_json::Value, String) {
         let out = self
             .command(env!("CARGO_BIN_EXE_muxa"))
             .args(args)
@@ -80,8 +83,9 @@ impl Scratch {
             "CLI {args:?}: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        serde_json::from_slice(&out.stdout)
-            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)))
+        let value = serde_json::from_slice(&out.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&out.stdout)));
+        (value, String::from_utf8_lossy(&out.stderr).into_owned())
     }
     #[allow(clippy::unnecessary_debug_formatting)] // Path Debug emits quoted TOML strings for isolated temp paths.
     fn new() -> Self {
@@ -118,7 +122,7 @@ start = open('/proc/%s/stat' % pid).read().rsplit(')',1)[1].split()[19]
 root = os.environ['CLAUDE_CONFIG_DIR']
 with open('%s/sessions/%s.json' % (root,pid),'w') as f:
     json.dump({'pid':pid,'procStart':start,'sessionId':session},f)
-subprocess.run([os.environ['TEST_MUXA'],'hook','claude','--event','session_start'], input=json.dumps({'session_id':session,'cwd':os.getcwd()}), text=True, check=True)
+if not os.environ.get('TEST_SKIP_HOOK'): subprocess.run([os.environ['TEST_MUXA'],'hook','claude','--event','session_start'], input=json.dumps({'session_id':session,'cwd':os.getcwd()}), text=True, check=True)
 while True: time.sleep(1)
 ").unwrap();
         std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -282,5 +286,102 @@ os.execv(real,[real]+args)
     .unwrap();
     let row = scratch.await_identity(archive["expected_session"].as_str().unwrap(), "unknown");
     assert_eq!(row["launch_identity"]["reason"], "unsupported_receipt");
+    assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
+}
+
+#[test]
+fn post_create_archive_failure_preserves_marks_registration_and_success() {
+    archive_failure_still_launches(true);
+}
+
+#[test]
+fn inaccessible_archive_directory_still_launches() {
+    archive_failure_still_launches(false);
+}
+
+#[allow(clippy::unnecessary_debug_formatting)] // Quoted Python paths in the private tmux shim.
+fn archive_failure_still_launches(corrupt_after_create: bool) {
+    let scratch = Scratch::new();
+    // Synthetic registrations use a short socket name. Give the daemon's
+    // existing canonical-path scope check an alias to this private socket.
+    std::os::unix::fs::symlink(&scratch.socket, scratch.root.path().join(&scratch.label)).unwrap();
+    // Disable hooks to prove the launcher itself registers the observed provider.
+    scratch.tmux(&["set-environment", "-g", "TEST_SKIP_HOOK", "1"]);
+    let archives = scratch.root.path().join("data/muxa/spawns");
+    if !corrupt_after_create {
+        std::fs::create_dir_all(archives.parent().unwrap()).unwrap();
+        // ENOTDIR is deterministic even when the test runner has root privileges.
+        std::fs::write(&archives, "archive directory unavailable").unwrap();
+    }
+    let wrapper = scratch.root.path().join("bin/tmux");
+    let real = muxa::tmux::tmux_binary().to_str().unwrap();
+    let count = scratch.root.path().join("creates");
+    std::fs::write(&wrapper, format!(r"#!/usr/bin/env python3
+import os, pathlib, subprocess, sys
+args=sys.argv[1:]
+out=subprocess.run([{real:?}]+args, capture_output=True)
+if any(a in ('new-window','new-session','split-window') for a in args):
+    with open({count:?},'a') as f: f.write('create\n')
+    if {corrupt}:
+        for path in pathlib.Path({archives:?}).glob('*.json'): path.write_text('corrupt receipt archive')
+# The stand-in is Python; report Claude only in discovery to exercise registration.
+stdout=out.stdout
+if 'list-panes' in args and '-F' in args:
+    columns=args[args.index('-F')+1].split('\t')
+    if '#{{pane_current_command}}' in columns:
+        index=columns.index('#{{pane_current_command}}')
+        rows=[]
+        for line in stdout.splitlines():
+            fields=line.split(b'\t')
+            fields[index]=b'claude'
+            rows.append(b'\t'.join(fields))
+        stdout=b'\n'.join(rows)+b'\n'
+sys.stdout.buffer.write(stdout)
+sys.stderr.buffer.write(out.stderr)
+sys.exit(out.returncode)
+", count=count.to_str().unwrap(), archives=archives.to_str().unwrap(), corrupt=if corrupt_after_create { "True" } else { "False" })).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (result, stderr) = scratch.cli_with_stderr(&[
+        "agent",
+        "start",
+        "--host",
+        "tmux",
+        "--agent",
+        "claude",
+        "--placement",
+        "session",
+        "--cwd",
+        scratch.root.path().to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(
+        stderr.contains(if corrupt_after_create {
+            "warning: cannot archive launch receipt"
+        } else {
+            "warning: cannot prepare launch identity"
+        }),
+        "{stderr}"
+    );
+    let pane = result["pane"].as_str().unwrap();
+    for (option, expected) in [
+        ("@muxa_launch_id", result["launch_id"].as_str().unwrap()),
+        ("@muxa_agent", "claude"),
+        ("@muxa_managed_agent", "1"),
+    ] {
+        assert_eq!(
+            scratch.tmux(&["show-options", "-p", "-v", "-t", pane, option]),
+            expected
+        );
+    }
+    let rows = scratch.cli(&["agents", "--json"]);
+    assert!(
+        rows.as_array().unwrap().iter().any(|row| {
+            row["pane"] == pane
+                && row["agent_session_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("synthetic-"))
+        }),
+        "launcher did not register the pane: {rows}; stderr={stderr}"
+    );
     assert_eq!(std::fs::read_to_string(count).unwrap().lines().count(), 1);
 }

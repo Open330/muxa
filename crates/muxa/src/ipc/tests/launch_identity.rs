@@ -29,9 +29,7 @@ fn legacy_launch_payloads_decode_without_provenance_or_receipt() {
     assert!(matches!(
         ingest.body,
         RequestBody::Ingest {
-            event: Some(_),
             launch_id: None,
-            launch_receipt: None,
             ..
         }
     ));

@@ -46,12 +46,9 @@ impl RuntimeError {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum RequestBody {
     Ingest {
-        #[serde(default)]
-        event: Option<AgentEvent>,
+        event: AgentEvent,
         #[serde(default)]
         launch_id: Option<String>,
-        #[serde(default)]
-        launch_receipt: Option<Box<crate::launch_identity::LaunchReceipt>>,
         #[serde(default)]
         ask_entry: Option<String>,
     },

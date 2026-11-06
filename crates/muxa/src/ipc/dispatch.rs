@@ -242,25 +242,7 @@ pub(super) async fn handle(
                     }
                 }
                 RequestBody::Ingest {
-                    event: None,
-                    launch_receipt: Some(receipt),
-                    ..
-                } => {
-                    kind = "ingest";
-                    let saved = crate::launch_identity::archive_directory().and_then(|directory| {
-                        crate::launch_identity::read_archive(&directory, &receipt.launch_id)
-                    });
-                    if saved.and_then(|record| record.receipt).as_ref() == Some(receipt.as_ref()) {
-                        Response::ok()
-                    } else {
-                        Response::err("launch receipt has no matching archived intent")
-                    }
-                }
-                RequestBody::Ingest { event: None, .. } => {
-                    Response::err("ingest requires an event or receipt")
-                }
-                RequestBody::Ingest {
-                    event: Some(mut event),
+                    mut event,
                     ask_entry,
                     launch_id,
                     ..
