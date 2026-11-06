@@ -134,7 +134,7 @@ Fleet sends refuse the flag until relay and destination negotiate it. The protec
 unsolicited agent work, not to second-guess the user, so nobody has to accept
 the request again on the target. The sender asserts the authorization on the
 user's behalf; it is recorded on the request (`user_authorized: true`). Daemons
-without `collaboration_user_authorized_v1` refuse the flag instead of queuing
+without `collaboration_user_authorized_v2` refuse the flag instead of queuing
 the request silently.
 New peers use configured provider defaults; conversation history, exact model
 and account settings are not cloned from the primary.

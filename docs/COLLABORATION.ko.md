@@ -53,7 +53,7 @@ primary에서는 그때까지 대기합니다. 이 옵션은 그 요청을 전�
 때까지 이 옵션을 거부합니다. 보호 기능은 요청하지 않은 에이전트 작업을 막기 위한
 것이지 사용자의 지시를 다시 묻기 위한 것이 아니므로, 대상 세션에서 다시 수락할 필요가
 없습니다. 이 허가는 보내는 쪽이 사용자를 대신해 주장하는 것이며, 요청에
-`user_authorized: true`로 기록됩니다. `collaboration_user_authorized_v1`이 없는
+`user_authorized: true`로 기록됩니다. `collaboration_user_authorized_v2`이 없는
 daemon은 요청을 조용히 대기시키지 않고 이 옵션을 거부합니다.
 
 새 peer는
