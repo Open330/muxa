@@ -5551,6 +5551,7 @@ mod tests {
                 sender,
                 pending,
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,
