@@ -2398,8 +2398,21 @@ async fn review_items_round_trip_over_ipc() {
         returned.disposition.as_ref().map(|d| d.kind),
         Some(DispositionKind::Returned)
     );
-    assert!(client.review_list(true, 10).await.unwrap().is_empty());
-    assert_eq!(client.review_list(false, 10).await.unwrap().len(), 1);
+    let query = |open_only| crate::review::ReviewQuery {
+        open_only,
+        oldest_first: false,
+        limit: 10,
+        offset: 0,
+    };
+    assert!(client
+        .review_list(&query(true))
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    let all = client.review_list(&query(false)).await.unwrap();
+    assert_eq!(all.items.len(), 1);
+    assert!(!all.has_more);
 
     // Clients cannot claim to be a policy, and refusals keep their message.
     let policy = ReviewActor {

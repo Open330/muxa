@@ -19,12 +19,22 @@ pub(super) async fn review_response(
             "review_get",
             reviews.get(id).await.map(Response::with_review_item),
         ),
-        RequestBody::ReviewList { open_only, limit } => (
+        RequestBody::ReviewList {
+            open_only,
+            oldest_first,
+            limit,
+            offset,
+        } => (
             "review_list",
             reviews
-                .list(open_only, limit)
+                .list(crate::review::ReviewQuery {
+                    open_only,
+                    oldest_first,
+                    limit,
+                    offset,
+                })
                 .await
-                .map(Response::with_review_items),
+                .map(Response::with_review_page),
         ),
         RequestBody::ReviewSummary => (
             "review_summary",

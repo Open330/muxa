@@ -85,8 +85,12 @@ pub(super) enum RequestBody {
     ReviewList {
         #[serde(default)]
         open_only: bool,
+        #[serde(default)]
+        oldest_first: bool,
         #[serde(default = "default_review_list_limit")]
         limit: usize,
+        #[serde(default)]
+        offset: usize,
     },
     /// Open count and oldest open request time, for status surfaces.
     ReviewSummary,
@@ -1120,6 +1124,9 @@ pub struct Response {
     pub review_item: Option<Box<crate::review::ReviewItem>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_items: Option<Vec<crate::review::ReviewItem>>,
+    /// With `review_items`: another page follows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_has_more: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_summary: Option<crate::review::ReviewSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1229,6 +1236,7 @@ impl Response {
             pipeline_run: None,
             review_item: None,
             review_items: None,
+            review_has_more: None,
             review_summary: None,
             pipeline_claims: None,
             work_operation: None,
@@ -1272,9 +1280,10 @@ impl Response {
         response.review_item = Some(Box::new(item));
         response
     }
-    pub(super) fn with_review_items(items: Vec<crate::review::ReviewItem>) -> Self {
+    pub(super) fn with_review_page(page: crate::review::ReviewPage) -> Self {
         let mut response = Self::ok();
-        response.review_items = Some(items);
+        response.review_items = Some(page.items);
+        response.review_has_more = Some(page.has_more);
         response
     }
     pub(super) fn with_review_summary(summary: crate::review::ReviewSummary) -> Self {

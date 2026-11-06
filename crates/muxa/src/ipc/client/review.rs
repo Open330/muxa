@@ -1,5 +1,7 @@
 use super::{Client, RuntimeError, PROTOCOL_VERSION};
-use crate::review::{DispositionKind, NewReview, ReviewActor, ReviewItem, ReviewSummary};
+use crate::review::{
+    DispositionKind, NewReview, ReviewActor, ReviewItem, ReviewPage, ReviewQuery, ReviewSummary,
+};
 use std::time::Duration;
 
 fn field<T: serde::de::DeserializeOwned>(
@@ -29,18 +31,20 @@ impl Client {
         field(&self.call_checked(&req).await?, "review_item")
     }
 
-    pub async fn review_list(
-        &self,
-        open_only: bool,
-        limit: usize,
-    ) -> Result<Vec<ReviewItem>, RuntimeError> {
+    pub async fn review_list(&self, query: &ReviewQuery) -> Result<ReviewPage, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "review_list",
-            "open_only": open_only,
-            "limit": limit,
+            "open_only": query.open_only,
+            "oldest_first": query.oldest_first,
+            "limit": query.limit,
+            "offset": query.offset,
         });
-        field(&self.call_checked(&req).await?, "review_items")
+        let response = self.call_checked(&req).await?;
+        Ok(ReviewPage {
+            items: field(&response, "review_items")?,
+            has_more: response["review_has_more"].as_bool().unwrap_or(false),
+        })
     }
 
     /// Bounded aggregate under `deadline`, for status surfaces that must

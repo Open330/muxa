@@ -18,8 +18,10 @@ muxa review request --work muxa/storage --alias impl \
 muxa review request --session <session-id> --provider codex --summary "…"
 muxa review request --request <collaboration-request-id> --summary "…"
 
-muxa review list            # open items, newest first
+muxa review list            # open items, newest first, 50 per page
+muxa review list --oldest   # oldest first (where the status-line age comes from)
 muxa review list --all      # include disposed items
+muxa review list --offset 50   # next page; a page that has more says so
 muxa review show rv_…
 
 muxa review accept   rv_… [--note "…"]
@@ -46,6 +48,12 @@ Every command takes `--json`. `request` and the dispositions take
 - **Targets are descriptors.** An item outlives its pane, session or
   transcript. Nothing retires an item except an explicit disposition.
 - **Anchors are recorded, never opened.**
+- **No control characters.** Identifiers, labels, anchors and keys refuse all
+  control characters; summaries and notes allow newlines and tabs only. Every
+  stored string is printed by the CLI, so terminal escapes are refused at the
+  boundary.
+- **Bounded pages.** A list returns at most 500 items and reports whether more
+  follow, so the oldest item is always reachable.
 
 ## Status line
 
@@ -62,7 +70,10 @@ nothing.
 
 ## Storage
 
-`$XDG_DATA_HOME/muxa/reviews.sqlite3`, owner-only (0600), owned by muxad.
+`$XDG_DATA_HOME/muxa/reviews.sqlite3`, owned by muxad. The database is
+created owner-only (0600), and an existing database and its WAL/SHM files
+are tightened to 0600 on open. A symlinked path is refused; the 0700 data
+directory, not an atomic no-follow open, is what keeps other users out.
 Every request and disposition is also appended to an event log in the same
 file for later flow metrics. If the file cannot be opened, muxad still
 starts and refuses review requests with the reason.

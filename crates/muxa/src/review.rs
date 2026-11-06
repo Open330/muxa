@@ -80,33 +80,29 @@ pub enum ReviewTarget {
 }
 
 impl ReviewTarget {
-    /// Items for the same key share one generation sequence.
+    /// Items for the same key share one generation sequence. A JSON tuple,
+    /// so no component value can make two targets collide.
     fn key(&self) -> String {
-        match self {
+        let parts: (&str, Option<&str>, Option<&str>, Option<&str>) = match self {
             Self::Session {
                 provider,
                 session_id,
-            } => format!(
-                "session\0{}\0{session_id}",
-                provider.as_deref().unwrap_or("")
-            ),
+            } => ("session", provider.as_deref(), Some(session_id), None),
             Self::Work {
                 workspace,
                 work,
                 alias,
                 ..
-            } => format!(
-                "work\0{workspace}\0{work}\0{}",
-                alias.as_deref().unwrap_or("")
-            ),
-            Self::Request { request_id, .. } => format!("request\0{request_id}"),
-        }
+            } => ("work", Some(workspace), Some(work), alias.as_deref()),
+            Self::Request { request_id, .. } => ("request", Some(request_id), None, None),
+        };
+        serde_json::to_string(&parts).unwrap_or_default()
     }
 
     fn validate(&self) -> Result<(), ReviewError> {
-        let required = |name: &str, value: &str| bounded(name, value, MAX_ID_BYTES, true);
+        let required = |name: &str, value: &str| bounded(name, value, MAX_ID_BYTES, Text::Line);
         let optional = |name: &str, value: Option<&String>| {
-            value.map_or(Ok(()), |v| bounded(name, v, MAX_ID_BYTES, true))
+            value.map_or(Ok(()), |v| bounded(name, v, MAX_ID_BYTES, Text::Line))
         };
         match self {
             Self::Session {
@@ -174,7 +170,7 @@ impl ReviewActor {
             ));
         }
         if let Some(label) = &self.label {
-            bounded("actor label", label, MAX_LABEL_BYTES, true)?;
+            bounded("actor label", label, MAX_LABEL_BYTES, Text::Line)?;
         }
         Ok(())
     }
@@ -256,15 +252,31 @@ pub struct NewReview {
 impl NewReview {
     fn validate(&self) -> Result<(), ReviewError> {
         self.target.validate()?;
-        bounded("summary", &self.summary, MAX_SUMMARY_BYTES, true)?;
+        bounded("summary", &self.summary, MAX_SUMMARY_BYTES, Text::Prose)?;
         if let Some(anchor) = &self.anchor {
-            bounded("anchor", anchor, MAX_ANCHOR_BYTES, true)?;
+            bounded("anchor", anchor, MAX_ANCHOR_BYTES, Text::Line)?;
         }
         if let Some(key) = &self.idempotency_key {
-            bounded("idempotency_key", key, MAX_KEY_BYTES, true)?;
+            bounded("idempotency_key", key, MAX_KEY_BYTES, Text::Line)?;
         }
         self.requested_by.validate_client()
     }
+}
+
+/// Which page of items to list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewQuery {
+    pub open_only: bool,
+    /// Oldest first instead of newest first.
+    pub oldest_first: bool,
+    pub limit: usize,
+    pub offset: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewPage {
+    pub items: Vec<ReviewItem>,
+    pub has_more: bool,
 }
 
 /// Bounded aggregate for status surfaces.
@@ -311,12 +323,29 @@ impl From<std::io::Error> for ReviewError {
     }
 }
 
-fn bounded(name: &str, value: &str, max: usize, nonblank: bool) -> Result<(), ReviewError> {
-    if nonblank && value.trim().is_empty() {
+/// What a text field may contain besides printable characters.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Text {
+    /// Identifiers, labels, anchors: no control characters at all.
+    Line,
+    /// Summaries and notes: newlines and tabs allowed, nothing else.
+    Prose,
+}
+
+/// Every stored string is printed by the CLI and status surfaces, so control
+/// characters (terminal escapes, NUL) are refused at the boundary.
+fn bounded(name: &str, value: &str, max: usize, text: Text) -> Result<(), ReviewError> {
+    if value.trim().is_empty() {
         return Err(ReviewError::Invalid(format!("{name} must not be blank")));
     }
     if value.len() > max {
         return Err(ReviewError::Invalid(format!("{name} exceeds {max} bytes")));
+    }
+    let allowed = |c: char| text == Text::Prose && (c == '\n' || c == '\t');
+    if value.chars().any(|c| c.is_control() && !allowed(c)) {
+        return Err(ReviewError::Invalid(format!(
+            "{name} must not contain control characters"
+        )));
     }
     Ok(())
 }
@@ -356,19 +385,7 @@ impl ReviewStore {
                 std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
             }
         }
-        if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(ReviewError::Storage(
-                "review store must not be a symlink".into(),
-            ));
-        }
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options.open(path)?;
+        prepare_file(path)?;
         let connection = Connection::open(path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -395,30 +412,22 @@ impl ReviewStore {
     }
 
     fn initialize(mut connection: Connection, path: Option<&Path>) -> Result<Self, ReviewError> {
-        let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        // Read the version inside the exclusive transaction: a newer muxa
+        // committing its schema while this opener waits must be seen, not
+        // overwritten back to this version.
+        let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+        let version: i64 = tx.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version > SCHEMA_VERSION {
             return Err(ReviewError::Storage(format!(
                 "review store schema {version} is newer than this muxa ({SCHEMA_VERSION})"
             )));
         }
-        let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
         tx.execute_batch(SCHEMA)?;
         tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         tx.commit()?;
-        #[cfg(unix)]
         if let Some(path) = path {
-            use std::os::unix::fs::PermissionsExt;
-            for suffix in ["", "-wal", "-shm"] {
-                let mut candidate = path.as_os_str().to_os_string();
-                candidate.push(suffix);
-                let candidate = PathBuf::from(candidate);
-                if candidate.exists() {
-                    std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o600))?;
-                }
-            }
+            secure_sidecars(path)?;
         }
-        #[cfg(not(unix))]
-        let _ = path;
         Ok(Self {
             inner: Ok(Arc::new(Mutex::new(connection))),
         })
@@ -452,23 +461,32 @@ impl ReviewStore {
             .await
     }
 
-    /// Newest first. `open_only` hides disposed items.
-    pub async fn list(
-        &self,
-        open_only: bool,
-        limit: usize,
-    ) -> Result<Vec<ReviewItem>, ReviewError> {
-        let limit = i64::try_from(limit.clamp(1, MAX_LIST_LIMIT)).unwrap_or(1);
+    /// One bounded page. `open_only` hides disposed items; `has_more` says
+    /// whether another page follows at `offset + items.len()`.
+    pub async fn list(&self, query: ReviewQuery) -> Result<ReviewPage, ReviewError> {
+        let limit = query.limit.clamp(1, MAX_LIST_LIMIT);
         self.with(move |connection| {
-            let sql = if open_only {
-                "SELECT body FROM review_items WHERE disposed_at_ns IS NULL
-                 ORDER BY requested_at_ns DESC, rowid DESC LIMIT ?1"
+            let filter = if query.open_only {
+                "WHERE disposed_at_ns IS NULL"
             } else {
-                "SELECT body FROM review_items ORDER BY requested_at_ns DESC, rowid DESC LIMIT ?1"
+                ""
             };
-            let mut statement = connection.prepare(sql)?;
-            let rows = statement.query_map(params![limit], |row| row.get::<_, String>(0))?;
-            rows.map(|body| Ok(serde_json::from_str(&body?)?)).collect()
+            let order = if query.oldest_first { "ASC" } else { "DESC" };
+            let sql = format!(
+                "SELECT body FROM review_items {filter}
+                 ORDER BY requested_at_ns {order}, rowid {order} LIMIT ?1 OFFSET ?2"
+            );
+            let mut statement = connection.prepare(&sql)?;
+            let fetch = i64::try_from(limit + 1).unwrap_or(i64::MAX);
+            let offset = i64::try_from(query.offset).unwrap_or(i64::MAX);
+            let rows =
+                statement.query_map(params![fetch, offset], |row| row.get::<_, String>(0))?;
+            let mut items = rows
+                .map(|body| Ok(serde_json::from_str(&body?)?))
+                .collect::<Result<Vec<ReviewItem>, ReviewError>>()?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            Ok(ReviewPage { items, has_more })
         })
         .await
     }
@@ -501,13 +519,65 @@ impl ReviewStore {
     ) -> Result<ReviewItem, ReviewError> {
         by.validate_client()?;
         if let Some(note) = &note {
-            bounded("note", note, MAX_NOTE_BYTES, true)?;
+            bounded("note", note, MAX_NOTE_BYTES, Text::Prose)?;
         }
         self.with(move |connection| {
             dispose(connection, &id, kind, by, note, OffsetDateTime::now_utc())
         })
         .await
     }
+}
+
+/// Create the database owner-only, or tighten an existing one, through the
+/// opened handle before `SQLite` touches it. Refuses a symlink, and a path
+/// that changed between the check and the open. Not an atomic no-follow open:
+/// the 0700 parent directory is what keeps other users out.
+fn prepare_file(path: &Path) -> Result<(), ReviewError> {
+    let refuse =
+        || ReviewError::Storage("review store must be a regular file, not a symlink".into());
+    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Err(refuse());
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let opened = file.metadata()?;
+        let named = std::fs::symlink_metadata(path)?;
+        if !opened.is_file() || opened.ino() != named.ino() || opened.dev() != named.dev() {
+            return Err(refuse());
+        }
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    drop(file);
+    secure_sidecars(path)
+}
+
+/// Owner-only permissions on existing WAL and shared-memory files.
+fn secure_sidecars(path: &Path) -> Result<(), ReviewError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["-wal", "-shm"] {
+            let mut candidate = path.as_os_str().to_os_string();
+            candidate.push(suffix);
+            let candidate = PathBuf::from(candidate);
+            if candidate.exists() {
+                std::fs::set_permissions(candidate, std::fs::Permissions::from_mode(0o600))?;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }
 
 fn load(connection: &Connection, id: &str) -> Result<Option<ReviewItem>, ReviewError> {
@@ -647,6 +717,22 @@ mod tests {
         }
     }
 
+    fn page(open_only: bool, limit: usize, offset: usize) -> ReviewQuery {
+        ReviewQuery {
+            open_only,
+            oldest_first: false,
+            limit,
+            offset,
+        }
+    }
+
+    fn event_count(path: &Path) -> i64 {
+        Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM review_events", [], |r| r.get(0))
+            .unwrap()
+    }
+
     fn user() -> ReviewActor {
         ReviewActor {
             kind: ActorKind::User,
@@ -769,14 +855,15 @@ mod tests {
         };
         let store = ReviewStore::open(&path).unwrap();
         let open: Vec<_> = store
-            .list(true, 10)
+            .list(page(true, 10, 0))
             .await
             .unwrap()
+            .items
             .into_iter()
             .map(|i| i.id)
             .collect();
         assert_eq!(open, vec![open_id.clone()]);
-        let all = store.list(false, 10).await.unwrap();
+        let all = store.list(page(false, 10, 0)).await.unwrap().items;
         assert_eq!(all.len(), 2);
         assert!(all.iter().any(|i| i.id == done_id && !i.is_open()));
         #[cfg(unix)]
@@ -830,5 +917,255 @@ mod tests {
                 .unwrap();
         }
         assert!(ReviewStore::open(&path).is_err());
+    }
+
+    #[test]
+    fn a_newer_schema_committed_while_opening_is_not_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviews.sqlite3");
+        drop(ReviewStore::open(&path).unwrap());
+        let newer = Connection::open(&path).unwrap();
+        newer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        newer
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        let opener = {
+            let path = path.clone();
+            std::thread::spawn(move || ReviewStore::open(&path).map(|_| ()))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        newer.execute_batch("COMMIT").unwrap();
+        assert!(opener.join().unwrap().is_err());
+        let version: i64 = newer
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION + 1);
+    }
+
+    #[tokio::test]
+    async fn control_characters_are_refused_and_prose_keeps_newlines() {
+        let store = ReviewStore::in_memory();
+        let nul = ReviewTarget::Work {
+            workspace: "a\0b".into(),
+            work: "c".into(),
+            alias: None,
+            pipeline_generation: None,
+        };
+        assert!(matches!(
+            store.create(claim(nul, None)).await.unwrap_err(),
+            ReviewError::Invalid(_)
+        ));
+        let mut escape = claim(session("s1"), None);
+        escape.summary = "ok\u{1b}[2Jgone".into();
+        assert!(store.create(escape).await.is_err());
+        let mut label = claim(session("s1"), None);
+        label.requested_by.label = Some("a\nb".into());
+        assert!(store.create(label).await.is_err());
+        let mut prose = claim(session("s1"), None);
+        prose.summary = "line one\n\tline two".into();
+        assert!(store.create(prose).await.is_ok());
+        let item = store.create(claim(session("s2"), None)).await.unwrap();
+        assert!(store
+            .dispose(
+                item.id,
+                DispositionKind::Returned,
+                user(),
+                Some("\u{7}".into())
+            )
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn target_keys_cannot_collide_across_components() {
+        let a = ReviewTarget::Work {
+            workspace: "a".into(),
+            work: "b/c".into(),
+            alias: None,
+            pipeline_generation: None,
+        };
+        let b = ReviewTarget::Work {
+            workspace: "a/b".into(),
+            work: "c".into(),
+            alias: None,
+            pipeline_generation: None,
+        };
+        assert_ne!(a.key(), b.key());
+        let session = ReviewTarget::Session {
+            provider: None,
+            session_id: "x".into(),
+        };
+        let request = ReviewTarget::Request {
+            request_id: "x".into(),
+            attempt_id: None,
+        };
+        assert_ne!(session.key(), request.key());
+    }
+
+    #[tokio::test]
+    async fn the_oldest_item_stays_reachable_past_one_page() {
+        let store = ReviewStore::in_memory();
+        let first = store.create(claim(session("s0"), None)).await.unwrap();
+        for i in 1..=MAX_LIST_LIMIT {
+            store
+                .create(claim(session(&format!("s{i}")), None))
+                .await
+                .unwrap();
+        }
+        let newest = store.list(page(true, usize::MAX, 0)).await.unwrap();
+        assert_eq!(newest.items.len(), MAX_LIST_LIMIT);
+        assert!(newest.has_more);
+        assert!(newest.items.iter().all(|i| i.id != first.id));
+        let rest = store
+            .list(page(true, MAX_LIST_LIMIT, MAX_LIST_LIMIT))
+            .await
+            .unwrap();
+        assert_eq!(
+            rest.items.iter().map(|i| &i.id).collect::<Vec<_>>(),
+            [&first.id]
+        );
+        assert!(!rest.has_more);
+        let mut oldest = page(true, 1, 0);
+        oldest.oldest_first = true;
+        let oldest = store.list(oldest).await.unwrap();
+        assert_eq!(oldest.items[0].id, first.id);
+        assert!(oldest.has_more);
+    }
+
+    #[tokio::test]
+    async fn retries_write_no_extra_events_and_never_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviews.sqlite3");
+        let store = ReviewStore::open(&path).unwrap();
+        let item = store.create(claim(session("s1"), Some("k"))).await.unwrap();
+        store.create(claim(session("s1"), Some("k"))).await.unwrap();
+        assert_eq!(event_count(&path), 1);
+        store
+            .dispose(item.id.clone(), DispositionKind::Accepted, user(), None)
+            .await
+            .unwrap();
+        store
+            .dispose(item.id.clone(), DispositionKind::Accepted, user(), None)
+            .await
+            .unwrap();
+        assert_eq!(event_count(&path), 2);
+        // A keyed retry after disposal returns the disposed item; it does
+        // not reopen it or open another generation.
+        let retry = store.create(claim(session("s1"), Some("k"))).await.unwrap();
+        assert_eq!(retry.id, item.id);
+        assert!(!retry.is_open());
+        assert_eq!(store.summary().await.unwrap().open, 0);
+        assert_eq!(event_count(&path), 2);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disposition_write_failure_leaves_the_item_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviews.sqlite3");
+        let store = ReviewStore::open(&path).unwrap();
+        let item = store.create(claim(session("s1"), None)).await.unwrap();
+        store
+            .with(|c| {
+                c.execute_batch(
+                    "CREATE TRIGGER fail_dispositions BEFORE INSERT ON review_events
+                     WHEN NEW.event <> 'requested'
+                     BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert!(store
+            .dispose(item.id.clone(), DispositionKind::Accepted, user(), None)
+            .await
+            .is_err());
+        assert!(store.get(item.id).await.unwrap().is_open());
+        assert_eq!(store.summary().await.unwrap().open, 1);
+        assert_eq!(event_count(&path), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_creates_from_separate_connections_stay_consistent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviews.sqlite3");
+        let stores: Vec<_> = (0..4).map(|_| ReviewStore::open(&path).unwrap()).collect();
+        let keyed = futures_join(stores.iter().map(|store| {
+            let store = store.clone();
+            async move { store.create(claim(session("s1"), Some("k"))).await }
+        }))
+        .await;
+        let ids: std::collections::HashSet<_> = keyed.into_iter().map(|r| r.unwrap().id).collect();
+        assert_eq!(ids.len(), 1);
+        let unkeyed = futures_join(stores.iter().map(|store| {
+            let store = store.clone();
+            async move { store.create(claim(session("s2"), None)).await }
+        }))
+        .await;
+        let mut generations: Vec<_> = unkeyed.into_iter().map(|r| r.unwrap().generation).collect();
+        generations.sort_unstable();
+        assert_eq!(generations, [1, 2, 3, 4]);
+        assert_eq!(event_count(&path), 5);
+    }
+
+    async fn futures_join<F: std::future::Future + Send + 'static>(
+        futures: impl Iterator<Item = F>,
+    ) -> Vec<F::Output>
+    where
+        F::Output: Send + 'static,
+    {
+        let handles: Vec<_> = futures.map(tokio::spawn).collect();
+        let mut out = Vec::new();
+        for handle in handles {
+            out.push(handle.await.unwrap());
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn existing_permissive_files_are_tightened_and_symlinks_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviews.sqlite3");
+        drop(ReviewStore::open(&path).unwrap());
+        for suffix in ["", "-wal", "-shm"] {
+            let file = PathBuf::from(format!("{}{suffix}", path.display()));
+            if file.exists() {
+                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+        }
+        let store = ReviewStore::open(&path).unwrap();
+        store.create(claim(session("s1"), None)).await.unwrap();
+        for suffix in ["", "-wal", "-shm"] {
+            let file = PathBuf::from(format!("{}{suffix}", path.display()));
+            if file.exists() {
+                let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+                assert_eq!(mode & 0o777, 0o600, "{}", file.display());
+            }
+        }
+        let link = dir.path().join("link.sqlite3");
+        std::os::unix::fs::symlink(&path, &link).unwrap();
+        assert!(ReviewStore::open(&link).is_err());
+    }
+
+    #[tokio::test]
+    async fn unavailable_store_refuses_every_operation() {
+        let store = ReviewStore::unavailable("disk full");
+        let unavailable = |e: ReviewError| matches!(e, ReviewError::Unavailable(_));
+        assert!(unavailable(
+            store.create(claim(session("s1"), None)).await.unwrap_err()
+        ));
+        assert!(unavailable(store.get("rv_x".into()).await.unwrap_err()));
+        assert!(unavailable(
+            store.list(page(true, 10, 0)).await.unwrap_err()
+        ));
+        assert!(unavailable(store.summary().await.unwrap_err()));
+        assert!(unavailable(
+            store
+                .dispose("rv_x".into(), DispositionKind::Accepted, user(), None)
+                .await
+                .unwrap_err()
+        ));
     }
 }

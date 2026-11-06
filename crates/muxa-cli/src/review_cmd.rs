@@ -9,7 +9,8 @@
 use anyhow::{bail, Context, Result};
 use muxa::ipc::Client;
 use muxa::review::{
-    ActorKind, DispositionKind, NewReview, ReviewActor, ReviewItem, ReviewTarget, REVIEW_CAPABILITY,
+    ActorKind, DispositionKind, NewReview, ReviewActor, ReviewItem, ReviewQuery, ReviewTarget,
+    REVIEW_CAPABILITY,
 };
 use std::fmt::Write as _;
 use time::OffsetDateTime;
@@ -98,6 +99,12 @@ enum Action {
         all: bool,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Skip this many items (continue a listing that had more).
+        #[arg(long, default_value_t = 0)]
+        offset: usize,
+        /// Oldest first, which is where the status-line age comes from.
+        #[arg(long)]
+        oldest: bool,
         #[arg(long)]
         json: bool,
     },
@@ -146,12 +153,32 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
                 .await?;
             print_item(&item, json)
         }
-        Action::List { all, limit, json } => {
-            let items = client.review_list(!all, limit).await?;
+        Action::List {
+            all,
+            limit,
+            offset,
+            oldest,
+            json,
+        } => {
+            let page = client
+                .review_list(&ReviewQuery {
+                    open_only: !all,
+                    oldest_first: oldest,
+                    limit,
+                    offset,
+                })
+                .await?;
             if json {
-                println!("{}", serde_json::to_string(&items)?);
+                println!("{}", serde_json::to_string(&page)?);
             } else {
-                print!("{}", render_list(&items, OffsetDateTime::now_utc()));
+                print!("{}", render_list(&page.items, OffsetDateTime::now_utc()));
+                if page.has_more {
+                    println!(
+                        "… more: --offset {}{}",
+                        offset + page.items.len(),
+                        if oldest { " --oldest" } else { "" }
+                    );
+                }
             }
             Ok(())
         }
