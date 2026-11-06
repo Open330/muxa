@@ -29,7 +29,7 @@ Workspace를, window는 현재 Run을, pane은 agent session을 바인딩합니�
 ```console
 $ muxa work init
 ◇  Describe the work pipeline you want
-│  cal-* 티켓은 codex 기획, codex 구현, claude 리뷰로
+│  eng-* 티켓은 codex 기획, codex 구현, claude 리뷰로
 ```
 
 muxa는 headless agent 한 턴으로 그 문장을 TOML로 바꾸고, **위임하지 않는 부분**을
@@ -82,7 +82,7 @@ apply`는 같은 방식으로 — `toml_edit`으로, 파일을 건드리기 전�
 ```console
 muxa work preset list                              # 각 preset이 무엇을 띄우는지
 muxa work preset apply solo --route '.*'           # [pipeline.solo] + catch-all [[route]]
-muxa work preset apply triad --route '^cal-'       # 두 번째 pipeline과 route 추가
+muxa work preset apply triad --route '^eng-'       # 두 번째 pipeline과 route 추가
 muxa work preset apply pair --overwrite            # 손본 [pipeline.pair]를 교체
 muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
 ```
@@ -117,9 +117,9 @@ muxa work pipeline set pair --from-json pair.json     # {"pipeline","replaced","
 muxa work options --json | jq '.pipelines[] | select(.name == "triad")' \
   | muxa work pipeline set triad --from-json -        # 왕복해도 그대로
 muxa work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
-muxa work route set --match '^cal-' --pipeline triad --position 0   # {"match","position","created","config_path"}
+muxa work route set --match '^eng-' --pipeline triad --position 0   # {"match","position","created","config_path"}
 muxa work route set --match '.*' --clear-workspace    # 안 준 플래그는 아무것도 안 바꿈
-muxa work route remove --match '^cal-'                # {"match","removed","config_path"}
+muxa work route remove --match '^eng-'                # {"match","removed","config_path"}
 ```
 
 손으로 쓰는 게 편하시면 주석 달린 레퍼런스가
@@ -149,7 +149,7 @@ bridge)를 써서 agent에게 ticket 조회를 시킵니다. 이미 skill, MCP s
 
 ```toml
 [ticket.source.linear]
-match  = '^cal-\d+$'
+match  = '^eng-\d+$'
 prompt = '''
 linear skill로 Linear issue {{id}}를 조회해서 JSON object 하나만 출력해라.
 {"id": "...", "title": "...", "body": "...", "url": "...", "state": "..."}
@@ -170,7 +170,7 @@ linear skill로 Linear issue {{id}}를 조회해서 JSON object 하나만 출력
 
 ```toml
 [[route]]
-match     = '^cal-'
+match     = '^eng-'
 workspace = 'webapp'
 pipeline  = 'triad'
 

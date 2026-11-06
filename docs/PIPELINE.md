@@ -31,7 +31,7 @@ to write them from this document:
 ```console
 $ muxa work init
 ◇  Describe the work pipeline you want
-│  cal-* tickets: codex planner, codex implementer, claude reviewer
+│  eng-* tickets: codex planner, codex implementer, claude reviewer
 ```
 
 muxa spends one headless agent turn turning that sentence into TOML, then
@@ -89,7 +89,7 @@ unless you pass `--overwrite`:
 ```console
 muxa work preset list                              # what each preset staffs
 muxa work preset apply solo --route '.*'           # [pipeline.solo] + a catch-all [[route]]
-muxa work preset apply triad --route '^cal-'       # add a second pipeline and its route
+muxa work preset apply triad --route '^eng-'       # add a second pipeline and its route
 muxa work preset apply pair --overwrite            # replace [pipeline.pair] you edited
 muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
 ```
@@ -127,9 +127,9 @@ muxa work pipeline set pair --from-json pair.json     # {"pipeline","replaced","
 muxa work options --json | jq '.pipelines[] | select(.name == "triad")' \
   | muxa work pipeline set triad --from-json -        # round trip, unchanged
 muxa work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
-muxa work route set --match '^cal-' --pipeline triad --position 0   # {"match","position","created","config_path"}
+muxa work route set --match '^eng-' --pipeline triad --position 0   # {"match","position","created","config_path"}
 muxa work route set --match '.*' --clear-workspace    # unset flags change nothing
-muxa work route remove --match '^cal-'                # {"match","removed","config_path"}
+muxa work route remove --match '^eng-'                # {"match","removed","config_path"}
 ```
 
 Prefer to write it by hand? The annotated reference is in
@@ -162,7 +162,7 @@ a token in the environment. Adding a provider is a prompt, not a release.
 
 ```toml
 [ticket.source.linear]
-match  = '^cal-\d+$'
+match  = '^eng-\d+$'
 prompt = '''
 Look up Linear issue {{id}} using the linear skill and answer with one JSON
 object and nothing else:
@@ -185,7 +185,7 @@ the cache; `--no-ticket` skips lookup entirely and launches on the id alone.
 
 ```toml
 [[route]]
-match     = '^cal-'
+match     = '^eng-'
 workspace = 'webapp'
 pipeline  = 'triad'
 
@@ -216,7 +216,7 @@ instead of `[route.worktree]`:
 
 ```toml
 [[route]]
-match   = '^cal-'
+match   = '^eng-'
 cwd     = '~/workspace-agent/{{id}}'
 prepare = 'workspace-tool create {{id}} {{ticket.branch}}'
 ```

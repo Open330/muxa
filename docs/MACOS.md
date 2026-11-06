@@ -88,7 +88,7 @@ pipelines.
 
 **Start Work** collects the stable Work id, project folder, optional
 workspace, pipeline, external issue reference, and initial task. Typing a
-Work id shows the route it would take (`Route ^cal- → pipeline triad →
+Work id shows the route it would take (`Route ^eng- → pipeline triad →
 workspace webapp → own git worktree`), the workspace field suggests the
 route's workspace and existing local sessions, the pipeline is a picker whose
 default is the route's choice, the selected pipeline's stage diagram is shown
