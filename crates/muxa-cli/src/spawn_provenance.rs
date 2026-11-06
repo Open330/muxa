@@ -3,6 +3,7 @@ use anyhow::{Context, Result};
 use muxa::backend::PaneBackend;
 use muxa::collaboration::CollaborationEndpoint;
 use muxa::tmux::layout::SpawnProvenance;
+use std::io::Write;
 use std::path::Path;
 
 /// Resolve through muxad so shared app-server environments cannot invent a parent.
@@ -93,7 +94,14 @@ fn save(pane: &str, provenance: &SpawnProvenance) -> Result<()> {
 }
 
 fn archive(directory: &Path, provenance: &SpawnProvenance, json: &[u8]) -> Result<()> {
-    use std::io::Write;
+    if muxa::launch_identity::read_archive(directory, &provenance.launch_id).is_some() {
+        muxa::launch_identity::add_creation(
+            directory,
+            &provenance.launch_id,
+            &serde_json::from_slice(json)?,
+        )?;
+        return Ok(());
+    }
     std::fs::create_dir_all(directory)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)

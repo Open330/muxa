@@ -106,6 +106,31 @@ impl Dialect {
         }
     }
 
+    /// Export explicit values into the new execution environment, replacing inherited values.
+    pub fn exec_line_with_env<S: AsRef<str>>(
+        self,
+        argv: &[S],
+        env: &[(&str, &str)],
+    ) -> Result<String, String> {
+        let mut lines = Vec::new();
+        for (key, value) in env {
+            if key.is_empty()
+                || !key.chars().enumerate().all(|(i, c)| {
+                    c == '_' || c.is_ascii_alphabetic() || (i > 0 && c.is_ascii_digit())
+                })
+                || value.contains('\0')
+            {
+                return Err("invalid execution environment".into());
+            }
+            lines.push(match self {
+                Self::Posix => format!("export {key}={}", self.quote(value)),
+                Self::PowerShell => format!("$env:{key}={}", self.quote(value)),
+            });
+        }
+        lines.push(self.exec_line(argv));
+        Ok(lines.join("; "))
+    }
+
     /// `cd` into `path`.
     #[must_use]
     pub fn cd(self, path: &str) -> String {
@@ -325,5 +350,44 @@ mod tests {
             Dialect::PowerShell.cd(r"F:\work's"),
             r"Set-Location -LiteralPath 'F:\work''s'"
         );
+    }
+}
+
+#[cfg(test)]
+mod launch_env_tests {
+    use super::*;
+    #[test]
+    fn exported_value_replaces_inheritance_and_quotes_are_literal() {
+        let value = "fresh ' $HOME `id`\nnext line";
+        let arg = "prompt '\n$(id)";
+        let line = Dialect::Posix
+            .exec_line_with_env(
+                &[
+                    "sh",
+                    "-c",
+                    "printf '%s\\0%s' \"$MUXA_LAUNCH_ID\" \"$1\"",
+                    "unused",
+                    arg,
+                ],
+                &[("MUXA_LAUNCH_ID", value)],
+            )
+            .unwrap();
+        #[cfg(unix)]
+        {
+            let output = std::process::Command::new("sh")
+                .args(["-c", &line])
+                .env("MUXA_LAUNCH_ID", "inherited")
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, format!("{value}\0{arg}").as_bytes());
+        }
+        assert!(Dialect::Posix
+            .exec_line_with_env(&["true"], &[("BAD; id", "x")])
+            .is_err());
+        assert!(!Dialect::PowerShell
+            .exec_line_with_env(&["claude"], &[("MUXA_LAUNCH_ID", "new")])
+            .unwrap()
+            .contains("exec "));
     }
 }

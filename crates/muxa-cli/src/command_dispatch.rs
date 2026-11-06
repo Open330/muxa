@@ -6,7 +6,7 @@ use super::{
     fleet_cli, graph, handle_hook, init, logs, mcp, message_skill, mux_control, onboarding,
     parse_args, paths, peek, relay, reload, run_agent_cmd, run_window_cmd, run_work_cmd,
     run_workspace_cmd, set_icon_set, sidebar, start, stats, swap, timeline, upgrade, worker_cmd,
-    AgentCmd, AskOptions, Client, Cmd, Config, Context, ProcCmd, RegistryCmd, Result,
+    AgentCmd, AgentViewCmd, AskOptions, Client, Cmd, Config, Context, ProcCmd, RegistryCmd, Result,
     WatchInvocation, WindowCmd, WorkCmd, WorkspaceCmd, CALLER_CLIENT,
 };
 
@@ -110,6 +110,13 @@ pub(super) async fn main() -> Result<()> {
     let invalidation_client = Client::new(socket.clone());
     let result = match cmd {
         Cmd::Start => start::run(&client, cfg, socket, config_path).await,
+        Cmd::AgentView(AgentViewCmd::Agents(_)) => {
+            println!(
+                "{}",
+                serde_json::to_string(&client.agents_with_launch_identity().await?)?
+            );
+            Ok(())
+        }
         Cmd::Status { theme, flat, json } => cmd_status(&client, &cfg, theme, flat, json).await,
         Cmd::StatusLine {
             pane,

@@ -15,6 +15,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
         &[
             "start",
             "status",
+            "agents",
             "watch",
             "dashboard",
             "attend",

@@ -244,6 +244,8 @@ pub(super) async fn handle(
                 RequestBody::Ingest {
                     mut event,
                     ask_entry,
+                    launch_id,
+                    ..
                 } => {
                     if ask_entry.is_some() {
                         event.id_mut().pane = None;
@@ -268,6 +270,11 @@ pub(super) async fn handle(
                     if in_scope {
                         tracing::debug!(?event, "ingest");
                         store.apply_with_ask(&event, ask_entry.as_deref()).await;
+                        if ask_entry.is_none() {
+                            store
+                                .observe_launch_claim(&event, launch_id.as_deref())
+                                .await;
+                        }
                         if ask_entry.is_none() {
                             if let Err(error) = collaboration.observe_worker_hook(event.id()).await
                             {
@@ -364,9 +371,17 @@ pub(super) async fn handle(
                         Err(error) => Response::err(error),
                     }
                 }
-                RequestBody::Snapshot => {
+                RequestBody::Snapshot { launch_identity } => {
                     kind = "snapshot";
-                    Response::with_agents(store.snapshot().await)
+                    let agents = store.snapshot().await;
+                    let identities = if launch_identity {
+                        Some(Arc::new(store.launch_identity_snapshot(&agents).await))
+                    } else {
+                        None
+                    };
+                    let mut response = Response::with_agents(agents);
+                    response.launch_identities = identities;
+                    response
                 }
                 RequestBody::PipelineRuns => {
                     kind = "pipeline_runs";
