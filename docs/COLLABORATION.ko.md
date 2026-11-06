@@ -38,8 +38,14 @@ pane·alias 직접 지정 메시지는 primary에서 대기합니다. 작업을 
 
 사용자가 에이전트에게 primary로 보내라고 지시했다면, 에이전트는 `muxa msg send`나
 `muxa peer`에 `--user-authorized`를 붙입니다(MCP는 `user_authorized=true`). 그러면
-primary는 operator console에서 온 작업처럼 다음 idle 때 요청을 받고, 지정한 primary가
-worker로 바뀌지도 않습니다. 보호 기능은 요청하지 않은 에이전트 작업을 막기 위한
+primary는 수락 단계 없이 요청을 받고, 지정한 primary가 worker로 바뀌지도 않습니다.
+muxad는 이 요청을 사람의 터미널에 입력하지 않습니다. 보내지 않은 입력이 남아 있으면
+요청과 섞여 함께 제출될 수 있기 때문입니다. 대신 그 세션의 provider hook이 다음 턴
+경계에서 넘깁니다. 진행 중인 턴이 끝날 때 이어서 처리하거나(Claude Code·Codex `Stop`
+hook), 사용자의 다음 프롬프트에 함께 붙습니다(`UserPromptSubmit`). 다가올 턴 없이
+idle 상태인 primary에서는 그때까지 대기합니다. 이 옵션은 그 요청을 전달하라는 사용자
+지시를 뜻할 뿐 실행 권한을 주지 않습니다. Fleet 전송은 중계와 대상이 협상할 수 있을
+때까지 이 옵션을 거부합니다. 보호 기능은 요청하지 않은 에이전트 작업을 막기 위한
 것이지 사용자의 지시를 다시 묻기 위한 것이 아니므로, 대상 세션에서 다시 수락할 필요가
 없습니다. 이 허가는 보내는 쪽이 사용자를 대신해 주장하는 것이며, 요청에
 `user_authorized: true`로 기록됩니다. `collaboration_user_authorized_v1`이 없는

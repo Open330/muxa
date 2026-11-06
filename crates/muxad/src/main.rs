@@ -2858,6 +2858,12 @@ async fn wake_idle_collaboration_peers_with_inflight(
         if !request.bypasses_primary_protection() && !recipient.accepts_peer_work() {
             continue;
         }
+        // Never write into a human primary's terminal for agent work, even
+        // user-authorized: its provider hook hands the request over at the
+        // next turn boundary instead (`muxa hook … --event stop`).
+        if request.awaits_turn_boundary(recipient) {
+            continue;
+        }
         let wake_key = collaboration_wake_key(recipient);
         if wake_inflight.contains(&wake_key) {
             continue;

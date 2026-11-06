@@ -125,6 +125,9 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             let ev = run_hook::<ClaudeAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
             best_effort_default_alias(client, &ev).await;
+            if let Some(output) = turn_boundary_delivery(client, &ev, &event).await {
+                println!("{output}");
+            }
         }
         HookCmd::ClaudeStatusline { forward } => {
             if let Some(cmd) = forward {
@@ -179,6 +182,9 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             let ev = run_hook::<CodexAdapter, _>(&event, &mut std::io::stdin())?;
             best_effort_ingest(client, &ev).await;
             best_effort_default_alias(client, &ev).await;
+            if let Some(output) = turn_boundary_delivery(client, &ev, &event).await {
+                println!("{output}");
+            }
         }
         HookCmd::Gemini { event } => {
             let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
@@ -209,4 +215,133 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Budget for handing user-authorized work to a human primary at its turn
+/// boundary. This runs inside the agent's Stop / `UserPromptSubmit` hook, so a
+/// slow daemon must cost the request one turn of delay, never the agent its
+/// turn.
+const TURN_BOUNDARY_IPC_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The hook output that hands queued user-authorized requests to this
+/// session at a turn boundary, or `None` when there is nothing to hand over.
+///
+/// muxad never types such a request into a human primary's terminal, where
+/// it could merge with an unsent draft. Instead the provider's own hook
+/// carries it: at `stop` the turn continues with the request (Stop
+/// `decision: block`), at `user_prompt_submit` it rides along with the
+/// user's prompt as additional context. Nothing is written to the composer.
+pub(super) async fn turn_boundary_delivery(
+    client: &Client,
+    ev: &muxa::event::AgentEvent,
+    event: &str,
+) -> Option<String> {
+    if event != "stop" && event != "user_prompt_submit" {
+        return None;
+    }
+    let requests = tokio::time::timeout(
+        TURN_BOUNDARY_IPC_TIMEOUT,
+        claim_turn_boundary_requests(client, ev.id()),
+    )
+    .await
+    .ok()
+    .flatten()?;
+    turn_boundary_output(event, &requests)
+}
+
+async fn claim_turn_boundary_requests(
+    client: &Client,
+    id: &muxa::event::AgentId,
+) -> Option<Vec<muxa::collaboration::CollaborationRequest>> {
+    let pane = id.pane.clone()?;
+    // No capability probe on the agent's critical path: an older daemon
+    // never stores `user_authorized`, so it has nothing to hand over here.
+    let socket = id
+        .tmux_socket
+        .as_deref()
+        .map(|path| muxa::backend::pane_endpoint_identity(Some(&pane), path));
+    let origin = muxa::collaboration::CollaborationOrigin {
+        exact_session: true,
+        pane,
+        socket,
+        console: false,
+        agent_session_id: Some(id.session_id.clone()),
+    };
+    let incoming = client
+        .collaboration_list(&origin, muxa::collaboration::RequestMailbox::Incoming)
+        .await
+        .ok()?;
+    let mut claimed = Vec::new();
+    for request in incoming.iter().filter(|request| {
+        request.status == muxa::collaboration::RequestStatus::Queued
+            && request.awaits_turn_boundary(&request.to)
+    }) {
+        if let Ok(requests) = client.collaboration_claim(&origin, &request.id).await {
+            claimed.extend(requests.into_iter().filter(|r| r.id == request.id));
+        }
+    }
+    (!claimed.is_empty()).then_some(claimed)
+}
+
+fn turn_boundary_output(
+    event: &str,
+    requests: &[muxa::collaboration::CollaborationRequest],
+) -> Option<String> {
+    if requests.is_empty() {
+        return None;
+    }
+    let instructions: Vec<_> = requests
+        .iter()
+        .map(muxa::collaboration::instruction::inbox_instruction)
+        .collect();
+    let text = format!(
+        "Muxa delivered {} request(s) the user authorized for this session. Each is already claimed for you: \
+         handle it within its kind, work_mode and paths, and when expects_reply is true reply exactly once \
+         (muxa_reply or `muxa msg reply REQUEST_ID`). Requests: {}",
+        requests.len(),
+        serde_json::Value::Array(instructions)
+    );
+    let output = if event == "stop" {
+        serde_json::json!({"decision": "block", "reason": text})
+    } else {
+        serde_json::json!({"hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": text,
+        }})
+    };
+    Some(output.to_string())
+}
+
+#[cfg(test)]
+mod turn_boundary_tests {
+    use super::turn_boundary_output;
+
+    fn request() -> muxa::collaboration::CollaborationRequest {
+        let mut request = crate::collaboration_output::fixture();
+        request.id = "req_1".into();
+        request.body = "plan the import".into();
+        request.user_authorized = true;
+        request
+    }
+
+    #[test]
+    fn stop_continues_the_turn_and_prompt_submit_adds_context() {
+        let requests = [request()];
+        let stop: serde_json::Value =
+            serde_json::from_str(&turn_boundary_output("stop", &requests).unwrap()).unwrap();
+        assert_eq!(stop["decision"], "block");
+        assert!(stop["reason"].as_str().unwrap().contains("plan the import"));
+        let submit: serde_json::Value =
+            serde_json::from_str(&turn_boundary_output("user_prompt_submit", &requests).unwrap())
+                .unwrap();
+        assert_eq!(
+            submit["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert!(submit["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .unwrap()
+            .contains("req_1"));
+        assert!(turn_boundary_output("stop", &[]).is_none());
+    }
 }

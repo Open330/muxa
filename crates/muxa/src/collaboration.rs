@@ -981,6 +981,14 @@ impl CollaborationRequest {
     pub fn bypasses_primary_protection(&self) -> bool {
         self.from.console || self.user_authorized
     }
+
+    /// Agent work the user authorized for a human's own session. It is
+    /// delivered at that session's turn boundary by its provider hook and
+    /// never typed into its terminal: the human may have an unsent draft
+    /// there, and pasting plus Enter would submit it with the request.
+    pub fn awaits_turn_boundary(&self, recipient: &Participant) -> bool {
+        self.user_authorized && !self.from.console && !recipient.accepts_peer_work()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -3584,6 +3592,7 @@ impl CollaborationStore {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if (!request.bypasses_primary_protection() && !caller.accepts_peer_work())
+                || request.awaits_turn_boundary(caller)
                 || request.status != RequestStatus::Queued
                 || request.notified_at.is_some()
             {

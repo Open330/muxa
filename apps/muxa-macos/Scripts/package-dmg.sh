@@ -140,16 +140,25 @@ notarize() {
         [ -n "${NOTARY_ISSUER_ID:-}" ] || fail "NOTARY_KEY_PATH needs NOTARY_ISSUER_ID"
         args+=(--key "$NOTARY_KEY_PATH" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID")
     else
-        log "No notarization credentials — skipping (Gatekeeper will refuse this DMG)"
-        return 1
+        fail "notarize called without credentials"
     fi
     [ -n "${MUXA_TEAM_ID:-}" ] && args+=(--team-id "$MUXA_TEAM_ID")
     log "Submitting for notarization; this waits for Apple"
     xcrun "${args[@]}"
 }
 
+have_notary_credentials() {
+    [ -n "${MUXA_NOTARY_PROFILE:-}" ] || [ -n "${NOTARY_KEY_PATH:-}" ]
+}
+
 if [ -n "${MUXA_SIGN_IDENTITY:-}" ] && [ "${MUXA_SKIP_NOTARIZE:-}" != "1" ]; then
-    if notarize "$DMG"; then
+    if ! have_notary_credentials; then
+        # A developer packaging run without credentials: say so plainly.
+        log "No notarization credentials — skipping (Gatekeeper will refuse this DMG)"
+    else
+        # With credentials, a failed submission must fail the release rather
+        # than leave a signed but unnotarized DMG under the release name.
+        notarize "$DMG" || fail "notarization of the DMG failed"
         # Homebrew and anyone who drags the app out copy only Muxa.app, so a
         # ticket stapled to the DMG alone stays behind. Without its own
         # ticket the app depends on an online notarization check at first

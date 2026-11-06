@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A user-authorized request to a human's primary session is no longer typed
+  into its terminal, where it could merge with an unsent draft and be
+  submitted with it. The session's Claude Code or Codex hook hands it over
+  at the next turn boundary instead: the end of the current turn, or the
+  user's next prompt.
+- Fleet sends refuse `user_authorized` until relay and destination can
+  negotiate it, instead of silently dropping the flag.
+- The macOS release fails when the first notarization submission fails,
+  instead of shipping a signed but unnotarized DMG.
+
 ## [0.9.7] - 2026-11-06
 
 ### Added

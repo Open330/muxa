@@ -69,7 +69,9 @@ with message lists and accept just one with `muxa_inbox(request_id=...)` only wh
 the human task permits it; do not promote a human session merely to drain inbox.
 When the user explicitly tells you to deliver to a primary session, pass
 `user_authorized=true` (CLI `--user-authorized`): the primary takes the request
-on its next idle turn, an exact primary target is kept instead of rerouted, and
+at its next turn boundary (end of its current turn or the user's next prompt)
+through its provider hook, never by typing into its terminal; an exact
+primary target is kept instead of rerouted, and
 the flag is recorded on the request. Never ask the user to accept it again on
 the target.
 

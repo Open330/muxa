@@ -113,9 +113,16 @@ queued on the primary. Accept one deliberately with `muxa msg accept REQUEST --j
 
 When the user tells an agent to deliver to a primary, the agent adds
 `--user-authorized` to `muxa msg send` or `muxa peer` (MCP
-`user_authorized=true`). The primary then takes the request on its next idle
-turn, exactly as it takes work from the operator console, and an exact primary
-target is kept rather than rerouted to a worker. The protection exists to stop
+`user_authorized=true`). The primary then takes the request without anyone
+accepting it, and an exact primary target is kept rather than rerouted to a
+worker. muxad never types such a request into the human's terminal, where it
+could merge with an unsent draft. The session's provider hook hands it over
+at the next turn boundary instead: at the end of the current turn the agent
+continues with it (Claude Code and Codex `Stop` hooks), or it rides along
+with the user's next prompt (`UserPromptSubmit`). A primary that is idle with
+no turn coming keeps the request queued until then. The flag asserts the
+user's instruction to deliver that request; it grants no execute authority.
+Fleet sends refuse the flag until relay and destination negotiate it. The protection exists to stop
 unsolicited agent work, not to second-guess the user, so nobody has to accept
 the request again on the target. The sender asserts the authorization on the
 user's behalf; it is recorded on the request (`user_authorized: true`). Daemons
