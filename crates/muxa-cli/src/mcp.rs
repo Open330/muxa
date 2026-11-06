@@ -61,7 +61,7 @@ const DEFAULT_WAIT_SECS: u64 = 30;
 const DEFAULT_SPAWN_GRACE_SECS: u64 = 10;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
-const MAX_WAIT_SECS: u64 = 600;
+pub(crate) const MAX_WAIT_SECS: u64 = 600;
 /// Compatibility polling is used only with controllers lacking shared reply waits.
 const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 

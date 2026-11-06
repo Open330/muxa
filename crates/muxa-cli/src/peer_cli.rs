@@ -25,7 +25,7 @@ pub(crate) struct Args {
     /// Wait for the structured reply instead of returning its durable request id.
     #[arg(long)]
     pub wait: bool,
-    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=3600))]
+    #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=crate::mcp::MAX_WAIT_SECS))]
     pub timeout_secs: u64,
     #[arg(long = "path")]
     pub paths: Vec<String>,
