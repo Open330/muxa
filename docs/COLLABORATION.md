@@ -110,6 +110,17 @@ for generic work. Set `context_bound=true` only when the exact target conversati
 is required. Those requests and low-level exact-pane/alias messages remain
 queued on the primary. Accept one deliberately with `muxa msg accept REQUEST --json` or
 `muxa_inbox(request_id=REQUEST)`. Already claimed work stays with its owner.
+
+When the user tells an agent to deliver to a primary, the agent adds
+`--user-authorized` to `muxa msg send` or `muxa peer` (MCP
+`user_authorized=true`). The primary then takes the request on its next idle
+turn, exactly as it takes work from the operator console, and an exact primary
+target is kept rather than rerouted to a worker. The protection exists to stop
+unsolicited agent work, not to second-guess the user, so nobody has to accept
+the request again on the target. The sender asserts the authorization on the
+user's behalf; it is recorded on the request (`user_authorized: true`). Daemons
+without `collaboration_user_authorized_v1` refuse the flag instead of queuing
+the request silently.
 New peers use configured provider defaults; conversation history, exact model
 and account settings are not cloned from the primary.
 

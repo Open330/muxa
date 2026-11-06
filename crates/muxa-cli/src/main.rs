@@ -608,6 +608,12 @@ enum MsgCmd {
         /// wake you. Its work and reply are unchanged. Repeatable.
         #[arg(long = "withdraw", value_name = "REQUEST")]
         withdraw: Vec<String>,
+        /// The user told you to deliver this: a protected primary (a human's
+        /// own session) takes it now instead of holding it for `msg accept`.
+        /// Use only on the user's explicit instruction; it is recorded on
+        /// the request.
+        #[arg(long)]
+        user_authorized: bool,
         /// Print a compact acknowledgement without repeating request/reply bodies.
         #[arg(long)]
         json: bool,

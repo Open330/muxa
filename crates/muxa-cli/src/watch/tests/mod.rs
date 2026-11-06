@@ -272,6 +272,7 @@ pub(super) fn fake_watch_collaboration_request(
 ) -> CollaborationRequest {
     let now = OffsetDateTime::now_utc();
     CollaborationRequest {
+        user_authorized: false,
         task_contract: None,
         attempt: None,
         supersedes_request_id: None,
@@ -923,6 +924,7 @@ pub(super) const COLLAB_FIXTURE_BODY: &str =
 
 pub(super) fn collab_request(to_pane: &str) -> CollaborationRequest {
     CollaborationRequest {
+        user_authorized: false,
         task_contract: None,
         attempt: None,
         supersedes_request_id: None,

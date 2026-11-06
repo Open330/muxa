@@ -1324,6 +1324,7 @@ async fn run_watch_collaboration_broadcast(
     for (pane, label) in recipients {
         let pane = pane.clone();
         let request = NewRequest {
+            user_authorized: false,
             task_contract: None,
             supersedes_request_id: None,
             dispatch_id: None,
@@ -1398,6 +1399,7 @@ async fn run_watch_collaboration_single(
                 }
             };
             let request = NewRequest {
+                user_authorized: false,
                 task_contract: None,
                 supersedes_request_id: None,
                 dispatch_id: None,

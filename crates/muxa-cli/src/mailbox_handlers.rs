@@ -436,9 +436,18 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             no_reply,
             notify,
             withdraw,
+            user_authorized,
             json,
             full,
         } => {
+            if user_authorized {
+                require_capability(
+                    client,
+                    muxa::collaboration::USER_AUTHORIZED_DELIVERY_CAPABILITY,
+                    "msg send --user-authorized",
+                )
+                .await?;
+            }
             if !withdraw.is_empty() {
                 require_capability(
                     client,
@@ -495,6 +504,7 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                         links,
                         withdraw_reply_wakes: withdraw,
                         recipient_slot: None,
+                        user_authorized,
                     },
                     if full {
                         muxa::collaboration::CollaborationReadView::Full
@@ -1068,7 +1078,9 @@ pub(super) fn print_collaboration_receipt(
     }
     match request.status {
         RequestStatus::Cancelled => println!("cancelled  {}", request.id),
-        RequestStatus::Queued if !request.from.console && !request.to.accepts_peer_work() => {
+        RequestStatus::Queued
+            if !request.bypasses_primary_protection() && !request.to.accepts_peer_work() =>
+        {
             println!(
                 "queued  {}  to {}  (protected primary; explicit acceptance required)",
                 request.id,

@@ -2855,7 +2855,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
             continue;
         };
         let recipient = &recipient;
-        if !request.from.console && !recipient.accepts_peer_work() {
+        if !request.bypasses_primary_protection() && !recipient.accepts_peer_work() {
             continue;
         }
         let wake_key = collaboration_wake_key(recipient);
@@ -5312,6 +5312,7 @@ mod tests {
                 sender,
                 recipient,
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,
@@ -5650,6 +5651,7 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,
@@ -5715,6 +5717,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,
@@ -5786,6 +5789,7 @@ mod tests {
                 console,
                 recipient.clone(),
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,
@@ -5878,6 +5882,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,
@@ -5964,6 +5969,7 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        user_authorized: false,
                         task_contract: None,
                         supersedes_request_id: None,
                         dispatch_id: None,
@@ -6116,6 +6122,7 @@ mod tests {
                     sender,
                     recipient.clone(),
                     NewRequest {
+                        user_authorized: false,
                         task_contract: None,
                         supersedes_request_id: None,
                         dispatch_id: None,
@@ -6544,6 +6551,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,
@@ -6679,6 +6687,7 @@ mod tests {
                 console.clone(),
                 recipient.clone(),
                 NewRequest {
+                    user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
                     dispatch_id: None,

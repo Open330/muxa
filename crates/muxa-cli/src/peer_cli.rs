@@ -19,6 +19,10 @@ pub(crate) struct Args {
     /// Require this exact conversation; protected primaries then need explicit acceptance.
     #[arg(long)]
     pub context_bound: bool,
+    /// The user told you to deliver to this exact session: a protected
+    /// primary takes it now instead of holding it for acceptance.
+    #[arg(long)]
+    pub user_authorized: bool,
     /// Reuse workers only; do not create one when missing.
     #[arg(long)]
     pub no_spawn: bool,
@@ -40,6 +44,9 @@ pub(crate) async fn run(client: &Client, config: &Config, args: Args) -> Result<
     // Omission preserves the user's auto_spawn_workers policy.
     if args.no_spawn {
         request["spawn_if_missing"] = json!(false);
+    }
+    if args.user_authorized {
+        request["user_authorized"] = json!(true);
     }
     let result = crate::mcp::call_peer(client, &request, config).await;
     print_result(&result)

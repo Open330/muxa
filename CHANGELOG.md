@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An agent the user told to deliver work to a protected primary session can
+  do so: `muxa msg send --user-authorized`, `muxa peer --user-authorized`, or
+  MCP `user_authorized=true`. The primary takes the request on its next idle
+  turn like operator-console work, instead of holding it until someone
+  accepts it on the target. The flag is recorded on the request.
+
 ### Fixed
 
 - macOS daemon installation preserves the installing shell's PATH for headless

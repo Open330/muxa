@@ -1643,6 +1643,7 @@ mod tests {
             request_id: "relay-1".into(),
             pane: pane.clone(),
             request: Box::new(NewRequest {
+                user_authorized: false,
                 task_contract: None,
                 supersedes_request_id: None,
                 dispatch_id: None,

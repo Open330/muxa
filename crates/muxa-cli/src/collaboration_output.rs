@@ -52,7 +52,7 @@ pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
         value["delegation_parent"] = json!(parent);
     }
     if request.status == RequestStatus::Queued
-        && !request.from.console
+        && !request.bypasses_primary_protection()
         && !request.to.accepts_peer_work()
     {
         value["deferred"] = json!("protected_primary");

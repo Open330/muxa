@@ -233,6 +233,7 @@ fn dispatch_matches(
         && existing.artifacts == input.artifacts
         && existing.links == input.links
         && existing.air_artifacts == input.air_artifacts
+        && existing.user_authorized == input.user_authorized
         && existing.withdrew_reply_wakes == normalize_withdrawals(&input.withdraw_reply_wakes)
 }
 
@@ -752,6 +753,9 @@ pub const MAX_REPLY_WAKE_WITHDRAWALS: usize = 16;
 /// alone or alongside a send. A client must not send `withdraw_reply_wakes`
 /// to a daemon without it, which would silently ignore the field.
 pub const REPLY_WAKE_WITHDRAW_CAPABILITY: &str = "collaboration_reply_withdraw_v1";
+/// The daemon honours `user_authorized` on a new request: a protected
+/// primary takes it without by-id acceptance.
+pub const USER_AUTHORIZED_DELIVERY_CAPABILITY: &str = "collaboration_user_authorized_v1";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -961,6 +965,22 @@ pub struct CollaborationRequest {
     pub superseded_by: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub late_replies: Vec<CollaborationReply>,
+    /// The user explicitly told the sending agent to deliver this request,
+    /// so a protected primary session takes it like a request from the
+    /// operator console instead of holding it for by-id acceptance. The
+    /// sender asserts this on the user's behalf; it is kept on the request
+    /// as the audit record of that claim.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_authorized: bool,
+}
+
+impl CollaborationRequest {
+    /// Whether a protected primary takes this request without by-id
+    /// acceptance: it came from the operator console, or the sending agent
+    /// delivered it on the user's explicit instruction.
+    pub fn bypasses_primary_protection(&self) -> bool {
+        self.from.console || self.user_authorized
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1134,6 +1154,13 @@ pub struct NewRequest {
     pub task_contract: Option<TaskContract>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supersedes_request_id: Option<String>,
+    /// The user explicitly told the sending agent to deliver this request,
+    /// so a protected primary session takes it like a request from the
+    /// operator console instead of holding it for by-id acceptance. The
+    /// sender asserts this on the user's behalf; it is kept on the request
+    /// as the audit record of that claim.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_authorized: bool,
 }
 
 impl Default for NewRequest {
@@ -1162,6 +1189,7 @@ impl Default for NewRequest {
             recipient_slot: None,
             task_contract: None,
             supersedes_request_id: None,
+            user_authorized: false,
         }
     }
 }
@@ -3233,6 +3261,7 @@ impl CollaborationStore {
             supersedes_request_id: input.supersedes_request_id,
             superseded_by: None,
             late_replies: Vec::new(),
+            user_authorized: input.user_authorized,
             dispatch_id: input.dispatch_id,
             source_node_id: input.source_node_id,
             delegation_parent: input.delegation_parent,
@@ -3466,7 +3495,7 @@ impl CollaborationStore {
                     addresses(&r.to, caller)
                         && selected.is_none_or(|id| r.id == id)
                         && (selected.is_some()
-                            || r.from.console
+                            || r.bypasses_primary_protection()
                             || caller.accepts_peer_work()
                             || r.status == RequestStatus::Claimed)
                         && matches!(r.status, RequestStatus::Queued | RequestStatus::Claimed)
@@ -3490,7 +3519,7 @@ impl CollaborationStore {
                 if addresses(&request.to, caller)
                     && selected.is_none_or(|id| request.id == id)
                     && (selected.is_some()
-                        || request.from.console
+                        || request.bypasses_primary_protection()
                         || caller.accepts_peer_work()
                         || request.status == RequestStatus::Claimed)
                     && matches!(
@@ -3554,7 +3583,7 @@ impl CollaborationStore {
             if !addresses(&request.to, caller) {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
-            if (!request.from.console && !caller.accepts_peer_work())
+            if (!request.bypasses_primary_protection() && !caller.accepts_peer_work())
                 || request.status != RequestStatus::Queued
                 || request.notified_at.is_some()
             {
