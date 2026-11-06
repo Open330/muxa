@@ -147,6 +147,23 @@ notarize() {
     xcrun "${args[@]}"
 }
 
+# Stapling fetches the ticket from Apple's CloudKit endpoint, which drops
+# connections now and then (v0.9.8 failed once with NSURLErrorDomain -1005
+# after both notarizations were accepted). Retry instead of failing the
+# release; a ticket that genuinely does not exist still fails every attempt.
+staple() {
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if xcrun stapler staple "$1"; then
+            xcrun stapler validate "$1"
+            return 0
+        fi
+        log "Stapling $(basename "$1") failed (attempt $attempt); retrying"
+        sleep $((attempt * 10))
+    done
+    fail "could not staple $(basename "$1")"
+}
+
 have_notary_credentials() {
     [ -n "${MUXA_NOTARY_PROFILE:-}" ] || [ -n "${NOTARY_KEY_PATH:-}" ]
 }
@@ -166,13 +183,11 @@ if [ -n "${MUXA_SIGN_IDENTITY:-}" ] && [ "${MUXA_SKIP_NOTARIZE:-}" != "1" ]; the
         # the app. The first submission registered the app's code hash, so
         # staple the app, rebuild the DMG around it, and notarize that.
         log "Stapling the ticket to Muxa.app"
-        xcrun stapler staple "$APP"
-        xcrun stapler validate "$APP"
+        staple "$APP"
         build_dmg
         notarize "$DMG" || fail "the rebuilt DMG failed notarization"
         log "Stapling the ticket to the DMG"
-        xcrun stapler staple "$DMG"
-        xcrun stapler validate "$DMG"
+        staple "$DMG"
         log "Gatekeeper assessment"
         # The real test: what a stranger's Mac decides about these files.
         spctl -a -vvv -t install "$DMG" || fail "Gatekeeper refused the DMG"
