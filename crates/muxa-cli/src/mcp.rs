@@ -6413,7 +6413,10 @@ mod tests {
         let client = Client::new(socket);
         let room = client.collaboration_context(&origin).await.unwrap();
         mailbox
-            .set_purpose(&room.peers[0], muxa::collaboration::LaunchPurpose::Worker)
+            .set_purpose(
+                room.peers.iter().find(|peer| peer.pane == "%2").unwrap(),
+                muxa::collaboration::LaunchPurpose::Worker,
+            )
             .await
             .unwrap();
         let tool = |target: &str| {
