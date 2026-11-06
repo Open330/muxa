@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-11-06
+
+### Fixed
+
+- Muxa.app installed with Homebrew opens even when macOS cannot reach
+  Apple's notarization service. The release now staples the notarization
+  ticket to Muxa.app itself, not only to the DMG it ships in, so the app
+  stops failing with "Apple could not verify Muxa.app is free of malware".
+- Muxa.app no longer offers disabled Fleet hosts as Work targets or polls
+  them for Work options.
+
+### Changed
+
+- An open watch history no longer reloads when only a worker's lifecycle
+  changed; it opts into request-row invalidations. Ordinary send and cancel
+  receipts from the CLI, MCP and watch ask for metadata instead of echoing
+  the full instructions back over IPC. `--full`, synchronous peer calls and
+  Fleet relays keep the full response.
+
 ## [0.9.5] - 2026-11-05
 
 ### Added
