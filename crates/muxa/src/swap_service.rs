@@ -2184,7 +2184,7 @@ fn reason_code(outcome: &SwapOutcome) -> &'static str {
         ("more than one live pane", "ambiguous_target"),
         ("no live pane", "unresolved_target"),
         ("no agent muxa knows", "no_agent"),
-        ("aas cannot switch", "provider_unsupported"),
+        ("account switching is not supported", "provider_unsupported"),
         ("not in a multiplexer pane", "no_pane"),
     ];
     if outcome.status == SwapStatus::Failed {

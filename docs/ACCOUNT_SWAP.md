@@ -19,9 +19,10 @@ Codex) in this order:
    `aas candidates --json`, launches go through `aas e <account>`.
 3. **None.** New agents start on whatever account the CLI is logged into,
    and a swap reports that there is no account to move to and touches
-   nothing. A capped agent is still recovered: the `resume-after-limit` rule
-   (see [Automation](AUTOMATION.md)) waits for its reset and resumes it, and
-   needs no accounts at all.
+   nothing. A capped agent can still be recovered: the `resume-after-limit`
+   rule (see [Automation](AUTOMATION.md)) waits for its reset and resumes it,
+   and needs no accounts at all. It is installed disabled; turn it on with
+   `muxa automation enable resume-after-limit`.
 
 ```toml
 [[accounts.claude]]
@@ -43,8 +44,8 @@ to recognise the account. `[accounts]` is host-local: config sync never
 copies it.
 
 `auto` over configured accounts follows a fixed rule: a new agent starts on
-the first listed account, and a swap moves an agent to the next listed
-account other than its own, skipping the one it was capped on. muxa does not
+the first listed account, and a swap moves an agent to the first eligible
+listed account other than its own, skipping the one it was capped on. muxa does not
 yet rank configured accounts by the usage it observes on other agents: it
 cannot yet tell deterministically which account a running agent's limit
 reports belong to. Ranking by observed usage is coming in a follow-up (#367).
@@ -142,7 +143,7 @@ example a Codex with a nested Claude child).
 When no other account has quota left, the agent is skipped and the report says
 why each account was passed over. When the provider has no account backend at
 all, the swap fails for that agent with nothing done and says how to configure
-one; `resume-after-limit` still resumes it after its reset.
+one; with `resume-after-limit` enabled it is resumed after its reset.
 
 ## Options and `[swap]`
 
@@ -328,12 +329,13 @@ swap it finds unfinished to its job's end; it never starts one again.
 
 ## New agents
 
-`muxa swap` moves agents that are already running. To keep new ones off a
-capped account in the first place, set `[agent.<program>].account = "auto"`
+`muxa swap` moves agents that are already running. To start new ones on a
+chosen account, set `[agent.<program>].account = "auto"`
 (see [Configuration](CONFIGURATION.md#starting-on-an-account)): every muxa
-launch then starts on a chosen account (the first configured account's
-environment, or `aas e <best eligible account>` with the `aas` backend)
-instead of the bare CLI. With no backend it starts the bare CLI and
+launch then starts on the first configured account's environment, or, with
+the `aas` backend, on `aas e <best eligible account>` instead of the bare
+CLI. Only the `aas` backend skips a capped account at launch; configured
+accounts always start on the first one listed. With no backend it starts the bare CLI and
 says why.
 
 ## Configuration compatibility

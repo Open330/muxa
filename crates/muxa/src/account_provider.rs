@@ -62,8 +62,9 @@ fn backend_with(
 pub fn no_accounts(provider: &str) -> String {
     format!(
         "no {provider} accounts are configured: list them as [[accounts.{provider}]] in \
-         config.toml (or install aas); a capped agent still resumes after its reset \
-         with the resume-after-limit rule"
+         config.toml (or install aas); a capped agent can still resume after its reset \
+         once the resume-after-limit rule is enabled \
+         (`muxa automation enable resume-after-limit`)"
     )
 }
 

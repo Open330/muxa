@@ -451,7 +451,9 @@ fn select_at<'a>(
                 "not registered by its own hooks, so whether it is mid-turn is unknown; pass --force to stop it anyway",
             ));
         } else if provider_name(agent.kind).is_none() {
-            skipped.push(skip("aas cannot switch this agent's provider"));
+            skipped.push(skip(
+                "account switching is not supported for this agent's provider",
+            ));
         } else if agent.pane.is_none() {
             skipped.push(skip("not in a multiplexer pane"));
         } else if is_busy(agent) && !request.force {

@@ -188,7 +188,7 @@ has quota left, the agent starts bare as before, which may still be the
 capped account. The reason goes to stderr and to the `account` field of
 `muxa agent start --json`. An agent already capped mid-run is
 [`muxa swap`](ACCOUNT_SWAP.md)'s job, and with no accounts at all the
-`resume-after-limit` rule resumes it after its reset.
+`resume-after-limit` rule, once enabled, resumes it after its reset.
 
 ### Advanced launch options form
 
