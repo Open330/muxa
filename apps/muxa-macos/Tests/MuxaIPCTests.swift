@@ -6267,3 +6267,14 @@ func panePreviewWakesImmediatelyWhenApplicationBecomesActive() async throws {
     polling.cancel()
     await polling.value
 }
+
+@Test
+func workCapableHostsSkipDisabledHosts() {
+    let hosts = [
+        inboxShellsTestHost(alias: "zeta"),
+        inboxShellsTestHost(alias: "june-mbp", state: "disabled"),
+        inboxShellsTestHost(alias: "local", local: true),
+        inboxShellsTestHost(alias: "away", state: "offline"),
+    ]
+    #expect(AppModel.workCapable(hosts).map(\.alias) == ["local", "away", "zeta"])
+}

@@ -111,23 +111,28 @@ SUFFIX=""
 DMG="$DIST_DIR/Muxa-$VERSION$SUFFIX.dmg"
 rm -f "$DMG"
 
-log "Building $(basename "$DMG")"
 ln -sf /Applications "$STAGE/Applications"
-hdiutil create \
-    -volname "Muxa $VERSION" \
-    -srcfolder "$STAGE" \
-    -ov -format UDZO \
-    -quiet \
-    "$DMG"
 
-if [ -n "${MUXA_SIGN_IDENTITY:-}" ]; then
-    codesign --force --timestamp --sign "$MUXA_SIGN_IDENTITY" "$DMG"
-fi
+build_dmg() {
+    log "Building $(basename "$DMG")"
+    rm -f "$DMG"
+    hdiutil create \
+        -volname "Muxa $VERSION" \
+        -srcfolder "$STAGE" \
+        -ov -format UDZO \
+        -quiet \
+        "$DMG"
+    if [ -n "${MUXA_SIGN_IDENTITY:-}" ]; then
+        codesign --force --timestamp --sign "$MUXA_SIGN_IDENTITY" "$DMG"
+    fi
+}
+
+build_dmg
 
 # ---------------------------------------------------------------- notarize
 
 notarize() {
-    local args=(notarytool submit "$DMG" --wait --timeout 30m)
+    local args=(notarytool submit "$1" --wait --timeout 30m)
     if [ -n "${MUXA_NOTARY_PROFILE:-}" ]; then
         args+=(--keychain-profile "$MUXA_NOTARY_PROFILE")
     elif [ -n "${NOTARY_KEY_PATH:-}" ]; then
@@ -144,13 +149,25 @@ notarize() {
 }
 
 if [ -n "${MUXA_SIGN_IDENTITY:-}" ] && [ "${MUXA_SKIP_NOTARIZE:-}" != "1" ]; then
-    if notarize; then
-        log "Stapling the ticket"
+    if notarize "$DMG"; then
+        # Homebrew and anyone who drags the app out copy only Muxa.app, so a
+        # ticket stapled to the DMG alone stays behind. Without its own
+        # ticket the app depends on an online notarization check at first
+        # launch, and when that check fails macOS says it "could not verify"
+        # the app. The first submission registered the app's code hash, so
+        # staple the app, rebuild the DMG around it, and notarize that.
+        log "Stapling the ticket to Muxa.app"
+        xcrun stapler staple "$APP"
+        xcrun stapler validate "$APP"
+        build_dmg
+        notarize "$DMG" || fail "the rebuilt DMG failed notarization"
+        log "Stapling the ticket to the DMG"
         xcrun stapler staple "$DMG"
         xcrun stapler validate "$DMG"
         log "Gatekeeper assessment"
-        # The real test: what a stranger's Mac decides about this file.
+        # The real test: what a stranger's Mac decides about these files.
         spctl -a -vvv -t install "$DMG" || fail "Gatekeeper refused the DMG"
+        spctl -a -vvv -t exec "$APP" || fail "Gatekeeper refused Muxa.app"
     fi
 fi
 
