@@ -36,6 +36,7 @@ mod orchestration;
 mod owner_only;
 mod pane_identity;
 mod peek;
+mod peer_cli;
 mod relay;
 mod reload;
 mod sidebar;
@@ -164,6 +165,8 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Send a peer request through dedicated workers, creating one when needed.
+    Peer(peer_cli::Args),
     /// Durable request/reply messaging with agents in the current tmux window.
     Msg {
         #[command(subcommand)]

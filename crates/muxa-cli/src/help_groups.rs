@@ -26,7 +26,7 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     (
         "Collaborate",
         &[
-            "peers", "workers", "msg", "identity", "ask", "skill", "graph",
+            "peer", "peers", "workers", "msg", "identity", "ask", "skill", "graph",
         ],
     ),
     ("Work & layout", &["work", "workspace", "window", "agent"]),

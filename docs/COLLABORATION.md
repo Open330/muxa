@@ -944,3 +944,19 @@ is the sum of MCP text blocks before their outer JSON escaping, not billed token
 or useful-body bytes. A tool without a body argument has a zero input-body
 baseline, not a zero-cost output. No new cost ledger or cross-process tracing
 framework is introduced, and these diagnostics do no extra work when debug is off.
+
+### Peer requests from the CLI
+
+Use `muxa peer codex "Review the change; report findings without editing"`
+when MCP is unavailable. It shares `muxa_call_peer` worker selection, launch
+permissions, contracts and durable receipts. The default returns immediately;
+`--wait --timeout-secs 60` waits for a reply. Keep the request id and resume with
+`muxa msg wait REQUEST_ID`. A timeout exits nonzero without resending work.
+`--intent task --execute` is required for edits. `--context-bound` targets the
+exact conversation and retains primary-session acceptance. Low-level
+`muxa msg send %N` preserves exact mailbox delivery; protected-primary receipts
+explain how to cancel that queued request before using worker routing.
+
+On macOS, `muxa init --component muxad-launchd --yes` records the installing
+shell's PATH in the LaunchAgent so headless providers can find user-installed
+CLIs and account shims. Run it from the shell that normally launches your agents.

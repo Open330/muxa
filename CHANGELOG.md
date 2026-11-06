@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- macOS daemon installation preserves the installing shell's PATH for headless
+  providers, and escapes executable/search paths in the LaunchAgent XML.
+- `muxa peer` exposes dedicated-worker routing to CLI-only agents, sharing the
+  MCP permission and delivery contract. Protected-primary mailbox receipts
+  explain how to recover without duplicating requests.
+
+
 ## [0.9.5] - 2026-11-05
 
 ### Added

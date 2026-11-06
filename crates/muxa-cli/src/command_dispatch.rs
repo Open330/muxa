@@ -117,6 +117,7 @@ pub(super) async fn main() -> Result<()> {
         } => cmd_status_line(&client, pane, needs_attention).await,
         Cmd::Recap { pane, limit, all } => cmd_recap(&client, pane, limit, all).await,
         Cmd::Peers { json } => cmd_peers(&client, json).await,
+        Cmd::Peer(args) => super::peer_cli::run(&client, &cfg, args).await,
         Cmd::Msg { action } => cmd_msg(&client, action).await,
         Cmd::Ask {
             action: Some(action),

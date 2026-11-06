@@ -1074,6 +1074,7 @@ pub(super) fn print_collaboration_receipt(
                 request.id,
                 request.to.label()
             );
+            println!("For a generic peer request, cancel this queued request first (`muxa msg cancel {}`), then use `muxa peer {} BODY` to reuse or create a worker.", request.id, request.to.pane);
         }
         // A reply on the request means this was `msg reply`, not `msg send`.
         _ if request.reply.is_some() => {

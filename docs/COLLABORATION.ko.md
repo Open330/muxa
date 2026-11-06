@@ -728,3 +728,18 @@ UTF-8 본문 768바이트 이하, 전체 지시 JSON 1024바이트 이하인 요
 짧은 pane ID는 namespace를 붙인 ID로 변환한 뒤 출처를 비교합니다. 여러 host나
 socket에 걸쳐 모호하면 환경 변수만으로 위치를 확정하지 않습니다. 실제 출처
 불일치 표시는 유지하면서 표기 차이로 붙던 진단 정보는 줄입니다.
+
+### CLI에서 peer 요청 보내기
+
+MCP를 사용할 수 없으면 `muxa peer codex "변경 사항을 읽기 전용으로 리뷰하세요"`를
+사용합니다. `muxa_call_peer`와 같은 전용 worker 선택·생성 및 권한 정책을 적용하며,
+기본값은 대기 없이 요청 ID를 반환합니다. `--wait --timeout-secs 60`으로 기다리거나
+같은 요청 ID로 `muxa msg wait REQUEST_ID`를 사용하세요. 편집은
+`--intent task --execute`가 필요합니다. `--context-bound`는 정확한 대화를 지정하며
+primary 세션의 명시적 수락을 유지합니다. `muxa msg send %N`은 정확한 세션의
+메일함에 보내는 명령이므로 primary에 보낸 일반 요청은 먼저 취소한 뒤
+`muxa peer`로 전용 worker에 보내세요.
+
+macOS에서 `muxa init --component muxad-launchd --yes`는 설치 셸의 PATH를
+LaunchAgent에 기록합니다. 평소 에이전트를 실행하는 셸에서 설치하면 headless
+실행도 사용자 CLI와 계정 shim을 찾을 수 있습니다.
