@@ -424,6 +424,7 @@ async fn client_disconnect_before_response_is_clean_handler_exit() {
         None,
         None,
         PipelineRunStore::in_memory(),
+        crate::review::ReviewStore::in_memory(),
         WorkUpManager::new(PathBuf::from("/tmp/muxa-disconnect-test.sock")),
         crate::mux_snapshot_control::MuxSnapshotControl::new(PathBuf::from(
             "/tmp/muxa-disconnect-test.sock",
@@ -2334,5 +2335,116 @@ async fn ask_provider_add_and_remove_compose_the_list_over_the_wire() {
     assert!(text.contains("enabled = true"), "{text}");
 
     tx.send(()).unwrap();
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn review_items_round_trip_over_ipc() {
+    use crate::review::{ActorKind, DispositionKind, NewReview, ReviewActor, ReviewTarget};
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("muxa-review.sock");
+    let reviews = crate::review::ReviewStore::open(&dir.path().join("reviews.sqlite3")).unwrap();
+    let server = Server::new(sock.clone(), Store::shared()).with_reviews(reviews);
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+
+    let hello = client.hello(Duration::from_secs(3)).await.unwrap();
+    assert!(hello
+        .capabilities
+        .iter()
+        .any(|c| c == crate::review::REVIEW_CAPABILITY));
+    let empty = client
+        .review_summary_with_timeout(Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(empty.open, 0);
+
+    let new = NewReview {
+        target: ReviewTarget::Work {
+            workspace: "muxa".into(),
+            work: "review".into(),
+            alias: Some("impl".into()),
+            pipeline_generation: Some(3),
+        },
+        summary: "check the store migration".into(),
+        anchor: Some("commit:abc".into()),
+        idempotency_key: Some("muxa/review/impl/3/1".into()),
+        requested_by: ReviewActor {
+            kind: ActorKind::Agent,
+            label: Some("impl".into()),
+        },
+    };
+    let item = client.review_create(&new).await.unwrap();
+    assert_eq!(client.review_create(&new).await.unwrap(), item);
+    assert_eq!(client.review_get(&item.id).await.unwrap(), item);
+    let summary = client
+        .review_summary_with_timeout(Duration::from_secs(3))
+        .await
+        .unwrap();
+    assert_eq!(summary.open, 1);
+    assert_eq!(summary.oldest_requested_at, Some(item.requested_at));
+
+    let user = ReviewActor {
+        kind: ActorKind::User,
+        label: None,
+    };
+    let returned = client
+        .review_dispose(&item.id, DispositionKind::Returned, &user, Some("no tests"))
+        .await
+        .unwrap();
+    assert_eq!(
+        returned.disposition.as_ref().map(|d| d.kind),
+        Some(DispositionKind::Returned)
+    );
+    let query = |open_only| crate::review::ReviewQuery {
+        open_only,
+        oldest_first: false,
+        limit: 10,
+        offset: 0,
+    };
+    assert!(client
+        .review_list(&query(true))
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    let all = client.review_list(&query(false)).await.unwrap();
+    assert_eq!(all.items.len(), 1);
+    assert!(!all.has_more);
+
+    // Clients cannot claim to be a policy, and refusals keep their message.
+    let policy = ReviewActor {
+        kind: ActorKind::Policy,
+        label: None,
+    };
+    let err = client
+        .review_dispose(&item.id, DispositionKind::Accepted, &policy, None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("policy"), "{err}");
+
+    let _ = tx.send(());
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn unavailable_review_store_refuses_without_breaking_the_daemon() {
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("muxa-review-down.sock");
+    let server = Server::new(sock.clone(), Store::shared())
+        .with_reviews(crate::review::ReviewStore::unavailable("disk full"));
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+    let err = client
+        .review_summary_with_timeout(Duration::from_secs(3))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("disk full"), "{err}");
+    assert!(client.snapshot().await.unwrap().is_empty());
+    let _ = tx.send(());
     handle.await.unwrap();
 }

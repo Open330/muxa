@@ -544,6 +544,7 @@ async fn run() -> Result<()> {
         .with_config_path(config_path.clone())
         .with_fleet(fleet_runtime)
         .with_pipeline_runs(pipeline_runs.clone())
+        .with_reviews(build_reviews())
         .with_mux_snapshots(mux_snapshots) // WS-F: snapshot
         .with_swap(Some(swap_jobs))
         .with_restart_controller(Arc::clone(&restart));
@@ -922,6 +923,19 @@ async fn observe_pipeline_agent(
 /// Resolve `[automation]` into a live store. The ledger is materialized
 /// unconditionally — the guards read from it, and an operator who adds a
 /// rule at runtime should not have to restart the daemon to get one.
+/// The review queue. A store that cannot open is served as unavailable, so
+/// a broken review file never keeps muxad from starting.
+fn build_reviews() -> muxa::review::ReviewStore {
+    let Some(path) = muxa::review::ReviewStore::default_path() else {
+        tracing::warn!("no data directory; review items are unavailable");
+        return muxa::review::ReviewStore::unavailable("no data directory");
+    };
+    muxa::review::ReviewStore::open(&path).unwrap_or_else(|error| {
+        tracing::warn!(path = %path.display(), %error, "review store unavailable");
+        muxa::review::ReviewStore::unavailable(error.to_string())
+    })
+}
+
 fn build_automation(cfg: &Config, config_path: Option<PathBuf>) -> Arc<AutomationStore> {
     let ledger = AutomationLedger::load(muxa::automation::default_automation_file());
     let store = AutomationStore::new(cfg.automation.clone(), config_path, ledger);

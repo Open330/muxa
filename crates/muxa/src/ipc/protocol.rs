@@ -74,6 +74,33 @@ pub(super) enum RequestBody {
         socket: Option<String>,
         request: collaboration::HandleRequest,
     },
+    /// Record a claim that a result needs review (`review_items_v1`).
+    ReviewCreate {
+        review: Box<crate::review::NewReview>,
+    },
+    ReviewGet {
+        id: String,
+    },
+    /// Newest first, at most `review::MAX_LIST_LIMIT`.
+    ReviewList {
+        #[serde(default)]
+        open_only: bool,
+        #[serde(default)]
+        oldest_first: bool,
+        #[serde(default = "default_review_list_limit")]
+        limit: usize,
+        #[serde(default)]
+        offset: usize,
+    },
+    /// Open count and oldest open request time, for status surfaces.
+    ReviewSummary,
+    ReviewDispose {
+        id: String,
+        disposition: crate::review::DispositionKind,
+        by: crate::review::ReviewActor,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
     PipelineSubscribe,
@@ -907,6 +934,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     collaboration::REPLY_WAKE_WITHDRAW_CAPABILITY,
     collaboration::USER_AUTHORIZED_DELIVERY_CAPABILITY,
     "pipeline_runs_v1",
+    crate::review::REVIEW_CAPABILITY,
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
@@ -1093,6 +1121,15 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_run: Option<PipelineRun>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_item: Option<Box<crate::review::ReviewItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_items: Option<Vec<crate::review::ReviewItem>>,
+    /// With `review_items`: another page follows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_has_more: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_summary: Option<crate::review::ReviewSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_claims: Option<Vec<PipelineClaim>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_operation: Option<WorkUpOperation>,
@@ -1197,6 +1234,10 @@ impl Response {
             fleet_result: None,
             pipeline_runs: None,
             pipeline_run: None,
+            review_item: None,
+            review_items: None,
+            review_has_more: None,
+            review_summary: None,
             pipeline_claims: None,
             work_operation: None,
             work_command: None,
@@ -1232,6 +1273,22 @@ impl Response {
     pub(super) fn with_fleet_result(result: FleetCommandResult) -> Self {
         let mut response = Self::ok();
         response.fleet_result = Some(result);
+        response
+    }
+    pub(super) fn with_review_item(item: crate::review::ReviewItem) -> Self {
+        let mut response = Self::ok();
+        response.review_item = Some(Box::new(item));
+        response
+    }
+    pub(super) fn with_review_page(page: crate::review::ReviewPage) -> Self {
+        let mut response = Self::ok();
+        response.review_items = Some(page.items);
+        response.review_has_more = Some(page.has_more);
+        response
+    }
+    pub(super) fn with_review_summary(summary: crate::review::ReviewSummary) -> Self {
+        let mut response = Self::ok();
+        response.review_summary = Some(summary);
         response
     }
     pub(super) fn with_pipeline_runs(runs: Vec<PipelineRun>) -> Self {
