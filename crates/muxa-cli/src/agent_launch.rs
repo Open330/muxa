@@ -398,7 +398,7 @@ pub struct StartRequest {
     /// room — or, with no daemon on the default socket at all, failed and
     /// rolled the whole launch back.
     pub socket: PathBuf,
-    /// `[agent.<program>].account`: which `aas` account the agent starts
+    /// `[agent.<program>].account`: which account the agent starts
     /// on. `None` runs the bare provider CLI.
     pub account: Option<muxa::account_route::AccountRoute>,
 }
@@ -761,7 +761,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         request.creator = crate::spawn_provenance::resolve_creator(&request.socket);
     }
     // Before prepare_launch: it can create sessions and windows, and a slow
-    // or failed `aas` must not leave them behind.
+    // or failed account query must not leave them behind.
     let routed = route_account(request.account.as_ref());
     let PreparedLaunch {
         cwd,

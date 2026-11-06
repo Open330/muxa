@@ -165,10 +165,10 @@ pub struct Config {
     /// one is written.
     #[serde(default)]
     pub automation: crate::automation::AutomationConfig,
-    /// Defaults for moving agents onto another `aas` account: `muxa swap`
-    /// and the `swap_account` automation action.
+    /// Defaults for moving agents onto another account: `muxa swap` and the
+    /// `swap_account` automation action.
     pub swap: crate::account_swap::SwapConfig,
-    /// Accounts muxa starts and moves agents on without `aas`:
+    /// Accounts muxa starts and moves agents on, with no external tool:
     /// `[[accounts.claude]]` / `[[accounts.codex]]`. Host-local.
     pub accounts: crate::accounts::AccountsConfig,
     /// This host's choices for `muxa config export` / `apply`: which
@@ -247,7 +247,7 @@ impl Config {
         Vec::new()
     }
 
-    /// The `aas` account routing for a new `program` agent, when
+    /// The account routing for a new `program` agent, when
     /// `[agent.<program>].account` asks for it.
     #[must_use]
     pub fn account_route(&self, program: &str) -> Option<crate::account_route::AccountRoute> {
@@ -714,9 +714,12 @@ pub struct AgentLaunchConfig {
     /// `account` changes nothing about the arguments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub options: Option<Vec<String>>,
-    /// The `aas` account new agents start on (`claude` / `codex` only):
-    /// `auto` for the best-ranked one with quota left, or an account name.
-    /// Unset leaves the choice to the `aas` shim's active account.
+    /// The account new agents start on (`claude` / `codex` only): `auto`
+    /// or an account name. The accounts are `[[accounts.<program>]]`
+    /// (`auto`: the first listed), or `aas`'s when none are listed (`auto`:
+    /// its best-ranked one with quota left); see
+    /// [`crate::account_provider`]. Unset starts the CLI on
+    /// whatever account it is logged into.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
 }

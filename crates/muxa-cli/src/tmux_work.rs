@@ -382,8 +382,8 @@ pub struct WorkspaceViewArgs {
 /// `<session>~view~<suffix>` sorts next to the session it mirrors and reads as
 /// what it is. Safe despite tmux matching session names by prefix, because an
 /// exact match wins over prefix candidates — measured on tmux 3.4 with
-/// `callabo`, `callabo-set` and `callabo~view~1734560` all present, `-t
-/// callabo` resolves to `callabo`.
+/// `acme`, `acme-set` and `acme~view~1734560` all present, `-t
+/// acme` resolves to `acme`.
 fn view_session_name(session: &str, suffix: &str) -> String {
     format!("{session}~view~{suffix}")
 }
@@ -1609,8 +1609,8 @@ pub fn find_workspace(raw: &str) -> Result<Option<WorkspaceInfo>> {
 pub enum MarkAnomaly {
     /// The workspace is claimed by one session while a *different* session
     /// carries the name the workspace would otherwise resolve to. The mark
-    /// wins, so `--workspace callabo` goes to the claiming session even
-    /// though a session named `callabo` is sitting right there.
+    /// wins, so `--workspace acme` goes to the claiming session even
+    /// though a session named `acme` is sitting right there.
     Shadowed {
         workspace: String,
         claimed_by: String,
@@ -1713,7 +1713,7 @@ pub fn list_workspaces() -> Result<Vec<WorkspaceInfo>> {
 /// having created it: one already named after the workspace. Returns its
 /// tmux *session id*, not its name.
 ///
-/// Refusing to adopt splits a workspace across `callabo` and `callabo-2`,
+/// Refusing to adopt splits a workspace across `acme` and `acme-2`,
 /// which contradicts the whole model — one session is one workspace. The
 /// safety that mattered was never "do not touch it"; it is that
 /// `close_workspace` refuses a session muxa did not create.
@@ -1889,9 +1889,9 @@ fn set_window_automatic_rename(window: &str, enabled: bool) -> Result<()> {
 /// tmux resolves a bare name by exact match, then as a pattern, then as a
 /// unique prefix — and that last step is silent. So a name that named one
 /// session when muxa looked it up can name a *different* one by the time the
-/// write goes out: with `callabo` gone and `callabo-set` the only session
-/// left starting with those letters, `set-option -t callabo` succeeds against
-/// `callabo-set`, exit 0. The `=name` spelling does not close this, because
+/// write goes out: with `acme` gone and `acme-set` the only session
+/// left starting with those letters, `set-option -t acme` succeeds against
+/// `acme-set`, exit 0. The `=name` spelling does not close this, because
 /// tmux 3.4 refuses it for `set-option` (it accepts it for `kill-session`,
 /// which is why `close_workspace` is already safe). An id is the only
 /// spelling that means one session and nothing else.

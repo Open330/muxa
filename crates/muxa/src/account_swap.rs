@@ -1,12 +1,15 @@
-//! Move a running agent onto another `aas` account and resume its
-//! conversation in place.
+//! Move a running agent onto another account and resume its conversation
+//! in place.
 //!
 //! When one account's usage cap is spent, the conversation itself is still
-//! good: `aas` profiles share `projects/` (Claude) and `sessions/` (Codex),
-//! so the same provider session id resumes under any account. A swap stops
-//! the agent in its pane, types `aas e <next> … --resume <id>` back into the
-//! pane's shell, and optionally sends a follow-up prompt so the interrupted
-//! turn carries on.
+//! good as long as the accounts share the provider's conversation store
+//! (`projects/` for Claude, `sessions/` for Codex), so the same provider
+//! session id resumes under any account. A swap stops the agent in its
+//! pane, types the relaunch (`env CLAUDE_CONFIG_DIR=… claude --resume <id>`
+//! for a configured account, `aas e <next> … --resume <id>` through `aas`)
+//! back into the pane's shell, and optionally sends a follow-up prompt so the
+//! interrupted turn carries on. Where the accounts come from is
+//! [`crate::account_provider`]'s business.
 //!
 //! The module splits into a pure half — which agents to touch, what command
 //! line to type, which account each gets — and [`execute`], the one place
@@ -60,9 +63,11 @@ pub struct SwapConfig {
     pub continue_when: ContinueWhen,
     /// What a relaunch must show before the follow-up is typed into it.
     pub continue_evidence: ContinueEvidence,
-    /// The `aas` binary muxa queries for candidates. The daemon may not
-    /// inherit the login shell's `PATH`, so a bare `aas` is also looked for
-    /// in the usual install locations.
+    /// The `aas` binary, an optional account backend used when a provider
+    /// lists no `[[accounts.<provider>]]`. The daemon may not inherit the
+    /// login shell's `PATH`, so a bare `aas` is also looked for in the
+    /// usual install locations; when it is not found, swaps have no
+    /// account to move to and launches start bare.
     pub aas: String,
 }
 
@@ -446,7 +451,9 @@ fn select_at<'a>(
                 "not registered by its own hooks, so whether it is mid-turn is unknown; pass --force to stop it anyway",
             ));
         } else if provider_name(agent.kind).is_none() {
-            skipped.push(skip("aas cannot switch this agent's provider"));
+            skipped.push(skip(
+                "account switching is not supported for this agent's provider",
+            ));
         } else if agent.pane.is_none() {
             skipped.push(skip("not in a multiplexer pane"));
         } else if is_busy(agent) && !request.force {
@@ -518,33 +525,6 @@ fn profile_account(
             .map(|name| crate::accounts::bare_name(name, provider).to_owned());
     }
     resolved.identify(&environ).map(str::to_owned)
-}
-
-/// Configured accounts as ranked candidates, in config order; `capped` ones
-/// are ineligible.
-fn profile_candidates(
-    profiles: &[crate::accounts::AccountProfile],
-    provider: &str,
-    capped: &[&str],
-) -> Vec<Candidate> {
-    profiles
-        .iter()
-        .map(|profile| {
-            let is_capped = capped.contains(&profile.name.as_str());
-            Candidate {
-                name: profile.name.clone(),
-                provider: provider.to_owned(),
-                eligible: !is_capped,
-                active: false,
-                reason: if is_capped {
-                    "rate limited here".into()
-                } else {
-                    "configured".into()
-                },
-                remaining_pct: None,
-            }
-        })
-        .collect()
 }
 
 /// Where a relaunched agent turned out to run.
@@ -1889,35 +1869,29 @@ fn plan(
 }
 
 /// Pick an account for each planned agent, provider by provider, in the
-/// order they were planned.
+/// order they were planned. Each provider's accounts come from its
+/// [`crate::account_provider::Backend`].
 fn assign_accounts(
     request: &SwapRequest,
     planned: Vec<Planned>,
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
 ) -> Vec<Step> {
-    // One `aas candidates` per provider, shared by that provider's targets.
-    let mut by_provider: Vec<(&'static str, Result<Vec<Candidate>, String>)> = Vec::new();
+    use crate::account_provider::Backend;
+    // One backend (and one `aas candidates`) per provider, shared by that
+    // provider's targets.
+    let mut by_provider: Vec<(&'static str, Backend)> = Vec::new();
     for Planned { agent, .. } in &planned {
         let provider = provider_name(agent.kind).unwrap_or_default();
         if !by_provider.iter().any(|(name, _)| *name == provider) {
-            let candidates = if accounts.for_provider(provider).is_empty() {
-                match request.to {
-                    // A named account needs no ranking.
-                    AccountChoice::Named(_) => Ok(Vec::new()),
-                    _ => query_candidates(&config.aas, provider),
-                }
-            } else {
-                // Configured accounts: ranked below, from what muxa sees.
-                Ok(Vec::new())
-            };
-            by_provider.push((provider, candidates));
+            let backend = crate::account_provider::backend(provider, accounts, &config.aas);
+            by_provider.push((provider, backend));
         }
     }
 
     let mut remaining: Vec<Option<Planned>> = planned.into_iter().map(Some).collect();
     let mut steps = Vec::new();
-    for (provider, candidates) in by_provider {
+    for (provider, backend) in by_provider {
         let group: Vec<Planned> = remaining
             .iter_mut()
             .filter(|slot| {
@@ -1926,6 +1900,18 @@ fn assign_accounts(
             })
             .filter_map(Option::take)
             .collect();
+        let candidates = match backend {
+            Backend::Accounts(profiles) => {
+                steps.extend(profile_steps(request, group, &profiles, provider));
+                continue;
+            }
+            Backend::Aas(aas) => match request.to {
+                // A named account needs no ranking.
+                AccountChoice::Named(_) => Ok(Vec::new()),
+                _ => query_candidates(&aas, provider),
+            },
+            Backend::Unavailable(reason) => Err(reason),
+        };
         let candidates = match candidates {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -1939,11 +1925,6 @@ fn assign_accounts(
                 continue;
             }
         };
-        let profiles = accounts.for_provider(provider);
-        if !profiles.is_empty() {
-            steps.extend(profile_steps(request, group, profiles, provider));
-            continue;
-        }
         let current: Vec<Option<String>> = group
             .iter()
             .map(|p| current_account(&p.launch.line, &candidates))
@@ -1983,7 +1964,7 @@ fn profile_steps(
         .filter(|(p, _)| is_rate_limited(&p.agent))
         .filter_map(|(_, account)| account.as_deref())
         .collect();
-    let ranked = profile_candidates(profiles, provider, &capped);
+    let ranked = crate::account_provider::configured(provider, profiles, &capped);
     let choice = match &request.to {
         AccountChoice::Named(name) => {
             AccountChoice::Named(crate::accounts::bare_name(name, provider).to_owned())
@@ -2379,7 +2360,7 @@ pub(crate) struct Planned {
 /// Why each account was passed over, for a "nothing left" report.
 fn unavailable(candidates: &[Candidate]) -> String {
     if candidates.is_empty() {
-        return "aas lists no accounts for this provider".into();
+        return "no accounts are listed for this provider".into();
     }
     candidates
         .iter()
@@ -6143,13 +6124,88 @@ mod tests {
             account("b", "K", "2"),
             account("c", "K", "3"),
         ];
-        let ranked = profile_candidates(&profiles, "claude", &["b"]);
+        let ranked = crate::account_provider::configured("claude", &profiles, &["b"]);
         assert_eq!(
             ranked.iter().map(|c| c.eligible).collect::<Vec<_>>(),
             [true, false, true]
         );
         let moves = assign(&[Some("a".to_owned()), None], &ranked, &AccountChoice::Auto);
         assert_eq!(moves, vec![Ok("c".to_owned()), Ok("a".to_owned())]);
+    }
+
+    fn test_pane(pane_id: &str) -> crate::tmux::PaneInfo {
+        crate::tmux::PaneInfo {
+            session_group: None,
+            agent_program: None,
+            worker_launch_id: None,
+            agent_role: None,
+            agent_alias: None,
+            workspace_id: None,
+            work_id: None,
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "work".into(),
+            window_id: "@1".into(),
+            window_name: "task".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            current_path: "/repo".into(),
+            pane_pid: 70,
+            socket: None,
+        }
+    }
+
+    /// No accounts configured and no `aas`: a capped agent is left exactly
+    /// where it is, so the `resume-after-limit` rule can resume it on its
+    /// reset. Nothing is stopped or typed.
+    #[test]
+    fn with_no_account_backend_a_swap_leaves_the_agent_for_resume_after_limit() {
+        let agent = limited("%7", "sid-7");
+        let pane = test_pane("%7");
+        let planned = Planned {
+            agent: agent.clone(),
+            session_id: "sid-7".into(),
+            source: SessionIdSource::Registry,
+            verified: false,
+            unverified_reason: None,
+            process_start: None,
+            launch: PaneLaunch {
+                agent_pid: 71,
+                top_pid: 71,
+                line: LaunchLine::bare("claude"),
+                resumed_id: None,
+            },
+            pane,
+            backend: crate::backend::default_backend(),
+        };
+        let config = SwapConfig {
+            aas: "/nonexistent/muxa-test/aas".into(),
+            ..SwapConfig::default()
+        };
+        let steps = assign_accounts(
+            &request(SwapScope::All),
+            vec![planned],
+            &config,
+            &crate::accounts::AccountsConfig::default(),
+        );
+        let [Step::Done(outcome)] = steps.as_slice() else {
+            panic!("no account backend must settle the target without running it");
+        };
+        assert_eq!(outcome.status, SwapStatus::Failed);
+        assert!(
+            outcome.note.contains("[[accounts.claude]]"),
+            "{}",
+            outcome.note
+        );
+        assert!(
+            outcome.note.contains("resume-after-limit"),
+            "{}",
+            outcome.note
+        );
+        assert_eq!(outcome.to, None);
     }
 
     #[test]
