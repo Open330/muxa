@@ -158,6 +158,7 @@ staple() {
             xcrun stapler validate "$1"
             return 0
         fi
+        [ "$attempt" -lt 5 ] || break
         log "Stapling $(basename "$1") failed (attempt $attempt); retrying"
         sleep $((attempt * 10))
     done
