@@ -20,7 +20,10 @@ use time::OffsetDateTime;
 pub const MAX_STOP_OFFERS: u32 = 3;
 /// Minimum gap between two offers of one request through the same event.
 pub const OFFER_BACKOFF: time::Duration = time::Duration::minutes(5);
-/// Server-side clamps on what one hook response may carry.
+/// Server-side clamps on what one hook response may carry. The byte budget
+/// covers the offered payload objects; the IPC envelope and the hook's short
+/// instruction text add a small fixed overhead on top, and the count clamp
+/// bounds the total.
 pub const MAX_OFFER_REQUESTS: usize = 8;
 pub const MAX_OFFER_BYTES: usize = 24 * 1024;
 
