@@ -119,12 +119,19 @@ struct AgentsArgs {
     json: bool,
 }
 
+// Keep this optional view's command builder out of the large root parser frame.
+#[derive(Debug, Subcommand)]
+enum AgentViewCmd {
+    /// List agents with display-only launch provenance as JSON.
+    Agents(AgentsArgs),
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Open Muxa: find running agents, start one, or try the short demo.
     Start,
-    /// List agents with display-only launch provenance as JSON.
-    Agents(AgentsArgs),
+    #[command(flatten)]
+    AgentView(AgentViewCmd),
     /// List active agents as a human-readable table.
     Status {
         /// One-shot visual theme override.
