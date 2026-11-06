@@ -1,4 +1,4 @@
-//! CLI access to the same worker routing and permission contract as muxa_call_peer.
+//! CLI access to the same worker routing and permission contract as `muxa_call_peer`.
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use muxa::{config::Config, ipc::Client};
