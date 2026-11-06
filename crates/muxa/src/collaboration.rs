@@ -8,6 +8,7 @@ mod database;
 use database::DurableDatabase;
 mod contract;
 pub mod instruction;
+pub mod turn_offer;
 pub(crate) use contract::deserialize_report_input;
 pub use contract::{
     task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,
@@ -754,8 +755,10 @@ pub const MAX_REPLY_WAKE_WITHDRAWALS: usize = 16;
 /// to a daemon without it, which would silently ignore the field.
 pub const REPLY_WAKE_WITHDRAW_CAPABILITY: &str = "collaboration_reply_withdraw_v1";
 /// The daemon honours `user_authorized` on a new request: a protected
-/// primary takes it without by-id acceptance.
-pub const USER_AUTHORIZED_DELIVERY_CAPABILITY: &str = "collaboration_user_authorized_v1";
+/// primary takes it without by-id acceptance, offered at its turn boundary
+/// and never typed into its terminal. `v1` daemons (0.9.7) typed it in, so
+/// clients require `v2`.
+pub const USER_AUTHORIZED_DELIVERY_CAPABILITY: &str = "collaboration_user_authorized_v2";
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -972,6 +975,9 @@ pub struct CollaborationRequest {
     /// as the audit record of that claim.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub user_authorized: bool,
+    /// Turn-boundary offer attempts for user-authorized work to a primary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_offer: Option<turn_offer::TurnOffer>,
 }
 
 impl CollaborationRequest {
@@ -980,6 +986,14 @@ impl CollaborationRequest {
     /// delivered it on the user's explicit instruction.
     pub fn bypasses_primary_protection(&self) -> bool {
         self.from.console || self.user_authorized
+    }
+
+    /// Agent work the user authorized for a human's own session. It is
+    /// delivered at that session's turn boundary by its provider hook and
+    /// never typed into its terminal: the human may have an unsent draft
+    /// there, and pasting plus Enter would submit it with the request.
+    pub fn awaits_turn_boundary(&self, recipient: &Participant) -> bool {
+        self.user_authorized && !self.from.console && !recipient.accepts_peer_work()
     }
 }
 
@@ -2717,6 +2731,9 @@ pub struct CollaborationStore {
     read_epoch: String,
     read_revision: AtomicU64,
     read_validators: Mutex<read_validator::ReadValidators>,
+    /// Whether Stop hooks may continue a turn with an offer; see
+    /// [`turn_offer`]. Off when collaboration wakes are disabled.
+    turn_continuation: std::sync::atomic::AtomicBool,
 }
 
 impl CollaborationStore {
@@ -2749,6 +2766,7 @@ impl CollaborationStore {
             read_epoch: uuid::Uuid::new_v4().to_string(),
             read_revision: AtomicU64::new(0),
             read_validators: Mutex::new(read_validator::ReadValidators::default()),
+            turn_continuation: std::sync::atomic::AtomicBool::new(true),
             changes,
         })
     }
@@ -2847,6 +2865,7 @@ impl CollaborationStore {
             read_epoch: uuid::Uuid::new_v4().to_string(),
             read_revision: AtomicU64::new(0),
             read_validators: Mutex::new(read_validator::ReadValidators::default()),
+            turn_continuation: std::sync::atomic::AtomicBool::new(true),
             changes,
         });
         if let Some(days) = store.opts.retention_days {
@@ -3262,6 +3281,7 @@ impl CollaborationStore {
             superseded_by: None,
             late_replies: Vec::new(),
             user_authorized: input.user_authorized,
+            turn_offer: None,
             dispatch_id: input.dispatch_id,
             source_node_id: input.source_node_id,
             delegation_parent: input.delegation_parent,
@@ -3584,6 +3604,7 @@ impl CollaborationStore {
                 return Err(CollaborationError::NotParticipant(request_id.to_string()));
             }
             if (!request.bypasses_primary_protection() && !caller.accepts_peer_work())
+                || request.awaits_turn_boundary(caller)
                 || request.status != RequestStatus::Queued
                 || request.notified_at.is_some()
             {

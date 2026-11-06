@@ -783,6 +783,7 @@ async fn build_collaboration(cfg: &Config) -> Result<Arc<CollaborationStore>> {
                     "agent collaboration enabled",
                 );
             }
+            store.set_turn_continuation(cfg.collaboration.wake != CollaborationWake::Never);
             Ok(store)
         }
         Err(error @ muxa::collaboration::CollaborationError::UnsupportedSchema(_)) => {
@@ -2856,6 +2857,12 @@ async fn wake_idle_collaboration_peers_with_inflight(
         };
         let recipient = &recipient;
         if !request.bypasses_primary_protection() && !recipient.accepts_peer_work() {
+            continue;
+        }
+        // Never write into a human primary's terminal for agent work, even
+        // user-authorized: its provider hook hands the request over at the
+        // next turn boundary instead (`muxa hook … --event stop`).
+        if request.awaits_turn_boundary(recipient) {
             continue;
         }
         let wake_key = collaboration_wake_key(recipient);

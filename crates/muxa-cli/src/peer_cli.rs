@@ -20,7 +20,8 @@ pub(crate) struct Args {
     #[arg(long)]
     pub context_bound: bool,
     /// The user told you to deliver to this exact session: a protected
-    /// primary takes it now instead of holding it for acceptance.
+    /// primary takes it at its next turn boundary instead of holding it for
+    /// acceptance.
     #[arg(long)]
     pub user_authorized: bool,
     /// Reuse workers only; do not create one when missing.

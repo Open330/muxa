@@ -1448,6 +1448,35 @@ pub(super) async fn handle(
                     ));
                     response
                 }
+                RequestBody::CollaborationTurnBoundaryOffer {
+                    origin,
+                    event,
+                    max_requests,
+                    max_bytes,
+                } => {
+                    kind = "collaboration_turn_boundary_offer";
+                    collaboration_actor.observe_pane(&backends).await;
+                    let topology = collaboration_participants(
+                        &store,
+                        &backends,
+                        &collaboration,
+                        origin.agent_session_id.as_deref(),
+                        collaboration_actor.take_request_panes(),
+                    )
+                    .await;
+                    // Exact-session origins (a paneless Codex app-server hook)
+                    // resolve only to a live binding; no pane fallback.
+                    match topology.resolve_origin(&origin) {
+                        Ok(current) => match collaboration
+                            .offer_turn_boundary(&current, event, max_requests, max_bytes)
+                            .await
+                        {
+                            Ok(offers) => Response::with_turn_boundary_offers(offers),
+                            Err(error) => Response::err(error.to_string()),
+                        },
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationInbox {
                     origin,
                     request_id,

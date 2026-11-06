@@ -423,6 +423,14 @@ impl super::NewRequest {
     /// Fleet forwards as the remote console; retain its initiating agent.
     /// This validates attribution only and is not caller authentication.
     pub fn validate_fleet_contract(&self) -> Result<(), String> {
+        // Fleet has no end-to-end capability negotiation for this flag yet:
+        // an older relay or destination would drop the user's assertion and
+        // its audit record silently. Refuse it until both ends advertise it.
+        if self.user_authorized {
+            return Err(
+                "user-authorized delivery is not supported over Fleet yet; send it on the destination host".into(),
+            );
+        }
         if self.task_contract.is_some()
             && self.initiator.as_ref().is_none_or(|p| {
                 p.console

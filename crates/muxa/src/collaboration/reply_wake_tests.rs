@@ -489,6 +489,7 @@ fn legacy_rows_derive_their_release_from_timestamps() {
 
 fn legacy_request(pair: &Pair) -> CollaborationRequest {
     CollaborationRequest {
+        turn_offer: None,
         user_authorized: false,
         task_contract: None,
         attempt: None,
