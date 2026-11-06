@@ -197,7 +197,7 @@ struct MuxaOperatorMessage: Identifiable, Hashable, Sendable {
 /// the plain `[hostAlias: reason]` dictionary `AppModel.inboxHostFailures`, so
 /// the Inbox editor and, later, the sidebar render the same wording.
 enum MuxaInboxHostFailureText {
-    /// One compact line, e.g. "2 hosts unreachable: jiun-mbp, rtzr". The
+    /// One compact line, e.g. "2 hosts unreachable: laptop, devbox". The
     /// singular/plural form comes from the String Catalog.
     static func summary(_ failures: [String: String]) -> String? {
         guard !failures.isEmpty else { return nil }

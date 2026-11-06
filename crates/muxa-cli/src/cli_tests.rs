@@ -405,7 +405,7 @@ async fn prune_command_includes_missing_native_session_in_preview() {
         .ingest(&muxa::AgentEvent::Started {
             id: muxa::AgentId {
                 kind: AgentKind::Codex,
-                session_id: "cal-7651-ghost".into(),
+                session_id: "eng-7651-ghost".into(),
                 surface: Some(muxa::SurfaceRef {
                     kind: muxa::SurfaceKind::Pty,
                     id: "pty:missing".into(),
@@ -420,7 +420,7 @@ async fn prune_command_includes_missing_native_session_in_preview() {
         .await
         .unwrap();
     cmd_prune(&client, "1h", false, true).await.unwrap();
-    assert!(store.by_session("cal-7651-ghost").await.is_none());
+    assert!(store.by_session("eng-7651-ghost").await.is_none());
     shutdown.send(()).unwrap();
     handle.await.unwrap();
 }
@@ -859,7 +859,7 @@ fn collaboration_participant(pane: &str, window: &str) -> Participant {
             window_id: format!("@{window}"),
         },
         tmux_session_id: Some("$1".into()),
-        tmux_session_name: Some("callabo".into()),
+        tmux_session_name: Some("webapp".into()),
         window_name: Some(window.into()),
         state: AgentState::Idle,
         cwd: None,
@@ -1153,10 +1153,10 @@ fn jump_falls_back_when_the_client_session_is_unknown() {
 
 #[test]
 fn session_target_prefers_the_stable_id_over_the_name() {
-    // `callabo` matches `callabo-set` by prefix; `$3` matches nothing else.
-    assert_eq!(session_target("$3", "callabo"), "$3");
+    // `webapp` matches `webapp-set` by prefix; `$3` matches nothing else.
+    assert_eq!(session_target("$3", "webapp"), "$3");
     // Only a row with no id at all falls back to the ambiguous name.
-    assert_eq!(session_target("", "callabo"), "callabo");
+    assert_eq!(session_target("", "webapp"), "webapp");
 }
 
 fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) -> Agent {
@@ -1308,7 +1308,7 @@ fn message_list_cli_parses_history_filters_and_pagination() {
         "--since",
         "7d",
         "--work",
-        "CAL-7345",
+        "ENG-7345",
         "--workspace",
         "muxa",
         "--thread",
@@ -1318,7 +1318,7 @@ fn message_list_cli_parses_history_filters_and_pagination() {
         "--status",
         "completed",
         "--room",
-        "CAL-7345",
+        "ENG-7345",
         "--offset",
         "20",
         "--limit",
@@ -1348,12 +1348,12 @@ fn message_list_cli_parses_history_filters_and_pagination() {
     };
     assert_eq!(scope, "all");
     assert_eq!(since.as_deref(), Some("7d"));
-    assert_eq!(work.as_deref(), Some("CAL-7345"));
+    assert_eq!(work.as_deref(), Some("ENG-7345"));
     assert_eq!(workspace.as_deref(), Some("muxa"));
     assert_eq!(thread.as_deref(), Some("review-cycle"));
     assert_eq!(kind.as_deref(), Some("review"));
     assert_eq!(status.as_deref(), Some("completed"));
-    assert_eq!(window.as_deref(), Some("CAL-7345"));
+    assert_eq!(window.as_deref(), Some("ENG-7345"));
     assert_eq!(offset, 20);
     assert_eq!(limit, Some(10));
     assert!(json);
@@ -1372,7 +1372,7 @@ fn message_send_cli_parses_correlation_and_artifact_metadata() {
         "--parent",
         "req-parent",
         "--work",
-        "CAL-7345",
+        "ENG-7345",
         "--workspace",
         "muxa",
         "--run",
@@ -1401,7 +1401,7 @@ fn message_send_cli_parses_correlation_and_artifact_metadata() {
     };
     assert_eq!(thread.as_deref(), Some("review-cycle"));
     assert_eq!(parent.as_deref(), Some("req-parent"));
-    assert_eq!(work.as_deref(), Some("CAL-7345"));
+    assert_eq!(work.as_deref(), Some("ENG-7345"));
     assert_eq!(workspace.as_deref(), Some("muxa"));
     assert_eq!(run.as_deref(), Some("run-2"));
     assert_eq!(artifacts, ["commit:d4bf2aa53"]);
@@ -1414,8 +1414,8 @@ fn message_history_filters_before_paginating_and_keeps_newest_order() {
         collaboration_request(
             "newest",
             datetime!(2026-08-30 12:00:00 UTC),
-            "CAL-7345",
-            Some("CAL-7345"),
+            "ENG-7345",
+            Some("ENG-7345"),
             Some("review-cycle"),
             RequestKind::Review,
             RequestStatus::Completed,
@@ -1423,8 +1423,8 @@ fn message_history_filters_before_paginating_and_keeps_newest_order() {
         collaboration_request(
             "wrong-kind",
             datetime!(2026-08-30 11:00:00 UTC),
-            "CAL-7345",
-            Some("CAL-7345"),
+            "ENG-7345",
+            Some("ENG-7345"),
             Some("review-cycle"),
             RequestKind::Notice,
             RequestStatus::Completed,
@@ -1432,8 +1432,8 @@ fn message_history_filters_before_paginating_and_keeps_newest_order() {
         collaboration_request(
             "second-match",
             datetime!(2026-08-30 10:00:00 UTC),
-            "CAL-7345",
-            Some("CAL-7345"),
+            "ENG-7345",
+            Some("ENG-7345"),
             Some("review-cycle"),
             RequestKind::Review,
             RequestStatus::Completed,
@@ -1441,8 +1441,8 @@ fn message_history_filters_before_paginating_and_keeps_newest_order() {
         collaboration_request(
             "too-old",
             datetime!(2026-08-29 09:00:00 UTC),
-            "CAL-7345",
-            Some("CAL-7345"),
+            "ENG-7345",
+            Some("ENG-7345"),
             Some("review-cycle"),
             RequestKind::Review,
             RequestStatus::Completed,
@@ -1455,11 +1455,11 @@ fn message_history_filters_before_paginating_and_keeps_newest_order() {
             until_at: None,
         }),
         workspace_id: Some("muxa".into()),
-        work_id: Some("CAL-7345".into()),
+        work_id: Some("ENG-7345".into()),
         thread_id: Some("review-cycle".into()),
         kind: Some(RequestKind::Review),
         status: Some(RequestStatus::Completed),
-        window: Some("@CAL-7345".into()),
+        window: Some("@ENG-7345".into()),
         limit: Some(1),
         offset: 1,
     };
@@ -1545,7 +1545,7 @@ fn work_start_cli_pins_ticket_agent_and_role() {
         "muxa",
         "work",
         "start",
-        "cal-7041",
+        "eng-7041",
         "--workspace",
         "muxa",
         "--agent",
@@ -1564,7 +1564,7 @@ fn work_start_cli_pins_ticket_agent_and_role() {
     else {
         panic!("expected work start");
     };
-    assert_eq!(start.work, "cal-7041");
+    assert_eq!(start.work, "eng-7041");
     assert_eq!(start.workspace.as_deref(), Some("muxa"));
     assert_eq!(start.agent, agent_launch::AgentProgram::Codex);
     assert_eq!(start.role.as_deref(), Some("reviewer"));
@@ -1576,7 +1576,7 @@ fn work_up_cli_carries_the_pipeline_overrides() {
         "muxa",
         "work",
         "up",
-        "cal-1234",
+        "eng-1234",
         "--pipeline",
         "triad",
         "--body",
@@ -1596,7 +1596,7 @@ fn work_up_cli_carries_the_pipeline_overrides() {
     else {
         panic!("expected work up");
     };
-    assert_eq!(up.work, "cal-1234");
+    assert_eq!(up.work, "eng-1234");
     assert_eq!(up.pipeline.as_deref(), Some("triad"));
     assert_eq!(up.body.as_deref(), Some("rebase onto main"));
     assert_eq!(up.skill.as_deref(), Some("/review-plan"));
@@ -1609,7 +1609,7 @@ fn work_up_cli_carries_the_pipeline_overrides() {
 #[test]
 fn work_up_still_accepts_prompt_as_a_spelling_of_body() {
     let args =
-        Args::try_parse_from(["muxa", "work", "up", "cal-1234", "--prompt", "do it"]).unwrap();
+        Args::try_parse_from(["muxa", "work", "up", "eng-1234", "--prompt", "do it"]).unwrap();
     let Cmd::Work {
         action: WorkCmd::Up(up),
     } = args.cmd.expect("explicit subcommand")
@@ -1621,14 +1621,14 @@ fn work_up_still_accepts_prompt_as_a_spelling_of_body() {
 
 #[test]
 fn work_down_is_a_spelling_of_work_close() {
-    let args = Args::try_parse_from(["muxa", "work", "down", "cal-1234", "-y"]).unwrap();
+    let args = Args::try_parse_from(["muxa", "work", "down", "eng-1234", "-y"]).unwrap();
     let Cmd::Work {
         action: WorkCmd::Down(down),
     } = args.cmd.expect("explicit subcommand")
     else {
         panic!("expected work down");
     };
-    assert_eq!(down.work, "cal-1234");
+    assert_eq!(down.work, "eng-1234");
     assert!(down.yes);
 }
 
@@ -1638,7 +1638,7 @@ fn window_rename_cli_supports_explicit_automatic_and_buffered_names() {
         "muxa",
         "window",
         "rename",
-        "CAL-7175 auth refactor",
+        "ENG-7175 auth refactor",
         "--window",
         "@42",
         "--json",
@@ -1650,7 +1650,7 @@ fn window_rename_cli_supports_explicit_automatic_and_buffered_names() {
     else {
         panic!("expected window rename");
     };
-    assert_eq!(rename.name.as_deref(), Some("CAL-7175 auth refactor"));
+    assert_eq!(rename.name.as_deref(), Some("ENG-7175 auth refactor"));
     assert!(rename.buffer.is_none());
     assert_eq!(rename.window.as_deref(), Some("@42"));
     assert!(!rename.auto);
@@ -1793,7 +1793,7 @@ fn fleet_attach_accepts_app_fit_mode() {
             "fleet",
             "attach",
             "--fit",
-            "rtzr",
+            "devbox",
             r#"{"window":{"session":{"host":"tmux","socket":"default","session_id":"$1"},"window_id":"@2"},"pane_id":"%3"}"#,
         ])
         .is_ok());
@@ -2069,7 +2069,7 @@ fn status_tree_groups_agents_by_session_and_window() {
     let pane = |id: &str, session: &str, session_id: &str, window: &str, index: &str| {
         serde_json::from_value::<muxa::tmux::PaneInfo>(serde_json::json!({
             "pane_id": id, "session": session, "session_id": session_id,
-            "session_group": "callabo", "window_id": format!("@{window}"),
+            "session_group": "webapp", "window_id": format!("@{window}"),
             "window_name": format!("w{window}"), "window_index": window,
             "pane_index": index, "tty": "", "current_command": "aas", "title": "",
             "pane_pid": 0, "socket": "default"
@@ -2077,10 +2077,10 @@ fn status_tree_groups_agents_by_session_and_window() {
         .unwrap()
     };
     let panes = vec![
-        pane("%1", "callabo", "$1", "0", "0"),
-        pane("%1", "callabo~view~9", "$9", "0", "0"),
-        pane("%2", "callabo", "$1", "1", "0"),
-        pane("%3", "callabo", "$1", "1", "1"),
+        pane("%1", "webapp", "$1", "0", "0"),
+        pane("%1", "webapp~view~9", "$9", "0", "0"),
+        pane("%2", "webapp", "$1", "1", "0"),
+        pane("%3", "webapp", "$1", "1", "1"),
     ];
     let mut agents = vec![
         agent("a", Some("%1"), AgentState::Working, "first task"),
@@ -2109,9 +2109,9 @@ fn status_tree_groups_agents_by_session_and_window() {
             .unwrap_or_else(|| panic!("{needle:?} missing:\n{rendered}"))
     };
     assert!(!rendered.contains("~view~"), "{rendered}");
-    assert!(lines[at("callabo")].contains("1 working · 1 waiting · 1 idle"));
+    assert!(lines[at("webapp")].contains("1 working · 1 waiting · 1 idle"));
     // A window with one agent carries it on its own line.
-    assert!(at("callabo") < at("├─ 0:w0 · claude"));
+    assert!(at("webapp") < at("├─ 0:w0 · claude"));
     assert!(lines[at("├─ 0:w0 · claude")].contains("first task"));
     assert!(at("├─ 0:w0 · claude") < at("└─ 1:w1"));
     assert!(at("└─ 1:w1") < at("   ├─ 0 claude"));
@@ -2174,12 +2174,12 @@ fn pane_inventory_lists_grouped_panes_once_with_their_view_count() {
         .unwrap()
     };
     let lines = pane_inventory_lines(&[
-        pane("callabo~view~1", "$8"),
-        pane("callabo", "$0"),
-        pane("callabo~view~2", "$9"),
+        pane("webapp~view~1", "$8"),
+        pane("webapp", "$0"),
+        pane("webapp~view~2", "$9"),
     ]);
     assert_eq!(lines.len(), 1, "{lines:?}");
-    assert!(lines[0].contains("callabo:2.0  +2 views"), "{lines:?}");
+    assert!(lines[0].contains("webapp:2.0  +2 views"), "{lines:?}");
 }
 
 #[test]
@@ -2200,8 +2200,8 @@ fn pane_display_shows_task_name_when_paneless() {
 fn pane_display_matches_the_server_and_falls_back_to_the_session() {
     let mut agent = agent("cx", Some("rmux:%2"), AgentState::Idle, "");
     agent.tmux_socket = Some("/tmp/rmux-1/default".into());
-    agent.tmux_session = Some("callabo~view~7".into());
-    assert_eq!(pane_display(&agent, &[]), "callabo:%2");
+    agent.tmux_session = Some("webapp~view~7".into());
+    assert_eq!(pane_display(&agent, &[]), "webapp:%2");
 
     let pane = |socket: &str, session: &str| -> muxa::tmux::PaneInfo {
         serde_json::from_value(serde_json::json!({
@@ -2213,9 +2213,9 @@ fn pane_display_matches_the_server_and_falls_back_to_the_session() {
     };
     let panes = [
         pane("/tmp/rmux-9/other", "elsewhere"),
-        pane("/tmp/rmux-1/default", "callabo"),
+        pane("/tmp/rmux-1/default", "webapp"),
     ];
-    assert_eq!(pane_display(&agent, &panes), "callabo:2.0");
+    assert_eq!(pane_display(&agent, &panes), "webapp:2.0");
     agent.tmux_session = None;
     assert_eq!(pane_display(&agent, &panes[..1]), "rmux:%2");
 }
@@ -2237,7 +2237,7 @@ fn status_table_compacts_without_wrapping_at_88_cols() {
         ),
     ];
     let panes = vec![
-        pane("%1", "callabo-knowledge-long-session-name"),
+        pane("%1", "webapp-knowledge-long-session-name"),
         pane("%2", "muxa"),
     ];
 
@@ -2251,7 +2251,7 @@ fn status_table_compacts_without_wrapping_at_88_cols() {
 
     assert!(rendered.contains("choice"));
     assert!(!rendered.contains("MODEL"));
-    assert!(rendered.contains("callabo-knowled..."));
+    assert!(rendered.contains("webapp-knowledg..."));
     for line in rendered.lines() {
         assert!(
             UnicodeWidthStr::width(line) <= 88,
@@ -2268,7 +2268,7 @@ fn status_table_minimal_layout_for_very_narrow_width() {
         AgentState::WaitingInput,
         "approve permission",
     )];
-    let panes = vec![pane("%1", "callabo-set")];
+    let panes = vec![pane("%1", "webapp-set")];
 
     let rendered = render_status_table(
         &agents,

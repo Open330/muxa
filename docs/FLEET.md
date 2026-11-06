@@ -353,8 +353,8 @@ selector-based placement, configurable workspace paths, and durable dispatch.
 ## Preview and synchronize automation settings
 
 ```sh
-muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --diff
-muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --apply
+muxa fleet sync --from devbox --to local,mac-pro,mac-mini --diff
+muxa fleet sync --from devbox --to local,mac-pro,mac-mini --apply
 ```
 
 To share more than automation, or between hosts that are not in a Fleet, use

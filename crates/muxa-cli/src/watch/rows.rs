@@ -397,7 +397,7 @@ mod work_up_key_tests {
     /// argument, not as a second command.
     #[test]
     fn a_work_id_cannot_break_out_of_the_shell_command() {
-        let nasty = "cal-1'; rm -rf ~; echo '";
+        let nasty = "eng-1'; rm -rf ~; echo '";
         let args = work_up_window_args("/usr/bin/muxa", nasty);
         let command = args.last().expect("command").clone();
         // Every embedded quote is closed, escaped and reopened, so the whole
@@ -411,12 +411,12 @@ mod work_up_key_tests {
     /// An install path with a space is ordinary on macOS.
     #[test]
     fn the_binary_path_is_quoted_too() {
-        let command = work_up_window_args("/Applications/My Tools/muxa", "CAL-1")
+        let command = work_up_window_args("/Applications/My Tools/muxa", "ENG-1")
             .last()
             .expect("command")
             .clone();
         assert!(
-            command.starts_with("'/Applications/My Tools/muxa' work up 'CAL-1'"),
+            command.starts_with("'/Applications/My Tools/muxa' work up 'ENG-1'"),
             "{command}",
         );
     }
@@ -425,15 +425,15 @@ mod work_up_key_tests {
     /// looking, and the run would sit on a confirmation prompt nobody sees.
     #[test]
     fn outside_tmux_it_refuses_and_names_the_command() {
-        let error = open_work_up_window("cal-7229", false).expect_err("must refuse");
-        assert!(error.contains("muxa work up CAL-7229"), "{error}");
+        let error = open_work_up_window("eng-7229", false).expect_err("must refuse");
+        assert!(error.contains("muxa work up ENG-7229"), "{error}");
     }
 
     /// The window has to outlive the command, or the plan `work up` prints
     /// scrolls past before it can be read.
     #[test]
     fn the_window_waits_before_closing() {
-        let args = work_up_window_args("/usr/bin/muxa", "CAL-1");
+        let args = work_up_window_args("/usr/bin/muxa", "ENG-1");
         assert_eq!(args[0], "new-window");
         assert!(args.last().expect("command").ends_with("read _"));
     }
@@ -450,7 +450,7 @@ mod work_up_key_tests {
         assert!(app.work_composer.is_some(), "the composer stays open");
 
         app.work_composer = Some(WorkComposer {
-            input: "cal-7229".into(),
+            input: "eng-7229".into(),
             cursor: 8,
         });
         assert!(matches!(

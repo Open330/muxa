@@ -33,8 +33,8 @@ const request = (id, createdAt, extra = {}) => ({
   status: "completed",
   body: `review ${id}`,
   created_at: createdAt,
-  thread_id: "CAL-7345/review",
-  work_id: "CAL-7345",
+  thread_id: "ENG-7345/review",
+  work_id: "ENG-7345",
   ...extra,
 });
 
@@ -82,7 +82,7 @@ test("aggregates directional requests and reverse replies without losing roles",
   assert.equal(projection.edges[0].count, 2);
   assert.equal(projection.edges[0].replyCount, 1);
   assert.deepEqual(projection.edges[0].kinds, { review: 2 });
-  assert.deepEqual(projection.works, ["CAL-7345"]);
+  assert.deepEqual(projection.works, ["ENG-7345"]);
 });
 
 test("durable participant identity namespaces a session by host and socket", () => {
@@ -97,10 +97,10 @@ test("durable participant identity namespaces a session by host and socket", () 
 
 test("qualifies work ids with workspace to avoid cross-workspace collisions", () => {
   const projection = projectCollaboration([
-    request("one", "2026-08-30T01:00:00Z", { workspace_id: "callabo" }),
+    request("one", "2026-08-30T01:00:00Z", { workspace_id: "webapp" }),
     request("two", "2026-08-30T02:00:00Z", { workspace_id: "muxa" }),
   ]);
-  assert.deepEqual(projection.works, ["callabo/CAL-7345", "muxa/CAL-7345"]);
+  assert.deepEqual(projection.works, ["muxa/ENG-7345", "webapp/ENG-7345"]);
 });
 
 test("drill-down filters by exact room and directed edge, then sorts chronologically", () => {

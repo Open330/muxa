@@ -654,12 +654,12 @@ mod tests {
 spinner = false
 
 [[route]]
-match = '^cal-'
-workspace = 'callabo'
+match = '^eng-'
+workspace = 'webapp'
 pipeline = 'triad' # the main line-up
 prepare = 'mk-ws {{id}}'
 [route.worktree]
-repo = '~/workspace/callabo'
+repo = '~/workspace/webapp'
 
 [[route]]
 match = '.*'
@@ -945,7 +945,7 @@ agent = 'codex'
         let error = remove_pipeline(&path, "triad", false).unwrap_err();
         let text = format!("{error:#}");
         assert!(text.contains("--force"), "{text}");
-        assert!(text.contains("\"^cal-\", \".*\""), "{text}");
+        assert!(text.contains("\"^eng-\", \".*\""), "{text}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
 
         let error = remove_pipeline(&path, "quartet", false).unwrap_err();
@@ -958,21 +958,21 @@ agent = 'codex'
             PipelineRemoved {
                 pipeline: "triad".into(),
                 removed: true,
-                routes_cleared: vec!["^cal-".into(), ".*".into()],
+                routes_cleared: vec!["^eng-".into(), ".*".into()],
                 config_path: path.clone(),
             }
         );
         let json = serde_json::to_value(&removed).unwrap();
-        assert_eq!(json["routes_cleared"], json!(["^cal-", ".*"]));
+        assert_eq!(json["routes_cleared"], json!(["^eng-", ".*"]));
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("pipeline"), "{text}");
         assert!(text.contains("# hand-written by the operator"), "{text}");
         assert!(text.contains("prepare = 'mk-ws {{id}}'"), "{text}");
         let config = Config::load(&path).unwrap();
         assert!(config.pipeline.is_empty());
-        assert_eq!(route_patterns(&config), ["^cal-", ".*"]);
+        assert_eq!(route_patterns(&config), ["^eng-", ".*"]);
         assert!(config.route.iter().all(|route| route.pipeline.is_none()));
-        assert_eq!(config.route[0].workspace.as_deref(), Some("callabo"));
+        assert_eq!(config.route[0].workspace.as_deref(), Some("webapp"));
         assert!(config.route[0].worktree.is_some());
         assert!(config.route[0].prepare.is_some());
         assert_eq!(config.ticket.agent, "codex");
@@ -1047,7 +1047,7 @@ agent = 'codex'
         );
         assert!(text.contains("# the line-up\n[pipeline.triad]"), "{text}");
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), ["^cal-", ".*", "^muxa-"]);
+        assert_eq!(route_patterns(&config), ["^eng-", ".*", "^muxa-"]);
         let route = &config.route[2];
         assert_eq!(route.pipeline.as_deref(), Some("triad"));
         assert_eq!(route.workspace.as_deref(), Some("muxa"));
@@ -1077,7 +1077,7 @@ agent = 'codex'
         assert_eq!(set.position, 0);
         assert!(set.created);
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), ["^hot-", "^cal-", ".*"]);
+        assert_eq!(route_patterns(&config), ["^hot-", "^eng-", ".*"]);
         assert!(config.route[1].worktree.is_some());
         assert_eq!(config.route[1].prepare.as_deref(), Some("mk-ws {{id}}"));
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1105,7 +1105,7 @@ agent = 'codex'
         .unwrap();
         assert_eq!(set.position, 3);
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), ["^hot-", "^cal-", ".*", "^cold-"]);
+        assert_eq!(route_patterns(&config), ["^hot-", "^eng-", ".*", "^cold-"]);
         assert_eq!(config.route[3].pipeline, None);
     }
 
@@ -1116,7 +1116,7 @@ agent = 'codex'
         let set = set_route(
             &path,
             &RouteEdit {
-                pattern: "^cal-".into(),
+                pattern: "^eng-".into(),
                 pipeline: Some("pair".into()),
                 cwd: Some("/tmp/cal".into()),
                 clear_workspace: true,
@@ -1132,9 +1132,9 @@ agent = 'codex'
             "{text}"
         );
         assert!(text.contains("prepare = 'mk-ws {{id}}'"), "{text}");
-        assert!(!text.contains("workspace = 'callabo'"), "{text}");
+        assert!(!text.contains("workspace = 'webapp'"), "{text}");
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), ["^cal-", ".*"]);
+        assert_eq!(route_patterns(&config), ["^eng-", ".*"]);
         let route = &config.route[0];
         assert_eq!(route.pipeline.as_deref(), Some("pair"));
         assert_eq!(route.cwd.as_deref(), Some("/tmp/cal"));
@@ -1144,7 +1144,7 @@ agent = 'codex'
                 .worktree
                 .as_ref()
                 .map(|worktree| worktree.repo.as_str()),
-            Some("~/workspace/callabo")
+            Some("~/workspace/webapp")
         );
         assert_eq!(route.prepare.as_deref(), Some("mk-ws {{id}}"));
         // The other route is untouched.
@@ -1154,7 +1154,7 @@ agent = 'codex'
         let set = set_route(
             &path,
             &RouteEdit {
-                pattern: "^cal-".into(),
+                pattern: "^eng-".into(),
                 clear_pipeline: true,
                 clear_cwd: true,
                 ..RouteEdit::default()
@@ -1168,7 +1168,7 @@ agent = 'codex'
         assert_eq!(route.cwd, None);
         assert!(route.worktree.is_some());
         assert!(
-            render_route_set(&set).starts_with("updated [[route]] match = \"^cal-\" at position 0")
+            render_route_set(&set).starts_with("updated [[route]] match = \"^eng-\" at position 0")
         );
     }
 
@@ -1187,7 +1187,7 @@ agent = 'codex'
         assert_eq!(set.position, 0);
         assert!(!set.created);
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), [".*", "^cal-"]);
+        assert_eq!(route_patterns(&config), [".*", "^eng-"]);
         assert_eq!(config.route[0].pipeline.as_deref(), Some("triad"));
         assert!(config.route[1].worktree.is_some());
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1210,13 +1210,13 @@ agent = 'codex'
         .unwrap();
         assert_eq!(set.position, 0);
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), [".*", "^cal-"]);
+        assert_eq!(route_patterns(&config), [".*", "^eng-"]);
 
         // And moving the one with a worktree carries the worktree along.
         let set = set_route(
             &path,
             &RouteEdit {
-                pattern: "^cal-".into(),
+                pattern: "^eng-".into(),
                 position: Some(0),
                 ..RouteEdit::default()
             },
@@ -1224,7 +1224,7 @@ agent = 'codex'
         .unwrap();
         assert_eq!(set.position, 0);
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), ["^cal-", ".*"]);
+        assert_eq!(route_patterns(&config), ["^eng-", ".*"]);
         assert!(config.route[0].worktree.is_some());
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1291,7 +1291,7 @@ agent = 'codex'
         );
         assert_eq!(serde_json::to_value(&removed).unwrap()["match"], ".*");
         let config = Config::load(&path).unwrap();
-        assert_eq!(route_patterns(&config), ["^cal-"]);
+        assert_eq!(route_patterns(&config), ["^eng-"]);
         assert!(config.route[0].worktree.is_some());
         assert!(config.pipeline.contains_key("triad"));
         let text = std::fs::read_to_string(&path).unwrap();
@@ -1301,7 +1301,7 @@ agent = 'codex'
             format!("removed [[route]] match = \".*\" from {}\n", path.display())
         );
 
-        let removed = remove_route(&path, "^cal-").unwrap();
+        let removed = remove_route(&path, "^eng-").unwrap();
         assert!(removed.removed);
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("route"), "{text}");

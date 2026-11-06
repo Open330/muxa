@@ -2588,7 +2588,7 @@ mod tests {
                 kind: AgentKind::Codex,
                 session_id: id.into(),
                 pane: Some(format!("%{id}")),
-                session_name: Some("callabo".into()),
+                session_name: Some("webapp".into()),
                 cwd: None,
                 from: AgentState::Working,
                 to: AgentState::Idle,

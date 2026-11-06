@@ -41,7 +41,7 @@ adapter, not the logical cardinality: the snapshot and dashboards already allow
 multiple Runs under one Work. Existing `@muxa_work_id` metadata and v1 dashboard
 records are migrated rather than discarded.
 
-`muxa work up CAL-1234` may use the external display key as the default Work ID
+`muxa work up ENG-1234` may use the external display key as the default Work ID
 for convenience. The resulting Work and the Linear/GitHub/Jira issue remain
 separate objects: the Work owns its local stage and goal, while the external
 reference owns provider status and URL.

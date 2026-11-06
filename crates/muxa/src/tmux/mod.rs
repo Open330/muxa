@@ -1695,12 +1695,12 @@ mod tests {
         cols.resize(12, "");
         cols.push("workspace"); // 12: @muxa_workspace_id
         cols.resize(15, "");
-        cols.push("CAL-7345"); // 15: @muxa_work_id
+        cols.push("ENG-7345"); // 15: @muxa_work_id
         cols.resize(24, "");
 
         let panes = parse_pane_lines(&format!("{}\n", cols.join("\t")));
         assert_eq!(panes[0].workspace_id.as_deref(), Some("workspace"));
-        assert_eq!(panes[0].work_id.as_deref(), Some("CAL-7345"));
+        assert_eq!(panes[0].work_id.as_deref(), Some("ENG-7345"));
     }
 
     #[test]

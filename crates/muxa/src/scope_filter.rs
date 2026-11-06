@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn a_session_exclusion_covers_its_grouped_views() {
-        let exclusions = ScopeExclusions::new(Vec::new(), vec!["callabo".into()]);
-        assert!(exclusions.excludes(None, None, Some("callabo~view~743208")));
-        assert!(!exclusions.excludes(None, None, Some("callabo-base")));
+        let exclusions = ScopeExclusions::new(Vec::new(), vec!["webapp".into()]);
+        assert!(exclusions.excludes(None, None, Some("webapp~view~743208")));
+        assert!(!exclusions.excludes(None, None, Some("webapp-base")));
     }
 }

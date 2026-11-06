@@ -53,12 +53,12 @@ fn discovery_reports_a_gap_when_last_accepted_entry_reaches_limit() {
 #[test]
 fn natural_korean_question_preserves_identifier_and_interprets_kst_event_time() {
     let plan = query::plan(
-        "2026.10.22 11:54 KST에 callabo-internal 버킷을 우리가 만들었는지",
+        "2026.10.22 11:54 KST에 webapp-internal 버킷을 우리가 만들었는지",
         "UTC",
         OffsetDateTime::UNIX_EPOCH,
     )
     .unwrap();
-    assert!(plan.terms.contains(&"callabo-internal".into()));
+    assert!(plan.terms.contains(&"webapp-internal".into()));
     assert!(plan.expanded_terms.contains(&"create_bucket".into()));
     assert_eq!(plan.from.as_deref(), Some("2026-10-22T11:39:00+09:00"));
     assert_eq!(plan.to.as_deref(), Some("2026-10-22T12:09:00+09:00"));
@@ -110,12 +110,12 @@ fn finds_execution_by_event_date_not_filename_and_reads_separated_tool_pair() {
         &[
             claude(
                 "user",
-                json!("create the callabo-internal bucket"),
+                json!("create the webapp-internal bucket"),
                 "2026-10-22T02:53:00Z",
             ),
             claude(
                 "assistant",
-                json!([{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"aws --endpoint-url https://minio.rtzr.ai s3api create-bucket --bucket callabo-internal"}}]),
+                json!([{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"aws --endpoint-url https://minio.devbox.ai s3api create-bucket --bucket webapp-internal"}}]),
                 "2026-10-22T02:54:32Z",
             ),
             claude(
@@ -130,12 +130,12 @@ fn finds_execution_by_event_date_not_filename_and_reads_separated_tool_pair() {
             ),
             claude(
                 "assistant",
-                json!([{"type":"text","text":"callabo-internal was created"}]),
+                json!([{"type":"text","text":"webapp-internal was created"}]),
                 "2026-10-26T02:54:34Z",
             ),
         ],
     );
-    let mut req = request("2026.10.22 11:54 KST callabo-internal 버킷 생성");
+    let mut req = request("2026.10.22 11:54 KST webapp-internal 버킷 생성");
     req.kinds = vec!["tool_call".into()];
     let result = store.search(&req).unwrap();
     assert!(result.coverage.complete);
@@ -163,13 +163,13 @@ fn codex_canonical_messages_and_tool_calls_avoid_lifecycle_duplicates() {
         &roots.join("codex.jsonl"),
         &[
             json!({"type":"session_meta","payload":{"id":"codex-session","cwd":"/repo"}}),
-            json!({"timestamp":"2026-10-22T02:54:32Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"create_bucket('callabo-internal')"}}),
-            json!({"timestamp":"2026-10-22T02:54:33Z","type":"event_msg","payload":{"type":"agent_message","message":"callabo-internal done"}}),
-            json!({"timestamp":"2026-10-22T02:54:33Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"callabo-internal done"}]}}),
+            json!({"timestamp":"2026-10-22T02:54:32Z","type":"response_item","payload":{"type":"custom_tool_call","name":"exec","call_id":"c1","input":"create_bucket('webapp-internal')"}}),
+            json!({"timestamp":"2026-10-22T02:54:33Z","type":"event_msg","payload":{"type":"agent_message","message":"webapp-internal done"}}),
+            json!({"timestamp":"2026-10-22T02:54:33Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"webapp-internal done"}]}}),
             json!({"timestamp":"2026-10-22T02:54:34Z","type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"c1","output":"{\"exit_code\":0}"}}),
         ],
     );
-    let result = store.search(&request("callabo-internal")).unwrap();
+    let result = store.search(&request("webapp-internal")).unwrap();
     assert_eq!(result.matches.len(), 2);
     assert!(result
         .matches
@@ -199,22 +199,20 @@ fn copied_tool_logs_stay_user_prose_and_instructions_are_opt_in() {
         &[
             claude(
                 "user",
-                json!("# AGENTS.md instructions\ncallabo-internal"),
+                json!("# AGENTS.md instructions\nwebapp-internal"),
                 "2026-10-22T02:00:00Z",
             ),
             claude(
                 "user",
-                json!(
-                    r#"Here is a quote: {"type":"tool_use","command":"create callabo-internal"}"#
-                ),
+                json!(r#"Here is a quote: {"type":"tool_use","command":"create webapp-internal"}"#),
                 "2026-10-22T02:01:00Z",
             ),
         ],
     );
-    let result = store.search(&request("callabo-internal")).unwrap();
+    let result = store.search(&request("webapp-internal")).unwrap();
     assert_eq!(result.matches.len(), 1);
     assert_eq!(result.matches[0].event.kind, "user");
-    let mut req = request("callabo-internal");
+    let mut req = request("webapp-internal");
     req.include_instructions = true;
     assert_eq!(store.search(&req).unwrap().matches.len(), 2);
     req.exclude_session_ids = vec!["claude-test".into()];
@@ -855,12 +853,12 @@ fn multiple_dates_do_not_silently_narrow_to_the_first_day() {
     let plan = query::plan("backstage deploy", "UTC", OffsetDateTime::UNIX_EPOCH).unwrap();
     assert_eq!(plan.timezone, "UTC");
     let plan = query::plan(
-        "callabo-internal이라는 버킷을 만들었나요",
+        "webapp-internal이라는 버킷을 만들었나요",
         "UTC",
         OffsetDateTime::UNIX_EPOCH,
     )
     .unwrap();
-    assert!(plan.terms.contains(&"callabo-internal".into()));
+    assert!(plan.terms.contains(&"webapp-internal".into()));
 }
 
 #[test]

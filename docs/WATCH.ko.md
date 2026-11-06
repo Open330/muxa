@@ -478,8 +478,8 @@ muxa workspace view
 
 view 이름은 `<session>~view~<pid>`라 원본 session 옆에 정렬됩니다. tmux가 session
 이름을 prefix로 매칭하는데도 안전한 이유는 **정확 일치가 우선**하기 때문입니다 —
-`callabo`, `callabo-set`, `callabo~view~1734560`이 모두 있어도 `-t callabo`는
-`callabo`로 해석됩니다. detach하면 사라지므로 view가 쌓이지 않습니다.
+`webapp`, `webapp-set`, `webapp~view~1734560`이 모두 있어도 `-t webapp`는
+`webapp`로 해석됩니다. detach하면 사라지므로 view가 쌓이지 않습니다.
 
 window 크기를 session에 붙은 가장 작은 client가 아니라 실제로 그 window를 보고
 있는 터미널 기준으로 잡으려면 window 단위 sizing을 함께 켭니다.

@@ -7236,16 +7236,16 @@ mod tests {
         add_capped_agent(&store, "%1", "match").await;
         add_capped_agent(&store, "%2", "miss").await;
         let mut matching = collaboration_pane("%1", "0");
-        matching.workspace_id = Some("callabo".into());
-        matching.work_id = Some("CAL-1234".into());
+        matching.workspace_id = Some("webapp".into());
+        matching.work_id = Some("ENG-1234".into());
         let mut other = collaboration_pane("%2", "1");
-        other.workspace_id = Some("callabo".into());
+        other.workspace_id = Some("webapp".into());
         other.work_id = Some("JIRA-9".into());
         let (backends, sends) = automation_backend(vec![matching, other]);
 
         let mut config = resume_rule_config();
-        config.rule[0].workspace = Some("callabo".into());
-        config.rule[0].work = Some("^CAL-".into());
+        config.rule[0].workspace = Some("webapp".into());
+        config.rule[0].work = Some("^ENG-".into());
         let automation = AutomationStore::in_memory(config);
         let mut engine = AutomationEngine::new(automation, store, backends);
 

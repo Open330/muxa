@@ -1908,8 +1908,8 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
         )
         .await
         .unwrap();
-    assert_eq!(request.workspace_id.as_deref(), Some("callabo"));
-    assert_eq!(request.work_id.as_deref(), Some("CAL-7345"));
+    assert_eq!(request.workspace_id.as_deref(), Some("webapp"));
+    assert_eq!(request.work_id.as_deref(), Some("ENG-7345"));
     // `@reviewer` names a slot, recorded beside the session it reached.
     let slot = request
         .to_slot
@@ -2197,8 +2197,8 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
         )
         .await
         .unwrap();
-    assert_eq!(console_request.workspace_id.as_deref(), Some("callabo"));
-    assert_eq!(console_request.work_id.as_deref(), Some("CAL-7345"));
+    assert_eq!(console_request.workspace_id.as_deref(), Some("webapp"));
+    assert_eq!(console_request.work_id.as_deref(), Some("ENG-7345"));
     assert_eq!(console_request.run_id.as_deref(), Some("tmux:default:@1"));
 
     let audit_entries = audit.entries().await;

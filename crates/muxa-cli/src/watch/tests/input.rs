@@ -115,7 +115,7 @@ fn the_collab_screen_paints_where_each_request_happened() {
         .collect();
     // Both ends, the room each sits in, and the message itself: without
     // the location a fleet-wide list cannot say where the work happened.
-    assert!(painted.contains("callabo:CAL-7330"), "{painted}");
+    assert!(painted.contains("webapp:ENG-7330"), "{painted}");
     assert!(painted.contains("Collab"), "{painted}");
     assert!(painted.contains("check the upload chunking"), "{painted}");
 }
@@ -166,7 +166,7 @@ fn rename_submitting_an_untouched_prefill_is_a_cancel() {
     // likely accident in it. Renaming a window to the name it already has
     // would still pin `automatic-rename off` as a side effect, which is a
     // real change nobody asked for.
-    let mut app = rename_app(RenameLevel::Window, "cal-7306");
+    let mut app = rename_app(RenameLevel::Window, "eng-7306");
     let action = handle_rename_event(KeyCode::Enter, KeyModifiers::NONE, &mut app);
     assert!(matches!(action, Action::None));
     assert!(app.rename.is_none(), "the form closes");
@@ -174,7 +174,7 @@ fn rename_submitting_an_untouched_prefill_is_a_cancel() {
 
 #[test]
 fn rename_submits_only_a_changed_name() {
-    let mut app = rename_app(RenameLevel::Window, "cal-7306");
+    let mut app = rename_app(RenameLevel::Window, "eng-7306");
     {
         let rename = app.rename.as_mut().expect("form is open");
         spawn_edit_text(
@@ -196,7 +196,7 @@ fn rename_success_asks_for_an_immediate_refresh() {
     // The rename lands in tmux, and muxad has nothing to announce about
     // it. Without this wake the row keeps its old name until the fallback
     // tick, which reads as a rename that silently did not take.
-    let mut app = rename_app(RenameLevel::Window, "cal-7306");
+    let mut app = rename_app(RenameLevel::Window, "eng-7306");
     let (wake_tx, mut wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     finish_rename(&mut app, &wake_tx, |_| Ok("renamed window".into()));
     assert!(app.rename.is_none(), "the form closes on success");
@@ -206,7 +206,7 @@ fn rename_success_asks_for_an_immediate_refresh() {
 
 #[test]
 fn rename_failure_keeps_the_form_and_skips_the_refresh() {
-    let mut app = rename_app(RenameLevel::Window, "cal-7306");
+    let mut app = rename_app(RenameLevel::Window, "eng-7306");
     let (wake_tx, mut wake_rx) = mpsc::channel::<()>(WAKE_CAPACITY);
     finish_rename(&mut app, &wake_tx, |_| Err("duplicate window name".into()));
     assert!(app.rename.is_some(), "the form stays open to be corrected");
@@ -216,7 +216,7 @@ fn rename_failure_keeps_the_form_and_skips_the_refresh() {
 
 #[test]
 fn rename_refuses_an_empty_name_without_closing() {
-    let mut app = rename_app(RenameLevel::Session, "callabo");
+    let mut app = rename_app(RenameLevel::Session, "webapp");
     app.rename.as_mut().unwrap().input.clear();
     app.rename.as_mut().unwrap().cursor = 0;
     // Enter on an empty field warns rather than submitting; Backspace on
@@ -241,13 +241,13 @@ fn rename_escape_abandons_the_edit() {
 
 #[test]
 fn window_name_taken_excludes_the_window_being_renamed() {
-    let listing = "@1\tbuild\n@4\tcal-7306\n@9\treview\n";
+    let listing = "@1\tbuild\n@4\teng-7306\n@9\treview\n";
     // Keeping your own name is not a collision with yourself.
-    assert!(!window_name_taken(listing, "@4", "cal-7306"));
+    assert!(!window_name_taken(listing, "@4", "eng-7306"));
     // Another window holding it is.
     assert!(window_name_taken(listing, "@4", "review"));
     // Free names are free.
-    assert!(!window_name_taken(listing, "@4", "cal-7307"));
+    assert!(!window_name_taken(listing, "@4", "eng-7307"));
     // Whole-field equality, never a prefix: `build` must not match
     // `build-2`, or a rename would be refused against a name nobody has.
     assert!(!window_name_taken(listing, "@4", "build-2"));
@@ -273,8 +273,8 @@ fn rename_rules_preserve_label_spaces_but_normalize_window_spaces() {
         "two terminals"
     );
     assert_eq!(
-        crate::tmux_work::normalize_window_name("CAL-1 review").unwrap(),
-        "CAL-1-review"
+        crate::tmux_work::normalize_window_name("ENG-1 review").unwrap(),
+        "ENG-1-review"
     );
     assert!(rename_label("bad:name", RenameLevel::Session).is_err());
     assert!(rename_label("bad\ntitle", RenameLevel::Pane).is_err());

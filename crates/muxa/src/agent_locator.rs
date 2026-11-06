@@ -361,7 +361,7 @@ pub(crate) mod tests {
     }
 
     fn fixture() -> TopologySnapshot {
-        let mut direct = pane("a", "project", "CAL-8226");
+        let mut direct = pane("a", "project", "ENG-8226");
         direct.session_group = Some("project".into());
         let mut view = direct.clone();
         view.session_id = "$9".into();
@@ -370,7 +370,7 @@ pub(crate) mod tests {
         first.last_prompt = Some("unrelated follow-up".into());
         let other = pane("b", "other", "main");
         let mut second = agent("mention", Some("b"));
-        second.last_response = Some(format!("{} CAL-8226 화자 분리", "앞".repeat(500)));
+        second.last_response = Some(format!("{} ENG-8226 화자 분리", "앞".repeat(500)));
         TopologySnapshot::build(
             OffsetDateTime::UNIX_EPOCH,
             vec![TopologyInput::new(
@@ -383,7 +383,7 @@ pub(crate) mod tests {
 
     #[test]
     fn ranks_location_over_mentions_and_folds_views_without_socket_collisions() {
-        let result = find(&fixture(), "cal-8226", 10, &[]).unwrap();
+        let result = find(&fixture(), "eng-8226", 10, &[]).unwrap();
         assert_eq!(result.total, 2);
         assert_eq!(result.matches[0].agent_session_id, "implementer");
         assert_eq!(result.matches[0].workspace, "project");
@@ -395,7 +395,7 @@ pub(crate) mod tests {
             result.matches[1].location.window.session.endpoint.socket,
             "b"
         );
-        assert!(result.matches[1].evidence[0].excerpt.contains("CAL-8226"));
+        assert!(result.matches[1].evidence[0].excerpt.contains("ENG-8226"));
         assert!(result.matches[1].evidence[0].excerpt.chars().count() <= 202);
     }
 
@@ -405,7 +405,7 @@ pub(crate) mod tests {
         assert_eq!(result.total, 1);
         assert_eq!(result.matches[0].agent_session_id, "mention");
         assert_eq!(
-            find(&fixture(), "CAL-8226", 10, &["implementer".into()])
+            find(&fixture(), "ENG-8226", 10, &["implementer".into()])
                 .unwrap()
                 .total,
             1
@@ -414,7 +414,7 @@ pub(crate) mod tests {
 
     #[test]
     fn bounds_results_and_reports_no_match_without_inventing_a_location() {
-        let result = find(&fixture(), "cal-8226", 1, &[]).unwrap();
+        let result = find(&fixture(), "eng-8226", 1, &[]).unwrap();
         assert_eq!(result.matches.len(), 1);
         assert!(result.has_more);
         assert_eq!(result.total, 2);
@@ -441,7 +441,7 @@ pub(crate) mod tests {
         orphan.state = AgentState::Working;
         orphan.session_id = "orphan".into();
         topology.unassigned_agents.push(orphan);
-        let result = find(&topology, "cal-8226", 10, &[]).unwrap();
+        let result = find(&topology, "eng-8226", 10, &[]).unwrap();
         assert_eq!(result.total, 1);
         assert_eq!(result.unassigned_agents, 1);
     }

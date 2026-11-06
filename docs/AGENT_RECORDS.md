@@ -5,12 +5,12 @@
 For “where is the agent working on this?”, start with the local live lookup:
 
 ```sh
-muxa agent find 'CAL-8226' --json
+muxa agent find 'ENG-8226' --json
 muxa agent find '화자 분리' --limit 5 --json
 muxa agent find 'AGENT_SESSION_ID' --json
 ```
 
-MCP callers use `muxa_agent_find(query="CAL-8226")`. All whitespace-separated
+MCP callers use `muxa_agent_find(query="ENG-8226")`. All whitespace-separated
 keywords must match, case-insensitively, across workspace/window names, paths,
 alias, titles, recap and latest prompt/response. Extract a few keywords from a
 natural-language question; try alternate spellings if needed. Results prefer
@@ -93,7 +93,7 @@ the historical work never happened.
 
 New `muxa ask` conversations using Claude, Codex or Gemini are guided to this
 lookup first. Existing conversations retain their original guidance; start with
-`muxa ask --new 'CAL-8226 작업하던 에이전트 위치 찾아줘'` after updating muxad.
+`muxa ask --new 'ENG-8226 작업하던 에이전트 위치 찾아줘'` after updating muxad.
 Direct API providers do not have shell/MCP workspace tools; this change does not
 give them live workspace access.
 
@@ -106,7 +106,7 @@ calls/results. They do not require a running daemon, contact a model, or query
 MinIO/GitHub/other services mentioned in a transcript.
 
 ```sh
-muxa agent search '2026.10.22 11:54 KST에 callabo-internal 버킷을 우리가 만들었는지' --json
+muxa agent search '2026.10.22 11:54 KST에 acme-internal 버킷을 우리가 만들었는지' --json
 muxa agent read EVENT_ID --before 5 --after 10 --json
 ```
 
@@ -260,7 +260,7 @@ to discover them. See [MCP setup](MCP.md).
 
 ```json
 {
-  "query": "Who created the callabo-internal bucket?",
+  "query": "Who created the acme-internal bucket?",
   "from": "2026-10-22T11:40:00+09:00",
   "to": "2026-10-22T12:10:00+09:00",
   "exclude_session_ids": ["CURRENT_SESSION_ID"],

@@ -212,7 +212,7 @@ argument로 발신 pane을 임의 지정하지 않습니다.
   이를 요구합니다.
 - pane이 아니라 "이 작업의 이 역할"에게 보내려면 경로를 씁니다:
   `workspace/work/role`, `workspace/work/role@alias`, `workspace/work/@alias`
-  (예: `muxa msg send callabo/CAL-8111/implementer "진행 상황?"`). 살아 있는 agent
+  (예: `muxa msg send webapp/ENG-8111/implementer "진행 상황?"`). 살아 있는 agent
   하나와 정확히 일치해야 하며 pane 대상과 같은 scope 규칙을 따릅니다.
 - 경로·`@alias`·`role:`로 보낸 요청은 슬롯을 기억합니다. 아직 전달되기 전(미수신, 알림
   전)이라면 같은 세션이 다른 pane으로 옮겼을 때 그 세션을, 원래 세션이 사라졌을 때는
@@ -270,7 +270,7 @@ muxa msg send peer "auth 변경의 race 가능성을 검토해 주세요" --kind
 
 # 원인 request와 Work/Run을 연결한 후속 검증
 muxa msg send peer "수정 결과를 검증해 주세요" --kind review \
-  --parent req_... --workspace callabo --work CAL-7345 --run resolve-2 \
+  --parent req_... --workspace webapp --work ENG-7345 --run resolve-2 \
   --artifact commit:d4bf2aa --link https://example.test/review
 
 # 수정 권한과 advisory path scope를 명시한 작업
@@ -279,7 +279,7 @@ muxa msg send pane:%18 "테스트를 보강해 주세요" \
 
 # 검증된 AIR plan을 작업 입력으로 함께 전달
 muxa msg send peer "이 계획의 위험을 검토해 주세요" --kind review \
-  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
+  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"ENG-6924 plan","locator":{"display":".air/eng-6924-plan.air.json","disclosure":"local-only"}}'
 
 # 수신 agent
 muxa msg inbox
@@ -297,7 +297,7 @@ muxa msg list --scope room
 muxa msg list --scope all
 
 # 모든 조건은 AND이며 필터 뒤 offset/limit 적용
-muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
+muxa msg list --scope all --since 7d --work ENG-7345 --kind review \
   --status completed --limit 50 --offset 0
 
 # 아직 상대가 claim하지 않은 요청 취소

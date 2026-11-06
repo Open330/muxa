@@ -64,8 +64,8 @@ has.
   solve a problem every heavy Claude/Codex user hits. They work with plain
   configuration; `aas` is one optional provider, not a prerequisite.
 - No product default, preset, or code path assumes a specific organization or
-  project (for example Callabo). Personal workflows live in user config and
-  user skills, not in muxa.
+  project. Personal workflows live in user config and user skills, not in
+  muxa.
 
 ### Deterministic first
 

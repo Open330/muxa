@@ -803,18 +803,18 @@ mod tests {
     fn work_rows_keep_the_explicit_managed_work_mark_and_issue() {
         let unmarked = full_row("/tmp/row.sock");
         let mut cols: Vec<String> = unmarked.split('\t').map(str::to_string).collect();
-        cols[15] = "CAL-1".into();
+        cols[15] = "ENG-1".into();
         cols[17] = "1".into();
         cols[24] = "linear".into();
-        cols[27] = "CAL-1".into();
+        cols[27] = "ENG-1".into();
         let marked = cols.join("\t");
         let rows = parse_work_panes(&format!("{marked}\n{unmarked}\n"), None);
         assert_eq!(rows.len(), 2);
         let (pane, marks) = &rows[0];
         assert_eq!(pane.pane_id, "rmux:%7");
         assert!(marks.managed_work);
-        assert_eq!(marks.work_id.as_deref(), Some("CAL-1"));
-        assert_eq!(marks.external_key.as_deref(), Some("CAL-1"));
+        assert_eq!(marks.work_id.as_deref(), Some("ENG-1"));
+        assert_eq!(marks.external_key.as_deref(), Some("ENG-1"));
         assert!(!rows[1].1.managed_work, "no mark, no Work");
     }
 

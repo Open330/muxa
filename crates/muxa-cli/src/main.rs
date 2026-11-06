@@ -572,7 +572,7 @@ enum MsgCmd {
         /// `--thread` is omitted.
         #[arg(long)]
         parent: Option<String>,
-        /// Stable Work id associated with this message (for example CAL-7345).
+        /// Stable Work id associated with this message (for example ENG-7345).
         #[arg(long)]
         work: Option<String>,
         /// Workspace containing `--work`.

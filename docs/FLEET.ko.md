@@ -41,16 +41,16 @@ Inbox의 Needs Action, Dock 배지와 macOS 알림에 표시합니다. 한 Mac�
 각 Mac의 알림 설정을 따르며, 같은 요청의 배너는 기기별로 한 번만 보냅니다.
 연결이 끊긴 호스트의 마지막 요청은 유지하고, 재연결하면 다시 동기화합니다.
 
-예를 들어 `june-mba`에서는 나머지 호스트를 등록합니다. SSH alias는 먼저
+예를 들어 `mac-air`에서는 나머지 호스트를 등록합니다. SSH alias는 먼저
 `~/.ssh/config`에 준비합니다.
 
 ```sh
-muxa fleet host add rtzr rtzr --mode control
-muxa fleet host add jiun-mbp jiun-mbp --mode control
-muxa fleet host add jiun-mini jiun-mini --mode control
+muxa fleet host add devbox devbox --mode control
+muxa fleet host add mac-pro mac-pro --mode control
+muxa fleet host add mac-mini mac-mini --mode control
 ```
 
-`jiun-mbp`를 사용하는 경우에는 `june-mba`, `rtzr`, `jiun-mini`를 그 기기의
+`mac-pro`를 사용하는 경우에는 `mac-air`, `devbox`, `mac-mini`를 그 기기의
 Fleet에도 등록합니다. 현재 기기는 항상 `local`로 포함됩니다. Fleet 등록은
 기기별 설정이므로 자동으로 양방향 등록되지는 않습니다. 읽기 전용 호스트의
 요청은 볼 수 있지만 답하려면 `control` 연결이 필요합니다.
@@ -335,8 +335,8 @@ backend를 관측하는 기능은 [MULTI_HOST.md](MULTI_HOST.md)를 참고하세
 ## automation 설정 비교와 전파
 
 ```sh
-muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --diff
-muxa fleet sync --from rtzr --to local,jiun-mbp,jiun-mini --apply
+muxa fleet sync --from devbox --to local,mac-pro,mac-mini --diff
+muxa fleet sync --from devbox --to local,mac-pro,mac-mini --apply
 ```
 
 기본은 미리보기이며 `--diff`로 명시할 수도 있습니다. 초기 범위는

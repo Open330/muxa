@@ -10,11 +10,11 @@ fn pane(id: &str, window: &str, work: Option<&str>, role: Option<&str>) -> PaneI
         worker_launch_id: None,
         agent_role: role.map(str::to_string),
         agent_alias: None,
-        workspace_id: work.map(|_| "callabo".to_string()),
+        workspace_id: work.map(|_| "webapp".to_string()),
         work_id: work.map(str::to_string),
         pane_id: id.into(),
         session_id: "$1".into(),
-        session: "callabo".into(),
+        session: "webapp".into(),
         window_id: window.into(),
         window_name: work.unwrap_or("main").into(),
         window_index: "0".into(),
@@ -40,7 +40,7 @@ fn agent(pane: &PaneInfo, session: &str, purpose: LaunchPurpose) -> Participant 
             window_id: pane.window_id.clone(),
         },
         tmux_session_id: Some("$1".into()),
-        tmux_session_name: Some("callabo".into()),
+        tmux_session_name: Some("webapp".into()),
         window_name: Some(pane.window_name.clone()),
         state: AgentState::Idle,
         cwd: Some("/repo".into()),
@@ -57,28 +57,28 @@ const WORKER: LaunchPurpose = LaunchPurpose::Worker;
 #[test]
 fn slot_paths_parse_and_pane_ids_do_not() {
     assert_eq!(
-        parse_slot_path("callabo/CAL-8111/implementer"),
+        parse_slot_path("webapp/ENG-8111/implementer"),
         Some((
-            "callabo".into(),
-            "CAL-8111".into(),
+            "webapp".into(),
+            "ENG-8111".into(),
             Some("implementer".into()),
             None
         ))
     );
     assert_eq!(
-        parse_slot_path("callabo/CAL-8111/reviewer@codex"),
+        parse_slot_path("webapp/ENG-8111/reviewer@codex"),
         Some((
-            "callabo".into(),
-            "CAL-8111".into(),
+            "webapp".into(),
+            "ENG-8111".into(),
             Some("reviewer".into()),
             Some("codex".into())
         ))
     );
     assert_eq!(
-        parse_slot_path("callabo/CAL-8111/@lead"),
+        parse_slot_path("webapp/ENG-8111/@lead"),
         Some((
-            "callabo".into(),
-            "CAL-8111".into(),
+            "webapp".into(),
+            "ENG-8111".into(),
             None,
             Some("lead".into())
         ))
@@ -102,8 +102,8 @@ fn slot_paths_parse_and_pane_ids_do_not() {
 fn a_slot_path_resolves_to_exactly_one_live_holder() {
     let orchestrator_pane = pane("rmux:%4", "@4", None, None);
     let orchestrator = agent(&orchestrator_pane, "orchestrator", LaunchPurpose::Primary);
-    let impl_8111 = pane("rmux:%356", "@9", Some("CAL-8111"), Some("implementer"));
-    let impl_7842 = pane("rmux:%357", "@10", Some("CAL-7842"), Some("implementer"));
+    let impl_8111 = pane("rmux:%356", "@9", Some("ENG-8111"), Some("implementer"));
+    let impl_7842 = pane("rmux:%357", "@10", Some("ENG-7842"), Some("implementer"));
     let panes = vec![orchestrator_pane, impl_8111.clone(), impl_7842.clone()];
     let participants = vec![
         orchestrator.clone(),
@@ -113,21 +113,21 @@ fn a_slot_path_resolves_to_exactly_one_live_holder() {
 
     let (recipient, slot) = resolve_slot_path(
         &orchestrator,
-        "callabo/CAL-8111/implementer",
+        "webapp/ENG-8111/implementer",
         &participants,
         &panes,
     )
     .unwrap()
     .unwrap();
     assert_eq!(recipient.agent_session_id, "s-8111");
-    assert_eq!(slot.work_id.as_deref(), Some("CAL-8111"));
+    assert_eq!(slot.work_id.as_deref(), Some("ENG-8111"));
     assert_eq!(slot.role.as_deref(), Some("implementer"));
     assert_eq!(slot.room.window_id, "@9");
 
     assert!(matches!(
         resolve_slot_path(
             &orchestrator,
-            "callabo/CAL-9999/implementer",
+            "webapp/ENG-9999/implementer",
             &participants,
             &panes
         ),
@@ -143,7 +143,7 @@ fn a_slot_path_resolves_to_exactly_one_live_holder() {
     assert!(matches!(
         resolve_slot_path(
             &orchestrator,
-            "callabo/CAL-8111/implementer",
+            "webapp/ENG-8111/implementer",
             &doubled,
             &panes_twice
         ),
@@ -423,21 +423,21 @@ fn a_slot_is_held_only_on_its_own_server() {
 fn a_stale_launch_role_does_not_hold_a_slot() {
     let sender_pane = pane("rmux:%4", "@4", None, None);
     let sender = agent(&sender_pane, "coordinator", LaunchPurpose::Primary);
-    let marked = pane("rmux:%7", "@9", Some("CAL-8111"), Some("reviewer"));
+    let marked = pane("rmux:%7", "@9", Some("ENG-8111"), Some("reviewer"));
     let mut reroled = agent(&marked, "s", WORKER);
     reroled.roles = vec!["implementer".into()];
     let panes = vec![sender_pane, marked];
     assert!(matches!(
         resolve_slot_path(
             &sender,
-            "callabo/CAL-8111/reviewer",
+            "webapp/ENG-8111/reviewer",
             &[reroled.clone()],
             &panes
         ),
         Some(Err(CollaborationError::UnknownTarget(_)))
     ));
     assert!(
-        resolve_slot_path(&sender, "callabo/CAL-8111/implementer", &[reroled], &panes)
+        resolve_slot_path(&sender, "webapp/ENG-8111/implementer", &[reroled], &panes)
             .unwrap()
             .is_ok()
     );

@@ -830,7 +830,7 @@ mod tests {
             - time::Duration::minutes(minutes_ago);
         WorkSnapshotItem {
             identity: WorkIdentity {
-                workspace_id: "callabo".into(),
+                workspace_id: "webapp".into(),
                 work_id: id.into(),
             },
             title: format!("title {id}"),
@@ -865,8 +865,8 @@ mod tests {
                 session_id: "$1".into(),
                 window_id: "@1".into(),
             },
-            session_name: "callabo".into(),
-            window_name: "CAL-1".into(),
+            session_name: "webapp".into(),
+            window_name: "ENG-1".into(),
             window_index: "1".into(),
             cwd: None,
             panes: panes
@@ -936,16 +936,16 @@ mod tests {
 
     #[test]
     fn works_that_need_the_operator_come_first_then_stage_then_recency() {
-        let mut waiting = work("CAL-4", BoardStage::Done, Vec::new(), 90);
+        let mut waiting = work("ENG-4", BoardStage::Done, Vec::new(), 90);
         waiting.runs = vec![run("/s", vec![("%4", Some(AgentState::WaitingInput))])];
         let mut board = BoardScreen::default();
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-1", BoardStage::Queued, Vec::new(), 1),
-                work("CAL-2", BoardStage::InProgress, Vec::new(), 30),
-                work("CAL-3", BoardStage::InProgress, Vec::new(), 5),
+                work("ENG-1", BoardStage::Queued, Vec::new(), 1),
+                work("ENG-2", BoardStage::InProgress, Vec::new(), 30),
+                work("ENG-3", BoardStage::InProgress, Vec::new(), 5),
                 waiting,
-                work("CAL-5", BoardStage::Review, vec![WorkSignal::Blocked], 60),
+                work("ENG-5", BoardStage::Review, vec![WorkSignal::Blocked], 60),
             ]),
             Vec::new(),
         );
@@ -954,7 +954,7 @@ mod tests {
             .iter()
             .map(|work| work.identity.work_id.as_str())
             .collect();
-        assert_eq!(order, ["CAL-5", "CAL-4", "CAL-3", "CAL-2", "CAL-1"]);
+        assert_eq!(order, ["ENG-5", "ENG-4", "ENG-3", "ENG-2", "ENG-1"]);
     }
 
     #[test]
@@ -962,23 +962,23 @@ mod tests {
         let mut board = BoardScreen::default();
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-1", BoardStage::InProgress, Vec::new(), 1),
-                work("CAL-2", BoardStage::InProgress, Vec::new(), 2),
+                work("ENG-1", BoardStage::InProgress, Vec::new(), 1),
+                work("ENG-2", BoardStage::InProgress, Vec::new(), 2),
             ]),
             Vec::new(),
         );
         board.move_selection(1, "");
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-2");
-        // CAL-2 now needs the operator and jumps to the top.
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-2");
+        // ENG-2 now needs the operator and jumps to the top.
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-1", BoardStage::InProgress, Vec::new(), 1),
-                work("CAL-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
+                work("ENG-1", BoardStage::InProgress, Vec::new(), 1),
+                work("ENG-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
             ]),
             Vec::new(),
         );
         assert_eq!(board.selected_index(""), 0);
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-2");
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-2");
     }
 
     #[test]
@@ -986,50 +986,50 @@ mod tests {
         let mut board = BoardScreen::default();
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-1", BoardStage::InProgress, Vec::new(), 1),
-                work("CAL-2", BoardStage::InProgress, Vec::new(), 2),
+                work("ENG-1", BoardStage::InProgress, Vec::new(), 1),
+                work("ENG-2", BoardStage::InProgress, Vec::new(), 2),
             ]),
             Vec::new(),
         );
-        // No navigation: the operator is looking at CAL-1.
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-1");
+        // No navigation: the operator is looking at ENG-1.
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-1");
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-1", BoardStage::InProgress, Vec::new(), 1),
-                work("CAL-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
+                work("ENG-1", BoardStage::InProgress, Vec::new(), 1),
+                work("ENG-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
             ]),
             Vec::new(),
         );
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-1");
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-1");
         // The selected Work goes away: the cursor commits to the new first row.
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
-                work("CAL-3", BoardStage::Queued, Vec::new(), 3),
+                work("ENG-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
+                work("ENG-3", BoardStage::Queued, Vec::new(), 3),
             ]),
             Vec::new(),
         );
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-2");
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-2");
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-3", BoardStage::Queued, vec![WorkSignal::Error], 3),
-                work("CAL-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
+                work("ENG-3", BoardStage::Queued, vec![WorkSignal::Error], 3),
+                work("ENG-2", BoardStage::InProgress, vec![WorkSignal::Error], 2),
             ]),
             Vec::new(),
         );
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-2");
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-2");
     }
 
     #[test]
     fn pane_issue_marks_show_on_their_work_once() {
-        let mut snap = snapshot(vec![work("CAL-1", BoardStage::Queued, Vec::new(), 1)]);
+        let mut snap = snapshot(vec![work("ENG-1", BoardStage::Queued, Vec::new(), 1)]);
         let pane = muxa::tmux::scanner::PaneSummary {
             host: muxa::backend::HostKind::Rmux,
             pane_id: "rmux:%1".into(),
             session_id: "$1".into(),
-            session: "callabo".into(),
+            session: "webapp".into(),
             window_id: "@1".into(),
-            window_name: "CAL-1".into(),
+            window_name: "ENG-1".into(),
             window_index: "1".into(),
             pane_index: "0".into(),
             tty: String::new(),
@@ -1039,10 +1039,10 @@ mod tests {
             socket: "/tmp/rmux/default".into(),
             muxa: muxa::tmux::scanner::MuxaPaneMetadata {
                 managed_work: true,
-                workspace_id: Some("callabo".into()),
-                work_id: Some("CAL-1".into()),
+                workspace_id: Some("webapp".into()),
+                work_id: Some("ENG-1".into()),
                 external_source: Some("linear".into()),
-                external_key: Some("CAL-1".into()),
+                external_key: Some("ENG-1".into()),
                 ..Default::default()
             },
             attach_command: String::new(),
@@ -1051,12 +1051,12 @@ mod tests {
         attach_pane_issues(&mut snap, &panes, OffsetDateTime::UNIX_EPOCH);
         attach_pane_issues(&mut snap, &panes, OffsetDateTime::UNIX_EPOCH);
         assert_eq!(snap.works[0].external_items.len(), 1);
-        assert_eq!(snap.works[0].external_items[0].display_key, "CAL-1");
+        assert_eq!(snap.works[0].external_items[0].display_key, "ENG-1");
     }
 
     #[test]
     fn filtering_matches_ids_titles_and_issue_keys_and_keeps_the_cursor_inside() {
-        let mut tagged = work("CAL-9", BoardStage::Queued, Vec::new(), 1);
+        let mut tagged = work("ENG-9", BoardStage::Queued, Vec::new(), 1);
         tagged.external_items = vec![muxa::work::ExternalItemRef {
             source: "linear".into(),
             scope: None,
@@ -1071,20 +1071,20 @@ mod tests {
         let mut board = BoardScreen::default();
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-1", BoardStage::Queued, Vec::new(), 2),
+                work("ENG-1", BoardStage::Queued, Vec::new(), 2),
                 tagged,
             ]),
             Vec::new(),
         );
         assert_eq!(board.visible("lin-42").len(), 1);
-        assert_eq!(board.visible("title cal-1").len(), 1);
-        assert_eq!(board.visible("callabo").len(), 2);
+        assert_eq!(board.visible("title eng-1").len(), 1);
+        assert_eq!(board.visible("webapp").len(), 2);
         board.select_last("");
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-1");
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-1");
         // The selected Work is filtered out: the cursor lands on what is left.
         assert_eq!(
             board.selected_work("lin").unwrap().identity.work_id,
-            "CAL-9"
+            "ENG-9"
         );
         board.move_selection(5, "nothing matches");
         assert!(board.selected_work("nothing matches").is_none());
@@ -1092,7 +1092,7 @@ mod tests {
 
     #[test]
     fn enter_prefers_the_agent_waiting_on_the_operator_and_keeps_its_socket() {
-        let mut item = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut item = work("ENG-1", BoardStage::InProgress, Vec::new(), 1);
         item.runs = vec![
             run("/a", vec![("%1", None), ("%2", Some(AgentState::Working))]),
             run("/b", vec![("%2", Some(AgentState::WaitingChoice))]),
@@ -1112,7 +1112,7 @@ mod tests {
 
     #[test]
     fn each_board_sort_orders_by_what_it_names_and_keeps_the_cursor() {
-        let mut busy = work("CAL-2", BoardStage::Queued, Vec::new(), 50);
+        let mut busy = work("ENG-2", BoardStage::Queued, Vec::new(), 50);
         busy.runs = vec![run(
             "/s",
             vec![
@@ -1123,9 +1123,9 @@ mod tests {
         let mut board = BoardScreen::default();
         board.set_snapshot(
             snapshot(vec![
-                work("CAL-3", BoardStage::InProgress, Vec::new(), 1),
+                work("ENG-3", BoardStage::InProgress, Vec::new(), 1),
                 busy,
-                work("CAL-1", BoardStage::Review, vec![WorkSignal::Blocked], 90),
+                work("ENG-1", BoardStage::Review, vec![WorkSignal::Blocked], 90),
             ]),
             Vec::new(),
         );
@@ -1136,15 +1136,15 @@ mod tests {
                 .map(|work| work.identity.work_id.clone())
                 .collect()
         };
-        assert_eq!(order(&board), ["CAL-1", "CAL-3", "CAL-2"]);
+        assert_eq!(order(&board), ["ENG-1", "ENG-3", "ENG-2"]);
         board.move_selection(1, "");
         board.set_sort(WatchBoardSort::Activity);
-        assert_eq!(order(&board), ["CAL-3", "CAL-2", "CAL-1"]);
+        assert_eq!(order(&board), ["ENG-3", "ENG-2", "ENG-1"]);
         board.set_sort(WatchBoardSort::Busy);
-        assert_eq!(order(&board)[0], "CAL-2");
+        assert_eq!(order(&board)[0], "ENG-2");
         board.set_sort(WatchBoardSort::Name);
-        assert_eq!(order(&board), ["CAL-1", "CAL-2", "CAL-3"]);
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-3");
+        assert_eq!(order(&board), ["ENG-1", "ENG-2", "ENG-3"]);
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-3");
         assert_eq!(parse_sort("working"), Some(WatchBoardSort::Busy));
         assert_eq!(
             parse_sort("active"),
@@ -1155,7 +1155,7 @@ mod tests {
 
     #[test]
     fn the_agent_cursor_reaches_every_live_run_and_skips_stopped_agents() {
-        let mut item = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut item = work("ENG-1", BoardStage::InProgress, Vec::new(), 1);
         item.runs = vec![
             run(
                 "/a",
@@ -1192,7 +1192,7 @@ mod tests {
 
     #[test]
     fn the_agent_cursor_is_committed_without_navigation_and_survives_reorders() {
-        let mut item = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut item = work("ENG-1", BoardStage::InProgress, Vec::new(), 1);
         item.runs = vec![run(
             "/a",
             vec![
@@ -1227,8 +1227,8 @@ mod tests {
 
     #[test]
     fn choosing_an_agent_in_a_filtered_work_survives_a_refresh() {
-        let a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
-        let mut b = work("CAL-2", BoardStage::InProgress, Vec::new(), 2);
+        let a = work("ENG-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut b = work("ENG-2", BoardStage::InProgress, Vec::new(), 2);
         b.runs = vec![run(
             "/a",
             vec![
@@ -1239,17 +1239,17 @@ mod tests {
         let snap = || snapshot(vec![a.clone(), b.clone()]);
         let mut board = BoardScreen::default();
         board.set_snapshot(snap(), Vec::new());
-        assert_eq!(board.selected_work("").unwrap().identity.work_id, "CAL-1");
-        board.cycle_agent(1, "cal-2");
+        assert_eq!(board.selected_work("").unwrap().identity.work_id, "ENG-1");
+        board.cycle_agent(1, "eng-2");
         board.set_snapshot(snap(), Vec::new());
-        let work = board.selected_work("cal-2").unwrap();
-        let (_, pane) = live_agents(work)[board.selected_agent_index("cal-2")];
+        let work = board.selected_work("eng-2").unwrap();
+        let (_, pane) = live_agents(work)[board.selected_agent_index("eng-2")];
         assert_eq!(pane.pane_id, "%6");
     }
 
     #[test]
     fn leaving_a_work_resets_its_agent_cursor() {
-        let mut a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut a = work("ENG-1", BoardStage::InProgress, Vec::new(), 1);
         a.runs = vec![run(
             "/a",
             vec![
@@ -1257,7 +1257,7 @@ mod tests {
                 ("%2", Some(AgentState::Idle)),
             ],
         )];
-        let mut b = work("CAL-2", BoardStage::InProgress, Vec::new(), 2);
+        let mut b = work("ENG-2", BoardStage::InProgress, Vec::new(), 2);
         b.runs = vec![run("/a", vec![("%5", Some(AgentState::Idle))])];
         let mut board = BoardScreen::default();
         board.set_snapshot(snapshot(vec![a, b]), Vec::new());
@@ -1266,7 +1266,7 @@ mod tests {
         board.move_selection(1, "");
         assert_eq!(cursor(&board), "%5");
         board.move_selection(-1, "");
-        assert_eq!(cursor(&board), "%1", "back on CAL-1 the cursor starts over");
+        assert_eq!(cursor(&board), "%1", "back on ENG-1 the cursor starts over");
     }
 
     fn activity(board: &BoardScreen, id: &str) -> WorkActivity {
@@ -1284,17 +1284,17 @@ mod tests {
             active_secs: secs,
             work_active_secs: 0,
         };
-        let mut on_a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut on_a = work("ENG-1", BoardStage::InProgress, Vec::new(), 1);
         on_a.runs = vec![run(
             "/tmp/rmux-a/default",
             vec![("rmux:%1", Some(AgentState::Idle))],
         )];
-        let mut on_b = work("CAL-2", BoardStage::InProgress, Vec::new(), 2);
+        let mut on_b = work("ENG-2", BoardStage::InProgress, Vec::new(), 2);
         on_b.runs = vec![run(
             "/tmp/rmux-b/default",
             vec![("rmux:%1", Some(AgentState::Idle))],
         )];
-        let mut alone = work("CAL-3", BoardStage::InProgress, Vec::new(), 3);
+        let mut alone = work("ENG-3", BoardStage::InProgress, Vec::new(), 3);
         alone.runs = vec![run(
             "/tmp/rmux-a/default",
             vec![("rmux:%7", Some(AgentState::Idle))],
@@ -1310,13 +1310,13 @@ mod tests {
             .collect(),
         ));
         assert_eq!(
-            activity(&board, "CAL-1"),
+            activity(&board, "ENG-1"),
             WorkActivity::Ambiguous("rmux:%1".into())
         );
-        assert_eq!(activity(&board, "CAL-2").cell(), "?");
-        assert_eq!(activity(&board, "CAL-3"), WorkActivity::Known(act(60)));
+        assert_eq!(activity(&board, "ENG-2").cell(), "?");
+        assert_eq!(activity(&board, "ENG-3"), WorkActivity::Known(act(60)));
         // An unlinked execution elsewhere makes the id ambiguous too.
-        let mut only_a = work("CAL-1", BoardStage::InProgress, Vec::new(), 1);
+        let mut only_a = work("ENG-1", BoardStage::InProgress, Vec::new(), 1);
         only_a.runs = vec![run(
             "/tmp/rmux-a/default",
             vec![("rmux:%1", Some(AgentState::Idle))],
@@ -1324,12 +1324,12 @@ mod tests {
         let mut snap = snapshot(vec![only_a]);
         snap.unlinked_executions = vec![run("/tmp/rmux-b/default", vec![("rmux:%1", None)])];
         board.set_snapshot(snap, Vec::new());
-        assert_eq!(activity(&board, "CAL-1").cell(), "?");
+        assert_eq!(activity(&board, "ENG-1").cell(), "?");
     }
 
     #[test]
     fn unlinked_executions_are_counted_not_listed() {
-        let mut snap = snapshot(vec![work("CAL-1", BoardStage::Queued, Vec::new(), 1)]);
+        let mut snap = snapshot(vec![work("ENG-1", BoardStage::Queued, Vec::new(), 1)]);
         snap.unlinked_executions = vec![run("/s", Vec::new()), run("/t", Vec::new())];
         let mut board = BoardScreen::default();
         board.set_snapshot(snap, Vec::new());

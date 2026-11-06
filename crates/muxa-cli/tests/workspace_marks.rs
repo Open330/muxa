@@ -128,7 +128,7 @@ fn run_muxa(server: &Server, stub_bin: &Path, args: &[&str]) -> std::process::Ou
         .expect("run muxa")
 }
 
-/// The shape that sent four agents to `callabo-set`: a stale mark on one
+/// The shape that sent four agents to `webapp-set`: a stale mark on one
 /// session while another carries the workspace's own name.
 ///
 /// The mark winning is the intended order — this locks it so a later change

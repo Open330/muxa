@@ -10,21 +10,21 @@ fn aggregate_session_history_is_exact_socket_scoped_and_de_duplicates_internal_t
             },
             session_id: "$1".into(),
         },
-        label: "callabo".into(),
+        label: "webapp".into(),
     };
     let internal = fake_watch_collaboration_request(
         "internal",
-        participant_on("%1", "default", "$1", "callabo", "@1", "CAL-1"),
-        participant_on("%2", "default", "$1", "callabo", "@2", "CAL-2"),
+        participant_on("%1", "default", "$1", "webapp", "@1", "ENG-1"),
+        participant_on("%2", "default", "$1", "webapp", "@2", "ENG-2"),
         RequestStatus::Completed,
     );
     let cross_socket = fake_watch_collaboration_request(
         "other-socket",
-        participant_on("%1", "amux", "$1", "other", "@1", "CAL-1"),
-        participant_on("%2", "amux", "$1", "other", "@2", "CAL-2"),
+        participant_on("%1", "amux", "$1", "other", "@1", "ENG-1"),
+        participant_on("%2", "amux", "$1", "other", "@2", "ENG-2"),
         RequestStatus::Completed,
     );
-    let mut missing_socket = participant_on("%3", "default", "$1", "callabo", "@1", "CAL-1");
+    let mut missing_socket = participant_on("%3", "default", "$1", "webapp", "@1", "ENG-1");
     missing_socket.socket = None;
     missing_socket.room.socket = None;
     let missing_socket = fake_watch_collaboration_request(
@@ -50,8 +50,8 @@ fn aggregate_session_history_is_exact_socket_scoped_and_de_duplicates_internal_t
 #[test]
 fn hierarchy_mailbox_scope_keeps_session_and_window_nodes_aggregate() {
     let panes = vec![
-        fake_topology_pane("default", "$1", "callabo", "@1", "CAL-1", 0, "%1", 0),
-        fake_topology_pane("default", "$1", "callabo", "@2", "CAL-2", 1, "%2", 0),
+        fake_topology_pane("default", "$1", "webapp", "@1", "ENG-1", 0, "%1", 0),
+        fake_topology_pane("default", "$1", "webapp", "@2", "ENG-2", 1, "%2", 0),
     ];
     let agents = vec![
         topology_agent("one", "%1", "default", AgentState::Idle, "one", 0),
@@ -85,7 +85,7 @@ fn aggregate_mailbox_actions_are_read_only() {
             },
             session_id: "$1".into(),
         },
-        label: "callabo".into(),
+        label: "webapp".into(),
     });
     for key in ['i', 'e', 'm'] {
         assert!(matches!(
@@ -108,19 +108,19 @@ fn session_mailbox_leads_with_human_window_names_and_message_summaries() {
             },
             session_id: "$1".into(),
         },
-        label: "callabo".into(),
+        label: "webapp".into(),
     });
     app.collaboration.incoming = vec![
         fake_watch_collaboration_request(
             "req_internal_one",
-            participant_on("%1", "default", "$1", "callabo", "@1", "CAL-7345"),
-            participant_on("%2", "default", "$1", "callabo", "@2", "CAL-8000"),
+            participant_on("%1", "default", "$1", "webapp", "@1", "ENG-7345"),
+            participant_on("%2", "default", "$1", "webapp", "@2", "ENG-8000"),
             RequestStatus::Completed,
         ),
         fake_watch_collaboration_request(
             "req_internal_two",
-            participant_on("%2", "default", "$1", "callabo", "@2", "CAL-8000"),
-            participant_on("%1", "default", "$1", "callabo", "@1", "CAL-7345"),
+            participant_on("%2", "default", "$1", "webapp", "@2", "ENG-8000"),
+            participant_on("%1", "default", "$1", "webapp", "@1", "ENG-7345"),
             RequestStatus::Blocked,
         ),
     ];
@@ -139,8 +139,8 @@ fn session_mailbox_leads_with_human_window_names_and_message_summaries() {
         .join("\n");
 
     assert_eq!(lines.len(), 6, "one header and two rows per message");
-    assert!(painted.contains("CAL-7345 · 1 message"), "{painted}");
-    assert!(painted.contains("CAL-8000 · 1 message"), "{painted}");
+    assert!(painted.contains("ENG-7345 · 1 message"), "{painted}");
+    assert!(painted.contains("ENG-8000 · 1 message"), "{painted}");
     assert!(painted.contains("done"), "{painted}");
     assert!(painted.contains("blocked"), "{painted}");
     assert!(painted.contains("review the auth change"), "{painted}");
@@ -1014,7 +1014,7 @@ fn host_scope_selected_work_beats_the_only_launch_window_peer() {
                 None,
             ),
             fake_agent(
-                "cal-7041",
+                "eng-7041",
                 Some("%913"),
                 AgentKind::ClaudeCode,
                 AgentState::Idle,
@@ -1027,14 +1027,14 @@ fn host_scope_selected_work_beats_the_only_launch_window_peer() {
         vec![
             fake_pane("%1", "main", 0, 0, "codex"),
             fake_pane("%2", "main", 0, 1, "codex"),
-            fake_pane("%913", "cal-7041", 0, 0, "claude"),
+            fake_pane("%913", "eng-7041", 0, 0, "claude"),
         ],
     );
     app.apply_view(WatchView::Window);
     let row_index = app
         .rows
         .iter()
-        .position(|row| matches!(row, WatchRow::Work(session) if session.session == "cal-7041"))
+        .position(|row| matches!(row, WatchRow::Work(session) if session.session == "eng-7041"))
         .unwrap();
     let visible_index = app
         .visible_targets()
@@ -1230,11 +1230,11 @@ fn the_peer_hint_names_the_rows_that_can_receive() {
     // The table lists every agent on the host; without names the user
     // has no way to tell which handful of rows qualify.
     let hint = peer_choice_hint(&[
-        "reviewer@%747 · callabo-set:0.1".to_string(),
-        "codex@%751 · callabo-set:0.2".to_string(),
+        "reviewer@%747 · webapp-set:0.1".to_string(),
+        "codex@%751 · webapp-set:0.2".to_string(),
     ]);
-    assert!(hint.contains("reviewer@%747 · callabo-set:0.1"), "{hint}");
-    assert!(hint.contains("codex@%751 · callabo-set:0.2"), "{hint}");
+    assert!(hint.contains("reviewer@%747 · webapp-set:0.1"), "{hint}");
+    assert!(hint.contains("codex@%751 · webapp-set:0.2"), "{hint}");
 }
 
 #[test]
@@ -1405,7 +1405,7 @@ fn watch_mailbox_render_contains_request_and_peer() {
     request.air_artifacts.push(AirArtifactReference {
         artifact_id: format!("urn:air:sha256:{}", "b".repeat(64)),
         profile: AirArtifactProfile::PlanNativeCli,
-        label: Some("CAL-6924 execution plan".into()),
+        label: Some("ENG-6924 execution plan".into()),
         locator: None,
     });
     app.collaboration.incoming.push(request);

@@ -459,7 +459,7 @@ mod tests {
 
     fn pane(id: &str, pid: u32) -> muxa::tmux::PaneInfo {
         serde_json::from_value(serde_json::json!({
-            "pane_id": id, "session": "callabo", "window_index": "4", "pane_index": "1",
+            "pane_id": id, "session": "webapp", "window_index": "4", "pane_index": "1",
             "tty": "", "current_command": "aas", "title": "", "pane_pid": pid
         }))
         .unwrap()
@@ -522,7 +522,7 @@ mod tests {
             &[
                 {
                     let mut view = pane("rmux:%217", 200);
-                    view.session = "callabo~view~1".into();
+                    view.session = "webapp~view~1".into();
                     view
                 },
                 pane("rmux:%217", 200),
@@ -536,7 +536,7 @@ mod tests {
                 .get(&(100, Some("/home/u/.codex".into()))),
             Some(&2)
         );
-        assert_eq!(report.panes.get("rmux:%217 (callabo:4.1)"), Some(&1));
+        assert_eq!(report.panes.get("rmux:%217 (webapp:4.1)"), Some(&1));
         assert_eq!(report.total(), 3);
         let text = report.guidance().unwrap();
         assert!(text.contains("CODEX_HOME=/home/u/.codex muxa reload mcp"));
@@ -599,7 +599,7 @@ mod tests {
                 .get(&(300, Some("/profiles/shared".into()))),
             Some(&1)
         );
-        assert!(report.standalone_codex.contains("rmux:%439 (callabo:4.1)"));
+        assert!(report.standalone_codex.contains("rmux:%439 (webapp:4.1)"));
         assert_eq!(report.total(), 2);
         assert!(report.guidance().unwrap().contains("when idle"));
     }
@@ -683,7 +683,7 @@ mod tests {
             |_| None,
             |pid| pid == 202,
         );
-        assert_eq!(report.panes.get("rmux:%7 (callabo:4.1)"), Some(&1));
+        assert_eq!(report.panes.get("rmux:%7 (webapp:4.1)"), Some(&1));
         assert_eq!(report.total(), 1);
     }
 

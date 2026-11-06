@@ -42,7 +42,7 @@ impl WorkIdentity {
 
 /// An optional external source attached to a muxa work item.
 ///
-/// `display_key` is the human identifier (`CAL-123`, `#79`). `stable_id`
+/// `display_key` is the human identifier (`ENG-123`, `#79`). `stable_id`
 /// carries the provider's immutable id when one is available. Keeping both
 /// avoids using a mutable or repository-local label as a global identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -785,7 +785,7 @@ mod tests {
             session_id: "$1".into(),
             session: "muxa".into(),
             window_id: window.into(),
-            window_name: if managed { "CAL-1" } else { "node" }.into(),
+            window_name: if managed { "ENG-1" } else { "node" }.into(),
             window_index: "1".into(),
             pane_index: "0".into(),
             tty: String::new(),
@@ -799,7 +799,7 @@ mod tests {
                 managed_agent: managed,
                 workspace_id: managed.then(|| "muxa".into()),
                 workspace_cwd: managed.then(|| "/repo".into()),
-                work_id: managed.then(|| "CAL-1".into()),
+                work_id: managed.then(|| "ENG-1".into()),
                 work_cwd: managed.then(|| "/repo".into()),
                 agent: managed.then(|| "codex".into()),
                 role: None,

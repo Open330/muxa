@@ -476,7 +476,7 @@ async fn work_command_on_an_observe_host_may_only_read_options() {
     for args in [
         argv(&["work", "preset", "apply", "solo"]),
         argv(&["work", "pipeline", "set", "--from-json", "-"]),
-        argv(&["work", "route", "remove", "CAL-.*"]),
+        argv(&["work", "route", "remove", "ENG-.*"]),
     ] {
         let error = manager
             .command(Some("dev".into()), args.clone(), None)

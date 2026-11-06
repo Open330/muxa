@@ -2698,11 +2698,11 @@ options = ["--model", "gpt-5-codex"]
                 "{bad}"
             );
         }
-        let named: Config = toml::from_str("[agent.claude]\naccount = \"jelly@claude\"\n").unwrap();
+        let named: Config = toml::from_str("[agent.claude]\naccount = \"spare@claude\"\n").unwrap();
         named.validate().unwrap();
         assert_eq!(
             named.account_route("claude").unwrap().choice,
-            crate::account_route::SpawnAccount::Named("jelly@claude".into())
+            crate::account_route::SpawnAccount::Named("spare@claude".into())
         );
     }
 
@@ -2784,7 +2784,7 @@ options = []
         let cfg: Config = toml::from_str(
             r#"
 [[route]]
-match = "^cal-"
+match = "^eng-"
 cwd = "~/workspace-agent/{{id}}"
 prepare = "workspace-tool create {{id}} {{ticket.branch}}"
 "#,

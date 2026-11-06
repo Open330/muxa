@@ -2127,7 +2127,7 @@ mod work_list_view_tests {
     fn run(work: &str, aliases: &[(&str, bool)]) -> muxa::pipeline_run::PipelineRun {
         use muxa::pipeline_run::{PipelineAliasState, PipelineAliasStatus};
         muxa::pipeline_run::PipelineRun {
-            identity: muxa::work::WorkIdentity::new("callabo", work),
+            identity: muxa::work::WorkIdentity::new("webapp", work),
             pipeline: "pair".into(),
             desired: aliases
                 .iter()
@@ -2176,8 +2176,8 @@ mod work_list_view_tests {
     fn work(name: &str, agents: Vec<ManagedAgentPane>) -> WorkInfo {
         WorkInfo {
             work: name.into(),
-            workspace: "callabo".into(),
-            session: "callabo".into(),
+            workspace: "webapp".into(),
+            session: "webapp".into(),
             session_id: "$1".into(),
             window: "@1".into(),
             window_index: 0,
@@ -2217,7 +2217,7 @@ mod work_list_view_tests {
             updated_at: now,
         };
         PipelineRun {
-            identity: muxa::work::WorkIdentity::new("callabo", "CAL-1"),
+            identity: muxa::work::WorkIdentity::new("webapp", "ENG-1"),
             pipeline: "delivery".to_string(),
             desired,
             cwd: PathBuf::from("/repo"),
@@ -2242,7 +2242,7 @@ mod work_list_view_tests {
     #[test]
     fn agents_read_as_aliases_or_collapsed_programs() {
         let piped = work(
-            "CAL-1",
+            "ENG-1",
             vec![
                 agent("%1", "claude", Some("impl")),
                 agent("%2", "codex", Some("review")),
@@ -2267,7 +2267,7 @@ mod work_list_view_tests {
     fn table_shows_the_completion_ratio() {
         let works = vec![
             work(
-                "CAL-1",
+                "ENG-1",
                 vec![
                     agent("%1", "claude", Some("impl")),
                     agent("%2", "codex", Some("review")),
@@ -2275,9 +2275,9 @@ mod work_list_view_tests {
             ),
             work("RELEASE-1", vec![agent("%3", "claude", None)]),
         ];
-        let runs = vec![run("CAL-1", &[("impl", true), ("review", true)])];
+        let runs = vec![run("ENG-1", &[("impl", true), ("review", true)])];
         let out = work_list_table(&works, &[], &runs, crate::theme::CliTheme::plain());
-        assert!(out.contains("CAL-1"), "{out}");
+        assert!(out.contains("ENG-1"), "{out}");
         assert!(out.contains("2/2"), "{out}");
         // The stage column stays out of the way when nothing is staged.
         assert!(!out.contains("STAGE"), "{out}");
@@ -2288,8 +2288,8 @@ mod work_list_view_tests {
     /// `1/1`, which is indistinguishable from converged.
     #[test]
     fn an_unlaunched_agent_still_counts_against_the_total() {
-        let works = vec![work("CAL-1", vec![agent("%1", "claude", Some("impl"))])];
-        let runs = vec![run("CAL-1", &[("impl", true), ("review", false)])];
+        let works = vec![work("ENG-1", vec![agent("%1", "claude", Some("impl"))])];
+        let runs = vec![run("ENG-1", &[("impl", true), ("review", false)])];
         let out = work_list_table(&works, &[], &runs, crate::theme::CliTheme::plain());
         assert!(out.contains("1/2"), "{out}");
     }
@@ -2298,15 +2298,15 @@ mod work_list_view_tests {
     /// nothing finished; the truth is that nothing here was ever asked to.
     #[test]
     fn a_work_without_a_run_reports_no_ratio() {
-        let works = vec![work("CAL-1", vec![agent("%1", "claude", Some("impl"))])];
+        let works = vec![work("ENG-1", vec![agent("%1", "claude", Some("impl"))])];
         let out = work_list_table(&works, &[], &[], crate::theme::CliTheme::plain());
         assert!(!out.contains("0/1"), "{out}");
-        assert!(out.contains("CAL-1"), "{out}");
+        assert!(out.contains("ENG-1"), "{out}");
     }
 
     #[test]
     fn table_uses_durable_desired_aliases_before_downstream_has_a_pane() {
-        let works = vec![work("CAL-1", vec![agent("%1", "codex", Some("impl"))])];
+        let works = vec![work("ENG-1", vec![agent("%1", "codex", Some("impl"))])];
         let out = work_list_table(
             &works,
             &[],
@@ -2322,8 +2322,8 @@ mod work_list_view_tests {
     #[test]
     fn table_keeps_a_durable_run_visible_without_a_tmux_window() {
         let out = work_list_table(&[], &[], &[durable_run()], crate::theme::CliTheme::plain());
-        assert!(out.contains("CAL-1"), "{out}");
-        assert!(out.contains("callabo"), "{out}");
+        assert!(out.contains("ENG-1"), "{out}");
+        assert!(out.contains("webapp"), "{out}");
         assert!(out.contains("impl:done"), "{out}");
         assert!(out.contains("review:pending"), "{out}");
         assert!(out.contains("1/2"), "{out}");
@@ -2852,10 +2852,10 @@ mod tests {
         // `<session>~view~<pid>` rather than `view~<pid>~<session>`: the view
         // lands next to its session in `list-sessions` and in watch's tree.
         // Safe despite tmux's prefix matching because an exact name match wins
-        // — `-t callabo` resolves to `callabo`, not to this.
+        // — `-t webapp` resolves to `webapp`, not to this.
         assert_eq!(
-            view_session_name("callabo", "1734560"),
-            "callabo~view~1734560"
+            view_session_name("webapp", "1734560"),
+            "webapp~view~1734560"
         );
     }
 
@@ -2957,21 +2957,18 @@ mod tests {
     fn a_mark_on_a_differently_named_session_is_only_reported_when_the_name_is_taken() {
         // Adoption and renames both leave a mark whose session is named
         // something else. On its own that is the feature working.
-        let renamed = [workspace_at("callabo", "callabo-set", "$5")];
-        assert!(mark_anomalies(&renamed, &["callabo-set".to_string()]).is_empty());
+        let renamed = [workspace_at("webapp", "webapp-set", "$5")];
+        assert!(mark_anomalies(&renamed, &["webapp-set".to_string()]).is_empty());
 
         // A session carrying the workspace's own name is what makes it
-        // ambiguous: `--workspace callabo` passes it by without a word.
-        let shadowed = mark_anomalies(
-            &renamed,
-            &["callabo-set".to_string(), "callabo".to_string()],
-        );
+        // ambiguous: `--workspace webapp` passes it by without a word.
+        let shadowed = mark_anomalies(&renamed, &["webapp-set".to_string(), "webapp".to_string()]);
         assert_eq!(
             shadowed,
             vec![MarkAnomaly::Shadowed {
-                workspace: "callabo".to_string(),
-                claimed_by: "callabo-set".to_string(),
-                named: "callabo".to_string(),
+                workspace: "webapp".to_string(),
+                claimed_by: "webapp-set".to_string(),
+                named: "webapp".to_string(),
             }]
         );
     }
@@ -2979,17 +2976,17 @@ mod tests {
     #[test]
     fn two_sessions_claiming_one_workspace_are_reported_together() {
         let both = [
-            workspace_at("callabo", "callabo", "$2"),
-            workspace_at("callabo", "callabo-set", "$5"),
+            workspace_at("webapp", "webapp", "$2"),
+            workspace_at("webapp", "webapp-set", "$5"),
         ];
         // Reported as the duplicate, not as a shadow: which session a lookup
         // returns is down to tmux's listing order, and naming one of them as
         // the claimant would imply muxa had chosen.
         assert_eq!(
-            mark_anomalies(&both, &["callabo".to_string(), "callabo-set".to_string()]),
+            mark_anomalies(&both, &["webapp".to_string(), "webapp-set".to_string()]),
             vec![MarkAnomaly::Duplicated {
-                workspace: "callabo".to_string(),
-                sessions: vec!["callabo".to_string(), "callabo-set".to_string()],
+                workspace: "webapp".to_string(),
+                sessions: vec!["webapp".to_string(), "webapp-set".to_string()],
             }]
         );
     }
@@ -2998,11 +2995,9 @@ mod tests {
     fn the_mark_writers_refuse_a_session_name() {
         // The whole point of the id: a name is what tmux may resolve to a
         // neighbour, so it must not reach `set-option` at all.
-        let error = adopt_workspace("callabo", "callabo")
-            .unwrap_err()
-            .to_string();
+        let error = adopt_workspace("webapp", "webapp").unwrap_err().to_string();
         assert!(error.contains("session id"), "unexpected error: {error}");
-        let error = mark_workspace("callabo", "callabo", Path::new("/tmp"))
+        let error = mark_workspace("webapp", "webapp", Path::new("/tmp"))
             .unwrap_err()
             .to_string();
         assert!(error.contains("session id"), "unexpected error: {error}");
@@ -3026,8 +3021,8 @@ mod tests {
     #[test]
     fn explicit_window_names_preserve_case_and_normalize_whitespace() {
         assert_eq!(
-            normalize_window_name("  CAL-7175  auth refactor  ").unwrap(),
-            "CAL-7175-auth-refactor"
+            normalize_window_name("  ENG-7175  auth refactor  ").unwrap(),
+            "ENG-7175-auth-refactor"
         );
         assert_eq!(
             normalize_window_name("topology-watch").unwrap(),
@@ -3041,15 +3036,15 @@ mod tests {
     #[test]
     fn window_identity_parser_requires_stable_native_ids() {
         assert_eq!(
-            parse_window_identity("@42\t$7\tmuxa\tCAL-7175\t0"),
+            parse_window_identity("@42\t$7\tmuxa\tENG-7175\t0"),
             Some(WindowIdentity {
                 window_id: "@42".into(),
                 session_id: "$7".into(),
                 session_name: "muxa".into(),
-                name: "CAL-7175".into(),
+                name: "ENG-7175".into(),
             })
         );
-        assert!(parse_window_identity("CAL-7175\t$7\tmuxa\tname\t0").is_none());
+        assert!(parse_window_identity("ENG-7175\t$7\tmuxa\tname\t0").is_none());
         assert!(parse_window_identity("@42\tmuxa\tmuxa\tname\t0").is_none());
     }
 
@@ -3057,7 +3052,7 @@ mod tests {
     fn parser_keeps_only_managed_workspace_work_and_agent_hierarchy() {
         let sessions = "muxa\t$1\tmuxa\t/repo\t1\t1\t2\n\
                         legacy\t$2\t\t/tmp\t\t0\t1\n";
-        let windows = "muxa\t$1\t@1\t0\ttest-0001\tTEST-0001\t/repo/wt\t1\tlinear\tCAL\tstable-1\tCAL-7093\tDashboard work\thttps://linear.app/CAL-7093\tstarted\n\
+        let windows = "muxa\t$1\t@1\t0\ttest-0001\tTEST-0001\t/repo/wt\t1\tlinear\tENG\tstable-1\tENG-7093\tDashboard work\thttps://linear.app/ENG-7093\tstarted\n\
                        muxa\t$1\t@2\t1\tplain\t\t/repo\t\n\
                        legacy\t$2\t@3\t0\tlegacy\tOLD-1\t/tmp\t1\n";
         // Trailing column is the pipeline alias: set on %1, empty on the
@@ -3077,7 +3072,7 @@ mod tests {
                 .external_item
                 .as_ref()
                 .map(|item| (item.source.as_str(), item.display_key.as_str())),
-            Some(("linear", "CAL-7093"))
+            Some(("linear", "ENG-7093"))
         );
         assert_eq!(workspaces[0].works[0].agents.len(), 2);
         assert_eq!(workspaces[0].works[0].agents[0].pane, "%1");
@@ -3119,7 +3114,7 @@ mod tests {
         WorkInfo {
             work: work.into(),
             workspace: workspace.into(),
-            session: "callabo".into(),
+            session: "webapp".into(),
             session_id: "$1".into(),
             window: "@7".into(),
             window_index: 0,
@@ -3148,24 +3143,24 @@ mod tests {
 
     #[test]
     fn a_stage_follows_the_logical_work_across_runs() {
-        let work = work_at("callabo", "CAL-1234");
+        let work = work_at("webapp", "ENG-1234");
         let records = vec![
-            record_at("callabo", "CAL-1234", WorkStage::Review),
-            record_at("callabo", "OTHER", WorkStage::Done),
-            record_at("other", "CAL-1234", WorkStage::Blocked),
+            record_at("webapp", "ENG-1234", WorkStage::Review),
+            record_at("webapp", "OTHER", WorkStage::Done),
+            record_at("other", "ENG-1234", WorkStage::Blocked),
         ];
         assert_eq!(stage_for(&work, &records), Some(WorkStage::Review));
-        assert_eq!(stage_for(&work_at("callabo", "MISSING"), &records), None);
+        assert_eq!(stage_for(&work_at("webapp", "MISSING"), &records), None);
         assert_eq!(stage_for(&work, &[]), None);
     }
 
     #[test]
     fn the_default_stage_adds_no_column() {
-        let work = work_at("callabo", "CAL-1234");
-        let records = vec![record_at("callabo", "CAL-1234", WorkStage::Auto)];
+        let work = work_at("webapp", "ENG-1234");
+        let records = vec![record_at("webapp", "ENG-1234", WorkStage::Auto)];
         // `auto` means "nobody has said anything"; printing it would be noise.
         assert_eq!(stage_suffix(&work, &records), "");
-        let staged = vec![record_at("callabo", "CAL-1234", WorkStage::InProgress)];
+        let staged = vec![record_at("webapp", "ENG-1234", WorkStage::InProgress)];
         assert_eq!(stage_suffix(&work, &staged), "  stage=in_progress");
     }
 
@@ -3184,12 +3179,12 @@ mod tests {
         // Identity and ownership are separate facts. muxa must be able to
         // find work in a session it adopted, and must never offer to kill
         // it — it is full of windows muxa did not open.
-        let sessions = "callabo\t$1\tcallabo\t/repo\t\t1\t3\n\
+        let sessions = "webapp\t$1\twebapp\t/repo\t\t1\t3\n\
                         owned\t$2\towned\t/repo\t1\t1\t1\n";
         let workspaces = parse_workspaces(sessions, "", "");
         let adopted = workspaces
             .iter()
-            .find(|w| w.workspace == "callabo")
+            .find(|w| w.workspace == "webapp")
             .expect("an adopted session is still visible");
         assert!(!adopted.managed, "adoption must not claim ownership");
         let owned = workspaces

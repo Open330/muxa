@@ -309,7 +309,7 @@ mod tests {
     use crate::work::WorkStage;
 
     fn identity() -> WorkIdentity {
-        WorkIdentity::new("muxa", "CAL-1")
+        WorkIdentity::new("muxa", "ENG-1")
     }
 
     #[tokio::test]
@@ -343,9 +343,9 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let item = ExternalItemRef {
             source: "linear".into(),
-            scope: Some("CAL".into()),
+            scope: Some("ENG".into()),
             stable_id: Some("uuid-1".into()),
-            display_key: "CAL-1".into(),
+            display_key: "ENG-1".into(),
             title: Some("Provider title".into()),
             url: None,
             status: Some("started".into()),

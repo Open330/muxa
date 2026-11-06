@@ -1154,8 +1154,8 @@ mod tests {
     /// in the `created` slot) seeds instead of reading as a keypress.
     #[test]
     fn rmux_samples_are_namespaced_and_pid_identified() {
-        let sessions = tmux::parse_session_lines("$0\tcallabo\t1\t\n$1\tsys\t0\t\n");
-        let clients = tmux::parse_client_lines("/dev/pts/1\tcallabo\t0\t1000\t4242\t0\n");
+        let sessions = tmux::parse_session_lines("$0\twebapp\t1\t\n$1\tsys\t0\t\n");
+        let clients = tmux::parse_client_lines("/dev/pts/1\twebapp\t0\t1000\t4242\t0\n");
         let sample = rmux_sample(sessions, clients);
         let ids: Vec<_> = sample
             .sessions
@@ -1184,8 +1184,8 @@ mod tests {
             "first poll seeds"
         );
         let typed = rmux_sample(
-            tmux::parse_session_lines("$0\tcallabo\t1\t\n"),
-            tmux::parse_client_lines("/dev/pts/1\tcallabo\t0\t1005\t4242\t0\n"),
+            tmux::parse_session_lines("$0\twebapp\t1\t\n"),
+            tmux::parse_client_lines("/dev/pts/1\twebapp\t0\t1005\t4242\t0\n"),
         );
         assert_eq!(
             detect_input_ticks(&mut seen, &typed.client_inputs).len(),
@@ -1193,8 +1193,8 @@ mod tests {
             "same attach, activity advanced"
         );
         let reattached = rmux_sample(
-            tmux::parse_session_lines("$0\tcallabo\t1\t\n"),
-            tmux::parse_client_lines("/dev/pts/1\tcallabo\t0\t1010\t5555\t0\n"),
+            tmux::parse_session_lines("$0\twebapp\t1\t\n"),
+            tmux::parse_client_lines("/dev/pts/1\twebapp\t0\t1010\t5555\t0\n"),
         );
         assert!(
             detect_input_ticks(&mut seen, &reattached.client_inputs).is_empty(),

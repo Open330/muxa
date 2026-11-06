@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn a_claude_session_file_reads_its_identity() {
         let json = format!(
-            r#"{{"pid":157653,"sessionId":"{A}","cwd":"/w","procStart":"51554631","tmux":"callabo:@232.%490","status":"idle"}}"#
+            r#"{{"pid":157653,"sessionId":"{A}","cwd":"/w","procStart":"51554631","tmux":"webapp:@232.%490","status":"idle"}}"#
         );
         assert_eq!(
             parse_claude_session(json.as_bytes()),

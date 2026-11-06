@@ -123,7 +123,7 @@ fn board_authority_ends_with_its_operation() {
 #[test]
 fn board_m_messages_exactly_the_cursor_agent_and_ignores_topology_marks() {
     let (mut app, keys) = board_ready_to_message();
-    let marked_peer = collab_participant("%3", "callabo", "CAL-1");
+    let marked_peer = collab_participant("%3", "webapp", "ENG-1");
     app.collaboration.room = Some(RoomContext {
         current: marked_peer.clone(),
         peers: vec![marked_peer],
@@ -168,9 +168,9 @@ fn board_m_is_not_sent_to_a_replacement_agent_in_the_same_pane() {
             fake_topology_pane(
                 "/tmp/a",
                 "$1",
-                "callabo",
+                "webapp",
                 "@4",
-                "CAL-1",
+                "ENG-1",
                 1,
                 pane,
                 u32::try_from(index).unwrap(),
@@ -242,9 +242,9 @@ fn a_board_message_follows_its_session_to_another_pane() {
             fake_topology_pane(
                 "/tmp/a",
                 "$1",
-                "callabo",
+                "webapp",
                 "@4",
-                "CAL-1",
+                "ENG-1",
                 1,
                 pane,
                 u32::try_from(index).unwrap(),
@@ -376,7 +376,7 @@ fn a_board_message_is_always_a_request_and_keeps_its_draft() {
 
 #[test]
 fn a_session_pinned_mailbox_hides_a_predecessors_history_in_the_same_pane() {
-    let mut predecessor = collab_participant("%1", "callabo", "CAL-1");
+    let mut predecessor = collab_participant("%1", "webapp", "ENG-1");
     predecessor.agent_session_id = "old".into();
     let mut current = predecessor.clone();
     current.agent_session_id = "new".into();
@@ -817,7 +817,7 @@ fn board_stats_label_tells_loading_unavailable_and_figures_apart() {
 #[test]
 fn each_work_gets_the_activity_of_its_own_panes_and_can_sort_by_it() {
     let (mut app, _) = board_with_agents();
-    let mut quiet = board_work("CAL-2", None);
+    let mut quiet = board_work("ENG-2", None);
     quiet.latest_at = Some(OffsetDateTime::now_utc());
     let busy = app.board.selected_work("").unwrap().clone();
     app.board
@@ -826,7 +826,7 @@ fn each_work_gets_the_activity_of_its_own_panes_and_can_sort_by_it() {
         active_secs: secs,
         work_active_secs: secs / 2,
     };
-    // CAL-1's panes are %1..%3; %9 belongs to nobody on the board.
+    // ENG-1's panes are %1..%3; %9 belongs to nobody on the board.
     let by_pane: std::collections::BTreeMap<String, _> = [
         ("%1".to_string(), act(600)),
         ("%2".to_string(), act(60)),
@@ -840,7 +840,7 @@ fn each_work_gets_the_activity_of_its_own_panes_and_can_sort_by_it() {
         .board
         .visible("")
         .into_iter()
-        .find(|work| work.identity.work_id == "CAL-1")
+        .find(|work| work.identity.work_id == "ENG-1")
         .unwrap()
         .clone();
     assert_eq!(
@@ -848,7 +848,7 @@ fn each_work_gets_the_activity_of_its_own_panes_and_can_sort_by_it() {
         board_screen::WorkActivity::Known(act(660))
     );
     app.board.set_sort(muxa::config::WatchBoardSort::Active);
-    assert_eq!(app.board.visible("")[0].identity.work_id, "CAL-1");
+    assert_eq!(app.board.visible("")[0].identity.work_id, "ENG-1");
     app.board.set_activity(board_screen::ActivityState::Loading);
     assert_eq!(
         app.board.active_of(&cal1),
@@ -897,8 +897,8 @@ fn board_enter_attaches_the_runs_exact_pane_not_a_same_id_pane_elsewhere() {
     app.set_data(
         Vec::new(),
         vec![
-            fake_topology_pane("/tmp/a", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0),
-            fake_topology_pane("/tmp/b", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0),
+            fake_topology_pane("/tmp/a", "$1", "webapp", "@4", "ENG-1", 1, "%2", 0),
+            fake_topology_pane("/tmp/b", "$1", "webapp", "@4", "ENG-1", 1, "%2", 0),
         ],
     );
     let on_b = app.pane_key_for("%2", Some("b")).expect("pane on b");
@@ -907,7 +907,7 @@ fn board_enter_attaches_the_runs_exact_pane_not_a_same_id_pane_elsewhere() {
     let mut spelled_as_path = on_b.clone();
     spelled_as_path.window.session.endpoint.socket = "/tmp/b".into();
     app.board.set_snapshot(
-        board_snapshot(vec![board_work("CAL-1", Some(&spelled_as_path))]),
+        board_snapshot(vec![board_work("ENG-1", Some(&spelled_as_path))]),
         Vec::new(),
     );
     app.apply_screen(WatchScreen::Board);
@@ -926,13 +926,13 @@ fn board_enter_never_substitutes_the_same_pane_id_on_another_server() {
     app.set_data(
         Vec::new(),
         vec![fake_topology_pane(
-            "/tmp/a", "$1", "callabo", "@4", "CAL-1", 1, "%2", 0,
+            "/tmp/a", "$1", "webapp", "@4", "ENG-1", 1, "%2", 0,
         )],
     );
     let mut elsewhere = app.pane_key_for("%2", Some("a")).expect("pane on a");
     elsewhere.window.session.endpoint.socket = "/tmp/c".into();
     app.board.set_snapshot(
-        board_snapshot(vec![board_work("CAL-1", Some(&elsewhere))]),
+        board_snapshot(vec![board_work("ENG-1", Some(&elsewhere))]),
         Vec::new(),
     );
     app.apply_screen(WatchScreen::Board);
@@ -1068,9 +1068,9 @@ fn board_enter_refuses_an_rmux_server_that_only_shares_a_file_name() {
     let mut pane = fake_topology_pane(
         "/tmp/rmux-new/default",
         "$1",
-        "callabo",
+        "webapp",
         "@4",
-        "CAL-1",
+        "ENG-1",
         1,
         "rmux:%2",
         0,
@@ -1088,7 +1088,7 @@ fn board_enter_refuses_an_rmux_server_that_only_shares_a_file_name() {
         .expect("rmux pane");
     old.window.session.endpoint.socket = "/tmp/rmux-old/default".into();
     app.board.set_snapshot(
-        board_snapshot(vec![board_work("CAL-1", Some(&old))]),
+        board_snapshot(vec![board_work("ENG-1", Some(&old))]),
         Vec::new(),
     );
     app.apply_screen(WatchScreen::Board);
@@ -1107,7 +1107,7 @@ async fn board_scans_never_block_and_only_one_runs_at_a_time() {
     let (release, gate) = tokio::sync::oneshot::channel::<()>();
     assert!(refresher.start(async move {
         let _ = gate.await;
-        (board_snapshot(vec![board_work("CAL-1", None)]), Vec::new())
+        (board_snapshot(vec![board_work("ENG-1", None)]), Vec::new())
     }));
     assert!(!refresher.start(async { (board_snapshot(Vec::new()), Vec::new()) }));
     assert!(
@@ -1149,7 +1149,7 @@ fn an_empty_board_still_shows_why_the_scan_failed() {
 fn board_enter_on_a_work_without_a_live_run_says_so() {
     let mut app = App::with_legacy_config(WatchConfig::default());
     app.board
-        .set_snapshot(board_snapshot(vec![board_work("CAL-1", None)]), Vec::new());
+        .set_snapshot(board_snapshot(vec![board_work("ENG-1", None)]), Vec::new());
     app.apply_screen(WatchScreen::Board);
     assert!(matches!(
         handle_event(
@@ -1167,7 +1167,7 @@ fn board_enter_on_a_work_without_a_live_run_says_so() {
 #[test]
 fn board_renders_works_with_their_detail_and_moves_with_j() {
     let mut app = App::with_legacy_config(WatchConfig::default());
-    let mut snap = board_snapshot(vec![board_work("CAL-1", None), board_work("CAL-2", None)]);
+    let mut snap = board_snapshot(vec![board_work("ENG-1", None), board_work("ENG-2", None)]);
     snap.unlinked_executions = Vec::new();
     app.board.set_snapshot(snap, Vec::new());
     app.apply_screen(WatchScreen::Board);
@@ -1181,7 +1181,7 @@ fn board_renders_works_with_their_detail_and_moves_with_j() {
     };
     let screen = draw(&mut app, 110);
     assert!(screen.contains("Board · 2 Works · 0 need you"), "{screen}");
-    assert!(screen.contains("callabo/CAL-1"), "{screen}");
+    assert!(screen.contains("webapp/ENG-1"), "{screen}");
     assert!(screen.contains("goal  ship it"), "{screen}");
     assert!(screen.contains("go to Run"), "{screen}");
     let first = app

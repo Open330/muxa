@@ -875,7 +875,7 @@ mod tests {
     fn native_work_request_rejects_conflicting_external_modes() {
         let input = WorkUpRequest {
             work: "W-1".into(),
-            external: Some("CAL-1".into()),
+            external: Some("ENG-1".into()),
             pipeline: None,
             workspace: None,
             cwd: None,

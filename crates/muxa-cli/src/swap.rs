@@ -1632,7 +1632,7 @@ mod tests {
             "--continue-when",
             "always",
             "--host",
-            "rtzr",
+            "devbox",
         ]);
         let argv = remote_argv(&cli.args);
         assert_eq!(
@@ -1654,8 +1654,8 @@ mod tests {
     /// The notice names the host and promises neither outcome.
     #[test]
     fn a_remote_swap_says_ctrl_c_only_stops_the_wait() {
-        let notice = remote_wait_notice("rtzr");
-        assert!(notice.contains("rtzr"), "{notice}");
+        let notice = remote_wait_notice("devbox");
+        assert!(notice.contains("devbox"), "{notice}");
         assert!(notice.contains("does not reliably cancel"), "{notice}");
         assert!(!notice.contains("cancelled"), "{notice}");
     }
@@ -1681,9 +1681,9 @@ mod tests {
 
     #[test]
     fn targets_all_and_account_flags_map_onto_the_request() {
-        let request = parse(&["%5", "--to", "jelly@claude", "--bare", "wrap"]);
+        let request = parse(&["%5", "--to", "spare@claude", "--bare", "wrap"]);
         assert_eq!(request.scope, SwapScope::Targets(vec!["%5".into()]));
-        assert_eq!(request.to, AccountChoice::Named("jelly@claude".into()));
+        assert_eq!(request.to, AccountChoice::Named("spare@claude".into()));
         assert_eq!(request.bare, BareMode::Wrap);
 
         let request = parse(&["--all", "--spread", "--force", "--provider", "codex"]);
@@ -2070,16 +2070,16 @@ mod tests {
     #[tokio::test]
     async fn a_lost_relay_answer_points_at_the_key_it_sent() {
         let fake = relay(|_| Err(RuntimeError::Disconnected));
-        let cli = Cli::parse_from(["swap", "%5", "--host", "rtzr"]);
+        let cli = Cli::parse_from(["swap", "%5", "--host", "devbox"]);
         let error = format!(
             "{:#}",
-            run_remote(&fake, &cli.args, "rtzr").await.unwrap_err()
+            run_remote(&fake, &cli.args, "devbox").await.unwrap_err()
         );
         let calls = fake.calls.borrow();
         assert_eq!(calls.len(), 1);
         let key = sent_key(&calls[0]).expect("a starting swap carries a key");
         assert!(
-            error.contains(&format!("muxa swap --host rtzr --status {key}")),
+            error.contains(&format!("muxa swap --host devbox --status {key}")),
             "{error}"
         );
     }
@@ -2100,8 +2100,8 @@ mod tests {
                 &format!("`swap` does not accept {word:?} here"),
             ))
         });
-        let cli = Cli::parse_from(["swap", "%5", "--host", "rtzr"]);
-        let error = run_remote(&fake, &cli.args, "rtzr")
+        let cli = Cli::parse_from(["swap", "%5", "--host", "devbox"]);
+        let error = run_remote(&fake, &cli.args, "devbox")
             .await
             .unwrap_err()
             .to_string();
@@ -2117,16 +2117,16 @@ mod tests {
                 "warning: something does not accept --request-key elsewhere",
             ))
         });
-        let cli = Cli::parse_from(["swap", "%5", "--detach", "--host", "rtzr"]);
-        assert!(run_remote(&accepted, &cli.args, "rtzr").await.is_ok());
+        let cli = Cli::parse_from(["swap", "%5", "--detach", "--host", "devbox"]);
+        assert!(run_remote(&accepted, &cli.args, "devbox").await.is_ok());
         // An in-process run that fails names the host, and no job.
         let local = relay(|_| Ok(output(2, "", "boom")));
-        let cli = Cli::parse_from(["swap", "%5", "--local", "--host", "rtzr"]);
-        let error = run_remote(&local, &cli.args, "rtzr")
+        let cli = Cli::parse_from(["swap", "%5", "--local", "--host", "devbox"]);
+        let error = run_remote(&local, &cli.args, "devbox")
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("check rtzr"), "{error}");
+        assert!(error.contains("check devbox"), "{error}");
         assert!(!error.contains("--status"), "{error}");
     }
 
@@ -2141,8 +2141,8 @@ mod tests {
                 "",
             ))
         });
-        let cli = Cli::parse_from(["swap", "%5", "--detach", "--host", "rtzr"]);
-        assert!(run_remote(&echo, &cli.args, "rtzr").await.is_ok());
+        let cli = Cli::parse_from(["swap", "%5", "--detach", "--host", "devbox"]);
+        assert!(run_remote(&echo, &cli.args, "devbox").await.is_ok());
         let other = relay(|_| {
             Ok(output(
                 0,
@@ -2150,15 +2150,15 @@ mod tests {
                 "",
             ))
         });
-        let error = run_remote(&other, &cli.args, "rtzr")
+        let error = run_remote(&other, &cli.args, "devbox")
             .await
             .unwrap_err()
             .to_string();
         assert!(error.contains("instead of"), "{error}");
         // An explicitly in-process run on the host makes no job and has no key.
         let local = relay(|_| Ok(output(0, "[]", "")));
-        let cli = Cli::parse_from(["swap", "%5", "--local", "--host", "rtzr"]);
-        run_remote(&local, &cli.args, "rtzr").await.unwrap();
+        let cli = Cli::parse_from(["swap", "%5", "--local", "--host", "devbox"]);
+        run_remote(&local, &cli.args, "devbox").await.unwrap();
         assert_eq!(sent_key(&local.calls.borrow()[0]), None);
     }
 
@@ -2198,10 +2198,10 @@ mod tests {
     #[tokio::test]
     async fn a_relayed_swap_keeps_the_callers_key() {
         let fake = relay(|_| Err(RuntimeError::Disconnected));
-        let cli = Cli::parse_from(["swap", "%5", "--host", "rtzr", "--request-key", "agent-9"]);
+        let cli = Cli::parse_from(["swap", "%5", "--host", "devbox", "--request-key", "agent-9"]);
         let error = format!(
             "{:#}",
-            run_remote(&fake, &cli.args, "rtzr").await.unwrap_err()
+            run_remote(&fake, &cli.args, "devbox").await.unwrap_err()
         );
         let calls = fake.calls.borrow();
         assert_eq!(calls.len(), 1);
@@ -2450,8 +2450,9 @@ mod tests {
         for action in ["--status", "--cancel"] {
             let answer = running.clone();
             let fake = relay(move |_| Ok(output(0, &answer, "")));
-            let cli = Cli::parse_from(["swap", action, "k", "--host", "rtzr", "--wait-secs", "1"]);
-            run_remote(&fake, &cli.args, "rtzr").await.unwrap();
+            let cli =
+                Cli::parse_from(["swap", action, "k", "--host", "devbox", "--wait-secs", "1"]);
+            run_remote(&fake, &cli.args, "devbox").await.unwrap();
             assert!(
                 fake.calls.borrow()[0].contains(&"--wait-secs=1".to_owned()),
                 "{:?}",
@@ -2459,12 +2460,13 @@ mod tests {
             );
             let answer = running.clone();
             let fake = relay(move |_| Ok(output(1, &answer, "")));
-            let cli = Cli::parse_from(["swap", action, "k", "--host", "rtzr", "--wait-secs", "1"]);
-            assert!(run_remote(&fake, &cli.args, "rtzr").await.is_err());
+            let cli =
+                Cli::parse_from(["swap", action, "k", "--host", "devbox", "--wait-secs", "1"]);
+            assert!(run_remote(&fake, &cli.args, "devbox").await.is_err());
         }
         let fake = relay(move |_| Ok(output(0, &running, "")));
-        let cli = Cli::parse_from(["swap", "--status", "k", "--host", "rtzr"]);
-        assert!(run_remote(&fake, &cli.args, "rtzr").await.is_err());
+        let cli = Cli::parse_from(["swap", "--status", "k", "--host", "devbox"]);
+        assert!(run_remote(&fake, &cli.args, "devbox").await.is_err());
     }
 
     /// An id that is not found is read as a key; any other error is final.
@@ -2667,9 +2669,9 @@ mod tests {
             agent_session_id: "sid".into(),
             kind: AgentKind::ClaudeCode,
             from: Some("e-ed@claude".into()),
-            to: Some("jelly@claude".into()),
+            to: Some("spare@claude".into()),
             status: SwapStatus::Planned,
-            command: Some("aas e jelly@claude --resume sid".into()),
+            command: Some("aas e spare@claude --resume sid".into()),
             note: String::new(),
             continue_reason: None,
             session_id_source: None,
@@ -2680,11 +2682,11 @@ mod tests {
             follow_up: None,
         }]);
         assert!(
-            rendered.contains("e-ed@claude -> jelly@claude"),
+            rendered.contains("e-ed@claude -> spare@claude"),
             "{rendered}"
         );
         assert!(
-            rendered.contains("$ aas e jelly@claude --resume sid"),
+            rendered.contains("$ aas e spare@claude --resume sid"),
             "{rendered}"
         );
         assert_eq!(render(&[]), "nothing to swap\n");

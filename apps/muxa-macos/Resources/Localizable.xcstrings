@@ -6108,12 +6108,12 @@
         }
       }
     },
-    "External issue, for example CAL-1234 (optional)" : {
+    "External issue, for example ENG-1234 (optional)" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "외부 이슈, 예: CAL-1234 (선택)"
+            "value" : "외부 이슈, 예: ENG-1234 (선택)"
           }
         }
       }
@@ -17549,12 +17549,12 @@
         }
       }
     },
-    "match (regex, for example ^cal- or .*)" : {
+    "match (regex, for example ^eng- or .*)" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "매치 (정규식, 예: ^cal- 또는 .*)"
+            "value" : "매치 (정규식, 예: ^eng- 또는 .*)"
           }
         }
       }

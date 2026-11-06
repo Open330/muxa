@@ -7,7 +7,7 @@ can attach at any time. This is not a headless agent or live session migration.
 
 ## Configuration
 
-On the coordinator (for example june-mbp):
+On the coordinator (for example laptop):
 
 ```toml
 [orchestration]
@@ -30,8 +30,8 @@ selector = "organization=personal"
 root = "~/projects/muxa-execution"
 
 # Prefer a stable NodeId; a coordinator-local Fleet alias also works.
-[orchestration.workspaces.muxa.nodes.rtzr]
-root = "/home/june/workspace-muxa"
+[orchestration.workspaces.muxa.nodes.devbox]
+root = "/srv/workspace-muxa"
 ```
 
 On entry hosts:
@@ -39,7 +39,7 @@ On entry hosts:
 ```toml
 [orchestration]
 enabled = true
-coordinator = "june-mbp"
+coordinator = "laptop"
 ```
 
 The coordinator alias must be a configured control-mode Fleet host, reachable

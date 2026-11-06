@@ -2541,9 +2541,9 @@ mod tests {
 
     #[test]
     fn window_and_session_listings_keep_their_marks() {
-        let mut listing = String::from("callabo\t1\tCAL-1\t1\t@4\tabc,80x24,0,0");
+        let mut listing = String::from("webapp\t1\tENG-1\t1\t@4\tabc,80x24,0,0");
         let values = [
-            "callabo", "CAL-1", "/w", "1", "linear", "", "", "CAL-1", "", "", "",
+            "webapp", "ENG-1", "/w", "1", "linear", "", "", "ENG-1", "", "", "",
         ];
         for value in values {
             listing.push('\t');
@@ -2553,27 +2553,27 @@ mod tests {
         assert_eq!(
             windows[0].marks,
             vec![
-                ("@muxa_workspace_id".into(), "callabo".into()),
-                ("@muxa_work_id".into(), "CAL-1".into()),
+                ("@muxa_workspace_id".into(), "webapp".into()),
+                ("@muxa_work_id".into(), "ENG-1".into()),
                 ("@muxa_work_cwd".into(), "/w".into()),
                 ("@muxa_managed_work".into(), "1".into()),
                 ("@muxa_external_source".into(), "linear".into()),
-                ("@muxa_external_key".into(), "CAL-1".into()),
+                ("@muxa_external_key".into(), "ENG-1".into()),
             ]
         );
         // A listing without mark columns (an older format) still folds.
         let (plain, _) = fold_window_groups("s\t0\tw\t1\t@1\tabc,80x24,0,0");
         assert!(plain[0].marks.is_empty());
-        let sessions = read_sessions("callabo\tcallabo\t/w\t1\nscratch\t\t\t\n");
+        let sessions = read_sessions("webapp\twebapp\t/w\t1\nscratch\t\t\t\n");
         assert_eq!(sessions.len(), 1, "a session with no marks is not kept");
-        assert_eq!(sessions[0].session, "callabo");
+        assert_eq!(sessions[0].session, "webapp");
         assert_eq!(sessions[0].marks.len(), 3);
     }
 
     #[test]
     fn a_window_does_not_keep_a_mark_it_only_inherits_from_its_session() {
         let (mut windows, _) = fold_window_groups(
-            "demo\t0\tCAL-9\t1\t@1\tabc,80x24,0,0\tdemo\tCAL-9\t\t1\t\t\t\t\t\t\t",
+            "demo\t0\tENG-9\t1\t@1\tabc,80x24,0,0\tdemo\tENG-9\t\t1\t\t\t\t\t\t\t",
         );
         let sessions = [SessionShape {
             session: "demo".into(),
@@ -2583,7 +2583,7 @@ mod tests {
         assert_eq!(
             windows[0].marks,
             vec![
-                ("@muxa_work_id".into(), "CAL-9".into()),
+                ("@muxa_work_id".into(), "ENG-9".into()),
                 ("@muxa_managed_work".into(), "1".into()),
             ]
         );
@@ -2592,7 +2592,7 @@ mod tests {
     #[test]
     fn a_mark_value_with_a_tab_or_newline_is_dropped_not_misread() {
         // A task with a tab: one extra column.
-        let shifted = ["reviewer", "fix\tthis", "rev", "callabo", "CAL-1"]
+        let shifted = ["reviewer", "fix\tthis", "rev", "webapp", "ENG-1"]
             .join("\t")
             .split('\t')
             .map(str::to_owned)
@@ -2618,20 +2618,20 @@ mod tests {
                 .map(|(option, value)| ((*option).to_owned(), (*value).to_owned()))
                 .collect()
         };
-        let work = marks(&[("@muxa_work_id", "CAL-1")]);
+        let work = marks(&[("@muxa_work_id", "ENG-1")]);
         let saved_a = marks(&[("@muxa_workspace_id", "A")]);
         let live_b = marks(&[("@muxa_workspace_id", "B")]);
         let live_none = marks(&[("@other", "x")]);
 
         assert!(same_parent(&work, &saved_a, Some(&saved_a)));
-        // Saved under A, landing under B: B/CAL-1 is a Work nobody had.
+        // Saved under A, landing under B: B/ENG-1 is a Work nobody had.
         assert!(!same_parent(&work, &saved_a, Some(&live_b)));
         // Saved under no workspace, landing under B: the same mix.
         assert!(!same_parent(&work, &[], Some(&live_b)));
         assert!(same_parent(&work, &[], Some(&live_none)));
         // A session that cannot be read is not assumed to match.
         assert!(!same_parent(&work, &saved_a, None));
-        let pinned = marks(&[("@muxa_workspace_id", "A"), ("@muxa_work_id", "CAL-1")]);
+        let pinned = marks(&[("@muxa_workspace_id", "A"), ("@muxa_work_id", "ENG-1")]);
         assert!(same_parent(&pinned, &[], Some(&live_b)));
     }
 
@@ -3015,7 +3015,7 @@ mod tests {
     #[test]
     fn a_resumed_agent_does_not_replay_its_first_instruction() {
         let shape = |argv: &[&str], kind: &str, session: &str| {
-            let mut pane = pane("callabo", "1", "0", Some(&argv.join(" ")));
+            let mut pane = pane("webapp", "1", "0", Some(&argv.join(" ")));
             pane.argv = Some(argv.iter().map(|a| (*a).to_owned()).collect());
             pane.agent = Some(AgentShape {
                 kind: kind.into(),

@@ -18,7 +18,7 @@ muxa stats activity --since today --type agent --format json
 ```
 
 Session groups in `muxa stats` and `muxa stats report` fold generated views such as
-`callabo~view~123` into `callabo`, including retained history. Grouping happens
+`webapp~view~123` into `webapp`, including retained history. Grouping happens
 before sorting and limiting rows. Overlapping human-presence intervals and
 ACT/WACT time are not counted twice for those views; agent work remains additive.
 
