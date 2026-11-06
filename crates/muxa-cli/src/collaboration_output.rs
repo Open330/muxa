@@ -56,6 +56,10 @@ pub(crate) fn receipt(request: &CollaborationRequest) -> Value {
         && !request.to.accepts_peer_work()
     {
         value["deferred"] = json!("protected_primary");
+        value["next_step"] = json!(format!(
+            "This human session requires explicit acceptance. For a generic peer review, cancel this queued request with `muxa msg cancel {}` and use `muxa peer {} BODY`; do not resend while the original request is open.",
+            request.id, request.to.pane
+        ));
     }
     value
 }
@@ -384,6 +388,19 @@ mod tests {
                 assert!(result.get(field).is_none(), "unexpected {field}");
             }
         }
+    }
+
+    #[test]
+    fn protected_primary_receipt_offers_nonduplicating_worker_recovery() {
+        let mut request = fixture();
+        request.status = RequestStatus::Queued;
+        request.from.console = false;
+        request.to.launch_purpose = muxa::collaboration::LaunchPurpose::Primary;
+        let value = receipt(&request);
+        assert_eq!(value["deferred"], "protected_primary");
+        let next = value["next_step"].as_str().unwrap();
+        assert!(next.contains(&format!("muxa msg cancel {}", request.id)));
+        assert!(next.contains(&format!("muxa peer {}", request.to.pane)));
     }
 
     #[test]

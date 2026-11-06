@@ -162,7 +162,15 @@ bypass flags and require authorization for that launch. A review does not grant
 editing authority. Never add bypass flags to work around a permission prompt.
 
 When MCP is missing, report that setup/restart is needed and use `muxa doctor`
-for diagnosis if shell access is available. CLI mailbox equivalents are usable
+for diagnosis if shell access is available. For new peer work without MCP, use `muxa peer codex "BOUNDED REQUEST"`
+(or `claude`, an exact pane, or `auto`). It uses the same dedicated-worker
+routing as `muxa_call_peer`, including primary-to-worker substitution, and
+returns a durable request id without waiting by default. Use `--wait
+--timeout-secs 60` when needed, or `muxa msg wait REQUEST` later. Use
+`--context-bound` only for that exact conversation; it keeps primary acceptance.
+Do not substitute `muxa msg send %N` for generic peer work: that is an exact
+mailbox delivery and can remain queued on a protected primary.
+CLI mailbox equivalents are usable
 when they preserve identity and the request contract; inspect `muxa msg --help`.
 Do not substitute terminal input or screen scraping for durable peer messages,
 or turn Muxa feedback into a GitHub PR workflow without grounded PR context.

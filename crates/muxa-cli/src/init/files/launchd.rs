@@ -27,7 +27,49 @@ pub fn default_unit_path() -> Option<PathBuf> {
 /// time rather than relying on `$PATH`, since launchd unsets a lot of
 /// the user's environment.
 pub fn render_plist(muxad_path: &str) -> String {
+    let path = provider_path(
+        dirs::home_dir().as_deref(),
+        &std::env::var("PATH").unwrap_or_default(),
+    );
+    render_plist_with_path(muxad_path, &path)
+}
+
+// Preserve shell/account-shim precedence, but a GUI or minimal installing
+// environment must still reach the common per-user and Homebrew CLI locations.
+fn provider_path(home: Option<&std::path::Path>, inherited: &str) -> String {
+    let mut paths: Vec<PathBuf> = std::env::split_paths(inherited)
+        .filter(|path| path.is_absolute())
+        .collect();
+    let mut fallback = Vec::new();
+    if let Some(home) = home {
+        fallback.extend([home.join(".local/bin"), home.join(".cargo/bin")]);
+    }
+    fallback.extend(
+        [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/usr/bin",
+            "/bin",
+            "/usr/sbin",
+            "/sbin",
+        ]
+        .map(PathBuf::from),
+    );
+    for path in fallback {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
+    }
+    std::env::join_paths(paths)
+        .expect("PATH entries contain no separator")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn render_plist_with_path(muxad_path: &str, path: &str) -> String {
     use std::fmt::Write as _;
+    let muxad_path = xml_escape(muxad_path);
+    let path = xml_escape(path);
     let mut s = String::with_capacity(640);
     s.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     s.push_str("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n");
@@ -39,6 +81,11 @@ pub fn render_plist(muxad_path: &str) -> String {
     s.push_str("  <array>\n");
     let _ = writeln!(s, "    <string>{muxad_path}</string>");
     s.push_str("  </array>\n");
+    // Child providers (codex/claude, npm and account shims) need the same
+    // executable search path as the installing shell, not launchd's minimal one.
+    s.push_str("  <key>EnvironmentVariables</key>\n  <dict>\n    <key>PATH</key>\n");
+    let _ = writeln!(s, "    <string>{path}</string>");
+    s.push_str("  </dict>\n");
     s.push_str("  <key>RunAtLoad</key>\n");
     s.push_str("  <true/>\n");
     s.push_str("  <key>KeepAlive</key>\n");
@@ -66,6 +113,13 @@ pub fn render_plist(muxad_path: &str) -> String {
     s.push_str("</dict>\n");
     s.push_str("</plist>\n");
     s
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Compute the install outcome given the file's current content and
@@ -231,6 +285,34 @@ mod tests {
         // Closing tags + xml prologue
         assert!(body.starts_with("<?xml"));
         assert!(body.trim_end().ends_with("</plist>"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn minimal_installer_path_still_finds_user_providers_without_current_directory() {
+        let path = provider_path(
+            Some(std::path::Path::new("/Users/jane")),
+            "/usr/bin::.:relative",
+        );
+        let paths: Vec<_> = std::env::split_paths(&path).collect();
+        assert_eq!(paths[0], PathBuf::from("/usr/bin"));
+        assert!(paths.contains(&PathBuf::from("/Users/jane/.local/bin")));
+        assert!(paths.contains(&PathBuf::from("/opt/homebrew/bin")));
+        assert!(paths.iter().all(|path| path.is_absolute()));
+    }
+
+    #[test]
+    fn launchd_keeps_provider_path_and_escapes_xml() {
+        let body = render_plist_with_path(
+            "/Users/A&B/bin/muxad",
+            "/Users/A&B/.local/bin:/opt/homebrew/bin:/usr/bin",
+        );
+        assert!(body.contains("<key>EnvironmentVariables</key>"));
+        assert!(
+            body.contains("<string>/Users/A&amp;B/.local/bin:/opt/homebrew/bin:/usr/bin</string>")
+        );
+        assert!(body.contains("<string>/Users/A&amp;B/bin/muxad</string>"));
+        assert!(!body.contains("/Users/A&B"));
     }
 
     #[test]

@@ -61,7 +61,7 @@ const DEFAULT_WAIT_SECS: u64 = 30;
 const DEFAULT_SPAWN_GRACE_SECS: u64 = 10;
 /// Hard ceiling on `muxa_wait_for_change` so a caller can't pin the stdio
 /// loop forever on a typo'd huge timeout.
-const MAX_WAIT_SECS: u64 = 600;
+pub(crate) const MAX_WAIT_SECS: u64 = 600;
 /// Compatibility polling is used only with controllers lacking shared reply waits.
 const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -2757,7 +2757,11 @@ async fn send_peer_call(
 /// target selection, contract construction, optional explicit spawn, durable
 /// delivery, and reply correlation.
 #[allow(clippy::too_many_lines)] // keep the security-sensitive call sequence linear and auditable
-async fn call_peer(client: &Client, args: &Value, config: &muxa::config::Config) -> Value {
+pub(crate) async fn call_peer(
+    client: &Client,
+    args: &Value,
+    config: &muxa::config::Config,
+) -> Value {
     for key in ["context_bound", "spawn_if_missing"] {
         if args.get(key).is_some_and(|value| !value.is_boolean()) {
             return error_result(&format!("{key} must be a boolean"));
@@ -6364,7 +6368,11 @@ mod tests {
         let socket = dir.path().join("slot.sock");
         let origin = current_collaboration_origin().unwrap();
         let store = Store::shared();
-        for (pane, session) in [("%1", "slot-sender"), ("%2", "slot-reviewer")] {
+        for (pane, session) in [
+            ("%1", "slot-sender"),
+            ("%2", "slot-reviewer"),
+            ("%3", "slot-primary"),
+        ] {
             store
                 .apply(&AgentEvent::Started {
                     id: muxa::event::AgentId {
@@ -6379,7 +6387,7 @@ mod tests {
                 })
                 .await;
         }
-        let panes = [("%1", "0"), ("%2", "1")]
+        let panes = [("%1", "0"), ("%2", "1"), ("%3", "2")]
             .into_iter()
             .map(|(pane, index)| {
                 let mut pane = registration_pane(pane, index);
@@ -6405,7 +6413,10 @@ mod tests {
         let client = Client::new(socket);
         let room = client.collaboration_context(&origin).await.unwrap();
         mailbox
-            .set_purpose(&room.peers[0], muxa::collaboration::LaunchPurpose::Worker)
+            .set_purpose(
+                room.peers.iter().find(|peer| peer.pane == "%2").unwrap(),
+                muxa::collaboration::LaunchPurpose::Worker,
+            )
             .await
             .unwrap();
         let tool = |target: &str| {
@@ -6438,6 +6449,37 @@ mod tests {
                 "{target} was not sent as a slot"
             );
         }
+        // The CLI shares the high-level routing: naming a protected primary
+        // must send once to the existing worker, without touching real panes.
+        crate::peer_cli::run(
+            &client,
+            &muxa::config::Config::default(),
+            crate::peer_cli::Args {
+                target: "%3".into(),
+                body: "CLI worker routing regression".into(),
+                intent: "question".into(),
+                execute: false,
+                context_bound: false,
+                no_spawn: true,
+                wait: false,
+                timeout_secs: 60,
+                paths: vec![],
+            },
+        )
+        .await
+        .unwrap();
+        let requests = client
+            .collaboration_list(&origin, RequestMailbox::Sent)
+            .await
+            .unwrap();
+        let cli: Vec<_> = requests
+            .iter()
+            .filter(|r| r.body == "CLI worker routing regression")
+            .collect();
+        assert_eq!(cli.len(), 1);
+        assert_eq!(cli[0].to.pane, "%2");
+        assert!(cli[0].to.accepts_peer_work());
+        assert_eq!(cli[0].work_mode, muxa::collaboration::WorkMode::ReadOnly);
         // A context-bound call stays with the exact session it selected,
         // and a path cannot name one.
         let bound = |target: &str| {

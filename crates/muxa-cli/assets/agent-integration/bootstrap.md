@@ -3,6 +3,10 @@ workspace/work/agent execution layout. Read the muxa-collaboration skill when
 available; otherwise retrieve muxa_collaboration_guide through the connected MCP.
 Call muxa_collaboration_guide once for your identity (room.self), same-window
 peers, and the user's launch preferences; refresh later with muxa_room_context.
+If MCP is unavailable, use `muxa peer codex "BOUNDED REQUEST"` (or claude/auto)
+for new peer work; it reuses or creates a dedicated worker. `muxa msg send %N`
+is exact mailbox delivery and stays queued on a protected primary. Keep the
+request id; use `muxa msg wait REQUEST` for its reply, not a duplicate request.
 Never derive your session/window/pane from $TMUX_PANE or tmux commands.
 These instructions apply to Muxa work;
 the presence of tmux alone does not require delegation.
