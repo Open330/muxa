@@ -7,7 +7,10 @@ use super::{
 /// every tool call). If the daemon is down we MUST NOT block or fail — a
 /// best-effort ingest with a stderr warning keeps the agent healthy.
 pub(super) async fn best_effort_ingest(client: &Client, ev: &muxa::event::AgentEvent) {
-    if let Err(e) = client.ingest(ev).await {
+    if let Err(e) = client
+        .ingest_with_launch_claim(ev, muxa::adapters::hook::launch_claim(ev.id().kind))
+        .await
+    {
         tracing::debug!(error = %e, "muxa ingest failed (daemon down?)");
     }
 }

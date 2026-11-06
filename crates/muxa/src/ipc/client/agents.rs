@@ -3,11 +3,23 @@ use super::{
     HOOK_CALL_TIMEOUT, PROTOCOL_VERSION, WORK_COMMAND_CLIENT_TIMEOUT,
 };
 impl Client {
-    pub async fn ingest(&self, event: &AgentEvent) -> Result<(), RuntimeError> {
+    pub fn ingest<'a>(
+        &'a self,
+        event: &'a AgentEvent,
+    ) -> impl std::future::Future<Output = Result<(), RuntimeError>> + Send + 'a {
+        self.ingest_with_launch_claim(event, None)
+    }
+
+    pub async fn ingest_with_launch_claim(
+        &self,
+        event: &AgentEvent,
+        launch_id: Option<String>,
+    ) -> Result<(), RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "ingest",
             "ask_entry": std::env::var_os(crate::ask::ASK_ENV_MARKER).map(|_|std::env::var("MUXA_ASK_ENTRY").unwrap_or_else(|_|"headless".into())),
+            "launch_id": launch_id,
             "event": event
         });
         // Hook ingest is on the agent's critical path — use the tighter
@@ -15,6 +27,33 @@ impl Client {
         // as a best-effort no-op) instead of stalling the agent.
         let _ = self.call_with_timeout(&req, HOOK_CALL_TIMEOUT).await?;
         Ok(())
+    }
+
+    /// Only the opt-in agents JSON view consumes this additive provenance sidecar.
+    pub async fn agents_with_launch_identity(
+        &self,
+    ) -> Result<Vec<serde_json::Value>, RuntimeError> {
+        let supported = self
+            .hello(Duration::from_secs(2))
+            .await?
+            .capabilities
+            .iter()
+            .any(|cap| cap == crate::launch_identity::CAPABILITY);
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"snapshot","launch_identity":supported})).await?;
+        let agents = decode_agents(&response)?;
+        agents
+            .iter()
+            .map(|agent| {
+                let mut value = serde_json::to_value(agent)?;
+                if let Some(identity) = response
+                    .get("launch_identities")
+                    .and_then(|m| m.get(&agent.session_id))
+                {
+                    value["launch_identity"] = identity.clone();
+                }
+                Ok(value)
+            })
+            .collect()
     }
 
     /// Push a wholesale pane snapshot to the daemon. The zellij

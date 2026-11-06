@@ -110,6 +110,13 @@ pub(super) async fn main() -> Result<()> {
     let invalidation_client = Client::new(socket.clone());
     let result = match cmd {
         Cmd::Start => start::run(&client, cfg, socket, config_path).await,
+        Cmd::Agents(_) => {
+            println!(
+                "{}",
+                serde_json::to_string(&client.agents_with_launch_identity().await?)?
+            );
+            Ok(())
+        }
         Cmd::Status { theme, flat, json } => cmd_status(&client, &cfg, theme, flat, json).await,
         Cmd::StatusLine {
             pane,

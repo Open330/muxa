@@ -446,6 +446,8 @@ impl StartRequest {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StartResult {
+    pub launch_id: Option<String>,
+    pub launch_receipt: Option<Box<muxa::launch_identity::LaunchReceipt>>,
     pub host: LaunchHost,
     pub pane: String,
     pub agent: AgentProgram,
@@ -480,6 +482,8 @@ pub struct StartResult {
 /// remains the tmux lifecycle result used by managed Work/MCP internals.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct AgentStartOutput {
+    launch_id: Option<String>,
+    launch_receipt: Option<Box<muxa::launch_identity::LaunchReceipt>>,
     schema_version: u8,
     host: LaunchHost,
     agent: AgentProgram,
@@ -504,6 +508,8 @@ impl AgentStartOutput {
     fn tmux(result: &StartResult) -> Self {
         Self {
             schema_version: 1,
+            launch_id: result.launch_id.clone(),
+            launch_receipt: result.launch_receipt.clone(),
             host: result.host,
             agent: result.agent,
             placement: result.placement,
@@ -615,6 +621,8 @@ async fn run_native(
         .await
         .context("spawning native muxa agent session")?;
     let result = AgentStartOutput {
+        launch_id: None,
+        launch_receipt: None,
         schema_version: 1,
         host: LaunchHost::Native,
         agent: args.agent,
@@ -763,6 +771,25 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // Before prepare_launch: it can create sessions and windows, and a slow
     // or failed account query must not leave them behind.
     let routed = route_account(request.account.as_ref());
+    let archive =
+        muxa::launch_identity::archive_directory().context("no launch archive directory")?;
+    let expected_session = if request.agent == AgentProgram::Claude {
+        claude_session_options(&mut request.options)
+    } else {
+        None
+    };
+    muxa::launch_identity::prepare(
+        &archive,
+        &muxa::launch_identity::LaunchRecord {
+            launch_id: launch_id.clone(),
+            provider: muxa::discovery::classify_command(request.agent.label()),
+            expected_session,
+            wrapper_forks: routed.as_ref().is_some_and(std::result::Result::is_ok),
+            no_exec: cfg!(windows),
+            ..Default::default()
+        },
+    )
+    .context("persist launch intent before create")?;
     let PreparedLaunch {
         cwd,
         workspace,
@@ -778,13 +805,16 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     // Replace tmux's command shell, so the pane's foreground command and PID
     // describe the CLI even before it emits a hook. rmux on Windows hands the
     // line to PowerShell, which has no `exec`; there the program just runs.
-    let command = muxa::shell::Dialect::native().exec_line(
-        &request
-            .agent
-            .permission_launch(&request.options, prompt, request.bypass_permissions)
-            .on_account(routed.as_ref())
-            .argv(),
-    );
+    let command = muxa::shell::Dialect::native()
+        .exec_line_with_env(
+            &request
+                .agent
+                .permission_launch(&request.options, prompt, request.bypass_permissions)
+                .on_account(routed.as_ref())
+                .argv(),
+            &[("MUXA_LAUNCH_ID", &launch_id)],
+        )
+        .map_err(anyhow::Error::msg)?;
     let args = tmux_args(&request, &cwd, &command)?;
     if let Some(ticket) = &request.worker_spawn {
         update_spawn(
@@ -799,6 +829,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         if create_was_rejected(&output) {
+            let _ = muxa::launch_identity::failed(&archive, &launch_id);
             if let Some(ticket) = &request.worker_spawn {
                 // Only a completed, unsuccessful single create command with
                 // no pane ID is definite. A missing reply or partial output
@@ -830,12 +861,46 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             }
         );
     }
-    let pane = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .find(|line| line.starts_with('%'))
-        .ok_or_else(|| anyhow::anyhow!("tmux created the surface but returned no pane id"))?
-        .to_string();
+    let rmux = crate::mux_control::ambient_rmux().is_some();
+    let mut receipt = muxa::launch_identity::LaunchReceipt::parse(
+        &String::from_utf8_lossy(&output.stdout),
+        &launch_id,
+        None,
+        rmux,
+    )
+    .context("tmux created the surface but returned no pane id; creation will not be retried")?;
+    let pane = receipt
+        .pane
+        .strip_prefix("rmux:")
+        .unwrap_or(&receipt.pane)
+        .to_owned();
+    // Query only the server that performed this create, never the daemon's ambient pane.
+    receipt.endpoint = crate::mux_control::ambient_command_with_args(&[
+        "display-message",
+        "-p",
+        "-t",
+        &pane,
+        "#{socket_path}",
+    ])
+    .ok()
+    .and_then(|mut command| command.output().ok())
+    .filter(|out| out.status.success())
+    .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_owned())
+    .filter(|endpoint| !endpoint.is_empty() && !endpoint.contains("#{"));
+    receipt.marked = crate::mux_control::ambient_command_with_args(&[
+        "set-option",
+        "-p",
+        "-t",
+        &pane,
+        "@muxa_launch_id",
+        &launch_id,
+    ])
+    .ok()
+    .and_then(|mut command| command.status().ok())
+    .is_some_and(|status| status.success());
+    muxa::launch_identity::complete(&archive, receipt.clone())
+        .context("archive launch receipt; created pane left in place")?;
+    register_launch_receipt(&request.socket, &receipt);
 
     if request.worker_spawn.is_some() {
         // Launching was persisted before creation. A crash in the small
@@ -937,6 +1002,8 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     let alias = request.alias;
 
     Ok(StartResult {
+        launch_id: Some(launch_id),
+        launch_receipt: Some(Box::new(receipt)),
         host: LaunchHost::Tmux,
         pane,
         agent: request.agent,
@@ -955,6 +1022,64 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         prompt_supplied: prompt.is_some(),
         account: routed.as_ref().map(muxa::account_route::report),
     })
+}
+
+/// A provider selection flag owns its own semantics; never inject a competing ID.
+fn claude_session_options(options: &mut Vec<String>) -> Option<String> {
+    let mut selection = false;
+    let mut expected = None;
+    for (index, arg) in options.iter().enumerate() {
+        let (flag, inline) = arg
+            .split_once('=')
+            .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+        if matches!(
+            flag,
+            "--resume" | "-r" | "--session-id" | "--continue" | "-c" | "--fork-session"
+        ) {
+            selection = true;
+            if matches!(flag, "--resume" | "-r" | "--session-id") {
+                expected = inline
+                    .or_else(|| options.get(index + 1).map(String::as_str))
+                    .filter(|value| uuid::Uuid::parse_str(value).is_ok())
+                    .map(str::to_owned);
+            }
+        }
+    }
+    if selection {
+        return if options.iter().any(|arg| arg == "--fork-session") {
+            None
+        } else {
+            expected
+        };
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    options.extend(["--session-id".into(), id.clone()]);
+    Some(id)
+}
+
+fn register_launch_receipt(socket: &Path, receipt: &muxa::launch_identity::LaunchReceipt) {
+    let hello = muxa::ipc::blocking_call(
+        socket,
+        &serde_json::json!({
+            "protocol":muxa::event::PROTOCOL_VERSION,"kind":"hello","client":"muxa-cli"
+        }),
+        std::time::Duration::from_secs(1),
+    );
+    if !hello.is_some_and(|response| {
+        response["capabilities"].as_array().is_some_and(|caps| {
+            caps.iter()
+                .any(|cap| cap == muxa::launch_identity::CAPABILITY)
+        })
+    }) {
+        return;
+    }
+    let _ = muxa::ipc::blocking_call(
+        socket,
+        &serde_json::json!({
+            "protocol":muxa::event::PROTOCOL_VERSION,"kind":"ingest","launch_receipt":receipt
+        }),
+        std::time::Duration::from_secs(1),
+    );
 }
 
 /// ` on <account>` for a routed launch's one-line report.
@@ -1348,7 +1473,7 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
                 "-d".into(),
                 "-P".into(),
                 "-F".into(),
-                "#{pane_id}".into(),
+                muxa::launch_identity::CREATE_FORMAT.into(),
                 "-t".into(),
                 target,
                 "-c".into(),
@@ -1363,7 +1488,7 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
                 "-d".into(),
                 "-P".into(),
                 "-F".into(),
-                "#{pane_id}".into(),
+                muxa::launch_identity::CREATE_FORMAT.into(),
                 "-t".into(),
                 target,
             ];
@@ -1391,7 +1516,7 @@ fn tmux_args(request: &StartRequest, cwd: &Path, command: &str) -> Result<Vec<St
                 "-d".into(),
                 "-P".into(),
                 "-F".into(),
-                "#{pane_id}".into(),
+                muxa::launch_identity::CREATE_FORMAT.into(),
                 "-s".into(),
                 name,
             ];
@@ -1452,6 +1577,49 @@ fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
 mod tests {
     /// A read that sees nothing (a listing that failed, a pane not shown
     /// yet) does not end the look; only the deadline does.
+    #[test]
+    fn claude_fresh_session_and_explicit_selection_keep_their_semantics() {
+        let mut fresh = vec!["--model".into(), "sonnet".into()];
+        let expected = claude_session_options(&mut fresh).unwrap();
+        assert!(uuid::Uuid::parse_str(&expected).is_ok());
+        assert_eq!(fresh.iter().filter(|arg| *arg == "--session-id").count(), 1);
+        assert_eq!(claude_session_options(&mut fresh), Some(expected));
+        for flags in [
+            vec!["--resume", "known"],
+            vec!["-r", "known"],
+            vec!["--resume=known"],
+            vec!["--session-id=known"],
+            vec!["--continue"],
+            vec!["-c"],
+            vec!["--fork-session"],
+        ] {
+            let mut options = flags
+                .iter()
+                .map(|flag| (*flag).to_string())
+                .collect::<Vec<_>>();
+            let before = options.clone();
+            claude_session_options(&mut options);
+            assert_eq!(options, before);
+        }
+        let session = uuid::Uuid::new_v4().to_string();
+        let mut options = vec!["--resume".into(), session.clone()];
+        assert_eq!(claude_session_options(&mut options), Some(session));
+    }
+    #[test]
+    fn each_create_shape_requests_a_tab_delimited_receipt() {
+        for placement in [Placement::Pane, Placement::Window, Placement::Session] {
+            let mut req = request(AgentProgram::Claude, placement);
+            if placement == Placement::Session {
+                req.target = None;
+            }
+            let args = tmux_args(&req, Path::new("/tmp"), "claude").unwrap();
+            let at = args.iter().position(|arg| arg == "-F").unwrap();
+            assert_eq!(
+                args[at + 1],
+                "#{pane_id}\t#{pane_pid}\t#{pid}\t#{start_time}"
+            );
+        }
+    }
     #[test]
     fn a_launch_keeps_looking_past_an_empty_read() {
         use std::time::Duration;
@@ -1717,6 +1885,8 @@ mod tests {
     #[test]
     fn agent_start_json_uses_one_schema_for_tmux_and_native() {
         let tmux = AgentStartOutput {
+            launch_id: None,
+            launch_receipt: None,
             schema_version: 1,
             host: LaunchHost::Tmux,
             agent: AgentProgram::Codex,
@@ -1778,12 +1948,14 @@ mod tests {
     }
 
     #[test]
-    fn pane_plan_is_detached_and_returns_the_pane_id_format() {
+    fn pane_plan_is_detached_and_returns_the_launch_receipt_format() {
         let request = request(AgentProgram::Codex, Placement::Pane);
         let args = tmux_args(&request, Path::new("/tmp"), "codex --yolo").unwrap();
         assert_eq!(args[0], "split-window");
         assert!(args.iter().any(|arg| arg == "-d"));
-        assert!(args.windows(2).any(|pair| pair == ["-F", "#{pane_id}"]));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-F", muxa::launch_identity::CREATE_FORMAT]));
         assert!(args.windows(2).any(|pair| pair == ["-t", "%9"]));
         assert_eq!(args.last().unwrap(), "codex --yolo");
     }

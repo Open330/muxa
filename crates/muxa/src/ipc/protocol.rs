@@ -46,11 +46,19 @@ impl RuntimeError {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub(super) enum RequestBody {
     Ingest {
-        event: AgentEvent,
+        #[serde(default)]
+        event: Option<AgentEvent>,
+        #[serde(default)]
+        launch_id: Option<String>,
+        #[serde(default)]
+        launch_receipt: Option<Box<crate::launch_identity::LaunchReceipt>>,
         #[serde(default)]
         ask_entry: Option<String>,
     },
-    Snapshot,
+    Snapshot {
+        #[serde(default)]
+        launch_identity: bool,
+    },
     InvalidateAgentDirectory,
     AgentFind {
         query: String,
@@ -849,6 +857,7 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// semver-additive capability the server supports; clients use the list
 /// to feature-gate behaviour without re-reading `protocol`.
 pub(super) const CAPABILITIES: &[&str] = &[
+    crate::launch_identity::CAPABILITY,
     "agent_session_id",
     "waiting_choice",
     "needs_choice",
@@ -931,6 +940,8 @@ pub(super) const STOP_CAPABILITY: &str = "stop";
 
 #[derive(Debug, Serialize)]
 pub struct Response {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub launch_identities: Option<Arc<BTreeMap<String, crate::launch_identity::LaunchIdentity>>>,
     pub ok: bool,
     pub protocol: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1124,6 +1135,7 @@ impl Response {
             protocol: PROTOCOL_VERSION,
             error: None,
             agents: None,
+            launch_identities: None,
             agent_locations: None,
             prompts: None,
             health: None,

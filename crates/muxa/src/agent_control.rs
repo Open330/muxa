@@ -120,6 +120,10 @@ pub struct AgentStartRequest {
 /// The CLI's `schema_version: 1` envelope, reduced to what a client acts on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentStartResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_receipt: Option<Box<crate::launch_identity::LaunchReceipt>>,
     /// Launch host kind the CLI resolved: `tmux` or `native`.
     pub host: String,
     pub agent: String,

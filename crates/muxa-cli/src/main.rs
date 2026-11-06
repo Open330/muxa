@@ -113,10 +113,18 @@ struct Args {
     cmd: Option<Cmd>,
 }
 
+#[derive(Debug, clap::Args)]
+struct AgentsArgs {
+    #[arg(long, required = true)]
+    json: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum Cmd {
     /// Open Muxa: find running agents, start one, or try the short demo.
     Start,
+    /// List agents with display-only launch provenance as JSON.
+    Agents(AgentsArgs),
     /// List active agents as a human-readable table.
     Status {
         /// One-shot visual theme override.

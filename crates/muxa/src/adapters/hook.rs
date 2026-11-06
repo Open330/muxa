@@ -32,6 +32,20 @@ pub trait HookAdapter {
     fn normalize(event: Self::Event, input: Self::Input, pane: Option<String>) -> AgentEvent;
 }
 
+/// An optional transport claim; never an `AgentId` or ownership assertion.
+pub fn launch_claim(kind: AgentKind) -> Option<String> {
+    if std::env::var_os(crate::ask::ASK_ENV_MARKER).is_some()
+        || std::env::var_os("MUXA_SESSION_ID").is_some()
+        || (kind == AgentKind::Codex
+            && crate::adapters::proc_ancestry::under_shared_codex_app_server(std::process::id()))
+    {
+        return None;
+    }
+    let value = std::env::var("MUXA_LAUNCH_ID").ok()?;
+    uuid::Uuid::parse_str(&value).ok()?;
+    Some(value)
+}
+
 /// Shared hook entrypoint. Binaries call this after parsing `--event`.
 ///
 /// Reads stdin to EOF, parses as `A::Input`, normalizes to `AgentEvent`.

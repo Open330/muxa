@@ -66,6 +66,7 @@ pub mod fleet;
 mod fleet_wait;
 pub mod history;
 pub mod ipc;
+pub mod launch_identity;
 pub mod metrics;
 pub mod notify;
 pub mod orchestration;

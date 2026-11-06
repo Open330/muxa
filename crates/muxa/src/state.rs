@@ -462,6 +462,7 @@ struct AskExecutionScope {
 }
 
 pub struct Store {
+    launch_identities: std::sync::Mutex<crate::launch_identity::LaunchIdentities>,
     ask_executions: std::sync::Mutex<HashMap<String, AskExecutionScope>>,
     /// Registry of live agents, keyed by session id.
     ///
@@ -537,6 +538,7 @@ impl Store {
         let (tx, _) = broadcast::channel(TRANSITION_CHANNEL_CAPACITY);
         let (prompts_tx, _) = broadcast::channel(PROMPT_CHANNEL_CAPACITY);
         Self {
+            launch_identities: std::sync::Mutex::default(),
             ask_executions: std::sync::Mutex::new(HashMap::new()),
             agents: RwLock::default(),
             transitions: tx,
@@ -1612,6 +1614,7 @@ impl Store {
             agent.last_activity_at = at;
         }
 
+        let stopped_launch = (agent.state == AgentState::Stopped).then(|| id.session_id.clone());
         let visible_change =
             new_agent || metrics_changed || touches_activity || agent.state != prev_state;
         if agent.state != prev_state {
@@ -1646,6 +1649,9 @@ impl Store {
         // locks are never held in nested order — keeps the lock-acquisition
         // graph linear and the deadlock surface zero.
         drop(agents);
+        if let Some(session) = stopped_launch {
+            self.launch_identities.lock().unwrap().remove(&session);
+        }
         if let Some(entry) = history_entry {
             self.history.append(entry).await;
         }
@@ -1714,6 +1720,42 @@ impl Store {
             .into_iter()
             .filter(|a| a.ask_origin.is_none() && !self.ask_session_pending(a))
             .collect()
+    }
+
+    /// Display-only claims never alter operational Agent fields or emit transitions.
+    pub async fn observe_launch_claim(&self, event: &AgentEvent, launch_id: Option<&str>) {
+        let stopped = self
+            .agents
+            .read()
+            .await
+            .get(&event.id().session_id)
+            .is_none_or(|a| a.state == AgentState::Stopped);
+        let mut identities = self.launch_identities.lock().unwrap();
+        if stopped {
+            identities.remove(&event.id().session_id);
+        } else if let Some(id) = launch_id {
+            identities.observe(event.id(), id, false);
+        }
+    }
+
+    pub async fn launch_identity_snapshot(
+        &self,
+        agents: &[Agent],
+    ) -> std::collections::BTreeMap<String, crate::launch_identity::LaunchIdentity> {
+        let mut identities = {
+            let mut shared = self.launch_identities.lock().unwrap();
+            shared.retain_live(agents);
+            shared.clone()
+        };
+        let agents = agents.to_vec();
+        tokio::task::spawn_blocking(move || {
+            crate::launch_identity::archive_directory()
+                .map_or_else(std::collections::BTreeMap::new, |directory| {
+                    identities.snapshot(&agents, &directory)
+                })
+        })
+        .await
+        .unwrap_or_default()
     }
 
     pub async fn snapshot(&self) -> Vec<Agent> {
