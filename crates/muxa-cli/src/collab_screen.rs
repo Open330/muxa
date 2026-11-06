@@ -664,14 +664,14 @@ mod tests {
         screen.set_requests(vec![
             request(
                 "req_1",
-                participant("%1", "callabo", "CAL-7330"),
-                participant("%2", "callabo", "CAL-7330"),
+                participant("%1", "webapp", "ENG-7330"),
+                participant("%2", "webapp", "ENG-7330"),
                 "review the auth change",
             ),
             request(
                 "req_2",
-                participant("%3", "callabo", "CAL-7331"),
-                participant("%4", "callabo", "CAL-7331"),
+                participant("%3", "webapp", "ENG-7331"),
+                participant("%4", "webapp", "ENG-7331"),
                 "upload chunking looks wrong",
             ),
             request(
@@ -697,7 +697,7 @@ mod tests {
             .collect();
         assert_eq!(
             groups,
-            vec!["callabo:CAL-7330", "callabo:CAL-7331", "muxa:watch"]
+            vec!["webapp:ENG-7330", "webapp:ENG-7331", "muxa:watch"]
         );
         assert_eq!(rows.len(), 6, "three headers, three requests");
     }
@@ -713,8 +713,8 @@ mod tests {
                 CollabRow::Request(_) => None,
             })
             .collect();
-        // Two callabo requests sit under one header; muxa opens the next.
-        assert_eq!(groups, vec!["callabo", "muxa"]);
+        // Two webapp requests sit under one header; muxa opens the next.
+        assert_eq!(groups, vec!["webapp", "muxa"]);
     }
 
     #[test]
@@ -739,7 +739,7 @@ mod tests {
         screen.set_requests(vec![request(
             "req_1",
             console,
-            participant("%2", "callabo", "CAL-7330"),
+            participant("%2", "webapp", "ENG-7330"),
             "ship it",
         )]);
         let groups: Vec<_> = screen
@@ -750,19 +750,19 @@ mod tests {
                 CollabRow::Request(_) => None,
             })
             .collect();
-        assert_eq!(groups, vec!["callabo:CAL-7330"]);
+        assert_eq!(groups, vec!["webapp:ENG-7330"]);
     }
 
     #[test]
     fn the_filter_reaches_the_session_a_request_happened_in() {
-        // Finding "everything CAL-7331 said" is the reason to widen the
+        // Finding "everything ENG-7331 said" is the reason to widen the
         // listing in the first place, so the window name has to be matchable
         // and not just the message text.
         let screen = screen();
-        assert_eq!(screen.visible("cal-7331").len(), 1);
+        assert_eq!(screen.visible("eng-7331").len(), 1);
         assert_eq!(screen.visible("muxa:watch").len(), 1);
         assert_eq!(screen.visible("chunking").len(), 1);
-        assert_eq!(screen.visible("callabo").len(), 2);
+        assert_eq!(screen.visible("webapp").len(), 2);
         assert!(screen.visible("nothing here").is_empty());
     }
 
@@ -783,8 +783,8 @@ mod tests {
         assert_eq!(screen.selected_index(), 2);
         screen.set_requests(vec![request(
             "req_9",
-            participant("%1", "callabo", "CAL-7330"),
-            participant("%2", "callabo", "CAL-7330"),
+            participant("%1", "webapp", "ENG-7330"),
+            participant("%2", "webapp", "ENG-7330"),
             "only one left",
         )]);
         assert_eq!(screen.selected_index(), 0);
@@ -801,8 +801,8 @@ mod tests {
             0,
             request(
                 "req_new",
-                participant("%8", "callabo", "CAL-7332"),
-                participant("%9", "callabo", "CAL-7332"),
+                participant("%8", "webapp", "ENG-7332"),
+                participant("%9", "webapp", "ENG-7332"),
                 "a newer request",
             ),
         );
@@ -813,8 +813,8 @@ mod tests {
     #[test]
     fn sequence_is_thread_grouped_and_orders_reply_as_its_own_event() {
         let now = OffsetDateTime::now_utc();
-        let from = participant("%1", "callabo", "CAL-7345");
-        let to = participant("%2", "callabo", "CAL-7345");
+        let from = participant("%1", "webapp", "ENG-7345");
+        let to = participant("%2", "webapp", "ENG-7345");
         let mut first = request("req_1", from.clone(), to.clone(), "review round one");
         first.thread_id = Some("review-1".into());
         first.created_at = now - time::Duration::minutes(5);

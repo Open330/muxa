@@ -2574,8 +2574,8 @@ mod tests {
             pane: Some("%42".into()),
             socket: Some("default".into()),
             host: Some(HostKind::Tmux),
-            workspace: Some("callabo".into()),
-            work: Some("CAL-1234".into()),
+            workspace: Some("webapp".into()),
+            work: Some("ENG-1234".into()),
             state: AgentState::Error,
             last_notification: None,
             rate_limit_scope: Some(RateLimitScope::FiveHour),
@@ -2595,7 +2595,7 @@ mod tests {
             name = "swap-on-limit"
             on = "rate_limited"
             action = "swap_account"
-            account = "jelly@claude"
+            account = "spare@claude"
             text = "pick up where you left off"
         "#;
         let config: AutomationConfig = toml::from_str(toml).unwrap();
@@ -2614,7 +2614,7 @@ mod tests {
         );
         let firing = decision.firing().expect("fires");
         assert_eq!(firing.fire_at, NOW, "no waiting out the cap");
-        assert_eq!(firing.account.as_deref(), Some("jelly@claude"));
+        assert_eq!(firing.account.as_deref(), Some("spare@claude"));
         assert_eq!(firing.text.as_deref(), Some("pick up where you left off"));
     }
 
@@ -2633,7 +2633,7 @@ mod tests {
         assert!(rule.validate().is_err());
 
         let mut prompt = resume_rule();
-        prompt.account = Some("jelly@claude".into());
+        prompt.account = Some("spare@claude".into());
         let error = prompt.validate().unwrap_err();
         assert!(error.contains("swap_account"), "{error}");
     }
@@ -2716,8 +2716,8 @@ enabled = true
 name = "resume-after-limit"
 on = "rate_limited"
 agent = ["claude", "codex"]
-workspace = "callabo"
-work = "^CAL-"
+workspace = "webapp"
+work = "^ENG-"
 scope = ["five_hour"]
 wait = "reset+2m"
 fallback = "20m"
@@ -2813,7 +2813,7 @@ waaait = "5m"
     #[test]
     fn validation_rejects_a_bad_work_regex_and_host() {
         let mut rule = resume_rule();
-        rule.work = Some("^CAL-[".into());
+        rule.work = Some("^ENG-[".into());
         assert!(rule.validate().is_err());
         let mut rule = resume_rule();
         rule.host = Some("mars".into());
@@ -3067,8 +3067,8 @@ waaait = "5m"
 
         let mut rule = resume_rule();
         rule.agent = vec![AgentKindSpec(AgentKind::ClaudeCode)];
-        rule.workspace = Some("callabo".into());
-        rule.work = Some("^CAL-".into());
+        rule.workspace = Some("webapp".into());
+        rule.work = Some("^ENG-".into());
         rule.pane = Some("%42".into());
         rule.host = Some("tmux".into());
         rule.scope = vec![RateLimitScope::FiveHour];
@@ -4109,7 +4109,7 @@ waaait = "5m"
             action: AutomationAction::SendPrompt,
             agent: vec![AgentKindSpec(AgentKind::ClaudeCode)],
             workspace: None,
-            work: Some("^CAL-".into()),
+            work: Some("^ENG-".into()),
             pane: None,
             host: None,
             notification: None,
@@ -4125,7 +4125,7 @@ waaait = "5m"
             cooldown: "5m".into(),
             max_per_hour: 2,
             only_if_still: AutomationCondition::RateLimited,
-            filters: "agent=claude_code work=^CAL-".into(),
+            filters: "agent=claude_code work=^ENG-".into(),
             fired_last_hour: 0,
             last_fired_at: None,
         };

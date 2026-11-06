@@ -9321,7 +9321,7 @@ mod tests {
                     kind: RequestKind::Review,
                     body: "round one".into(),
                     workspace_id: Some("workspace-a".into()),
-                    work_id: Some("CAL-7345".into()),
+                    work_id: Some("ENG-7345".into()),
                     artifacts: vec!["commit:d4bf2aa53".into()],
                     links: vec!["https://example.invalid/review/1".into()],
                     ..NewRequest::default()
@@ -9413,10 +9413,10 @@ mod tests {
             .unwrap();
             let caller = Participant::console(participant("%0", "caller").room);
             for (name, socket) in [
-                ("callabo", "default"),
-                ("callabo~view~123", "default"),
+                ("webapp", "default"),
+                ("webapp~view~123", "default"),
                 ("junia", "default"),
-                ("callabo", "other"),
+                ("webapp", "other"),
             ] {
                 let mut from = participant("%1", &format!("sender-{name}-{socket}"));
                 from.tmux_session_name = Some(name.into());
@@ -9438,7 +9438,7 @@ mod tests {
                     .unwrap();
             }
             let query = CollaborationQuery {
-                tmux_session_name: Some("callabo".into()),
+                tmux_session_name: Some("webapp".into()),
                 tmux_socket: Some("default".into()),
                 limit: Some(1),
                 ..CollaborationQuery::default()
@@ -9490,7 +9490,7 @@ mod tests {
                     kind: RequestKind::Review,
                     body: "review".into(),
                     workspace_id: Some("workspace-a".into()),
-                    work_id: Some("CAL-7345".into()),
+                    work_id: Some("ENG-7345".into()),
                     run_id: Some("run-1".into()),
                     ..NewRequest::default()
                 },
@@ -9519,7 +9519,7 @@ mod tests {
                     body: "follow up".into(),
                     parent_request_id: Some(root.id.clone()),
                     workspace_id: Some("workspace-a".into()),
-                    work_id: Some("CAL-7345".into()),
+                    work_id: Some("ENG-7345".into()),
                     ..NewRequest::default()
                 },
             )
@@ -9562,7 +9562,7 @@ mod tests {
                 MailboxScope::All,
                 &CollaborationQuery {
                     workspace_id: Some("workspace-a".into()),
-                    work_id: Some("CAL-7345".into()),
+                    work_id: Some("ENG-7345".into()),
                     thread_id: root.thread_id.clone(),
                     kind: Some(RequestKind::Review),
                     status: Some(RequestStatus::Completed),

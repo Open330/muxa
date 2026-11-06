@@ -5,11 +5,11 @@
 이슈 키를 별도로 주면 현재 Run을 만들거나 선언 상태로 수렴시킵니다.
 
 ```console
-$ muxa work up auth-cleanup --external CAL-1234
-work auth-cleanup is in workspace callabo via pipeline triad
-  cwd      /home/june/worktrees/auth-cleanup (worktree auth-cleanup, created)
-  external linear:CAL-1234 Reaper double-reaps a lying pane  [In Progress]
-           https://linear.app/rtzr/issue/CAL-1234
+$ muxa work up auth-cleanup --external ENG-1234
+work auth-cleanup is in workspace webapp via pipeline triad
+  cwd      ~/worktrees/auth-cleanup (worktree auth-cleanup, created)
+  external linear:ENG-1234 Reaper double-reaps a lying pane  [In Progress]
+           https://linear.app/acme/issue/ENG-1234
   + plan       codex     planner      %12
   + impl       codex     implementer  %13
   + review     claude    reviewer     %14
@@ -171,11 +171,11 @@ linear skill로 Linear issue {{id}}를 조회해서 JSON object 하나만 출력
 ```toml
 [[route]]
 match     = '^cal-'
-workspace = 'callabo'
+workspace = 'webapp'
 pipeline  = 'triad'
 
 [route.worktree]
-repo   = '~/workspace/callabo'
+repo   = '~/workspace/webapp'
 branch = '{{id}}'
 
 [[route]]
@@ -193,7 +193,7 @@ route는 순서 있는 목록이고 첫 매치가 이깁니다. 구체적인 규
 status와 agent가 돌리는 모든 `find`에 걸리기 때문입니다. 이미 있는 worktree는
 재사용하고, 이미 있는 branch는 새로 만들지 않고 checkout합니다.
 
-route 없이도 시작할 수 있습니다. `muxa work up cal-1234 --pipeline triad`는 그
+route 없이도 시작할 수 있습니다. `muxa work up eng-1234 --pipeline triad`는 그
 플래그 자체를 routing 결정으로 보고 현재 디렉터리를 씁니다.
 
 ## pipeline은 script가 아니라 desired state입니다
@@ -251,7 +251,7 @@ peer 요청을 직접 받습니다. `purpose = 'primary'`를 주면 사람 세�
 - alias에 살아있는 pane이 있고 요청을 줬다 → **그 pane에 전송**
 
 ```console
-$ muxa work up cal-1234           # reviewer pane이 닫혀 있던 상태
+$ muxa work up eng-1234           # reviewer pane이 닫혀 있던 상태
   = plan       running                %12
   = impl       running                %13
   + review     claude    reviewer     %21
@@ -265,7 +265,7 @@ $ muxa work up cal-1234           # reviewer pane이 닫혀 있던 상태
 일감이 *무엇인지*는 요청으로 들어옵니다. `muxa_call_peer`가 받는 방식 그대로입니다.
 
 ```console
-$ muxa work up cal-1234 \
+$ muxa work up eng-1234 \
     --skill review-plan \
     --body "reconciler가 살아있는 pane을 먹는 double reap을 고쳐라" \
     --context "main에서는 테스트 통과함"
@@ -284,7 +284,7 @@ $ muxa work up cal-1234 \
 | 살아있는 pane 있음 | 그 pane에 타이핑 |
 
 ```console
-$ muxa work up cal-1234 --body "이어가기 전에 main으로 rebase해라"
+$ muxa work up eng-1234 --body "이어가기 전에 main으로 rebase해라"
   » plan       prompted               %12
   » impl       prompted               %13
   » review     prompted               %21
@@ -316,7 +316,7 @@ desired state로 수렴시키는 건 유용합니다. 하지만 사람이 연 pa
 | 키 | 값 |
 | --- | --- |
 | `{{id}}` | 소문자 work id — branch명과 디렉터리용 |
-| `{{work}}` | muxa가 저장·표시하는 형태의 work id (`CAL-1234`) |
+| `{{work}}` | muxa가 저장·표시하는 형태의 work id (`ENG-1234`) |
 | `{{workspace}}` | 결정된 workspace/session |
 | `{{cwd}}` | 결정된 작업 디렉터리 |
 | `{{alias}}`, `{{role}}`, `{{program}}` | 렌더링 중인 agent |
@@ -373,7 +373,7 @@ muxa work down <id>                  # window와 그 안의 agent 전부 종료
 ```text
 muxa_start_work {
   "work": "auth-cleanup",
-  "external": "CAL-1234",
+  "external": "ENG-1234",
   "body": "double reap을 고쳐라",
   "skill": "review-plan",
   "dry_run": true
@@ -401,7 +401,7 @@ $ muxa work list
 ┌────────────────────────────────────────────────────────────────────────┐
 │ WORK           WORKSPACE   AGENTS          DONE   STAGE    CWD         │
 ╞════════════════════════════════════════════════════════════════════════╡
-│ auth-cleanup   callabo     impl · review    1/2   review   ~/work/auth │
+│ auth-cleanup   webapp      impl · review    1/2   review   ~/work/auth │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 

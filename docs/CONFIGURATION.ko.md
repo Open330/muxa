@@ -126,7 +126,7 @@ options = ['--model', 'claude-sonnet-5']
 
 ```toml
 [agent.claude]
-account = "auto"          # 또는 고정 계정: "jelly@claude"
+account = "auto"          # 또는 고정 계정: "work@claude"
 ```
 
 [`aas`](ACCOUNT_SWAP.md)로 여러 계정을 쓰면, 맨 `claude`는 `aas active` 계정으로

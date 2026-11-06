@@ -362,7 +362,7 @@ The toolbar filters by time range, exact room, Work, thread, kind, and status.
 The API form is:
 
 ```text
-GET /api/collaboration?since=7d&session=callabo&socket=%2Ftmp%2Frmux%2Fdefault&workspace=callabo&work=CAL-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
+GET /api/collaboration?since=7d&session=webapp&socket=%2Ftmp%2Frmux%2Fdefault&workspace=webapp&work=ENG-7345&thread=thread-id&parent=req-id&kind=review&status=completed&limit=100&cursor=...
 ```
 
 All supplied filters are conjunctive. `session` matches the durable tmux

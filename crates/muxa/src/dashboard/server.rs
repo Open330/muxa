@@ -3187,8 +3187,8 @@ mod tests {
                 window_id: window_id.to_string(),
             },
             tmux_session_id: Some("$1".to_string()),
-            tmux_session_name: Some("callabo".to_string()),
-            window_name: Some("CAL-7345".to_string()),
+            tmux_session_name: Some("webapp".to_string()),
+            window_name: Some("ENG-7345".to_string()),
             state: AgentState::Idle,
             cwd: Some("/work/muxa".to_string()),
             alias: None,
@@ -3225,10 +3225,10 @@ mod tests {
                             expects_reply: true,
                             notify: None,
                             work_mode: WorkMode::ReadOnly,
-                            thread_id: Some("thread-cal-7345".to_string()),
+                            thread_id: Some("thread-eng-7345".to_string()),
                             parent_request_id: None,
-                            workspace_id: Some("callabo".to_string()),
-                            work_id: Some("CAL-7345".to_string()),
+                            workspace_id: Some("webapp".to_string()),
+                            work_id: Some("ENG-7345".to_string()),
                             run_id: Some("run-1".to_string()),
                             paths: vec!["/private/review.patch".to_string()],
                             artifacts: vec!["artifact-request-secret".to_string()],
@@ -3261,10 +3261,10 @@ mod tests {
                         expects_reply: false,
                         notify: None,
                         work_mode: WorkMode::ReadOnly,
-                        thread_id: Some("thread-cal-7345".to_string()),
+                        thread_id: Some("thread-eng-7345".to_string()),
                         parent_request_id: None,
-                        workspace_id: Some("callabo".to_string()),
-                        work_id: Some("CAL-7345".to_string()),
+                        workspace_id: Some("webapp".to_string()),
+                        work_id: Some("ENG-7345".to_string()),
                         run_id: Some("run-1".to_string()),
                         paths: Vec::new(),
                         artifacts: Vec::new(),
@@ -3708,16 +3708,16 @@ mod tests {
             worker_launch_id: None,
             agent_role: Some("reviewer".into()),
             agent_alias: None,
-            // An agent stamped for CAL-1: the ids alone must not make its
+            // An agent stamped for ENG-1: the ids alone must not make its
             // window a Work.
-            workspace_id: Some("callabo".into()),
-            work_id: Some("CAL-1".into()),
+            workspace_id: Some("webapp".into()),
+            work_id: Some("ENG-1".into()),
             socket: Some("/tmp/rmux-user/default".into()),
             pane_id: id.into(),
             session_id: "$1".into(),
-            session: "callabo".into(),
+            session: "webapp".into(),
             window_id: window.into(),
-            window_name: "CAL-1".into(),
+            window_name: "ENG-1".into(),
             window_index: "0".into(),
             pane_index: "0".into(),
             tty: "/dev/pts/4".into(),
@@ -3728,15 +3728,15 @@ mod tests {
         };
         let marked = MuxaPaneMetadata {
             managed_work: true,
-            workspace_id: Some("callabo".into()),
-            work_id: Some("CAL-1".into()),
+            workspace_id: Some("webapp".into()),
+            work_id: Some("ENG-1".into()),
             external_source: Some("linear".into()),
-            external_key: Some("CAL-1".into()),
+            external_key: Some("ENG-1".into()),
             ..MuxaPaneMetadata::default()
         };
         let unmarked = MuxaPaneMetadata {
-            workspace_id: Some("callabo".into()),
-            work_id: Some("CAL-1".into()),
+            workspace_id: Some("webapp".into()),
+            work_id: Some("ENG-1".into()),
             ..MuxaPaneMetadata::default()
         };
         let scan = backend_scan_result(
@@ -3754,7 +3754,7 @@ mod tests {
             .collect();
         assert_eq!(
             works,
-            [("CAL-1", 1)],
+            [("ENG-1", 1)],
             "only the marked window is the Work's Run"
         );
         // The issue mark travels too; the daemon persists it from here.
@@ -3908,7 +3908,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(
-                        "/api/collaboration?workspace=callabo&work=CAL-7345&thread=thread-cal-7345&kind=review&status=queued&limit=1",
+                        "/api/collaboration?workspace=webapp&work=ENG-7345&thread=thread-eng-7345&kind=review&status=queued&limit=1",
                     )
                     .header(header::AUTHORIZATION, "Bearer s3cret")
                     .body(Body::empty())
@@ -3934,7 +3934,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!(
-                        "/api/collaboration?work=CAL-7345&kind=review&limit=1&cursor={cursor}"
+                        "/api/collaboration?work=ENG-7345&kind=review&limit=1&cursor={cursor}"
                     ))
                     .header(header::AUTHORIZATION, "Bearer s3cret")
                     .body(Body::empty())
@@ -4394,7 +4394,7 @@ mod tests {
                 "session-1",
                 "muxa",
                 "window-1",
-                "CAL-101",
+                "ENG-101",
             )],
         });
         let state = public_read_state("edit-pat")
@@ -4501,7 +4501,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{
-                            "identity":{"workspace_id":"muxa","work_id":"CAL-101"},
+                            "identity":{"workspace_id":"muxa","work_id":"ENG-101"},
                             "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
                             "metadata":{"stage":"review"}
                         }"#,
@@ -4525,7 +4525,7 @@ mod tests {
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         r#"{
-                            "identity":{"workspace_id":"muxa","work_id":"CAL-101"},
+                            "identity":{"workspace_id":"muxa","work_id":"ENG-101"},
                             "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
                             "text":"report status"
                         }"#,
@@ -4555,7 +4555,7 @@ mod tests {
                     .uri("/api/work-control/up")
                     .header(header::AUTHORIZATION, "Bearer edit-pat")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"work":"cal-1234"}"#))
+                    .body(Body::from(r#"{"work":"eng-1234"}"#))
                     .unwrap(),
             )
             .await
@@ -4585,7 +4585,7 @@ mod tests {
                     .method("POST")
                     .uri("/api/work-control/up")
                     .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"work":"cal-1234"}"#))
+                    .body(Body::from(r#"{"work":"eng-1234"}"#))
                     .unwrap(),
             )
             .await
@@ -4601,7 +4601,7 @@ mod tests {
             "session-1",
             "muxa",
             "window-1",
-            "CAL-101",
+            "ENG-101",
         )];
         let backend: SharedBackend = Arc::new(RecordingControlBackend {
             sent: sent.clone(),
@@ -4623,7 +4623,7 @@ mod tests {
                     .header(header::AUTHORIZATION, "Bearer edit-pat")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
-                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"skill":"/review-plan","body":"check CAL-101","context":"tests pass","submit":false}"#,
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"skill":"/review-plan","body":"check ENG-101","context":"tests pass","submit":false}"#,
                     ))
                     .unwrap(),
             )
@@ -4632,7 +4632,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             sent.lock().unwrap()[0].1,
-            "Run the peer review workflow.\n\ncheck CAL-101\n\nInvocation context:\ntests pass"
+            "Run the peer review workflow.\n\ncheck ENG-101\n\nInvocation context:\ntests pass"
         );
     }
 
@@ -4659,10 +4659,10 @@ mod tests {
     async fn work_prompt_targets_only_live_agents_in_the_selected_work() {
         let sent = Arc::new(Mutex::new(Vec::new()));
         let panes = vec![
-            test_pane("herdr:p1", "session-1", "muxa", "window-1", "CAL-101"),
-            test_pane("herdr:p2", "session-1", "muxa", "window-1", "CAL-101"),
-            test_pane("herdr:p3", "session-1", "muxa", "window-2", "CAL-102"),
-            test_pane("herdr:shell", "session-1", "muxa", "window-1", "CAL-101"),
+            test_pane("herdr:p1", "session-1", "muxa", "window-1", "ENG-101"),
+            test_pane("herdr:p2", "session-1", "muxa", "window-1", "ENG-101"),
+            test_pane("herdr:p3", "session-1", "muxa", "window-2", "ENG-102"),
+            test_pane("herdr:shell", "session-1", "muxa", "window-1", "ENG-101"),
         ];
         let backend: SharedBackend = Arc::new(RecordingControlBackend {
             sent: sent.clone(),

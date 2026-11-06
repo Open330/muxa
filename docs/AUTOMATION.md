@@ -177,8 +177,8 @@ enabled = true
 
 # --- filters: every one is optional; all present ones must match ---
 agent = ["claude", "codex"]      # agent kinds
-workspace = "callabo"            # exact workspace id stamped on the pane
-work = "^CAL-"                   # regex on the Work id
+workspace = "webapp"            # exact workspace id stamped on the pane
+work = "^ENG-"                   # regex on the Work id
 pane = "%42"                     # exact pane id
 host = "local"                   # `local`, or tmux / cmux / rmux / zellij / herdr
 notification = "(?i)capacity"     # regex on the latest notification
@@ -448,7 +448,7 @@ succeeding — an editor that lost sync should be told.
       "enabled": true,
       "action": "send_prompt",
       "agent": ["claude_code", "codex"],
-      "work": "^CAL-",
+      "work": "^ENG-",
       "scope": ["five_hour"],
       "text": "continue",
       "submit": true,
@@ -458,7 +458,7 @@ succeeding — an editor that lost sync should be told.
       "cooldown": "5m",
       "max_per_hour": 2,
       "only_if_still": "rate_limited",
-      "filters": "agent=claude_code,codex work=^CAL- scope=five_hour",
+      "filters": "agent=claude_code,codex work=^ENG- scope=five_hour",
       "fired_last_hour": 1,
       "last_fired_at": "2026-09-03T13:42:11Z"
     }

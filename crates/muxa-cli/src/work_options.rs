@@ -698,12 +698,12 @@ plan = "Write a plan first."
 agent = "codex"
 
 [[route]]
-match = '^cal-'
-workspace = 'callabo'
+match = '^eng-'
+workspace = 'webapp'
 pipeline = 'triad'
 prepare = 'mk-ws {{id}}'
 [route.worktree]
-repo = '~/workspace/callabo'
+repo = '~/workspace/webapp'
 
 [[route]]
 match = '.*'
@@ -818,8 +818,8 @@ after = ['plan']
                 "prepare"
             ])
         );
-        assert_eq!(routes[0]["match"], "^cal-");
-        assert_eq!(routes[0]["workspace"], "callabo");
+        assert_eq!(routes[0]["match"], "^eng-");
+        assert_eq!(routes[0]["workspace"], "webapp");
         assert_eq!(routes[0]["pipeline"], "triad");
         assert_eq!(routes[0]["cwd"], Value::Null);
         assert_eq!(routes[0]["worktree"], true);
@@ -860,7 +860,7 @@ after = ['plan']
         );
 
         let human = render_options(&options);
-        assert!(human.contains("^cal-"), "{human}");
+        assert!(human.contains("^eng-"), "{human}");
         assert!(human.contains("triad"), "{human}");
         assert!(human.contains("solo, pair, triad"), "{human}");
     }
@@ -965,7 +965,7 @@ after = ['plan']
             .iter()
             .map(|route| route.pattern.as_str())
             .collect();
-        assert_eq!(patterns, ["^cal-", ".*", "^muxa-"]);
+        assert_eq!(patterns, ["^eng-", ".*", "^muxa-"]);
         assert_eq!(config.route[2].pipeline.as_deref(), Some("pair"));
         assert!(config.route[0].worktree.is_some());
 

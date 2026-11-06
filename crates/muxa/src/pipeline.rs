@@ -1037,8 +1037,8 @@ mod tests {
         toml::from_str(
             r"
 [[route]]
-match = '^cal-'
-workspace = 'callabo'
+match = '^eng-'
+workspace = 'webapp'
 pipeline = 'triad'
 
 [[route]]
@@ -1072,8 +1072,8 @@ role = 'reviewer'
     #[test]
     fn routes_match_in_declaration_order_so_a_catch_all_can_sit_last() {
         let config = pipeline_config();
-        let cal = select_route(&config.route, "cal-1234").unwrap().unwrap();
-        assert_eq!(cal.workspace.as_deref(), Some("callabo"));
+        let cal = select_route(&config.route, "eng-1234").unwrap().unwrap();
+        assert_eq!(cal.workspace.as_deref(), Some("webapp"));
         assert_eq!(cal.pipeline.as_deref(), Some("triad"));
         let other = select_route(&config.route, "PROJ-7").unwrap().unwrap();
         assert_eq!(other.pipeline.as_deref(), Some("solo"));
@@ -1082,8 +1082,8 @@ role = 'reviewer'
     #[test]
     fn work_ids_route_case_insensitively() {
         let config = pipeline_config();
-        let route = select_route(&config.route, "CAL-1234").unwrap().unwrap();
-        assert_eq!(route.workspace.as_deref(), Some("callabo"));
+        let route = select_route(&config.route, "ENG-1234").unwrap().unwrap();
+        assert_eq!(route.workspace.as_deref(), Some("webapp"));
     }
 
     #[test]
@@ -1092,35 +1092,33 @@ role = 'reviewer'
             pattern: "cal-[".into(),
             ..RouteConfig::default()
         }];
-        let error = select_route(&routes, "cal-1").unwrap_err().to_string();
+        let error = select_route(&routes, "eng-1").unwrap_err().to_string();
         assert!(error.contains("route pattern"), "{error}");
         assert!(error.contains("cal-["), "{error}");
     }
 
     #[test]
     fn rendering_substitutes_known_keys_and_leaves_the_rest_alone() {
-        let vars = Vars::new()
-            .set("id", "cal-1234")
-            .set("workspace", "callabo");
-        assert_eq!(vars.render("{{workspace}}/{{id}}"), "callabo/cal-1234");
+        let vars = Vars::new().set("id", "eng-1234").set("workspace", "webapp");
+        assert_eq!(vars.render("{{workspace}}/{{id}}"), "webapp/eng-1234");
         // A resolver prompt shows the JSON shape it wants back. Neither the
         // single braces nor an unknown key may be eaten.
         assert_eq!(
             vars.render(r#"Fetch {{id}} and answer {"id":"...","title":"..."} only. {{nope}}"#),
-            r#"Fetch cal-1234 and answer {"id":"...","title":"..."} only. {{nope}}"#
+            r#"Fetch eng-1234 and answer {"id":"...","title":"..."} only. {{nope}}"#
         );
     }
 
     #[test]
     fn an_unterminated_placeholder_is_left_verbatim() {
-        let vars = Vars::new().set("id", "cal-1");
-        assert_eq!(vars.render("{{id}} and {{oops"), "cal-1 and {{oops");
+        let vars = Vars::new().set("id", "eng-1");
+        assert_eq!(vars.render("{{id}} and {{oops"), "eng-1 and {{oops");
     }
 
     #[test]
     fn a_long_ticket_body_is_clipped_and_says_so() {
         let ticket = Ticket {
-            id: "cal-1".into(),
+            id: "eng-1".into(),
             body: Some("x".repeat(MAX_BODY_CHARS + 50)),
             ..Ticket::default()
         };
@@ -1132,9 +1130,9 @@ role = 'reviewer'
 
     #[test]
     fn the_ticket_json_is_found_after_prose_and_a_fence() {
-        let reply = "Sure! Here is the ticket:\n```json\n{\"id\": \"CAL-1234\", \"title\": \"Fix the reaper\", \"state\": {\"name\": \"In Progress\"}}\n```\nLet me know if you need more.";
-        let ticket = Ticket::parse_reply("cal-1234", reply).expect("parses");
-        assert_eq!(ticket.id, "CAL-1234");
+        let reply = "Sure! Here is the ticket:\n```json\n{\"id\": \"ENG-1234\", \"title\": \"Fix the reaper\", \"state\": {\"name\": \"In Progress\"}}\n```\nLet me know if you need more.";
+        let ticket = Ticket::parse_reply("eng-1234", reply).expect("parses");
+        assert_eq!(ticket.id, "ENG-1234");
         assert_eq!(ticket.title.as_deref(), Some("Fix the reaper"));
         assert_eq!(ticket.state.as_deref(), Some("In Progress"));
     }
@@ -1142,24 +1140,24 @@ role = 'reviewer'
     #[test]
     fn the_last_object_wins_so_an_echoed_example_does_not() {
         let reply = r#"You asked for {"id":"...","title":"..."}. Here it is:
-{"id":"CAL-9","title":"Real one"}"#;
-        let ticket = Ticket::parse_reply("cal-9", reply).expect("parses");
+{"id":"ENG-9","title":"Real one"}"#;
+        let ticket = Ticket::parse_reply("eng-9", reply).expect("parses");
         assert_eq!(ticket.title.as_deref(), Some("Real one"));
     }
 
     #[test]
     fn a_brace_inside_a_title_does_not_unbalance_the_scan() {
-        let reply = r#"{"id":"CAL-3","title":"fix {{id}} rendering"}"#;
-        let ticket = Ticket::parse_reply("cal-3", reply).expect("parses");
+        let reply = r#"{"id":"ENG-3","title":"fix {{id}} rendering"}"#;
+        let ticket = Ticket::parse_reply("eng-3", reply).expect("parses");
         assert_eq!(ticket.title.as_deref(), Some("fix {{id}} rendering"));
     }
 
     #[test]
     fn alternate_field_spellings_are_accepted() {
         let reply =
-            r#"{"identifier":"CAL-4","name":"Title","description":"Body","html_url":"http://x"}"#;
-        let ticket = Ticket::parse_reply("cal-4", reply).expect("parses");
-        assert_eq!(ticket.id, "CAL-4");
+            r#"{"identifier":"ENG-4","name":"Title","description":"Body","html_url":"http://x"}"#;
+        let ticket = Ticket::parse_reply("eng-4", reply).expect("parses");
+        assert_eq!(ticket.id, "ENG-4");
         assert_eq!(ticket.title.as_deref(), Some("Title"));
         assert_eq!(ticket.body.as_deref(), Some("Body"));
         assert_eq!(ticket.url.as_deref(), Some("http://x"));
@@ -1167,30 +1165,30 @@ role = 'reviewer'
 
     #[test]
     fn the_human_ticket_id_wins_over_the_trackers_internal_uuid() {
-        // Verbatim shape from `linear-issue.sh json CAL-7093`.
-        let reply = r#"{"id":"3f594ef7-8e1e-4586-ae8f-a1fda4a57f0c","identifier":"CAL-7093","title":"마이크 목록 로드 실패","url":"https://linear.app/rtzr/issue/CAL-7093"}"#;
-        let ticket = Ticket::parse_reply("cal-7093", reply).expect("parses");
-        assert_eq!(ticket.id, "CAL-7093");
+        // Verbatim shape from `linear-issue.sh json ENG-7093`.
+        let reply = r#"{"id":"3f594ef7-8e1e-4586-ae8f-a1fda4a57f0c","identifier":"ENG-7093","title":"마이크 목록 로드 실패","url":"https://linear.app/devbox/issue/ENG-7093"}"#;
+        let ticket = Ticket::parse_reply("eng-7093", reply).expect("parses");
+        assert_eq!(ticket.id, "ENG-7093");
     }
 
     #[test]
     fn a_uuid_only_reply_falls_back_to_the_id_we_asked_about() {
         let reply = r#"{"id":"3f594ef7-8e1e-4586-ae8f-a1fda4a57f0c","title":"T"}"#;
-        let ticket = Ticket::parse_reply("cal-7093", reply).expect("parses");
-        assert_eq!(ticket.id, "cal-7093");
+        let ticket = Ticket::parse_reply("eng-7093", reply).expect("parses");
+        assert_eq!(ticket.id, "eng-7093");
     }
 
     #[test]
     fn uuid_detection_does_not_catch_ordinary_ticket_ids() {
         assert!(looks_like_uuid("3f594ef7-8e1e-4586-ae8f-a1fda4a57f0c"));
-        assert!(!looks_like_uuid("CAL-7093"));
+        assert!(!looks_like_uuid("ENG-7093"));
         assert!(!looks_like_uuid("3f594ef7-8e1e-4586-ae8f-a1fda4a57f0"));
         assert!(!looks_like_uuid("zzzzzzzz-8e1e-4586-ae8f-a1fda4a57f0c"));
     }
 
     #[test]
     fn a_reply_without_json_reports_what_it_said_instead() {
-        let error = Ticket::parse_reply("cal-5", "I could not find that ticket.")
+        let error = Ticket::parse_reply("eng-5", "I could not find that ticket.")
             .unwrap_err()
             .to_string();
         assert!(error.contains("I could not find that ticket."), "{error}");
@@ -1199,8 +1197,8 @@ role = 'reviewer'
     #[test]
     fn the_shared_prompt_leads_each_agents_own() {
         let config = pipeline_config();
-        let vars = Vars::new().set("id", "cal-1234").with_ticket(&Ticket {
-            id: "CAL-1234".into(),
+        let vars = Vars::new().set("id", "eng-1234").with_ticket(&Ticket {
+            id: "ENG-1234".into(),
             title: Some("Fix the reaper".into()),
             ..Ticket::default()
         });
@@ -1208,7 +1206,7 @@ role = 'reviewer'
         assert_eq!(agents.len(), 3);
         assert_eq!(
             agents[0].prompt.as_deref(),
-            Some("Fix the reaper\n\nPlan cal-1234.")
+            Some("Fix the reaper\n\nPlan eng-1234.")
         );
         // An agent with no prompt of its own still gets the shared context.
         assert_eq!(agents[1].prompt.as_deref(), Some("Fix the reaper"));
@@ -1219,17 +1217,17 @@ role = 'reviewer'
     fn the_request_leads_when_no_template_places_it() {
         let config = pipeline_config();
         let vars = Vars::new()
-            .set("id", "cal-1234")
+            .set("id", "eng-1234")
             .set(REQUEST_KEY, "Fix the double reap.")
             .with_ticket(&Ticket {
-                id: "CAL-1234".into(),
+                id: "ENG-1234".into(),
                 title: Some("Reaper".into()),
                 ..Ticket::default()
             });
         let agents = desired_agents("triad", &config.pipeline["triad"], &vars).unwrap();
         assert_eq!(
             agents[0].prompt.as_deref(),
-            Some("Fix the double reap.\n\nReaper\n\nPlan cal-1234.")
+            Some("Fix the double reap.\n\nReaper\n\nPlan eng-1234.")
         );
     }
 
@@ -1623,16 +1621,16 @@ after = ['a']
     #[test]
     fn the_default_worktree_path_sits_beside_the_repo_not_inside_it() {
         let config = WorktreeConfig {
-            repo: "/home/june/workspace/callabo".into(),
+            repo: "/home/june/workspace/webapp".into(),
             ..WorktreeConfig::default()
         };
-        let vars = Vars::new().set("id", "cal-1234");
+        let vars = Vars::new().set("id", "eng-1234");
         let plan = worktree_plan(&config, &vars, &|value| value.to_string());
         assert_eq!(
             plan.path,
-            Path::new("/home/june/workspace/callabo-worktrees/cal-1234")
+            Path::new("/home/june/workspace/webapp-worktrees/eng-1234")
         );
-        assert_eq!(plan.branch, "cal-1234");
+        assert_eq!(plan.branch, "eng-1234");
         assert!(!plan.path.starts_with(&plan.repo));
     }
 
@@ -1642,19 +1640,19 @@ after = ['a']
             repo: "/repo".into(),
             ..WorktreeConfig::default()
         };
-        let vars = Vars::new().set("id", "cal-7").with_ticket(&Ticket {
-            id: "CAL-7".into(),
-            branch: Some("june/cal-7-fix-reaper".into()),
+        let vars = Vars::new().set("id", "eng-7").with_ticket(&Ticket {
+            id: "ENG-7".into(),
+            branch: Some("june/eng-7-fix-reaper".into()),
             ..Ticket::default()
         });
         let plan = worktree_plan(&config, &vars, &|value| value.to_string());
-        assert_eq!(plan.branch, "june/cal-7-fix-reaper");
+        assert_eq!(plan.branch, "june/eng-7-fix-reaper");
 
         // No suggestion from the tracker: the work id is the branch.
-        let bare = Vars::new().set("id", "cal-7");
+        let bare = Vars::new().set("id", "eng-7");
         assert_eq!(
             worktree_plan(&config, &bare, &|value| value.to_string()).branch,
-            "cal-7"
+            "eng-7"
         );
     }
 
@@ -1666,16 +1664,16 @@ after = ['a']
             branch: Some("june/{{id}}".into()),
             base: Some("origin/main".into()),
         };
-        let vars = Vars::new().set("id", "cal-7");
+        let vars = Vars::new().set("id", "eng-7");
         let plan = worktree_plan(&config, &vars, &|value| value.to_string());
-        assert_eq!(plan.path, Path::new("/wt/cal-7"));
-        assert_eq!(plan.branch, "june/cal-7");
+        assert_eq!(plan.path, Path::new("/wt/eng-7"));
+        assert_eq!(plan.branch, "june/eng-7");
         assert_eq!(plan.base.as_deref(), Some("origin/main"));
     }
 
     const GOOD: &str = r"
 [[route]]
-match = '^cal-'
+match = '^eng-'
 pipeline = 'triad'
 
 [pipeline.triad]
@@ -1705,7 +1703,7 @@ program = 'claude'
     #[test]
     fn a_valid_proposal_reports_what_it_configures() {
         let (_, summary) = validate_proposal(GOOD).expect("valid");
-        assert_eq!(summary.routes, vec!["^cal- → triad"]);
+        assert_eq!(summary.routes, vec!["^eng- → triad"]);
         assert_eq!(summary.pipelines, vec![("triad".to_string(), 2)]);
         assert!(summary.ticket_sources.is_empty());
     }
@@ -1800,7 +1798,7 @@ program = 'codex'
         let config: Config = toml::from_str(
             r"
 [ticket.source.linear]
-match = '^cal-\d+$'
+match = '^eng-\d+$'
 prompt = 'fetch {{id}}'
 
 [ticket.source.github]
@@ -1809,7 +1807,7 @@ prompt = 'gh issue {{id}}'
 ",
         )
         .unwrap();
-        let (name, source) = select_source(&config.ticket, "cal-12").unwrap().unwrap();
+        let (name, source) = select_source(&config.ticket, "eng-12").unwrap().unwrap();
         assert_eq!(name, "linear");
         assert_eq!(source.prompt, "fetch {{id}}");
         assert!(select_source(&config.ticket, "nope-1").unwrap().is_none());

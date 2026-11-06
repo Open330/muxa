@@ -561,8 +561,8 @@ muxa workspace view
 
 The view is named `<session>~view~<pid>`, so it sorts beside the session it
 mirrors. That is safe despite tmux matching session names by prefix, because an
-exact match wins: with `callabo`, `callabo-set` and `callabo~view~1734560` all
-present, `-t callabo` resolves to `callabo`. It disappears on detach, so views
+exact match wins: with `webapp`, `webapp-set` and `webapp~view~1734560` all
+present, `-t webapp` resolves to `webapp`. It disappears on detach, so views
 never pile up.
 
 Pair it with per-window sizing, so a window is sized to the terminals actually

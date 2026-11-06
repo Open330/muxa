@@ -149,7 +149,7 @@ pub fn choose(candidates: &[Candidate], provider: &str) -> Result<String, String
 }
 
 /// A pinned account, used whatever its quota, but only for its own
-/// provider: `aas e` picks the CLI from the account, so `jelly@claude`
+/// provider: `aas e` picks the CLI from the account, so `work@claude`
 /// under `[agent.codex]` would start Claude with Codex's arguments.
 fn pinned(candidates: &[Candidate], name: &str, provider: &str) -> Result<String, String> {
     match candidates.iter().find(|c| c.name == name) {
@@ -248,8 +248,8 @@ mod tests {
     fn parse_reads_auto_names_and_blank() {
         assert_eq!(SpawnAccount::parse(" auto "), Some(SpawnAccount::Auto));
         assert_eq!(
-            SpawnAccount::parse("jelly@claude"),
-            Some(SpawnAccount::Named("jelly@claude".into()))
+            SpawnAccount::parse("spare@claude"),
+            Some(SpawnAccount::Named("spare@claude".into()))
         );
         assert_eq!(SpawnAccount::parse("  "), None);
     }

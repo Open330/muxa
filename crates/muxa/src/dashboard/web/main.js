@@ -1055,7 +1055,7 @@ function syncRailToSession(session, socket, { updateHash = false } = {}) {
 // Copy text to clipboard. Uses the async Clipboard API when available
 // (HTTPS or loopback) and falls back to the legacy execCommand path so
 // the dashboard remains usable when reached over plain HTTP via a
-// hostname like june.rtzr.ai.
+// hostname like muxa.example.com.
 async function copyToClipboard(text) {
   if (navigator.clipboard && navigator.clipboard.writeText) {
     try {

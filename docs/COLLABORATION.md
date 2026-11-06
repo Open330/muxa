@@ -368,7 +368,7 @@ advertise `collaboration_exact_session_v1`; the watch Work board requires it.
 
 To address whoever holds a role in a work rather than one pane, use a path:
 `workspace/work/role`, `workspace/work/role@alias` or `workspace/work/@alias`,
-for example `muxa msg send callabo/CAL-8111/implementer "status?"`. It must
+for example `muxa msg send webapp/ENG-8111/implementer "status?"`. It must
 match exactly one live agent and follows the same scope rule as pane targets.
 Such requests, and those sent to `@alias` or `role:`, remember the slot they
 named. Until a request is delivered (unclaimed, no wake sent yet), it follows
@@ -401,17 +401,17 @@ is refused. Identity never follows a later agent that reuses the pane.
 muxa peers
 muxa msg send peer "review the auth change" --kind review
 muxa msg send peer "verify the fix" --kind review \
-  --parent req_... --workspace callabo --work CAL-7345 --run resolve-2 \
+  --parent req_... --workspace webapp --work ENG-7345 --run resolve-2 \
   --artifact commit:d4bf2aa --link https://example.test/review
 muxa msg send peer "review the risks in this plan" --kind review \
-  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"CAL-6924 plan","locator":{"display":".air/cal-6924-plan.air.json","disclosure":"local-only"}}'
+  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"ENG-6924 plan","locator":{"display":".air/eng-6924-plan.air.json","disclosure":"local-only"}}'
 muxa msg inbox
 muxa msg reply req_... "review complete" --status completed
 muxa msg wait req_... --timeout-secs 300 --body
 muxa msg list --mailbox sent
 muxa msg list --scope room     # every participant in this window
 muxa msg list --scope all      # every room this daemon holds
-muxa msg list --scope all --since 7d --work CAL-7345 --kind review \
+muxa msg list --scope all --since 7d --work ENG-7345 --kind review \
   --status completed --limit 50 --offset 0
 muxa msg cancel req_... # queued requests only
 muxa msg send peer "retry with write access" --withdraw req_...  # replaces req_...

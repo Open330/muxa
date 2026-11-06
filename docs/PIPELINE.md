@@ -6,11 +6,11 @@ id and, optionally, a separate external issue key; it creates or converges the
 current Run.
 
 ```console
-$ muxa work up auth-cleanup --external CAL-1234
-work auth-cleanup is in workspace callabo via pipeline triad
-  cwd      /home/june/worktrees/auth-cleanup (worktree auth-cleanup, created)
-  external linear:CAL-1234 Reaper double-reaps a lying pane  [In Progress]
-           https://linear.app/rtzr/issue/CAL-1234
+$ muxa work up auth-cleanup --external ENG-1234
+work auth-cleanup is in workspace webapp via pipeline triad
+  cwd      ~/worktrees/auth-cleanup (worktree auth-cleanup, created)
+  external linear:ENG-1234 Reaper double-reaps a lying pane  [In Progress]
+           https://linear.app/acme/issue/ENG-1234
   + plan       codex     planner      %12
   + impl       codex     implementer  %13
   + review     claude    reviewer     %14
@@ -186,11 +186,11 @@ the cache; `--no-ticket` skips lookup entirely and launches on the id alone.
 ```toml
 [[route]]
 match     = '^cal-'
-workspace = 'callabo'
+workspace = 'webapp'
 pipeline  = 'triad'
 
 [route.worktree]
-repo   = '~/workspace/callabo'
+repo   = '~/workspace/webapp'
 branch = '{{id}}'
 
 [[route]]
@@ -227,7 +227,7 @@ command without executing it, and unresolved placeholders are refused before
 they reach the shell. `prepare` and `worktree` are mutually exclusive because
 only one mechanism may own provisioning.
 
-You do not need a route to get started: `muxa work up cal-1234 --pipeline
+You do not need a route to get started: `muxa work up eng-1234 --pipeline
 triad` treats the explicit flag as its own routing decision and uses the
 current directory.
 
@@ -290,7 +290,7 @@ window already has:
 - alias has a live pane and you passed a request → **send** it to that pane
 
 ```console
-$ muxa work up cal-1234           # the reviewer's pane was closed
+$ muxa work up eng-1234           # the reviewer's pane was closed
   = plan       running                %12
   = impl       running                %13
   + review     claude    reviewer     %21
@@ -305,7 +305,7 @@ What the work *is* comes in as a request, phrased exactly the way
 `muxa_call_peer` takes one:
 
 ```console
-$ muxa work up cal-1234 \
+$ muxa work up eng-1234 \
     --skill review-plan \
     --body "fix the double reap so the reconciler stops eating live panes" \
     --context "tests already pass on main"
@@ -325,7 +325,7 @@ The same request has **two deliveries, chosen by what already exists**:
 | has a live pane | typed into that pane |
 
 ```console
-$ muxa work up cal-1234 --body "rebase onto main before you continue"
+$ muxa work up eng-1234 --body "rebase onto main before you continue"
   » plan       prompted               %12
   » impl       prompted               %13
   » review     prompted               %21
@@ -361,7 +361,7 @@ typo show up in the prompt instead of silently blanking.
 | Key | Value |
 | --- | --- |
 | `{{id}}` | work id, lowercased — for branch names and directories |
-| `{{work}}` | work id as muxa stores and displays it (`CAL-1234`) |
+| `{{work}}` | work id as muxa stores and displays it (`ENG-1234`) |
 | `{{workspace}}` | resolved workspace/session |
 | `{{cwd}}` | resolved working directory |
 | `{{alias}}`, `{{role}}`, `{{program}}` | the agent being rendered |
@@ -421,7 +421,7 @@ arguments:
 ```text
 muxa_start_work {
   "work": "auth-cleanup",
-  "external": "CAL-1234",
+  "external": "ENG-1234",
   "body": "fix the double reap",
   "skill": "review-plan",
   "dry_run": true
@@ -451,7 +451,7 @@ $ muxa work list
 ┌────────────────────────────────────────────────────────────────────────┐
 │ WORK           WORKSPACE   AGENTS          DONE   STAGE    CWD         │
 ╞════════════════════════════════════════════════════════════════════════╡
-│ auth-cleanup   callabo     impl · review    1/2   review   ~/work/auth │
+│ auth-cleanup   webapp      impl · review    1/2   review   ~/work/auth │
 └────────────────────────────────────────────────────────────────────────┘
 ```
 

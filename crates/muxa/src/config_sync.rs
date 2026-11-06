@@ -1156,7 +1156,7 @@ cwd = "~"
 timeout_secs = 300
 
 [ticket.source.linear]
-match = '^cal-\d+$'
+match = '^eng-\d+$'
 prompt = "resolve {{id}}"
 
 [message.skills]

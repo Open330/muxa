@@ -48,7 +48,7 @@ test("accepts Work and unlinked executions as separate collections", () => {
       identity: { workspace_id: "muxa", work_id: "dashboard-v2" },
       stage: "in_progress",
       signals: ["attention"],
-      external_items: [{ source: "linear", display_key: "CAL-7093", status: "started" }],
+      external_items: [{ source: "linear", display_key: "ENG-7093", status: "started" }],
       runs: [],
     }],
     unlinked_executions: [{ id: "tmux/@9", linked: false, work: null }],
@@ -57,7 +57,7 @@ test("accepts Work and unlinked executions as separate collections", () => {
   assert.equal(validateWorkSnapshot(snapshot), snapshot);
   assert.equal(snapshot.works[0].stage, "in_progress");
   assert.deepEqual(snapshot.works[0].signals, ["attention"]);
-  assert.equal(snapshot.works[0].external_items[0].display_key, "CAL-7093");
+  assert.equal(snapshot.works[0].external_items[0].display_key, "ENG-7093");
 });
 
 test("rejects topology-only rows masquerading as Work", () => {

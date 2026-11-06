@@ -7,8 +7,8 @@ fn a_folded_workspace_counts_every_terminal_on_it() {
     // single node. Reporting either member's own count would understate
     // the workspace by exactly the terminals the group exists to allow.
     let all = vec![
-        grouped_session("$0", "callabo", 1, "callabo"),
-        grouped_session("$1", "view~9~callabo", 1, "callabo"),
+        grouped_session("$0", "webapp", 1, "webapp"),
+        grouped_session("$1", "view~9~webapp", 1, "webapp"),
         fake_session("$2", "unrelated", 3),
     ];
     assert_eq!(group_attached_clients(&all[0], &all), 2);
@@ -24,8 +24,8 @@ fn a_detached_group_member_adds_nothing() {
     // A view whose terminal has gone is still a session until tmux reaps
     // it. It must not inflate the count while it lingers.
     let all = vec![
-        grouped_session("$0", "callabo", 1, "callabo"),
-        grouped_session("$1", "view~9~callabo", 0, "callabo"),
+        grouped_session("$0", "webapp", 1, "webapp"),
+        grouped_session("$1", "view~9~webapp", 0, "webapp"),
     ];
     assert_eq!(group_attached_clients(&all[0], &all), 1);
 }

@@ -3412,10 +3412,10 @@ pub(crate) mod tests {
 
     #[test]
     fn generated_view_names_fold_without_merging_named_projects() {
-        assert_eq!(stats_session_name("callabo~view~123"), "callabo");
-        assert_eq!(stats_session_name("callabo-set~view~42"), "callabo-set");
+        assert_eq!(stats_session_name("webapp~view~123"), "webapp");
+        assert_eq!(stats_session_name("webapp-set~view~42"), "webapp-set");
         assert_eq!(stats_session_name("base~view~1~view~2"), "base");
-        for name in ["callabo-set", "project~view~draft", "base~view~", "~view~1"] {
+        for name in ["webapp-set", "project~view~draft", "base~view~", "~view~1"] {
             assert_eq!(stats_session_name(name), name);
         }
     }
@@ -3425,7 +3425,7 @@ pub(crate) mod tests {
         let at = datetime!(2026-05-30 10:30:00 UTC);
         let mut prompts = Vec::new();
         let mut presence = Vec::new();
-        for (index, name) in ["callabo", "callabo~view~123", "callabo~view~456"]
+        for (index, name) in ["webapp", "webapp~view~123", "webapp~view~456"]
             .into_iter()
             .enumerate()
         {
@@ -3448,7 +3448,7 @@ pub(crate) mod tests {
         d.activity_entries = presence;
         let rows = build_rows(&d, GroupBy::Session, 1, SortKey::Active, false);
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].key, "callabo");
+        assert_eq!(rows[0].key, "webapp");
         assert_eq!(rows[0].prompts, 3);
         assert_eq!(rows[0].human_secs, 600);
         let totals = build_totals(&d);
@@ -3833,7 +3833,7 @@ pub(crate) mod tests {
             "one",
             at(10),
         );
-        first.tmux_session = Some("callabo".into());
+        first.tmux_session = Some("webapp".into());
         let mut second = prompt(
             AgentKind::Codex,
             "b",
@@ -3842,7 +3842,7 @@ pub(crate) mod tests {
             "two",
             at(40),
         );
-        second.tmux_session = Some("callabo".into());
+        second.tmux_session = Some("webapp".into());
         let mut d = data(vec![first, second]);
         d.range = TimeRange {
             label: "bounded".into(),
@@ -3853,7 +3853,7 @@ pub(crate) mod tests {
         d.activity_entries = vec![ActivityEntry::SessionForeground(
             SessionForegroundEntry::new(
                 "$1",
-                "callabo",
+                "webapp",
                 datetime!(2026-05-30 10:00:00 UTC),
                 datetime!(2026-05-30 12:00:00 UTC),
             ),
@@ -3882,7 +3882,7 @@ pub(crate) mod tests {
                 kind,
                 pane: None,
                 session_id: Some("$1".into()),
-                session_name: Some("callabo".into()),
+                session_name: Some("webapp".into()),
                 started_at: datetime!(2026-05-30 10:00:00 UTC) + time::Duration::minutes(minute),
                 ended_at: datetime!(2026-05-30 10:00:01 UTC) + time::Duration::minutes(minute),
             }))
@@ -3895,7 +3895,7 @@ pub(crate) mod tests {
             "go",
             datetime!(2026-05-30 10:30:00 UTC),
         );
-        early.tmux_session = Some("callabo".into());
+        early.tmux_session = Some("webapp".into());
         let mut d = data(vec![early]);
         d.count_tmux_input = true;
         d.range = TimeRange {
@@ -3906,7 +3906,7 @@ pub(crate) mod tests {
         d.activity_entries = vec![
             ActivityEntry::SessionForeground(SessionForegroundEntry::new(
                 "$1",
-                "callabo",
+                "webapp",
                 datetime!(2026-05-30 10:00:00 UTC),
                 datetime!(2026-05-30 12:00:00 UTC),
             )),
@@ -4919,7 +4919,7 @@ pub(crate) mod tests {
             "hello",
             datetime!(2026-05-30 11:00:00 UTC),
         );
-        p.tmux_session = Some("callabo-auto-label".into());
+        p.tmux_session = Some("webapp-auto-label".into());
         let mut long = prompt(
             AgentKind::Codex,
             "agent-b",
@@ -4936,7 +4936,7 @@ pub(crate) mod tests {
 
         assert!(rendered.contains("PRM"));
         assert!(!rendered.contains("TOK EST"));
-        assert!(rendered.contains("callabo-auto-label"));
+        assert!(rendered.contains("webapp-auto-label"));
         assert!(rendered.contains("9248e2a7-88f8-4229"));
         assert!(rendered.contains("..."));
         for line in rendered.lines() {
@@ -4957,7 +4957,7 @@ pub(crate) mod tests {
             "hello",
             datetime!(2026-05-30 11:00:00 UTC),
         );
-        p.tmux_session = Some("callabo-auto-label".into());
+        p.tmux_session = Some("webapp-auto-label".into());
         let d = data(vec![p]);
         let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false, false);
 
@@ -4994,7 +4994,7 @@ pub(crate) mod tests {
             "hello",
             datetime!(2026-05-30 11:00:00 UTC),
         );
-        p.tmux_session = Some("callabo-auto-label".into());
+        p.tmux_session = Some("webapp-auto-label".into());
         let d = data(vec![p]);
         let doc = build_document(&d, GroupBy::Session, 0, SortKey::Prompts, false, false);
 

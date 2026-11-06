@@ -152,22 +152,22 @@ mod tests {
     fn pane(session_id: &str, session: &str, pane_id: &str) -> PaneInfo {
         serde_json::from_value(serde_json::json!({
             "pane_id": pane_id, "session_id": session_id, "session": session,
-            "session_group": "callabo", "window_id": "@2", "window_index": "2",
+            "session_group": "webapp", "window_id": "@2", "window_index": "2",
             "pane_index": "0", "tty": "", "current_command": "aas", "title": "",
             "pane_pid": 10, "socket": "/tmp/rmux-1044/default"
         }))
         .unwrap()
     }
 
-    /// The live shape that broke Codex binding: `callabo` and two client
+    /// The live shape that broke Codex binding: `webapp` and two client
     /// views, where only the base carries the workspace stamp.
     #[test]
     fn grouped_rows_collapse_to_the_base_session() {
-        let mut base = pane("$0", "callabo", "rmux:%2");
-        base.workspace_id = Some("ws-callabo".into());
-        let view_a = pane("$8", "callabo~view~743208", "rmux:%2");
-        let view_b = pane("$9", "callabo~view~922474", "rmux:%2");
-        let other = pane("$0", "callabo", "rmux:%24");
+        let mut base = pane("$0", "webapp", "rmux:%2");
+        base.workspace_id = Some("ws-webapp".into());
+        let view_a = pane("$8", "webapp~view~743208", "rmux:%2");
+        let view_b = pane("$9", "webapp~view~922474", "rmux:%2");
+        let other = pane("$0", "webapp", "rmux:%24");
 
         for order in [
             vec![view_a.clone(), base.clone(), view_b.clone(), other.clone()],
@@ -178,9 +178,9 @@ mod tests {
             let ids: Vec<_> = canonical.iter().map(|p| p.pane_id.as_str()).collect();
             assert_eq!(ids.len(), 2, "{ids:?}");
             let p2 = canonical.iter().find(|p| p.pane_id == "rmux:%2").unwrap();
-            assert_eq!(p2.session, "callabo");
+            assert_eq!(p2.session, "webapp");
             assert_eq!(p2.session_id, "$0");
-            assert_eq!(p2.workspace_id.as_deref(), Some("ws-callabo"));
+            assert_eq!(p2.workspace_id.as_deref(), Some("ws-webapp"));
         }
     }
 
@@ -188,29 +188,29 @@ mod tests {
     fn a_surviving_view_inherits_identity_and_servers_stay_apart() {
         // Base closed: only views remain; the oldest one wins and keeps the
         // window-level work stamp either row carried.
-        let mut a = pane("$9", "callabo~view~2", "rmux:%2");
-        let mut b = pane("$8", "callabo~view~1", "rmux:%2");
+        let mut a = pane("$9", "webapp~view~2", "rmux:%2");
+        let mut b = pane("$8", "webapp~view~1", "rmux:%2");
         a.work_id = Some("work-7".into());
         b.workspace_id = Some("ws".into());
         let kept = canonical_panes(&[a, b]);
         assert_eq!(kept.len(), 1);
-        assert_eq!(kept[0].session, "callabo~view~1");
+        assert_eq!(kept[0].session, "webapp~view~1");
         assert_eq!(kept[0].work_id.as_deref(), Some("work-7"));
         assert_eq!(kept[0].workspace_id.as_deref(), Some("ws"));
 
         // Same pane id on another server is another pane.
-        let mut elsewhere = pane("$0", "callabo", "%2");
+        let mut elsewhere = pane("$0", "webapp", "%2");
         elsewhere.socket = Some("default".into());
-        let mut here = pane("$0", "callabo", "%2");
+        let mut here = pane("$0", "webapp", "%2");
         here.socket = Some("other".into());
         assert_eq!(canonical_panes(&[elsewhere, here]).len(), 2);
     }
 
     #[test]
     fn base_names_strip_numeric_view_suffixes_only() {
-        assert_eq!(base_session_name("callabo~view~743208"), "callabo");
+        assert_eq!(base_session_name("webapp~view~743208"), "webapp");
         assert_eq!(base_session_name("a~view~1~view~2"), "a");
-        assert_eq!(base_session_name("callabo"), "callabo");
+        assert_eq!(base_session_name("webapp"), "webapp");
         assert_eq!(base_session_name("x~view~beta"), "x~view~beta");
         assert_eq!(base_session_name("~view~3"), "~view~3");
     }

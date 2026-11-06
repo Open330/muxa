@@ -723,7 +723,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "work": { "type": "string", "description": "Stable Muxa Work id. One managed tmux window per id." },
-                    "external": { "type": "string", "description": "Optional external issue key to resolve and link, for example CAL-1234." },
+                    "external": { "type": "string", "description": "Optional external issue key to resolve and link, for example ENG-1234." },
                     "pipeline": { "type": "string", "description": "Pipeline name from [pipeline.*]. Defaults to the matching route's; required when no route matches." },
                     "workspace": { "type": "string", "description": "Workspace/project session. Defaults to the route's, then the cwd basename." },
                     "cwd": { "type": "string", "description": "Work directory. Overrides the route; refused when the route creates a git worktree." },
@@ -5648,7 +5648,7 @@ mod tests {
             plan.argv
         );
         muxa::work_control::validate_swap_argv(&plan.argv).unwrap();
-        let own = swap_plan(&json!({"request_key": "agent-7"}), Some("rtzr"), None).unwrap();
+        let own = swap_plan(&json!({"request_key": "agent-7"}), Some("devbox"), None).unwrap();
         assert_eq!(key_in(&own.argv).as_deref(), Some("agent-7"));
         assert!(!own.argv.iter().any(|w| w.starts_with("--exclude")));
         // A dry run makes no job and has no key.
@@ -5745,32 +5745,39 @@ mod tests {
     fn a_swap_reply_keeps_its_handle_whatever_happened() {
         let plan = swap_plan(
             &json!({"targets": ["%5"], "request_key": "k-1"}),
-            Some("rtzr"),
+            Some("devbox"),
             None,
         )
         .unwrap();
-        let (error, fields) = reply_fields(&swap_reply(&plan, Some("rtzr"), &output(0, "[]", "")));
+        let (error, fields) =
+            reply_fields(&swap_reply(&plan, Some("devbox"), &output(0, "[]", "")));
         assert!(!error);
         assert_eq!(fields["request_key"], "k-1");
-        assert_eq!(fields["host"], "rtzr");
+        assert_eq!(fields["host"], "devbox");
         let failed =
             r#"[{"pane":"%5","agent_session_id":"s","kind":"claude_code","status":"failed"}]"#;
-        let (error, fields) =
-            reply_fields(&swap_reply(&plan, Some("rtzr"), &output(1, failed, "boom")));
+        let (error, fields) = reply_fields(&swap_reply(
+            &plan,
+            Some("devbox"),
+            &output(1, failed, "boom"),
+        ));
         assert!(error);
         assert_eq!(fields["outcomes"][0]["status"], "failed");
         assert_eq!(fields["stderr"], "boom");
         assert_eq!(fields["recovery"]["arguments"]["job"], "k-1");
-        assert_eq!(fields["recovery"]["arguments"]["host"], "rtzr");
-        let (error, fields) =
-            reply_fields(&swap_reply(&plan, Some("rtzr"), &output(1, "", "refused")));
+        assert_eq!(fields["recovery"]["arguments"]["host"], "devbox");
+        let (error, fields) = reply_fields(&swap_reply(
+            &plan,
+            Some("devbox"),
+            &output(1, "", "refused"),
+        ));
         assert!(error);
         assert!(fields["error"]
             .as_str()
             .unwrap()
             .contains("not proof nothing started"));
         // A lost answer: the error still names the key.
-        let (error, fields) = reply_fields(&swap_error(&plan.call(Some("rtzr")), "disconnected"));
+        let (error, fields) = reply_fields(&swap_error(&plan.call(Some("devbox")), "disconnected"));
         assert!(error);
         assert_eq!(fields["recovery"]["arguments"]["action"], "status");
     }
@@ -7303,7 +7310,7 @@ mod tests {
                 "socket": "default",
                 "room": { "host": "tmux", "socket": "default", "window_id": "@1" },
                 "tmux_session_id": "$1",
-                "tmux_session_name": "cal-6924",
+                "tmux_session_name": "eng-6924",
                 "window_name": "agents",
                 "state": "idle"
             })
@@ -7491,7 +7498,7 @@ mod tests {
             "agent_session_id": format!("session-{pane}"),
             "pane": pane,
             "room": { "host": "tmux", "window_id": "@1" },
-            "tmux_session_name": "cal-7000",
+            "tmux_session_name": "eng-7000",
             "window_name": "agents",
             "state": state,
             "cwd": "/tmp/project"
@@ -7590,11 +7597,11 @@ mod tests {
             &json!({
                 "thread_id": "thread-7345",
                 "parent_request_id": "req-review-1",
-                "workspace_id": "callabo",
-                "work_id": "CAL-7345",
+                "workspace_id": "webapp",
+                "work_id": "ENG-7345",
                 "run_id": "resolve-2",
                 "artifacts": ["commit:d4bf2aa53", "test:258-passed"],
-                "links": ["https://linear.app/callabo/issue/CAL-7345"]
+                "links": ["https://linear.app/webapp/issue/ENG-7345"]
             }),
             RequestKind::Review,
             "review the must-fix follow-up".into(),
@@ -7607,11 +7614,11 @@ mod tests {
 
         assert_eq!(request.thread_id.as_deref(), Some("thread-7345"));
         assert_eq!(request.parent_request_id.as_deref(), Some("req-review-1"));
-        assert_eq!(request.workspace_id.as_deref(), Some("callabo"));
-        assert_eq!(request.work_id.as_deref(), Some("CAL-7345"));
+        assert_eq!(request.workspace_id.as_deref(), Some("webapp"));
+        assert_eq!(request.work_id.as_deref(), Some("ENG-7345"));
         assert_eq!(request.run_id.as_deref(), Some("resolve-2"));
         assert_eq!(request.artifacts, ["commit:d4bf2aa53", "test:258-passed"]);
-        assert_eq!(request.links, ["https://linear.app/callabo/issue/CAL-7345"]);
+        assert_eq!(request.links, ["https://linear.app/webapp/issue/ENG-7345"]);
         assert_eq!(
             request.paths,
             ["crates/muxa/src/collaboration.rs".to_string()]

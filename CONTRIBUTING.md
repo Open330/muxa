@@ -43,7 +43,7 @@ that was right for the simple test setup and wrong for real ones. Hold these
 invariants:
 
 - **A pane listing repeats a pane once per member of a session group.** Two
-  terminals on one workspace (`callabo` plus `callabo~view~N`) make
+  terminals on one workspace (`webapp` plus `webapp~view~N`) make
   `list-panes -a` report every pane two or more times. A view row can also
   lack session-level workspace metadata. Before you count panes, require
   "exactly one" match, key anything by session, persist a session name, or do

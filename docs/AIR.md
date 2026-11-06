@@ -114,7 +114,7 @@ in the artifact saying they are not measurements.
 
 muxa's `[message.skills]` is a name → prompt map. AIR is built around
 `SKILL.md` with lossless byte ranges. Importing a Skill into a pipeline
-draft — what we did by hand for `callabo/resolve` — is the natural end of
+draft — what we once did by hand for a resolve skill — is the natural end of
 this road, but only after Phases 0–2 prove the boundary holds.
 
 ## Decisions and risks

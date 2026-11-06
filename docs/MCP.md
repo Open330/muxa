@@ -384,14 +384,14 @@ still has to:
 
 ```text
 muxa_start_work {
-  "work": "cal-1234",
+  "work": "eng-1234",
   "body": "fix the double reap so the reconciler stops eating live panes",
   "skill": "review-plan",
   "context": "tests already pass on main"
 }
-→ { "work": "CAL-1234", "workspace": "callabo", "pipeline": "triad",
-    "cwd": "/home/june/worktrees/cal-1234",
-    "ticket": { "id": "CAL-1234", "title": "...", "url": "..." },
+→ { "work": "ENG-1234", "workspace": "webapp", "pipeline": "triad",
+    "cwd": "~/worktrees/eng-1234",
+    "ticket": { "id": "ENG-1234", "title": "...", "url": "..." },
     "launched": [ { "alias": "plan", "pane": "%12", ... }, ... ],
     "plan": { "steps": [...], "unclaimed": [] } }
 ```
@@ -532,8 +532,8 @@ an AIR executor and does not make an unvalidated document conformant.
 {
   "artifact_id": "urn:air:sha256:<64 lowercase hex characters>",
   "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
-  "label": "CAL-6924 execution plan",
-  "locator": { "display": ".air/cal-6924-plan.air.json", "disclosure": "local-only" }
+  "label": "ENG-6924 execution plan",
+  "locator": { "display": ".air/eng-6924-plan.air.json", "disclosure": "local-only" }
 }
 ```
 

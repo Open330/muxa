@@ -6,30 +6,30 @@ import { buildRailEntries } from "../src/dashboard/web/workspace-rail.mjs";
 import { projectCollaboration, scopeCollaborationRequests } from "../src/dashboard/web/collaboration-model.mjs";
 
 test("numeric client views collapse to the base pane and do not inflate the session rail", () => {
-  const base = { host: "rmux", socket: "/tmp/rmux/default", pane_id: "rmux:%1", window_id: "@1", session_id: "$1", session: "callabo" };
-  const view = { ...base, session_id: "$9", session: "callabo~view~123" };
+  const base = { host: "rmux", socket: "/tmp/rmux/default", pane_id: "rmux:%1", window_id: "@1", session_id: "$1", session: "webapp" };
+  const view = { ...base, session_id: "$9", session: "webapp~view~123" };
   const otherServer = { ...base, socket: "/tmp/other/control", session_id: "$2" };
   assert.deepEqual(canonicalDashboardPanes([view, base]), [base]);
-  assert.equal(canonicalDashboardPanes([view])[0].session, "callabo");
+  assert.equal(canonicalDashboardPanes([view])[0].session, "webapp");
   assert.equal(canonicalDashboardPanes([view, base, otherServer]).length, 2);
   const topology = buildTopology([view, base], [{ pane: "rmux:%1", tmux_socket: base.socket, state: "working" }]);
   const entries = buildRailEntries({ topology, unlinked: [{ session_name: view.session, execution: { socket: base.socket, window_id: "@1" } }] });
   assert.equal(entries.length, 1);
-  assert.equal(entries[0].name, "callabo");
+  assert.equal(entries[0].name, "webapp");
   assert.equal(entries[0].agents, 1);
-  assert.equal(baseSessionName("callabo~view~12~view~34"), "callabo");
-  assert.equal(baseSessionName("callabo~view~beta"), "callabo~view~beta");
+  assert.equal(baseSessionName("webapp~view~12~view~34"), "webapp");
+  assert.equal(baseSessionName("webapp~view~beta"), "webapp~view~beta");
 });
 
 test("retained collaboration rooms have a session group and client views share its scope", () => {
   const participant = (session, pane) => ({ tmux_session_name: session, pane, agent_session_id: pane, agent_kind: "codex", room: { host: "rmux", socket: "/tmp/rmux/default", window_id: "@1" } });
   const messages = [
-    { id: "callabo", from: participant("callabo~view~123", "%1"), to: participant("callabo", "%2") },
+    { id: "webapp", from: participant("webapp~view~123", "%1"), to: participant("webapp", "%2") },
     { id: "junia", from: participant("junia", "%3"), to: participant("junia", "%4") },
   ];
-  assert.deepEqual(scopeCollaborationRequests(messages, { session: "callabo", socket: "default" }).map((request) => request.id), ["callabo"]);
+  assert.deepEqual(scopeCollaborationRequests(messages, { session: "webapp", socket: "default" }).map((request) => request.id), ["webapp"]);
   const projection = projectCollaboration(messages.slice(0, 1));
-  assert.equal(projection.rooms[0].session, "callabo");
+  assert.equal(projection.rooms[0].session, "webapp");
   assert.ok(!projection.rooms[0].label.includes("~view~"));
 });
 

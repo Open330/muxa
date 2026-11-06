@@ -1417,7 +1417,7 @@ impl App {
     /// name it has now.
     ///
     /// The cursor lands at the end of the prefill: renaming is usually an edit
-    /// of what is there (`cal-7306` → `cal-7306-review`), and a cursor at
+    /// of what is there (`eng-7306` → `eng-7306-review`), and a cursor at
     /// column zero turns the first keystroke into a prefix splice.
     pub(super) fn open_rename(&mut self) {
         let Some(node) = self.selected_node() else {

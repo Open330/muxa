@@ -169,7 +169,7 @@ struct WorkStartView: View {
                 }
 
                 Section("Task") {
-                    TextField("External issue, for example CAL-1234 (optional)", text: $external)
+                    TextField("External issue, for example ENG-1234 (optional)", text: $external)
                     Text("An empty external issue creates a local Muxa Work; the issue never becomes the Work identity.")
                         .font(MuxaType.detail)
                         .foregroundStyle(.secondary)

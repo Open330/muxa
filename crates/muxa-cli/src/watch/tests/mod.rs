@@ -939,8 +939,8 @@ pub(super) fn collab_request(to_pane: &str) -> CollaborationRequest {
         initiator: None,
         updates: Vec::new(),
         id: "req_1".into(),
-        from: collab_participant("%1", "callabo", "CAL-7330"),
-        to: collab_participant(to_pane, "callabo", "CAL-7330"),
+        from: collab_participant("%1", "webapp", "ENG-7330"),
+        to: collab_participant(to_pane, "webapp", "ENG-7330"),
         provenance: None,
         kind: RequestKind::Review,
         body: COLLAB_FIXTURE_BODY.into(),
@@ -978,7 +978,7 @@ pub(super) fn collab_app(to_pane: &str) -> App {
     app.set_data(
         Vec::new(),
         vec![fake_topology_pane(
-            "default", "$1", "callabo", "@4", "CAL-7330", 4, "%2", 0,
+            "default", "$1", "webapp", "@4", "ENG-7330", 4, "%2", 0,
         )],
     );
     app.collab.set_requests(vec![collab_request(to_pane)]);
@@ -990,7 +990,7 @@ pub(super) fn board_work(id: &str, key: Option<&PaneKey>) -> muxa::work::WorkSna
     let at = OffsetDateTime::now_utc();
     muxa::work::WorkSnapshotItem {
         identity: muxa::work::WorkIdentity {
-            workspace_id: "callabo".into(),
+            workspace_id: "webapp".into(),
             work_id: id.into(),
         },
         title: format!("work {id}"),
@@ -1011,7 +1011,7 @@ pub(super) fn board_work(id: &str, key: Option<&PaneKey>) -> muxa::work::WorkSna
                     session_id: key.window.session.session_id.clone(),
                     window_id: key.window.window_id.clone(),
                 },
-                session_name: "callabo".into(),
+                session_name: "webapp".into(),
                 window_name: id.into(),
                 window_index: "1".into(),
                 cwd: None,
@@ -1066,9 +1066,9 @@ pub(super) fn board_with_agents() -> (App, Vec<PaneKey>) {
                 fake_topology_pane(
                     "/tmp/a",
                     "$1",
-                    "callabo",
+                    "webapp",
                     "@4",
-                    "CAL-1",
+                    "ENG-1",
                     1,
                     pane,
                     u32::try_from(index).unwrap(),
@@ -1080,7 +1080,7 @@ pub(super) fn board_with_agents() -> (App, Vec<PaneKey>) {
         .iter()
         .map(|pane| app.pane_key_for(pane, Some("a")).unwrap())
         .collect();
-    let mut work = board_work("CAL-1", Some(&keys[0]));
+    let mut work = board_work("ENG-1", Some(&keys[0]));
     let template = work.runs[0].panes[0].clone();
     work.runs[0].panes = [
         ("%1", AgentState::Working),
@@ -1125,9 +1125,9 @@ pub(super) fn board_with_tracked_topology_agent() -> (App, Vec<PaneKey>) {
             fake_topology_pane(
                 "/tmp/a",
                 "$1",
-                "callabo",
+                "webapp",
                 "@4",
-                "CAL-1",
+                "ENG-1",
                 1,
                 pane,
                 u32::try_from(index).unwrap(),
@@ -1155,13 +1155,13 @@ pub(super) fn board_on_b_topology_on_a() -> (App, PaneKey) {
     app.set_data(
         Vec::new(),
         vec![
-            fake_topology_pane("/tmp/a", "$1", "callabo", "@4", "CAL-A", 1, "%1", 0),
-            fake_topology_pane("/tmp/a", "$1", "callabo", "@5", "CAL-B", 2, "%2", 0),
+            fake_topology_pane("/tmp/a", "$1", "webapp", "@4", "ENG-A", 1, "%1", 0),
+            fake_topology_pane("/tmp/a", "$1", "webapp", "@5", "ENG-B", 2, "%2", 0),
         ],
     );
     let b = app.pane_key_for("%2", Some("a")).expect("pane B");
     app.board.set_snapshot(
-        board_snapshot(vec![board_work("CAL-B", Some(&b))]),
+        board_snapshot(vec![board_work("ENG-B", Some(&b))]),
         Vec::new(),
     );
     app.apply_screen(WatchScreen::Board);

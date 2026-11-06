@@ -4789,7 +4789,7 @@ mod tests {
                     session_id: "$1".into(),
                     session: "work".into(),
                     window_id: "@1".into(),
-                    window_name: "CAL-1".into(),
+                    window_name: "ENG-1".into(),
                     window_index: "0".into(),
                     pane_index: "0".into(),
                     tty: String::new(),
@@ -5219,14 +5219,14 @@ mod tests {
         let mut second_window = remote.panes[0].clone();
         second_window.pane_id = "%2".into();
         second_window.window_id = "@2".into();
-        second_window.window_name = "CAL-2".into();
+        second_window.window_name = "ENG-2".into();
         second_window.window_index = "1".into();
         let mut second_session = remote.panes[0].clone();
         second_session.pane_id = "%3".into();
         second_session.session_id = "$2".into();
         second_session.session = "other".into();
         second_session.window_id = "@3".into();
-        second_session.window_name = "CAL-3".into();
+        second_session.window_name = "ENG-3".into();
         remote.panes.extend([second_window, second_session]);
 
         let mut app = App::new(
@@ -5444,8 +5444,8 @@ mod tests {
     fn fleet_message_work_identity_uses_only_a_complete_stamped_pair() {
         let mut remote_host = host();
         let pane = &mut remote_host.remote.as_mut().unwrap().panes[0];
-        pane.workspace_id = Some("callabo".into());
-        pane.work_id = Some("CAL-7345".into());
+        pane.workspace_id = Some("webapp".into());
+        pane.work_id = Some("ENG-7345".into());
         let key = PaneKey::from_pane(HostKind::Tmux, pane);
 
         let mut app = App::new(
@@ -5463,7 +5463,7 @@ mod tests {
         });
         assert_eq!(
             app.work_identity_for_message_pane("dev", &key),
-            (Some("callabo".into()), Some("CAL-7345".into()))
+            (Some("webapp".into()), Some("ENG-7345".into()))
         );
 
         app.snapshot.hosts[0].remote.as_mut().unwrap().panes[0].work_id = None;

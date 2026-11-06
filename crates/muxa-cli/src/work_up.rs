@@ -37,7 +37,7 @@ use crate::agent_launch::{AgentProgram, Placement, SplitDirection, StartRequest}
 pub struct UpArgs {
     /// Stable Muxa Work id, for example auth-cleanup.
     pub work: String,
-    /// Optional external issue key to resolve and link, for example CAL-1234.
+    /// Optional external issue key to resolve and link, for example ENG-1234.
     /// When omitted, the Work id is still looked up for compatibility; use
     /// `--no-ticket` for a strictly local Work.
     #[arg(long, value_name = "ISSUE")]
@@ -663,7 +663,7 @@ pub(crate) async fn resolve(
     // which is where most people meet this command.
     let fallback = muxa::config::RouteConfig::default();
     // An explicitly linked issue may carry the routing prefix while the
-    // durable Work id stays provider-neutral (`auth-cleanup` + `CAL-1234`).
+    // durable Work id stays provider-neutral (`auth-cleanup` + `ENG-1234`).
     // Legacy calls without `--external` continue routing on the Work id.
     let route_selector = explicit_external.unwrap_or(&work);
     let route = match pipeline::select_route(&config.route, route_selector)? {
@@ -1618,7 +1618,7 @@ mod done_view_tests {
 
     fn result_with(done: &[&str]) -> UpResult {
         UpResult {
-            work: "CAL-1".into(),
+            work: "ENG-1".into(),
             workspace: "ws".into(),
             pipeline: "pair".into(),
             cwd: std::path::PathBuf::from("/repo"),
@@ -1855,7 +1855,7 @@ mod tests {
 
     fn up_args(cwd: Option<&str>) -> UpArgs {
         UpArgs {
-            work: "cal-1".into(),
+            work: "eng-1".into(),
             external: None,
             pipeline: None,
             workspace: None,
@@ -1915,7 +1915,7 @@ mod tests {
             cwd: Some("/tmp/{{id}}".into()),
             ..muxa::config::RouteConfig::default()
         };
-        let vars = Vars::new().set("id", "cal-1");
+        let vars = Vars::new().set("id", "eng-1");
         let error = resolve_cwd(&up_args(None), &route, &vars, None)
             .unwrap_err()
             .to_string();
@@ -1933,13 +1933,13 @@ mod tests {
             ..muxa::config::RouteConfig::default()
         };
         let existing = crate::tmux_work::WorkInfo {
-            work: "CAL-1".into(),
-            workspace: "callabo".into(),
-            session: "callabo".into(),
+            work: "ENG-1".into(),
+            workspace: "webapp".into(),
+            session: "webapp".into(),
             session_id: "$1".into(),
             window: "@1".into(),
             window_index: 0,
-            window_name: "CAL-1".into(),
+            window_name: "ENG-1".into(),
             cwd: PathBuf::from("/tmp/already-here"),
             external_item: None,
             agents: Vec::new(),
@@ -1979,8 +1979,8 @@ mod tests {
     fn tilde_expands_only_for_the_current_user() {
         let home = dirs::home_dir().expect("home");
         assert_eq!(
-            expand_tilde("~/workspace/callabo"),
-            format!("{}/workspace/callabo", home.display())
+            expand_tilde("~/workspace/webapp"),
+            format!("{}/workspace/webapp", home.display())
         );
         assert_eq!(expand_tilde("~"), home.display().to_string());
         // `~someone-else` is a shell feature, left alone rather than guessed.
@@ -1990,8 +1990,8 @@ mod tests {
 
     #[test]
     fn a_ticket_cache_path_is_safe_for_any_work_id() {
-        let path = ticket_cache_path("cal-1234").expect("cache dir");
-        assert!(path.ends_with("muxa/tickets/cal-1234.json"), "{path:?}");
+        let path = ticket_cache_path("eng-1234").expect("cache dir");
+        assert!(path.ends_with("muxa/tickets/eng-1234.json"), "{path:?}");
         let nasty = ticket_cache_path("../../etc/passwd").expect("cache dir");
         let name = nasty.file_name().expect("file name").to_string_lossy();
         assert_eq!(name, "------etc-passwd.json");

@@ -666,7 +666,7 @@ struct WorkRoutesEditor: View {
     private func routeForm(position: Int) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 8) {
-                TextField("Match", text: $draft.match, prompt: Text("match (regex, for example ^cal- or .*)"))
+                TextField("Match", text: $draft.match, prompt: Text("match (regex, for example ^eng- or .*)"))
                     .labelsHidden()
                     .font(.callout.monospaced())
                     .disabled(draft.existing)

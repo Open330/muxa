@@ -4581,7 +4581,7 @@ mod tests {
             )]),
             ..AskOptions::default()
         });
-        for prompt in ["CAL-8226 작업 에이전트 위치", "다시 확인"] {
+        for prompt in ["ENG-8226 작업 에이전트 위치", "다시 확인"] {
             let pending = store.ask(prompt).await.unwrap();
             assert_eq!(pending.prompt, prompt);
             tokio::time::timeout(Duration::from_secs(10), async {
@@ -4600,7 +4600,7 @@ mod tests {
         }
         let first = std::fs::read_to_string(directory.path().join("first-args")).unwrap();
         assert!(first.contains("muxa agent find"));
-        assert!(first.contains("CAL-8226 작업 에이전트 위치"));
+        assert!(first.contains("ENG-8226 작업 에이전트 위치"));
         let second = std::fs::read_to_string(directory.path().join("second-args")).unwrap();
         assert!(second.contains("locator-session"));
         assert!(!second.contains("Global Ask:"));

@@ -5802,11 +5802,11 @@ mod tests {
                 &line,
                 AgentKind::ClaudeCode,
                 "new-id",
-                "jelly@claude",
+                "spare@claude",
                 BareMode::Skip
             )
             .unwrap(),
-            "aas e jelly@claude --dangerously-skip-permissions --resume new-id"
+            "aas e spare@claude --dangerously-skip-permissions --resume new-id"
         );
     }
 
@@ -6487,7 +6487,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let mut capped = limited(&pane, sid);
         capped.tmux_socket = None;
         let mut request = request(SwapScope::Targets(vec![pane.clone()]));
-        request.to = AccountChoice::Named("jelly@claude".into());
+        request.to = AccountChoice::Named("spare@claude".into());
         let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
         let outcomes = run(
             &request,
@@ -6588,7 +6588,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let mut capped = limited(&pane, sid);
         capped.tmux_socket = None;
         let mut request = request(SwapScope::Targets(vec![pane.clone()]));
-        request.to = AccountChoice::Named("jelly@claude".into());
+        request.to = AccountChoice::Named("spare@claude".into());
         let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
         let outcomes = run(
             &request,
@@ -6620,7 +6620,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         assert!(!command.starts_with("/bin/sh"), "{command}");
         assert!(
             command.ends_with(&format!(
-                "/aas e jelly@claude --dangerously-skip-permissions --resume {sid}"
+                "/aas e spare@claude --dangerously-skip-permissions --resume {sid}"
             )),
             "{command}"
         );
@@ -6652,8 +6652,8 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         assert_eq!(AccountChoice::parse(""), AccountChoice::Auto);
         assert_eq!(AccountChoice::parse("spread"), AccountChoice::Spread);
         assert_eq!(
-            AccountChoice::parse("jelly@claude"),
-            AccountChoice::Named("jelly@claude".into())
+            AccountChoice::parse("spare@claude"),
+            AccountChoice::Named("spare@claude".into())
         );
     }
 

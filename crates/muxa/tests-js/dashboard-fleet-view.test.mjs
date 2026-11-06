@@ -22,7 +22,7 @@ const mbp = {
     sessions: [{}, {}],
   },
 };
-const rtzr = { alias: "rtzr", local: false, state: "offline", error: "timed out waiting for the remote relay handshake" };
+const devbox = { alias: "devbox", local: false, state: "offline", error: "timed out waiting for the remote relay handshake" };
 
 test("waiting on input or a choice, or an error, needs the operator", () => {
   assert.equal(needsAttention({ state: "waiting_input" }), true);
@@ -44,14 +44,14 @@ test("a host summary counts its remote snapshot", () => {
 });
 
 test("an offline host keeps its error and has no counts", () => {
-  const s = summarizeHost(rtzr);
+  const s = summarizeHost(devbox);
   assert.equal(s.online, false);
   assert.equal(s.agents, 0);
   assert.match(s.error, /handshake/);
 });
 
 test("hosts: this node first, then online, then by name", () => {
-  assert.deepEqual(orderHosts([rtzr, mbp, local]).map((h) => h.alias), ["local", "jiun-mbp", "rtzr"]);
+  assert.deepEqual(orderHosts([devbox, mbp, local]).map((h) => h.alias), ["local", "jiun-mbp", "devbox"]);
 });
 
 test("agents: what needs the operator first, then busy, then most recent", () => {
@@ -59,14 +59,14 @@ test("agents: what needs the operator first, then busy, then most recent", () =>
 });
 
 test("fleet totals add up across hosts", () => {
-  assert.deepEqual(fleetTotals([local, mbp, rtzr]), { hosts: 3, online: 2, agents: 5, attention: 2 });
+  assert.deepEqual(fleetTotals([local, mbp, devbox]), { hosts: 3, online: 2, agents: 5, attention: 2 });
 });
 
 test("rendering lists every host and opens only the selected online one, escaped", () => {
-  const html = renderFleet([local, mbp, rtzr], { selected: "jiun-mbp", esc, relTime });
+  const html = renderFleet([local, mbp, devbox], { selected: "jiun-mbp", esc, relTime });
   assert.match(html, /data-fleet-host="local"/);
   assert.match(html, /data-fleet-host="jiun-mbp"[^>]*aria-pressed="true"/);
-  assert.match(html, /data-fleet-host="rtzr"[^>]*disabled/);
+  assert.match(html, /data-fleet-host="devbox"[^>]*disabled/);
   assert.match(html, /handshake/);
   assert.match(html, /class="fleet-agents"/);
   assert.match(html, /&lt;b&gt;fix&lt;\/b&gt;/);
@@ -74,13 +74,13 @@ test("rendering lists every host and opens only the selected online one, escaped
 });
 
 test("a host that is still connecting is not shown as an error", () => {
-  const html = renderFleet([local, { alias: "rtzr", state: "connecting" }], { selected: null, esc, relTime });
+  const html = renderFleet([local, { alias: "devbox", state: "connecting" }], { selected: null, esc, relTime });
   assert.match(html, /fleet-pending">connecting…/);
   assert.doesNotMatch(html, /fleet-error/);
 });
 
 test("an offline selection opens nothing; no hosts explains the config", () => {
-  assert.doesNotMatch(renderFleet([local, rtzr], { selected: "rtzr", esc, relTime }), /fleet-agents"/);
+  assert.doesNotMatch(renderFleet([local, devbox], { selected: "devbox", esc, relTime }), /fleet-agents"/);
   assert.match(renderFleet([], { selected: null, esc, relTime }), /\[fleet\.hosts\]/);
 });
 

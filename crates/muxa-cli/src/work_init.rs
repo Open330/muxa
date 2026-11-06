@@ -231,7 +231,7 @@ fn ask_operator() -> Result<String> {
         bail!("no description given; pass --describe \"...\" when stdin is not a terminal");
     }
     let text: String = cliclack::input("Describe the work pipeline you want")
-        .placeholder("cal-* tickets: codex planner, codex implementer, claude reviewer")
+        .placeholder("eng-* tickets: codex planner, codex implementer, claude reviewer")
         .interact()?;
     let text = text.trim().to_string();
     if text.is_empty() {

@@ -1704,7 +1704,7 @@ mod tests {
             local: true,
             ssh_target: "local://".into(),
             labels: BTreeMap::from([
-                ("kubernetes.io/hostname".into(), "june.rtzr.ai".into()),
+                ("kubernetes.io/hostname".into(), "june.devbox.ai".into()),
                 ("muxa.io/local".into(), "true".into()),
                 ("muxa.io/transport".into(), "local".into()),
             ]),
@@ -1712,7 +1712,7 @@ mod tests {
             mode: HostAccessMode::Control,
             state: FleetHostState::Online,
             node_id: None,
-            hostname: Some("june.rtzr.ai".into()),
+            hostname: Some("june.devbox.ai".into()),
             os: Some("linux".into()),
             arch: Some("x86_64".into()),
             muxa_version: Some("0.8.34".into()),

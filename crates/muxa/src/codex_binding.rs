@@ -375,7 +375,7 @@ mod tests {
 
         // A pane listed once per `~view~` session is still one pane.
         let mut view = a.clone();
-        view.session = "callabo~view~1".into();
+        view.session = "webapp~view~1".into();
         let grouped = vec![
             (
                 a.clone(),

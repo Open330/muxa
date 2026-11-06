@@ -500,7 +500,7 @@ mod tests {
  repo = "muxa"
  url = "git@example:muxa.git"
  pipeline = "solo"
- [orchestration.workspaces.muxa.nodes.rtzr]
+ [orchestration.workspaces.muxa.nodes.devbox]
  root = "/srv/jobs"
  "#;
         let c: crate::Config = toml::from_str(text).unwrap();
