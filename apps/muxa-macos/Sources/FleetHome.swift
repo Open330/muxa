@@ -300,6 +300,71 @@ enum FleetBoard {
     }
 }
 
+// MARK: - Acting on a unit
+
+/// What the person can type to a unit's agent from the inspector.
+enum FleetReply: Equatable, Sendable {
+    /// The agent asked a question and waits for the answer.
+    case answer
+    /// The unit finished; a new instruction sends it back to work.
+    case sendBack
+}
+
+extension FleetBoard {
+    /// Text goes only to an agent at its prompt: one asking a question, or
+    /// one done with its turn. A choice dialog, an error, or a working agent
+    /// is handled in the pane, where the person sees what they answer.
+    static func reply(for work: FleetWork) -> FleetReply? {
+        guard let focus = work.focus, focus.pane != nil else { return nil }
+        switch (work.lane, focus.agent.state) {
+        case (.needsYou, "waiting_input"): return .answer
+        case (.finished, "idle"), (.finished, "done"): return .sendBack
+        default: return nil
+        }
+    }
+
+    /// The agent waits on a choice only its pane can show.
+    static func choosesInPane(_ work: FleetWork) -> Bool {
+        work.lane == .needsYou && work.focus?.agent.state == "waiting_choice"
+    }
+}
+
+/// Finished units the person reviewed and set aside. A mark holds the
+/// moment the unit had finished, so the unit returns to the board as soon
+/// as it changes again.
+struct FleetReviewMarks: Equatable, Sendable {
+    static let defaultsKey = "fleetHome.reviewed"
+
+    private(set) var marks: [String: Double] = [:]
+
+    init(marks: [String: Double] = [:]) { self.marks = marks }
+
+    init(defaults: UserDefaults) {
+        marks = defaults.dictionary(forKey: Self.defaultsKey) as? [String: Double] ?? [:]
+    }
+
+    func save(to defaults: UserDefaults) {
+        defaults.set(marks, forKey: Self.defaultsKey)
+    }
+
+    func hides(_ work: FleetWork) -> Bool {
+        work.lane == .finished && marks[work.id] == Self.stamp(work)
+    }
+
+    mutating func markReviewed(_ work: FleetWork) {
+        marks[work.id] = Self.stamp(work)
+    }
+
+    /// Drops marks for units no longer on the board.
+    mutating func prune(keeping ids: Set<String>) {
+        marks = marks.filter { ids.contains($0.key) }
+    }
+
+    private static func stamp(_ work: FleetWork) -> Double {
+        (work.since ?? .distantPast).timeIntervalSince1970
+    }
+}
+
 private extension MuxaAgent {
     func status(at now: Date) -> MuxaAgentStatus { MuxaAgentStatus(agent: self, now: now) }
 }

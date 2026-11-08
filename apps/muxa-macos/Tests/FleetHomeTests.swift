@@ -186,3 +186,47 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     #expect(FleetBoard.stageState(aliasStatus: "blocked", status: .working, agentState: "working") == .needsYou)
     #expect(FleetBoard.stageState(aliasStatus: nil, status: covered, agentState: "error") == .running)
 }
+
+@Test func onlyAnAgentAtItsPromptTakesTypedText() throws {
+    func solo(_ state: String, withPane: Bool = true) throws -> FleetWork {
+        let hosted = MuxaHostedAgent(
+            host: host,
+            agent: try agent(["state": state], id: state),
+            pane: withPane ? try pane("%1", alias: "a") : nil
+        )
+        return FleetBoard.work(for: hosted, now: .now)
+    }
+    #expect(FleetBoard.reply(for: try solo("waiting_input")) == .answer)
+    #expect(FleetBoard.reply(for: try solo("idle")) == .sendBack)
+    #expect(FleetBoard.reply(for: try solo("waiting_choice")) == nil)
+    #expect(FleetBoard.choosesInPane(try solo("waiting_choice")))
+    #expect(FleetBoard.reply(for: try solo("working")) == nil)
+    #expect(FleetBoard.reply(for: try solo("error")) == nil)
+    #expect(FleetBoard.reply(for: try solo("waiting_input", withPane: false)) == nil)
+}
+
+@Test func reviewedWorkReturnsWhenItChanges() throws {
+    func finished(at time: String) throws -> FleetWork {
+        let hosted = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "state_entered_at": time], id: "a"), pane: nil)
+        return FleetBoard.work(for: hosted, now: .now)
+    }
+    let first = try finished(at: "2026-11-08T01:00:00Z")
+    var marks = FleetReviewMarks()
+    marks.markReviewed(first)
+    #expect(marks.hides(first))
+    #expect(!marks.hides(try finished(at: "2026-11-08T02:00:00Z")))
+
+    let working = FleetBoard.work(
+        for: MuxaHostedAgent(host: host, agent: try agent(["state_entered_at": "2026-11-08T01:00:00Z"], id: "a"), pane: nil),
+        now: .now
+    )
+    #expect(!marks.hides(working))
+
+    marks.prune(keeping: [])
+    #expect(!marks.hides(first))
+
+    let defaults = try #require(UserDefaults(suiteName: "fleet-home-tests-\(UUID().uuidString)"))
+    marks.markReviewed(first)
+    marks.save(to: defaults)
+    #expect(FleetReviewMarks(defaults: defaults) == marks)
+}

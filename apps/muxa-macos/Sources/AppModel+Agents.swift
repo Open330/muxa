@@ -21,6 +21,9 @@ final class MuxaAgentLauncher: ObservableObject {
     /// An editor to open pinned once its pane appeared. ContentView owns the
     /// tabs, so it performs the open and clears this.
     @Published var pendingEditor: MuxaSidebarSelection?
+    /// A first prompt typed elsewhere (Fleet Home's assign bar) that the
+    /// sheet starts with; taken once when the sheet seeds itself.
+    @Published var draftPrompt: String?
 
     let defaults: UserDefaults
 
@@ -40,7 +43,8 @@ final class MuxaAgentLauncher: ObservableObject {
 extension AppModel {
     /// Opens the New Agent sheet for the focused editor. `error` carries a
     /// failed quick start over, so the operator sees why and can adjust.
-    func presentNewAgent(error: String? = nil) {
+    func presentNewAgent(error: String? = nil, prompt: String? = nil) {
+        agentLauncher.draftPrompt = prompt
         agentLauncher.error = error
         agentLauncher.status = nil
         agentLauncher.focus = agentLaunchFocus()

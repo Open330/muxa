@@ -346,6 +346,10 @@ struct NewAgentView: View {
     private func seed() {
         guard !seeded else { return }
         seeded = true
+        if let draft = launcher.draftPrompt {
+            prompt = draft
+            launcher.draftPrompt = nil
+        }
         let focus = launcher.focus
         let remembered = launcher.rememberedDefaults
         if let focusHost = focus.hostAlias,
