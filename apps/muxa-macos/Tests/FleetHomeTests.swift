@@ -175,3 +175,14 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     #expect(work.currentStageIndex == 1)
     #expect(work.doneStageCount == 0)
 }
+
+@Test func aCoveredRateLimitIsNotAHumanGate() {
+    let covered = MuxaAgentStatus.limited(MuxaRateLimitCap(scope: .fiveHour, until: nil, covered: true))
+    let uncovered = MuxaAgentStatus.limited(MuxaRateLimitCap(scope: .fiveHour, until: nil, covered: false))
+
+    #expect(FleetBoard.stageState(aliasStatus: "failed", status: covered, agentState: "error") == .running)
+    #expect(FleetBoard.stageState(aliasStatus: "failed", status: uncovered, agentState: "error") == .needsYou)
+    #expect(FleetBoard.stageState(aliasStatus: "failed", status: .error, agentState: "error") == .needsYou)
+    #expect(FleetBoard.stageState(aliasStatus: "blocked", status: .working, agentState: "working") == .needsYou)
+    #expect(FleetBoard.stageState(aliasStatus: nil, status: covered, agentState: "error") == .running)
+}

@@ -108,9 +108,13 @@ enum FleetBoard {
             .sorted { $0.agent.status(at: now).priority < $1.agent.status(at: now).priority }
             .first
         let active = group.participants.first { $0.agent.status(at: now) == .working }
-        // Keyed by the alias the desired agents use.
+        // Keyed by the alias the desired agents use. A failure the limit
+        // policy is handling is not a gate (see `stageState`).
+        let handled = Set(group.participants
+            .filter { isHandledLimit($0.agent, now: now) }
+            .compactMap { group.desiredAgent(for: $0)?.alias })
         let blocked = group.pipelineRun?.aliases
-            .filter { $0.value.status == "blocked" || $0.value.status == "failed" }
+            .filter { ($0.value.status == "blocked" || $0.value.status == "failed") && !handled.contains($0.key) }
             .sorted { $0.key < $1.key }
             .first
         let blockedAlias = blocked?.value
@@ -185,13 +189,19 @@ enum FleetBoard {
         )
     }
 
+    static func stageState(aliasStatus: String?, agent: MuxaAgent?, now: Date) -> FleetWorkStage.State {
+        stageState(aliasStatus: aliasStatus, status: agent?.status(at: now), agentState: agent?.state)
+    }
+
     /// The pipeline's durable gates outrank live activity: a blocked or
     /// failed stage stays in front of the person even while its agent keeps
     /// working, and a done stage is never demoted (the daemon does not demote
-    /// it either). Live state decides everything else.
-    static func stageState(aliasStatus: String?, agent: MuxaAgent?, now: Date) -> FleetWorkStage.State {
+    /// it either). The one exception is a rate limit the policy covers: the
+    /// daemon reports the 429 as a failed stage, but the policy resumes it,
+    /// so it is still running. Live state decides everything else.
+    static func stageState(aliasStatus: String?, status: MuxaAgentStatus?, agentState: String?) -> FleetWorkStage.State {
+        if case .limited(let cap) = status, cap.covered { return aliasStatus == "done" ? .done : .running }
         if aliasStatus == "blocked" || aliasStatus == "failed" { return .needsYou }
-        let status = agent?.status(at: now)
         if status?.needsAttention == true { return .needsYou }
         if aliasStatus == "done" { return .done }
         switch status {
@@ -201,7 +211,7 @@ enum FleetBoard {
         }
         if aliasStatus == "running" || aliasStatus == "working" || aliasStatus == "starting" { return .running }
         // An idle agent finished its turn; a stage with no agent yet waits.
-        if let agent, agent.state == "idle" { return .done }
+        if agentState == "idle" { return .done }
         return .waiting
     }
 
