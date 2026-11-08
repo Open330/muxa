@@ -52,6 +52,9 @@ struct FleetWork: Identifiable, Sendable {
     let focus: MuxaHostedAgent?
     /// A limit the configured policy will handle on its own.
     let handledLimit: Bool
+    /// Changes whenever any agent of the unit or its pipeline moves on, so
+    /// a mark made on one version of the unit never covers a later one.
+    var revision: String = ""
 
     var id: String {
         switch source {
@@ -149,7 +152,8 @@ enum FleetBoard {
             since: focus.flatMap { MuxaUsageTimestamp.parse($0.agent.stateEnteredAt ?? $0.agent.lastActivityAt) },
             agents: group.participants,
             focus: focus,
-            handledLimit: group.participants.contains { isHandledLimit($0.agent, now: now) }
+            handledLimit: group.participants.contains { isHandledLimit($0.agent, now: now) },
+            revision: revision(agents: group.participants, run: group.pipelineRun)
         )
     }
 
@@ -245,8 +249,22 @@ enum FleetBoard {
             since: MuxaUsageTimestamp.parse(agent.stateEnteredAt ?? agent.lastActivityAt),
             agents: [hosted],
             focus: hosted,
-            handledLimit: isHandledLimit(agent, now: now)
+            handledLimit: isHandledLimit(agent, now: now),
+            revision: revision(agents: [hosted], run: nil)
         )
+    }
+
+    /// Every agent's session, state and state entry, plus the pipeline's
+    /// generation and stage statuses.
+    static func revision(agents: [MuxaHostedAgent], run: MuxaPipelineRun?) -> String {
+        var parts = agents
+            .map { "\($0.id)|\($0.agent.state)|\($0.agent.stateEnteredAt ?? $0.agent.lastActivityAt ?? "")" }
+            .sorted()
+        if let run {
+            parts.append("gen:\(run.generation)")
+            parts += run.aliases.map { "\($0.key)=\($0.value.status)" }.sorted()
+        }
+        return parts.joined(separator: ";")
     }
 
     // MARK: - Wording
@@ -310,7 +328,39 @@ enum FleetReply: Equatable, Sendable {
     case sendBack
 }
 
+/// The agent and the exact question a reply is written for. A draft keeps
+/// its target, so text written for one question never goes to another
+/// agent, a replacement session, or the same agent's next question.
+struct FleetReplyTarget: Equatable, Sendable {
+    let kind: FleetReply
+    let agentID: String
+    let sessionID: String
+    let state: String
+    let stateEnteredAt: String?
+    let owner: String
+
+    init(kind: FleetReply, agent hosted: MuxaHostedAgent) {
+        self.kind = kind
+        agentID = hosted.id
+        sessionID = hosted.agent.agentSessionID
+        state = hosted.agent.state
+        stateEnteredAt = hosted.agent.stateEnteredAt
+        owner = FleetBoard.owner(hosted)
+    }
+
+    /// The agent at the pane is still the one, at the same question.
+    func matches(_ agent: MuxaAgent?) -> Bool {
+        guard let agent else { return false }
+        return agent.agentSessionID == sessionID && agent.state == state && agent.stateEnteredAt == stateEnteredAt
+    }
+}
+
 extension FleetBoard {
+    static func replyTarget(for work: FleetWork) -> FleetReplyTarget? {
+        guard let kind = reply(for: work), let focus = work.focus else { return nil }
+        return FleetReplyTarget(kind: kind, agent: focus)
+    }
+
     /// Text goes only to an agent at its prompt: one asking a question, or
     /// one done with its turn. A choice dialog, an error, or a working agent
     /// is handled in the pane, where the person sees what they answer.
@@ -323,6 +373,12 @@ extension FleetBoard {
         }
     }
 
+    /// The empty state only when nothing is hidden either, so a board of
+    /// reviewed units keeps the lanes and their Show reviewed control.
+    static func showsEmptyBoard(visible: Int, reviewed: Int) -> Bool {
+        visible == 0 && reviewed == 0
+    }
+
     /// The agent waits on a choice only its pane can show.
     static func choosesInPane(_ work: FleetWork) -> Bool {
         work.lane == .needsYou && work.focus?.agent.state == "waiting_choice"
@@ -330,17 +386,17 @@ extension FleetBoard {
 }
 
 /// Finished units the person reviewed and set aside. A mark holds the
-/// moment the unit had finished, so the unit returns to the board as soon
-/// as it changes again.
+/// unit's revision, so the unit returns as soon as any of its agents or its
+/// pipeline moves on.
 struct FleetReviewMarks: Equatable, Sendable {
     static let defaultsKey = "fleetHome.reviewed"
 
-    private(set) var marks: [String: Double] = [:]
+    private(set) var marks: [String: String] = [:]
 
-    init(marks: [String: Double] = [:]) { self.marks = marks }
+    init(marks: [String: String] = [:]) { self.marks = marks }
 
     init(defaults: UserDefaults) {
-        marks = defaults.dictionary(forKey: Self.defaultsKey) as? [String: Double] ?? [:]
+        marks = defaults.dictionary(forKey: Self.defaultsKey) as? [String: String] ?? [:]
     }
 
     func save(to defaults: UserDefaults) {
@@ -348,20 +404,16 @@ struct FleetReviewMarks: Equatable, Sendable {
     }
 
     func hides(_ work: FleetWork) -> Bool {
-        work.lane == .finished && marks[work.id] == Self.stamp(work)
+        work.lane == .finished && marks[work.id] == work.revision
     }
 
     mutating func markReviewed(_ work: FleetWork) {
-        marks[work.id] = Self.stamp(work)
+        marks[work.id] = work.revision
     }
 
     /// Drops marks for units no longer on the board.
     mutating func prune(keeping ids: Set<String>) {
         marks = marks.filter { ids.contains($0.key) }
-    }
-
-    private static func stamp(_ work: FleetWork) -> Double {
-        (work.since ?? .distantPast).timeIntervalSince1970
     }
 }
 

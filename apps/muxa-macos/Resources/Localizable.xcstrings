@@ -5431,6 +5431,16 @@
         }
       }
     },
+    "Discard" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "버리기"
+          }
+        }
+      }
+    },
     "Discard Launch Changes" : {
       "localizations" : {
         "ko" : {
@@ -16373,6 +16383,16 @@
         }
       }
     },
+    "Use for %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에게 보내기로 바꾸기"
+          }
+        }
+      }
+    },
     "Use the Controls" : {
       "localizations" : {
         "ko" : {
@@ -17195,6 +17215,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "프리셋을 %@에 기록하는 중…"
+          }
+        }
+      }
+    },
+    "Written for an earlier question from %@. It was not sent." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@의 이전 질문에 쓴 답입니다. 보내지 않았습니다."
           }
         }
       }

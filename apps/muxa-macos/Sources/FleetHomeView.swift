@@ -16,6 +16,9 @@ struct FleetHomeView: View {
     @State private var assignment = ""
     @State private var reviewed = FleetReviewMarks(defaults: .standard)
     @State private var showsReviewed = false
+    /// Reply drafts per unit, kept while the inspector closes or the unit's
+    /// focus changes, each bound to the question it was written for.
+    @State private var drafts: [String: FleetReplyDraft] = [:]
 
     private var allWorks: [FleetWork] {
         FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
@@ -165,7 +168,11 @@ struct FleetHomeView: View {
             close: { selectedID = nil },
             open: open,
             openWork: { identity in model.select(.work(identity)) },
-            send: { text in try await send(text, to: work) },
+            draft: Binding(
+                get: { drafts[work.id] ?? FleetReplyDraft() },
+                set: { drafts[work.id] = $0.isEmpty ? nil : $0 }
+            ),
+            send: { text, target in try await send(text, to: target) },
             markReviewed: {
                 reviewed.markReviewed(work)
                 reviewed.save(to: .standard)
@@ -175,14 +182,13 @@ struct FleetHomeView: View {
         .id(work.id)
     }
 
-    /// Types `text` into the unit's agent, after checking that the agent the
-    /// person looked at is still the one at that pane, in the same state.
-    private func send(_ text: String, to work: FleetWork) async throws {
-        guard let focus = work.focus,
-              let paneID = MuxaAgentAttentionCenter.paneIdentity(for: focus),
+    /// Types `text` into the agent the draft was written for, after checking
+    /// that the same session is still at its pane, at the same question.
+    private func send(_ text: String, to target: FleetReplyTarget) async throws {
+        guard let hosted = model.hostedAgents.first(where: { $0.id == target.agentID }),
+              let paneID = MuxaAgentAttentionCenter.paneIdentity(for: hosted),
               let current = model.executionSnapshot.watchPane(id: paneID),
-              current.agent?.agentSessionID == focus.agent.agentSessionID,
-              current.agent?.state == focus.agent.state else {
+              target.matches(current.agent) else {
             throw MuxaIPCError.server(String(localized: "The agent moved on. Open its pane to see where it is."))
         }
         if let blocker = MuxaNotificationActions.replyBlocker(current) { throw MuxaIPCError.server(blocker) }
@@ -192,7 +198,7 @@ struct FleetHomeView: View {
     @ViewBuilder
     private func lanes(_ works: [FleetWork], reviewedCount: Int) -> some View {
         Group {
-            if works.isEmpty {
+            if FleetBoard.showsEmptyBoard(visible: works.count, reviewed: reviewedCount) {
                 FleetEmptyBoard(
                     isConnected: model.isConnected,
                     newAgent: { model.presentNewAgent() },
@@ -437,13 +443,21 @@ private struct FleetWorkInspector: View {
     let close: () -> Void
     let open: (MuxaHostedAgent) -> Void
     let openWork: (MuxaWorkIdentity) -> Void
-    let send: (String) async throws -> Void
+    @Binding var draft: FleetReplyDraft
+    let send: (String, FleetReplyTarget) async throws -> Void
     let markReviewed: () -> Void
 
-    @State private var draft = ""
     @State private var sending = false
     @State private var failure: String?
     @State private var sent = false
+
+    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
+
+    /// Text written for a question the unit has moved past.
+    private var isStale: Bool {
+        guard let target = draft.target, !draft.isEmpty else { return false }
+        return target != currentTarget
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -523,8 +537,8 @@ private struct FleetWorkInspector: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
-            if let reply = FleetBoard.reply(for: work) {
-                replyField(reply)
+            if currentTarget != nil || !draft.isEmpty {
+                replyField
             }
             HStack(spacing: 8) {
                 if let focus = work.focus {
@@ -558,21 +572,54 @@ private struct FleetWorkInspector: View {
     }
 
     @ViewBuilder
-    private func replyField(_ reply: FleetReply) -> some View {
+    private var replyField: some View {
+        let kind = (isStale ? nil : draft.target?.kind) ?? currentTarget?.kind ?? .answer
         VStack(alignment: .leading, spacing: 6) {
+            if isStale, let target = draft.target {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Written for an earlier question from \(target.owner). It was not sent.", systemImage: "exclamationmark.triangle.fill")
+                        .font(MuxaType.meta)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        if let current = currentTarget {
+                            Button(String(localized: "Use for \(current.owner)")) {
+                                draft.target = current
+                                failure = nil
+                            }
+                            .buttonStyle(.muxaSecondary)
+                            .controlSize(.small)
+                        }
+                        Button("Discard", role: .destructive) {
+                            draft = FleetReplyDraft()
+                            failure = nil
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                    }
+                }
+            }
             HStack(alignment: .bottom, spacing: 8) {
                 TextField(
-                    reply == .answer ? String(localized: "Your answer") : String(localized: "Next instruction"),
-                    text: $draft,
+                    kind == .answer ? String(localized: "Your answer") : String(localized: "Next instruction"),
+                    text: Binding(
+                        get: { draft.text },
+                        set: { text in
+                            draft.text = text
+                            // The draft belongs to the question on screen when typing starts.
+                            if draft.target == nil || draft.isEmpty { draft.target = text.isEmpty ? nil : currentTarget }
+                            sent = false
+                        }
+                    ),
                     axis: .vertical
                 )
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...6)
                 .disabled(sending)
                 .onSubmit(submit)
-                Button(reply == .answer ? String(localized: "Answer") : String(localized: "Send Back"), action: submit)
+                Button(kind == .answer ? String(localized: "Answer") : String(localized: "Send Back"), action: submit)
                     .buttonStyle(.muxaPrimary)
-                    .disabled(sending || draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    .disabled(sending || isStale || draft.target == nil || draft.isEmpty)
             }
             if sending {
                 ProgressView().controlSize(.small)
@@ -589,16 +636,17 @@ private struct FleetWorkInspector: View {
     }
 
     private func submit() {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sending, !text.isEmpty else { return }
+        let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !sending, !isStale, !text.isEmpty, let target = draft.target else { return }
         sending = true
         failure = nil
         sent = false
         Task {
             defer { sending = false }
             do {
-                try await send(text)
-                draft = ""
+                try await send(text, target)
+                // Clear only what was sent; a newer draft stays.
+                if draft.text.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = FleetReplyDraft() }
                 sent = true
             } catch {
                 // Keep the text so nothing typed is lost.
@@ -726,4 +774,12 @@ private struct FleetEmptyBoard: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(32)
     }
+}
+
+/// Text for one unit's agent and the question it answers.
+struct FleetReplyDraft: Equatable {
+    var text = ""
+    var target: FleetReplyTarget?
+
+    var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
 }
