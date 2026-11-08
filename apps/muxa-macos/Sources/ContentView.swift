@@ -258,7 +258,7 @@ struct ContentView: View {
             ArtifactPreviewView(location: location, model: model, isFocused: groupID == tabs.focusedGroupID, openFile: openFile)
                 .id(location)
         case .workBoard:
-            WorkCommandCenterView(model: model)
+            FleetHomeView(model: model)
         case .watch:
             NativeWatchView(model: model)
         case .inbox:
