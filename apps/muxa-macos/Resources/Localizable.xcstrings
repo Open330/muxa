@@ -20020,6 +20020,396 @@
           }
         }
       }
+    },
+    "%lld more agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 %lld개 더 보기"
+          }
+        }
+      }
+    },
+    "Accounts and usage" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "계정 및 사용량"
+          }
+        }
+      }
+    },
+    "Active accounts only" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "활성 계정만"
+          }
+        }
+      }
+    },
+    "All agents" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전체 에이전트"
+          }
+        }
+      }
+    },
+    "All providers" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "모든 제공업체"
+          }
+        }
+      }
+    },
+    "Cached usage" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "캐시된 사용량"
+          }
+        }
+      }
+    },
+    "Discard Draft" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초안 버리기"
+          }
+        }
+      }
+    },
+    "Find account" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "계정 찾기"
+          }
+        }
+      }
+    },
+    "Finished" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "완료"
+          }
+        }
+      }
+    },
+    "Highest usage among active accounts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "활성 계정 중 가장 높은 사용률"
+          }
+        }
+      }
+    },
+    "Host disconnected" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트 연결 끊김"
+          }
+        }
+      }
+    },
+    "Muxa actions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa 작업 메뉴"
+          }
+        }
+      }
+    },
+    "No agents need attention" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인이 필요한 에이전트가 없습니다"
+          }
+        }
+      }
+    },
+    "No current usage reported" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "현재 사용량 정보가 없습니다"
+          }
+        }
+      }
+    },
+    "No matching accounts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "일치하는 계정이 없습니다"
+          }
+        }
+      }
+    },
+    "Reply to agent…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트에게 답장…"
+          }
+        }
+      }
+    },
+    "Send Reply" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답장 보내기"
+          }
+        }
+      }
+    },
+    "This agent no longer needs attention" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 에이전트는 더 이상 확인이 필요하지 않습니다"
+          }
+        }
+      }
+    },
+    "Usage is shown per account" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "사용량은 계정별로 표시됩니다"
+          }
+        }
+      }
+    },
+    "Usage may be out of date" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "needs_review",
+            "value" : "사용량 정보가 오래되었을 수 있습니다"
+          }
+        }
+      }
+    },
+    "Menu Bar" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "메뉴 막대"
+          }
+        }
+      }
+    },
+    "Maximum agent icons" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최대 agent 아이콘 수"
+          }
+        }
+      }
+    },
+    "Hide agent icons" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "agent 아이콘 숨기기"
+          }
+        }
+      }
+    },
+    "Additional activity stays in the +N list. Reviewed agents are hidden until new activity arrives." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "나머지 활동은 +N 목록에 표시됩니다. 확인한 agent는 새 활동이 생길 때까지 숨겨집니다."
+          }
+        }
+      }
+    },
+    "By agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Agent별"
+          }
+        }
+      }
+    },
+    "By Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work별"
+          }
+        }
+      }
+    },
+    "By Fleet host" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet 호스트별"
+          }
+        }
+      }
+    },
+    "Unassigned Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "미지정 Work"
+          }
+        }
+      }
+    },
+    "Group activity" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "활동 묶기"
+          }
+        }
+      }
+    },
+    "Maximum activity icons" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최대 활동 아이콘 수"
+          }
+        }
+      }
+    },
+    "Hide activity icons" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "활동 아이콘 숨기기"
+          }
+        }
+      }
+    },
+    "AAS appears as a hoverable usage chip when its module is enabled." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AAS 확장을 켜면 마우스 오버 가능한 사용량 칩이 표시됩니다."
+          }
+        }
+      }
+    },
+    "Show AAS usage chip" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AAS 사용량 칩 표시"
+          }
+        }
+      }
+    },
+    "Hover to see active account usage. Click to compare all accounts." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마우스를 올리면 활성 계정 사용량을, 클릭하면 모든 계정 사용량을 볼 수 있습니다."
+          }
+        }
+      }
+    },
+    "Enable AAS module" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "AAS 확장 켜기"
+          }
+        }
+      }
+    },
+    "Back to activity" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "활동으로 돌아가기"
+          }
+        }
+      }
+    },
+    "All groups" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 그룹"
+          }
+        }
+      }
+    },
+    "Menu Bar Settings…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "메뉴 막대 설정…"
+          }
+        }
+      }
+    },
+    "%lld more items" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "추가 항목 %lld개"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

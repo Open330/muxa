@@ -3,8 +3,11 @@ import SwiftUI
 
 @MainActor
 private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
+    static weak var model: AppModel?
+    private var menuBar: MuxaMenuBarAgentController?
+
     override init() {
-        // Muxa has a persistent menu-bar scene, so AppKit can otherwise treat
+        // Muxa has a persistent status item, so AppKit can otherwise treat
         // a previously closed/off-screen workbench as the desired launch
         // state and create no visible window at all.
         MuxaPreferences.registerDefaults()
@@ -22,7 +25,7 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         super.init()
     }
 
-    /// Muxa keeps a menu-bar scene, a daemon connection, and host monitoring
+    /// Muxa keeps a menu-bar item, a daemon connection, and host monitoring
     /// alive without a window, and the workbench is reopened from the menu
     /// bar or the Dock. Closing the last window must not quit the app.
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -37,6 +40,10 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // working install. A module that is switched off is not probed, so
         // an operator who uses none still pays nothing.
         Task { await MuxaModuleRegistry.shared.probeEnabled() }
+        if !AppModel.isRunningTests(), let model = Self.model {
+            menuBar = MuxaMenuBarAgentController(model: model)
+            model.start()
+        }
         // WS-A: set before launch completes so a notification click that
         // launched Muxa still reaches its pane.
         if !AppModel.isRunningTests() { MuxaUserNotifications.shared.installDelegate() }
@@ -49,6 +56,8 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
     /// loopback page until it is stopped — and quitting must not leave it
     /// running.
     func applicationWillTerminate(_ notification: Notification) {
+        menuBar?.stop()
+        menuBar = nil
         MuxaModuleRegistry.shared.shutdown()
     }
 
@@ -175,8 +184,14 @@ enum MuxaTerminalAppearance {
 @main
 struct MuxaApp: App {
     @NSApplicationDelegateAdaptor(MuxaApplicationDelegate.self) private var appDelegate
-    @StateObject private var model = AppModel()
+    @StateObject private var model: AppModel
     @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
+
+    init() {
+        let model = AppModel()
+        _model = StateObject(wrappedValue: model)
+        MuxaApplicationDelegate.model = model
+    }
 
     var body: some Scene {
         workbenchWindow
@@ -215,12 +230,6 @@ struct MuxaApp: App {
         }
         .defaultPosition(.center)
         .windowResizability(.contentSize)
-
-        MenuBarExtra("Muxa", systemImage: menuBarIcon) {
-            MenuBarContent(model: model)
-                .preferredColorScheme(preferredColorScheme)
-        }
-        .menuBarExtraStyle(.window)
     }
 
     private var workbenchWindow: some Scene {
@@ -266,13 +275,6 @@ struct MuxaApp: App {
                     .keyboardShortcut("t", modifiers: [.command, .option, .shift])
                     .disabled(!model.isConnected || model.isStartingAgent)
             }
-        }
-    }
-
-    private var menuBarIcon: String {
-        switch model.connectionState {
-        case .failed, .upgradeRequired: "terminal.fill"
-        case .connecting, .connected: "terminal"
         }
     }
 
@@ -416,114 +418,5 @@ private struct MuxaEditorMenuCommands: Commands {
                 .keyboardShortcut("f", modifiers: [.command, .shift])
                 .disabled(actions?.focusSidebar == nil)
         }
-    }
-}
-
-private struct MenuBarContent: View {
-    @ObservedObject var model: AppModel
-    @ObservedObject private var attention: MuxaAgentAttentionCenter
-    @Environment(\.openWindow) private var openWindow
-
-    init(model: AppModel) {
-        self.model = model
-        attention = model.attention
-    }
-
-    private func openMain(_ then: () -> Void = {}) {
-        then()
-        openWindow(id: "main")
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
-    private var liveSessionCount: Int {
-        model.sessions.lazy.filter { !$0.exited }.count
-    }
-
-    private var liveAgentCount: Int {
-        model.agents.lazy.filter { $0.state != "stopped" }.count
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Muxa")
-                .font(.headline)
-            Text("\(liveAgentCount) agents · \(model.pipelineRuns.count) work items")
-                .foregroundStyle(.secondary)
-            if let line = attention.summary.needsYouLine {
-                // The same count as the Inbox badge; opens the Inbox.
-                Button {
-                    openMain { model.select(.inbox) }
-                } label: {
-                    Label(line, systemImage: "exclamationmark.circle.fill")
-                        .foregroundStyle(.orange)
-                }
-                .buttonStyle(.plain)
-                .help("Open the Inbox")
-            }
-            if attention.summary.uncoveredLimited > 0,
-               MuxaSwitchLimitedButton.hostCount(for: model.hostedAgents.filter { $0.agent.status.isLimited }) > 0 {
-                Button {
-                    openMain {
-                        MuxaSwitchLimitedButton.presentSwitch(
-                            for: model.hostedAgents.filter { $0.agent.status.isLimited }, model: model
-                        )
-                    }
-                } label: {
-                    Label(attention.summary.uncoveredLimited == 1
-                        ? "1 agent hit its usage limit: Switch Account…"
-                        : "\(attention.summary.uncoveredLimited) agents hit their usage limit: Switch…",
-                        systemImage: "arrow.triangle.2.circlepath")
-                }
-            }
-            Text("\(liveSessionCount) native shells")
-                .font(MuxaType.detail)
-                .foregroundStyle(.secondary)
-            Divider()
-            Button("Start Work…") {
-                model.presentWorkStart()
-                openWindow(id: "main")
-                NSApp.activate(ignoringOtherApps: true)
-            }
-            .disabled(!model.isConnected || model.isStartingWork)
-            Button("Open Live Watch") {
-                model.select(.watch)
-                openWindow(id: "main")
-                NSApp.activate(ignoringOtherApps: true)
-            }
-            Button("New Shell") { model.createShell() }
-                .disabled(!model.isConnected || model.isCreatingSession)
-            Button("Open Muxa") {
-                openWindow(id: "main")
-                NSApp.activate(ignoringOtherApps: true)
-            }
-            Divider()
-            if #available(macOS 14.0, *) {
-                SettingsLink {
-                    Label("Settings…", systemImage: "gearshape")
-                }
-            } else {
-                Button {
-                    let opened = NSApp.sendAction(
-                        Selector(("showSettingsWindow:")),
-                        to: nil,
-                        from: nil
-                    )
-                    if !opened {
-                        NSApp.sendAction(
-                            Selector(("showPreferencesWindow:")),
-                            to: nil,
-                            from: nil
-                        )
-                    }
-                } label: {
-                    Label("Settings…", systemImage: "gearshape")
-                }
-            }
-            Button("Quit") { NSApp.terminate(nil) }
-        }
-        .padding(12)
-        .frame(width: 240)
-        // WS-A: lets a notification click reopen a closed workbench.
-        .onAppear { MuxaWorkbenchPresenter.remember(openWindow) }
     }
 }

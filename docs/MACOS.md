@@ -200,6 +200,44 @@ and the terminal surface used for direct inspection. The patterns are based on
 the official [VS Code UI documentation](https://code.visualstudio.com/docs/editing/userinterface)
 and [Lens Navigator documentation](https://docs.k8slens.dev/k8slens/using-lens/navigator/).
 
+## AAS accounts in the menu bar
+
+Enable **Settings → Modules → aas — Agent Account Switcher** with `aas` on
+the login shell's PATH. AAS joins the Muxa cluster as a hoverable gauge chip;
+it does not create a separate status item. Hover to see the highest
+reported usage among active accounts. Click it to compare every stored
+account by provider, filter active accounts, or search by name/email. Each
+limit window has its own usage bar and reset time; limits are never added
+across accounts. Expired readings are unavailable, and old or failed readings
+are marked with a warning rather than presented as fresh quota.
+
+The widget reads `aas usage --json` on opening and at most once every two
+minutes while its chip is visible. Recent manual reads postpone the next
+background read; failed reads also wait before retrying. **Refresh live**
+explicitly requests `--fresh`. It does not switch
+accounts or export credentials. Disabling the module removes its chip and
+stops background usage queries. Hiding the chip also pauses those queries.
+An existing AAS installation is reused; a missing
+installation is explained in the module settings.
+
+**Settings → Menu Bar** controls grouping by **Agent**, **Work**, or **Fleet
+host**, up to three activity icons by default, and the AAS chip's visibility.
+The same settings can be opened with the cluster popover's gear button.
+**Maximum activity icons** allows zero through eight icons, with `+N` for
+the rest; the available screen width may
+reduce the count further. Zero keeps activity reachable through `+N` without
+individual activity icons. Group chips open their agents rather than
+acknowledging the entire group. Work identity includes host and workspace;
+unmanaged panes use their actual socket/session/window boundary. Opening an agent card acknowledges
+that session. Reviewed icons disappear after the card is closed and the
+pointer leaves; a new state change can show the agent again. With no unseen
+activity, only the Muxa launcher and any enabled extension chip remain.
+
+The cluster polls the pointer at 15 Hz while idle and 60 Hz while tracking
+or animating, and pauses polling during display sleep. Snapshot notifications
+in the same run-loop turn share one refresh. Unchanged render and accessibility
+snapshots reuse the existing image/elements instead of rebuilding them.
+
 ## Build and run
 
 Requirements:
