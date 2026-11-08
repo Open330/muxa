@@ -1222,7 +1222,7 @@ private struct WorkBoardRow: View {
                 .foregroundStyle(.tint)
                 .frame(width: 18)
             VStack(alignment: .leading, spacing: 2) {
-                Text("Work Command Center")
+                Text("Fleet Home")
                 Text("\(workCount) work · \(agentCount) agents")
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)

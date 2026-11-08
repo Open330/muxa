@@ -4,6 +4,8 @@ import SwiftUI
 
 struct WorkCommandCenterView: View {
     @ObservedObject var model: AppModel
+    /// Fleet Home's Templates page: only the pipeline library and routes.
+    var pipelinesOnly = false
     @Environment(\.colorScheme) private var colorScheme
 
     private let columns = [GridItem(.adaptive(minimum: 260, maximum: 420), spacing: 12)]
@@ -40,6 +42,7 @@ struct WorkCommandCenterView: View {
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
+                if !pipelinesOnly {
                 ViewThatFits(in: .horizontal) {
                     HStack(alignment: .top, spacing: 18) {
                         commandCenterTitle
@@ -150,6 +153,8 @@ struct WorkCommandCenterView: View {
                             }
                         }
                     }
+                }
+
                 }
 
                 pipelinesSection

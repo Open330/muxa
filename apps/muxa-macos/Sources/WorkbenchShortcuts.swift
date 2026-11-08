@@ -108,7 +108,7 @@ enum MuxaShortcutCatalog {
             Section(title: String(localized: "Views"), entries: [
                 Entry(keys: "⌘B", title: String(localized: "Toggle Side Bar")),
                 Entry(keys: "⇧⌘F", title: String(localized: "Focus Side Bar Filter")),
-                Entry(keys: "⇧⌘1", title: String(localized: "Open Work Command Center")),
+                Entry(keys: "⇧⌘1", title: String(localized: "Open Fleet Home")),
                 Entry(keys: "⇧⌘2", title: String(localized: "Open Ask")),
                 Entry(keys: "⇧⌘3", title: String(localized: "Open Inbox")),
                 Entry(keys: "⌃⌘W", title: String(localized: "Open Live Watch")),

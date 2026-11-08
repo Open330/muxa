@@ -20410,6 +20410,316 @@
           }
         }
       }
+    },
+    "%@ on %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%2$@의 %1$@"
+          }
+        }
+      }
+    },
+    "%lld/%lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$lld/%2$lld"
+          }
+        }
+      }
+    },
+    "Agents are on it" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 진행 중"
+          }
+        }
+      }
+    },
+    "Answer in Pane" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "pane에서 답하기"
+          }
+        }
+      }
+    },
+    "Board" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보드"
+          }
+        }
+      }
+    },
+    "Decide or review" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정하거나 점검할 것"
+          }
+        }
+      }
+    },
+    "Fleet Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet Home"
+          }
+        }
+      }
+    },
+    "Host connections" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트 연결 상태"
+          }
+        }
+      }
+    },
+    "Hosts %lld/%lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트 %1$lld/%2$lld"
+          }
+        }
+      }
+    },
+    "In progress" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "진행 중"
+          }
+        }
+      }
+    },
+    "Inspect" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "점검"
+          }
+        }
+      }
+    },
+    "Last result" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 결과"
+          }
+        }
+      }
+    },
+    "Needs your decision" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정이 필요합니다"
+          }
+        }
+      }
+    },
+    "No agent is working." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 중인 에이전트가 없습니다."
+          }
+        }
+      }
+    },
+    "No hosts yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 호스트가 없습니다."
+          }
+        }
+      }
+    },
+    "No work yet" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 Work가 없습니다"
+          }
+        }
+      }
+    },
+    "Nothing finished yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 끝난 Work가 없습니다."
+          }
+        }
+      }
+    },
+    "Nothing needs you right now." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 결정할 것이 없습니다."
+          }
+        }
+      }
+    },
+    "Now" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금"
+          }
+        }
+      }
+    },
+    "Open Fleet Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Fleet Home 열기"
+          }
+        }
+      }
+    },
+    "Open Pane" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "pane 열기"
+          }
+        }
+      }
+    },
+    "Page" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "페이지"
+          }
+        }
+      }
+    },
+    "Rate limited · the limit policy will resume it" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "한도 도달 · 한도 정책이 이어서 진행합니다"
+          }
+        }
+      }
+    },
+    "Ready for the next instruction" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다음 지시를 기다림"
+          }
+        }
+      }
+    },
+    "Stage %@ is %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ 단계: %2$@"
+          }
+        }
+      }
+    },
+    "Stages" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "단계"
+          }
+        }
+      }
+    },
+    "Start a Work from a template, or start one agent. Each shows up here as a unit of work." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "템플릿으로 Work를 시작하거나 에이전트 하나를 띄우세요. 모두 여기에 Work 단위로 나타납니다."
+          }
+        }
+      }
+    },
+    "Templates" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "템플릿"
+          }
+        }
+      }
+    },
+    "Waiting for its agents to start" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 시작되기를 기다리는 중"
+          }
+        }
+      }
+    },
+    "Work Details" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 상세"
+          }
+        }
+      }
+    },
+    "Your turn" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "내 차례"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

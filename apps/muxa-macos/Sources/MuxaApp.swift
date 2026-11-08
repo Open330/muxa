@@ -397,7 +397,7 @@ private struct MuxaEditorMenuCommands: Commands {
                 .keyboardShortcut("g", modifiers: [.control, .shift])
                 .disabled(actions?.showChanges == nil)
             Divider()
-            Button("Open Work Command Center") { dispatchActions?.openWorkCommandCenter?() }
+            Button("Open Fleet Home") { dispatchActions?.openWorkCommandCenter?() }
                 .keyboardShortcut("1", modifiers: [.command, .shift])
                 .disabled(actions?.openWorkCommandCenter == nil)
             Button("Open Ask") { dispatchActions?.openAsk?() }
