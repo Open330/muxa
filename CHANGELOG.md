@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Dedicated Claude workers declare a process-local inbound-message policy so
+  permission-mode differences do not strand delegated messages. Existing
+  operator settings and tool approval permissions remain in effect.
+- Provider approval pauses on handed-over collaboration requests now create a
+  durable, immediate Muxa Inbox recovery item. The original request stays open
+  across restart and resumes without resending when the recipient continues.
+
 ## [0.9.8] - 2026-11-06
 
 ### Fixed

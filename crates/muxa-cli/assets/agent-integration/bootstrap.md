@@ -10,6 +10,11 @@ user told you to deliver it there: then add `--user-authorized` (MCP
 `user_authorized=true`) and it is handed over at that session's next turn
 boundary without anyone accepting it. Keep the
 request id; use `muxa msg wait REQUEST` for its reply, not a duplicate request.
+For Muxa coordination, use Muxa's durable mailbox rather than Claude's native
+SendMessage/ListAgents channel. Native cross-session acceptance is not a Muxa
+delivery receipt. If provider approval interrupts an accepted request, keep its
+request ID and use the Muxa interruption/recovery record; do not resend the body,
+change the recipient's permissions, or treat a held/refused message as completed.
 Never derive your session/window/pane from $TMUX_PANE or tmux commands.
 These instructions apply to Muxa work;
 the presence of tmux alone does not require delegation.

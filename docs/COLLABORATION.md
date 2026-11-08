@@ -20,6 +20,24 @@ bypass flags for these workers. Work pipeline agents that have a `role` launch
 as workers; set `purpose = "primary"` on one to keep it protected. General
 `start` and role-less pipeline agents remain primary.
 
+Muxa-launched Claude workers set `crossSessionInbound=accept` through a
+process-local `--settings` argument, so Claude's default permission-mode parity
+does not strand a dedicated worker's incoming messages. This changes message
+receipt only; the worker's tool permission mode still follows its configured
+launch profile. An explicit operator `--settings` argument is preserved. Existing
+sessions and primary sessions keep their own inbound policy. Muxa coordination
+uses the Muxa mailbox and request IDs; Claude's native `SendMessage` channel is
+not a substitute for a Muxa delivery receipt.
+
+After a request is handed over, a provider permission prompt is tracked as
+`peer_interrupted` with reason `approval_required` (or `input_required` for
+provider input and legacy permission notifications). Muxa immediately creates one
+linked operator Inbox recovery item and keeps the original request open. This
+state survives daemon restart. When the recipient resumes, Muxa clears the
+interruption and retires its unanswered recovery item automatically; it neither
+resends the request nor reports the work complete merely because approval ended.
+Startup/trust choices before handover do not become delivery failures.
+
 Automatic creation requires the daemon capability
 `collaboration_worker_spawn_v1`. muxad reserves creation capacity for the observed
 room, provider and compatible role before the CLI creates a pane. Concurrent

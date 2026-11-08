@@ -50,6 +50,15 @@ fn reason(agent: &Agent) -> Option<&'static str> {
         AgentState::Error if agent.rate_limit_scope.is_some() => Some("rate_limited"),
         AgentState::Error => Some("error"),
         AgentState::Stopped => Some("stopped"),
+        AgentState::WaitingChoice
+            if agent.kind == AgentKind::ClaudeCode
+                && agent.last_notification.as_deref().is_some_and(|message| {
+                    message.starts_with(crate::adapters::claude::APPROVAL_NOTIFICATION_PREFIX)
+                }) =>
+        {
+            Some("approval_required")
+        }
+        AgentState::WaitingInput if agent.last_notification.is_some() => Some("input_required"),
         _ => None,
     }
 }
@@ -137,6 +146,16 @@ fn recovery_body(
     current_reason: &str,
     reset: Option<&str>,
 ) -> String {
+    if matches!(current_reason, "approval_required" | "input_required") {
+        let needed = if current_reason == "approval_required" {
+            "approval"
+        } else {
+            "input"
+        };
+        return format!(
+            "Muxa is retaining request {request_id} while recipient {session} waits for provider {needed}.\nThe request has not completed. Open this exact recipient's prompt and review its sender/action preview. Resolve the provider prompt, or choose to wait or stop the work. Muxa will observe the recipient resume and clear this recovery item automatically; do not resend the request or relaunch the agent merely to clear the hold. Answering this recovery item does not itself grant provider tool permissions."
+        );
+    }
     let observation = if current_reason == "binding_unavailable" {
         "cannot verify the recipient binding; delivery and execution are uncertain, and process exit is not established"
     } else {
@@ -213,7 +232,16 @@ impl CollaborationStore {
         }) {
             let agent = exact_agent(&original.to, agents);
             let missing_reason = missing_binding_reason(original, agent, &mut missing, now);
-            let current_reason = agent.and_then(reason).or(missing_reason);
+            // A fresh worker may still be at a startup/trust dialog. Track
+            // approvals only after this request was actually handed over.
+            let handed_over = original.notified_at.is_some()
+                || (original.status == RequestStatus::Claimed && original.wake_delivery.is_none());
+            let current_reason = agent
+                .and_then(reason)
+                .filter(|reason| {
+                    !matches!(*reason, "approval_required" | "input_required") || handed_over
+                })
+                .or(missing_reason);
             let mut parent = original.clone();
             if let Some(current_reason) = current_reason.filter(|_| !parent.status.is_terminal()) {
                 if !parent.peer_interrupted() {
@@ -252,7 +280,11 @@ impl CollaborationStore {
                         })
                         .map(|r| r.id.clone());
                 }
-                if info.action_request_id.is_none() && (coordinator_unavailable || overdue) {
+                if info.action_request_id.is_none()
+                    && (matches!(current_reason, "approval_required" | "input_required")
+                        || coordinator_unavailable
+                        || overdue)
+                {
                     let id = next_request_id(now);
                     info.action_request_id = Some(id.clone());
                     changed.push(recovery_action(&parent, id, now, current_reason));
@@ -332,6 +364,111 @@ mod tests {
         }))
         .unwrap();
         (participant, agent)
+    }
+
+    #[tokio::test]
+    async fn provider_approval_is_durable_and_resumes_the_same_request_without_a_resend() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("mailbox.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (mut recipient, mut peer) = actor("%2", "peer").await;
+        recipient.agent_kind = AgentKind::ClaudeCode;
+        peer.kind = AgentKind::ClaudeCode;
+        peer.last_notification = Some(format!(
+            "{}Cross-session message requires approval",
+            crate::adapters::claude::APPROVAL_NOTIFICATION_PREFIX
+        ));
+        let request = mailbox
+            .create(
+                sender.clone(),
+                recipient.clone(),
+                NewRequest {
+                    body: "review only".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        peer.state = AgentState::WaitingChoice;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        let queued = mailbox.get_for(&sender, &request.id).await.unwrap();
+        assert!(
+            !queued.peer_interrupted(),
+            "a startup choice before delivery is not a failed delivery"
+        );
+        mailbox.claim_by_id(&recipient, &request.id).await.unwrap();
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        let held = mailbox
+            .wait_for_terminal(&sender, &request.id, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert_eq!(held.status, RequestStatus::Claimed);
+        assert!(held.peer_interrupted());
+        let info = held.interruption.as_ref().unwrap();
+        assert_eq!(info.reason, "approval_required");
+        let action_id = info
+            .action_request_id
+            .clone()
+            .expect("approval must reach the operator immediately");
+        let human = Participant::console(sender.room.clone());
+        let action = mailbox.get_for(&human, &action_id).await.unwrap();
+        assert!(action.needs_human_response());
+        assert!(action.body.contains("do not resend"));
+        drop(mailbox);
+        let mailbox = CollaborationStore::load(options).await.unwrap();
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        assert_eq!(
+            mailbox
+                .get_for(&sender, &request.id)
+                .await
+                .unwrap()
+                .interruption
+                .unwrap()
+                .action_request_id
+                .as_deref(),
+            Some(action_id.as_str())
+        );
+        // Notifications persisted by older adapters used WaitingInput. They
+        // must retain the same recovery item rather than silently lose a hold.
+        peer.state = AgentState::WaitingInput;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator.clone(), peer.clone()])
+            .await
+            .unwrap();
+        let legacy = mailbox.get_for(&sender, &request.id).await.unwrap();
+        let interruption = legacy.interruption.as_ref().unwrap();
+        assert_eq!(interruption.reason, "input_required");
+        assert_eq!(
+            interruption.action_request_id.as_deref(),
+            Some(action_id.as_str())
+        );
+        peer.state = AgentState::Working;
+        mailbox
+            .reconcile_peer_interruptions(&[coordinator, peer])
+            .await
+            .unwrap();
+        let resumed = mailbox.get_for(&sender, &request.id).await.unwrap();
+        assert_eq!(resumed.id, request.id);
+        assert_eq!(resumed.status, RequestStatus::Claimed);
+        assert!(resumed.reply.is_none());
+        assert!(!resumed.peer_interrupted());
+        assert_eq!(
+            mailbox.get_for(&human, &action_id).await.unwrap().status,
+            RequestStatus::Cancelled
+        );
     }
 
     // Keep the restart, authorization and recovery assertions on one episode.

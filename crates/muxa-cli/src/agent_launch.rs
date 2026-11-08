@@ -740,11 +740,38 @@ pub fn run_work_start(
     Ok(())
 }
 
+/// A dedicated Claude worker is explicitly created to receive delegated work.
+/// Set its inbound policy for this process only, independently of tool approval
+/// permissions. An operator-supplied settings file/value retains full control.
+fn configure_worker_inbound(
+    agent: AgentProgram,
+    purpose: muxa::collaboration::LaunchPurpose,
+    options: &mut Vec<String>,
+) {
+    if agent != AgentProgram::Claude || purpose != muxa::collaboration::LaunchPurpose::Worker {
+        return;
+    }
+    let explicit_settings = options
+        .iter()
+        .take_while(|arg| arg.as_str() != "--")
+        .any(|arg| arg == "--settings" || arg.starts_with("--settings="));
+    if !explicit_settings {
+        options.splice(
+            0..0,
+            [
+                "--settings".into(),
+                r#"{"crossSessionInbound":"accept"}"#.into(),
+            ],
+        );
+    }
+}
+
 /// Start one allowlisted agent in a detached tmux surface and return its exact
 /// pane id. The operation is synchronous and should be wrapped in
 /// `spawn_blocking` by async callers.
 #[allow(clippy::too_many_lines)] // launch, metadata stamping, and rollback form one physical transaction
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
+    configure_worker_inbound(request.agent, request.purpose, &mut request.options);
     let launch_id = request.worker_spawn.as_ref().map_or_else(
         || uuid::Uuid::new_v4().to_string(),
         |ticket| ticket.launch_id.clone(),
@@ -1575,6 +1602,76 @@ fn unique_session_name(base: String, exists: impl Fn(&str) -> bool) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn claude_workers_receive_messages_without_changing_execution_permissions() {
+        use muxa::collaboration::LaunchPurpose;
+        let mut options = vec!["--model".into(), "sonnet".into()];
+        super::configure_worker_inbound(
+            super::AgentProgram::Claude,
+            LaunchPurpose::Worker,
+            &mut options,
+        );
+        let launch = super::AgentProgram::Claude.permission_launch(&options, None, false);
+        assert_eq!(
+            &launch.args[..2],
+            &["--settings", r#"{"crossSessionInbound":"accept"}"#]
+        );
+        assert!(!launch
+            .args
+            .iter()
+            .any(|arg| arg == "--dangerously-skip-permissions"));
+        let once = options.clone();
+        super::configure_worker_inbound(
+            super::AgentProgram::Claude,
+            LaunchPurpose::Worker,
+            &mut options,
+        );
+        assert_eq!(
+            options, once,
+            "reconciliation must not stack settings arguments"
+        );
+        for (agent, purpose) in [
+            (super::AgentProgram::Claude, LaunchPurpose::Primary),
+            (super::AgentProgram::Codex, LaunchPurpose::Worker),
+        ] {
+            let mut untouched = vec!["--model".into(), "test".into()];
+            let before = untouched.clone();
+            super::configure_worker_inbound(agent, purpose, &mut untouched);
+            assert_eq!(untouched, before);
+        }
+    }
+
+    #[test]
+    fn claude_worker_keeps_explicit_inbound_settings_and_flag_boundaries() {
+        use muxa::collaboration::LaunchPurpose;
+        for mut options in [
+            vec![
+                "--settings".into(),
+                r#"{"crossSessionInbound":"hold"}"#.into(),
+            ],
+            vec!["--settings=/operator/settings.json".into()],
+        ] {
+            let before = options.clone();
+            super::configure_worker_inbound(
+                super::AgentProgram::Claude,
+                LaunchPurpose::Worker,
+                &mut options,
+            );
+            assert_eq!(options, before);
+        }
+        let mut options = vec!["--".into(), "--settings is prompt text".into()];
+        super::configure_worker_inbound(
+            super::AgentProgram::Claude,
+            LaunchPurpose::Worker,
+            &mut options,
+        );
+        assert_eq!(
+            &options[..2],
+            &["--settings", r#"{"crossSessionInbound":"accept"}"#]
+        );
+        assert_eq!(options[2], "--");
+    }
+
     /// A read that sees nothing (a listing that failed, a pane not shown
     /// yet) does not end the look; only the deadline does.
     #[test]

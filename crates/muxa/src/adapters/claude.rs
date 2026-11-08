@@ -82,6 +82,8 @@ pub fn idle_composer_from_capture(raw: &str) -> bool {
 
 pub struct ClaudeAdapter;
 
+pub const APPROVAL_NOTIFICATION_PREFIX: &str = "Claude approval required: ";
+
 #[derive(Debug, Deserialize)]
 pub struct Input {
     pub session_id: String,
@@ -192,13 +194,22 @@ impl HookAdapter for ClaudeAdapter {
             Event::Notification => {
                 let kind = input.notification_type.unwrap_or_default();
                 let level = match kind.as_str() {
-                    "permission_prompt" | "elicitation_dialog" => NotificationLevel::NeedsInput,
+                    "permission_prompt" | "cross_session_message_held" => {
+                        NotificationLevel::NeedsChoice
+                    }
+                    "elicitation_dialog" => NotificationLevel::NeedsInput,
                     _ => NotificationLevel::Info,
+                };
+                let message = input.message.unwrap_or(kind);
+                let message = if level == NotificationLevel::NeedsChoice {
+                    format!("{APPROVAL_NOTIFICATION_PREFIX}{message}")
+                } else {
+                    message
                 };
                 AgentEvent::NotificationFired {
                     id,
                     level,
-                    message: input.message.unwrap_or(kind),
+                    message,
                     at,
                 }
             }
@@ -589,8 +600,12 @@ mod tests {
     }
 
     #[test]
-    fn user_blocking_notifications_still_need_input() {
-        for notification_type in ["permission_prompt", "elicitation_dialog"] {
+    fn user_blocking_notifications_distinguish_approval_from_free_text() {
+        for (notification_type, expected) in [
+            ("permission_prompt", NotificationLevel::NeedsChoice),
+            ("cross_session_message_held", NotificationLevel::NeedsChoice),
+            ("elicitation_dialog", NotificationLevel::NeedsInput),
+        ] {
             let ev = ClaudeAdapter::normalize(
                 Event::Notification,
                 notification_input(notification_type),
@@ -598,7 +613,7 @@ mod tests {
             );
             match ev {
                 AgentEvent::NotificationFired { level, .. } => {
-                    assert_eq!(level, NotificationLevel::NeedsInput);
+                    assert_eq!(level, expected);
                 }
                 other => panic!("expected NotificationFired, got {other:?}"),
             }
