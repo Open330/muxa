@@ -64,11 +64,18 @@ struct FleetWork: Identifiable, Sendable {
         Array(Set(agents.map(\.host.alias))).sorted()
     }
 
-    /// The stage to name on a card: the first not yet done, else the last.
+    /// The stage to name on a card. Stages form a dependency graph, not a
+    /// line, so the one that needs the person wins, then one that is running,
+    /// then the first still waiting, else the last.
     var currentStageIndex: Int? {
         guard !stages.isEmpty else { return nil }
-        return stages.firstIndex { $0.state != .done } ?? stages.count - 1
+        return stages.firstIndex { $0.state == .needsYou }
+            ?? stages.firstIndex { $0.state == .running }
+            ?? stages.firstIndex { $0.state != .done }
+            ?? stages.count - 1
     }
+
+    var doneStageCount: Int { stages.filter { $0.state == .done }.count }
 }
 
 enum FleetBoard {
@@ -101,17 +108,28 @@ enum FleetBoard {
             .sorted { $0.agent.status(at: now).priority < $1.agent.status(at: now).priority }
             .first
         let active = group.participants.first { $0.agent.status(at: now) == .working }
-        let focus = attention ?? active ?? group.participants.first
-        let blockedAlias = group.pipelineRun?.aliases.values
-            .filter { $0.status == "blocked" || $0.status == "failed" }
-            .sorted { $0.alias < $1.alias }
+        // Keyed by the alias the desired agents use.
+        let blocked = group.pipelineRun?.aliases
+            .filter { $0.value.status == "blocked" || $0.value.status == "failed" }
+            .sorted { $0.key < $1.key }
             .first
+        let blockedAlias = blocked?.value
+        // A blocked stage opens its own agent; with no agent for it, the
+        // card offers Work Details rather than an unrelated branch's pane.
+        let focus: MuxaHostedAgent?
+        if let attention {
+            focus = attention
+        } else if let blockedAlias {
+            focus = group.participants.first { group.desiredAgent(for: $0)?.alias == blocked?.key }
+        } else {
+            focus = active ?? group.participants.first
+        }
         let headline: String
         if let attention {
             headline = question(for: attention.agent, now: now)
         } else if let blockedAlias {
             headline = blockedAlias.error.flatMap(firstLine)
-                ?? String(localized: "Stage \(blockedAlias.alias) is \(agentStateLabel(blockedAlias.status))")
+                ?? String(localized: "Stage \(blocked?.key ?? blockedAlias.alias) is \(agentStateLabel(blockedAlias.status))")
         } else if let focus {
             headline = statusLine(for: focus.agent, now: now)
         } else {
@@ -133,7 +151,7 @@ enum FleetBoard {
 
     static func stages(for group: MuxaWorkGroup, now: Date) -> [FleetWorkStage] {
         if let run = group.pipelineRun, !run.desired.isEmpty {
-            return run.desired.map { desired in
+            let planned = run.desired.map { desired in
                 let participant = group.participants.first { group.desiredAgent(for: $0)?.alias == desired.alias }
                 let state = stageState(
                     aliasStatus: run.aliases[desired.alias]?.status,
@@ -146,34 +164,42 @@ enum FleetBoard {
                     state: state
                 )
             }
+            // An agent stamped with the Work but outside the pipeline (an ad hoc
+            // peer or reviewer) is a stage of its own, so its question or its
+            // activity still decides the lane.
+            let extra = group.participants
+                .filter { group.desiredAgent(for: $0) == nil }
+                .map { adHocStage(for: $0, now: now) }
+            return planned + extra
         }
-        return group.participants.map { participant in
-            FleetWorkStage(
-                name: participant.pane?.agentRole.flatMap(nonEmpty)
-                    ?? participant.pane?.agentAlias.flatMap(nonEmpty)
-                    ?? kindName(participant.agent.kind),
-                owner: owner(participant),
-                state: stageState(aliasStatus: nil, agent: participant.agent, now: now)
-            )
-        }
+        return group.participants.map { adHocStage(for: $0, now: now) }
     }
 
+    private static func adHocStage(for participant: MuxaHostedAgent, now: Date) -> FleetWorkStage {
+        FleetWorkStage(
+            name: participant.pane?.agentRole.flatMap(nonEmpty)
+                ?? participant.pane?.agentAlias.flatMap(nonEmpty)
+                ?? kindName(participant.agent.kind),
+            owner: owner(participant),
+            state: stageState(aliasStatus: nil, agent: participant.agent, now: now)
+        )
+    }
+
+    /// The pipeline's durable gates outrank live activity: a blocked or
+    /// failed stage stays in front of the person even while its agent keeps
+    /// working, and a done stage is never demoted (the daemon does not demote
+    /// it either). Live state decides everything else.
     static func stageState(aliasStatus: String?, agent: MuxaAgent?, now: Date) -> FleetWorkStage.State {
-        if let agent {
-            let status = agent.status(at: now)
-            if status.needsAttention { return .needsYou }
-            switch status {
-            case .working, .limited: return .running
-            case .done: return .done
-            default: break
-            }
-        }
-        switch aliasStatus {
-        case "done": return .done
-        case "blocked", "failed": return .needsYou
-        case "running", "working", "starting": return .running
+        if aliasStatus == "blocked" || aliasStatus == "failed" { return .needsYou }
+        let status = agent?.status(at: now)
+        if status?.needsAttention == true { return .needsYou }
+        if aliasStatus == "done" { return .done }
+        switch status {
+        case .working, .limited: return .running
+        case .done: return .done
         default: break
         }
+        if aliasStatus == "running" || aliasStatus == "working" || aliasStatus == "starting" { return .running }
         // An idle agent finished its turn; a stage with no agent yet waits.
         if let agent, agent.state == "idle" { return .done }
         return .waiting

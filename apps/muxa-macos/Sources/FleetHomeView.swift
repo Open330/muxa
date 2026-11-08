@@ -93,7 +93,46 @@ struct FleetHomeView: View {
     private var board: some View {
         let works = works
         let selected = works.first { $0.id == selectedID }
-        return HStack(spacing: 0) {
+        return GeometryReader { geometry in
+            // Beside the board while all three lanes keep a readable width;
+            // over the board in a narrower window.
+            let floats = geometry.size.width < 1040
+            ZStack(alignment: .trailing) {
+                HStack(spacing: 0) {
+                    lanes(works)
+                    if let selected, !floats {
+                        Divider()
+                        inspector(selected)
+                            .frame(width: 400)
+                            .transition(.move(edge: .trailing))
+                    }
+                }
+                if let selected, floats {
+                    inspector(selected)
+                        .frame(width: min(400, geometry.size.width - 40))
+                        .background(.background)
+                        .overlay(alignment: .leading) { Divider() }
+                        .shadow(color: .black.opacity(0.18), radius: 14, x: -4)
+                        .transition(.move(edge: .trailing))
+                }
+            }
+        }
+        .animation(.easeOut(duration: 0.18), value: selected?.id)
+        .onExitCommand { selectedID = nil }
+    }
+
+    private func inspector(_ work: FleetWork) -> some View {
+        FleetWorkInspector(
+            work: work,
+            close: { selectedID = nil },
+            open: open,
+            openWork: { identity in model.select(.work(identity)) }
+        )
+    }
+
+    @ViewBuilder
+    private func lanes(_ works: [FleetWork]) -> some View {
+        Group {
             if works.isEmpty {
                 FleetEmptyBoard(
                     isConnected: model.isConnected,
@@ -115,20 +154,7 @@ struct FleetHomeView: View {
                 .padding(16)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
-            if let selected {
-                Divider()
-                FleetWorkInspector(
-                    work: selected,
-                    close: { selectedID = nil },
-                    open: open,
-                    openWork: { identity in model.select(.work(identity)) }
-                )
-                .frame(width: 400)
-                .transition(.move(edge: .trailing))
-            }
         }
-        .animation(.easeOut(duration: 0.18), value: selected?.id)
-        .onExitCommand { selectedID = nil }
     }
 
     /// An agent's pane when it has a live one, its agent editor otherwise.
@@ -301,7 +327,7 @@ private struct FleetStageBar: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                     if work.stages.count > 1 {
-                        Text("\(index + 1)/\(work.stages.count)")
+                        Text("\(work.doneStageCount)/\(work.stages.count)")
                             .monospacedDigit()
                     }
                 }

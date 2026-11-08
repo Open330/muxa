@@ -117,3 +117,61 @@ private func run(aliases: [String: String]) throws -> MuxaPipelineRun {
     #expect(FleetBoard.firstLine(String(repeating: "a", count: 200))?.count == 160)
     #expect(FleetBoard.repoName("/Users/me/src/muxa/") == "muxa")
 }
+
+private func group(_ aliases: [String: String], _ participants: [MuxaHostedAgent]) throws -> MuxaWorkGroup {
+    MuxaWorkGroup(
+        identity: MuxaWorkIdentity(workspaceID: "ws", workID: "fleet-home"),
+        pipelineRun: try run(aliases: aliases),
+        participants: participants
+    )
+}
+
+private func member(_ id: String, _ state: String, alias: String, pane paneID: String) throws -> MuxaHostedAgent {
+    MuxaHostedAgent(host: host, agent: try agent(["state": state], id: id), pane: try pane(paneID, alias: alias))
+}
+
+@Test func pipelineGatesOutrankLiveActivity() throws {
+    let working = try member("impl", "working", alias: "impl", pane: "%1")
+
+    let blocked = FleetBoard.work(for: try group(["impl": "blocked"], [working]), now: .now)
+    #expect(blocked.lane == .needsYou)
+    #expect(blocked.stages.map(\.state) == [.needsYou, .waiting])
+
+    let done = FleetBoard.work(for: try group(["impl": "done"], [working]), now: .now)
+    #expect(done.stages.map(\.state) == [.done, .waiting])
+}
+
+@Test func agentsOutsideThePipelineStillDecideTheLane() throws {
+    let asking = try member("peer", "waiting_input", alias: "helper", pane: "%9")
+    let needsYou = FleetBoard.work(for: try group(["impl": "done", "review": "done"], [asking]), now: .now)
+    #expect(needsYou.lane == .needsYou)
+    #expect(needsYou.stages.count == 3)
+    #expect(needsYou.stages[2].name == "helper")
+    #expect(needsYou.focus?.id == asking.id)
+
+    let busy = try member("peer", "working", alias: "helper", pane: "%9")
+    let running = FleetBoard.work(for: try group(["impl": "done", "review": "done"], [busy]), now: .now)
+    #expect(running.lane == .running)
+    #expect(running.currentStageIndex == 2)
+}
+
+@Test func aBlockedStageFocusesItsOwnAgent() throws {
+    let impl = try member("impl", "working", alias: "impl", pane: "%1")
+    let review = try member("review", "idle", alias: "review", pane: "%2")
+
+    let withAgent = FleetBoard.work(for: try group(["review": "blocked"], [impl, review]), now: .now)
+    #expect(withAgent.lane == .needsYou)
+    #expect(withAgent.focus?.id == review.id)
+
+    let withoutAgent = FleetBoard.work(for: try group(["review": "failed"], [impl]), now: .now)
+    #expect(withoutAgent.lane == .needsYou)
+    #expect(withoutAgent.focus?.id == nil)
+}
+
+@Test func theCurrentStageIsTheOneRunningNotTheFirstPending() throws {
+    let review = try member("review", "working", alias: "review", pane: "%2")
+    let work = FleetBoard.work(for: try group([:], [review]), now: .now)
+    #expect(work.stages.map(\.state) == [.waiting, .running])
+    #expect(work.currentStageIndex == 1)
+    #expect(work.doneStageCount == 0)
+}
