@@ -27,6 +27,7 @@ enum MuxaAppearance: String, CaseIterable, Identifiable {
 
 enum MuxaSettingsTab: String, CaseIterable, Identifiable {
     case general
+    case menuBar
     case providers
     case automations
     case behaviour
@@ -44,12 +45,24 @@ enum MuxaPreferences {
     static let showWorkbenchOnLaunchKey = "muxa.showWorkbenchOnLaunch"
     static let settingsTabKey = "muxa.settings.selectedTab"
     static let workDirectoryKey = "nativeWorkDirectory"
+    static let menuBarAgentLimitKey = "muxa.menuBar.maximumAgentIcons"
+    static let defaultMenuBarAgentLimit = 3
+    static let menuBarGroupingKey = "muxa.menuBar.grouping"
+    static let menuBarAasChipKey = "muxa.menuBar.showAasUsage"
+
+    static func menuBarAgentLimit(_ defaults: UserDefaults = .standard) -> Int {
+        let stored = (defaults.object(forKey: menuBarAgentLimitKey) as? NSNumber)?.intValue ?? defaultMenuBarAgentLimit
+        return min(8, max(0, stored))
+    }
 
     static func registerDefaults(_ defaults: UserDefaults = .standard) {
         defaults.register(defaults: [
             appearanceKey: MuxaAppearance.system.rawValue,
             showWorkbenchOnLaunchKey: true,
             settingsTabKey: MuxaSettingsTab.general.rawValue,
+            menuBarAgentLimitKey: defaultMenuBarAgentLimit,
+            menuBarGroupingKey: MuxaMenuBarGrouping.agent.rawValue,
+            menuBarAasChipKey: true,
         ])
     }
 }
@@ -63,6 +76,10 @@ struct MuxaSettingsView: View {
             MuxaGeneralSettingsView()
                 .tabItem { Label("General", systemImage: "gearshape") }
                 .tag(MuxaSettingsTab.general.rawValue)
+
+            MuxaMenuBarSettingsView()
+                .tabItem { Label("Menu Bar", systemImage: "menubar.rectangle") }
+                .tag(MuxaSettingsTab.menuBar.rawValue)
 
             AskProvidersSettingsPane(model: model, store: AskProviderStore.shared)
                 .tabItem { Label("Providers", systemImage: "brain.head.profile") }
@@ -101,6 +118,61 @@ struct MuxaSettingsView: View {
                 .tag(MuxaSettingsTab.advanced.rawValue)
         }
         .frame(width: 760, height: 640)
+    }
+}
+
+/// Works in the AppKit-hosted popover too: invoke the Settings scene's own
+/// menu command rather than depending on a SwiftUI scene environment.
+struct MuxaSettingsShortcut: View {
+    let tab: MuxaSettingsTab
+    let title: LocalizedStringKey
+
+    var body: some View {
+        Button {
+            MuxaSettingsOpener.select(tab)
+            MuxaSettingsOpener.openLegacySettingsWindow()
+        } label: { Label(title, systemImage: "gearshape") }
+    }
+}
+
+private struct MuxaMenuBarSettingsView: View {
+    @AppStorage(MuxaPreferences.menuBarAgentLimitKey) private var menuBarAgentLimit = MuxaPreferences.defaultMenuBarAgentLimit
+    @AppStorage(MuxaPreferences.menuBarGroupingKey) private var menuBarGrouping = MuxaMenuBarGrouping.agent.rawValue
+    @AppStorage(MuxaPreferences.menuBarAasChipKey) private var showAasChip = true
+    @ObservedObject private var registry = MuxaModuleRegistry.shared
+
+    var body: some View {
+        Form {
+            Section("Menu Bar") {
+                Picker("Group activity", selection: $menuBarGrouping) {
+                    ForEach(MuxaMenuBarGrouping.allCases) { grouping in Text(grouping.title).tag(grouping.rawValue) }
+                }
+                Picker("Maximum activity icons", selection: $menuBarAgentLimit) {
+                    Text("Hide activity icons").tag(0)
+                    ForEach(1...8, id: \.self) { count in
+                        Text(verbatim: String(count)).tag(count)
+                    }
+                }
+                Text("Additional activity stays in the +N list. Reviewed agents are hidden until new activity arrives.")
+                    .font(MuxaType.detail).foregroundStyle(.secondary)
+                Text("AAS appears as a hoverable usage chip when its module is enabled.")
+                    .font(MuxaType.detail).foregroundStyle(.secondary)
+            }
+
+            Section("Accounts and usage") {
+                Toggle("Show AAS usage chip", isOn: $showAasChip)
+                Text("Hover to see active account usage. Click to compare all accounts.")
+                    .font(MuxaType.detail).foregroundStyle(.secondary)
+                if !registry.isEnabled("aas") {
+                    Button("Enable AAS module") { registry.setEnabled("aas", true) }
+                } else if let module = registry.module(AasModule.self), !module.availability.isAvailable {
+                    Text(verbatim: module.availability.summary).font(MuxaType.detail).foregroundStyle(.secondary)
+                }
+                MuxaSettingsShortcut(tab: .modules, title: "Open Accounts settings")
+            }
+        }
+        .formStyle(.grouped)
+        .padding(.top, 8)
     }
 }
 

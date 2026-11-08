@@ -415,18 +415,28 @@ final class AasModule: MuxaModule {
     /// The first successful probe loads the cached accounts; later probes —
     /// the pane runs one on every appearance — leave them alone.
     private var hasLoadedAccounts = false
+    private var probeRevision = 0
 
     func probe() async {
+        probeRevision &+= 1
+        let revision = probeRevision
         let result: Result<MuxaModuleProcess.Output, any Error>
         do {
             result = .success(try await MuxaModuleProcess.run("aas", ["--version"], timeout: 10))
         } catch {
             result = .failure(error)
         }
+        guard revision == probeRevision else { return }
         availability = Self.availability(from: result)
         guard availability.isAvailable, !hasLoadedAccounts else { return }
         hasLoadedAccounts = true
         await store.refresh()
+    }
+
+    func shutdown() {
+        // An outstanding availability probe must not recreate a disabled item.
+        probeRevision &+= 1
+        hasLoadedAccounts = false
     }
 
     /// What `aas --version` says about whether the module can work. Split out

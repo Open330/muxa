@@ -36,8 +36,12 @@ final class MuxaModuleRegistry: ObservableObject {
     func setEnabled(_ id: String, _ enabled: Bool) {
         defaults.set(enabled, forKey: Self.enabledKey(id))
         objectWillChange.send()
-        guard enabled, let module = module(id: id) else { return }
-        Task { await probe(module) }
+        guard let module = module(id: id) else { return }
+        guard enabled else { module.shutdown(); return }
+        Task {
+            guard self.isEnabled(id) else { return }
+            await probe(module)
+        }
     }
 
     func module(id: String) -> (any MuxaModule)? {
@@ -57,6 +61,7 @@ final class MuxaModuleRegistry: ObservableObject {
 
     func probeEnabled() async {
         for module in enabledModules {
+            guard isEnabled(module.id) else { continue }
             await probe(module)
         }
     }

@@ -578,9 +578,26 @@ enum MuxaSettingsOpener {
         defaults.set(tab.rawValue, forKey: MuxaPreferences.settingsTabKey)
     }
 
-    /// macOS 13 path: the responder-chain selector the Settings scene answers.
+    /// Invoke the Settings scene's own command, including on modern macOS
+    /// where the old responder-chain selectors no longer open that scene.
+    @MainActor
+    static func settingsCommand(in menu: NSMenu) -> (NSMenu, Int)? {
+        for (index, item) in menu.items.enumerated() {
+            if item.keyEquivalent == ",", item.keyEquivalentModifierMask == .command, item.isEnabled {
+                return (menu, index)
+            }
+            if let submenu = item.submenu, let result = settingsCommand(in: submenu) { return result }
+        }
+        return nil
+    }
+
     @MainActor
     static func openLegacySettingsWindow() {
+        if let menu = NSApp.mainMenu, let (submenu, index) = settingsCommand(in: menu) {
+            submenu.performActionForItem(at: index)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
         let opened = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
         if !opened {
             NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)

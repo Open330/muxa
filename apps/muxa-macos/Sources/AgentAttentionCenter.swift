@@ -278,6 +278,13 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         markSeen([pane])
     }
 
+    /// A visible menu card names a session, not just a reusable pane id.
+    /// Never wait for or mark a replacement agent as seen after a slow send.
+    func markRead(_ pane: MuxaWatchPaneIdentity, agentSessionID: String) {
+        guard snapshot.watchPane(id: pane)?.agent?.agentSessionID == agentSessionID else { return }
+        markSeen([pane])
+    }
+
     /// Reply… on a notification types `text` into the agent's pane as a
     /// prompt. A reply that cannot be delivered comes back as a notification
     /// carrying the text, so nothing the operator typed is dropped silently.
@@ -318,7 +325,7 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         }
     }
 
-    private func postReplyFailure(_ text: String, to pane: MuxaWatchPaneIdentity, reason: String) {
+    func postReplyFailure(_ text: String, to pane: MuxaWatchPaneIdentity, reason: String) {
         poster?.post(MuxaAgentNotification(
             identifier: "reply:\(Self.key(pane))",
             title: String(localized: "Your reply was not sent"),
