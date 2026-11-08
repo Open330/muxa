@@ -13,8 +13,14 @@ struct FleetHomeView: View {
     @State private var page: Page = .board
     @State private var selectedID: String?
     @State private var showsHosts = false
+    @State private var assignment = ""
+    @State private var reviewed = FleetReviewMarks(defaults: .standard)
+    @State private var showsReviewed = false
+    /// Reply drafts per unit, kept while the inspector closes or the unit's
+    /// focus changes, each bound to the question it was written for.
+    @State private var drafts: [String: FleetReplyDraft] = [:]
 
-    private var works: [FleetWork] {
+    private var allWorks: [FleetWork] {
         FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
     }
 
@@ -23,7 +29,9 @@ struct FleetHomeView: View {
             header
             Divider()
             switch page {
-            case .board: board
+            case .board:
+                assignBar
+                board
             case .templates: WorkCommandCenterView(model: model, pipelinesOnly: true)
             }
         }
@@ -45,13 +53,6 @@ struct FleetHomeView: View {
             .fixedSize()
             Spacer(minLength: 8)
             hostsButton
-            Button {
-                model.presentNewAgent()
-            } label: {
-                Label("New Agent", systemImage: "plus")
-            }
-            .buttonStyle(.muxaSecondary)
-            .disabled(!model.isConnected)
             Button {
                 model.presentWorkStart()
             } label: {
@@ -88,18 +89,50 @@ struct FleetHomeView: View {
         }
     }
 
+    // MARK: - Assign
+
+    /// Always there: say what to do, then pick who does it in the sheet.
+    private var assignBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "text.bubble")
+                .foregroundStyle(.secondary)
+            TextField("What should an agent do?", text: $assignment, axis: .vertical)
+                .textFieldStyle(.plain)
+                .lineLimit(1...4)
+                .onSubmit(assign)
+            Button("Assign", action: assign)
+                .buttonStyle(.muxaPrimary)
+                .disabled(!model.isConnected || assignment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .help("Choose the host, folder and agent, then start it with this task")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 9)
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+        .padding(.horizontal, 16)
+        .padding(.top, 14)
+    }
+
+    private func assign() {
+        let task = assignment.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard model.isConnected, !task.isEmpty else { return }
+        model.presentNewAgent(prompt: task)
+        assignment = ""
+    }
+
     // MARK: - Board
 
     private var board: some View {
-        let works = works
-        let selected = works.first { $0.id == selectedID }
+        let all = allWorks
+        let works = all.filter { showsReviewed || !reviewed.hides($0) }
+        let hiddenCount = all.filter { reviewed.hides($0) }.count
+        let selected = all.first { $0.id == selectedID }
         return GeometryReader { geometry in
             // Beside the board while all three lanes keep a readable width;
             // over the board in a narrower window.
             let floats = geometry.size.width < 1040
             ZStack(alignment: .trailing) {
                 HStack(spacing: 0) {
-                    lanes(works)
+                    lanes(works, reviewedCount: hiddenCount)
                     if let selected, !floats {
                         Divider()
                         inspector(selected)
@@ -119,21 +152,71 @@ struct FleetHomeView: View {
         }
         .animation(.easeOut(duration: 0.18), value: selected?.id)
         .onExitCommand { selectedID = nil }
+        .onChange(of: all.map(\.id)) { ids in
+            // Only a live board says a unit is gone; a disconnect is not.
+            guard model.isConnected, !ids.isEmpty else { return }
+            var pruned = reviewed
+            pruned.prune(keeping: Set(ids))
+            if pruned != reviewed { reviewed = pruned; reviewed.save(to: .standard) }
+        }
     }
 
     private func inspector(_ work: FleetWork) -> some View {
         FleetWorkInspector(
             work: work,
+            isReviewed: reviewed.hides(work),
             close: { selectedID = nil },
             open: open,
-            openWork: { identity in model.select(.work(identity)) }
+            openWork: { identity in model.select(.work(identity)) },
+            draft: Binding(
+                get: { drafts[work.id] ?? FleetReplyDraft() },
+                set: { drafts[work.id] = $0.isIdle ? nil : $0 }
+            ),
+            submit: { submit(for: work.id) },
+            markReviewed: {
+                reviewed.markReviewed(work)
+                reviewed.save(to: .standard)
+                selectedID = nil
+            }
         )
+        .id(work.id)
+    }
+
+    /// Sends a unit's draft. The board owns the send, so it outlives the
+    /// inspector and a second submission waits for the first to finish.
+    private func submit(for workID: String) {
+        guard var draft = drafts[workID], let submission = draft.begin() else { return }
+        drafts[workID] = draft
+        Task {
+            var failure: String?
+            do {
+                try await send(submission.text, to: submission.target)
+            } catch {
+                failure = error.localizedDescription
+            }
+            guard var current = drafts[workID] else { return }
+            current.finish(submission, error: failure)
+            drafts[workID] = current.isIdle ? nil : current
+        }
+    }
+
+    /// Types `text` into the agent the draft was written for, after checking
+    /// that the same session is still at its pane, at the same question.
+    private func send(_ text: String, to target: FleetReplyTarget) async throws {
+        guard let hosted = model.hostedAgents.first(where: { $0.id == target.agentID }),
+              let paneID = MuxaAgentAttentionCenter.paneIdentity(for: hosted),
+              let current = model.executionSnapshot.watchPane(id: paneID),
+              target.matches(current.agent) else {
+            throw MuxaIPCError.server(String(localized: "The agent moved on. Open its pane to see where it is."))
+        }
+        if let blocker = MuxaNotificationActions.replyBlocker(current) { throw MuxaIPCError.server(blocker) }
+        try await model.client.sendFleetPrompt(host: current.host, pane: current.pane, text: text)
     }
 
     @ViewBuilder
-    private func lanes(_ works: [FleetWork]) -> some View {
+    private func lanes(_ works: [FleetWork], reviewedCount: Int) -> some View {
         Group {
-            if works.isEmpty {
+            if FleetBoard.showsEmptyBoard(visible: works.count, reviewed: reviewedCount) {
                 FleetEmptyBoard(
                     isConnected: model.isConnected,
                     newAgent: { model.presentNewAgent() },
@@ -147,7 +230,9 @@ struct FleetHomeView: View {
                             works: works.filter { $0.lane == lane },
                             selectedID: selectedID,
                             select: { id in selectedID = selectedID == id ? nil : id },
-                            open: open
+                            open: open,
+                            reviewedCount: lane == .finished ? reviewedCount : 0,
+                            showsReviewed: $showsReviewed
                         )
                     }
                 }
@@ -176,6 +261,8 @@ private struct FleetLaneColumn: View {
     let selectedID: String?
     let select: (String) -> Void
     let open: (MuxaHostedAgent) -> Void
+    var reviewedCount = 0
+    @Binding var showsReviewed: Bool
 
     private var title: String {
         switch lane {
@@ -236,6 +323,14 @@ private struct FleetLaneColumn: View {
                             select: { select(work.id) },
                             open: open
                         )
+                    }
+                    if reviewedCount > 0 || (lane == .finished && showsReviewed) {
+                        Button(showsReviewed ? String(localized: "Hide reviewed") : String(localized: "Show \(reviewedCount) reviewed")) {
+                            showsReviewed.toggle()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .padding(.top, 2)
                     }
                 }
                 .padding(.horizontal, 8)
@@ -362,9 +457,21 @@ extension FleetWorkStage.State {
 
 private struct FleetWorkInspector: View {
     let work: FleetWork
+    let isReviewed: Bool
     let close: () -> Void
     let open: (MuxaHostedAgent) -> Void
     let openWork: (MuxaWorkIdentity) -> Void
+    @Binding var draft: FleetReplyDraft
+    let submit: () -> Void
+    let markReviewed: () -> Void
+
+    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
+
+    /// Text written for a question the unit has moved past.
+    private var isStale: Bool {
+        guard let target = draft.target, draft.hasText else { return false }
+        return target != currentTarget
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -444,14 +551,25 @@ private struct FleetWorkInspector: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
+            if currentTarget != nil || !draft.isIdle {
+                replyField
+            }
             HStack(spacing: 8) {
                 if let focus = work.focus {
-                    Button(work.lane == .needsYou ? "Answer in Pane" : "Open Pane") { open(focus) }
-                        .buttonStyle(.muxaPrimary)
+                    Button(paneButtonTitle) { open(focus) }
+                        .buttonStyle(FleetBoard.reply(for: work) == nil ? .muxaPrimary : .muxaSecondary)
                 }
                 if case .work(let identity) = work.source {
                     Button("Work Details") { openWork(identity) }
                         .buttonStyle(.muxaSecondary)
+                }
+                if work.lane == .finished && !isReviewed {
+                    Spacer(minLength: 0)
+                    Button(action: markReviewed) {
+                        Label("Looks Good", systemImage: "checkmark")
+                    }
+                    .buttonStyle(.muxaGhost)
+                    .help("Set this aside until it changes again")
                 }
             }
         }
@@ -459,6 +577,75 @@ private struct FleetWorkInspector: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(tint.opacity(0.1), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(tint.opacity(0.45)))
+    }
+
+    private var paneButtonTitle: String {
+        if FleetBoard.choosesInPane(work) { return String(localized: "Choose in Pane") }
+        if work.lane == .needsYou && FleetBoard.reply(for: work) == nil { return String(localized: "Answer in Pane") }
+        return String(localized: "Open Pane")
+    }
+
+    @ViewBuilder
+    private var replyField: some View {
+        let kind = (isStale ? nil : draft.target?.kind) ?? currentTarget?.kind ?? .answer
+        VStack(alignment: .leading, spacing: 6) {
+            if isStale, let target = draft.target {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Written for an earlier question from \(target.owner). It was not sent.", systemImage: "exclamationmark.triangle.fill")
+                        .font(MuxaType.meta)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 8) {
+                        if let current = currentTarget {
+                            Button(String(localized: "Use for \(current.owner)")) {
+                                draft.retarget(current)
+                            }
+                            .buttonStyle(.muxaSecondary)
+                            .controlSize(.small)
+                        }
+                        Button("Discard", role: .destructive) {
+                            draft.discard()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                    }
+                    .disabled(draft.isSending)
+                }
+            }
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField(
+                    kind == .answer ? String(localized: "Your answer") : String(localized: "Next instruction"),
+                    text: Binding(
+                        get: { draft.text },
+                        set: { draft.edit($0, current: currentTarget) }
+                    ),
+                    axis: .vertical
+                )
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(1...6)
+                .disabled(draft.isSending)
+                .onSubmit(send)
+                Button(kind == .answer ? String(localized: "Answer") : String(localized: "Send Back"), action: send)
+                    .buttonStyle(.muxaPrimary)
+                    .disabled(draft.isSending || isStale || draft.target == nil || !draft.hasText)
+            }
+            if draft.isSending {
+                ProgressView().controlSize(.small)
+            } else if let failure = draft.failure {
+                Label(failure, systemImage: "exclamationmark.circle.fill")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.red)
+            } else if draft.sent {
+                Label("Sent", systemImage: "checkmark.circle.fill")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.green)
+            }
+        }
+    }
+
+    private func send() {
+        guard !isStale else { return }
+        submit()
     }
 
     private var laneTitle: String {
@@ -581,3 +768,4 @@ private struct FleetEmptyBoard: View {
         .padding(32)
     }
 }
+

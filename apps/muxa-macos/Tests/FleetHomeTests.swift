@@ -186,3 +186,154 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     #expect(FleetBoard.stageState(aliasStatus: "blocked", status: .working, agentState: "working") == .needsYou)
     #expect(FleetBoard.stageState(aliasStatus: nil, status: covered, agentState: "error") == .running)
 }
+
+@Test func onlyAnAgentAtItsPromptTakesTypedText() throws {
+    func solo(_ state: String, withPane: Bool = true) throws -> FleetWork {
+        let hosted = MuxaHostedAgent(
+            host: host,
+            agent: try agent(["state": state], id: state),
+            pane: withPane ? try pane("%1", alias: "a") : nil
+        )
+        return FleetBoard.work(for: hosted, now: .now)
+    }
+    #expect(FleetBoard.reply(for: try solo("waiting_input")) == .answer)
+    #expect(FleetBoard.reply(for: try solo("idle")) == .sendBack)
+    #expect(FleetBoard.reply(for: try solo("waiting_choice")) == nil)
+    #expect(FleetBoard.choosesInPane(try solo("waiting_choice")))
+    #expect(FleetBoard.reply(for: try solo("working")) == nil)
+    #expect(FleetBoard.reply(for: try solo("error")) == nil)
+    #expect(FleetBoard.reply(for: try solo("waiting_input", withPane: false)) == nil)
+}
+
+@Test func reviewedWorkReturnsWhenItChanges() throws {
+    func finished(at time: String) throws -> FleetWork {
+        let hosted = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "state_entered_at": time], id: "a"), pane: nil)
+        return FleetBoard.work(for: hosted, now: .now)
+    }
+    let first = try finished(at: "2026-11-08T01:00:00Z")
+    var marks = FleetReviewMarks()
+    marks.markReviewed(first)
+    #expect(marks.hides(first))
+    #expect(!marks.hides(try finished(at: "2026-11-08T02:00:00Z")))
+
+    let working = FleetBoard.work(
+        for: MuxaHostedAgent(host: host, agent: try agent(["state_entered_at": "2026-11-08T01:00:00Z"], id: "a"), pane: nil),
+        now: .now
+    )
+    #expect(!marks.hides(working))
+
+    marks.prune(keeping: [])
+    #expect(!marks.hides(first))
+
+    let defaults = try #require(UserDefaults(suiteName: "fleet-home-tests-\(UUID().uuidString)"))
+    marks.markReviewed(first)
+    marks.save(to: defaults)
+    #expect(FleetReviewMarks(defaults: defaults) == marks)
+}
+
+@Test func aReplyTargetIsOneSessionAtOneQuestion() throws {
+    let asking = MuxaHostedAgent(
+        host: host,
+        agent: try agent(["state": "waiting_input", "state_entered_at": "2026-11-08T01:00:00Z"], id: "a"),
+        pane: try pane("%1", alias: "a")
+    )
+    let target = try #require(FleetBoard.replyTarget(for: FleetBoard.work(for: asking, now: .now)))
+    #expect(target.kind == .answer)
+    #expect(target.matches(asking.agent))
+    #expect(!target.matches(try agent(["state": "waiting_input", "state_entered_at": "2026-11-08T02:00:00Z"], id: "a")),
+            "the same agent's next question")
+    #expect(!target.matches(try agent(["state": "waiting_input", "state_entered_at": "2026-11-08T01:00:00Z"], id: "b")),
+            "a replacement session")
+    #expect(!target.matches(try agent(["state": "working", "state_entered_at": "2026-11-08T01:00:00Z"], id: "a")))
+    #expect(!target.matches(nil))
+}
+
+@Test func aReviewMarkCoversOneRevisionOfTheWholeWork() throws {
+    func idle(_ id: String, _ at: String, alias: String, pane paneID: String) throws -> MuxaHostedAgent {
+        MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "state_entered_at": at], id: id), pane: try pane(paneID, alias: alias))
+    }
+    func work(_ participants: [MuxaHostedAgent]) -> FleetWork {
+        FleetBoard.work(for: MuxaWorkGroup(
+            identity: MuxaWorkIdentity(workspaceID: "ws", workID: "w"),
+            pipelineRun: nil,
+            participants: participants
+        ), now: .now)
+    }
+    let a = try idle("a", "2026-11-08T01:00:00Z", alias: "x", pane: "%1")
+    let before = work([a, try idle("b", "2026-11-08T01:00:00Z", alias: "y", pane: "%2")])
+    var marks = FleetReviewMarks()
+    marks.markReviewed(before)
+    #expect(marks.hides(before))
+
+    // B ran another turn and is idle again; A, the focus, did not change.
+    let after = work([a, try idle("b", "2026-11-08T03:00:00Z", alias: "y", pane: "%2")])
+    #expect(after.since == before.since)
+    #expect(!marks.hides(after))
+
+    let firstRun = FleetBoard.work(for: try group(["impl": "done", "review": "done"], []), now: .now)
+    marks.markReviewed(firstRun)
+    let rerun = try JSONDecoder().decode(MuxaPipelineRun.self, from: JSONSerialization.data(withJSONObject: [
+        "identity": ["workspace_id": "ws", "work_id": "fleet-home"], "pipeline": "implement-review",
+        "desired": [["alias": "impl", "program": "claude"]], "cwd": "/x", "generation": 2,
+        "aliases": ["impl": ["alias": "impl", "status": "done", "generation": 2]],
+    ] as [String: Any]))
+    let secondRun = FleetBoard.work(for: MuxaWorkGroup(identity: MuxaWorkIdentity(workspaceID: "ws", workID: "fleet-home"), pipelineRun: rerun, participants: []), now: .now)
+    #expect(secondRun.lane == .finished)
+    #expect(!marks.hides(secondRun))
+}
+
+@Test func aBoardOfOnlyReviewedUnitsKeepsItsLanes() {
+    #expect(FleetBoard.showsEmptyBoard(visible: 0, reviewed: 0))
+    #expect(!FleetBoard.showsEmptyBoard(visible: 0, reviewed: 1))
+    #expect(!FleetBoard.showsEmptyBoard(visible: 2, reviewed: 0))
+}
+
+@Test func aDraftSendsOnceAndClearsOnlyWhatItSent() throws {
+    func target(_ id: String) throws -> FleetReplyTarget {
+        FleetReplyTarget(kind: .answer, agent: MuxaHostedAgent(
+            host: host, agent: try agent(["state": "waiting_input"], id: id), pane: try pane("%1", alias: "a")
+        ))
+    }
+    let a = try target("a")
+    let b = try target("b")
+    var draft = FleetReplyDraft()
+    draft.edit("yes", current: a)
+    #expect(draft.target == a)
+
+    // A pending send survives the inspector closing; reopening cannot send again
+    // or change the text or recipient until it finishes.
+    let startedsubmission = draft.begin()
+    let submission = try #require(startedsubmission)
+    #expect(draft.begin() == nil)
+    draft.edit("other", current: b)
+    draft.retarget(b)
+    draft.discard()
+    #expect(draft.text == "yes" && draft.target == a && draft.isSending)
+
+    draft.finish(submission, error: nil)
+    #expect(!draft.hasText && draft.target == nil && draft.sent && !draft.isSending)
+
+    // A stale completion is ignored.
+    draft.finish(submission, error: "late")
+    #expect(draft.failure == nil)
+}
+
+@Test func aFailedSendKeepsTheTextAndAnEditAfterwardsWins() throws {
+    let a = FleetReplyTarget(kind: .answer, agent: MuxaHostedAgent(
+        host: host, agent: try agent(["state": "waiting_input"], id: "a"), pane: try pane("%1", alias: "a")
+    ))
+    var draft = FleetReplyDraft()
+    draft.edit("yes", current: a)
+    let startedfirst = draft.begin()
+    let first = try #require(startedfirst)
+    draft.finish(first, error: "Not connected")
+    #expect(draft.text == "yes" && draft.failure == "Not connected" && !draft.isIdle)
+
+    let startedsecond = draft.begin()
+    let second = try #require(startedsecond)
+    #expect(draft.failure == nil)
+    draft.finish(second, error: nil)
+    #expect(draft.text.isEmpty && draft.sent)
+    draft.edit("", current: a)
+    #expect(draft.isIdle)
+}
