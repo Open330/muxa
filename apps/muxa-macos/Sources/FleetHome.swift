@@ -385,6 +385,87 @@ extension FleetBoard {
     }
 }
 
+/// Text for one unit's agent, the question it answers, and the send in
+/// flight for it. Owned by the board, not by an inspector, so closing and
+/// reopening the inspector never forgets a pending send or allows a
+/// second one.
+struct FleetReplyDraft: Equatable, Sendable {
+    struct Submission: Equatable, Sendable {
+        let id: UUID
+        let text: String
+        let target: FleetReplyTarget
+        let version: Int
+    }
+
+    private(set) var text = ""
+    private(set) var target: FleetReplyTarget?
+    /// Bumped by every edit, so a finished send clears only what it sent.
+    private(set) var version = 0
+    private(set) var pending: Submission?
+    private(set) var failure: String?
+    private(set) var sent = false
+
+    var isSending: Bool { pending != nil }
+    var hasText: Bool { !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    /// Nothing to keep: no text, no send, no result to show.
+    var isIdle: Bool { !hasText && pending == nil && failure == nil && !sent }
+
+    /// The draft belongs to the question on screen when typing starts.
+    mutating func edit(_ newText: String, current: FleetReplyTarget?) {
+        guard pending == nil else { return }
+        text = newText
+        if !hasText { target = nil } else if target == nil { target = current }
+        version += 1
+        sent = false
+    }
+
+    mutating func retarget(_ newTarget: FleetReplyTarget) {
+        guard pending == nil else { return }
+        target = newTarget
+        failure = nil
+        version += 1
+    }
+
+    mutating func discard() {
+        guard pending == nil else { return }
+        self = FleetReplyDraft(version: version + 1)
+    }
+
+    private init(version: Int) { self.version = version }
+    init() {}
+
+    /// Starts a send unless one is already in flight.
+    mutating func begin() -> Submission? {
+        guard pending == nil, hasText, let target else { return nil }
+        let submission = Submission(
+            id: UUID(),
+            text: text.trimmingCharacters(in: .whitespacesAndNewlines),
+            target: target,
+            version: version
+        )
+        pending = submission
+        failure = nil
+        sent = false
+        return submission
+    }
+
+    /// Ends the send `submission` started; a stale completion is ignored.
+    mutating func finish(_ submission: Submission, error: String?) {
+        guard pending?.id == submission.id else { return }
+        pending = nil
+        if let error {
+            failure = error
+            return
+        }
+        sent = true
+        if version == submission.version && target == submission.target {
+            text = ""
+            target = nil
+            version += 1
+        }
+    }
+}
+
 /// Finished units the person reviewed and set aside. A mark holds the
 /// unit's revision, so the unit returns as soon as any of its agents or its
 /// pipeline moves on.

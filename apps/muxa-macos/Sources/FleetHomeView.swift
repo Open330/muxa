@@ -170,9 +170,9 @@ struct FleetHomeView: View {
             openWork: { identity in model.select(.work(identity)) },
             draft: Binding(
                 get: { drafts[work.id] ?? FleetReplyDraft() },
-                set: { drafts[work.id] = $0.isEmpty ? nil : $0 }
+                set: { drafts[work.id] = $0.isIdle ? nil : $0 }
             ),
-            send: { text, target in try await send(text, to: target) },
+            submit: { submit(for: work.id) },
             markReviewed: {
                 reviewed.markReviewed(work)
                 reviewed.save(to: .standard)
@@ -180,6 +180,24 @@ struct FleetHomeView: View {
             }
         )
         .id(work.id)
+    }
+
+    /// Sends a unit's draft. The board owns the send, so it outlives the
+    /// inspector and a second submission waits for the first to finish.
+    private func submit(for workID: String) {
+        guard var draft = drafts[workID], let submission = draft.begin() else { return }
+        drafts[workID] = draft
+        Task {
+            var failure: String?
+            do {
+                try await send(submission.text, to: submission.target)
+            } catch {
+                failure = error.localizedDescription
+            }
+            guard var current = drafts[workID] else { return }
+            current.finish(submission, error: failure)
+            drafts[workID] = current.isIdle ? nil : current
+        }
     }
 
     /// Types `text` into the agent the draft was written for, after checking
@@ -444,18 +462,14 @@ private struct FleetWorkInspector: View {
     let open: (MuxaHostedAgent) -> Void
     let openWork: (MuxaWorkIdentity) -> Void
     @Binding var draft: FleetReplyDraft
-    let send: (String, FleetReplyTarget) async throws -> Void
+    let submit: () -> Void
     let markReviewed: () -> Void
-
-    @State private var sending = false
-    @State private var failure: String?
-    @State private var sent = false
 
     private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
 
     /// Text written for a question the unit has moved past.
     private var isStale: Bool {
-        guard let target = draft.target, !draft.isEmpty else { return false }
+        guard let target = draft.target, draft.hasText else { return false }
         return target != currentTarget
     }
 
@@ -537,7 +551,7 @@ private struct FleetWorkInspector: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
-            if currentTarget != nil || !draft.isEmpty {
+            if currentTarget != nil || !draft.isIdle {
                 replyField
             }
             HStack(spacing: 8) {
@@ -584,19 +598,18 @@ private struct FleetWorkInspector: View {
                     HStack(spacing: 8) {
                         if let current = currentTarget {
                             Button(String(localized: "Use for \(current.owner)")) {
-                                draft.target = current
-                                failure = nil
+                                draft.retarget(current)
                             }
                             .buttonStyle(.muxaSecondary)
                             .controlSize(.small)
                         }
                         Button("Discard", role: .destructive) {
-                            draft = FleetReplyDraft()
-                            failure = nil
+                            draft.discard()
                         }
                         .buttonStyle(.muxaGhost)
                         .controlSize(.small)
                     }
+                    .disabled(draft.isSending)
                 }
             }
             HStack(alignment: .bottom, spacing: 8) {
@@ -604,30 +617,25 @@ private struct FleetWorkInspector: View {
                     kind == .answer ? String(localized: "Your answer") : String(localized: "Next instruction"),
                     text: Binding(
                         get: { draft.text },
-                        set: { text in
-                            draft.text = text
-                            // The draft belongs to the question on screen when typing starts.
-                            if draft.target == nil || draft.isEmpty { draft.target = text.isEmpty ? nil : currentTarget }
-                            sent = false
-                        }
+                        set: { draft.edit($0, current: currentTarget) }
                     ),
                     axis: .vertical
                 )
                 .textFieldStyle(.roundedBorder)
                 .lineLimit(1...6)
-                .disabled(sending)
-                .onSubmit(submit)
-                Button(kind == .answer ? String(localized: "Answer") : String(localized: "Send Back"), action: submit)
+                .disabled(draft.isSending)
+                .onSubmit(send)
+                Button(kind == .answer ? String(localized: "Answer") : String(localized: "Send Back"), action: send)
                     .buttonStyle(.muxaPrimary)
-                    .disabled(sending || isStale || draft.target == nil || draft.isEmpty)
+                    .disabled(draft.isSending || isStale || draft.target == nil || !draft.hasText)
             }
-            if sending {
+            if draft.isSending {
                 ProgressView().controlSize(.small)
-            } else if let failure {
+            } else if let failure = draft.failure {
                 Label(failure, systemImage: "exclamationmark.circle.fill")
                     .font(MuxaType.meta)
                     .foregroundStyle(.red)
-            } else if sent {
+            } else if draft.sent {
                 Label("Sent", systemImage: "checkmark.circle.fill")
                     .font(MuxaType.meta)
                     .foregroundStyle(.green)
@@ -635,24 +643,9 @@ private struct FleetWorkInspector: View {
         }
     }
 
-    private func submit() {
-        let text = draft.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !sending, !isStale, !text.isEmpty, let target = draft.target else { return }
-        sending = true
-        failure = nil
-        sent = false
-        Task {
-            defer { sending = false }
-            do {
-                try await send(text, target)
-                // Clear only what was sent; a newer draft stays.
-                if draft.text.trimmingCharacters(in: .whitespacesAndNewlines) == text { draft = FleetReplyDraft() }
-                sent = true
-            } catch {
-                // Keep the text so nothing typed is lost.
-                failure = error.localizedDescription
-            }
-        }
+    private func send() {
+        guard !isStale else { return }
+        submit()
     }
 
     private var laneTitle: String {
@@ -776,10 +769,3 @@ private struct FleetEmptyBoard: View {
     }
 }
 
-/// Text for one unit's agent and the question it answers.
-struct FleetReplyDraft: Equatable {
-    var text = ""
-    var target: FleetReplyTarget?
-
-    var isEmpty: Bool { text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
-}

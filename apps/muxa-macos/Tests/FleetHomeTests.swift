@@ -287,3 +287,53 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     #expect(!FleetBoard.showsEmptyBoard(visible: 0, reviewed: 1))
     #expect(!FleetBoard.showsEmptyBoard(visible: 2, reviewed: 0))
 }
+
+@Test func aDraftSendsOnceAndClearsOnlyWhatItSent() throws {
+    func target(_ id: String) throws -> FleetReplyTarget {
+        FleetReplyTarget(kind: .answer, agent: MuxaHostedAgent(
+            host: host, agent: try agent(["state": "waiting_input"], id: id), pane: try pane("%1", alias: "a")
+        ))
+    }
+    let a = try target("a")
+    let b = try target("b")
+    var draft = FleetReplyDraft()
+    draft.edit("yes", current: a)
+    #expect(draft.target == a)
+
+    // A pending send survives the inspector closing; reopening cannot send again
+    // or change the text or recipient until it finishes.
+    let startedsubmission = draft.begin()
+    let submission = try #require(startedsubmission)
+    #expect(draft.begin() == nil)
+    draft.edit("other", current: b)
+    draft.retarget(b)
+    draft.discard()
+    #expect(draft.text == "yes" && draft.target == a && draft.isSending)
+
+    draft.finish(submission, error: nil)
+    #expect(!draft.hasText && draft.target == nil && draft.sent && !draft.isSending)
+
+    // A stale completion is ignored.
+    draft.finish(submission, error: "late")
+    #expect(draft.failure == nil)
+}
+
+@Test func aFailedSendKeepsTheTextAndAnEditAfterwardsWins() throws {
+    let a = FleetReplyTarget(kind: .answer, agent: MuxaHostedAgent(
+        host: host, agent: try agent(["state": "waiting_input"], id: "a"), pane: try pane("%1", alias: "a")
+    ))
+    var draft = FleetReplyDraft()
+    draft.edit("yes", current: a)
+    let startedfirst = draft.begin()
+    let first = try #require(startedfirst)
+    draft.finish(first, error: "Not connected")
+    #expect(draft.text == "yes" && draft.failure == "Not connected" && !draft.isIdle)
+
+    let startedsecond = draft.begin()
+    let second = try #require(startedsecond)
+    #expect(draft.failure == nil)
+    draft.finish(second, error: nil)
+    #expect(draft.text.isEmpty && draft.sent)
+    draft.edit("", current: a)
+    #expect(draft.isIdle)
+}
