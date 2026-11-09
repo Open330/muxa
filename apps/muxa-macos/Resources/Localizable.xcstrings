@@ -31,12 +31,22 @@
         }
       }
     },
-    "Always Approve This…" : {
+    "Always Approve This Command" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이런 요청은 항상 승인…"
+            "value" : "이 명령은 항상 승인"
+          }
+        }
+      }
+    },
+    "Always Approve This Command…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 명령은 항상 승인…"
           }
         }
       }
@@ -3238,16 +3248,6 @@
         }
       }
     },
-    "Approve Requests Like This" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이런 요청은 알아서 승인"
-          }
-        }
-      }
-    },
     "Argument (empty string allowed)" : {
       "localizations" : {
         "ko" : {
@@ -4423,6 +4423,26 @@
         }
       }
     },
+    "Command" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명령"
+          }
+        }
+      }
+    },
+    "Command on screen" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면의 명령"
+          }
+        }
+      }
+    },
     "Command Palette" : {
       "localizations" : {
         "ko" : {
@@ -5049,12 +5069,12 @@
         }
       }
     },
-    "Copy the part that should always be allowed, such as the command, into Request text." : {
+    "Copy the command into Command. Only a Codex or Claude Code shell command dialog can be approved; a Claude description line is not part of the command." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "항상 허용할 부분(예: 명령)을 요청 문구에 복사해 넣으세요."
+            "value" : "명령을 '명령' 칸에 복사해 넣으세요. Codex·Claude Code의 셸 명령 확인 창만 승인할 수 있고, Claude의 설명 줄은 명령에 포함되지 않습니다."
           }
         }
       }
@@ -5631,12 +5651,12 @@
         }
       }
     },
-    "Does not find the request on screen" : {
+    "Does not match the command on screen" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "화면의 요청과 맞지 않습니다"
+            "value" : "화면의 명령과 맞지 않습니다"
           }
         }
       }
@@ -6474,16 +6494,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "워크벤치 둘러보기"
-          }
-        }
-      }
-    },
-    "Finds the request on screen" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "화면의 요청과 맞습니다"
           }
         }
       }
@@ -8320,6 +8330,16 @@
         }
       }
     },
+    "Matches the command on screen" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면의 명령과 맞습니다"
+          }
+        }
+      }
+    },
     "Maximum judgment calls per hour: %u" : {
       "localizations" : {
         "ko" : {
@@ -9282,12 +9302,12 @@
         }
       }
     },
-    "No confirmation is on screen right now." : {
+    "No command confirmation is on screen right now." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "지금 화면에 확인 창이 없습니다."
+            "value" : "지금 화면에 명령 확인 창이 없습니다."
           }
         }
       }
@@ -10493,12 +10513,12 @@
         }
       }
     },
-    "Only requests you name here. Muxa presses the one-time Yes, never \"don't ask again\", and only on agents on this Mac." : {
+    "Only shell commands you name here, matched in full. Muxa presses the one-time Yes, never \"don't ask again\", and only on agents on this Mac." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "여기 적은 요청만 승인합니다. Muxa는 한 번만 허용하는 Yes만 누르고 \"다시 묻지 않기\"는 절대 누르지 않으며, 이 Mac의 에이전트에만 적용됩니다."
+            "value" : "여기 적은 셸 명령과 완전히 같을 때만 승인합니다. Muxa는 한 번만 허용하는 Yes만 누르고 \"다시 묻지 않기\"는 절대 누르지 않으며, 이 Mac의 에이전트에만 적용됩니다."
           }
         }
       }
@@ -12122,12 +12142,12 @@
         }
       }
     },
-    "Regular expression, e.g. ^npm (test|run lint)$" : {
+    "Regular expression for the whole command, e.g. npm (test|run lint)" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "정규식, 예: ^npm (test|run lint)$"
+            "value" : "명령 전체에 맞는 정규식, 예: npm (test|run lint)"
           }
         }
       }
@@ -12569,26 +12589,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "요청 화살표는 받는 쪽을 가리키고, 점선 답장은 보낸 쪽으로 돌아갑니다. 주황색 요청은 응답이 필요합니다."
-          }
-        }
-      }
-    },
-    "Request on screen" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "화면의 요청"
-          }
-        }
-      }
-    },
-    "Request text" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "요청 문구"
           }
         }
       }
@@ -17226,12 +17226,12 @@
         }
       }
     },
-    "When an agent on this Mac asks for permission and the request contains this text, Muxa presses the one-time Yes. Anything else still waits for you." : {
+    "When an agent on this Mac asks to run exactly this command, Muxa presses the one-time Yes. Any other command, or anything Muxa cannot read with certainty, still waits for you." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 Mac의 에이전트가 권한을 요청할 때 요청에 이 문구가 있으면 Muxa가 한 번만 허용하는 Yes를 누릅니다. 그 밖의 요청은 그대로 직접 확인해야 합니다."
+            "value" : "이 Mac의 에이전트가 정확히 이 명령을 실행하려 할 때 Muxa가 한 번만 허용하는 Yes를 누릅니다. 다른 명령이나 Muxa가 확실히 읽지 못한 요청은 그대로 직접 확인해야 합니다."
           }
         }
       }
@@ -17549,12 +17549,12 @@
         }
       }
     },
-    "Write a rule so Muxa approves requests like this one on its own" : {
+    "Write a rule so Muxa approves this command on its own" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이런 요청을 Muxa가 알아서 승인하도록 규칙을 만듭니다"
+            "value" : "이 명령을 Muxa가 알아서 승인하도록 규칙을 만듭니다"
           }
         }
       }

@@ -113,7 +113,7 @@ private struct FleetAutomationPopover: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Approve on its own")
                 .font(MuxaType.detail.weight(.semibold))
-            Text("Only requests you name here. Muxa presses the one-time Yes, never \"don't ask again\", and only on agents on this Mac.")
+            Text("Only shell commands you name here, matched in full. Muxa presses the one-time Yes, never \"don't ask again\", and only on agents on this Mac.")
                 .font(MuxaType.meta)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -239,7 +239,7 @@ struct FleetApprovalRuleSheet: View {
     @State private var isPattern = false
     @State private var agents: Set<String> = Set(FleetApprovalRules.supportedKinds)
     @State private var onlyThisWork = false
-    @State private var request: String?
+    @State private var request: [String]?
     @State private var loadingRequest = false
     @State private var saving = false
     @State private var error: String?
@@ -253,9 +253,9 @@ struct FleetApprovalRuleSheet: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Approve Requests Like This")
+            Text("Always Approve This Command")
                 .font(.title3.weight(.semibold))
-            Text("When an agent on this Mac asks for permission and the request contains this text, Muxa presses the one-time Yes. Anything else still waits for you.")
+            Text("When an agent on this Mac asks to run exactly this command, Muxa presses the one-time Yes. Any other command, or anything Muxa cannot read with certainty, still waits for you.")
                 .font(MuxaType.detail)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
@@ -265,9 +265,9 @@ struct FleetApprovalRuleSheet: View {
             }
 
             VStack(alignment: .leading, spacing: 6) {
-                Text("Request text")
+                Text("Command")
                     .font(MuxaType.detail.weight(.semibold))
-                TextField(isPattern ? "Regular expression, e.g. ^npm (test|run lint)$" : "e.g. npm test", text: $text)
+                TextField(isPattern ? "Regular expression for the whole command, e.g. npm (test|run lint)" : "e.g. npm test", text: $text)
                     .textFieldStyle(.roundedBorder)
                     .font(.system(size: 12, design: .monospaced))
                 Toggle("Regular expression", isOn: $isPattern)
@@ -278,9 +278,9 @@ struct FleetApprovalRuleSheet: View {
                         .font(MuxaType.meta)
                         .foregroundStyle(.red)
                 } else if let request, !trimmed.isEmpty {
-                    let found = FleetApprovalRules.matches(trimmed, isPattern: isPattern, request: request)
+                    let found = FleetApprovalRules.matches(trimmed, isPattern: isPattern, command: request)
                     Label(
-                        found ? String(localized: "Finds the request on screen") : String(localized: "Does not find the request on screen"),
+                        found ? String(localized: "Matches the command on screen") : String(localized: "Does not match the command on screen"),
                         systemImage: found ? "checkmark.circle.fill" : "xmark.circle"
                     )
                     .font(MuxaType.meta)
@@ -341,18 +341,18 @@ struct FleetApprovalRuleSheet: View {
 
     private var requestPreview: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Request on screen")
+            Text("Command on screen")
                 .font(MuxaType.detail.weight(.semibold))
             Group {
                 if loadingRequest {
                     ProgressView().controlSize(.small)
                 } else if let request {
-                    Text(request)
+                    Text(request.joined(separator: "\n"))
                         .font(.system(size: 11, design: .monospaced))
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
-                    Text("No confirmation is on screen right now.")
+                    Text("No command confirmation is on screen right now.")
                         .font(MuxaType.meta)
                         .foregroundStyle(.secondary)
                 }
@@ -360,7 +360,7 @@ struct FleetApprovalRuleSheet: View {
             .padding(10)
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 7, style: .continuous))
-            Text("Copy the part that should always be allowed, such as the command, into Request text.")
+            Text("Copy the command into Command. Only a Codex or Claude Code shell command dialog can be approved; a Claude description line is not part of the command.")
                 .font(MuxaType.meta)
                 .foregroundStyle(.tertiary)
         }
@@ -372,7 +372,7 @@ struct FleetApprovalRuleSheet: View {
         defer { loadingRequest = false }
         if let capture = try? await model.client.captureFleetPane(host: hosted.host, pane: pane),
            let screen = capture.screenText {
-            request = FleetApprovalRules.dialogText(from: screen)
+            request = FleetApprovalRules.commandPreview(from: screen)
         }
     }
 

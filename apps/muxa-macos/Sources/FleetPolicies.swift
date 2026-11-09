@@ -22,8 +22,8 @@ enum FleetApprovalRules {
         rule.action == .pressEnter && !(rule.screen ?? "").trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    /// An approval rule for requests whose dialog shows `text`, or matches
-    /// it as a regular expression. `work` narrows it to one Work.
+    /// An approval rule for the shell command `text` exactly, or every
+    /// command the regex matches in full. `work` narrows it to one Work.
     static func make(
         text: String,
         isPattern: Bool,
@@ -64,46 +64,57 @@ enum FleetApprovalRules {
     }
 
     /// Escapes the characters Rust's `regex::escape` escapes, so a literal
-    /// request matches itself and nothing else.
+    /// request matches itself and nothing else. Works on Unicode scalars,
+    /// not grapheme clusters: a `.` followed by a combining mark is still a
+    /// `.` to the daemon's regex and must be escaped.
     static func escape(_ text: String) -> String {
-        let meta: Set<Character> = ["\\", ".", "+", "*", "?", "(", ")", "|", "[", "]", "{", "}", "^", "$", "#", "&", "-", "~"]
-        var escaped = ""
-        for character in text {
-            if meta.contains(character) { escaped.append("\\") }
-            escaped.append(character)
+        let meta: Set<Unicode.Scalar> = ["\\", ".", "+", "*", "?", "(", ")", "|", "[", "]", "{", "}", "^", "$", "#", "&", "-", "~"]
+        var escaped = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars {
+            if meta.contains(scalar) { escaped.append("\\") }
+            escaped.append(scalar)
         }
-        return escaped
+        return String(escaped)
     }
 
-    /// The request a confirmation dialog on `screen` asks about, read the
-    /// way muxad reads it before Enter: the lines above the one selected
-    /// row, up to the dialog's top edge and at most 14 lines, box sides
-    /// removed. A preview for the rule sheet; muxad decides on its own copy.
-    static func dialogText(from screen: String) -> String? {
+    /// The command a confirmation dialog on `screen` asks to run, read the
+    /// way muxad reads it: exactly one Codex `Would you like to run the
+    /// following command?` heading with its single `$ …` line, or one Claude
+    /// `Bash command` heading with the lines before `Do you want to
+    /// proceed?`. A preview: the capture here has no styling, so a Claude
+    /// description still shows as a last line; muxad leaves it out.
+    static func commandPreview(from screen: String) -> [String]? {
         var lines = screen.components(separatedBy: .newlines)
         while let last = lines.last, last.trimmingCharacters(in: .whitespaces).isEmpty { lines.removeLast() }
         lines = Array(lines.suffix(30))
         let cursors = lines.indices.filter { isCursor(lines[$0]) }
         guard cursors.count == 1, let selected = cursors.first else { return nil }
-        var start = max(0, selected - 14)
-        for index in stride(from: selected - 1, through: start, by: -1) where isBoundary(lines[index]) {
-            start = index + 1
-            break
+        let start = max(0, selected - 14)
+        let headers = (start..<selected).filter { index in
+            let text = content(lines[index]).lowercased()
+            return text == "would you like to run the following command?" || text == "bash command"
         }
-        let text = lines[start..<selected]
-            .map { $0.trimmingCharacters(in: .whitespaces).trimmingCharacters(in: CharacterSet(charactersIn: "│|")).trimmingCharacters(in: .whitespaces) }
-            .filter { !$0.isEmpty }
-            .joined(separator: "\n")
-        return text.isEmpty ? nil : text
+        guard headers.count == 1, let header = headers.first else { return nil }
+        let body = (header + 1..<selected).map { content(lines[$0]) }.filter { !$0.isEmpty }
+        if content(lines[header]).lowercased() == "bash command" {
+            guard let question = body.firstIndex(where: { $0.lowercased() == "do you want to proceed?" }) else { return nil }
+            let command = Array(body[..<question])
+            return command.isEmpty ? nil : command
+        }
+        guard let first = body.first, first.hasPrefix("$ ") else { return nil }
+        return [String(first.dropFirst(2))]
     }
 
-    /// Whether `pattern` (a regex, or literal text) finds the request.
-    static func matches(_ text: String, isPattern: Bool, request: String) -> Bool {
+    /// Whether the text (literal, or a regex) matches one of the preview's
+    /// lines in full, as muxad matches the whole command.
+    static func matches(_ text: String, isPattern: Bool, command: [String]) -> Bool {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return false }
-        guard isPattern else { return request.contains(trimmed) }
-        guard let regex = try? NSRegularExpression(pattern: trimmed, options: [.anchorsMatchLines]) else { return false }
-        return regex.firstMatch(in: request, range: NSRange(request.startIndex..., in: request)) != nil
+        guard isPattern else { return command.contains(trimmed) }
+        guard let regex = try? NSRegularExpression(pattern: "\\A(?:\(trimmed))\\z") else { return false }
+        return command.contains { line in
+            regex.firstMatch(in: line, range: NSRange(line.startIndex..., in: line)) != nil
+        }
     }
 
     static func isValidPattern(_ text: String) -> Bool {
@@ -118,10 +129,10 @@ enum FleetApprovalRules {
         return after.isEmpty || after.first == " " || after.first == "\t"
     }
 
-    private static func isBoundary(_ line: String) -> Bool {
-        let trimmed = line.trimmingCharacters(in: .whitespaces)
-        if trimmed.hasPrefix("╭") || trimmed.hasPrefix("┌") { return true }
-        return trimmed.prefix(6).count == 6 && trimmed.prefix(6).allSatisfy { "─━═-".contains($0) }
+    private static func content(_ line: String) -> String {
+        line.trimmingCharacters(in: .whitespaces)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "│|"))
+            .trimmingCharacters(in: .whitespaces)
     }
 }
 

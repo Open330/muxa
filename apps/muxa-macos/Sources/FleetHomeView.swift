@@ -575,9 +575,9 @@ private struct FleetWorkInspector: View {
                         .buttonStyle(.muxaSecondary)
                 }
                 if FleetBoard.choosesInPane(work), work.focus.map({ FleetApprovalRules.supportedKinds.contains($0.agent.kind) }) == true {
-                    Button("Always Approve This…", action: approveLikeThis)
+                    Button("Always Approve This Command…", action: approveLikeThis)
                         .buttonStyle(.muxaGhost)
-                        .help("Write a rule so Muxa approves requests like this one on its own")
+                        .help("Write a rule so Muxa approves this command on its own")
                 }
                 if work.lane == .finished && !isReviewed {
                     Spacer(minLength: 0)

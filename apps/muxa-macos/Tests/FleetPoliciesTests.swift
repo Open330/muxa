@@ -44,24 +44,35 @@ import Testing
     #expect(prompt.wireObject["screen"] == nil, "only press_enter carries a screen pattern")
 }
 
-@Test func theDialogPreviewIsTheRequestAboveTheSelectedYes() {
+@Test func theCommandPreviewReadsOnlyAKnownCommandDialog() {
     let claude = """
     earlier: ran rm -rf build
     ╭──────────────────────────────╮
     │ Bash command                 │
     │   npm test                   │
+    │   Run the test suite         │
     │ Do you want to proceed?      │
     │ ❯ 1. Yes                     │
     │   2. No                      │
     ╰──────────────────────────────╯
     Enter to confirm · Esc to cancel
     """
-    let request = FleetApprovalRules.dialogText(from: claude)
-    #expect(request == "Bash command\nnpm test\nDo you want to proceed?")
-    #expect(FleetApprovalRules.matches("npm test", isPattern: false, request: request ?? ""))
-    #expect(!FleetApprovalRules.matches("rm -rf", isPattern: false, request: request ?? ""))
-    #expect(FleetApprovalRules.matches("^npm (test|run lint)$", isPattern: true, request: request ?? ""))
-    #expect(FleetApprovalRules.dialogText(from: "npm test\n› Ask anything\n› again") == nil)
+    let command = FleetApprovalRules.commandPreview(from: claude)
+    #expect(command == ["npm test", "Run the test suite"])
+    #expect(FleetApprovalRules.matches("npm test", isPattern: false, command: command ?? []))
+    #expect(!FleetApprovalRules.matches("npm", isPattern: false, command: command ?? []))
+    #expect(FleetApprovalRules.matches("npm (test|run lint)", isPattern: true, command: command ?? []))
+    #expect(!FleetApprovalRules.matches("npm", isPattern: true, command: command ?? []), "a regex matches the whole line")
+
+    let codex = "npm test\nWould you like to run the following command?\n  $ rm -rf /tmp/x\n› 1. Yes, proceed (y)\n  2. No (esc)\nPress enter to confirm or esc to cancel"
+    #expect(FleetApprovalRules.commandPreview(from: codex) == ["rm -rf /tmp/x"])
+    #expect(!FleetApprovalRules.matches("npm test", isPattern: false, command: FleetApprovalRules.commandPreview(from: codex) ?? []))
+    #expect(FleetApprovalRules.commandPreview(from: "npm test\n› Ask anything") == nil)
+}
+
+@Test func escapingWorksOnScalarsNotGraphemes() {
+    // A dot followed by a combining accent is one Character but two scalars.
+    #expect(FleetApprovalRules.escape("file.\u{0301}") == "file\\.\u{0301}")
 }
 
 @Test func handledTodayCountsActionsNotSkips() throws {
