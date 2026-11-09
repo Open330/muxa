@@ -20,6 +20,7 @@ struct FleetHomeView: View {
     /// focus changes, each bound to the question it was written for.
     @State private var drafts: [String: FleetReplyDraft] = [:]
     @State private var approvalSeed: FleetApprovalSeed?
+    @State private var quickLook: FleetQuickLookTarget?
 
     private var allWorks: [FleetWork] {
         FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
@@ -39,6 +40,17 @@ struct FleetHomeView: View {
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
         .sheet(item: $approvalSeed) { seed in
             FleetApprovalRuleSheet(model: model, seed: seed)
+        }
+        .sheet(item: $quickLook) { target in
+            let work = allWorks.first { work in work.agents.contains { $0.id == target.agentID } }
+            FleetQuickLookView(
+                model: model,
+                target: target,
+                work: work,
+                draft: draftBinding(work?.id ?? ""),
+                submit: { if let work { submit(for: work.id) } },
+                openFull: open
+            )
         }
     }
 
@@ -171,12 +183,9 @@ struct FleetHomeView: View {
             work: work,
             isReviewed: reviewed.hides(work),
             close: { selectedID = nil },
-            open: open,
+            open: peek,
             openWork: { identity in model.select(.work(identity)) },
-            draft: Binding(
-                get: { drafts[work.id] ?? FleetReplyDraft() },
-                set: { drafts[work.id] = $0.isIdle ? nil : $0 }
-            ),
+            draft: draftBinding(work.id),
             submit: { submit(for: work.id) },
             approveLikeThis: {
                 var seed = FleetApprovalSeed(agent: work.focus)
@@ -240,7 +249,7 @@ struct FleetHomeView: View {
                             works: works.filter { $0.lane == lane },
                             selectedID: selectedID,
                             select: { id in selectedID = selectedID == id ? nil : id },
-                            open: open,
+                            open: peek,
                             reviewedCount: lane == .finished ? reviewedCount : 0,
                             showsReviewed: $showsReviewed
                         )
@@ -250,6 +259,18 @@ struct FleetHomeView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
+    }
+
+    private func draftBinding(_ workID: String) -> Binding<FleetReplyDraft> {
+        Binding(
+            get: { drafts[workID] ?? FleetReplyDraft() },
+            set: { drafts[workID] = $0.isIdle ? nil : $0 }
+        )
+    }
+
+    /// Open on the board: a quick look first, the full view from there.
+    private func peek(_ hosted: MuxaHostedAgent) {
+        quickLook = FleetQuickLookTarget(agentID: hosted.id)
     }
 
     /// An agent's pane when it has a live one, its agent editor otherwise.
@@ -476,14 +497,6 @@ private struct FleetWorkInspector: View {
     let approveLikeThis: () -> Void
     let markReviewed: () -> Void
 
-    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
-
-    /// Text written for a question the unit has moved past.
-    private var isStale: Bool {
-        guard let target = draft.target, draft.hasText else { return false }
-        return target != currentTarget
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 8) {
@@ -562,8 +575,8 @@ private struct FleetWorkInspector: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
-            if currentTarget != nil || !draft.isIdle {
-                replyField
+            if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
+                FleetReplyField(work: work, draft: $draft, submit: submit)
             }
             HStack(spacing: 8) {
                 if let focus = work.focus {
@@ -601,8 +614,43 @@ private struct FleetWorkInspector: View {
         return String(localized: "Open Pane")
     }
 
-    @ViewBuilder
-    private var replyField: some View {
+
+    private var laneTitle: String {
+        switch work.lane {
+        case .needsYou: String(localized: "Needs your decision")
+        case .running: String(localized: "Now")
+        case .finished: String(localized: "Last result")
+        }
+    }
+
+    private func section<Content: View>(_ title: LocalizedStringKey, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            content()
+        }
+    }
+}
+
+/// Answer an agent's question, or send a finished unit back to work. The
+/// draft is the board's, bound to the question it was written for; shared
+/// by the inspector and the quick look.
+struct FleetReplyField: View {
+    let work: FleetWork
+    @Binding var draft: FleetReplyDraft
+    let submit: () -> Void
+
+    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
+
+    /// Text written for a question the unit has moved past.
+    private var isStale: Bool {
+        guard let target = draft.target, draft.hasText else { return false }
+        return target != currentTarget
+    }
+
+    var body: some View {
         let kind = (isStale ? nil : draft.target?.kind) ?? currentTarget?.kind ?? .answer
         VStack(alignment: .leading, spacing: 6) {
             if isStale, let target = draft.target {
@@ -662,24 +710,6 @@ private struct FleetWorkInspector: View {
     private func send() {
         guard !isStale else { return }
         submit()
-    }
-
-    private var laneTitle: String {
-        switch work.lane {
-        case .needsYou: String(localized: "Needs your decision")
-        case .running: String(localized: "Now")
-        case .finished: String(localized: "Last result")
-        }
-    }
-
-    private func section<Content: View>(_ title: LocalizedStringKey, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-            content()
-        }
     }
 }
 

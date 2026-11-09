@@ -645,18 +645,6 @@ struct MuxaSidebar: View {
         switch model.sidebarMode {
         case .files: EmptyView()
         case .work:
-            Section("Workspace") {
-                Button {
-                    model.select(.workBoard)
-                } label: {
-                    WorkBoardRow(workCount: model.workGroups.count, agentCount: model.hostedAgents.count)
-                }
-                .buttonStyle(.plain)
-                .listRowBackground(
-                    model.sidebarSelection == .workBoard
-                        ? Color.accentColor.opacity(0.14) : Color.clear
-                )
-            }
             Section("Managed work") {
                 if model.workGroups.isEmpty {
                     SidebarEmptyRow(title: "No managed work", systemImage: "square.stack.3d.up.slash")
@@ -965,9 +953,23 @@ private struct SidebarActivityRail: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            // Fleet Home sits above the lists: one click from anywhere, and
+            // its badge counts what is waiting for the person.
+            ActivityRailItem(
+                systemImage: "house",
+                title: String(localized: "Fleet Home"),
+                active: model.sidebarSelection == .workBoard,
+                badge: FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
+                    .filter { $0.lane == .needsYou }.count,
+                select: { model.select(.workBoard) }
+            )
+            MuxaTheme.border(colorScheme)
+                .frame(width: MuxaTheme.activityBarWidth - 18, height: 1)
+                .padding(.vertical, 4)
             ForEach(MuxaSidebarMode.allCases) { mode in
                 ActivityRailItem(
-                    mode: mode,
+                    systemImage: mode.systemImage,
+                    title: mode.title,
                     active: model.sidebarMode == mode,
                     badge: attentionCount(for: mode),
                     select: { model.show(mode) }
@@ -1003,7 +1005,8 @@ private struct SidebarActivityRail: View {
 /// One activity bar icon: dimmed at rest, full strength with a 2pt accent bar
 /// on the leading edge when its view is showing, a count badge in the corner.
 private struct ActivityRailItem: View {
-    let mode: MuxaSidebarMode
+    let systemImage: String
+    let title: String
     let active: Bool
     let badge: Int
     let select: () -> Void
@@ -1011,7 +1014,7 @@ private struct ActivityRailItem: View {
 
     var body: some View {
         Button(action: select) {
-            Image(systemName: mode.systemImage)
+            Image(systemName: systemImage)
                 .font(.system(size: 17, weight: .regular))
                 .frame(width: MuxaTheme.activityBarWidth, height: 44)
                 .contentShape(Rectangle())
@@ -1035,8 +1038,8 @@ private struct ActivityRailItem: View {
         .buttonStyle(.plain)
         .foregroundStyle(Color.primary.opacity(active || hovering ? 0.92 : 0.45))
         .onHover { hovering = $0 }
-        .help(mode.title)
-        .accessibilityLabel(mode.title)
+        .help(title)
+        .accessibilityLabel(title)
     }
 }
 
@@ -1209,29 +1212,6 @@ private struct InboxAgentRow: View {
         .padding(.vertical, 5)
         .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
         .contentShape(Rectangle())
-    }
-}
-
-private struct WorkBoardRow: View {
-    let workCount: Int
-    let agentCount: Int
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "rectangle.3.group.fill")
-                .foregroundStyle(.tint)
-                .frame(width: 18)
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Fleet Home")
-                Text("\(workCount) work · \(agentCount) agents")
-                    .font(MuxaType.meta)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-        .padding(.vertical, 3)
     }
 }
 

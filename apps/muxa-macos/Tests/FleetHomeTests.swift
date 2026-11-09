@@ -337,3 +337,10 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     draft.edit("", current: a)
     #expect(draft.isIdle)
 }
+
+@Test func quickLookShowsPlainTextOfThePaneBottom() {
+    let screen = "\u{1B}]0;title\u{07}\u{1B}[1mbold\u{1B}[0m line   \nsecond\n\n\n"
+    #expect(FleetQuickLookText.plain(screen) == "bold line\nsecond")
+    let long = (1...60).map(String.init).joined(separator: "\n")
+    #expect(FleetQuickLookText.plain(long, lines: 3) == "58\n59\n60")
+}

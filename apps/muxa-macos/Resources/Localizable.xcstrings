@@ -7010,6 +7010,16 @@
         }
       }
     },
+    "Go to the full view (⌘↩)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전체 화면으로 이동 (⌘↩)"
+          }
+        }
+      }
+    },
     "Go: Jump to agent" : {
       "localizations" : {
         "ko" : {
@@ -7850,6 +7860,16 @@
         }
       }
     },
+    "Last response" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 응답"
+          }
+        }
+      }
+    },
     "Latency" : {
       "localizations" : {
         "ko" : {
@@ -8066,6 +8086,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "선택한 보기의 항목을 필터와 함께 나열합니다. ⌘B로 숨기거나 표시합니다."
+          }
+        }
+      }
+    },
+    "Live" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실시간"
           }
         }
       }
@@ -9328,6 +9358,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 메일함에 메시지가 없습니다."
+          }
+        }
+      }
+    },
+    "No output yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 출력이 없습니다."
           }
         }
       }
@@ -15891,6 +15931,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "생각 중"
+          }
+        }
+      }
+    },
+    "This agent is no longer running." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 에이전트는 더 이상 실행 중이 아닙니다."
           }
         }
       }

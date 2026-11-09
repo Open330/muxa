@@ -1837,7 +1837,9 @@ final class AppModel: ObservableObject {
 
     func select(_ selection: MuxaSidebarSelection) {
         switch selection {
-        case .workBoard: sidebarMode = .work
+        // Fleet Home has its own place on the activity rail, so opening it
+        // leaves the sidebar on whatever list the person was looking at.
+        case .workBoard: break
         case .watch: sidebarMode = .watch
         case .inbox: sidebarMode = .inbox
         case .ask: sidebarMode = .ask
@@ -1914,7 +1916,6 @@ final class AppModel: ObservableObject {
             // show only exited shells); every other mode falls back to the
             // Work board.
             if sidebarMode != .shells && sidebarMode != .files {
-                sidebarMode = .work
                 self.sidebarSelection = .workBoard
             }
             return
@@ -1928,7 +1929,6 @@ final class AppModel: ObservableObject {
             return
         }
 
-        sidebarMode = .work
         self.sidebarSelection = .workBoard
     }
 
