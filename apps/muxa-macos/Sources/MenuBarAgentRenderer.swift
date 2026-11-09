@@ -1,9 +1,24 @@
 import AppKit
 
+/// The paint style is also the render-cache key; status text alone is not a
+/// pixel change, while a different glyph/tint must invalidate the bitmap.
+enum MuxaMenuBarBadgeStyle: Equatable, Sendable {
+    case error, input, limited, finished
+    init(status: MuxaAgentStatus) {
+        switch status {
+        case .error: self = .error
+        case .needsInput: self = .input
+        case .limited: self = .limited
+        default: self = .finished
+        }
+    }
+}
+
 /// Rasterizes immediately; no deferred drawing closure retains the controller
 /// or touches actor-isolated model state when the menu-bar host draws it.
 @MainActor
 enum MuxaMenuBarAgentRenderer {
+    static var backingScales: [CGFloat] { Array(Set([1] + NSScreen.screens.map(\.backingScaleFactor))).sorted() }
     static let focusScale: CGFloat = 1.1
     static let textGap: CGFloat = 3
     static let trailing: CGFloat = 8
@@ -23,73 +38,86 @@ enum MuxaMenuBarAgentRenderer {
     static func image(
         chips: [MuxaMenuBarChip], positions: [CGFloat], focus: Int?, pillWidth: CGFloat,
         lead: CGFloat, markOpacity: CGFloat, overflow: Int, selectedID: String?,
-        liveIDs: Set<String>, dark: Bool, mark: String
+        liveIDs: Set<String>, dark: Bool, mark: String, scales: [CGFloat]? = nil
     ) -> NSImage {
         let geometry = MuxaMenuBarGeometry(count: chips.count)
         let size = NSSize(width: ceil(geometry.width + lead + (overflow > 0 ? MuxaMenuBarGeometry.overflowWidth : 0)), height: 24)
-        let image = NSImage(size: size)
-        image.lockFocus()
-        defer { image.unlockFocus() }
-        let ink: NSColor = dark ? .white : .black
-        let markRect = NSRect(x: lead + geometry.markX + 3, y: 4, width: 18, height: 16)
-        NSImage(systemSymbolName: mark, accessibilityDescription: nil)?.draw(in: markRect, from: .zero, operation: .sourceOver, fraction: markOpacity)
-        ink.setFill()
-        markRect.fill(using: .sourceAtop)
-        NSGraphicsContext.current?.cgContext.beginTransparencyLayer(auxiliaryInfo: nil)
-        let paint = MuxaMenuBarPaintGeometry(count: chips.count, positions: positions, focus: focus, pillWidth: pillWidth,
-            badged: Set(chips.indices.filter { chips[$0].status.needsAttention || chips[$0].unread }))
-        for index in paint.drawOrder {
-            let agent = chips[index]
-            let face = paint.faces[index].offsetBy(dx: lead, dy: 0)
-            let height = face.height
-            let isPill = face.width > height
-            let shape = NSBezierPath(roundedRect: face, xRadius: height / 2, yRadius: height / 2)
-            let alpha: CGFloat = liveIDs.contains(agent.id) ? 1 : 0.3
-            let appearance = agent.appearance
-            // Clear a narrow moat from the chip layer before painting the
-            // next face: overlapping avatars retain a readable silhouette.
-            NSGraphicsContext.current?.compositingOperation = .clear
-            NSBezierPath(roundedRect: face.insetBy(dx: -0.8, dy: -0.8), xRadius: height / 2 + 0.8, yRadius: height / 2 + 0.8).fill()
-            NSGraphicsContext.current?.compositingOperation = .sourceOver
-            NSGradient(starting: appearance.top.withAlphaComponent(alpha), ending: appearance.bottom.withAlphaComponent(alpha))?.draw(in: shape, angle: -45)
-            NSColor.white.withAlphaComponent(0.18 * alpha).setStroke()
-            shape.lineWidth = 0.5
-            shape.stroke()
-            NSGraphicsContext.saveGraphicsState()
-            shape.addClip()
-            drawSymbol(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha))
-            if isPill {
-                let text = agent.pillLabel as NSString
-                let textSize = text.size(withAttributes: [.font: pillFont])
-                let textX = face.minX + height + textGap
-                let room = face.maxX - trailing - textX
-                if room > 0 {
-                    NSRect(x: textX, y: face.minY, width: room, height: height).clip()
-                    text.draw(at: NSPoint(x: textX, y: face.midY - textSize.height / 2), withAttributes: [.font: pillFont, .foregroundColor: NSColor.white.withAlphaComponent(alpha)])
+        let draw = {
+            let ink: NSColor = dark ? .white : .black
+            let markRect = NSRect(x: lead + geometry.markX + 3, y: 4, width: 18, height: 16)
+            NSImage(systemSymbolName: mark, accessibilityDescription: nil)?.draw(in: markRect, from: .zero, operation: .sourceOver, fraction: markOpacity)
+            ink.setFill()
+            markRect.fill(using: .sourceAtop)
+            NSGraphicsContext.current?.cgContext.beginTransparencyLayer(auxiliaryInfo: nil)
+            let paint = MuxaMenuBarPaintGeometry(count: chips.count, positions: positions, focus: focus, pillWidth: pillWidth,
+                badged: Set(chips.indices.filter { chips[$0].status.needsAttention || chips[$0].unread }))
+            for index in paint.drawOrder {
+                let agent = chips[index]
+                let face = paint.faces[index].offsetBy(dx: lead, dy: 0)
+                let height = face.height
+                let isPill = face.width > height
+                let shape = NSBezierPath(roundedRect: face, xRadius: height / 2, yRadius: height / 2)
+                let alpha: CGFloat = liveIDs.contains(agent.id) ? 1 : 0.3
+                let appearance = agent.appearance
+                // Clear a narrow moat from the chip layer before painting the
+                // next face: overlapping avatars retain a readable silhouette.
+                NSGraphicsContext.current?.compositingOperation = .clear
+                NSBezierPath(roundedRect: face.insetBy(dx: -0.8, dy: -0.8), xRadius: height / 2 + 0.8, yRadius: height / 2 + 0.8).fill()
+                NSGraphicsContext.current?.compositingOperation = .sourceOver
+                NSGradient(starting: appearance.top.withAlphaComponent(alpha), ending: appearance.bottom.withAlphaComponent(alpha))?.draw(in: shape, angle: -45)
+                NSColor.white.withAlphaComponent(0.18 * alpha).setStroke()
+                shape.lineWidth = 0.5
+                shape.stroke()
+                NSGraphicsContext.saveGraphicsState()
+                shape.addClip()
+                drawSymbol(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha))
+                if isPill {
+                    let text = agent.pillLabel as NSString
+                    let textSize = text.size(withAttributes: [.font: pillFont])
+                    let textX = face.minX + height + textGap
+                    let room = face.maxX - trailing - textX
+                    if room > 0 {
+                        NSRect(x: textX, y: face.minY, width: room, height: height).clip()
+                        text.draw(at: NSPoint(x: textX, y: face.midY - textSize.height / 2), withAttributes: [.font: pillFont, .foregroundColor: NSColor.white.withAlphaComponent(alpha)])
+                    }
                 }
+                NSGraphicsContext.restoreGraphicsState()
+                if selectedID == agent.id {
+                    ink.setStroke()
+                    let ring = NSBezierPath(roundedRect: face.insetBy(dx: -1, dy: -1), xRadius: height / 2, yRadius: height / 2)
+                    ring.lineWidth = 1.5
+                    ring.stroke()
+                }
+                // Badge and face are one layer: the next chip covers both.
+                if let rect = paint.badges[index] { drawBadge(chips[index], in: rect.offsetBy(dx: lead, dy: 0), dark: dark) }
             }
+            NSGraphicsContext.current?.cgContext.endTransparencyLayer()
+            if overflow > 0 {
+                let text = "+\(overflow)" as NSString
+                let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold), .foregroundColor: ink]
+                let x = lead + geometry.width
+                let capsule = NSRect(x: x + 1, y: 5, width: MuxaMenuBarGeometry.overflowWidth - 2, height: 14)
+                ink.withAlphaComponent(0.1).setFill()
+                NSBezierPath(roundedRect: capsule, xRadius: 7, yRadius: 7).fill()
+                let textWidth = text.size(withAttributes: attributes).width
+                text.draw(at: NSPoint(x: capsule.midX - textWidth / 2, y: 6), withAttributes: attributes)
+            }
+        }
+        let image = NSImage(size: size)
+        for scale in Set(scales ?? backingScales).sorted() where scale > 0 && scale.isFinite {
+            guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                pixelsWide: Int(ceil(size.width * scale)), pixelsHigh: Int(ceil(size.height * scale)),
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0) else { continue }
+            // Set point dimensions BEFORE constructing the context, otherwise
+            // Retina draws at 1x into the lower-left quarter of the bitmap.
+            rep.size = size
+            guard let context = NSGraphicsContext(bitmapImageRep: rep) else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = context
+            draw()
             NSGraphicsContext.restoreGraphicsState()
-            if selectedID == agent.id {
-                ink.setStroke()
-                let ring = NSBezierPath(roundedRect: face.insetBy(dx: -1, dy: -1), xRadius: height / 2, yRadius: height / 2)
-                ring.lineWidth = 1.5
-                ring.stroke()
-            }
-        }
-        // Same order and badge rects as the hit-test model.
-        for index in paint.drawOrder {
-            if let rect = paint.badges[index] { drawBadge(chips[index], in: rect.offsetBy(dx: lead, dy: 0), dark: dark) }
-        }
-        NSGraphicsContext.current?.cgContext.endTransparencyLayer()
-        if overflow > 0 {
-            let text = "+\(overflow)" as NSString
-            let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .semibold), .foregroundColor: ink]
-            let x = lead + geometry.width
-            let capsule = NSRect(x: x + 1, y: 5, width: MuxaMenuBarGeometry.overflowWidth - 2, height: 14)
-            ink.withAlphaComponent(0.1).setFill()
-            NSBezierPath(roundedRect: capsule, xRadius: 7, yRadius: 7).fill()
-            let textWidth = text.size(withAttributes: attributes).width
-            text.draw(at: NSPoint(x: capsule.midX - textWidth / 2, y: 6), withAttributes: attributes)
+            image.addRepresentation(rep)
         }
         return image
     }
@@ -99,14 +127,14 @@ enum MuxaMenuBarAgentRenderer {
         let configured = source.withSymbolConfiguration(.init(pointSize: 11, weight: .semibold)) ?? source
         let scale = min(rect.width / configured.size.width, rect.height / configured.size.height)
         let size = NSSize(width: configured.size.width * scale, height: configured.size.height * scale)
-        let tinted = NSImage(size: size)
-        tinted.lockFocus()
-        let bounds = NSRect(origin: .zero, size: size)
+        let bounds = NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height)
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current?.cgContext.beginTransparencyLayer(auxiliaryInfo: nil)
         configured.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
         color.setFill()
         bounds.fill(using: .sourceAtop)
-        tinted.unlockFocus()
-        tinted.draw(in: NSRect(x: rect.midX - size.width / 2, y: rect.midY - size.height / 2, width: size.width, height: size.height))
+        NSGraphicsContext.current?.cgContext.endTransparencyLayer()
+        NSGraphicsContext.restoreGraphicsState()
     }
 
     private static func drawBadge(_ agent: MuxaMenuBarChip, in rect: NSRect, dark: Bool) {
@@ -115,15 +143,16 @@ enum MuxaMenuBarAgentRenderer {
         NSBezierPath(ovalIn: rect.insetBy(dx: -0.8, dy: -0.8)).fill()
         let fill: NSColor
         let glyph: String
-        switch agent.status {
+        let style = MuxaMenuBarBadgeStyle(status: agent.status)
+        switch style {
         case .error: fill = NSColor(srgbRed: 0.77, green: 0.16, blue: 0.22, alpha: 1); glyph = "exclamationmark"
-        case .needsInput: fill = NSColor(srgbRed: 0.96, green: 0.73, blue: 0.22, alpha: 1); glyph = "questionmark"
+        case .input: fill = NSColor(srgbRed: 0.96, green: 0.73, blue: 0.22, alpha: 1); glyph = "questionmark"
         case .limited: fill = NSColor(srgbRed: 0.49, green: 0.30, blue: 0.68, alpha: 1); glyph = "hourglass"
-        default: fill = NSColor(srgbRed: 0.16, green: 0.53, blue: 0.33, alpha: 1); glyph = "checkmark"
+        case .finished: fill = NSColor(srgbRed: 0.16, green: 0.53, blue: 0.33, alpha: 1); glyph = "checkmark"
         }
         fill.setFill()
         NSBezierPath(ovalIn: rect).fill()
-        let color: NSColor = agent.status.needsAttention && glyph == "questionmark" ? NSColor(white: 0.12, alpha: 1) : .white
+        let color: NSColor = style == .input ? NSColor(white: 0.12, alpha: 1) : .white
         drawSymbol(glyph, in: rect.insetBy(dx: 1.5, dy: 1.4), color: color)
     }
 

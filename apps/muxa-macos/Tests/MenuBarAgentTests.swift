@@ -346,14 +346,15 @@ private func menuBarSnapshot(_ agents: [(String, String, String)], host: String 
     let paint = MuxaMenuBarPaintGeometry(count: 3, positions: [0, 13, 26], focus: nil, pillWidth: 50, badged: [0, 1, 2])
     #expect(paint.index(at: CGPoint(x: 14, y: 12)) == 0)
     #expect(geometry.index(at: 14, focus: nil, pillWidth: 50) == 0)
-    #expect(paint.index(at: CGPoint(x: 20, y: 5.5)) == 0)
-    #expect(paint.index(at: CGPoint(x: 33, y: 5.5)) == 1)
-    #expect(paint.index(at: CGPoint(x: 20, y: 12)) == 1) // same x, front face above its neighbour's badge
+    #expect(paint.index(at: CGPoint(x: 20, y: 18.5)) == 0)
+    #expect(paint.index(at: CGPoint(x: 33, y: 18.5)) == 1)
+    #expect(paint.index(at: CGPoint(x: 20, y: 12)) == 0) // left face is the front of the folded avatar stack
 }
 
 @Test func menuBarHitsTrackThePaintedIntermediateAnimationInsteadOfTheFinalLayout() {
     let paint = MuxaMenuBarPaintGeometry(count: 3, positions: [0, 13, 26], focus: 0, pillWidth: 18, badged: [])
-    #expect(paint.index(at: CGPoint(x: 35, y: 12)) == 2)
+    #expect(paint.index(at: CGPoint(x: 35, y: 12)) == 1) // front chip owns its clear separator
+    #expect(paint.index(at: CGPoint(x: 37, y: 12)) == 2)
     #expect(paint.index(at: CGPoint(x: 60, y: 12)) == nil)
 }
 
@@ -487,6 +488,7 @@ private struct MenuReplyError: LocalizedError {
     #expect(MuxaMenuBarPolling.interval(pointerInside: true, animating: false, popoverShown: false) == 1.0 / 60)
     #expect(MuxaMenuBarPolling.interval(pointerInside: false, animating: true, popoverShown: false) == 1.0 / 60)
     #expect(MuxaMenuBarPolling.interval(pointerInside: true, animating: false, popoverShown: true) == 1.0 / 15)
+    #expect(MuxaMenuBarPolling.interval(pointerInside: false, animating: false, popoverShown: false, waitingToFold: true) == 1.0 / 60)
 }
 
 @Test func menuBarUsagePollingPausesForHiddenChipsAndAvoidsRecentReadsAndFailureRetries() {
@@ -513,4 +515,71 @@ private struct MenuReplyError: LocalizedError {
     #expect(original != frame(items[0], position: 3))
     #expect(original != frame(items[0], live: false))
     #expect(original != frame(MuxaMenuBarAgent(hosted: items[0].hosted, unread: false)))
+}
+
+@Test func menuBarHoverGraceKeepsItsDeadlineAndCancelsOnReturn() {
+    let now = Date(timeIntervalSince1970: 100)
+    var intent = MuxaMenuBarFoldIntent()
+    intent.schedule(now: now, grace: MuxaMenuBarHoverPolicy.exitGrace)
+    intent.schedule(now: now.addingTimeInterval(0.1), grace: MuxaMenuBarHoverPolicy.exitGrace)
+    #expect(intent.deadline == now.addingTimeInterval(0.2))
+    let early = intent.consume(now: now.addingTimeInterval(0.19))
+    #expect(!early)
+    let due = intent.consume(now: now.addingTimeInterval(0.2))
+    #expect(due)
+    intent.schedule(now: now, grace: MuxaMenuBarHoverPolicy.peekGrace)
+    let peekEarly = intent.consume(now: now.addingTimeInterval(0.3))
+    #expect(!peekEarly)
+    intent.cancel()
+    let cancelled = intent.consume(now: now.addingTimeInterval(1))
+    #expect(!cancelled)
+}
+
+@Test func menuBarHoverMarginAndPeekRespectScreenCoordinates() {
+    let item = CGRect(x: 100, y: 700, width: 100, height: 24)
+    let peek = CGRect(x: 70, y: 630, width: 160, height: 65)
+    #expect(MuxaMenuBarHoverPolicy.zone(point: CGPoint(x: 120, y: 710), item: item, peek: peek) == .item)
+    #expect(MuxaMenuBarHoverPolicy.zone(point: CGPoint(x: 98, y: 695), item: item, peek: peek) == .margin)
+    #expect(MuxaMenuBarHoverPolicy.zone(point: CGPoint(x: 120, y: 680), item: item, peek: peek) == .peek)
+    #expect(MuxaMenuBarHoverPolicy.zone(point: CGPoint(x: 20, y: 680), item: item, peek: peek) == .outside)
+    #expect(MuxaMenuBarHoverPolicy.foldDuration > MuxaMenuBarHoverPolicy.unfoldDuration)
+}
+
+@Test @MainActor func menuBarPixelKeyIgnoresHiddenLabelsButTracksVisiblePillAndScale() throws {
+    let snap = try menuBarSnapshot([("coder", "idle", "1")])
+    let chip = MuxaMenuBarChip.agent(MuxaMenuBarAgent(hosted: snap.hostedAgents[0], unread: true))
+    let changed = MuxaMenuBarChip(id: chip.id, name: "new accessible name", location: "new host location",
+        pillLabel: "new value", menuStatusLabel: "new status text", appearance: chip.appearance,
+        status: chip.status, unread: chip.unread, memberIDs: chip.memberIDs, destination: chip.destination)
+    func frame(_ chip: MuxaMenuBarChip, focus: Int? = nil, scale: CGFloat = 1) -> MuxaMenuBarRenderState {
+        MuxaMenuBarRenderState(chips: [chip], positions: [0], focus: focus, pillWidth: 70,
+            lead: 0, markOpacity: 1, overflow: 0, selectedID: nil, liveIDs: [chip.id], dark: false,
+            mark: "terminal", backingScales: [scale])
+    }
+    #expect(frame(chip) == frame(changed))
+    #expect(frame(chip, focus: 0) != frame(changed, focus: 0))
+    #expect(frame(chip) != frame(chip, scale: 2))
+}
+
+@Test @MainActor func menuBarBitmapsFillTheirRetinaRepresentation() throws {
+    let snap = try menuBarSnapshot([("coder", "waiting_input", "1")])
+    let chip = MuxaMenuBarChip.agent(MuxaMenuBarAgent(hosted: snap.hostedAgents[0], unread: true))
+    let image = MuxaMenuBarAgentRenderer.image(chips: [chip], positions: [0], focus: nil, pillWidth: 18,
+        lead: 0, markOpacity: 1, overflow: 0, selectedID: nil, liveIDs: [chip.id], dark: false,
+        mark: "terminal", scales: [1, 2])
+    let reps = image.representations.compactMap { $0 as? NSBitmapImageRep }.sorted { $0.pixelsWide < $1.pixelsWide }
+    #expect(reps.count == 2)
+    for (rep, scale) in zip(reps, [1, 2]) {
+        #expect(rep.pixelsWide == Int(image.size.width) * scale)
+        #expect(rep.pixelsHigh == 24 * scale)
+        #expect(rep.size == image.size)
+        var maxX = 0, maxY = 0
+        for y in 0..<rep.pixelsHigh {
+            for x in 0..<rep.pixelsWide where (rep.colorAt(x: x, y: y)?.alphaComponent ?? 0) > 0.2 {
+                maxX = max(maxX, x); maxY = max(maxY, y)
+            }
+        }
+        #expect(maxX > Int(CGFloat(rep.pixelsWide) * 0.8))
+        #expect(maxY > Int(CGFloat(rep.pixelsHigh) * 0.65))
+    }
 }

@@ -233,6 +233,18 @@ that session. Reviewed icons disappear after the card is closed and the
 pointer leaves; a new state change can show the agent again. With no unseen
 activity, only the Muxa launcher and any enabled extension chip remain.
 
+Chips unfold on entry without an intent delay. Leaving schedules a 0.2-second
+fold, or 0.45 seconds toward an already-visible peek; returning cancels it.
+A 4pt side/10pt lower margin retains the current state. Unfolding takes 0.16s,
+folding 0.26s, and Reduce Motion applies the final layout immediately. The
+focused capsule stays on top; otherwise left chips cover right chips, including
+their badges. Hit tests use this paint order and the in-flight geometry.
+
+Render keys contain visible chip styling, the focused label, live/selected
+state, geometry, appearance and display scales. Hidden label/location changes
+still update accessibility without assigning a new status image. The renderer
+builds a point-sized bitmap for each display scale (including 1x) before drawing.
+
 The cluster polls the pointer at 15 Hz while idle and 60 Hz while tracking
 or animating, and pauses polling during display sleep. Snapshot notifications
 in the same run-loop turn share one refresh. Unchanged render and accessibility
