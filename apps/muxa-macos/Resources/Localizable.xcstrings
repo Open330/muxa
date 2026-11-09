@@ -1,6 +1,16 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%lld helper sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보조 세션 %lld개"
+          }
+        }
+      }
+    },
     "%lld in the last hour" : {
       "localizations" : {
         "ko" : {
@@ -17,6 +27,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이전 항목 %lld개"
+          }
+        }
+      }
+    },
+    "%lld possible helper sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보조 세션 후보 %lld개"
           }
         }
       }
@@ -7237,12 +7257,42 @@
         }
       }
     },
+    "Helper" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보조"
+          }
+        }
+      }
+    },
+    "Helpers" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보조 세션"
+          }
+        }
+      }
+    },
     "Hide older" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "이전 항목 숨기기"
+          }
+        }
+      }
+    },
+    "Hide possible helpers" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보조 세션 후보 숨기기"
           }
         }
       }
@@ -12783,6 +12833,16 @@
         }
       }
     },
+    "Reply from %@ is ready" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@의 회신 도착"
+          }
+        }
+      }
+    },
     "Reply to %@" : {
       "localizations" : {
         "ko" : {
@@ -13481,6 +13541,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "세션 요약"
+          }
+        }
+      }
+    },
+    "Sessions other agents started to help with this work." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다른 에이전트가 이 작업을 돕기 위해 띄운 세션입니다."
+          }
+        }
+      }
+    },
+    "Sessions whose prompt hands over a muxa request; who asked is not confirmed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa 요청을 넘겨받은 것으로 보이는 세션입니다. 누가 요청했는지는 확인되지 않았습니다"
           }
         }
       }
@@ -17305,6 +17385,16 @@
         }
       }
     },
+    "Waiting on %@: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@ 기다리는 중: %@"
+          }
+        }
+      }
+    },
     "Waiting Reply" : {
       "localizations" : {
         "ko" : {
@@ -17845,6 +17935,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "작업 중인 에이전트"
+          }
+        }
+      }
+    },
+    "Working on another agent's request; that agent is no longer running" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다른 에이전트의 요청을 처리 중이지만, 요청한 에이전트는 더 이상 실행 중이 아닙니다"
           }
         }
       }
@@ -21607,6 +21707,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "내 차례"
+          }
+        }
+      }
+    },
+    "⟳ Background task" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "⟳ 백그라운드 작업"
           }
         }
       }

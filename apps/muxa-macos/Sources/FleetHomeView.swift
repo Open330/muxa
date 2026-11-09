@@ -32,7 +32,9 @@ struct FleetHomeView: View {
             FleetApprovalRuleSheet(model: model, seed: seed)
         }
         .sheet(item: $quickLook) { target in
-            let work = allWorks.first { work in work.agents.contains { $0.id == target.agentID } }
+            let work = allWorks.first { work in
+                (work.agents + work.helpers).contains { $0.id == target.agentID }
+            }
             FleetQuickLookView(
                 model: model,
                 target: target,
@@ -291,11 +293,20 @@ private struct FleetLaneColumn: View {
     var reviewedCount = 0
     @Binding var showsReviewed: Bool
     @State private var showsOlder = false
+    @State private var showsProbable = false
 
-    /// Finished units older than a day fold away behind one row.
+    /// Finished units older than a day fold away behind one row, and so do
+    /// probable helpers, except in Your turn, where nothing is folded.
     private var shown: [FleetWork] {
-        guard lane == .finished, !showsOlder else { return works }
-        return works.filter { FleetBoard.isRecent($0) }
+        works.filter { work in
+            if lane != .needsYou, work.isProbableHelper, !showsProbable { return false }
+            if lane == .finished, !showsOlder, !FleetBoard.isRecent(work) { return false }
+            return true
+        }
+    }
+
+    private var probableCount: Int {
+        lane == .needsYou ? 0 : works.filter(\.isProbableHelper).count
     }
 
     private var olderCount: Int {
@@ -368,6 +379,17 @@ private struct FleetLaneColumn: View {
                             )
                         }
                     }
+                    if probableCount > 0 {
+                        Button(showsProbable
+                            ? String(localized: "Hide possible helpers")
+                            : String(localized: "\(probableCount) possible helper sessions")) {
+                            showsProbable.toggle()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                        .help("Sessions whose prompt hands over a muxa request; who asked is not confirmed")
+                    }
                     if olderCount > 0 {
                         Button(showsOlder ? String(localized: "Hide older") : String(localized: "\(olderCount) older")) {
                             showsOlder.toggle()
@@ -428,10 +450,21 @@ private struct FleetWorkCard: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text(work.title)
-                .font(.system(size: 13, weight: .semibold))
-                .lineLimit(2)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack(alignment: .firstTextBaseline, spacing: 6) {
+                if work.isOrphanHelper {
+                    Text("Helper")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.secondary)
+                        .help("Working on another agent's request; that agent is no longer running")
+                }
+                Text(work.title)
+                    .font(.system(size: 13, weight: .semibold))
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
             if work.lane != .finished || work.stages.count > 1 {
                 FleetStageBar(work: work)
             }
@@ -456,6 +489,11 @@ private struct FleetWorkCard: View {
                 }
                 Text(work.hostAliases.joined(separator: ", "))
                     .lineLimit(1)
+                if !work.helpers.isEmpty {
+                    Label("\(work.helpers.count)", systemImage: "person.2")
+                        .labelStyle(.titleAndIcon)
+                        .help("\(work.helpers.count) helper sessions")
+                }
                 Spacer(minLength: 4)
                 if let since = work.since {
                     Text(since, format: .relative(presentation: .numeric, unitsStyle: .abbreviated))
@@ -576,21 +614,16 @@ private struct FleetWorkInspector: View {
                     }
                     section("Agents") {
                         VStack(alignment: .leading, spacing: 8) {
-                            ForEach(work.agents) { hosted in
-                                HStack(spacing: 8) {
-                                    AgentStatusTag(status: hosted.agent.status, showsLabel: false)
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(FleetBoard.owner(hosted))
-                                            .font(MuxaType.body.weight(.medium))
-                                        Text(hosted.agent.status.label())
-                                            .font(MuxaType.meta)
-                                            .foregroundStyle(.secondary)
-                                    }
-                                    Spacer(minLength: 4)
-                                    Button("Open") { open(hosted) }
-                                        .buttonStyle(.muxaSecondary)
-                                        .controlSize(.small)
-                                }
+                            ForEach(work.agents) { hosted in agentRow(hosted) }
+                        }
+                    }
+                    if !work.helpers.isEmpty {
+                        section("Helpers") {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("Sessions other agents started to help with this work.")
+                                    .font(MuxaType.meta)
+                                    .foregroundStyle(.secondary)
+                                ForEach(work.helpers) { hosted in agentRow(hosted) }
                             }
                         }
                     }
@@ -652,6 +685,23 @@ private struct FleetWorkInspector: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(tint.opacity(0.1), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 9, style: .continuous).strokeBorder(tint.opacity(0.45)))
+    }
+
+    private func agentRow(_ hosted: MuxaHostedAgent) -> some View {
+        HStack(spacing: 8) {
+            AgentStatusTag(status: hosted.agent.status, showsLabel: false)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(FleetBoard.owner(hosted))
+                    .font(MuxaType.body.weight(.medium))
+                Text(hosted.agent.status.label())
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 4)
+            Button("Open") { open(hosted) }
+                .buttonStyle(.muxaSecondary)
+                .controlSize(.small)
+        }
     }
 
     private var paneButtonTitle: String {
