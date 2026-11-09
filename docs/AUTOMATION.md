@@ -71,6 +71,31 @@ state checks without sending keys; the screen check runs immediately before
 an actual Enter action. `press_enter` requires `on = "waiting_input"`, its
 waiting-input recheck, and no `text`, `message` or `submit` payload.
 
+An option that grants more than the one request is never pressed, even when
+it is highlighted: `don't ask again`, `always`, `remember`, `for this
+session` and `all edits/commands/tools`.
+
+### Approve only requests you name
+
+Give a `press_enter` rule a `screen` regex and it confirms only a request
+whose dialog matches. The pattern is matched against the request text above
+the selected Yes (up to the dialog's top edge, at most 14 lines, box sides
+removed), read from the capture taken right before Enter, so output printed
+before the dialog cannot satisfy it. Fleet Home in the macOS app writes these
+rules from its Approvals list.
+
+```toml
+[[automation.rule]]
+name = "approve-npm-test"
+on = "waiting_input"
+action = "press_enter"
+agent = ["claude_code", "codex"]
+screen = '(?m)^\$? ?npm (test|run lint)$'
+wait = "3s"
+cooldown = "10s"
+max_per_hour = 20
+```
+
 ## Quick start
 
 Put this in `$XDG_CONFIG_HOME/muxa/config.toml` and restart `muxad`:

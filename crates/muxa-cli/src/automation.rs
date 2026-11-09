@@ -445,6 +445,7 @@ mod tests {
             pane: None,
             host: None,
             notification: None,
+            screen: None,
             scope: Vec::new(),
             for_: None,
             text: Some("continue".into()),

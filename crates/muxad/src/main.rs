@@ -2541,6 +2541,13 @@ impl AutomationEngine {
         {
             return false;
         }
+        // A rule that names the request confirms only that request, read from
+        // the same capture the Yes was found on.
+        if let Some(pattern) = &rule.screen {
+            if !muxa::automation_choice::choice_dialog_matches_pattern(&screen, pattern) {
+                return false;
+            }
+        }
         let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
             return false;
         };

@@ -19,6 +19,7 @@ struct FleetHomeView: View {
     /// Reply drafts per unit, kept while the inspector closes or the unit's
     /// focus changes, each bound to the question it was written for.
     @State private var drafts: [String: FleetReplyDraft] = [:]
+    @State private var approvalSeed: FleetApprovalSeed?
 
     private var allWorks: [FleetWork] {
         FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
@@ -36,6 +37,9 @@ struct FleetHomeView: View {
             }
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
+        .sheet(item: $approvalSeed) { seed in
+            FleetApprovalRuleSheet(model: model, seed: seed)
+        }
     }
 
     // MARK: - Header
@@ -52,6 +56,7 @@ struct FleetHomeView: View {
             .labelsHidden()
             .fixedSize()
             Spacer(minLength: 8)
+            FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
             hostsButton
             Button {
                 model.presentWorkStart()
@@ -173,6 +178,11 @@ struct FleetHomeView: View {
                 set: { drafts[work.id] = $0.isIdle ? nil : $0 }
             ),
             submit: { submit(for: work.id) },
+            approveLikeThis: {
+                var seed = FleetApprovalSeed(agent: work.focus)
+                if case .work(let identity) = work.source { seed.work = identity }
+                approvalSeed = seed
+            },
             markReviewed: {
                 reviewed.markReviewed(work)
                 reviewed.save(to: .standard)
@@ -463,6 +473,7 @@ private struct FleetWorkInspector: View {
     let openWork: (MuxaWorkIdentity) -> Void
     @Binding var draft: FleetReplyDraft
     let submit: () -> Void
+    let approveLikeThis: () -> Void
     let markReviewed: () -> Void
 
     private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
@@ -562,6 +573,11 @@ private struct FleetWorkInspector: View {
                 if case .work(let identity) = work.source {
                     Button("Work Details") { openWork(identity) }
                         .buttonStyle(.muxaSecondary)
+                }
+                if FleetBoard.choosesInPane(work), work.focus.map({ FleetApprovalRules.supportedKinds.contains($0.agent.kind) }) == true {
+                    Button("Always Approve This…", action: approveLikeThis)
+                        .buttonStyle(.muxaGhost)
+                        .help("Write a rule so Muxa approves requests like this one on its own")
                 }
                 if work.lane == .finished && !isReviewed {
                     Spacer(minLength: 0)
