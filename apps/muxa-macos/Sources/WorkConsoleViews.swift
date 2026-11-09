@@ -348,11 +348,15 @@ struct WorkStartView: View {
                     onDescribe: describeWithAgent
                 )
             } else {
-                Picker("Pipeline", selection: $pipeline) {
-                    Text(defaultPipelineLabel).tag("")
-                    ForEach(options.pipelines) { candidate in
-                        Text(candidate.name).tag(candidate.name)
+                HStack {
+                    Picker("Pipeline", selection: $pipeline) {
+                        Text(defaultPipelineLabel).tag("")
+                        ForEach(options.pipelines) { candidate in
+                            Text(candidate.name).tag(candidate.name)
+                        }
                     }
+                    Button("Manage Templates…") { model.presentTemplates() }
+                        .help("Edit pipelines and the routes that pick them")
                 }
                 if let selected = effectivePipeline {
                     VStack(alignment: .leading, spacing: 8) {
@@ -1134,4 +1138,32 @@ struct ConsoleUnavailableView: View {
 
 private extension String {
     var nonEmpty: String? { isEmpty ? nil : self }
+}
+
+/// The Work templates: pipelines and the routes that pick them per host.
+/// Opened from Start Work; a template's Start button goes back to it.
+struct WorkTemplatesSheet: View {
+    @ObservedObject var model: AppModel
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("Work Templates")
+                    .font(.title3.weight(.semibold))
+                Spacer()
+                Button("Back to Start Work") { model.presentWorkStart() }
+                Button("Done") { dismiss() }
+                    .buttonStyle(.muxaPrimary)
+                    .keyboardShortcut(.defaultAction)
+            }
+            .padding(16)
+            Divider()
+            WorkCommandCenterView(model: model, pipelinesOnly: true)
+        }
+        .frame(minWidth: 860, idealWidth: 960, minHeight: 600, idealHeight: 720)
+        .sheet(item: $model.pipelineEditorTarget) { target in
+            PipelineEditorView(target: target, model: model)
+        }
+    }
 }

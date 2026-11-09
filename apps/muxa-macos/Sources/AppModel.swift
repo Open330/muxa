@@ -27,6 +27,10 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
 
     var id: Self { self }
 
+    /// The lists on the activity rail. Work units live on Home, so the Work
+    /// list has no place of its own there.
+    static let railModes: [MuxaSidebarMode] = [.watch, .inbox, .ask, .shells, .files]
+
     var title: String {
         switch self {
         case .work: String(localized: "Work")
@@ -105,24 +109,38 @@ final class AppModel: ObservableObject {
     @Published private(set) var workGroups: [MuxaWorkGroup] = []
     @Published private(set) var hostedAgents: [MuxaHostedAgent] = []
     @Published private(set) var workspaceRevision: UInt64 = 0
-    @Published var sidebarSelection: MuxaSidebarSelection?
-    @Published var sidebarMode: MuxaSidebarMode = .work
-    /// Fleet Home was opened from the activity rail: the window gives it the
-    /// whole width and the list column folds away until another list or
-    /// editor is chosen.
-    @Published var isHomeFocused = false
+    @Published var sidebarSelection: MuxaSidebarSelection? {
+        didSet {
+            // Coming back to Home folds the lists away again.
+            if Self.isHome(sidebarSelection), !Self.isHome(oldValue) { showsListOverHome = false }
+        }
+    }
+    @Published var sidebarMode: MuxaSidebarMode = .watch
+    /// A list chosen on the rail while Home is in front shows beside it.
+    @Published var showsListOverHome = false
 
-    /// The list column folds away while Fleet Home is the focused editor and
-    /// was opened from the rail.
-    var isSidebarListCollapsed: Bool { isHomeFocused && sidebarSelection == .workBoard }
+    /// Home and the Work pages opened from it: the units of work, which
+    /// Home manages, so no list column is needed beside them.
+    static func isHome(_ selection: MuxaSidebarSelection?) -> Bool {
+        switch selection {
+        case .workBoard, .work: true
+        default: false
+        }
+    }
 
-    /// The activity rail's Home: open Fleet Home and fold the lists away.
+    var isHomeEditor: Bool { Self.isHome(sidebarSelection) }
+
+    /// The list column folds away whenever Home (or a Work page) is the
+    /// focused editor, however it got there, until a list is chosen.
+    var isSidebarListCollapsed: Bool { isHomeEditor && !showsListOverHome }
+
+    /// The activity rail's Home: bring Home to the front, lists folded.
     func showHome() {
-        // Re-selecting brings the Fleet Home tab to the front even when the
+        // Re-selecting brings the Home tab to the front even when the
         // selection already names it.
         if sidebarSelection == .workBoard { sidebarSelection = nil }
         select(.workBoard)
-        isHomeFocused = true
+        showsListOverHome = false
     }
     @Published var watchSelection: MuxaWatchPaneIdentity?
     @Published private(set) var connectionState: ConnectionState = .connecting
@@ -133,6 +151,8 @@ final class AppModel: ObservableObject {
     @Published var isPresentingFleetDispatch = false
     @Published private(set) var askUsesSnapshots = false
     @Published var isPresentingWorkStart = false
+    /// The Work templates (pipelines and routes), opened from Start Work.
+    @Published var isPresentingTemplates = false
     /// The Save / Restore snapshot sheet, when one is up. WS-F: snapshot
     @Published var sessionSnapshotSheet: MuxaSessionSnapshotSheet?
     /// Pipeline the Start Work sheet should preselect when opened from a
@@ -826,7 +846,24 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Leaves Start Work for the template manager; its Start buttons come
+    /// back here (see `presentWorkStart`).
+    func presentTemplates() {
+        isPresentingWorkStart = false
+        // One sheet closes before the next opens on the same window.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.isPresentingTemplates = true
+        }
+    }
+
     func presentWorkStart(pipeline: String? = nil, host: String? = nil) {
+        if isPresentingTemplates {
+            isPresentingTemplates = false
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                self?.presentWorkStart(pipeline: pipeline, host: host)
+            }
+            return
+        }
         workStartError = nil
         workStartStatus = nil
         workStartPlan = nil
@@ -1833,7 +1870,7 @@ final class AppModel: ObservableObject {
         // Like VS Code's Activity Bar, this changes the visible view
         // container without replacing whichever editor tab is active.
         if mode == .files, sidebarMode != .files, let directory = activeFileDirectory { fileRoot = directory }
-        isHomeFocused = false
+        showsListOverHome = true
         sidebarMode = mode
         if mode == .inbox, isConnected {
             Task { [weak self] in await self?.refreshOperatorInbox() }
@@ -1855,13 +1892,12 @@ final class AppModel: ObservableObject {
 
     func select(_ selection: MuxaSidebarSelection) {
         switch selection {
-        // Fleet Home has its own place on the activity rail, so opening it
-        // leaves the sidebar on whatever list the person was looking at.
-        case .workBoard: break
+        // Home and its Work pages fold the lists away (see
+        // `isSidebarListCollapsed`); the list underneath stays as it was.
+        case .workBoard, .work: break
         case .watch: sidebarMode = .watch
         case .inbox: sidebarMode = .inbox
         case .ask: sidebarMode = .ask
-        case .work: sidebarMode = .work
         case .agent(let id):
             // The side bar stays where the agent is listed — Explore when
             // its pane is in the tree, Work when it takes part in a Work —

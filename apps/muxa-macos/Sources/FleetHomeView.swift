@@ -1,16 +1,10 @@
-// Fleet Home: check what needs you, inspect a unit of work, start more.
+// Home: check what needs you, inspect a unit of work, start more.
 import SwiftUI
 
 struct FleetHomeView: View {
     @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
 
-    private enum Page: Hashable {
-        case board
-        case templates
-    }
-
-    @State private var page: Page = .board
     @State private var selectedID: String?
     @State private var showsHosts = false
     @State private var assignment = ""
@@ -30,12 +24,8 @@ struct FleetHomeView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            switch page {
-            case .board:
-                assignBar
-                board
-            case .templates: WorkCommandCenterView(model: model, pipelinesOnly: true)
-            }
+            assignBar
+            board
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
         .sheet(item: $approvalSeed) { seed in
@@ -58,15 +48,8 @@ struct FleetHomeView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Text("Fleet Home")
+            Text("Home")
                 .font(.system(size: 17, weight: .semibold))
-            Picker("Page", selection: $page) {
-                Text("Board").tag(Page.board)
-                Text("Templates").tag(Page.templates)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
             Spacer(minLength: 8)
             FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
             hostsButton

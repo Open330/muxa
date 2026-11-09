@@ -3660,6 +3660,16 @@
         }
       }
     },
+    "Back to Start Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 시작으로 돌아가기"
+          }
+        }
+      }
+    },
     "Backend" : {
       "localizations" : {
         "ko" : {
@@ -5811,6 +5821,16 @@
         }
       }
     },
+    "Edit pipelines and the routes that pick them" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인과 이를 고르는 라우트를 편집합니다"
+          }
+        }
+      }
+    },
     "Edit the agents, prompts, and after edges of this pipeline" : {
       "localizations" : {
         "ko" : {
@@ -7187,6 +7207,16 @@
         }
       }
     },
+    "Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "홈"
+          }
+        }
+      }
+    },
     "Host" : {
       "localizations" : {
         "ko" : {
@@ -8286,6 +8316,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "메일함"
+          }
+        }
+      }
+    },
+    "Manage Templates…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "템플릿 관리…"
           }
         }
       }
@@ -10670,6 +10710,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Global Ask 열기"
+          }
+        }
+      }
+    },
+    "Open Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "홈 열기"
           }
         }
       }
@@ -16954,6 +17004,16 @@
         }
       }
     },
+    "View: Show Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 홈 표시"
+          }
+        }
+      }
+    },
     "View: Show Inbox" : {
       "localizations" : {
         "ko" : {
@@ -17544,6 +17604,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work 플랜이 준비되었습니다"
+          }
+        }
+      }
+    },
+    "Work Templates" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 템플릿"
           }
         }
       }

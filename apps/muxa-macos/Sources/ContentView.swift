@@ -13,10 +13,16 @@ struct ContentView: View {
     @State private var showingShortcuts = false
     @AppStorage("muxa.sidebar.visible") private var sidebarVisible = true
 
-    /// Just the activity rail, but never narrower than the traffic lights
-    /// above it.
-    private var collapsedSidebarWidth: CGFloat {
-        max(MuxaTheme.activityBarWidth + 1, chrome.leadingInset + 4)
+    /// Just the activity rail and its edge.
+    private var collapsedSidebarWidth: CGFloat { MuxaTheme.activityBarWidth + 1 }
+
+    /// How far the first tab strip moves in to clear the traffic lights:
+    /// all the way with the side bar hidden, the part the rail does not
+    /// cover while the lists are folded away, nothing otherwise.
+    private var firstStripInset: CGFloat {
+        if !sidebarVisible { return chrome.leadingInset }
+        if model.isSidebarListCollapsed { return max(0, chrome.leadingInset - collapsedSidebarWidth) }
+        return 0
     }
 
     var body: some View {
@@ -102,8 +108,16 @@ struct ContentView: View {
         .sheet(item: $model.sessionSnapshotSheet) { sheet in
             SessionSnapshotSheetHost(model: model, sheet: sheet)
         }
-        .sheet(item: $model.pipelineEditorTarget) { target in
+        // While the template manager is open, it presents the editor on
+        // itself (a window shows one sheet at a time).
+        .sheet(item: Binding(
+            get: { model.isPresentingTemplates ? nil : model.pipelineEditorTarget },
+            set: { model.pipelineEditorTarget = $0 }
+        )) { target in
             PipelineEditorView(target: target, model: model)
+        }
+        .sheet(isPresented: $model.isPresentingTemplates) {
+            WorkTemplatesSheet(model: model)
         }
         .muxaNewAgentPresentation(model: model, openEditor: openEditor) // WS-B: new agent
         .muxaSwapSheet(model: model)
@@ -212,8 +226,7 @@ struct ContentView: View {
                         // With the side bar hidden the first strip reaches
                         // the window's leading edge and must clear the
                         // traffic lights.
-                        leadingInset: !sidebarVisible && group.id == tabs.groups.first?.id
-                            ? chrome.leadingInset : 0
+                        leadingInset: group.id == tabs.groups.first?.id ? firstStripInset : 0
                     )
                     // Editors paint backgrounds that ignore the safe area;
                     // the strip is the title bar and must stay on top of
@@ -505,7 +518,7 @@ struct ContentView: View {
             case .liveWatch: openEditor(.watch)
             case .ask: openEditor(.ask)
             case .newShell: model.createShell()
-            case .showWork: model.show(.work)
+            case .showWork: model.showHome()
             case .showWatch: model.show(.watch)
             case .showInbox: model.show(.inbox)
             case .showShells: model.show(.shells)

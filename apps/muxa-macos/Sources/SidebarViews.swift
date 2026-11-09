@@ -147,11 +147,13 @@ struct MuxaSidebar: View {
                 // The title bar row: the traffic lights, then the view's
                 // title and actions (see WorkbenchWindowChrome.swift).
                 HStack(spacing: 0) {
-                    Color.clear.frame(width: max(0, chrome.leadingInset - 14))
-                    if !model.isSidebarListCollapsed {
-                        sectionTitle
-                    } else {
+                    if model.isSidebarListCollapsed {
+                        // Only the rail is showing; the traffic lights sit
+                        // over it and the tab strip clears the rest.
                         Spacer(minLength: 0)
+                    } else {
+                        Color.clear.frame(width: max(0, chrome.leadingInset - 14))
+                        sectionTitle
                     }
                 }
                 .frame(height: chrome.rowHeight)
@@ -963,7 +965,7 @@ private struct SidebarActivityRail: View {
             // its badge counts what is waiting for the person.
             ActivityRailItem(
                 systemImage: "house",
-                title: String(localized: "Fleet Home"),
+                title: String(localized: "Home"),
                 active: model.isSidebarListCollapsed,
                 badge: FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
                     .filter { $0.lane == .needsYou }.count,
@@ -972,7 +974,7 @@ private struct SidebarActivityRail: View {
             MuxaTheme.border(colorScheme)
                 .frame(width: MuxaTheme.activityBarWidth - 18, height: 1)
                 .padding(.vertical, 4)
-            ForEach(MuxaSidebarMode.allCases) { mode in
+            ForEach(MuxaSidebarMode.railModes) { mode in
                 ActivityRailItem(
                     systemImage: mode.systemImage,
                     title: mode.title,

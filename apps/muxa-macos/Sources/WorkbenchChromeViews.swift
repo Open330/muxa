@@ -217,7 +217,7 @@ struct WorkspaceTabBar: View {
         case .file(let location):
             location.name
         case .workBoard:
-            String(localized: "Fleet Home")
+            String(localized: "Home")
         case .watch:
             String(localized: "Live Watch")
         case .inbox:

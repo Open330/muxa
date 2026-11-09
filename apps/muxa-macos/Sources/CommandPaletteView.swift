@@ -53,7 +53,7 @@ enum MuxaPaletteCommand: String, CaseIterable, Identifiable {
         case .liveWatch: String(localized: "Watch: Open native Live Watch")
         case .ask: String(localized: "Ask: Open global Ask")
         case .newShell: String(localized: "Shell: New native shell")
-        case .showWork: String(localized: "View: Show Work")
+        case .showWork: String(localized: "View: Show Home")
         case .showWatch: String(localized: "View: Show Explore")
         case .showInbox: String(localized: "View: Show Inbox")
         case .showShells: String(localized: "View: Show Shells")
