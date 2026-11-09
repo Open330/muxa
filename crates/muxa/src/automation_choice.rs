@@ -296,32 +296,27 @@ fn full_match(pattern: &str, text: &str) -> bool {
     Regex::new(&format!(r"\A(?:{pattern})\z")).is_ok_and(|anchored| anchored.is_match(text))
 }
 
-/// A command's lines with their indentation and blank lines dropped, so the
-/// command a hook reported and the same command on screen compare equal.
-fn normalized(command: &str) -> String {
-    command
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
 /// Whether a `screen`-filtered `press_enter` rule may confirm the dialog on
 /// screen. Two independent readings must agree: the command the agent's
 /// hook reported for its pending shell call, and the command read from the
-/// recognized dialog. The pattern must match that command in full. A
-/// missing hook command, an unrecognized dialog, a mismatch (a wrapped,
-/// truncated or different command on screen) or a partial match refuses.
+/// recognized dialog. Only a single-line command qualifies, compared and
+/// matched exactly as the hook reported it: in shell source, blank lines,
+/// line breaks and whitespace can change what runs, so nothing is trimmed
+/// or rejoined to make two readings agree. A missing hook command, a
+/// multi-line one, an unrecognized dialog, any difference from the screen,
+/// or a partial match refuses.
 #[must_use]
 pub fn approval_matches(raw: &str, hook_command: Option<&str>, pattern: &str) -> bool {
-    let Some(hook) = hook_command.map(normalized).filter(|hook| !hook.is_empty()) else {
+    let Some(hook) = hook_command else {
         return false;
     };
+    if hook.is_empty() || hook.contains(['\n', '\r']) || hook.trim() != hook {
+        return false;
+    }
     let Some(screen) = choice_command(raw) else {
         return false;
     };
-    normalized(&screen) == hook && full_match(pattern, &hook)
+    screen == hook && full_match(pattern, hook)
 }
 
 #[cfg(test)]
@@ -564,5 +559,26 @@ mod tests {
         );
         assert_eq!(read(serde_json::json!([1, 2])), None);
         assert_eq!(shell_command(None), None);
+    }
+
+    #[test]
+    fn only_a_single_line_command_exactly_as_reported_can_be_approved() {
+        // Backslash-newline continues `echo`; a blank line after it ends the
+        // command, so `rm` runs. The two must never compare equal.
+        let approved = "echo safe \\\nrm -rf /tmp/private";
+        let actual = "echo safe \\\n\nrm -rf /tmp/private";
+        let screen = claude("│   echo safe \\\n│\n│   rm -rf /tmp/private");
+        let literal = regex::escape(approved);
+        assert!(!approval_matches(&screen, Some(actual), &literal));
+        assert!(!approval_matches(&screen, Some(approved), &literal));
+        // Quoted multi-line text is multi-line too.
+        let quoted = claude("│   echo \"a\n│   b\"");
+        assert!(!approval_matches(&quoted, Some("echo \"a\n  b\""), ".*"));
+        // Whitespace is never trimmed to make a match.
+        let padded = codex("  $ npm test");
+        assert!(!approval_matches(&padded, Some(" npm test"), "npm test"));
+        assert!(!approval_matches(&padded, Some("npm test "), "npm test"));
+        assert!(!approval_matches(&padded, Some("npm test\r"), "npm test"));
+        assert!(approval_matches(&padded, Some("npm test"), "npm test"));
     }
 }
