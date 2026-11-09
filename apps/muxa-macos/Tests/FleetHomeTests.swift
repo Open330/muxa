@@ -585,3 +585,14 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     MuxaHostIcons.set(nil, for: "mini", defaults: defaults)
     #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "server.rack")
 }
+
+@Test func reviewKeysMapArrowsAndLetters() {
+    #expect(FleetReviewKey.from(keyCode: 124, characters: nil) == .looksGood)
+    #expect(FleetReviewKey.from(keyCode: 123, characters: nil) == .later)
+    #expect(FleetReviewKey.from(keyCode: 49, characters: " ") == .open)
+    #expect(FleetReviewKey.from(keyCode: 125, characters: nil) == .next)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "E") == .looksGood)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "r") == .sendBack)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "k") == .previous)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "x") == nil)
+}

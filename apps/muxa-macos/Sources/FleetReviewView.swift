@@ -115,6 +115,87 @@ struct FleetReviewView: View {
     }
 }
 
+/// The review's keys, caught for the whole sheet so a scroll view or list
+/// holding focus cannot swallow them; typing in a text field is left alone.
+enum FleetReviewKey: Equatable {
+    case looksGood, later, sendBack, open, next, previous
+
+    /// → / E Looks Good, ← / L Later, R Send Back, Space / O Open,
+    /// ↓ / J next, ↑ / K previous.
+    static func from(keyCode: UInt16, characters: String?) -> FleetReviewKey? {
+        switch keyCode {
+        case 124: return .looksGood
+        case 123: return .later
+        case 125: return .next
+        case 126: return .previous
+        case 49: return .open
+        default: break
+        }
+        switch characters?.lowercased() {
+        case "e": return .looksGood
+        case "l": return .later
+        case "r": return .sendBack
+        case "o": return .open
+        case "j": return .next
+        case "k": return .previous
+        default: return nil
+        }
+    }
+}
+
+private struct FleetReviewKeyMonitor: NSViewRepresentable {
+    let handle: (FleetReviewKey) -> Bool
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        context.coordinator.install(handle: handle)
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        context.coordinator.handle = handle
+    }
+
+    static func dismantleNSView(_ view: NSView, coordinator: Coordinator) {
+        coordinator.remove()
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    final class Coordinator {
+        var handle: ((FleetReviewKey) -> Bool)?
+        private var monitor: Any?
+
+        func install(handle: @escaping (FleetReviewKey) -> Bool) {
+            self.handle = handle
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+                // Leave modified keys and typing in a text field alone.
+                guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
+                      !(NSApp.keyWindow?.firstResponder is NSTextView),
+                      let key = FleetReviewKey.from(keyCode: event.keyCode, characters: event.charactersIgnoringModifiers),
+                      let handle = self?.handle,
+                      handle(key) else { return event }
+                return nil
+            }
+        }
+
+        func remove() {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+        }
+
+        deinit { remove() }
+    }
+}
+
+extension View {
+    /// Handles the review keys while the view is on screen; `handle`
+    /// returns whether it used the key.
+    func onFleetReviewKey(_ handle: @escaping (FleetReviewKey) -> Bool) -> some View {
+        background(FleetReviewKeyMonitor(handle: handle).frame(width: 0, height: 0))
+    }
+}
+
 /// The three things to do with a result, shared by every mode.
 struct FleetReviewActions {
     let looksGood: (FleetWork) -> Void
@@ -190,47 +271,35 @@ private struct FleetReviewButtons: View {
     let work: FleetWork
     let actions: FleetReviewActions
     @Binding var sendingBack: Bool
-    var keys: Bool = true
 
     var body: some View {
         HStack(spacing: 10) {
-            button("Later", systemImage: "arrow.left", key: .leftArrow) { actions.later(work) }
-            button("Send Back", systemImage: "arrow.uturn.down", key: KeyEquivalent("r")) { sendingBack.toggle() }
+            button("Later", systemImage: "arrow.left", hint: "← L") { actions.later(work) }
+            button("Send Back", systemImage: "arrow.uturn.down", hint: "R") { sendingBack.toggle() }
             if let focus = work.focus {
-                button("Open", systemImage: "arrow.up.forward.square", key: .space) { actions.open(focus) }
+                button("Open", systemImage: "arrow.up.forward.square", hint: "Space") { actions.open(focus) }
             }
             Spacer(minLength: 0)
             Button {
                 actions.looksGood(work)
             } label: {
-                Label("Looks Good", systemImage: "checkmark")
+                HStack(spacing: 6) {
+                    Label("Looks Good", systemImage: "checkmark")
+                    Text(verbatim: "→ E").font(MuxaType.meta).opacity(0.75)
+                }
             }
             .buttonStyle(.muxaPrimary)
-            .modifier(Shortcut(key: .rightArrow, enabled: keys))
-            .help("Looks Good (→)")
         }
     }
 
-    private func button(_ title: LocalizedStringKey, systemImage: String, key: KeyEquivalent, action: @escaping () -> Void) -> some View {
+    private func button(_ title: LocalizedStringKey, systemImage: String, hint: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Label(title, systemImage: systemImage)
-        }
-        .buttonStyle(.muxaSecondary)
-        .modifier(Shortcut(key: key, enabled: keys))
-    }
-
-    /// Keys stay off while the reply field takes typing.
-    private struct Shortcut: ViewModifier {
-        let key: KeyEquivalent
-        let enabled: Bool
-
-        func body(content: Content) -> some View {
-            if enabled {
-                content.keyboardShortcut(key, modifiers: [])
-            } else {
-                content
+            HStack(spacing: 6) {
+                Label(title, systemImage: systemImage)
+                Text(verbatim: hint).font(MuxaType.meta).foregroundStyle(.tertiary)
             }
         }
+        .buttonStyle(.muxaSecondary)
     }
 }
 
@@ -255,8 +324,8 @@ private struct FleetReviewSendBack: View {
 private struct FleetReviewCards: View {
     let queue: [FleetWork]
     let actions: FleetReviewActions
-    @State private var offset: CGFloat = 0
     @State private var sendingBack = false
+    @State private var offset: CGFloat = 0
 
     var body: some View {
         if let work = queue.first {
@@ -267,9 +336,9 @@ private struct FleetReviewCards: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                     Spacer()
-                    Text("← Later   R Send Back   Space Open   → Looks Good")
+                    Text("→ Looks Good   ← Later   R Send Back   Space Open")
                         .font(MuxaType.meta)
-                        .foregroundStyle(.tertiary)
+                        .foregroundStyle(.secondary)
                 }
                 ZStack {
                     // The next card, peeking under the current one.
@@ -284,7 +353,7 @@ private struct FleetReviewCards: View {
                         .rotationEffect(.degrees(Double(offset) / 40))
                         .gesture(swipe(work))
                 }
-                FleetReviewButtons(work: work, actions: actions, sendingBack: $sendingBack, keys: !sendingBack)
+                FleetReviewButtons(work: work, actions: actions, sendingBack: $sendingBack)
                 if sendingBack {
                     FleetReviewSendBack(work: work, actions: actions)
                 }
@@ -293,8 +362,18 @@ private struct FleetReviewCards: View {
             .frame(maxWidth: 760)
             .id(work.id)
             .onChange(of: work.id) { _ in
-                offset = 0
                 sendingBack = false
+                offset = 0
+            }
+            .onFleetReviewKey { key in
+                switch key {
+                case .looksGood: fly(work, right: true)
+                case .later, .next: fly(work, right: false)
+                case .sendBack: sendingBack.toggle()
+                case .open: if let focus = work.focus { actions.open(focus) } else { return false }
+                case .previous: return false
+                }
+                return true
             }
         }
     }
@@ -311,7 +390,7 @@ private struct FleetReviewCards: View {
         .shadow(color: .black.opacity(0.12), radius: 12, y: 4)
     }
 
-    /// Which way the card is being swiped.
+    /// Which way the card is going.
     @ViewBuilder
     private var stamp: some View {
         if offset > 40 {
@@ -321,19 +400,30 @@ private struct FleetReviewCards: View {
         }
     }
 
+    /// Swipe right for Looks Good, left for Later; a short drag springs back.
     private func swipe(_ work: FleetWork) -> some Gesture {
         DragGesture(minimumDistance: 20)
             .onChanged { offset = $0.translation.width }
             .onEnded { value in
                 let distance = value.translation.width
-                if distance > 140 {
-                    actions.looksGood(work)
-                } else if distance < -140 {
-                    actions.later(work)
+                if abs(distance) > 140 {
+                    fly(work, right: distance > 0)
+                } else {
+                    withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { offset = 0 }
                 }
-                withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) { offset = 0 }
             }
     }
+
+    /// The card leaves the way it was sent, by key or by swipe, then the
+    /// action runs and the next card takes its place.
+    private func fly(_ work: FleetWork, right: Bool) {
+        withAnimation(.easeIn(duration: 0.18)) { offset = right ? 900 : -900 }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+            if right { actions.looksGood(work) } else { actions.later(work) }
+            offset = 0
+        }
+    }
+
 }
 
 // MARK: - Inbox: a list and the selected result
@@ -376,7 +466,7 @@ private struct FleetReviewInbox: View {
                             .controlSize(.small)
                     }
                     Spacer()
-                    Text("J/K Move")
+                    Text("↑↓ J/K Move")
                         .font(MuxaType.meta)
                         .foregroundStyle(.tertiary)
                 }
@@ -391,7 +481,7 @@ private struct FleetReviewInbox: View {
                             .padding(20)
                     }
                     VStack(spacing: 10) {
-                        FleetReviewButtons(work: work, actions: actions, sendingBack: $sendingBack, keys: !sendingBack)
+                        FleetReviewButtons(work: work, actions: actions, sendingBack: $sendingBack)
                         if sendingBack {
                             FleetReviewSendBack(work: work, actions: actions)
                         }
@@ -402,10 +492,17 @@ private struct FleetReviewInbox: View {
                 .onChange(of: work.id) { _ in sendingBack = false }
             }
         }
-        .background {
-            // J and K move through the list.
-            Button("") { move(1) }.keyboardShortcut("j", modifiers: []).opacity(0)
-            Button("") { move(-1) }.keyboardShortcut("k", modifiers: []).opacity(0)
+        .onFleetReviewKey { key in
+            guard let work = selected else { return false }
+            switch key {
+            case .next: move(1)
+            case .previous: move(-1)
+            case .looksGood: actions.looksGood(work)
+            case .later: actions.later(work)
+            case .sendBack: sendingBack.toggle()
+            case .open: if let focus = work.focus { actions.open(focus) } else { return false }
+            }
+            return true
         }
     }
 
