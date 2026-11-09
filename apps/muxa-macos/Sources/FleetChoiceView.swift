@@ -3,9 +3,13 @@
 // person's own words through a "Type something" option.
 import SwiftUI
 
-struct FleetChoicePanel: View {
+/// What an agent waiting on the person takes, decided by what is on its
+/// screen rather than by its reported state alone: a numbered choice gets
+/// option buttons; otherwise `fallback` (the answer field) is shown.
+struct FleetChoicePanel<Fallback: View>: View {
     @ObservedObject var model: AppModel
     let hosted: MuxaHostedAgent
+    @ViewBuilder var fallback: () -> Fallback
 
     @State private var dialog: FleetChoiceDialog?
     @State private var loading = false
@@ -14,7 +18,23 @@ struct FleetChoicePanel: View {
     @State private var status: String?
     @State private var error: String?
 
+    init(model: AppModel, hosted: MuxaHostedAgent, @ViewBuilder fallback: @escaping () -> Fallback) {
+        self.model = model
+        self.hosted = hosted
+        self.fallback = fallback
+    }
+
     var body: some View {
+        if dialog == nil, !loading, hosted.agent.state != "waiting_choice" {
+            // Nothing to pick on screen: the agent takes typed words.
+            fallback()
+                .task(id: hosted.agent.stateEnteredAt) { await load() }
+        } else {
+            choiceBody
+        }
+    }
+
+    private var choiceBody: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack {
                 Text("Choice on screen")

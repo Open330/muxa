@@ -724,11 +724,17 @@ private struct FleetWorkInspector: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
-            if FleetBoard.choosesInPane(work), let focus = work.focus, focus.pane != nil {
-                FleetChoicePanel(model: model, hosted: focus)
-                    .id(focus.id)
-            }
-            if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
+            if work.lane == .needsYou, let focus = work.focus, focus.pane != nil,
+               ["waiting_input", "waiting_choice"].contains(focus.agent.state) {
+                // The screen decides: option buttons for a choice, the answer
+                // field for a question that takes words.
+                FleetChoicePanel(model: model, hosted: focus) {
+                    if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
+                        FleetReplyField(work: work, draft: $draft, submit: submit)
+                    }
+                }
+                .id(focus.id)
+            } else if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
                 FleetReplyField(work: work, draft: $draft, submit: submit)
             }
             HStack(spacing: 8) {
