@@ -11,12 +11,42 @@
         }
       }
     },
+    "%lld older" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이전 항목 %lld개"
+          }
+        }
+      }
+    },
     "Add Approval Rule…" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "승인 규칙 추가…"
+          }
+        }
+      }
+    },
+    "All hosts" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 호스트"
+          }
+        }
+      }
+    },
+    "All projects" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 프로젝트"
           }
         }
       }
@@ -3430,6 +3460,16 @@
         }
       }
     },
+    "Asked" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "맡긴 일"
+          }
+        }
+      }
+    },
     "Asking %@…" : {
       "localizations" : {
         "ko" : {
@@ -3650,6 +3690,16 @@
         }
       }
     },
+    "Back to Start Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 시작으로 돌아가기"
+          }
+        }
+      }
+    },
     "Backend" : {
       "localizations" : {
         "ko" : {
@@ -3726,6 +3776,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "차단됨"
+          }
+        }
+      }
+    },
+    "Bottom of the pane" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "창 아래쪽"
           }
         }
       }
@@ -3836,6 +3896,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "호스트·폴더·에이전트를 고른 뒤 이 일로 시작합니다"
+          }
+        }
+      }
+    },
+    "Clear Filters" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "필터 지우기"
           }
         }
       }
@@ -5311,6 +5381,16 @@
         }
       }
     },
+    "Defaults to your home folder; choose the project the agents should work in." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비워 두면 홈 폴더에서 시작합니다. 에이전트가 작업할 프로젝트를 고르세요."
+          }
+        }
+      }
+    },
     "Degraded" : {
       "localizations" : {
         "ko" : {
@@ -5787,6 +5867,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "파이프라인 %@ 편집"
+          }
+        }
+      }
+    },
+    "Edit pipelines and the routes that pick them" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "파이프라인과 이를 고르는 라우트를 편집합니다"
           }
         }
       }
@@ -6394,6 +6484,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "세션 1개 채우기"
+          }
+        }
+      }
+    },
+    "Filter" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "필터"
           }
         }
       }
@@ -7010,6 +7110,16 @@
         }
       }
     },
+    "Go to the full view (⌘↩)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "전체 화면으로 이동 (⌘↩)"
+          }
+        }
+      }
+    },
     "Go: Jump to agent" : {
       "localizations" : {
         "ko" : {
@@ -7127,6 +7237,16 @@
         }
       }
     },
+    "Hide older" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이전 항목 숨기기"
+          }
+        }
+      }
+    },
     "Hide prompt" : {
       "localizations" : {
         "ko" : {
@@ -7153,6 +7273,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이번 릴리스의 주요 변경 사항입니다."
+          }
+        }
+      }
+    },
+    "Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "홈"
           }
         }
       }
@@ -7850,6 +7980,16 @@
         }
       }
     },
+    "Last response" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "마지막 응답"
+          }
+        }
+      }
+    },
     "Latency" : {
       "localizations" : {
         "ko" : {
@@ -7896,6 +8036,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "최근 응답"
+          }
+        }
+      }
+    },
+    "Latest result" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최근 결과"
           }
         }
       }
@@ -8070,6 +8220,16 @@
         }
       }
     },
+    "Live" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실시간"
+          }
+        }
+      }
+    },
     "Live Pane" : {
       "localizations" : {
         "ko" : {
@@ -8226,6 +8386,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "메일함"
+          }
+        }
+      }
+    },
+    "Manage Templates…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "템플릿 관리…"
           }
         }
       }
@@ -8496,6 +8666,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "자동화에서 더 보기…"
+          }
+        }
+      }
+    },
+    "More options" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "추가 옵션"
           }
         }
       }
@@ -8971,6 +9151,16 @@
         }
       }
     },
+    "Needs you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "내 차례"
+          }
+        }
+      }
+    },
     "Needs your decision: %@" : {
       "localizations" : {
         "ko" : {
@@ -9332,12 +9522,32 @@
         }
       }
     },
+    "No output yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 출력이 없습니다."
+          }
+        }
+      }
+    },
     "No pipelines yet. Muxa ships presets for one, two, and three agents." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "아직 파이프라인이 없습니다. 에이전트 1~3개용 프리셋이 준비되어 있습니다."
+          }
+        }
+      }
+    },
+    "No project" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프로젝트 없음"
           }
         }
       }
@@ -10594,6 +10804,16 @@
         }
       }
     },
+    "Open Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "홈 열기"
+          }
+        }
+      }
+    },
     "Open Host" : {
       "localizations" : {
         "ko" : {
@@ -11512,12 +11732,42 @@
         }
       }
     },
+    "Project" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프로젝트"
+          }
+        }
+      }
+    },
+    "Project folder" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프로젝트 폴더"
+          }
+        }
+      }
+    },
     "Project folder (use configured route when empty)" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "프로젝트 폴더 (비우면 설정된 라우트 사용)"
+          }
+        }
+      }
+    },
+    "Project folder on %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@의 프로젝트 폴더"
           }
         }
       }
@@ -13185,6 +13435,16 @@
         }
       }
     },
+    "Say what needs to get done. The agents work out the rest." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "해야 할 일만 적으세요. 나머지는 에이전트가 판단합니다."
+          }
+        }
+      }
+    },
     "Send a follow-up so the agent carries on" : {
       "localizations" : {
         "ko" : {
@@ -13211,6 +13471,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "“continue” 보내기"
+          }
+        }
+      }
+    },
+    "Session recap" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "세션 요약"
           }
         }
       }
@@ -13271,6 +13541,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "더 보기"
+          }
+        }
+      }
+    },
+    "Show one host or one project" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트나 프로젝트 하나만 보기"
+          }
+        }
+      }
+    },
+    "Show pane" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "창 화면 보기"
           }
         }
       }
@@ -15204,6 +15494,16 @@
         }
       }
     },
+    "Team" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "팀"
+          }
+        }
+      }
+    },
     "Terminal" : {
       "localizations" : {
         "ko" : {
@@ -15895,6 +16195,16 @@
         }
       }
     },
+    "This agent is no longer running." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 에이전트는 더 이상 실행 중이 아닙니다."
+          }
+        }
+      }
+    },
     "This agent is not attached to a pane" : {
       "localizations" : {
         "ko" : {
@@ -16386,6 +16696,16 @@
         }
       }
     },
+    "Type the project path on %@." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에서의 프로젝트 경로를 입력하세요."
+          }
+        }
+      }
+    },
     "Typed after the conversation resumes on the new account, so the turn the limit cut off carries on." : {
       "localizations" : {
         "ko" : {
@@ -16844,6 +17164,16 @@
         }
       }
     },
+    "View: Show Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보기: 홈 표시"
+          }
+        }
+      }
+    },
     "View: Show Inbox" : {
       "localizations" : {
         "ko" : {
@@ -17146,6 +17476,16 @@
         }
       }
     },
+    "What needs to get done? For example: fix the login timeout on slow networks and add a test." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "무엇을 해야 하나요? 예: 느린 네트워크에서 로그인 시간 초과를 고치고 테스트를 추가하기"
+          }
+        }
+      }
+    },
     "What should an agent do?" : {
       "localizations" : {
         "ko" : {
@@ -17434,6 +17774,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work 플랜이 준비되었습니다"
+          }
+        }
+      }
+    },
+    "Work Templates" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 템플릿"
           }
         }
       }

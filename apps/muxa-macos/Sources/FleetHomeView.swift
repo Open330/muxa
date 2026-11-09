@@ -1,25 +1,21 @@
-// Fleet Home: check what needs you, inspect a unit of work, start more.
+// Home: check what needs you, inspect a unit of work, start more.
 import SwiftUI
 
 struct FleetHomeView: View {
     @ObservedObject var model: AppModel
     @Environment(\.colorScheme) private var colorScheme
 
-    private enum Page: Hashable {
-        case board
-        case templates
-    }
-
-    @State private var page: Page = .board
     @State private var selectedID: String?
     @State private var showsHosts = false
-    @State private var assignment = ""
+    @State private var hostFilter: String?
+    @State private var projectFilter: String?
     @State private var reviewed = FleetReviewMarks(defaults: .standard)
     @State private var showsReviewed = false
     /// Reply drafts per unit, kept while the inspector closes or the unit's
     /// focus changes, each bound to the question it was written for.
     @State private var drafts: [String: FleetReplyDraft] = [:]
     @State private var approvalSeed: FleetApprovalSeed?
+    @State private var quickLook: FleetQuickLookTarget?
 
     private var allWorks: [FleetWork] {
         FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
@@ -29,16 +25,22 @@ struct FleetHomeView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            switch page {
-            case .board:
-                assignBar
-                board
-            case .templates: WorkCommandCenterView(model: model, pipelinesOnly: true)
-            }
+            board
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
         .sheet(item: $approvalSeed) { seed in
             FleetApprovalRuleSheet(model: model, seed: seed)
+        }
+        .sheet(item: $quickLook) { target in
+            let work = allWorks.first { work in work.agents.contains { $0.id == target.agentID } }
+            FleetQuickLookView(
+                model: model,
+                target: target,
+                work: work,
+                draft: draftBinding(work?.id ?? ""),
+                submit: { if let work { submit(for: work.id) } },
+                openFull: open
+            )
         }
     }
 
@@ -46,18 +48,12 @@ struct FleetHomeView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Text("Fleet Home")
+            Text("Home")
                 .font(.system(size: 17, weight: .semibold))
-            Picker("Page", selection: $page) {
-                Text("Board").tag(Page.board)
-                Text("Templates").tag(Page.templates)
-            }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
             Spacer(minLength: 8)
-            FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
+            filterMenu
             hostsButton
+            FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
             Button {
                 model.presentWorkStart()
             } label: {
@@ -68,6 +64,46 @@ struct FleetHomeView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    /// Narrows the board to one host and/or one project.
+    private var filterMenu: some View {
+        let all = allWorks
+        let hosts = Array(Set(all.flatMap(\.hostAliases))).sorted()
+        let projects = Array(Set(all.compactMap(\.repo))).sorted()
+        let active = hostFilter != nil || projectFilter != nil
+        return Menu {
+            Picker("Host", selection: $hostFilter) {
+                Text("All hosts").tag(String?.none)
+                ForEach(hosts, id: \.self) { Text($0).tag(String?.some($0)) }
+            }
+            Picker("Project", selection: $projectFilter) {
+                Text("All projects").tag(String?.none)
+                ForEach(projects, id: \.self) { Text($0).tag(String?.some($0)) }
+            }
+            if active {
+                Divider()
+                Button("Clear Filters") {
+                    hostFilter = nil
+                    projectFilter = nil
+                }
+            }
+        } label: {
+            Label(filterLabel, systemImage: active ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .foregroundStyle(active ? Color.accentColor : Color.primary)
+        .help("Show one host or one project")
+    }
+
+    private var filterLabel: String {
+        switch (hostFilter, projectFilter) {
+        case (nil, nil): String(localized: "Filter")
+        case (let host?, nil): host
+        case (nil, let project?): project
+        case (let host?, let project?): "\(project) · \(host)"
+        }
     }
 
     private var hostsButton: some View {
@@ -94,40 +130,10 @@ struct FleetHomeView: View {
         }
     }
 
-    // MARK: - Assign
-
-    /// Always there: say what to do, then pick who does it in the sheet.
-    private var assignBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "text.bubble")
-                .foregroundStyle(.secondary)
-            TextField("What should an agent do?", text: $assignment, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...4)
-                .onSubmit(assign)
-            Button("Assign", action: assign)
-                .buttonStyle(.muxaPrimary)
-                .disabled(!model.isConnected || assignment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .help("Choose the host, folder and agent, then start it with this task")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-    }
-
-    private func assign() {
-        let task = assignment.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard model.isConnected, !task.isEmpty else { return }
-        model.presentNewAgent(prompt: task)
-        assignment = ""
-    }
-
     // MARK: - Board
 
     private var board: some View {
-        let all = allWorks
+        let all = FleetBoard.filter(allWorks, host: hostFilter, project: projectFilter)
         let works = all.filter { showsReviewed || !reviewed.hides($0) }
         let hiddenCount = all.filter { reviewed.hides($0) }.count
         let selected = all.first { $0.id == selectedID }
@@ -157,7 +163,9 @@ struct FleetHomeView: View {
         }
         .animation(.easeOut(duration: 0.18), value: selected?.id)
         .onExitCommand { selectedID = nil }
-        .onChange(of: all.map(\.id)) { ids in
+        // Display filters hide units; they are not gone. Prune review marks
+        // against the whole board.
+        .onChange(of: allWorks.map(\.id)) { ids in
             // Only a live board says a unit is gone; a disconnect is not.
             guard model.isConnected, !ids.isEmpty else { return }
             var pruned = reviewed
@@ -171,12 +179,9 @@ struct FleetHomeView: View {
             work: work,
             isReviewed: reviewed.hides(work),
             close: { selectedID = nil },
-            open: open,
+            open: peek,
             openWork: { identity in model.select(.work(identity)) },
-            draft: Binding(
-                get: { drafts[work.id] ?? FleetReplyDraft() },
-                set: { drafts[work.id] = $0.isIdle ? nil : $0 }
-            ),
+            draft: draftBinding(work.id),
             submit: { submit(for: work.id) },
             approveLikeThis: {
                 var seed = FleetApprovalSeed(agent: work.focus)
@@ -240,7 +245,7 @@ struct FleetHomeView: View {
                             works: works.filter { $0.lane == lane },
                             selectedID: selectedID,
                             select: { id in selectedID = selectedID == id ? nil : id },
-                            open: open,
+                            open: peek,
                             reviewedCount: lane == .finished ? reviewedCount : 0,
                             showsReviewed: $showsReviewed
                         )
@@ -250,6 +255,18 @@ struct FleetHomeView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
         }
+    }
+
+    private func draftBinding(_ workID: String) -> Binding<FleetReplyDraft> {
+        Binding(
+            get: { drafts[workID] ?? FleetReplyDraft() },
+            set: { drafts[workID] = $0.isIdle ? nil : $0 }
+        )
+    }
+
+    /// Open on the board: a quick look first, the full view from there.
+    private func peek(_ hosted: MuxaHostedAgent) {
+        quickLook = FleetQuickLookTarget(agentID: hosted.id)
     }
 
     /// An agent's pane when it has a live one, its agent editor otherwise.
@@ -273,6 +290,17 @@ private struct FleetLaneColumn: View {
     let open: (MuxaHostedAgent) -> Void
     var reviewedCount = 0
     @Binding var showsReviewed: Bool
+    @State private var showsOlder = false
+
+    /// Finished units older than a day fold away behind one row.
+    private var shown: [FleetWork] {
+        guard lane == .finished, !showsOlder else { return works }
+        return works.filter { FleetBoard.isRecent($0) }
+    }
+
+    private var olderCount: Int {
+        lane == .finished ? works.filter { !FleetBoard.isRecent($0) }.count : 0
+    }
 
     private var title: String {
         switch lane {
@@ -326,13 +354,27 @@ private struct FleetLaneColumn: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 24)
                     }
-                    ForEach(works) { work in
-                        FleetWorkCard(
-                            work: work,
-                            isSelected: work.id == selectedID,
-                            select: { select(work.id) },
-                            open: open
-                        )
+                    let groups = FleetBoard.byProject(shown)
+                    ForEach(groups) { group in
+                        if groups.count > 1 {
+                            FleetProjectHeader(project: group.project, count: group.works.count)
+                        }
+                        ForEach(group.works) { work in
+                            FleetWorkCard(
+                                work: work,
+                                isSelected: work.id == selectedID,
+                                select: { select(work.id) },
+                                open: open
+                            )
+                        }
+                    }
+                    if olderCount > 0 {
+                        Button(showsOlder ? String(localized: "Hide older") : String(localized: "\(olderCount) older")) {
+                            showsOlder.toggle()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .padding(.top, 2)
                     }
                     if reviewedCount > 0 || (lane == .finished && showsReviewed) {
                         Button(showsReviewed ? String(localized: "Hide reviewed") : String(localized: "Show \(reviewedCount) reviewed")) {
@@ -349,6 +391,31 @@ private struct FleetLaneColumn: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
+/// A project's name over its units in a lane.
+private struct FleetProjectHeader: View {
+    let project: String?
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.system(size: 10))
+            Text(project ?? String(localized: "No project"))
+                .font(.system(size: 11, weight: .semibold))
+                .lineLimit(1)
+            Text("\(count)")
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 4)
+        .padding(.top, 6)
+        .accessibilityElement(children: .combine)
     }
 }
 
@@ -476,14 +543,6 @@ private struct FleetWorkInspector: View {
     let approveLikeThis: () -> Void
     let markReviewed: () -> Void
 
-    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
-
-    /// Text written for a question the unit has moved past.
-    private var isStale: Bool {
-        guard let target = draft.target, draft.hasText else { return false }
-        return target != currentTarget
-    }
-
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             HStack(alignment: .top, spacing: 8) {
@@ -562,8 +621,8 @@ private struct FleetWorkInspector: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
-            if currentTarget != nil || !draft.isIdle {
-                replyField
+            if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
+                FleetReplyField(work: work, draft: $draft, submit: submit)
             }
             HStack(spacing: 8) {
                 if let focus = work.focus {
@@ -601,8 +660,43 @@ private struct FleetWorkInspector: View {
         return String(localized: "Open Pane")
     }
 
-    @ViewBuilder
-    private var replyField: some View {
+
+    private var laneTitle: String {
+        switch work.lane {
+        case .needsYou: String(localized: "Needs your decision")
+        case .running: String(localized: "Now")
+        case .finished: String(localized: "Last result")
+        }
+    }
+
+    private func section<Content: View>(_ title: LocalizedStringKey, @ViewBuilder content: () -> Content) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+            content()
+        }
+    }
+}
+
+/// Answer an agent's question, or send a finished unit back to work. The
+/// draft is the board's, bound to the question it was written for; shared
+/// by the inspector and the quick look.
+struct FleetReplyField: View {
+    let work: FleetWork
+    @Binding var draft: FleetReplyDraft
+    let submit: () -> Void
+
+    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
+
+    /// Text written for a question the unit has moved past.
+    private var isStale: Bool {
+        guard let target = draft.target, draft.hasText else { return false }
+        return target != currentTarget
+    }
+
+    var body: some View {
         let kind = (isStale ? nil : draft.target?.kind) ?? currentTarget?.kind ?? .answer
         VStack(alignment: .leading, spacing: 6) {
             if isStale, let target = draft.target {
@@ -662,24 +756,6 @@ private struct FleetWorkInspector: View {
     private func send() {
         guard !isStale else { return }
         submit()
-    }
-
-    private var laneTitle: String {
-        switch work.lane {
-        case .needsYou: String(localized: "Needs your decision")
-        case .running: String(localized: "Now")
-        case .finished: String(localized: "Last result")
-        }
-    }
-
-    private func section<Content: View>(_ title: LocalizedStringKey, @ViewBuilder content: () -> Content) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(title)
-                .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(.secondary)
-                .textCase(.uppercase)
-            content()
-        }
     }
 }
 

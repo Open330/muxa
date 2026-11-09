@@ -337,3 +337,69 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     draft.edit("", current: a)
     #expect(draft.isIdle)
 }
+
+@Test func quickLookShowsPlainTextOfThePaneBottom() {
+    let screen = "\u{1B}]0;title\u{07}\u{1B}[1mbold\u{1B}[0m line   \nsecond\n\n\n"
+    #expect(FleetQuickLookText.plain(screen) == "bold line\nsecond")
+    let long = (1...60).map(String.init).joined(separator: "\n")
+    #expect(FleetQuickLookText.plain(long, lines: 3) == "58\n59\n60")
+}
+
+@Test func aDigestIsTheOpeningOfTheTextWithoutMarkdown() {
+    #expect(FleetQuickLookText.digest(nil) == nil)
+    #expect(FleetQuickLookText.digest("  \n---\n") == nil)
+    #expect(FleetQuickLookText.digest("## Done\n\n- Fixed the parser\n- Added tests") == "Done Fixed the parser Added tests")
+    let long = "First sentence is here. " + String(repeating: "word ", count: 100)
+    let cut = FleetQuickLookText.digest(long, limit: 60) ?? ""
+    #expect(cut.count <= 61)
+    #expect(cut.hasSuffix("…") || cut.hasSuffix("."))
+}
+
+@Test func theBoardGroupsByProjectFiltersAndFoldsOldFinishes() throws {
+    func solo(_ id: String, path: String?, state: String, at: String) throws -> FleetWork {
+        var fields: [String: Any] = ["state": state, "state_entered_at": at]
+        if let path { fields["cwd"] = path }
+        return FleetBoard.work(for: MuxaHostedAgent(host: host, agent: try agent(fields, id: id), pane: nil), now: .now)
+    }
+    let works = [
+        try solo("a", path: "/src/muxa", state: "working", at: "2026-11-09T03:00:00Z"),
+        try solo("b", path: "/src/site", state: "working", at: "2026-11-09T02:00:00Z"),
+        try solo("c", path: "/src/muxa", state: "working", at: "2026-11-09T01:00:00Z"),
+        try solo("d", path: nil, state: "working", at: "2026-11-09T00:00:00Z"),
+    ]
+    let groups = FleetBoard.byProject(works)
+    #expect(groups.map(\.project) == ["muxa", "site", nil])
+    #expect(groups[0].works.map(\.id) == ["agent:mini:a", "agent:mini:c"])
+    #expect(FleetBoard.filter(works, host: nil, project: "site").map(\.id) == ["agent:mini:b"])
+    #expect(FleetBoard.filter(works, host: "other", project: nil).isEmpty)
+
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    #expect(FleetBoard.isRecent(try solo("e", path: nil, state: "idle", at: "2026-11-09T01:00:00Z"), now: now))
+    #expect(!FleetBoard.isRecent(try solo("f", path: nil, state: "idle", at: "2026-11-07T01:00:00Z"), now: now))
+}
+
+@Test func aWorkIDIsMadeFromTheTask() throws {
+    let date = try #require(MuxaUsageTimestamp.parse("2026-11-09T03:04:00Z"))
+    let id = WorkStartID.make(task: "Fix the login timeout on slow networks", at: date, suffix: "abc123")
+    #expect(id.hasPrefix("fix-the-login-timeout-"))
+    #expect(id.hasSuffix("-abc123"))
+    #expect(WorkStartID.make(task: "로그인 오류 고치기", at: date, suffix: "x").hasPrefix("work-"))
+    // Two forms never share an ID, even for the same task in the same minute.
+    #expect(WorkStartID.suffix() != WorkStartID.suffix())
+    #expect(WorkStartID.make(task: "같은 일", at: date, suffix: WorkStartID.suffix())
+        != WorkStartID.make(task: "같은 일", at: date, suffix: WorkStartID.suffix()))
+}
+
+@Test func aFinishedWorkIsRecentByItsLatestAgent() throws {
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    let old = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "state_entered_at": "2026-11-07T12:00:00Z"], id: "a"), pane: try pane("%1", alias: "x"))
+    let fresh = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "state_entered_at": "2026-11-09T11:00:00Z"], id: "b"), pane: try pane("%2", alias: "y"))
+    let work = FleetBoard.work(for: MuxaWorkGroup(
+        identity: MuxaWorkIdentity(workspaceID: "ws", workID: "w"),
+        pipelineRun: nil,
+        participants: [old, fresh]
+    ), now: now)
+    #expect(work.lane == .finished)
+    #expect(work.focus?.id == old.id)
+    #expect(FleetBoard.isRecent(work, now: now))
+}

@@ -397,7 +397,7 @@ private struct MuxaEditorMenuCommands: Commands {
                 .keyboardShortcut("g", modifiers: [.control, .shift])
                 .disabled(actions?.showChanges == nil)
             Divider()
-            Button("Open Fleet Home") { dispatchActions?.openWorkCommandCenter?() }
+            Button("Open Home") { dispatchActions?.openWorkCommandCenter?() }
                 .keyboardShortcut("1", modifiers: [.command, .shift])
                 .disabled(actions?.openWorkCommandCenter == nil)
             Button("Open Ask") { dispatchActions?.openAsk?() }
@@ -408,7 +408,7 @@ private struct MuxaEditorMenuCommands: Commands {
                 .disabled(actions?.openInbox == nil)
             Divider()
             Menu("Sidebar") {
-                ForEach(MuxaSidebarMode.allCases) { mode in
+                ForEach(MuxaSidebarMode.railModes) { mode in
                     Button(mode.title) { dispatchActions?.selectSidebar?(mode) }
                         .disabled(actions?.selectSidebar == nil)
                 }

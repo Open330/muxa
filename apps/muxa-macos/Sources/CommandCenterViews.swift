@@ -62,7 +62,7 @@ struct WorkCommandCenterView: View {
                     work: model.workGroups.count,
                     hosts: model.fleetHosts.count,
                     openInbox: { model.select(.inbox) },
-                    openWork: { model.show(.work) },
+                    openWork: { model.showHome() },
                     openHosts: { model.show(.watch) }
                 )
 

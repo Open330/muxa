@@ -27,6 +27,10 @@ enum MuxaSidebarMode: String, CaseIterable, Identifiable {
 
     var id: Self { self }
 
+    /// The lists on the activity rail. Work units live on Home, so the Work
+    /// list has no place of its own there.
+    static let railModes: [MuxaSidebarMode] = [.watch, .inbox, .ask, .shells, .files]
+
     var title: String {
         switch self {
         case .work: String(localized: "Work")
@@ -105,8 +109,39 @@ final class AppModel: ObservableObject {
     @Published private(set) var workGroups: [MuxaWorkGroup] = []
     @Published private(set) var hostedAgents: [MuxaHostedAgent] = []
     @Published private(set) var workspaceRevision: UInt64 = 0
-    @Published var sidebarSelection: MuxaSidebarSelection?
-    @Published var sidebarMode: MuxaSidebarMode = .work
+    @Published var sidebarSelection: MuxaSidebarSelection? {
+        didSet {
+            // Coming back to Home folds the lists away again.
+            if Self.isHome(sidebarSelection), !Self.isHome(oldValue) { showsListOverHome = false }
+        }
+    }
+    @Published var sidebarMode: MuxaSidebarMode = .watch
+    /// A list chosen on the rail while Home is in front shows beside it.
+    @Published var showsListOverHome = false
+
+    /// Home and the Work pages opened from it: the units of work, which
+    /// Home manages, so no list column is needed beside them.
+    static func isHome(_ selection: MuxaSidebarSelection?) -> Bool {
+        switch selection {
+        case .workBoard, .work: true
+        default: false
+        }
+    }
+
+    var isHomeEditor: Bool { Self.isHome(sidebarSelection) }
+
+    /// The list column folds away whenever Home (or a Work page) is the
+    /// focused editor, however it got there, until a list is chosen.
+    var isSidebarListCollapsed: Bool { isHomeEditor && !showsListOverHome }
+
+    /// The activity rail's Home: bring Home to the front, lists folded.
+    func showHome() {
+        // Re-selecting brings the Home tab to the front even when the
+        // selection already names it.
+        if sidebarSelection == .workBoard { sidebarSelection = nil }
+        select(.workBoard)
+        showsListOverHome = false
+    }
     @Published var watchSelection: MuxaWatchPaneIdentity?
     @Published private(set) var connectionState: ConnectionState = .connecting
     @Published private(set) var isCreatingSession = false
@@ -116,11 +151,15 @@ final class AppModel: ObservableObject {
     @Published var isPresentingFleetDispatch = false
     @Published private(set) var askUsesSnapshots = false
     @Published var isPresentingWorkStart = false
+    /// The Work templates (pipelines and routes), opened from Start Work.
+    @Published var isPresentingTemplates = false
     /// The Save / Restore snapshot sheet, when one is up. WS-F: snapshot
     @Published var sessionSnapshotSheet: MuxaSessionSnapshotSheet?
     /// Pipeline the Start Work sheet should preselect when opened from a
     /// pipeline card; nil leaves the route default.
     @Published var workStartPreselectedPipeline: String?
+    /// A template chosen in the template manager over an open Start Work.
+    @Published var workStartTemplateChoice: MuxaTemplateChoice?
     /// Routes, pipelines, skills, and presets from `muxa work options` on
     /// the local host. Per-host copies live in `workOptionsByHost`.
     @Published private(set) var workOptions: MuxaWorkOptions?
@@ -809,7 +848,21 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Opens the template manager over Start Work, which stays open with
+    /// its form; a template's Start button returns to it (see
+    /// `presentWorkStart`).
+    func presentTemplates() {
+        isPresentingTemplates = true
+    }
+
     func presentWorkStart(pipeline: String? = nil, host: String? = nil) {
+        if isPresentingWorkStart && isPresentingTemplates {
+            // Chosen in the template manager over an open Start Work: close
+            // the manager and choose that template in the kept form.
+            workStartTemplateChoice = MuxaTemplateChoice(pipeline: pipeline)
+            isPresentingTemplates = false
+            return
+        }
         workStartError = nil
         workStartStatus = nil
         workStartPlan = nil
@@ -1816,6 +1869,7 @@ final class AppModel: ObservableObject {
         // Like VS Code's Activity Bar, this changes the visible view
         // container without replacing whichever editor tab is active.
         if mode == .files, sidebarMode != .files, let directory = activeFileDirectory { fileRoot = directory }
+        showsListOverHome = true
         sidebarMode = mode
         if mode == .inbox, isConnected {
             Task { [weak self] in await self?.refreshOperatorInbox() }
@@ -1837,11 +1891,12 @@ final class AppModel: ObservableObject {
 
     func select(_ selection: MuxaSidebarSelection) {
         switch selection {
-        case .workBoard: sidebarMode = .work
+        // Home and its Work pages fold the lists away (see
+        // `isSidebarListCollapsed`); the list underneath stays as it was.
+        case .workBoard, .work: break
         case .watch: sidebarMode = .watch
         case .inbox: sidebarMode = .inbox
         case .ask: sidebarMode = .ask
-        case .work: sidebarMode = .work
         case .agent(let id):
             // The side bar stays where the agent is listed — Explore when
             // its pane is in the tree, Work when it takes part in a Work —
@@ -1914,7 +1969,6 @@ final class AppModel: ObservableObject {
             // show only exited shells); every other mode falls back to the
             // Work board.
             if sidebarMode != .shells && sidebarMode != .files {
-                sidebarMode = .work
                 self.sidebarSelection = .workBoard
             }
             return
@@ -1928,7 +1982,6 @@ final class AppModel: ObservableObject {
             return
         }
 
-        sidebarMode = .work
         self.sidebarSelection = .workBoard
     }
 
@@ -1977,4 +2030,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+}
+
+/// One choice of a template; a fresh id makes choosing the same template
+/// twice two distinct events.
+struct MuxaTemplateChoice: Equatable {
+    let id = UUID()
+    let pipeline: String?
 }
