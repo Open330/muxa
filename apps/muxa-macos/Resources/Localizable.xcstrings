@@ -1,6 +1,16 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%lld empty sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "빈 세션 %lld개"
+          }
+        }
+      }
+    },
     "%lld helper sessions" : {
       "localizations" : {
         "ko" : {
@@ -47,6 +57,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "승인 규칙 추가…"
+          }
+        }
+      }
+    },
+    "Agents that were opened but never given a task" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "열렸지만 아무 일도 받지 않은 에이전트입니다"
           }
         }
       }
@@ -7273,6 +7293,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "보조 세션"
+          }
+        }
+      }
+    },
+    "Hide empty sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "빈 세션 숨기기"
           }
         }
       }

@@ -524,3 +524,13 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(works.count == 1)
     #expect(works.first?.helpers.count == 300)
 }
+
+@Test func aSessionNeverGivenATaskIsEmpty() throws {
+    let blank = MuxaHostedAgent(host: host, agent: try agent(["state": "idle"], id: "blank"), pane: nil)
+    let used = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Fix the README"], id: "used"), pane: nil)
+    let works = FleetBoard.works(groups: [], agents: [blank, used])
+    #expect(works.first { $0.agents.first?.id == blank.id }?.isEmptySession == true)
+    #expect(works.first { $0.agents.first?.id == used.id }?.isEmptySession == false)
+    #expect(FleetBoard.isEmpty(try agent(["recap": "  "], id: "x")))
+    #expect(!FleetBoard.isEmpty(try agent(["last_response": "Done."], id: "y")))
+}

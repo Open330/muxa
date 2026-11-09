@@ -294,24 +294,35 @@ private struct FleetLaneColumn: View {
     @Binding var showsReviewed: Bool
     @State private var showsOlder = false
     @State private var showsProbable = false
+    @State private var showsEmpty = false
 
-    /// Finished units older than a day fold away behind one row, and so do
-    /// probable helpers, except in Your turn, where nothing is folded.
+    /// Where a card folds outside Your turn, each in exactly one row, so a
+    /// row's count is what opening it shows: a possible helper first, then
+    /// an empty session, then (in Finished) anything older than a day.
+    private enum Fold { case probable, empty, older }
+
+    private func fold(_ work: FleetWork) -> Fold? {
+        guard lane != .needsYou else { return nil }
+        if work.isProbableHelper { return .probable }
+        if work.isEmptySession { return .empty }
+        if lane == .finished, !FleetBoard.isRecent(work) { return .older }
+        return nil
+    }
+
     private var shown: [FleetWork] {
         works.filter { work in
-            if lane != .needsYou, work.isProbableHelper, !showsProbable { return false }
-            if lane == .finished, !showsOlder, !FleetBoard.isRecent(work) { return false }
-            return true
+            switch fold(work) {
+            case .probable: showsProbable
+            case .empty: showsEmpty
+            case .older: showsOlder
+            case nil: true
+            }
         }
     }
 
-    private var probableCount: Int {
-        lane == .needsYou ? 0 : works.filter(\.isProbableHelper).count
-    }
-
-    private var olderCount: Int {
-        lane == .finished ? works.filter { !FleetBoard.isRecent($0) }.count : 0
-    }
+    private var emptyCount: Int { works.filter { fold($0) == .empty }.count }
+    private var probableCount: Int { works.filter { fold($0) == .probable }.count }
+    private var olderCount: Int { works.filter { fold($0) == .older }.count }
 
     private var title: String {
         switch lane {
@@ -378,6 +389,17 @@ private struct FleetLaneColumn: View {
                                 open: open
                             )
                         }
+                    }
+                    if emptyCount > 0 {
+                        Button(showsEmpty
+                            ? String(localized: "Hide empty sessions")
+                            : String(localized: "\(emptyCount) empty sessions")) {
+                            showsEmpty.toggle()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                        .help("Agents that were opened but never given a task")
                     }
                     if probableCount > 0 {
                         Button(showsProbable
