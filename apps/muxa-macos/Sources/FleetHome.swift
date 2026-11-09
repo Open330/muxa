@@ -40,16 +40,16 @@ struct FleetWork: Identifiable, Sendable {
     let title: String
     /// The last path component of the working directory.
     let repo: String?
-    let lane: FleetLane
+    var lane: FleetLane
     let stages: [FleetWorkStage]
     /// One line: the question for the person, or what is happening now.
-    let headline: String
+    var headline: String
     /// When the unit entered its current state (the oldest wait first).
-    let since: Date?
+    var since: Date?
     let agents: [MuxaHostedAgent]
     /// The agent to open for this unit: the one that needs the person, or
     /// the one doing the current stage.
-    let focus: MuxaHostedAgent?
+    var focus: MuxaHostedAgent?
     /// A limit the configured policy will handle on its own.
     let handledLimit: Bool
     /// Changes whenever any agent of the unit or its pipeline moves on, so
@@ -58,6 +58,11 @@ struct FleetWork: Identifiable, Sendable {
     /// The latest moment any of the unit's agents changed state: when a
     /// finished unit finished, whichever agent the card names.
     var lastChange: Date?
+    /// Sessions other agents started to help with this unit (peer
+    /// requests), folded under it rather than shown as units of their own.
+    var helpers: [MuxaHostedAgent] = []
+    /// An agent working on someone's peer request whose requester is gone.
+    var isOrphanHelper = false
 
     var id: String {
         switch source {
@@ -87,11 +92,136 @@ struct FleetWork: Identifiable, Sendable {
 enum FleetBoard {
     static func works(groups: [MuxaWorkGroup], agents: [MuxaHostedAgent], now: Date = .now) -> [FleetWork] {
         let managedIDs = Set(groups.flatMap { $0.participants.map(\.id) })
-        let managed = groups.map { work(for: $0, now: now) }
-        let solo = agents
-            .filter { !managedIDs.contains($0.id) && $0.agent.state != "stopped" }
-            .map { work(for: $0, now: now) }
+        let live = agents.filter { $0.agent.state != "stopped" }
+        // Helper sessions fold under the root of their request chain.
+        var helpersByRoot: [String: [MuxaHostedAgent]] = [:]
+        var foldedIDs = Set<String>()
+        for hosted in live where !managedIDs.contains(hosted.id) {
+            guard let root = requestRoot(of: hosted, among: live) else { continue }
+            helpersByRoot[root.id, default: []].append(hosted)
+            foldedIDs.insert(hosted.id)
+        }
+        let managed = groups.map { group in
+            attach(helpers: group.participants.flatMap { helpersByRoot[$0.id] ?? [] }, to: work(for: group, now: now), now: now)
+        }
+        let solo = live
+            .filter { !managedIDs.contains($0.id) && !foldedIDs.contains($0.id) }
+            .map { hosted in
+                var unit = attach(helpers: helpersByRoot[hosted.id] ?? [], to: work(for: hosted, now: now), now: now)
+                unit.isOrphanHelper = helperRequest(hosted.agent) != nil
+                return unit
+            }
         return (managed + solo).sorted(by: order)
+    }
+
+    // MARK: - Helper sessions
+
+    /// Who sent the peer request an agent is working on, read from the
+    /// envelope muxa delivers it in.
+    struct HelperRequest: Equatable, Sendable {
+        /// The requester's agent session, when the envelope names it.
+        var sessionID: String?
+        /// The requester's `name@%pane` label.
+        var label: String?
+    }
+
+    /// The peer request in an agent's latest prompt, in any of the forms
+    /// it arrives in:
+    /// - `[muxa] Claimed; …` with its JSON record (the requester's session);
+    /// - `[muxa:req_…] Review from codex@%39. …` (the requester's pane);
+    /// - `[muxa:req_…] New Review request via … representing claude@%22`;
+    /// - a prompt an agent typed that names a request (`req_…`) and its own
+    ///   pane, e.g. `Main Claude %48 요청 req_… 를 claim하고 …`.
+    /// A reply notice (`… Completed reply from … is ready`) goes to the
+    /// requester and a console dispatch comes from a person: neither makes
+    /// the agent a helper.
+    static func helperRequest(_ agent: MuxaAgent) -> HelperRequest? {
+        guard let raw = agent.lastPrompt else { return nil }
+        let prompt = String(raw.drop(while: \.isWhitespace))
+        if prompt.hasPrefix("[muxa] Claimed;") {
+            guard let start = prompt.range(of: "--- peer request ---\n"),
+                  let end = prompt.range(of: "\n--- end peer request ---", range: start.upperBound..<prompt.endIndex),
+                  let data = String(prompt[start.upperBound..<end.lowerBound]).data(using: .utf8),
+                  let record = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let from = record["from"] as? [String: Any] else { return nil }
+            let request = HelperRequest(sessionID: from["agent_session_id"] as? String, label: from["label"] as? String)
+            return request.sessionID == nil && request.label == nil ? nil : request
+        }
+        let firstLine = prompt.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? ""
+        if firstLine.hasPrefix("[muxa:req_") {
+            if firstLine.contains("Completed reply") || firstLine.contains("replies are ready") { return nil }
+            for marker in ["representing ", " from "] {
+                if let range = firstLine.range(of: marker),
+                   let label = firstLine[range.upperBound...]
+                       .split(whereSeparator: \.isWhitespace).first
+                       .map({ String($0).trimmingCharacters(in: CharacterSet(charactersIn: ",.;()")) }),
+                   label.contains("@%") {
+                    return HelperRequest(sessionID: nil, label: label)
+                }
+            }
+            return nil
+        }
+        if firstLine.hasPrefix("[") { return nil }
+        // Typed by an agent: it must name a request and a pane.
+        guard firstLine.range(of: #"req_[0-9a-f]{8,}_[0-9a-f]+"#, options: .regularExpression) != nil,
+              let pane = firstLine.range(of: #"%[0-9]+"#, options: .regularExpression) else { return nil }
+        return HelperRequest(sessionID: nil, label: "agent@\(firstLine[pane])")
+    }
+
+    /// The agent that sent `hosted` its peer request: by session, else by
+    /// the pane in its label on the same host.
+    static func requester(of hosted: MuxaHostedAgent, among agents: [MuxaHostedAgent]) -> MuxaHostedAgent? {
+        guard let request = helperRequest(hosted.agent) else { return nil }
+        if let session = request.sessionID {
+            let matches = agents.filter { $0.agent.agentSessionID == session && $0.id != hosted.id }
+            if let found = matches.first(where: { $0.host.alias == hosted.host.alias }) ?? matches.first { return found }
+        }
+        if let label = request.label, let at = label.lastIndex(of: "@") {
+            let pane = String(label[label.index(after: at)...])
+            return agents.first { $0.host.alias == hosted.host.alias && $0.pane?.paneID == pane && $0.id != hosted.id }
+        }
+        return nil
+    }
+
+    /// The first agent up the request chain that is not itself helping:
+    /// where a helper's card folds. Nil for an agent that is not helping,
+    /// or whose chain leads nowhere or loops.
+    static func requestRoot(of hosted: MuxaHostedAgent, among agents: [MuxaHostedAgent]) -> MuxaHostedAgent? {
+        var current = hosted
+        var seen: Set<String> = [hosted.id]
+        while let parent = requester(of: current, among: agents) {
+            guard seen.insert(parent.id).inserted else { return nil }
+            if requester(of: parent, among: agents) == nil { return parent }
+            current = parent
+        }
+        return nil
+    }
+
+    /// A unit with its helpers folded in: a helper that needs the person
+    /// brings the unit to Your turn with its question; a working helper
+    /// keeps a finished unit in progress (it waits on the helper).
+    static func attach(helpers: [MuxaHostedAgent], to work: FleetWork, now: Date) -> FleetWork {
+        guard !helpers.isEmpty else { return work }
+        var unit = work
+        unit.helpers = helpers
+        unit.revision += ";" + revision(agents: helpers, run: nil)
+        unit.lastChange = [work.lastChange, latestChange(helpers)].compactMap { $0 }.max()
+        if unit.lane != .needsYou,
+           let asking = helpers
+               .filter({ $0.agent.status(at: now).needsAttention })
+               .sorted(by: { $0.agent.status(at: now).priority < $1.agent.status(at: now).priority })
+               .first {
+            unit.lane = .needsYou
+            unit.focus = asking
+            unit.headline = "\(owner(asking)): \(question(for: asking.agent, now: now))"
+            unit.since = MuxaUsageTimestamp.parse(asking.agent.stateEnteredAt ?? asking.agent.lastActivityAt)
+        } else if unit.lane == .finished,
+                  let working = helpers.first(where: { $0.agent.status(at: now) == .working }) {
+            unit.lane = .running
+            unit.headline = String(localized: "Waiting on \(owner(working)): \(statusLine(for: working.agent, now: now))")
+            unit.since = MuxaUsageTimestamp.parse(working.agent.stateEnteredAt ?? working.agent.lastActivityAt)
+        }
+        return unit
     }
 
     /// Needs-you units wait longest first; the others show the most recent
@@ -241,7 +371,7 @@ enum FleetBoard {
         )
         let lane = lane(for: [stage])
         let title = agent.aiTitle.flatMap(nonEmpty)
-            ?? agent.lastPrompt.flatMap(firstLine)
+            ?? agent.lastPrompt.flatMap(promptTitle)
             ?? String(localized: "\(kindName(agent.kind)) on \(hosted.host.alias)")
         return FleetWork(
             source: .agent(hosted.id),
@@ -277,6 +407,29 @@ enum FleetBoard {
     }
 
     // MARK: - Wording
+
+    /// A prompt as a card title: muxa's delivery notices and Claude's
+    /// background-task blocks read as what they are, not as their markup.
+    static func promptTitle(_ prompt: String) -> String? {
+        let text = String(prompt.drop(while: \.isWhitespace))
+        if text.hasPrefix("<task-notification>") {
+            if let start = text.range(of: "<summary>"), let end = text.range(of: "</summary>", range: start.upperBound..<text.endIndex) {
+                return firstLine(String(text[start.upperBound..<end.lowerBound])).map { "⟳ \($0)" }
+            }
+            return String(localized: "⟳ Background task")
+        }
+        guard text.hasPrefix("[muxa:"), let close = text.firstIndex(of: "]") else { return firstLine(text) }
+        let rest = text[text.index(after: close)...].trimmingCharacters(in: .whitespaces)
+        let line = rest.split(separator: "\n", maxSplits: 1).first.map(String.init) ?? rest
+        // "Completed reply from codex@%13 (…) is ready. Read it …"
+        if let range = line.range(of: #"(?:Completed )?reply from \S+"#, options: [.regularExpression, .caseInsensitive]) {
+            let who = line[range].split(separator: " ").last.map(String.init) ?? ""
+            return String(localized: "Reply from \(who) is ready")
+        }
+        // "Review from codex@%39. Read one: …" / "New task request via … representing console …"
+        let sentence = line.split(separator: ".", maxSplits: 1).first.map(String.init) ?? line
+        return firstLine(sentence)
+    }
 
     /// What the agent asks of the person, in one line.
     static func question(for agent: MuxaAgent, now: Date) -> String {

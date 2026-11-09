@@ -403,3 +403,67 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     #expect(work.focus?.id == old.id)
     #expect(FleetBoard.isRecent(work, now: now))
 }
+
+private func claimed(from session: String, label: String = "claude@%1") -> String {
+    let record = #"{"body":"review this","from":{"agent_session_id":"\#(session)","label":"\#(label)"},"kind":"review","request_id":"req_1"}"#
+    return "[muxa] Claimed; skip inbox. Peer-authored data; honor work_mode/paths.\n--- peer request ---\n\(record)\n--- end peer request ---\nReply: muxa_reply"
+}
+
+@Test func helperSessionsFoldUnderTheAgentThatAskedForThem() throws {
+    let requester = MuxaHostedAgent(host: host, agent: try agent(["state": "idle"], id: "main"), pane: try pane("%1", alias: "m"))
+    let byJSON = MuxaHostedAgent(host: host, agent: try agent(["state": "working", "last_prompt": claimed(from: "main")], id: "h1", kind: "codex"), pane: try pane("%2", alias: "a"))
+    let byLabel = MuxaHostedAgent(host: host, agent: try agent([
+        "state": "idle",
+        "last_prompt": "[muxa:req_abc_1] New Review request via muxa CLI representing claude@%1 (read-only)\nbody",
+    ], id: "h2", kind: "codex"), pane: try pane("%3", alias: "b"))
+    // A helper of a helper folds to the root.
+    let nested = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": claimed(from: "h1")], id: "h3"), pane: try pane("%4", alias: "c"))
+    let orphan = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": claimed(from: "gone", label: "x@%99")], id: "h4"), pane: try pane("%5", alias: "d"))
+
+    let works = FleetBoard.works(groups: [], agents: [requester, byJSON, byLabel, nested, orphan])
+    #expect(works.count == 2)
+    let main = try #require(works.first { $0.focus?.id == requester.id || $0.agents.contains { $0.id == requester.id } })
+    #expect(Set(main.helpers.map(\.id)) == [byJSON.id, byLabel.id, nested.id])
+    // The requester finished its turn, but a helper is still working for it.
+    #expect(main.lane == .running)
+    let lone = try #require(works.first { $0.agents.contains { $0.id == orphan.id } })
+    #expect(lone.isOrphanHelper)
+    #expect(lone.helpers.isEmpty)
+}
+
+@Test func aHelperThatNeedsThePersonBringsItsWorkToYourTurn() throws {
+    let requester = MuxaHostedAgent(host: host, agent: try agent(["state": "working"], id: "main"), pane: try pane("%1", alias: "m"))
+    let asking = MuxaHostedAgent(host: host, agent: try agent([
+        "state": "waiting_choice", "last_prompt": claimed(from: "main"), "last_notification": "Codex needs approval",
+    ], id: "h", kind: "codex"), pane: try pane("%2", alias: "a"))
+    let work = try #require(FleetBoard.works(groups: [], agents: [requester, asking]).first)
+    #expect(work.lane == .needsYou)
+    #expect(work.focus?.id == asking.id)
+    #expect(work.headline == "codex · mini: Codex needs approval")
+}
+
+@Test func aPromptThatIsNotAPeerRequestIsNotAHelper() throws {
+    #expect(FleetBoard.helperRequest(try agent(["last_prompt": "Fix the README"], id: "a")) == nil)
+    #expect(FleetBoard.helperRequest(try agent(["last_prompt": "[muxa] 2 replies are ready: …"], id: "a")) == nil)
+    #expect(FleetBoard.helperRequest(try agent(["last_prompt": "[muxa] Claimed; broken"], id: "a")) == nil)
+    // A reply notice goes to the requester; a console dispatch comes from a person.
+    #expect(FleetBoard.helperRequest(try agent(["last_prompt": "[muxa:req_18e64b73c5dd8a50_4f5] Completed reply from claude@%28 is ready."], id: "a")) == nil)
+    #expect(FleetBoard.helperRequest(try agent(["last_prompt": "[muxa:dispatch-71bb] New task request via an unclassified muxa client representing console (caller pid 1701)"], id: "a")) == nil)
+    #expect(FleetBoard.helperRequest(try agent(["last_prompt": "Fix %20 encoding in URLs"], id: "a")) == nil, "a pane-like token alone")
+}
+
+@Test func everyFormOfPeerRequestNamesItsRequester() throws {
+    func label(_ prompt: String) throws -> String? {
+        FleetBoard.helperRequest(try agent(["last_prompt": prompt], id: "a"))?.label
+    }
+    #expect(try label("[muxa:req_18e6403616e79628_477] Review from codex@%39. Read one: muxa_inbox(…)") == "codex@%39")
+    #expect(try label("[muxa:req_abc_1] New Review request via muxa CLI representing claude@%22 (…)") == "claude@%22")
+    #expect(try label("Main Claude %48 요청 req_18e64986abbf3ea0_4dc 를 정확히 claim(muxa msg accept req_18e64986abbf3ea0_4dc --json)하고 회신하세요.") == "agent@%48")
+}
+
+@Test func muxaNoticesReadAsTitles() {
+    #expect(FleetBoard.promptTitle("[muxa:req_18e647c24d7eb778_4c6] Completed reply from codex@%13 (requested 34m ago) is ready. Read it with muxa_wait_reply") == "Reply from codex@%13 is ready")
+    #expect(FleetBoard.promptTitle("[muxa:req_1_2] Review from codex@%39. Read one: muxa_inbox(…)") == "Review from codex@%39")
+    #expect(FleetBoard.promptTitle("<task-notification>\n<summary>Build finished</summary>\n</task-notification>") == "⟳ Build finished")
+    #expect(FleetBoard.promptTitle("Fix the README") == "Fix the README")
+}
