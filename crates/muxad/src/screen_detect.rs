@@ -1129,6 +1129,7 @@ mod tests {
                 id: real.clone(),
                 tool: "run_command".into(),
                 subagent: None,
+                command: None,
                 at: AT,
             })
             .await;
@@ -1377,6 +1378,7 @@ mod claude_recovery_tests {
                 id: id.clone(),
                 tool: "Bash".into(),
                 subagent: None,
+                command: None,
                 at: AT + time::Duration::seconds(1),
             })
             .await;

@@ -66,6 +66,7 @@ fn make_realistic_agent() -> Agent {
         recap: None,
         ai_title: None,
         last_notification: Some("permission needed for tool: Bash(rm -rf /tmp/cache)".into()),
+        pending_command: None,
         model: Some("claude-opus-4-7".into()),
         context_used_pct: Some(48.5),
         cost_usd: Some(2.34),

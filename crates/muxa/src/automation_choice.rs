@@ -23,9 +23,15 @@ static ONE_TIME: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^(?:yes|proceed|continue|yes,? proceed|yes,? continue)(?:[\t ]*\([a-z]\))?$")
         .expect("static one-time label regex")
 });
-/// Any option row, selected or not: `1. …`, `› 2) …`.
+/// Any option row, selected or not: `1. …`, `› 2) …`, with its number.
 static OPTION_ROW: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^[\t ]*(?:│[\t ]*)?(?:[>›❯][\t ]*)?\d+[.)][\t ]").expect("static option row regex")
+    Regex::new(r"^[\t ]*(?:│[\t ]*)?(?:[>›❯][\t ]*)?(?P<number>\d+)[.)][\t ]")
+        .expect("static option row regex")
+});
+/// The unselected rows an unnumbered confirmation may list under its Yes.
+static SHORT_OPTION: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)^(?:no|cancel|exit|quit|skip|no, (?:exit|quit|cancel))$")
+        .expect("static short option regex")
 });
 static FOOTER: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
@@ -72,10 +78,28 @@ fn content(line: &str) -> &str {
     line.trim().trim_matches(|c| c == '│' || c == '|').trim()
 }
 
-/// The selected row's index, when the screen is a confirmation choice: a
-/// footer, exactly one highlighted row, a label that is a one-time Yes, and
-/// no wrapped continuation of that label on the next line.
-fn selected_affirmative_row(visible: &[String]) -> Option<usize> {
+/// The number on an option row, if it is one.
+fn option_number(line: &str) -> Option<u32> {
+    OPTION_ROW
+        .captures(line)?
+        .name("number")?
+        .as_str()
+        .parse()
+        .ok()
+}
+
+/// Whether a line ends the options block: blank, the footer, or a box's
+/// bottom edge.
+fn ends_options(line: &str) -> bool {
+    content(line).is_empty() || FOOTER.is_match(line) || line.trim_start().starts_with(['╰', '└'])
+}
+
+/// The selected row's index and number, when the screen is a confirmation
+/// choice: a footer, exactly one highlighted row whose label is a complete
+/// one-time Yes, and under it only the remaining options (numbered on in
+/// order, or short unnumbered labels) up to the footer. Any other line
+/// there, such as a label wrapped onto the next line, refuses the screen.
+fn selected_affirmative_row(visible: &[String]) -> Option<(usize, Option<u32>)> {
     if !FOOTER.is_match(&visible.join("\n")) {
         return None;
     }
@@ -91,18 +115,19 @@ fn selected_affirmative_row(visible: &[String]) -> Option<usize> {
     if !ONE_TIME.is_match(label) {
         return None;
     }
-    // A label that wrapped continues on the next line, indented and in
-    // lower case ("ask again for …"); refuse it rather than guess.
-    if let Some(next) = visible.get(index + 1) {
-        let inner = next.trim_start_matches([' ', '\t', '│']);
-        if !OPTION_ROW.is_match(next)
-            && inner.len() < next.len()
-            && inner.chars().next().is_some_and(char::is_lowercase)
-        {
-            return None;
+    let number = option_number(selected);
+    let mut expected = number.map(|n| n + 1);
+    for line in &visible[index + 1..] {
+        if ends_options(line) {
+            break;
+        }
+        match expected {
+            Some(next) if option_number(line) == Some(next) => expected = Some(next + 1),
+            None if SHORT_OPTION.is_match(content(line)) => {}
+            _ => return None,
         }
     }
-    Some(index)
+    Some((index, number))
 }
 
 /// Require one highlighted one-time Yes and a confirmation footer on the
@@ -182,9 +207,13 @@ fn starts_faint(raw_line: &str) -> bool {
 #[must_use]
 pub fn choice_command(raw: &str) -> Option<String> {
     let (raw_lines, visible) = screen_lines(raw);
-    let selected = selected_affirmative_row(&visible)?;
-    let start = selected.saturating_sub(DIALOG_LINES);
-    let headers: Vec<usize> = (start..selected)
+    // A command dialog opens with its first option selected.
+    let (selected, Some(1)) = selected_affirmative_row(&visible)? else {
+        return None;
+    };
+    // Exactly one heading on the whole capture, close enough above the
+    // options that the dialog is complete on screen.
+    let headers: Vec<usize> = (0..selected)
         .filter(|&index| {
             let text = content(&visible[index]);
             CODEX_COMMAND_HEADER.is_match(text) || CLAUDE_COMMAND_HEADER.is_match(text)
@@ -193,6 +222,9 @@ pub fn choice_command(raw: &str) -> Option<String> {
     let [header] = headers[..] else {
         return None;
     };
+    if selected - header > DIALOG_LINES {
+        return None;
+    }
     // A box that closed between the heading and the options is another box.
     if visible[header + 1..selected]
         .iter()
@@ -201,22 +233,17 @@ pub fn choice_command(raw: &str) -> Option<String> {
         return None;
     }
     if CODEX_COMMAND_HEADER.is_match(content(&visible[header])) {
-        let body: Vec<usize> = (header + 1..selected)
-            .filter(|&index| !content(&visible[index]).is_empty())
+        // Exactly the heading, one `$ …` line, then the selected option.
+        let body: Vec<&str> = visible[header + 1..selected]
+            .iter()
+            .map(|line| content(line))
+            .filter(|line| !line.is_empty())
             .collect();
-        let [command_line, after @ ..] = &body[..] else {
+        let [line] = body[..] else {
             return None;
         };
-        let command = content(&visible[*command_line]).strip_prefix("$ ")?;
-        // Nothing between the command and the options: no second line of
-        // the command, no extra text.
-        if after
-            .iter()
-            .any(|&index| !OPTION_ROW.is_match(&visible[index]))
-        {
-            return None;
-        }
-        return (!command.trim().is_empty()).then(|| command.trim().to_string());
+        let command = line.strip_prefix("$ ")?.trim();
+        return (!command.is_empty()).then(|| command.to_string());
     }
     let questions: Vec<usize> = (header + 1..selected)
         .filter(|&index| CLAUDE_QUESTION.is_match(content(&visible[index])))
@@ -263,25 +290,38 @@ pub fn choice_command(raw: &str) -> Option<String> {
     )
 }
 
-/// Whether the screen is a confirmation of a shell command that the rule's
-/// `screen` pattern matches in full: the pattern must cover the whole
-/// command, every line of it, not a part.
-#[must_use]
-pub fn choice_dialog_matches(raw: &str, pattern: &Regex) -> bool {
-    choice_command(raw).is_some_and(|command| full_match(pattern.as_str(), &command))
-}
-
-/// `^(?:pattern)$` over the whole text, so alternation cannot escape the
+/// `\A(?:pattern)\z` over the whole text, so alternation cannot escape the
 /// anchors and a partial match never counts.
 fn full_match(pattern: &str, text: &str) -> bool {
     Regex::new(&format!(r"\A(?:{pattern})\z")).is_ok_and(|anchored| anchored.is_match(text))
 }
 
-/// [`choice_dialog_matches`] for a rule's pattern text; an invalid pattern
-/// never matches (validation refuses one before it is saved).
+/// A command's lines with their indentation and blank lines dropped, so the
+/// command a hook reported and the same command on screen compare equal.
+fn normalized(command: &str) -> String {
+    command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Whether a `screen`-filtered `press_enter` rule may confirm the dialog on
+/// screen. Two independent readings must agree: the command the agent's
+/// hook reported for its pending shell call, and the command read from the
+/// recognized dialog. The pattern must match that command in full. A
+/// missing hook command, an unrecognized dialog, a mismatch (a wrapped,
+/// truncated or different command on screen) or a partial match refuses.
 #[must_use]
-pub fn choice_dialog_matches_pattern(raw: &str, pattern: &str) -> bool {
-    choice_command(raw).is_some_and(|command| full_match(pattern, &command))
+pub fn approval_matches(raw: &str, hook_command: Option<&str>, pattern: &str) -> bool {
+    let Some(hook) = hook_command.map(normalized).filter(|hook| !hook.is_empty()) else {
+        return false;
+    };
+    let Some(screen) = choice_command(raw) else {
+        return false;
+    };
+    normalized(&screen) == hook && full_match(pattern, &hook)
 }
 
 #[cfg(test)]
@@ -332,18 +372,6 @@ mod tests {
     }
 
     #[test]
-    fn never_presses_an_option_that_grants_more_than_this_request() {
-        for screen in [
-            "  1. Yes\n❯ 2. Yes, and don't ask again for npm test commands\n  3. No\nEnter to confirm · Esc to cancel",
-            "› Yes, allow all edits during this session\n  No\nPress enter to confirm or esc to cancel",
-            "› Yes, always allow\n  No\nPress enter to confirm",
-        ] {
-            assert!(!affirmative_choice_visible(screen), "{screen}");
-            assert!(choice_command(screen).is_none(), "{screen}");
-        }
-    }
-
-    #[test]
     fn a_screen_filter_belongs_to_press_enter_and_must_compile() {
         use crate::automation::{AutomationAction, AutomationEvent, AutomationRule};
         let mut rule = AutomationRule::new(
@@ -372,113 +400,169 @@ mod tests {
         assert!(prompt.validate().unwrap_err().contains("screen"));
     }
 
+    const CODEX_TAIL: &str = "› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for this command (p)\n  3. No, and tell Codex what to do differently (esc)\nPress enter to confirm or esc to cancel";
+
+    fn codex(body: &str) -> String {
+        format!("Would you like to run the following command?\n{body}\n{CODEX_TAIL}")
+    }
+
+    fn claude(body: &str) -> String {
+        format!(
+            "╭──────────────────────────────╮\n│ Bash command                 │\n│                              │\n{body}\n│                              │\n│ Do you want to proceed?      │\n│ ❯ 1. Yes                     │\n│   2. No                      │\n╰──────────────────────────────╯\nEnter to confirm · Esc to cancel"
+        )
+    }
+
     #[test]
-    fn reads_only_the_command_of_a_known_dialog() {
-        let codex = "earlier output: npm test\nWould you like to run the following command?\n  $ cargo test -p muxa\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for this command (p)\n  3. No (esc)\nPress enter to confirm or esc to cancel";
-        assert_eq!(choice_command(codex).as_deref(), Some("cargo test -p muxa"));
-        assert!(choice_dialog_matches_pattern(codex, r"cargo test -p muxa"));
-        assert!(choice_dialog_matches_pattern(
-            codex,
-            r"cargo test( -p \S+)?"
-        ));
+    fn approves_only_when_hook_and_screen_agree_and_the_pattern_covers_it() {
+        let screen = format!(
+            "earlier output: npm test\n{}",
+            codex("  $ cargo test -p muxa")
+        );
+        assert_eq!(
+            choice_command(&screen).as_deref(),
+            Some("cargo test -p muxa")
+        );
+        let hook = Some("cargo test -p muxa");
+        assert!(approval_matches(&screen, hook, "cargo test -p muxa"));
+        assert!(approval_matches(&screen, hook, r"cargo test( -p \S+)?"));
         assert!(
-            !choice_dialog_matches_pattern(codex, "cargo test"),
+            !approval_matches(&screen, hook, "cargo test"),
             "partial match"
         );
         assert!(
-            !choice_dialog_matches_pattern(codex, "npm test"),
-            "earlier output"
-        );
-        assert!(
-            !choice_dialog_matches_pattern(codex, "x|cargo test"),
+            !approval_matches(&screen, hook, "x|cargo test"),
             "alternation stays anchored"
         );
+        assert!(
+            !approval_matches(&screen, None, "cargo test -p muxa"),
+            "no hook command"
+        );
+        assert!(
+            !approval_matches(&screen, Some("rm -rf /"), "cargo test -p muxa"),
+            "hook disagrees"
+        );
 
-        let claude = "earlier: ran rm -rf build\n\
-╭──────────────────────────────╮\n\
-│ Bash command                 │\n\
-│                              │\n\
-│   npm test                   │\n\
-│   \x1b[2mRun the test suite\x1b[22m         │\n\
-│                              │\n\
-│ Do you want to proceed?      │\n\
-│ ❯ 1. Yes                     │\n\
-│   2. No                      │\n\
-╰──────────────────────────────╯\n\
-Enter to confirm · Esc to cancel";
-        assert_eq!(choice_command(claude).as_deref(), Some("npm test"));
-        assert!(choice_dialog_matches_pattern(claude, "npm test"));
-        assert!(!choice_dialog_matches_pattern(claude, "Run the test suite"));
+        let boxed = claude(
+            "│   npm test                   │\n│   \x1b[2mRun the test suite\x1b[22m         │",
+        );
+        assert_eq!(choice_command(&boxed).as_deref(), Some("npm test"));
+        assert!(approval_matches(&boxed, Some("npm test"), "npm test"));
+        assert!(!approval_matches(
+            &boxed,
+            Some("npm test"),
+            "Run the test suite"
+        ));
     }
 
     #[test]
     fn fails_closed_on_anything_but_a_complete_known_dialog() {
-        // Unboxed Codex dialog with earlier output containing the allowed text.
-        let earlier = "npm test\nWould you like to run the following command?\n  $ rm -rf /tmp/private\n› 1. Yes, proceed (y)\n  2. No (esc)\nPress enter to confirm or esc to cancel";
-        assert!(!choice_dialog_matches_pattern(earlier, "npm test"));
-        // No heading: no request at all.
-        let headless = "npm test\n› 1. Yes, proceed (y)\n  2. No (esc)\nPress enter to confirm or esc to cancel";
-        assert!(choice_command(headless).is_none());
-        // Heading pushed out of the window by a long command.
-        let mut long = String::from("Would you like to run the following command?\n  $ rm -rf /\n");
-        for _ in 0..15 {
-            long.push_str("  && echo filler\n");
+        // Earlier output containing the allowed text.
+        let earlier = format!("npm test\n{}", codex("  $ rm -rf /tmp/private"));
+        assert!(!approval_matches(&earlier, Some("npm test"), "npm test"));
+        assert!(!approval_matches(
+            &earlier,
+            Some("rm -rf /tmp/private"),
+            "npm test"
+        ));
+        // No heading.
+        assert!(choice_command(&format!("npm test\n{CODEX_TAIL}")).is_none());
+        // A line between the command and the options, even one that looks like an option.
+        assert!(choice_command(&codex("  $ npm test\n  1. ; rm -rf /tmp/private")).is_none());
+        assert!(choice_command(&codex("  $ npm test\n  rm -rf /")).is_none());
+        // Heading too far above the options.
+        let mut long = String::from("  $ npm test");
+        for _ in 0..14 {
+            long.push_str("\n  # filler");
         }
-        long.push_str("  $ npm test\n› 1. Yes, proceed (y)\n  2. No (esc)\nPress enter to confirm or esc to cancel");
-        assert!(choice_command(&long).is_none());
-        // A second command line under the heading.
-        let multi = "Would you like to run the following command?\n  $ npm test\n  rm -rf /\n› 1. Yes, proceed (y)\nPress enter to confirm or esc to cancel";
-        assert!(choice_command(multi).is_none());
-        // Two headings (an injected one in agent text) are ambiguous.
-        let injected = "Bash command\n  rm -rf /\n  \x1b[2mBash command\x1b[22m\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel";
-        assert!(choice_command(injected).is_none());
+        assert!(choice_command(&codex(&long)).is_none());
+        // A fake heading inside a long command: two headings on the capture.
+        let mut fake = String::from("│ rm -rf /tmp/private\n");
+        for _ in 0..15 {
+            fake.push_str("│ # filler\n");
+        }
+        fake.push_str("│ Bash command\n│ npm test\n│ \x1b[2mRun tests\x1b[22m");
+        let fake = claude(&fake);
+        assert!(choice_command(&fake).is_none());
+        // Even if the real heading had scrolled away, the hook's command differs.
+        assert!(!approval_matches(
+            &fake,
+            Some("rm -rf /tmp/private\n# filler\nBash command\nnpm test"),
+            "npm test"
+        ));
         // A Claude multi-line command with no faint description is the whole body.
-        let claude_multi = "Bash command\n  npm test\n  rm -rf /\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel";
+        let multi = claude("│   npm test                   │\n│   rm -rf /                   │");
         assert_eq!(
-            choice_command(claude_multi).as_deref(),
+            choice_command(&multi).as_deref(),
             Some("npm test\nrm -rf /")
         );
-        assert!(!choice_dialog_matches_pattern(claude_multi, "npm test"));
-        // A description that is not faint after a faint one is refused.
-        let mixed = "Bash command\n  npm test\n  \x1b[2mRun tests\x1b[22m\n  rm -rf /\nDo you want to proceed?\n❯ 1. Yes\n  2. No\nEnter to confirm · Esc to cancel";
-        assert!(choice_command(mixed).is_none());
+        assert!(!approval_matches(
+            &multi,
+            Some("npm test\nrm -rf /"),
+            "npm test"
+        ));
+        // A non-faint line after the faint description.
+        let mixed = claude("│   npm test\n│   \x1b[2mRun tests\x1b[22m\n│   rm -rf /");
+        assert!(choice_command(&mixed).is_none());
+        // A dialog whose Yes is not the first option.
+        let second = "Would you like to run the following command?\n  $ npm test\n  1. No\n› 2. Yes\nPress enter to confirm";
+        assert!(choice_command(second).is_none());
     }
 
     #[test]
     fn a_wrapped_or_unlisted_label_is_not_a_one_time_yes() {
         for screen in [
-            "Would you like to run the following command?\n  $ npm test\n› 2. Yes, and don't\n     ask again for commands that start with npm\n  3. No (esc)\nPress enter to confirm or esc to cancel",
-            "› 1. Yes, and don\u{2019}t ask again\n  2. No\nPress enter to confirm",
-            "› 1. Yes\n    and remember this choice\n  2. No\nPress enter to confirm",
-            "› 1. Yes, allow\n  2. No\nPress enter to confirm",
+            codex_with_selected("› 2. Yes, and don't\n     ask again for commands that start with npm\n  3. No (esc)"),
+            codex_with_selected("› 1. Yes\n     Always allow this command for this session\n  2. No"),
+            codex_with_selected("› 1. Yes\n     (and don't ask again)\n  2. No"),
+            "› 1. Yes, and don\u{2019}t ask again\n  2. No\nPress enter to confirm".to_string(),
+            "› 1. Yes, allow\n  2. No\nPress enter to confirm".to_string(),
+            "› 1. Yes\n  3. No\nPress enter to confirm".to_string(),
+            "> Proceed\n  Always\nPress enter to continue".to_string(),
         ] {
-            assert!(!affirmative_choice_visible(screen), "{screen}");
+            assert!(!affirmative_choice_visible(&screen), "{screen}");
+            assert!(!approval_matches(&screen, Some("npm test"), "npm test"), "{screen}");
         }
+    }
+
+    fn codex_with_selected(options: &str) -> String {
+        format!("Would you like to run the following command?\n  $ npm test\n{options}\nPress enter to confirm or esc to cancel")
     }
 
     #[test]
     fn a_literal_escaped_like_the_app_matches_only_itself() {
-        let screen = |command: &str| {
-            format!("Would you like to run the following command?\n  $ {command}\n› 1. Yes, proceed (y)\n  2. No (esc)\nPress enter to confirm or esc to cancel")
+        let check = |command: &str, pattern: &str| {
+            approval_matches(&codex(&format!("  $ {command}")), Some(command), pattern)
         };
         // What FleetApprovalRules.escape produces for `rm -rf ./b (x)` and `file.\u{301}`.
-        let literal = r"rm \-rf \./b \(x\)";
-        assert!(choice_dialog_matches_pattern(
-            &screen("rm -rf ./b (x)"),
-            literal
-        ));
-        assert!(!choice_dialog_matches_pattern(
-            &screen("rm -rf ./bb(x)"),
-            literal
-        ));
-        let accented = "file\\.\u{301}";
-        assert!(choice_dialog_matches_pattern(
-            &screen("file.\u{301}"),
-            accented
-        ));
-        assert!(!choice_dialog_matches_pattern(
-            &screen("fileX\u{301}"),
-            accented
-        ));
+        assert!(check("rm -rf ./b (x)", r"rm \-rf \./b \(x\)"));
+        assert!(!check("rm -rf ./bb(x)", r"rm \-rf \./b \(x\)"));
+        assert!(check("file.\u{301}", "file\\.\u{301}"));
+        assert!(!check("fileX\u{301}", "file\\.\u{301}"));
+    }
+
+    #[test]
+    fn codex_shell_argv_reads_as_the_dialog_shows_it() {
+        use crate::adapters::codex::shell_command;
+        let read = |value: serde_json::Value| {
+            shell_command(Some(&serde_json::json!({ "command": value })))
+        };
+        assert_eq!(
+            read(serde_json::json!("npm test")).as_deref(),
+            Some("npm test")
+        );
+        assert_eq!(
+            read(serde_json::json!(["bash", "-lc", "npm test"])).as_deref(),
+            Some("npm test")
+        );
+        assert_eq!(
+            read(serde_json::json!(["/bin/zsh", "-c", "ls"])).as_deref(),
+            Some("ls")
+        );
+        assert_eq!(
+            read(serde_json::json!(["git", "status"])).as_deref(),
+            Some("git status")
+        );
+        assert_eq!(read(serde_json::json!([1, 2])), None);
+        assert_eq!(shell_command(None), None);
     }
 }

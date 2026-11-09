@@ -245,6 +245,11 @@ pub struct Agent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_title: Option<String>,
     pub last_notification: Option<String>,
+    /// The shell command the agent's last shell tool call asked to run, as
+    /// its hook reported it; cleared when that tool completes or the turn
+    /// moves on. Approval rules require it to be the command on screen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_command: Option<String>,
     pub model: Option<String>,
     pub context_used_pct: Option<f32>,
     pub cost_usd: Option<f64>,
@@ -378,6 +383,7 @@ impl Agent {
             recap: None,
             ai_title: None,
             last_notification: None,
+            pending_command: None,
             model: None,
             context_used_pct: None,
             cost_usd: None,
@@ -829,6 +835,7 @@ fn mutate_for_event(
             agent.rate_limit_source = None;
         }
         AgentEvent::PromptSubmitted { prompt, .. } => {
+            agent.pending_command = None;
             agent.last_prompt = Some(prompt.clone());
             agent.last_prompt_at = Some(at);
             agent.state = AgentState::Working;
@@ -855,7 +862,12 @@ fn mutate_for_event(
                 ));
             }
         }
-        AgentEvent::ToolStarted { subagent, .. } => {
+        AgentEvent::ToolStarted {
+            subagent, command, ..
+        } => {
+            // Every tool call replaces the pending command, so a command is
+            // never remembered past the call that reported it.
+            agent.pending_command.clone_from(command);
             // ToolStarted always means "agent is actively doing work" —
             // covers the Idle → Working transition AND the
             // WaitingInput → Working recovery (e.g. Codex resuming
@@ -872,6 +884,7 @@ fn mutate_for_event(
             }
         }
         AgentEvent::ToolCompleted { tool, .. } => {
+            agent.pending_command = None;
             // Tool activity proves the agent isn't waiting on the user
             // any more. Specifically targets these cases:
             //   - Codex grants permission, runs the tool, the
@@ -915,6 +928,7 @@ fn mutate_for_event(
             idle_confirmed,
             ..
         } => {
+            agent.pending_command = None;
             if let Some(text) = response {
                 agent.last_response = Some(text.clone());
             }
@@ -3157,6 +3171,7 @@ mod tests {
             last_response: None,
             recap: None,
             ai_title: None,
+            pending_command: None,
             last_notification: last_notification.map(Into::into),
             model: None,
             context_used_pct: None,
@@ -4063,6 +4078,7 @@ mod tests {
                 id: id("c"),
                 tool: "Bash".into(),
                 subagent: None,
+                command: None,
                 at: now,
             })
             .await;
@@ -4071,6 +4087,42 @@ mod tests {
             AgentState::Working,
             "ToolStarted should recover WaitingInput → Working"
         );
+    }
+
+    #[tokio::test]
+    async fn a_shell_call_records_its_command_until_the_call_ends() {
+        let store = Store::shared();
+        let now = datetime!(2026-05-05 12:00:00 UTC);
+        let bash = |command: Option<&str>| AgentEvent::ToolStarted {
+            id: id("p"),
+            tool: "Bash".into(),
+            subagent: None,
+            command: command.map(str::to_string),
+            at: now,
+        };
+        store.apply(&bash(Some("npm test"))).await;
+        assert_eq!(
+            store
+                .by_session("p")
+                .await
+                .unwrap()
+                .pending_command
+                .as_deref(),
+            Some("npm test")
+        );
+        // The next call replaces it, even one that reports no command.
+        store.apply(&bash(None)).await;
+        assert_eq!(store.by_session("p").await.unwrap().pending_command, None);
+        store.apply(&bash(Some("cargo test"))).await;
+        store
+            .apply(&AgentEvent::ToolCompleted {
+                id: id("p"),
+                tool: "Bash".into(),
+                success: true,
+                at: now,
+            })
+            .await;
+        assert_eq!(store.by_session("p").await.unwrap().pending_command, None);
     }
 
     #[tokio::test]
@@ -4091,6 +4143,7 @@ mod tests {
                 kind: kind.into(),
                 description: None,
             }),
+            command: None,
             at: now,
         };
         store.apply(&spawn("Explore")).await;
@@ -4291,6 +4344,7 @@ mod tests {
                 id: id("e"),
                 tool: "Read".into(),
                 subagent: None,
+                command: None,
                 at: now,
             })
             .await;
@@ -4330,6 +4384,7 @@ mod tests {
                         id: codex,
                         tool: "exec_command".into(),
                         subagent: None,
+                        command: None,
                         at: t1,
                     },
                     _ => AgentEvent::ToolCompleted {
@@ -4370,6 +4425,7 @@ mod tests {
                 id: codex,
                 tool: "exec_command".into(),
                 subagent: None,
+                command: None,
                 at: now,
             })
             .await;
@@ -4594,6 +4650,7 @@ mod tests {
                 id: id("s"),
                 tool: "Bash".into(),
                 subagent: None,
+                command: None,
                 at: now,
             })
             .await;
@@ -5126,6 +5183,7 @@ mod tests {
                 id: id("s"),
                 tool: "review".into(),
                 subagent: None,
+                command: None,
                 at: active_at,
             })
             .await;
@@ -5826,6 +5884,7 @@ mod tests {
                 },
                 tool: "Bash".into(),
                 subagent: None,
+                command: None,
                 at: t2,
             })
             .await;
@@ -6832,6 +6891,7 @@ mod tests {
                     last_response: None,
                     recap: None,
                     ai_title: None,
+                    pending_command: None,
                     last_notification: None,
                     model: None,
                     context_used_pct: None,
@@ -6868,6 +6928,7 @@ mod tests {
                     last_response: None,
                     recap: None,
                     ai_title: None,
+                    pending_command: None,
                     last_notification: None,
                     model: None,
                     context_used_pct: None,
@@ -6933,6 +6994,7 @@ mod tests {
                         last_response: None,
                         recap: None,
                         ai_title: None,
+                        pending_command: None,
                         last_notification: None,
                         model: None,
                         context_used_pct: None,
@@ -7003,6 +7065,7 @@ mod tests {
             last_response: None,
             recap: None,
             ai_title: None,
+            pending_command: None,
             last_notification: None,
             model: None,
             context_used_pct: None,

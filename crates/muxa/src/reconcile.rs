@@ -389,6 +389,7 @@ impl<L: LivenessSource> Reconciler<L> {
                             id: t.id.clone(),
                             tool: "codex rollout activity".into(),
                             subagent: None,
+                            command: None,
                             at: status.at,
                         },
                         codex_rollout::StatusEvent::Stopped {
@@ -1567,6 +1568,7 @@ mod tests {
             last_response: None,
             recap: None,
             ai_title: None,
+            pending_command: None,
             last_notification: None,
             model: None,
             context_used_pct: None,

@@ -88,12 +88,19 @@ capture taken right before Enter, and only from a dialog it recognizes:
   description, and `Do you want to proceed?`. With no faint description,
   every line counts as the command.
 
-Anything else (no heading, two headings, a second command line, a heading
-more than 14 lines above the options, a box that closed in between) gives
-no command and no Enter. The pattern is anchored at both ends, so
-`npm test` approves exactly `npm test`, and a multi-line command must be
-matched line for line. Output printed before the dialog and the
-agent-written description are never part of the command.
+Anything else (no heading, more than one heading on the screen, any line
+between the command and option 1, options that do not run on in order, a
+heading more than 14 lines above the options, a box that closed in between)
+gives no command and no Enter.
+
+The command on screen must also be the command the agent's own hook
+reported for its pending shell call (Claude `PreToolUse` for `Bash`, Codex
+`PreToolUse` for its shell tool), compared line by line. Without a hook
+command, or when the two differ (a long command that wrapped on screen, a
+truncated dialog, a second queued call), nothing is pressed. The pattern is
+anchored at both ends, so `npm test` approves exactly `npm test`, and a
+multi-line command must be matched line for line. Output printed before the
+dialog and the agent-written description are never part of the command.
 
 The capture and the key press are not atomic: if someone moves the
 selection by hand in the moment between them, Enter confirms what is then

@@ -3129,6 +3129,7 @@ mod tests {
                 last_response: None,
                 recap: None,
                 ai_title: None,
+                pending_command: None,
                 last_notification: None,
                 model: None,
                 context_used_pct: None,

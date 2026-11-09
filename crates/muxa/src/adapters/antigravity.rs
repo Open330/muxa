@@ -216,6 +216,7 @@ impl HookAdapter for AntigravityAdapter {
                 id,
                 tool: input.tool_name(),
                 subagent: None,
+                command: None,
                 at,
             },
             Event::PostToolUse => AgentEvent::ToolCompleted {

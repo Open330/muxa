@@ -132,6 +132,10 @@ pub struct ToolInput {
     pub subagent_type: Option<String>,
     #[serde(default)]
     pub description: Option<String>,
+    /// `Bash` only: the shell command about to run. Approval rules compare
+    /// it with the command shown in the permission dialog.
+    #[serde(default)]
+    pub command: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -336,18 +340,19 @@ fn pre_tool_event(
         // Claude's `Task` tool spawns a subagent; carry its identity so the
         // store can track it as an in-flight subagent (retired on the
         // matching `PostToolUse`). Every other tool carries `None`.
-        let subagent = (tool_name == "Task").then(|| {
-            let (kind, description) =
-                tool_input.map_or((None, None), |ti| (ti.subagent_type, ti.description));
-            SubagentSpec {
-                kind: kind.unwrap_or_else(|| "subagent".into()),
-                description,
-            }
+        let (kind, description, command) = tool_input.map_or((None, None, None), |ti| {
+            (ti.subagent_type, ti.description, ti.command)
         });
+        let subagent = (tool_name == "Task").then(|| SubagentSpec {
+            kind: kind.unwrap_or_else(|| "subagent".into()),
+            description,
+        });
+        let command = if tool_name == "Bash" { command } else { None };
         AgentEvent::ToolStarted {
             id,
             tool: tool_name,
             subagent,
+            command,
             at,
         }
     }
@@ -477,6 +482,32 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
+    #[test]
+    fn bash_pre_tool_use_carries_its_command() {
+        let mut input = pretool_input("Bash");
+        input.tool_input = Some(ToolInput {
+            subagent_type: None,
+            description: Some("Run tests".into()),
+            command: Some("npm test".into()),
+        });
+        match ClaudeAdapter::normalize(Event::PreToolUse, input, None) {
+            AgentEvent::ToolStarted { command, .. } => {
+                assert_eq!(command.as_deref(), Some("npm test"));
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+        let mut edit = pretool_input("Edit");
+        edit.tool_input = Some(ToolInput {
+            subagent_type: None,
+            description: None,
+            command: Some("not a shell".into()),
+        });
+        match ClaudeAdapter::normalize(Event::PreToolUse, edit, None) {
+            AgentEvent::ToolStarted { command, .. } => assert_eq!(command, None),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
     fn pretool_input(tool_name: &str) -> Input {
         Input {
             session_id: "s".into(),
@@ -544,6 +575,7 @@ mod tests {
         input.tool_input = Some(ToolInput {
             subagent_type: Some("Explore".into()),
             description: Some("map the codebase".into()),
+            command: None,
         });
         let ev = ClaudeAdapter::normalize(Event::PreToolUse, input, None);
         match ev {

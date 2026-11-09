@@ -714,6 +714,7 @@ mod tests {
             },
             tool: "Bash".into(),
             subagent: None,
+            command: None,
             at,
         }
     }

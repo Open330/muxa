@@ -87,6 +87,7 @@ impl HookAdapter for GeminiAdapter {
                 id,
                 tool: input.tool_name.unwrap_or_else(|| "unknown".into()),
                 subagent: None,
+                command: None,
                 at,
             },
             Event::AfterTool => AgentEvent::ToolCompleted {

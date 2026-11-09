@@ -261,6 +261,7 @@ pub fn state_events(
             id: id.clone(),
             tool: name.to_owned(),
             subagent: None,
+            command: None,
             at,
         },
         SyntheticState::Blocked => AgentEvent::NotificationFired {
@@ -402,6 +403,7 @@ mod tests {
             last_response: None,
             recap: None,
             ai_title: None,
+            pending_command: None,
             last_notification: None,
             model: None,
             context_used_pct: None,
@@ -673,6 +675,7 @@ mod tests {
                 id: real.clone(),
                 tool: "run_command".into(),
                 subagent: None,
+                command: None,
                 at: AT,
             })
             .await;
@@ -792,6 +795,7 @@ mod tests {
             last_response: None,
             recap: None,
             ai_title: None,
+            pending_command: None,
             last_notification: None,
             model: None,
             context_used_pct: None,
