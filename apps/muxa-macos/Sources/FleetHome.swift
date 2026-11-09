@@ -63,6 +63,10 @@ struct FleetWork: Identifiable, Sendable {
     var helpers: [MuxaHostedAgent] = []
     /// An agent working on someone's peer request whose requester is gone.
     var isOrphanHelper = false
+    /// An agent whose prompt looks like a typed hand-over of a muxa
+    /// request: probably a helper, but unconfirmed, so it keeps its own
+    /// card and only folds behind a lane's "possible helpers" row.
+    var isProbableHelper = false
 
     var id: String {
         switch source {
@@ -112,6 +116,7 @@ enum FleetBoard {
             .map { hosted in
                 var unit = attach(helpers: helpersByRoot[hosted.id] ?? [], to: work(for: hosted, now: now), now: now)
                 unit.isOrphanHelper = index.isHelper(hosted.id)
+                unit.isProbableHelper = helperRequest(hosted.agent)?.confirmed == false
                 return unit
             }
         return (managed + solo).sorted(by: order)
@@ -126,6 +131,10 @@ enum FleetBoard {
         var sessionID: String?
         /// The requester's `name@%pane` label.
         var label: String?
+        /// Delivered by muxa (an envelope it writes), so who asked is known.
+        /// A hand-over an agent typed is only a hint: nothing says who wrote
+        /// it, so it never makes the agent part of another unit.
+        var confirmed = true
     }
 
     /// The peer request in an agent's latest prompt, in any of the forms
@@ -171,7 +180,7 @@ enum FleetBoard {
         // a request or a pane.
         guard firstLine.range(of: #"(muxa msg accept|muxa_inbox\(request_id=\"?)\s*req_[0-9a-f]{8,}_[0-9a-f]+"#, options: .regularExpression) != nil,
               let pane = firstLine.range(of: #"(?<![A-Za-z0-9])%[0-9]+(?![0-9A-Fa-f])"#, options: .regularExpression) else { return nil }
-        return HelperRequest(sessionID: nil, label: "agent@\(firstLine[pane])")
+        return HelperRequest(sessionID: nil, label: "agent@\(firstLine[pane])", confirmed: false)
     }
 
     /// Who asked whom for help, worked out once per board: each prompt is
@@ -192,7 +201,7 @@ enum FleetBoard {
                 }
             }
             for hosted in agents {
-                guard let request = FleetBoard.helperRequest(hosted.agent) else { continue }
+                guard let request = FleetBoard.helperRequest(hosted.agent), request.confirmed else { continue }
                 helpers.insert(hosted.id)
                 let candidates: [MuxaHostedAgent]
                 if let session = request.sessionID {

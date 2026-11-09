@@ -31,6 +31,16 @@
         }
       }
     },
+    "%lld possible helper sessions" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보조 세션 후보 %lld개"
+          }
+        }
+      }
+    },
     "Add Approval Rule…" : {
       "localizations" : {
         "ko" : {
@@ -7277,6 +7287,16 @@
         }
       }
     },
+    "Hide possible helpers" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보조 세션 후보 숨기기"
+          }
+        }
+      }
+    },
     "Hide prompt" : {
       "localizations" : {
         "ko" : {
@@ -13531,6 +13551,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "다른 에이전트가 이 작업을 돕기 위해 띄운 세션입니다."
+          }
+        }
+      }
+    },
+    "Sessions whose prompt hands over a muxa request; who asked is not confirmed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa 요청을 넘겨받은 것으로 보이는 세션입니다. 누가 요청했는지는 확인되지 않았습니다"
           }
         }
       }

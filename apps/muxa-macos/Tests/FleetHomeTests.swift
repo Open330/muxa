@@ -461,6 +461,24 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(try label("Main Claude %48 요청 req_18e64986abbf3ea0_4dc 를 정확히 claim(muxa msg accept req_18e64986abbf3ea0_4dc --json)하고 회신하세요.") == "agent@%48")
 }
 
+@Test func aTypedHandOverIsOnlyAHintAndKeepsItsCard() throws {
+    let root = MuxaHostedAgent(host: host, agent: try agent(["state": "idle"], id: "root"), pane: try pane("%1", alias: "r"))
+    // A real typed hand-over and a person quoting the same command look the
+    // same; neither is folded under the agent at %1.
+    for prompt in [
+        "Main Claude %1 요청 req_18e64986abbf3ea0_4dc 를 claim(muxa msg accept req_18e64986abbf3ea0_4dc --json)하고 회신하세요.",
+        "Debug why `muxa msg accept req_deadbeef01_1` fails on pane %1. Do not accept the request.",
+    ] {
+        let typed = MuxaHostedAgent(host: host, agent: try agent(["state": "working", "last_prompt": prompt], id: "t"), pane: try pane("%2", alias: "t"))
+        let works = FleetBoard.works(groups: [], agents: [root, typed])
+        #expect(works.count == 2, "\(prompt)")
+        #expect(works.allSatisfy { $0.helpers.isEmpty })
+        let card = try #require(works.first { $0.agents.contains { $0.id == typed.id } })
+        #expect(card.isProbableHelper)
+        #expect(!card.isOrphanHelper)
+    }
+}
+
 @Test func muxaNoticesReadAsTitles() {
     #expect(FleetBoard.promptTitle("[muxa:req_18e647c24d7eb778_4c6] Completed reply from codex@%13 (requested 34m ago) is ready. Read it with muxa_wait_reply") == "Reply from codex@%13 is ready")
     #expect(FleetBoard.promptTitle("[muxa:req_1_2] Review from codex@%39. Read one: muxa_inbox(…)") == "Review from codex@%39")

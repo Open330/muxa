@@ -293,11 +293,20 @@ private struct FleetLaneColumn: View {
     var reviewedCount = 0
     @Binding var showsReviewed: Bool
     @State private var showsOlder = false
+    @State private var showsProbable = false
 
-    /// Finished units older than a day fold away behind one row.
+    /// Finished units older than a day fold away behind one row, and so do
+    /// probable helpers, except in Your turn, where nothing is folded.
     private var shown: [FleetWork] {
-        guard lane == .finished, !showsOlder else { return works }
-        return works.filter { FleetBoard.isRecent($0) }
+        works.filter { work in
+            if lane != .needsYou, work.isProbableHelper, !showsProbable { return false }
+            if lane == .finished, !showsOlder, !FleetBoard.isRecent(work) { return false }
+            return true
+        }
+    }
+
+    private var probableCount: Int {
+        lane == .needsYou ? 0 : works.filter(\.isProbableHelper).count
     }
 
     private var olderCount: Int {
@@ -369,6 +378,17 @@ private struct FleetLaneColumn: View {
                                 open: open
                             )
                         }
+                    }
+                    if probableCount > 0 {
+                        Button(showsProbable
+                            ? String(localized: "Hide possible helpers")
+                            : String(localized: "\(probableCount) possible helper sessions")) {
+                            showsProbable.toggle()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                        .help("Sessions whose prompt hands over a muxa request; who asked is not confirmed")
                     }
                     if olderCount > 0 {
                         Button(showsOlder ? String(localized: "Hide older") : String(localized: "\(olderCount) older")) {
