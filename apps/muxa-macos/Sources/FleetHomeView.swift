@@ -294,15 +294,21 @@ private struct FleetLaneColumn: View {
     @Binding var showsReviewed: Bool
     @State private var showsOlder = false
     @State private var showsProbable = false
+    @State private var showsEmpty = false
 
     /// Finished units older than a day fold away behind one row, and so do
     /// probable helpers, except in Your turn, where nothing is folded.
     private var shown: [FleetWork] {
         works.filter { work in
             if lane != .needsYou, work.isProbableHelper, !showsProbable { return false }
+            if lane != .needsYou, work.isEmptySession, !work.isProbableHelper, !showsEmpty { return false }
             if lane == .finished, !showsOlder, !FleetBoard.isRecent(work) { return false }
             return true
         }
+    }
+
+    private var emptyCount: Int {
+        lane == .needsYou ? 0 : works.filter { $0.isEmptySession && !$0.isProbableHelper }.count
     }
 
     private var probableCount: Int {
@@ -378,6 +384,17 @@ private struct FleetLaneColumn: View {
                                 open: open
                             )
                         }
+                    }
+                    if emptyCount > 0 {
+                        Button(showsEmpty
+                            ? String(localized: "Hide empty sessions")
+                            : String(localized: "\(emptyCount) empty sessions")) {
+                            showsEmpty.toggle()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .padding(.top, 2)
+                        .help("Agents that were opened but never given a task")
                     }
                     if probableCount > 0 {
                         Button(showsProbable

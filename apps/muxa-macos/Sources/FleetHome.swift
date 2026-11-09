@@ -67,6 +67,9 @@ struct FleetWork: Identifiable, Sendable {
     /// request: probably a helper, but unconfirmed, so it keeps its own
     /// card and only folds behind a lane's "possible helpers" row.
     var isProbableHelper = false
+    /// A session that was opened but never given anything: no prompt, no
+    /// response, no recap. It folds behind a lane's "empty sessions" row.
+    var isEmptySession = false
 
     var id: String {
         switch source {
@@ -117,9 +120,16 @@ enum FleetBoard {
                 var unit = attach(helpers: helpersByRoot[hosted.id] ?? [], to: work(for: hosted, now: now), now: now)
                 unit.isOrphanHelper = index.isHelper(hosted.id)
                 unit.isProbableHelper = helperRequest(hosted.agent)?.confirmed == false
+                unit.isEmptySession = unit.helpers.isEmpty && isEmpty(hosted.agent)
                 return unit
             }
         return (managed + solo).sorted(by: order)
+    }
+
+    /// Opened and never used: nothing asked, nothing answered.
+    static func isEmpty(_ agent: MuxaAgent) -> Bool {
+        let blank: (String?) -> Bool = { ($0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        return blank(agent.lastPrompt) && blank(agent.lastResponse) && blank(agent.recap)
     }
 
     // MARK: - Helper sessions
