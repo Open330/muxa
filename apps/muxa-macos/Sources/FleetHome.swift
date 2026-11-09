@@ -51,7 +51,7 @@ struct FleetWork: Identifiable, Sendable {
     /// the one doing the current stage.
     var focus: MuxaHostedAgent?
     /// A limit the configured policy will handle on its own.
-    let handledLimit: Bool
+    var handledLimit: Bool
     /// Changes whenever any agent of the unit or its pipeline moves on, so
     /// a mark made on one version of the unit never covers a later one.
     var revision: String = ""
@@ -71,8 +71,10 @@ struct FleetWork: Identifiable, Sendable {
         }
     }
 
+    /// Every host the unit runs on, its helpers' included, so a host filter
+    /// never hides a helper's question.
     var hostAliases: [String] {
-        Array(Set(agents.map(\.host.alias))).sorted()
+        Array(Set((agents + helpers).map(\.host.alias))).sorted()
     }
 
     /// The stage to name on a card. Stages form a dependency graph, not a
@@ -94,11 +96,12 @@ enum FleetBoard {
         let managedIDs = Set(groups.flatMap { $0.participants.map(\.id) })
         let live = agents.filter { $0.agent.state != "stopped" }
         // Helper sessions fold under the root of their request chain.
+        let index = HelperIndex(agents: live)
         var helpersByRoot: [String: [MuxaHostedAgent]] = [:]
         var foldedIDs = Set<String>()
         for hosted in live where !managedIDs.contains(hosted.id) {
-            guard let root = requestRoot(of: hosted, among: live) else { continue }
-            helpersByRoot[root.id, default: []].append(hosted)
+            guard let root = index.root(of: hosted.id) else { continue }
+            helpersByRoot[root, default: []].append(hosted)
             foldedIDs.insert(hosted.id)
         }
         let managed = groups.map { group in
@@ -108,7 +111,7 @@ enum FleetBoard {
             .filter { !managedIDs.contains($0.id) && !foldedIDs.contains($0.id) }
             .map { hosted in
                 var unit = attach(helpers: helpersByRoot[hosted.id] ?? [], to: work(for: hosted, now: now), now: now)
-                unit.isOrphanHelper = helperRequest(hosted.agent) != nil
+                unit.isOrphanHelper = index.isHelper(hosted.id)
                 return unit
             }
         return (managed + solo).sorted(by: order)
@@ -162,39 +165,82 @@ enum FleetBoard {
             return nil
         }
         if firstLine.hasPrefix("[") { return nil }
-        // Typed by an agent: it must name a request and a pane.
-        guard firstLine.range(of: #"req_[0-9a-f]{8,}_[0-9a-f]+"#, options: .regularExpression) != nil,
-              let pane = firstLine.range(of: #"%[0-9]+"#, options: .regularExpression) else { return nil }
+        // Typed by an agent handing over a muxa request: only a prompt that
+        // tells the agent to claim it (`muxa msg accept req_…` or
+        // `muxa_inbox(request_id=…)`) counts, not one that merely mentions
+        // a request or a pane.
+        guard firstLine.range(of: #"(muxa msg accept|muxa_inbox\(request_id=\"?)\s*req_[0-9a-f]{8,}_[0-9a-f]+"#, options: .regularExpression) != nil,
+              let pane = firstLine.range(of: #"(?<![A-Za-z0-9])%[0-9]+(?![0-9A-Fa-f])"#, options: .regularExpression) else { return nil }
         return HelperRequest(sessionID: nil, label: "agent@\(firstLine[pane])")
     }
 
-    /// The agent that sent `hosted` its peer request: by session, else by
-    /// the pane in its label on the same host.
-    static func requester(of hosted: MuxaHostedAgent, among agents: [MuxaHostedAgent]) -> MuxaHostedAgent? {
-        guard let request = helperRequest(hosted.agent) else { return nil }
-        if let session = request.sessionID {
-            let matches = agents.filter { $0.agent.agentSessionID == session && $0.id != hosted.id }
-            if let found = matches.first(where: { $0.host.alias == hosted.host.alias }) ?? matches.first { return found }
-        }
-        if let label = request.label, let at = label.lastIndex(of: "@") {
-            let pane = String(label[label.index(after: at)...])
-            return agents.first { $0.host.alias == hosted.host.alias && $0.pane?.paneID == pane && $0.id != hosted.id }
-        }
-        return nil
-    }
+    /// Who asked whom for help, worked out once per board: each prompt is
+    /// parsed once, requesters are looked up through indexes, and chain
+    /// roots are memoized.
+    struct HelperIndex {
+        private var parent: [String: String] = [:]
+        private var helpers: Set<String> = []
+        private var roots: [String: String] = [:]
 
-    /// The first agent up the request chain that is not itself helping:
-    /// where a helper's card folds. Nil for an agent that is not helping,
-    /// or whose chain leads nowhere or loops.
-    static func requestRoot(of hosted: MuxaHostedAgent, among agents: [MuxaHostedAgent]) -> MuxaHostedAgent? {
-        var current = hosted
-        var seen: Set<String> = [hosted.id]
-        while let parent = requester(of: current, among: agents) {
-            guard seen.insert(parent.id).inserted else { return nil }
-            if requester(of: parent, among: agents) == nil { return parent }
-            current = parent
+        init(agents: [MuxaHostedAgent]) {
+            var bySession: [String: [MuxaHostedAgent]] = [:]
+            var byPane: [String: [MuxaHostedAgent]] = [:]
+            for hosted in agents {
+                bySession[hosted.agent.agentSessionID, default: []].append(hosted)
+                if let pane = hosted.pane {
+                    byPane[Self.paneKey(hosted.host.alias, pane.endpointSocket, pane.paneID), default: []].append(hosted)
+                }
+            }
+            for hosted in agents {
+                guard let request = FleetBoard.helperRequest(hosted.agent) else { continue }
+                helpers.insert(hosted.id)
+                let candidates: [MuxaHostedAgent]
+                if let session = request.sessionID {
+                    // The envelope names the requester: that session or none,
+                    // never whoever took over its pane.
+                    candidates = bySession[session] ?? []
+                } else if let label = request.label, let at = label.lastIndex(of: "@"), let pane = hosted.pane {
+                    // A pane label is local to the helper's own tmux server.
+                    let paneID = String(label[label.index(after: at)...])
+                    candidates = byPane[Self.paneKey(hosted.host.alias, pane.endpointSocket, paneID)] ?? []
+                } else {
+                    candidates = []
+                }
+                let others = candidates.filter { $0.id != hosted.id }
+                if others.count == 1, let requester = others.first { parent[hosted.id] = requester.id }
+            }
+            // Each chain is walked once: a helper folds to the first agent
+            // up its chain that asked nobody; a loop folds nowhere.
+            for id in helpers where roots[id] == nil {
+                guard parent[id] != nil else { continue }
+                var chain = [id]
+                var seen: Set<String> = [id]
+                var current = id
+                var result: String?
+                while let next = parent[current] {
+                    guard seen.insert(next).inserted else { result = nil; break }
+                    if let known = roots[next] { result = known; break }
+                    if parent[next] == nil { result = next; break }
+                    chain.append(next)
+                    current = next
+                }
+                if let result {
+                    for member in chain { roots[member] = result }
+                }
+            }
         }
-        return nil
+
+        private static func paneKey(_ host: String, _ socket: String?, _ pane: String) -> String {
+            "\(host)|\(socket ?? "")|\(pane)"
+        }
+
+        /// Whether the agent is working on someone's peer request.
+        func isHelper(_ id: String) -> Bool { helpers.contains(id) }
+
+        /// Where a helper folds: the first agent up its chain that asked
+        /// nobody. Nil for an agent that is not helping, one whose
+        /// requester cannot be found, or a chain that loops.
+        func root(of id: String) -> String? { roots[id] }
     }
 
     /// A unit with its helpers folded in: a helper that needs the person
@@ -206,6 +252,7 @@ enum FleetBoard {
         unit.helpers = helpers
         unit.revision += ";" + revision(agents: helpers, run: nil)
         unit.lastChange = [work.lastChange, latestChange(helpers)].compactMap { $0 }.max()
+        unit.handledLimit = work.handledLimit || helpers.contains { isHandledLimit($0.agent, now: now) }
         if unit.lane != .needsYou,
            let asking = helpers
                .filter({ $0.agent.status(at: now).needsAttention })
@@ -216,7 +263,9 @@ enum FleetBoard {
             unit.headline = "\(owner(asking)): \(question(for: asking.agent, now: now))"
             unit.since = MuxaUsageTimestamp.parse(asking.agent.stateEnteredAt ?? asking.agent.lastActivityAt)
         } else if unit.lane == .finished,
-                  let working = helpers.first(where: { $0.agent.status(at: now) == .working }) {
+                  let working = helpers.first(where: {
+                      stageState(aliasStatus: nil, agent: $0.agent, now: now) == .running
+                  }) {
             unit.lane = .running
             unit.headline = String(localized: "Waiting on \(owner(working)): \(statusLine(for: working.agent, now: now))")
             unit.since = MuxaUsageTimestamp.parse(working.agent.stateEnteredAt ?? working.agent.lastActivityAt)

@@ -467,3 +467,42 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(FleetBoard.promptTitle("<task-notification>\n<summary>Build finished</summary>\n</task-notification>") == "⟳ Build finished")
     #expect(FleetBoard.promptTitle("Fix the README") == "Fix the README")
 }
+
+@Test func helperFoldingHoldsUpOnTheHardCases() throws {
+    let other = MuxaFleetHostIdentity(alias: "mbp", local: false, state: "online", mode: "control")
+    // Cross-host: the helper's host still shows the unit under its filter.
+    let root = MuxaHostedAgent(host: host, agent: try agent(["state": "idle"], id: "root"), pane: try pane("%1", alias: "r"))
+    let remote = MuxaHostedAgent(host: other, agent: try agent(["state": "waiting_input", "last_prompt": claimed(from: "root")], id: "rh"), pane: try pane("%2", alias: "h"))
+    let crossHost = FleetBoard.works(groups: [], agents: [root, remote])
+    #expect(crossHost.count == 1)
+    #expect(FleetBoard.filter(crossHost, host: "mbp", project: nil).first?.lane == .needsYou)
+
+    // The envelope names a session that is gone: a new agent at its old pane
+    // is not adopted as the requester.
+    let replacement = MuxaHostedAgent(host: host, agent: try agent(["state": "idle"], id: "new"), pane: try pane("%1", alias: "n"))
+    let orphan = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": claimed(from: "gone", label: "claude@%1")], id: "o"), pane: try pane("%3", alias: "o"))
+    let separate = FleetBoard.works(groups: [], agents: [replacement, orphan])
+    #expect(separate.count == 2)
+    #expect(separate.allSatisfy { $0.helpers.isEmpty })
+
+    // A person's prompt that mentions a request and a pane is its own work.
+    let human = MuxaHostedAgent(host: host, agent: try agent([
+        "state": "working", "last_prompt": "Investigate req_deadbeef01_1 failure on pane %1; do not claim peer requests",
+    ], id: "human"), pane: try pane("%4", alias: "x"))
+    #expect(FleetBoard.helperRequest(human.agent) == nil)
+    #expect(FleetBoard.works(groups: [], agents: [replacement, human]).count == 2)
+}
+
+@Test func aLongHelperChainFoldsOnceToItsRoot() throws {
+    var agents = [MuxaHostedAgent(host: host, agent: try agent(["state": "idle"], id: "h0"), pane: try pane("%0", alias: "a"))]
+    for index in 1...300 {
+        agents.append(MuxaHostedAgent(
+            host: host,
+            agent: try agent(["state": "idle", "last_prompt": claimed(from: "h\(index - 1)")], id: "h\(index)"),
+            pane: try pane("%\(index)", alias: "a")
+        ))
+    }
+    let works = FleetBoard.works(groups: [], agents: agents)
+    #expect(works.count == 1)
+    #expect(works.first?.helpers.count == 300)
+}
