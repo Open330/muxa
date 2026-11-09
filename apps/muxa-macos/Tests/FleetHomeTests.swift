@@ -380,7 +380,26 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
 
 @Test func aWorkIDIsMadeFromTheTask() throws {
     let date = try #require(MuxaUsageTimestamp.parse("2026-11-09T03:04:00Z"))
-    let id = WorkStartID.make(task: "Fix the login timeout on slow networks", at: date)
+    let id = WorkStartID.make(task: "Fix the login timeout on slow networks", at: date, suffix: "abc123")
     #expect(id.hasPrefix("fix-the-login-timeout-"))
-    #expect(WorkStartID.make(task: "로그인 오류 고치기", at: date).hasPrefix("work-"))
+    #expect(id.hasSuffix("-abc123"))
+    #expect(WorkStartID.make(task: "로그인 오류 고치기", at: date, suffix: "x").hasPrefix("work-"))
+    // Two forms never share an ID, even for the same task in the same minute.
+    #expect(WorkStartID.suffix() != WorkStartID.suffix())
+    #expect(WorkStartID.make(task: "같은 일", at: date, suffix: WorkStartID.suffix())
+        != WorkStartID.make(task: "같은 일", at: date, suffix: WorkStartID.suffix()))
+}
+
+@Test func aFinishedWorkIsRecentByItsLatestAgent() throws {
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    let old = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "state_entered_at": "2026-11-07T12:00:00Z"], id: "a"), pane: try pane("%1", alias: "x"))
+    let fresh = MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "state_entered_at": "2026-11-09T11:00:00Z"], id: "b"), pane: try pane("%2", alias: "y"))
+    let work = FleetBoard.work(for: MuxaWorkGroup(
+        identity: MuxaWorkIdentity(workspaceID: "ws", workID: "w"),
+        pipelineRun: nil,
+        participants: [old, fresh]
+    ), now: now)
+    #expect(work.lane == .finished)
+    #expect(work.focus?.id == old.id)
+    #expect(FleetBoard.isRecent(work, now: now))
 }

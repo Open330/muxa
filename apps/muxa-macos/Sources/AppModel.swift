@@ -158,6 +158,8 @@ final class AppModel: ObservableObject {
     /// Pipeline the Start Work sheet should preselect when opened from a
     /// pipeline card; nil leaves the route default.
     @Published var workStartPreselectedPipeline: String?
+    /// A template chosen in the template manager over an open Start Work.
+    @Published var workStartTemplateChoice: MuxaTemplateChoice?
     /// Routes, pipelines, skills, and presets from `muxa work options` on
     /// the local host. Per-host copies live in `workOptionsByHost`.
     @Published private(set) var workOptions: MuxaWorkOptions?
@@ -857,8 +859,7 @@ final class AppModel: ObservableObject {
         if isPresentingWorkStart && isPresentingTemplates {
             // Chosen in the template manager over an open Start Work: close
             // the manager and choose that template in the kept form.
-            workStartPreselectedPipeline = nil
-            workStartPreselectedPipeline = pipeline
+            workStartTemplateChoice = MuxaTemplateChoice(pipeline: pipeline)
             isPresentingTemplates = false
             return
         }
@@ -2029,4 +2030,11 @@ final class AppModel: ObservableObject {
         }
     }
 
+}
+
+/// One choice of a template; a fresh id makes choosing the same template
+/// twice two distinct events.
+struct MuxaTemplateChoice: Equatable {
+    let id = UUID()
+    let pipeline: String?
 }

@@ -55,6 +55,9 @@ struct FleetWork: Identifiable, Sendable {
     /// Changes whenever any agent of the unit or its pipeline moves on, so
     /// a mark made on one version of the unit never covers a later one.
     var revision: String = ""
+    /// The latest moment any of the unit's agents changed state: when a
+    /// finished unit finished, whichever agent the card names.
+    var lastChange: Date?
 
     var id: String {
         switch source {
@@ -153,7 +156,8 @@ enum FleetBoard {
             agents: group.participants,
             focus: focus,
             handledLimit: group.participants.contains { isHandledLimit($0.agent, now: now) },
-            revision: revision(agents: group.participants, run: group.pipelineRun)
+            revision: revision(agents: group.participants, run: group.pipelineRun),
+            lastChange: latestChange(group.participants)
         )
     }
 
@@ -250,8 +254,13 @@ enum FleetBoard {
             agents: [hosted],
             focus: hosted,
             handledLimit: isHandledLimit(agent, now: now),
-            revision: revision(agents: [hosted], run: nil)
+            revision: revision(agents: [hosted], run: nil),
+            lastChange: latestChange([hosted])
         )
+    }
+
+    static func latestChange(_ agents: [MuxaHostedAgent]) -> Date? {
+        agents.compactMap { MuxaUsageTimestamp.parse($0.agent.stateEnteredAt ?? $0.agent.lastActivityAt) }.max()
     }
 
     /// Every agent's session, state and state entry, plus the pipeline's
@@ -350,8 +359,8 @@ extension FleetBoard {
     /// A finished unit that changed within `recentFinish`, or one with no
     /// known time.
     static func isRecent(_ work: FleetWork, now: Date = .now) -> Bool {
-        guard let since = work.since else { return true }
-        return now.timeIntervalSince(since) <= recentFinish
+        guard let changed = work.lastChange ?? work.since else { return true }
+        return now.timeIntervalSince(changed) <= recentFinish
     }
 
     /// The units on the chosen host and in the chosen project.

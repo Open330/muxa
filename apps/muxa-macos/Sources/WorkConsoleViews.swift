@@ -30,12 +30,15 @@ struct WorkStartView: View {
 
     @State private var showsMore = false
     @State private var startedAt = Date()
+    /// Random per form, kept from plan to launch, so two launches never
+    /// share a made-up Work ID.
+    @State private var idSuffix = WorkStartID.suffix()
 
     /// The Work ID the launch uses: the typed one, else one made from the
     /// task, so the task is all a person has to write.
     private var effectiveWork: String {
         let typed = work.trimmingCharacters(in: .whitespacesAndNewlines)
-        return typed.isEmpty ? WorkStartID.make(task: taskBody, at: startedAt) : typed
+        return typed.isEmpty ? WorkStartID.make(task: taskBody, at: startedAt, suffix: idSuffix) : typed
     }
 
     private var matchedRoute: MuxaWorkOptions.Route? {
@@ -169,7 +172,7 @@ struct WorkStartView: View {
 
                 Section {
                     DisclosureGroup("More options", isExpanded: $showsMore) {
-                        TextField("Work ID", text: $work, prompt: Text(WorkStartID.make(task: taskBody, at: startedAt)))
+                        TextField("Work ID", text: $work, prompt: Text(WorkStartID.make(task: taskBody, at: startedAt, suffix: idSuffix)))
                         routeSummary
                         HStack {
                             TextField("Workspace (optional)", text: $workspace)
@@ -245,9 +248,11 @@ struct WorkStartView: View {
         .sheet(isPresented: $model.isPresentingTemplates) {
             WorkTemplatesSheet(model: model)
         }
-        .onChange(of: model.workStartPreselectedPipeline) { chosen in
-            // A template's Start button chose it in the template manager.
-            if let chosen { pipeline = chosen }
+        .onChange(of: model.workStartTemplateChoice) { choice in
+            // A template's Start button chose it in the template manager;
+            // each choice is its own event, so choosing the same one again
+            // still applies.
+            if let choice { pipeline = choice.pipeline ?? "" }
         }
         .onAppear {
             if let preselected = model.workStartPreselectedPipeline {
@@ -1174,10 +1179,18 @@ struct WorkTemplatesSheet: View {
 }
 
 /// A Work ID made from the task, for a launch that names none: the task's
-/// first few words in lower case, joined by hyphens, then the time, so two
-/// launches never collide. A task with no Latin words gets `work-…`.
+/// first few words in lower case, joined by hyphens, the date, and a random
+/// suffix fixed for the form, so two launches never share an identity (a
+/// shared one would converge onto the other Work). A task with no Latin
+/// words gets `work-…`.
 enum WorkStartID {
-    static func make(task: String, at date: Date) -> String {
+    /// Six random base-36 characters.
+    static func suffix() -> String {
+        let alphabet = Array("abcdefghijklmnopqrstuvwxyz0123456789")
+        return String((0..<6).map { _ in alphabet.randomElement()! })
+    }
+
+    static func make(task: String, at date: Date, suffix: String) -> String {
         let words = task.lowercased()
             .split { !($0.isASCII && ($0.isLetter || $0.isNumber)) }
             .prefix(4)
@@ -1185,7 +1198,7 @@ enum WorkStartID {
         let stem = words.isEmpty ? "work" : String(words.joined(separator: "-").prefix(32))
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "MMdd-HHmm"
-        return "\(stem)-\(formatter.string(from: date))"
+        formatter.dateFormat = "MMdd"
+        return "\(stem)-\(formatter.string(from: date))-\(suffix)"
     }
 }

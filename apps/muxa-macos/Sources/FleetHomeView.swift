@@ -163,7 +163,9 @@ struct FleetHomeView: View {
         }
         .animation(.easeOut(duration: 0.18), value: selected?.id)
         .onExitCommand { selectedID = nil }
-        .onChange(of: all.map(\.id)) { ids in
+        // Display filters hide units; they are not gone. Prune review marks
+        // against the whole board.
+        .onChange(of: allWorks.map(\.id)) { ids in
             // Only a live board says a unit is gone; a disconnect is not.
             guard model.isConnected, !ids.isEmpty else { return }
             var pruned = reviewed
