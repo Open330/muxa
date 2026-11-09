@@ -3570,6 +3570,16 @@
         }
       }
     },
+    "Asks you to choose. Open to see the question." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택을 기다립니다. 열어서 질문을 확인하세요."
+          }
+        }
+      }
+    },
     "Assign" : {
       "localizations" : {
         "ko" : {
@@ -3966,6 +3976,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "카드"
+          }
+        }
+      }
+    },
+    "Choice on screen" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면의 선택지"
           }
         }
       }
@@ -9822,6 +9842,16 @@
         }
       }
     },
+    "No numbered choice is on screen. Open the pane to see what it is asking." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면에 번호가 붙은 선택지가 없습니다. 창을 열어 무엇을 묻는지 확인하세요."
+          }
+        }
+      }
+    },
     "No output yet." : {
       "localizations" : {
         "ko" : {
@@ -12345,6 +12375,16 @@
         }
       }
     },
+    "Read the screen again" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면 다시 읽기"
+          }
+        }
+      }
+    },
     "Read-only" : {
       "localizations" : {
         "ko" : {
@@ -13901,6 +13941,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "“continue” 보내기"
+          }
+        }
+      }
+    },
+    "Sent %lld. %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld. %@ 보냄"
           }
         }
       }
@@ -16524,6 +16574,16 @@
         }
       }
     },
+    "The question on screen changed. Check it again before choosing." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면의 질문이 바뀌었습니다. 다시 확인한 뒤 고르세요."
+          }
+        }
+      }
+    },
     "The route decides the folder." : {
       "localizations" : {
         "ko" : {
@@ -17956,6 +18016,16 @@
         }
       }
     },
+    "Waits for your answer. Open to see the question." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답을 기다립니다. 열어서 질문을 확인하세요."
+          }
+        }
+      }
+    },
     "Wake" : {
       "localizations" : {
         "ko" : {
@@ -18601,6 +18671,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "답변"
+          }
+        }
+      }
+    },
+    "Your own answer" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "직접 답하기"
           }
         }
       }

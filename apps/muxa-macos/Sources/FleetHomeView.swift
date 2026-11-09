@@ -225,6 +225,7 @@ struct FleetHomeView: View {
 
     private func inspector(_ work: FleetWork) -> some View {
         FleetWorkInspector(
+            model: model,
             work: work,
             isReviewed: reviewed.hides(work),
             close: { selectedID = nil },
@@ -556,8 +557,7 @@ private struct FleetWorkCard: View {
                 if let repo = work.repo {
                     Text(repo)
                 }
-                Text(work.hostAliases.joined(separator: ", "))
-                    .lineLimit(1)
+                FleetHostBadges(hosts: work.hosts)
                 if !work.helpers.isEmpty {
                     Label("\(work.helpers.count)", systemImage: "person.2")
                         .labelStyle(.titleAndIcon)
@@ -640,6 +640,7 @@ extension FleetWorkStage.State {
 // MARK: - Inspector
 
 private struct FleetWorkInspector: View {
+    @ObservedObject var model: AppModel
     let work: FleetWork
     let isReviewed: Bool
     let close: () -> Void
@@ -722,6 +723,10 @@ private struct FleetWorkInspector: View {
                 Label("Rate limited · the limit policy will resume it", systemImage: "arrow.triangle.2.circlepath")
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
+            }
+            if FleetBoard.choosesInPane(work), let focus = work.focus, focus.pane != nil {
+                FleetChoicePanel(model: model, hosted: focus)
+                    .id(focus.id)
             }
             if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
                 FleetReplyField(work: work, draft: $draft, submit: submit)
@@ -980,3 +985,25 @@ private struct FleetEmptyBoard: View {
     }
 }
 
+
+/// Each host a unit runs on: its icon (the one set for the menu bar) and
+/// its name.
+struct FleetHostBadges: View {
+    let hosts: [MuxaFleetHostIdentity]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(hosts, id: \.alias) { host in
+                let icon = MuxaHostIcons.icon(for: host.alias, local: host.local)
+                HStack(spacing: 3) {
+                    MuxaGlyphView(value: icon, size: 7)
+                        .frame(width: 14, height: 14)
+                        .background(MuxaMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                    Text(verbatim: host.alias)
+                        .lineLimit(1)
+                }
+                .help(host.local ? String(localized: "\(host.alias) (this Mac)") : host.alias)
+            }
+        }
+    }
+}

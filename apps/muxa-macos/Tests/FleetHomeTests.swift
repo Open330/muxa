@@ -621,3 +621,44 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
 @Test func digestIsTheDefaultReviewMode() {
     #expect(FleetReviewMode.allCases.first == .digest)
 }
+
+@Test func aChoiceDialogIsReadOffTheScreen() throws {
+    // The Main Claude screen from jiun-mbp, with a code panel on the right.
+    let screen = """
+      Ran 1 shell command                                                 │ 13      var resetPosition: () -> Void = {}
+    ──────────────────────────────────────────────────────────────────────│ 14      var heightChanged: (CGFloat) -> Void = { _ in
+     ☐ MBP AFM                                                            │     }
+                                                                          │ 15 +    var resting: Binding<Bool>? = nil
+    │ MBP에서 Apple Intelligence(AFM)가 modelNotReady입니다. Mac 언어가   │ 16      @FocusState private var inputFocused: Bool
+    │ English(South Korea)인데 Siri는 이미 한국어라서 둘이 달라 다운로드가│ 17 +    @FocusState private var searchFocused: Bool
+    │ 막혀 있습니다. 어떻게 맞출까요?                                     │ 18      @Environment(\\.colorScheme) private var colorS
+                                                                          │ 19 +    @AppStorage("mac.compactConversationShowsExcha
+    ❯ 1. Siri를 영어로 (Recommended)                                      │    +nge") private var showsExchange = true
+         Siri 언어만 English(US 등)로 바꿉니다. Mac UI는 그대로입니다.    │ 20 +    @AppStorage(DesktopConversationTextSize.prefer
+      2. Mac 언어를 한국어로                                              │    +enceKey) private var textSize: DesktopConversation
+         MBP 전체 UI가 한국어로 바뀝니다.                                 │ 21 +    @State private var readingPosition = ScrollPos
+      3. 그대로 두기                                                      │    +ition(edge: .bottom)
+         MBP AFM은 쓰지 않고, AFM 시험은 Mini에서만 합니다.               │ 22 +    @State private var followsLatest = true
+      4. Type something.                                                  │ 23 +    @State private var userScrolling = false
+    """
+    let dialog = try #require(FleetChoiceDialog.parse(screen))
+    #expect(dialog.question.hasPrefix("☐ MBP AFM\nMBP에서 Apple Intelligence"))
+    #expect(dialog.question.hasSuffix("어떻게 맞출까요?"))
+    #expect(dialog.options.map(\.number) == [1, 2, 3, 4])
+    #expect(dialog.options[0].label == "Siri를 영어로 (Recommended)")
+    #expect(dialog.options[0].detail?.hasPrefix("Siri 언어만") == true)
+    #expect(dialog.options[3].takesText)
+    #expect(!dialog.options[0].takesText)
+
+    #expect(FleetChoiceDialog.parse("just some output\n❯ ") == nil)
+    #expect(FleetChoiceDialog.parse("Pick one\n  2. B\n  3. C") == nil, "numbering must start at 1")
+}
+
+@Test func aGenericNoticeSaysWhatKindOfAnswerIsWanted() throws {
+    let choosing = try agent(["state": "waiting_choice", "last_notification": "Claude approval required: Claude needs your permission"], id: "a")
+    #expect(FleetBoard.question(for: choosing, now: .now) == "Asks you to choose. Open to see the question.")
+    let typing = try agent(["state": "waiting_input", "last_notification": "Claude is waiting for your input"], id: "b")
+    #expect(FleetBoard.question(for: typing, now: .now) == "Waits for your answer. Open to see the question.")
+    let specific = try agent(["state": "waiting_input", "last_notification": "Where should the sandbox live?"], id: "c")
+    #expect(FleetBoard.question(for: specific, now: .now) == "Where should the sandbox live?")
+}
