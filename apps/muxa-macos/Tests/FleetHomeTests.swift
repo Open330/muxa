@@ -344,3 +344,13 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     let long = (1...60).map(String.init).joined(separator: "\n")
     #expect(FleetQuickLookText.plain(long, lines: 3) == "58\n59\n60")
 }
+
+@Test func aDigestIsTheOpeningOfTheTextWithoutMarkdown() {
+    #expect(FleetQuickLookText.digest(nil) == nil)
+    #expect(FleetQuickLookText.digest("  \n---\n") == nil)
+    #expect(FleetQuickLookText.digest("## Done\n\n- Fixed the parser\n- Added tests") == "Done Fixed the parser Added tests")
+    let long = "First sentence is here. " + String(repeating: "word ", count: 100)
+    let cut = FleetQuickLookText.digest(long, limit: 60) ?? ""
+    #expect(cut.count <= 61)
+    #expect(cut.hasSuffix("…") || cut.hasSuffix("."))
+}

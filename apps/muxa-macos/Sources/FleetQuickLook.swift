@@ -1,6 +1,7 @@
 // Fleet Home's quick look: a short look at one agent without leaving the
-// board. Its state, the question or latest line, the bottom of its pane, and
-// the answer field; Open Pane goes to the full view only when wanted.
+// board. A summary of where it is (the question or what it is doing, what
+// it was asked, its latest result, its own recap), the answer field, and
+// the raw pane one click away; Open Pane goes to the full view.
 import SwiftUI
 
 struct FleetQuickLookTarget: Identifiable, Equatable {
@@ -27,6 +28,31 @@ enum FleetQuickLookText {
         while let last = rows.last, last.isEmpty { rows.removeLast() }
         return rows.suffix(lines).joined(separator: "\n")
     }
+
+    /// The opening of a longer text, for a summary line: Markdown markers
+    /// and blank lines removed, cut near `limit` characters at the end of a
+    /// sentence or word.
+    static func digest(_ text: String?, limit: Int = 320) -> String? {
+        guard let text else { return nil }
+        let lines = text.components(separatedBy: .newlines)
+            .map { line -> String in
+                var line = line.trimmingCharacters(in: .whitespaces)
+                while let first = line.first, "#>*-`".contains(first) {
+                    line = String(line.dropFirst()).trimmingCharacters(in: .whitespaces)
+                }
+                return line
+            }
+            .filter { !$0.isEmpty && !$0.allSatisfy { "-=*_`|".contains($0) } }
+        let joined = lines.joined(separator: " ")
+        guard !joined.isEmpty else { return nil }
+        guard joined.count > limit else { return joined }
+        let head = String(joined.prefix(limit))
+        if let stop = head.lastIndex(where: { ".!?。".contains($0) }), head.distance(from: head.startIndex, to: stop) > limit / 2 {
+            return String(head[...stop])
+        }
+        if let space = head.lastIndex(of: " ") { return String(head[..<space]) + "…" }
+        return head + "…"
+    }
 }
 
 struct FleetQuickLookView: View {
@@ -41,6 +67,7 @@ struct FleetQuickLookView: View {
 
     @State private var screen: String?
     @State private var captureError: String?
+    @State private var showsPane = false
 
     private var hosted: MuxaHostedAgent? {
         model.hostedAgents.first { $0.id == target.agentID }
@@ -59,13 +86,19 @@ struct FleetQuickLookView: View {
             header
             if let hosted {
                 summary(hosted)
-                preview(hosted)
                 if showsReply, let work {
                     FleetReplyField(work: work, draft: $draft, submit: submit)
                 }
             } else {
                 Text("This agent is no longer running.")
                     .foregroundStyle(.secondary)
+            }
+            if let hosted, hosted.pane != nil {
+                DisclosureGroup("Show pane", isExpanded: $showsPane) {
+                    preview(hosted)
+                        .padding(.top, 6)
+                }
+                .font(MuxaType.detail)
             }
             HStack {
                 Spacer()
@@ -83,9 +116,8 @@ struct FleetQuickLookView: View {
             }
         }
         .padding(20)
-        .frame(width: 620)
-        .frame(minHeight: 360)
-        .task(id: target.agentID) { await follow() }
+        .frame(width: 560)
+        .task(id: showsPane) { if showsPane { await follow() } }
     }
 
     private var header: some View {
@@ -112,21 +144,76 @@ struct FleetQuickLookView: View {
     }
 
     private func summary(_ hosted: MuxaHostedAgent) -> some View {
-        let status = hosted.agent.status
-        let line = status.needsAttention
-            ? FleetBoard.question(for: hosted.agent, now: .now)
-            : FleetBoard.statusLine(for: hosted.agent, now: .now)
-        return Text(line)
-            .font(.system(size: 13.5, weight: status.needsAttention ? .semibold : .regular))
-            .fixedSize(horizontal: false, vertical: true)
-            .textSelection(.enabled)
+        let agent = hosted.agent
+        let status = agent.status
+        let now = status.needsAttention
+            ? FleetBoard.question(for: agent, now: .now)
+            : FleetBoard.statusLine(for: agent, now: .now)
+        let since = MuxaUsageTimestamp.parse(agent.stateEnteredAt ?? agent.lastActivityAt)
+        return VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(status.needsAttention ? "Needs you" : "Now")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(status.needsAttention ? Color.orange : Color.secondary)
+                    if let since {
+                        Text(since, format: .relative(presentation: .numeric, unitsStyle: .abbreviated))
+                            .font(MuxaType.meta)
+                            .foregroundStyle(.tertiary)
+                            .monospacedDigit()
+                    }
+                }
+                Text(now)
+                    .font(.system(size: 13.5, weight: status.needsAttention ? .semibold : .regular))
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+            if let work, work.stages.count > 1 {
+                summaryRow("Stages", work.stages.map { "\($0.name) \(stageMark($0.state))" }.joined(separator: " → "))
+            }
+            if let asked = FleetQuickLookText.digest(agent.lastPrompt, limit: 200) {
+                summaryRow("Asked", asked)
+            }
+            if let result = FleetQuickLookText.digest(agent.lastResponse), result != now {
+                summaryRow("Latest result", result)
+            }
+            if let recap = FleetQuickLookText.digest(agent.recap), recap != now {
+                summaryRow("Session recap", recap)
+            }
+        }
+        .padding(14)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    private func summaryRow(_ title: LocalizedStringKey, _ text: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(title)
+                .font(.system(size: 11, weight: .bold))
+                .foregroundStyle(.secondary)
+            Text(text)
+                .font(MuxaType.body)
+                .foregroundStyle(.primary.opacity(0.85))
+                .lineLimit(4)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+        }
+    }
+
+    private func stageMark(_ state: FleetWorkStage.State) -> String {
+        switch state {
+        case .done: "✓"
+        case .running: "●"
+        case .needsYou: "!"
+        case .waiting: "○"
+        }
     }
 
     @ViewBuilder
     private func preview(_ hosted: MuxaHostedAgent) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text(hosted.pane == nil ? "Last response" : "Pane")
+                Text("Bottom of the pane")
                     .font(MuxaType.meta.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer()

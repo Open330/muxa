@@ -107,6 +107,23 @@ final class AppModel: ObservableObject {
     @Published private(set) var workspaceRevision: UInt64 = 0
     @Published var sidebarSelection: MuxaSidebarSelection?
     @Published var sidebarMode: MuxaSidebarMode = .work
+    /// Fleet Home was opened from the activity rail: the window gives it the
+    /// whole width and the list column folds away until another list or
+    /// editor is chosen.
+    @Published var isHomeFocused = false
+
+    /// The list column folds away while Fleet Home is the focused editor and
+    /// was opened from the rail.
+    var isSidebarListCollapsed: Bool { isHomeFocused && sidebarSelection == .workBoard }
+
+    /// The activity rail's Home: open Fleet Home and fold the lists away.
+    func showHome() {
+        // Re-selecting brings the Fleet Home tab to the front even when the
+        // selection already names it.
+        if sidebarSelection == .workBoard { sidebarSelection = nil }
+        select(.workBoard)
+        isHomeFocused = true
+    }
     @Published var watchSelection: MuxaWatchPaneIdentity?
     @Published private(set) var connectionState: ConnectionState = .connecting
     @Published private(set) var isCreatingSession = false
@@ -1816,6 +1833,7 @@ final class AppModel: ObservableObject {
         // Like VS Code's Activity Bar, this changes the visible view
         // container without replacing whichever editor tab is active.
         if mode == .files, sidebarMode != .files, let directory = activeFileDirectory { fileRoot = directory }
+        isHomeFocused = false
         sidebarMode = mode
         if mode == .inbox, isConnected {
             Task { [weak self] in await self?.refreshOperatorInbox() }

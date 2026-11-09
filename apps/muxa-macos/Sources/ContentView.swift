@@ -13,6 +13,12 @@ struct ContentView: View {
     @State private var showingShortcuts = false
     @AppStorage("muxa.sidebar.visible") private var sidebarVisible = true
 
+    /// Just the activity rail, but never narrower than the traffic lights
+    /// above it.
+    private var collapsedSidebarWidth: CGFloat {
+        max(MuxaTheme.activityBarWidth + 1, chrome.leadingInset + 4)
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             HSplitView {
@@ -36,7 +42,11 @@ struct ContentView: View {
                         // of the hidden title bar's inset: its top row is the
                         // title bar (see WorkbenchWindowChrome.swift).
                         .ignoresSafeArea(.container, edges: .top)
-                        .frame(minWidth: 260, idealWidth: 300, maxWidth: 380)
+                        .frame(
+                            minWidth: model.isSidebarListCollapsed ? collapsedSidebarWidth : 260,
+                            idealWidth: model.isSidebarListCollapsed ? collapsedSidebarWidth : 300,
+                            maxWidth: model.isSidebarListCollapsed ? collapsedSidebarWidth : 380
+                        )
                 }
                 editorRegion
                     .frame(minWidth: 560)

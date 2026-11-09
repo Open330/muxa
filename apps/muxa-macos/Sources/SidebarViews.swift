@@ -148,7 +148,11 @@ struct MuxaSidebar: View {
                 // title and actions (see WorkbenchWindowChrome.swift).
                 HStack(spacing: 0) {
                     Color.clear.frame(width: max(0, chrome.leadingInset - 14))
-                    sectionTitle
+                    if !model.isSidebarListCollapsed {
+                        sectionTitle
+                    } else {
+                        Spacer(minLength: 0)
+                    }
                 }
                 .frame(height: chrome.rowHeight)
                 .background(alignment: .bottom) {
@@ -164,7 +168,9 @@ struct MuxaSidebar: View {
 
                     MuxaTheme.border(colorScheme).frame(width: 1)
 
-                    if model.sidebarMode == .files {
+                    if model.isSidebarListCollapsed {
+                        EmptyView()
+                    } else if model.sidebarMode == .files {
                         ArtifactFileSidebar(model: model, openFile: openFile)
                     } else {
                     VStack(spacing: 0) {
@@ -958,10 +964,10 @@ private struct SidebarActivityRail: View {
             ActivityRailItem(
                 systemImage: "house",
                 title: String(localized: "Fleet Home"),
-                active: model.sidebarSelection == .workBoard,
+                active: model.isSidebarListCollapsed,
                 badge: FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
                     .filter { $0.lane == .needsYou }.count,
-                select: { model.select(.workBoard) }
+                select: { model.showHome() }
             )
             MuxaTheme.border(colorScheme)
                 .frame(width: MuxaTheme.activityBarWidth - 18, height: 1)
@@ -970,7 +976,7 @@ private struct SidebarActivityRail: View {
                 ActivityRailItem(
                     systemImage: mode.systemImage,
                     title: mode.title,
-                    active: model.sidebarMode == mode,
+                    active: model.sidebarMode == mode && !model.isSidebarListCollapsed,
                     badge: attentionCount(for: mode),
                     select: { model.show(mode) }
                 )
