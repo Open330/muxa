@@ -1,6 +1,56 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%lld in the last hour" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최근 1시간 %lld건"
+          }
+        }
+      }
+    },
+    "Add Approval Rule…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "승인 규칙 추가…"
+          }
+        }
+      }
+    },
+    "All Rules…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모든 규칙…"
+          }
+        }
+      }
+    },
+    "Always Approve This Command" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 명령은 항상 승인"
+          }
+        }
+      }
+    },
+    "Always Approve This Command…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 명령은 항상 승인…"
+          }
+        }
+      }
+    },
     "Answer" : {
       "localizations" : {
         "ko" : {
@@ -3188,6 +3238,16 @@
         }
       }
     },
+    "Approve on its own" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "알아서 승인"
+          }
+        }
+      }
+    },
     "Argument (empty string allowed)" : {
       "localizations" : {
         "ko" : {
@@ -3430,12 +3490,72 @@
         }
       }
     },
+    "Automatic handling" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 처리"
+          }
+        }
+      }
+    },
+    "Automatic handling is off. The rule is saved but does nothing until you turn it on." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 처리가 꺼져 있습니다. 규칙은 저장되지만 자동 처리를 켜야 동작합니다."
+          }
+        }
+      }
+    },
     "Automatic splits along the pane's longer side, so a growing line-up stays readable" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "자동 분할은 페인의 긴 쪽을 따라 나누므로, 늘어나도 읽기 좋게 유지됩니다"
+          }
+        }
+      }
+    },
+    "Automatic: off" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 처리: 꺼짐"
+          }
+        }
+      }
+    },
+    "Automatic: on" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 처리: 켜짐"
+          }
+        }
+      }
+    },
+    "Automatic: paused" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 처리: 일시 중지"
+          }
+        }
+      }
+    },
+    "Automatic: unavailable" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 처리: 사용 불가"
           }
         }
       }
@@ -4303,6 +4423,26 @@
         }
       }
     },
+    "Command" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명령"
+          }
+        }
+      }
+    },
+    "Command on screen" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면의 명령"
+          }
+        }
+      }
+    },
     "Command Palette" : {
       "localizations" : {
         "ko" : {
@@ -4929,6 +5069,16 @@
         }
       }
     },
+    "Copy the command into Command. Only a Codex or Claude Code shell command dialog can be approved; a Claude description line is not part of the command." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명령을 '명령' 칸에 복사해 넣으세요. Codex·Claude Code의 셸 명령 확인 창만 승인할 수 있고, Claude의 설명 줄은 명령에 포함되지 않습니다."
+          }
+        }
+      }
+    },
     "Copy this exchange" : {
       "localizations" : {
         "ko" : {
@@ -5501,6 +5651,16 @@
         }
       }
     },
+    "Does not match the command on screen" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면의 명령과 맞지 않습니다"
+          }
+        }
+      }
+    },
     "Don't show this guide again" : {
       "localizations" : {
         "ko" : {
@@ -5557,6 +5717,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "초안 생성이 취소되었습니다."
+          }
+        }
+      }
+    },
+    "e.g. npm test" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "예: npm test"
           }
         }
       }
@@ -6917,6 +7087,26 @@
         }
       }
     },
+    "Handled %lld today" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오늘 %lld건 처리"
+          }
+        }
+      }
+    },
+    "Handled today" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오늘 처리한 일"
+          }
+        }
+      }
+    },
     "Help" : {
       "localizations" : {
         "ko" : {
@@ -7475,6 +7665,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "알리기만 하기"
+          }
+        }
+      }
+    },
+    "Keep" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "유지"
           }
         }
       }
@@ -8126,6 +8326,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "매치"
+          }
+        }
+      }
+    },
+    "Matches the command on screen" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "화면의 명령과 맞습니다"
           }
         }
       }
@@ -9082,6 +9292,26 @@
         }
       }
     },
+    "No approval rules. Every permission request waits for you." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "승인 규칙이 없습니다. 모든 권한 요청은 직접 확인해야 합니다."
+          }
+        }
+      }
+    },
+    "No command confirmation is on screen right now." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "지금 화면에 명령 확인 창이 없습니다."
+          }
+        }
+      }
+    },
     "No Hosts" : {
       "localizations" : {
         "ko" : {
@@ -9835,6 +10065,16 @@
         }
       }
     },
+    "Nothing below runs until automatic handling is on." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "자동 처리를 켜야 아래 규칙이 동작합니다."
+          }
+        }
+      }
+    },
     "Nothing configured yet. Add a provider, or add one of the detected built-ins below." : {
       "localizations" : {
         "ko" : {
@@ -9932,6 +10172,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "변경 사항이 없습니다. Work 윈도우가 이미 파이프라인과 일치합니다."
+          }
+        }
+      }
+    },
+    "Nothing yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 없습니다."
           }
         }
       }
@@ -10163,6 +10413,16 @@
         }
       }
     },
+    "one Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 하나"
+          }
+        }
+      }
+    },
     "One workbench for every agent" : {
       "localizations" : {
         "ko" : {
@@ -10213,6 +10473,16 @@
         }
       }
     },
+    "Only in this Work" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 작업에서만"
+          }
+        }
+      }
+    },
     "Only metadata changed." : {
       "localizations" : {
         "ko" : {
@@ -10239,6 +10509,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "다른 호스트에만 있음"
+          }
+        }
+      }
+    },
+    "Only shell commands you name here, matched in full. Muxa presses the one-time Yes, never \"don't ask again\", and only on agents on this Mac." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "여기 적은 셸 명령과 완전히 같을 때만 승인합니다. Muxa는 한 번만 허용하는 Yes만 누르고 \"다시 묻지 않기\"는 절대 누르지 않으며, 이 Mac의 에이전트에만 적용됩니다."
           }
         }
       }
@@ -11852,6 +12132,26 @@
         }
       }
     },
+    "Regular expression" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "정규식"
+          }
+        }
+      }
+    },
+    "Regular expression for the whole command, e.g. npm (test|run lint)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명령 전체에 맞는 정규식, 예: npm (test|run lint)"
+          }
+        }
+      }
+    },
     "Relaunch" : {
       "localizations" : {
         "ko" : {
@@ -12109,6 +12409,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 라우트 제거"
+          }
+        }
+      }
+    },
+    "Remove this rule" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 규칙 삭제"
           }
         }
       }
@@ -12861,6 +13171,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "안전한 인계"
+          }
+        }
+      }
+    },
+    "Save Rule" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "규칙 저장"
           }
         }
       }
@@ -15444,6 +15764,16 @@
         }
       }
     },
+    "The rule was not saved." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "규칙을 저장하지 못했습니다."
+          }
+        }
+      }
+    },
     "The rule's hourly cap is reached" : {
       "localizations" : {
         "ko" : {
@@ -15715,6 +16045,16 @@
         }
       }
     },
+    "This is not a valid regular expression." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "올바른 정규식이 아닙니다."
+          }
+        }
+      }
+    },
     "This muxad cannot edit its configuration" : {
       "localizations" : {
         "ko" : {
@@ -15742,6 +16082,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 muxad는 자동화를 실행할 수 없습니다. 고르려면 muxa를 업데이트하세요."
+          }
+        }
+      }
+    },
+    "This muxad cannot run automations; update muxa to use them." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 muxad는 자동화를 실행할 수 없습니다. muxa를 업데이트하세요."
           }
         }
       }
@@ -16786,6 +17136,16 @@
         }
       }
     },
+    "What Muxa handles on its own" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 알아서 처리하는 일"
+          }
+        }
+      }
+    },
     "What should an agent do?" : {
       "localizations" : {
         "ko" : {
@@ -16862,6 +17222,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트가 사용 한도에 도달하면"
+          }
+        }
+      }
+    },
+    "When an agent on this Mac asks to run exactly this command, Muxa presses the one-time Yes. Any other command, or anything Muxa cannot read with certainty, still waits for you." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 Mac의 에이전트가 정확히 이 명령을 실행하려 할 때 Muxa가 한 번만 허용하는 Yes를 누릅니다. 다른 명령이나 Muxa가 확실히 읽지 못한 요청은 그대로 직접 확인해야 합니다."
           }
         }
       }
@@ -17175,6 +17545,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "실행 예정"
+          }
+        }
+      }
+    },
+    "Write a rule so Muxa approves this command on its own" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 명령을 Muxa가 알아서 승인하도록 규칙을 만듭니다"
           }
         }
       }

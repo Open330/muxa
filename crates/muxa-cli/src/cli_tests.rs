@@ -1059,6 +1059,7 @@ fn only_a_session_start_names_a_pane() {
         },
         tool: "Bash".into(),
         subagent: None,
+        command: None,
         at: time::OffsetDateTime::now_utc(),
     };
     assert_eq!(alias_target(&tool), None);
@@ -1179,6 +1180,7 @@ fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) 
         last_response: None,
         recap: None,
         ai_title: None,
+        pending_command: None,
         last_notification: None,
         model: Some("claude-sonnet-very-long-model-name".into()),
         context_used_pct: None,

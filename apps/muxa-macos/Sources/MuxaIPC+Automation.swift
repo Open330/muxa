@@ -283,6 +283,8 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
     var pane: String?
     var host: String?
     var notification: String?
+    /// `press_enter` only: the request text the visible choice must match.
+    var screen: String?
     var scope: [String]
     /// `for` — how long the agent must have been idle (`idle_for` only).
     var idleFor: String?
@@ -333,6 +335,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         pane: String? = nil,
         host: String? = nil,
         notification: String? = nil,
+        screen: String? = nil,
         scope: [String] = [],
         idleFor: String? = nil,
         wait: String? = nil,
@@ -358,6 +361,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         self.pane = pane
         self.host = host
         self.notification = notification
+        self.screen = screen
         self.scope = scope
         self.idleFor = idleFor
         self.text = text
@@ -378,7 +382,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
 
     enum CodingKeys: String, CodingKey {
         case name, on, enabled, action
-        case agent, workspace, work, pane, host, notification, scope
+        case agent, workspace, work, pane, host, notification, screen, scope
         case text, message, submit, account
         case wait, fallback, jitter, cooldown, filters
         case idleFor = "for"
@@ -401,6 +405,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         pane = try values.decodeIfPresent(String.self, forKey: .pane)
         host = try values.decodeIfPresent(String.self, forKey: .host)
         notification = try values.decodeIfPresent(String.self, forKey: .notification)
+        screen = try values.decodeIfPresent(String.self, forKey: .screen)
         scope = try values.decodeIfPresent([String].self, forKey: .scope) ?? []
         idleFor = try values.decodeIfPresent(String.self, forKey: .idleFor)
         text = try values.decodeIfPresent(String.self, forKey: .text)
@@ -439,6 +444,7 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         Self.put(pane, key: "pane", in: &object)
         Self.put(host, key: "host", in: &object)
         if let notification { object["notification"] = notification }
+        if action == .pressEnter, let screen { object["screen"] = screen }
         if on.requiresDuration { Self.put(idleFor, key: "for", in: &object) }
         Self.put(wait, key: "wait", in: &object)
         if on.supportsResetTiming { Self.put(fallback, key: "fallback", in: &object) }
@@ -471,6 +477,9 @@ struct MuxaAutomationRule: Decodable, Hashable, Sendable, Identifiable {
         ] {
             guard let value = Self.trimmed(value) else { continue }
             lines.append("\(key) = \(Self.tomlString(value))")
+        }
+        if action == .pressEnter, let screen {
+            lines.append("screen = \(Self.tomlString(screen))")
         }
         if let notification {
             lines.append("notification = \(Self.tomlString(notification))")

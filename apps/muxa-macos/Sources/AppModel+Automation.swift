@@ -109,6 +109,8 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
     var pane = ""
     var host = ""
     var notification: String?
+    /// Kept through an edit; the editor has no field for it yet.
+    var screen: String?
     var idleFor = ""
     var wait = ""
     var fallback = ""
@@ -324,6 +326,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             pane: pane,
             host: host,
             notification: notification,
+            screen: screen,
             scope: event.supportsScopeFilter ? Self.sorted(scopes) : [],
             idleFor: event.requiresDuration ? idleFor : nil,
             wait: wait,
@@ -358,6 +361,7 @@ struct MuxaAutomationRuleDraft: Hashable, Sendable {
             pane: rule.pane ?? "",
             host: rule.host ?? "",
             notification: rule.notification,
+            screen: rule.screen,
             idleFor: rule.idleFor ?? "",
             wait: rule.wait ?? "",
             fallback: rule.fallback ?? "",

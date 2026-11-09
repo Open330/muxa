@@ -240,6 +240,12 @@ pub enum AgentEvent {
         /// wire for every other tool/adapter and for older peers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         subagent: Option<SubagentSpec>,
+        /// The shell command a shell tool is about to run, as the agent's
+        /// hook reported it (Claude `Bash`, Codex shell). Approval rules
+        /// compare it with the command on screen; every other tool carries
+        /// `None`. Additive on the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },

@@ -71,6 +71,57 @@ state checks without sending keys; the screen check runs immediately before
 an actual Enter action. `press_enter` requires `on = "waiting_input"`, its
 waiting-input recheck, and no `text`, `message` or `submit` payload.
 
+Only a complete one-time label counts as the Yes to press: `Yes`,
+`Proceed`, `Continue`, `Yes, proceed` or `Yes, continue` (with an optional
+`(y)` hint). Any other label, including `Yes, and don't ask again …`, and a
+label that wraps onto the next line, receives no key.
+
+### Approve only commands you name
+
+Give a `press_enter` rule a `screen` regex and it confirms only a shell
+command that the pattern matches in full. muxad reads the command from the
+capture taken right before Enter, and only from a dialog it recognizes:
+
+- Codex: exactly one `Would you like to run the following command?`
+  heading, one `$ …` line under it, and the options directly after.
+- Claude Code: exactly one `Bash command` heading, the command, its faint
+  description, and `Do you want to proceed?`. With no faint description,
+  every line counts as the command.
+
+Anything else (no heading, more than one heading on the screen, any line
+between the command and option 1, options that do not run on in order, a
+heading more than 14 lines above the options, a box that closed in between)
+gives no command and no Enter.
+
+The command on screen must also be exactly the command the agent's own
+hook reported for its pending shell call (Claude `PreToolUse` for `Bash`,
+Codex `PreToolUse` for its shell tool). Only a single-line command
+qualifies, compared and matched as the hook reported it: in shell source a
+line break, a blank line or surrounding whitespace can change what runs, so
+nothing is trimmed or rejoined to make the two agree. Without a hook
+command, with a multi-line one, or when the two differ (a long command that
+wrapped on screen, a truncated dialog, a second queued call), nothing is
+pressed. The pattern is anchored at both ends, so `npm test` approves
+exactly `npm test`. Output printed before the dialog and the agent-written
+description are never part of the command.
+
+The capture and the key press are not atomic: if someone moves the
+selection by hand in the moment between them, Enter confirms what is then
+selected. muxad rechecks the agent's waiting state and episode after the
+capture, but cannot see a selection change inside the same wait.
+
+```toml
+[[automation.rule]]
+name = "approve-npm-test"
+on = "waiting_input"
+action = "press_enter"
+agent = ["claude_code", "codex"]
+screen = 'npm (test|run lint)'
+wait = "5s"
+cooldown = "30s"
+max_per_hour = 10
+```
+
 ## Quick start
 
 Put this in `$XDG_CONFIG_HOME/muxa/config.toml` and restart `muxad`:

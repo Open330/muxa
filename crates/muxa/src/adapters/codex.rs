@@ -118,6 +118,36 @@ pub struct Input {
     pub last_assistant_message: Option<String>,
     #[serde(default)]
     pub transcript_path: Option<std::path::PathBuf>,
+    /// `PreToolUse` / `PermissionRequest`: the tool's input. Only a shell
+    /// tool's `command` is read (see [`shell_command`]).
+    #[serde(default)]
+    pub tool_input: Option<serde_json::Value>,
+}
+
+/// The command a Codex shell tool runs, as the approval dialog shows it: a
+/// string as is; an argv as its script when it is `<shell> -lc <script>`
+/// (or `-c`), otherwise the words joined by spaces. Anything else is `None`.
+#[must_use]
+pub fn shell_command(tool_input: Option<&serde_json::Value>) -> Option<String> {
+    let command = tool_input?.get("command")?;
+    if let Some(text) = command.as_str() {
+        return Some(text.to_string());
+    }
+    let words: Vec<&str> = command
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_str)
+        .collect::<Option<_>>()?;
+    match words.as_slice() {
+        [shell, flag, script]
+            if matches!(*flag, "-lc" | "-c")
+                && matches!(shell.rsplit('/').next(), Some("bash" | "sh" | "zsh")) =>
+        {
+            Some((*script).to_string())
+        }
+        [] => None,
+        _ => Some(words.join(" ")),
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -167,6 +197,7 @@ impl HookAdapter for CodexAdapter {
             },
             Event::PreToolUse => AgentEvent::ToolStarted {
                 id,
+                command: shell_command(input.tool_input.as_ref()),
                 tool: input.tool_name.unwrap_or_else(|| "unknown".into()),
                 subagent: None,
                 at,

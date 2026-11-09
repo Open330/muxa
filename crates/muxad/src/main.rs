@@ -2541,6 +2541,7 @@ impl AutomationEngine {
         {
             return false;
         }
+
         let Some(agent) = self.store.by_session(&firing.agent_session_id).await else {
             return false;
         };
@@ -2551,6 +2552,18 @@ impl AutomationEngine {
             || !subject.satisfies(muxa::automation::AutomationCondition::WaitingInput)
         {
             return false;
+        }
+        // A rule that names the command confirms only that command: the one
+        // the agent's hook reported must be the one in the dialog on this
+        // capture, and the pattern must cover it in full.
+        if let Some(pattern) = &rule.screen {
+            if !muxa::automation_choice::approval_matches(
+                &screen,
+                agent.pending_command.as_deref(),
+                pattern,
+            ) {
+                return false;
+            }
         }
         send_automation_text(&self.backends, firing, "\r", io_guard.clone()).await
     }
@@ -4364,6 +4377,7 @@ async fn enrich_from_history(
             last_response: None,
             recap: None,
             ai_title: None,
+            pending_command: None,
             last_notification: None,
             model: entry.model,
             context_used_pct: None,

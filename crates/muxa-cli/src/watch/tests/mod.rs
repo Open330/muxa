@@ -35,6 +35,7 @@ pub(super) fn fake_agent(
         last_response: None,
         recap: None,
         ai_title: None,
+        pending_command: None,
         last_notification: None,
         model: model.map(Into::into),
         context_used_pct: ctx,

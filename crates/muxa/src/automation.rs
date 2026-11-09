@@ -533,6 +533,12 @@ pub struct AutomationRule {
     /// not match. Rechecked at firing time so a changed error cancels the action.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<String>,
+    /// Regex the visible choice dialog must match before `press_enter`
+    /// confirms it: the request text above the selected Yes, not the whole
+    /// screen. Only valid with `action = "press_enter"`. Checked on the
+    /// capture taken right before Enter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<String>,
     /// Which rate-limit windows count. Only valid with `on = "rate_limited"`;
     /// empty means any.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -607,6 +613,7 @@ impl AutomationRule {
             pane: None,
             host: None,
             notification: None,
+            screen: None,
             scope: Vec::new(),
             for_: None,
             wait: None,
@@ -732,6 +739,19 @@ impl AutomationRule {
                 named(format!(
                     "notification {pattern:?} is not a valid regex: {error}"
                 ))
+            })?;
+        }
+        if let Some(pattern) = &self.screen {
+            if self.action != AutomationAction::PressEnter {
+                return Err(named(
+                    "`screen` belongs to `action = \"press_enter\"`".into(),
+                ));
+            }
+            if pattern.trim().is_empty() {
+                return Err(named("screen cannot be empty".into()));
+            }
+            regex::Regex::new(pattern).map_err(|error| {
+                named(format!("screen {pattern:?} is not a valid regex: {error}"))
             })?;
         }
         if let Some(host) = &self.host {
@@ -922,6 +942,9 @@ impl AutomationRule {
         }
         if let Some(notification) = &self.notification {
             parts.push(format!("notification={notification}"));
+        }
+        if let Some(screen) = &self.screen {
+            parts.push(format!("screen={screen}"));
         }
         if !self.scope.is_empty() {
             let scopes: Vec<String> = self
@@ -1962,6 +1985,8 @@ pub struct AutomationRuleView {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub screen: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub scope: Vec<RateLimitScope>,
     #[serde(default, rename = "for", skip_serializing_if = "Option::is_none")]
@@ -2164,6 +2189,7 @@ impl AutomationStore {
                     pane: rule.pane.clone(),
                     host: rule.host.clone(),
                     notification: rule.notification.clone(),
+                    screen: rule.screen.clone(),
                     scope: rule.scope.clone(),
                     for_: rule.for_,
                     text: rule.text.clone(),
@@ -4113,6 +4139,7 @@ waaait = "5m"
             pane: None,
             host: None,
             notification: None,
+            screen: None,
             scope: vec![RateLimitScope::FiveHour],
             for_: None,
             text: Some("continue".into()),
