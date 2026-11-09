@@ -1177,6 +1177,7 @@ async fn hello_returns_capabilities_and_negotiated_protocol() {
     assert!(caps.contains(&"ask_providers_v1"));
     assert!(caps.contains(&"ask_provider_default_v1"));
     assert!(caps.contains(&"work_compose_v1"));
+    assert!(caps.contains(&"ask_one_shot_v1"));
     assert!(!caps.contains(&RESTART_CAPABILITY));
     assert!(!caps.contains(&STOP_CAPABILITY));
     assert!(resp["generation"].is_null());

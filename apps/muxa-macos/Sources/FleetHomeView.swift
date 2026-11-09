@@ -44,7 +44,9 @@ struct FleetHomeView: View {
                 markReviewed: { work in
                     reviewed.markReviewed(work)
                     reviewed.save(to: .standard)
-                }
+                },
+                send: { text, target in try await send(text, to: target) },
+                ask: { prompt in try await model.client.askOneShot(prompt) }
             )
         }
         .sheet(item: $quickLook) { target in

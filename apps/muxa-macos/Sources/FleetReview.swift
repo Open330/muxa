@@ -36,9 +36,12 @@ enum FleetReviewScope: String, CaseIterable, Identifiable, Sendable {
 }
 
 enum FleetReviewMode: String, CaseIterable, Identifiable, Sendable {
+    /// The default: every result at a glance, by project.
+    case digest
     case cards
     case inbox
-    case digest
+
+    static let defaultsKey = "home.review.mode.v2"
 
     var id: String { rawValue }
 
@@ -103,5 +106,83 @@ extension FleetBoard {
         let response = agent.lastResponse?.trimmingCharacters(in: .whitespacesAndNewlines)
         if let response, !response.isEmpty { return response }
         return agent.recap
+    }
+}
+
+// MARK: - Help from the Ask provider
+
+/// Prompts for muxa's configured Ask provider, and reading its answers:
+/// organizing a batch of results, and turning one reply from the person
+/// into a message that fits each agent.
+enum FleetReviewAssist {
+    /// How much of each result goes into a prompt.
+    static let resultLimit = 1_800
+
+    private static func context(_ work: FleetWork, index: Int) -> String {
+        var lines = ["### [\(index)] \(work.title)"]
+        if let repo = work.repo { lines.append("Project: \(repo)") }
+        if let focus = work.focus { lines.append("Agent: \(FleetBoard.owner(focus))") }
+        if let asked = FleetBoard.reviewAsked(work) { lines.append("Asked: \(asked)") }
+        let result = FleetBoard.reviewResult(work).map { String($0.prefix(resultLimit)) } ?? work.headline
+        lines.append("Result:\n\(result)")
+        return lines.joined(separator: "\n")
+    }
+
+    /// Asks for a short, organized digest of the results the person has to
+    /// review: what got done, what needs them, what to send back.
+    static func summaryPrompt(_ works: [FleetWork]) -> String {
+        let items = works.enumerated().map { context($0.element, index: $0.offset + 1) }.joined(separator: "\n\n")
+        return """
+        You help a person review the results of work they asked coding agents to do. \
+        Below are \(works.count) finished results. Write a short digest in Markdown:
+        - Group related results under a heading per project or theme.
+        - One line per result: [number] what was done, in plain words.
+        - Then a section "Needs you" listing results that ask a question, report a failure, \
+        are unfinished, or wait for a review or decision, with what the person should do.
+        Be brief and concrete. Write in the language the person used in their requests. \
+        Do not invent details that are not in the results.
+
+        \(items)
+        """
+    }
+
+    /// Asks for one message per agent, written from the person's single
+    /// reply, as JSON keyed by the ids given.
+    static func tailorPrompt(reply: String, targets: [(id: String, work: FleetWork)]) -> String {
+        let items = targets.enumerated().map { offset, target in
+            "id: \(target.id)\n" + context(target.work, index: offset + 1)
+        }.joined(separator: "\n\n")
+        return """
+        A person reviewed several coding agents' results and wrote one reply meant for all of them. \
+        Turn it into a separate message for each agent below. Each message:
+        - is addressed to that agent's own work and makes sense on its own;
+        - keeps only the parts of the reply that apply to that agent, made concrete for its result;
+        - is an instruction the agent can act on; keep the person's intent, do not add new requests;
+        - is in the language of the person's reply.
+        If nothing in the reply applies to an agent, give it an empty message.
+        Answer with JSON only, no prose: {"messages":[{"id":"<id>","message":"<text>"}]}
+
+        The person's reply:
+        \(reply)
+
+        The agents:
+        \(items)
+        """
+    }
+
+    /// The messages from a tailoring answer, by id: the first JSON object in
+    /// the text, ids it was not asked about dropped, empty messages kept as
+    /// "nothing to send".
+    static func parseTailored(_ answer: String, ids: Set<String>) -> [String: String]? {
+        guard let start = answer.firstIndex(of: "{"), let end = answer.lastIndex(of: "}"), start < end,
+              let data = String(answer[start...end]).data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let messages = object["messages"] as? [[String: Any]] else { return nil }
+        var result: [String: String] = [:]
+        for entry in messages {
+            guard let id = entry["id"] as? String, ids.contains(id) else { continue }
+            result[id] = (entry["message"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return result
     }
 }

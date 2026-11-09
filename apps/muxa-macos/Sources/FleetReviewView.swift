@@ -11,9 +11,13 @@ struct FleetReviewView: View {
     let submit: (String) -> Void
     let open: (MuxaHostedAgent) -> Void
     let markReviewed: (FleetWork) -> Void
+    /// Types a message into an agent at its prompt.
+    let send: (String, FleetReplyTarget) async throws -> Void
+    /// One turn of muxa's configured Ask provider.
+    let ask: (String) async throws -> String
     @Environment(\.dismiss) private var dismiss
 
-    @AppStorage("home.review.mode") private var mode: FleetReviewMode = .cards
+    @AppStorage(FleetReviewMode.defaultsKey) private var mode: FleetReviewMode = .digest
     @AppStorage("home.review.scope") private var scope: FleetReviewScope = .day
     /// Units put off with Later in this session: they go to the end.
     @State private var later: [String] = []
@@ -61,7 +65,9 @@ struct FleetReviewView: View {
                 open(hosted)
             },
             draft: draft,
-            submit: submit
+            submit: submit,
+            send: send,
+            ask: ask
         )
     }
 
@@ -120,20 +126,21 @@ struct FleetReviewView: View {
 enum FleetReviewKey: Equatable {
     case looksGood, later, sendBack, open, next, previous
 
-    /// → / E Looks Good, ← / L Later, R Send Back, Space / O Open,
-    /// ↓ / J next, ↑ / K previous.
+    /// Home-row keys first, as mail clients and vim use them: E (done) or
+    /// L (right) Looks Good, H (left) Later, J/K next and previous, R Send
+    /// Back, O or Return Open. The arrows and Space do the same.
     static func from(keyCode: UInt16, characters: String?) -> FleetReviewKey? {
         switch keyCode {
         case 124: return .looksGood
         case 123: return .later
         case 125: return .next
         case 126: return .previous
-        case 49: return .open
+        case 49, 36: return .open
         default: break
         }
         switch characters?.lowercased() {
-        case "e": return .looksGood
-        case "l": return .later
+        case "e", "l": return .looksGood
+        case "h": return .later
         case "r": return .sendBack
         case "o": return .open
         case "j": return .next
@@ -203,6 +210,8 @@ struct FleetReviewActions {
     let open: (MuxaHostedAgent) -> Void
     let draft: (String) -> Binding<FleetReplyDraft>
     let submit: (String) -> Void
+    let send: (String, FleetReplyTarget) async throws -> Void
+    let ask: (String) async throws -> String
 }
 
 // MARK: - The result itself
@@ -274,10 +283,10 @@ private struct FleetReviewButtons: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            button("Later", systemImage: "arrow.left", hint: "← L") { actions.later(work) }
+            button("Later", systemImage: "arrow.left", hint: "H") { actions.later(work) }
             button("Send Back", systemImage: "arrow.uturn.down", hint: "R") { sendingBack.toggle() }
             if let focus = work.focus {
-                button("Open", systemImage: "arrow.up.forward.square", hint: "Space") { actions.open(focus) }
+                button("Open", systemImage: "arrow.up.forward.square", hint: "O") { actions.open(focus) }
             }
             Spacer(minLength: 0)
             Button {
@@ -285,7 +294,7 @@ private struct FleetReviewButtons: View {
             } label: {
                 HStack(spacing: 6) {
                     Label("Looks Good", systemImage: "checkmark")
-                    Text(verbatim: "→ E").font(MuxaType.meta).opacity(0.75)
+                    Text(verbatim: "E").font(MuxaType.meta).opacity(0.75)
                 }
             }
             .buttonStyle(.muxaPrimary)
@@ -336,7 +345,7 @@ private struct FleetReviewCards: View {
                         .foregroundStyle(.secondary)
                         .monospacedDigit()
                     Spacer()
-                    Text("→ Looks Good   ← Later   R Send Back   Space Open")
+                    Text("E Looks Good   H Later   R Send Back   O Open")
                         .font(MuxaType.meta)
                         .foregroundStyle(.secondary)
                 }
@@ -466,7 +475,7 @@ private struct FleetReviewInbox: View {
                             .controlSize(.small)
                     }
                     Spacer()
-                    Text("↑↓ J/K Move")
+                    Text("J/K Move")
                         .font(MuxaType.meta)
                         .foregroundStyle(.tertiary)
                 }
@@ -546,43 +555,143 @@ private struct FleetReviewDigest: View {
     let queue: [FleetWork]
     let actions: FleetReviewActions
     @State private var expandedID: String?
+    @State private var selected: Set<String> = []
+    @State private var summary: String?
+    @State private var summaryFor: [String] = []
+    @State private var summarizing = false
+    @State private var summaryError: String?
+    @State private var replying: [FleetWork]?
+
+    private var selection: [FleetWork] { queue.filter { selected.contains($0.id) } }
 
     var body: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 18) {
-                ForEach(FleetBoard.byProject(queue)) { group in
-                    VStack(alignment: .leading, spacing: 6) {
-                        HStack {
-                            Label(group.project ?? String(localized: "No project"), systemImage: "folder")
-                                .font(.system(size: 13, weight: .semibold))
-                            Text("\(group.works.count)")
-                                .foregroundStyle(.secondary)
-                                .monospacedDigit()
-                            Spacer()
-                            Button("Mark Project Reviewed") { group.works.forEach(actions.looksGood) }
-                                .buttonStyle(.muxaGhost)
-                                .controlSize(.small)
-                        }
-                        ForEach(group.works) { work in
-                            row(work)
+        VStack(spacing: 0) {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 18) {
+                    summaryBox
+                    ForEach(FleetBoard.byProject(queue)) { group in
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Label(group.project ?? String(localized: "No project"), systemImage: "folder")
+                                    .font(.system(size: 13, weight: .semibold))
+                                Text("\(group.works.count)")
+                                    .foregroundStyle(.secondary)
+                                    .monospacedDigit()
+                                Spacer()
+                                if group.works.count > 1 {
+                                    Button("Reply to All…") { replying = group.works }
+                                        .buttonStyle(.muxaGhost)
+                                        .controlSize(.small)
+                                        .help("Write one reply; muxa's Ask provider turns it into a message for each agent")
+                                }
+                                Button("Mark Project Reviewed") { group.works.forEach(actions.looksGood) }
+                                    .buttonStyle(.muxaGhost)
+                                    .controlSize(.small)
+                            }
+                            ForEach(group.works) { work in
+                                row(work)
+                            }
                         }
                     }
                 }
+                .padding(20)
             }
-            .padding(20)
+            if !selection.isEmpty {
+                Divider()
+                HStack(spacing: 10) {
+                    Text("\(selection.count) selected")
+                        .font(MuxaType.detail)
+                    Button("Clear") { selected = [] }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                    Spacer()
+                    Button("Mark Reviewed") {
+                        selection.forEach(actions.looksGood)
+                        selected = []
+                    }
+                    .buttonStyle(.muxaSecondary)
+                    Button("Reply to \(selection.count)…") { replying = selection }
+                        .buttonStyle(.muxaPrimary)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+            }
+        }
+        .onChange(of: queue.map(\.id)) { ids in selected.formIntersection(ids) }
+        .sheet(item: Binding(
+            get: { replying.map(FleetReplyGroup.init) },
+            set: { if $0 == nil { replying = nil } }
+        )) { group in
+            FleetCombinedReplySheet(works: group.works, actions: actions) {
+                selected.subtract(group.works.map(\.id))
+                replying = nil
+            }
+        }
+    }
+
+    /// The Ask provider's organized digest of what is in the queue.
+    @ViewBuilder
+    private var summaryBox: some View {
+        let ids = queue.map(\.id)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Label("Summary", systemImage: "wand.and.stars")
+                    .font(.system(size: 13, weight: .semibold))
+                if summary != nil, summaryFor != ids {
+                    Text("Out of date")
+                        .font(MuxaType.meta)
+                        .foregroundStyle(.orange)
+                }
+                Spacer()
+                if summarizing { ProgressView().controlSize(.small) }
+                Button(summary == nil ? String(localized: "Summarize") : String(localized: "Summarize Again")) { summarize() }
+                    .buttonStyle(.muxaSecondary)
+                    .controlSize(.small)
+                    .disabled(summarizing)
+                    .help("Ask muxa's Ask provider to organize these results")
+            }
+            if let summary {
+                MarkdownContent(source: summary, selectable: true, font: MuxaType.body)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else if let summaryError {
+                Text(summaryError)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.red)
+            } else if !summarizing {
+                Text("Organizes these results by project and lists what needs you, using muxa's Ask provider.")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(14)
+        .background(Color.accentColor.opacity(0.06), in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+
+    private func summarize() {
+        let works = queue
+        summarizing = true
+        summaryError = nil
+        Task {
+            defer { summarizing = false }
+            do {
+                summary = try await actions.ask(FleetReviewAssist.summaryPrompt(works))
+                summaryFor = works.map(\.id)
+            } catch {
+                summaryError = error.localizedDescription
+            }
         }
     }
 
     private func row(_ work: FleetWork) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .firstTextBaseline, spacing: 10) {
-                Button {
-                    actions.looksGood(work)
-                } label: {
-                    Image(systemName: "checkmark.circle")
-                }
-                .buttonStyle(.muxaGhost)
-                .help("Looks Good")
+                Toggle("", isOn: Binding(
+                    get: { selected.contains(work.id) },
+                    set: { on in if on { selected.insert(work.id) } else { selected.remove(work.id) } }
+                ))
+                .toggleStyle(.checkbox)
+                .labelsHidden()
+                .help("Select to reply to several at once")
                 VStack(alignment: .leading, spacing: 2) {
                     Text(work.title)
                         .font(MuxaType.body.weight(.medium))
@@ -599,6 +708,13 @@ private struct FleetReviewDigest: View {
                         .foregroundStyle(.tertiary)
                         .monospacedDigit()
                 }
+                Button {
+                    actions.looksGood(work)
+                } label: {
+                    Image(systemName: "checkmark.circle")
+                }
+                .buttonStyle(.muxaGhost)
+                .help("Looks Good")
                 Button {
                     expandedID = expandedID == work.id ? nil : work.id
                 } label: {
@@ -622,5 +738,174 @@ private struct FleetReviewDigest: View {
         }
         .padding(10)
         .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// The results one reply goes to.
+private struct FleetReplyGroup: Identifiable {
+    let works: [FleetWork]
+    var id: String { works.map(\.id).joined(separator: "|") }
+}
+
+// MARK: - One reply, a message for each agent
+
+/// The person writes one reply for several results; muxa's Ask provider
+/// turns it into a message that fits each agent; the person checks and
+/// edits them, then sends. Nothing is sent before the person says so.
+private struct FleetCombinedReplySheet: View {
+    let works: [FleetWork]
+    let actions: FleetReviewActions
+    let finished: () -> Void
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var reply = ""
+    @State private var drafts: [String: String] = [:]
+    @State private var included: Set<String> = []
+    @State private var drafting = false
+    @State private var sending = false
+    @State private var error: String?
+    @State private var results: [String: String] = [:]
+
+    /// The results whose agent is at its prompt and can take a message.
+    private var reachable: [(work: FleetWork, target: FleetReplyTarget)] {
+        works.compactMap { work in FleetBoard.replyTarget(for: work).map { (work, $0) } }
+    }
+
+    private var unreachable: [FleetWork] {
+        works.filter { FleetBoard.replyTarget(for: $0) == nil }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Reply to \(works.count) Results")
+                .font(.title3.weight(.semibold))
+            Text("Write one reply. muxa's Ask provider turns it into a message for each agent, which you check before anything is sent.")
+                .font(MuxaType.detail)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            TextEditor(text: $reply)
+                .font(.body)
+                .frame(minHeight: 90, maxHeight: 140)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.3)))
+                .disabled(drafting || sending)
+            HStack {
+                if drafting { ProgressView().controlSize(.small) }
+                Spacer()
+                Button(drafts.isEmpty ? String(localized: "Draft Messages") : String(localized: "Draft Again")) { draft() }
+                    .buttonStyle(.muxaSecondary)
+                    .disabled(reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || drafting || sending || reachable.isEmpty)
+            }
+            if !unreachable.isEmpty {
+                Text("Not at their prompt, so left out: \(unreachable.map(\.title).joined(separator: ", "))")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            if !drafts.isEmpty {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 12) {
+                        ForEach(reachable, id: \.work.id) { item in
+                            draftRow(item.work)
+                        }
+                    }
+                }
+                .frame(maxHeight: 320)
+            }
+            if let error {
+                Text(error)
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            HStack {
+                Spacer()
+                Button("Cancel") { dismiss() }
+                    .keyboardShortcut(.cancelAction)
+                    .disabled(sending)
+                Button(String(localized: "Send \(sendable.count)")) { send() }
+                    .buttonStyle(.muxaPrimary)
+                    .disabled(sendable.isEmpty || sending || drafting)
+            }
+        }
+        .padding(20)
+        .frame(width: 620)
+    }
+
+    private var sendable: [(work: FleetWork, target: FleetReplyTarget, text: String)] {
+        reachable.compactMap { item in
+            guard included.contains(item.work.id), results[item.work.id] == nil,
+                  let text = drafts[item.work.id]?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty
+            else { return nil }
+            return (item.work, item.target, text)
+        }
+    }
+
+    private func draftRow(_ work: FleetWork) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Toggle(isOn: Binding(
+                    get: { included.contains(work.id) },
+                    set: { on in if on { included.insert(work.id) } else { included.remove(work.id) } }
+                )) {
+                    Text(work.title).font(MuxaType.body.weight(.medium)).lineLimit(1)
+                }
+                .toggleStyle(.checkbox)
+                Spacer()
+                if let focus = work.focus {
+                    Text(FleetBoard.owner(focus)).font(MuxaType.meta).foregroundStyle(.secondary)
+                }
+                if let result = results[work.id] {
+                    Text(result)
+                        .font(MuxaType.meta)
+                        .foregroundStyle(result == String(localized: "Sent") ? Color.green : Color.red)
+                }
+            }
+            TextEditor(text: Binding(get: { drafts[work.id] ?? "" }, set: { drafts[work.id] = $0 }))
+                .font(MuxaType.body)
+                .frame(minHeight: 60)
+                .overlay(RoundedRectangle(cornerRadius: 6).strokeBorder(Color.secondary.opacity(0.25)))
+                .disabled(sending || results[work.id] != nil)
+        }
+    }
+
+    private func draft() {
+        let targets = reachable.map { (id: $0.work.id, work: $0.work) }
+        let prompt = FleetReviewAssist.tailorPrompt(reply: reply, targets: targets)
+        drafting = true
+        error = nil
+        Task {
+            defer { drafting = false }
+            do {
+                let answer = try await actions.ask(prompt)
+                guard let messages = FleetReviewAssist.parseTailored(answer, ids: Set(targets.map(\.id))) else {
+                    error = String(localized: "The Ask provider's answer could not be read. Try again, or reply to each result yourself.")
+                    return
+                }
+                drafts = messages
+                included = Set(messages.filter { !$0.value.isEmpty }.map(\.key))
+            } catch {
+                self.error = error.localizedDescription
+            }
+        }
+    }
+
+    private func send() {
+        let batch = sendable
+        sending = true
+        error = nil
+        Task {
+            defer { sending = false }
+            for item in batch {
+                do {
+                    try await actions.send(item.text, item.target)
+                    results[item.work.id] = String(localized: "Sent")
+                } catch {
+                    results[item.work.id] = error.localizedDescription
+                }
+            }
+            if batch.allSatisfy({ results[$0.work.id] == String(localized: "Sent") }) {
+                finished()
+            }
+        }
     }
 }

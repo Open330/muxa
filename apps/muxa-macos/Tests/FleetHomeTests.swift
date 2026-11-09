@@ -586,13 +586,38 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "server.rack")
 }
 
-@Test func reviewKeysMapArrowsAndLetters() {
+@Test func reviewKeysAreOnTheHomeRowWithArrowsAsWell() {
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "E") == .looksGood)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "l") == .looksGood)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "h") == .later)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "j") == .next)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "k") == .previous)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "r") == .sendBack)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "o") == .open)
+    #expect(FleetReviewKey.from(keyCode: 36, characters: "\r") == .open)
     #expect(FleetReviewKey.from(keyCode: 124, characters: nil) == .looksGood)
     #expect(FleetReviewKey.from(keyCode: 123, characters: nil) == .later)
-    #expect(FleetReviewKey.from(keyCode: 49, characters: " ") == .open)
-    #expect(FleetReviewKey.from(keyCode: 125, characters: nil) == .next)
-    #expect(FleetReviewKey.from(keyCode: 0, characters: "E") == .looksGood)
-    #expect(FleetReviewKey.from(keyCode: 0, characters: "r") == .sendBack)
-    #expect(FleetReviewKey.from(keyCode: 0, characters: "k") == .previous)
     #expect(FleetReviewKey.from(keyCode: 0, characters: "x") == nil)
+}
+
+@Test func theAskProviderTailorsOneReplyPerAgent() throws {
+    let a = FleetBoard.work(for: MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Make the intro shorter", "last_response": "Cut it to 20s."], id: "a"), pane: nil), now: .now)
+    let b = FleetBoard.work(for: MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Pick a thumbnail", "last_response": "Option 2 is brightest."], id: "b"), pane: nil), now: .now)
+    let prompt = FleetReviewAssist.tailorPrompt(reply: "좋아요, 둘 다 진행해 주세요", targets: [(id: "a", work: a), (id: "b", work: b)])
+    #expect(prompt.contains("id: a") && prompt.contains("id: b"))
+    #expect(prompt.contains("좋아요, 둘 다 진행해 주세요"))
+    #expect(prompt.contains("Cut it to 20s."))
+    #expect(FleetReviewAssist.summaryPrompt([a, b]).contains("Option 2 is brightest."))
+
+    let answer = """
+    Here you go:
+    {"messages":[{"id":"a","message":" 20초 버전으로 진행해 주세요. "},{"id":"b","message":""},{"id":"zzz","message":"x"}]}
+    """
+    let parsed = try #require(FleetReviewAssist.parseTailored(answer, ids: ["a", "b"]))
+    #expect(parsed == ["a": "20초 버전으로 진행해 주세요.", "b": ""])
+    #expect(FleetReviewAssist.parseTailored("no json here", ids: ["a"]) == nil)
+}
+
+@Test func digestIsTheDefaultReviewMode() {
+    #expect(FleetReviewMode.allCases.first == .digest)
 }

@@ -561,6 +561,34 @@ pub(super) async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::AskOneShot {
+                    prompt,
+                    agent,
+                    credential,
+                } => {
+                    kind = "ask_one_shot";
+                    // Read-only whatever `[ask]` says: organizing results or
+                    // drafting replies must not edit files. Bounded so one
+                    // request cannot hand a provider an unbounded prompt.
+                    if prompt.len() > ASK_ONE_SHOT_MAX_PROMPT_BYTES {
+                        Response::err(format!(
+                            "ask_one_shot prompt exceeds {ASK_ONE_SHOT_MAX_PROMPT_BYTES} bytes"
+                        ))
+                    } else {
+                        match ask
+                            .one_shot_for(
+                                agent.as_deref(),
+                                &prompt,
+                                crate::config::AskPermissionMode::Plan,
+                                credential,
+                            )
+                            .await
+                        {
+                            Ok(answer) => Response::with_ask_one_shot(answer.text),
+                            Err(error) => Response::err(error.to_string()),
+                        }
+                    }
+                }
                 RequestBody::PipelineRegister { registration } => {
                     kind = "pipeline_register";
                     match pipeline_runs.register(registration).await {
@@ -2820,3 +2848,6 @@ pub(super) async fn handle(
         );
     }
 }
+
+/// The largest prompt `ask_one_shot` accepts.
+const ASK_ONE_SHOT_MAX_PROMPT_BYTES: usize = 256 * 1024;

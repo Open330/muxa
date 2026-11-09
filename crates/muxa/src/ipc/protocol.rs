@@ -186,6 +186,19 @@ pub(super) enum RequestBody {
         #[serde(default)]
         credential: Option<AskCredential>,
     },
+    /// `ask_one_shot_v1`: one read-only turn of a configured Ask provider,
+    /// answered to the caller and recorded nowhere (no conversation, no
+    /// history). Muxa.app uses it to organize review results and to tailor
+    /// one reply into a message per agent.
+    AskOneShot {
+        prompt: String,
+        /// Provider to ask; absent means the ask store's selection.
+        #[serde(default)]
+        agent: Option<String>,
+        /// Same shape and handling as `ask_send`'s.
+        #[serde(default)]
+        credential: Option<AskCredential>,
+    },
     /// Create or update one desired Run and reconcile live pane evidence.
     PipelineRegister {
         registration: PipelineRunRegistration,
@@ -927,6 +940,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::agent_directory::CAPABILITY,
     "ask_provider_default_v1",
     "work_compose_v1",
+    "ask_one_shot_v1",
     "automation_v1",
     "automation_ask_v1",
     "config_launch_v1",
@@ -1114,6 +1128,9 @@ pub struct Response {
     pub mux_snapshot_operation: Option<crate::mux_snapshot_control::MuxSnapshotOperation>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub work_compose: Option<WorkComposeOutput>,
+    /// `ask_one_shot_v1`: the provider's answer text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask_one_shot: Option<String>,
     /// `automation_v1`: the rule list plus the engine's switch/pause.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub automation_rules: Option<AutomationRules>,
@@ -1205,6 +1222,7 @@ impl Response {
             mux_snapshot: None,
             mux_snapshot_operation: None,
             work_compose: None,
+            ask_one_shot: None,
             automation_rules: None,
             automation_log: None,
             automation_test: None,
@@ -1280,6 +1298,11 @@ impl Response {
     ) -> Self {
         let mut response = Self::ok();
         response.mux_snapshot_operation = Some(operation);
+        response
+    }
+    pub(super) fn with_ask_one_shot(text: String) -> Self {
+        let mut response = Self::ok();
+        response.ask_one_shot = Some(text);
         response
     }
     pub(super) fn with_work_compose(output: WorkComposeOutput) -> Self {
@@ -1460,3 +1483,29 @@ impl Response {
 pub(super) const RESTART_RUNNING: u8 = 0;
 pub(super) const RESTART_REQUESTED: u8 = 1;
 pub(super) const RESTART_STOPPING: u8 = 2;
+
+#[cfg(test)]
+mod ask_one_shot_tests {
+    use super::*;
+
+    #[test]
+    fn ask_one_shot_parses_with_optional_agent_and_credential() {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "protocol": crate::event::PROTOCOL_VERSION,
+            "kind": "ask_one_shot",
+            "prompt": "Summarize these results",
+        }))
+        .unwrap();
+        match request.body {
+            RequestBody::AskOneShot {
+                prompt,
+                agent,
+                credential,
+            } => {
+                assert_eq!(prompt, "Summarize these results");
+                assert!(agent.is_none() && credential.is_none());
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}

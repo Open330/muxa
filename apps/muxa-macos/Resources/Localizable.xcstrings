@@ -51,6 +51,16 @@
         }
       }
     },
+    "%lld selected" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 선택"
+          }
+        }
+      }
+    },
     "1 of %lld" : {
       "localizations" : {
         "ko" : {
@@ -3368,6 +3378,16 @@
         }
       }
     },
+    "Ask muxa's Ask provider to organize these results" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa의 Ask 제공자에게 결과 정리를 맡깁니다"
+          }
+        }
+      }
+    },
     "Ask Providers" : {
       "localizations" : {
         "ko" : {
@@ -5881,6 +5901,26 @@
         }
       }
     },
+    "Draft Again" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 만들기"
+          }
+        }
+      }
+    },
+    "Draft Messages" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "메시지 만들기"
+          }
+        }
+      }
+    },
     "Draft pipeline" : {
       "localizations" : {
         "ko" : {
@@ -5897,6 +5937,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "초안 생성이 취소되었습니다."
+          }
+        }
+      }
+    },
+    "E Looks Good   H Later   R Send Back   O Open" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "E 확인 완료   H 나중에   R 다시 시키기   O 열기"
           }
         }
       }
@@ -8720,6 +8770,16 @@
         }
       }
     },
+    "Mark Reviewed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인 완료로 표시"
+          }
+        }
+      }
+    },
     "Match" : {
       "localizations" : {
         "ko" : {
@@ -10424,6 +10484,16 @@
         }
       }
     },
+    "Not at their prompt, so left out: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "입력 대기 상태가 아니라 제외됨: %@"
+          }
+        }
+      }
+    },
     "Not available" : {
       "localizations" : {
         "ko" : {
@@ -11540,6 +11610,16 @@
         }
       }
     },
+    "Organizes these results by project and lists what needs you, using muxa's Ask provider." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa의 Ask 제공자로 결과를 프로젝트별로 정리하고 내가 할 일을 뽑아 줍니다."
+          }
+        }
+      }
+    },
     "Original request: %@" : {
       "localizations" : {
         "ko" : {
@@ -11556,6 +11636,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 윈도우의 다른 에이전트"
+          }
+        }
+      }
+    },
+    "Out of date" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "갱신 필요"
           }
         }
       }
@@ -13063,6 +13153,36 @@
         }
       }
     },
+    "Reply to %lld Results" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과 %lld개에 답장"
+          }
+        }
+      }
+    },
+    "Reply to %lld…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개에 답장…"
+          }
+        }
+      }
+    },
+    "Reply to All…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모두에게 답장…"
+          }
+        }
+      }
+    },
     "Reply to an agent waiting for input, or mark it read, right from the banner." : {
       "localizations" : {
         "ko" : {
@@ -13731,6 +13851,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "해야 할 일만 적으세요. 나머지는 에이전트가 판단합니다."
+          }
+        }
+      }
+    },
+    "Select to reply to several at once" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "여러 개를 골라 한 번에 답장"
+          }
+        }
+      }
+    },
+    "Send %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 보내기"
           }
         }
       }
@@ -15516,6 +15656,26 @@
         }
       }
     },
+    "Summarize" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요약하기"
+          }
+        }
+      }
+    },
+    "Summarize Again" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 요약"
+          }
+        }
+      }
+    },
     "Summary" : {
       "localizations" : {
         "ko" : {
@@ -16132,6 +16292,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "앱은 대기를 중단했지만 muxad에서 이 Work 작업이 계속 실행 중일 수 있습니다."
+          }
+        }
+      }
+    },
+    "The Ask provider's answer could not be read. Try again, or reply to each result yourself." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ask 제공자의 답을 읽지 못했습니다. 다시 시도하거나 각각 직접 답장하세요."
           }
         }
       }
@@ -18315,6 +18485,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "라이브러리의 모든 파이프라인을 누락되었거나 다른 호스트에 기록합니다"
+          }
+        }
+      }
+    },
+    "Write one reply. muxa's Ask provider turns it into a message for each agent, which you check before anything is sent." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답장을 하나 쓰세요. Muxa의 Ask 제공자가 에이전트마다 맞는 메시지로 바꾸고, 보내기 전에 직접 확인합니다."
+          }
+        }
+      }
+    },
+    "Write one reply; muxa's Ask provider turns it into a message for each agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답장을 하나 쓰면 Muxa의 Ask 제공자가 에이전트마다 맞는 메시지로 바꿉니다"
           }
         }
       }
