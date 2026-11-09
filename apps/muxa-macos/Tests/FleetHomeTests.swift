@@ -687,4 +687,10 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(dialog.options.map(\.label) == ["김치찌개", "파스타", "샐러드", "Type something.", "Chat about this"])
     #expect(dialog.options[1].detail == "양식 면 요리")
     #expect(dialog.options[3].detail == nil)
+    #expect(dialog.selected == 1)
+    #expect(dialog.moves(to: 3) == ["down", "down"])
+    #expect(dialog.moves(to: 1) == [])
+    #expect(dialog.moves(to: 9) == nil)
+    let fromFour = FleetChoiceDialog(question: dialog.question, options: dialog.options, selected: 4)
+    #expect(fromFour.moves(to: 1) == ["up", "up", "up"])
 }

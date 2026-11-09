@@ -535,6 +535,12 @@ pub enum RelayRequest {
         text: String,
         submit: bool,
     },
+    /// Navigation keys for a choice dialog, sent as raw key bytes.
+    SendKeys {
+        request_id: String,
+        pane: PaneKey,
+        keys: Vec<FleetKey>,
+    },
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
@@ -608,6 +614,7 @@ impl RelayRequest {
             | Self::Capture { request_id, .. }
             | Self::CaptureWindow { request_id, .. }
             | Self::SendPrompt { request_id, .. }
+            | Self::SendKeys { request_id, .. }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
@@ -658,6 +665,54 @@ pub enum RelayFrame {
     },
 }
 
+/// The keys `send_keys` may press: what a choice dialog needs, nothing
+/// that types text or reaches a shell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FleetKey {
+    Up,
+    Down,
+    Enter,
+    Escape,
+    Tab,
+}
+
+impl FleetKey {
+    /// The bytes a terminal sends for the key.
+    #[must_use]
+    pub fn bytes(self) -> &'static str {
+        match self {
+            Self::Up => "\u{1b}[A",
+            Self::Down => "\u{1b}[B",
+            Self::Enter => "\r",
+            Self::Escape => "\u{1b}",
+            Self::Tab => "\t",
+        }
+    }
+}
+
+/// The most keys one `send_keys` presses.
+pub const FLEET_MAX_KEYS: usize = 32;
+
+/// Presses `keys` in order with a short pause between, so a TUI handles each
+/// before the next arrives. False as soon as one cannot be sent.
+pub fn press_keys(
+    backend: &dyn crate::backend::PaneBackend,
+    socket: Option<&str>,
+    pane_id: &str,
+    keys: &[FleetKey],
+) -> bool {
+    for (index, key) in keys.iter().enumerate() {
+        if index > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        }
+        if !backend.send_text_on(socket, pane_id, key.bytes()) {
+            return false;
+        }
+    }
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FleetOperation {
@@ -675,6 +730,13 @@ pub enum FleetOperation {
         text: String,
         #[serde(default)]
         submit: bool,
+    },
+    /// `fleet_keys_v1`: press navigation keys in a pane, so a choice dialog
+    /// can be answered by moving to an option and confirming it. Only the
+    /// keys in [`FleetKey`], at most [`FLEET_MAX_KEYS`] at a time.
+    SendKeys {
+        pane: PaneKey,
+        keys: Vec<FleetKey>,
     },
     CollaborationSend {
         pane: PaneKey,
@@ -1790,5 +1852,43 @@ mod tests {
                 .contains("command_")
         );
         assert!(FLEET_CAPABILITIES.contains(&FLEET_WORK_COMMAND_CAPABILITY));
+    }
+}
+
+#[cfg(test)]
+mod fleet_key_tests {
+    use super::*;
+    use crate::SessionKey;
+
+    #[test]
+    fn send_keys_takes_only_the_listed_keys() {
+        let operation: FleetOperation = serde_json::from_value(serde_json::json!({
+            "kind": "send_keys",
+            "pane": serde_json::to_value(PaneKey {
+                window: WindowKey {
+                    session: SessionKey {
+                        endpoint: crate::BackendEndpoint {
+                            host: HostKind::Tmux,
+                            socket: "default".into(),
+                        },
+                        session_id: "$1".into(),
+                    },
+                    window_id: "@1".into(),
+                },
+                pane_id: "%1".into(),
+            })
+            .unwrap(),
+            "keys": ["down", "down", "enter"],
+        }))
+        .unwrap();
+        match operation {
+            FleetOperation::SendKeys { keys, .. } => {
+                assert_eq!(keys, vec![FleetKey::Down, FleetKey::Down, FleetKey::Enter]);
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(serde_json::from_value::<FleetKey>(serde_json::json!("rm -rf")).is_err());
+        assert_eq!(FleetKey::Up.bytes(), "\u{1b}[A");
+        assert_eq!(FleetKey::Enter.bytes(), "\r");
     }
 }

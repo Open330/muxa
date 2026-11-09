@@ -135,9 +135,12 @@ struct FleetChoicePanel<Fallback: View>: View {
         }
     }
 
-    /// Sends the option's number, after reading the screen again: the same
-    /// agent session, still waiting, with the same question and the same
-    /// option at that number. Then the person's words, when they gave any.
+    /// Moves the dialog's cursor to the option with the arrow keys and
+    /// presses Enter, after reading the screen again: the same agent
+    /// session, still waiting, with the same question and the same option
+    /// at that number. For "Type something", the person's words are typed
+    /// on that row and submitted. Then the screen is read once more: a
+    /// question still there means the choice did not go through.
     private func choose(_ option: FleetChoiceDialog.Option, words: String?) {
         guard let shown = dialog, let pane = hosted.pane else { return }
         sending = true
@@ -157,15 +160,27 @@ struct FleetChoicePanel<Fallback: View>: View {
                     dialog = current
                     throw MuxaIPCError.server(String(localized: "The question on screen changed. Check it again before choosing."))
                 }
-                try await model.client.sendFleetPrompt(host: hosted.host, pane: pane, text: "\(option.number)", submit: false)
+                guard let moves = current.moves(to: option.number) else {
+                    throw MuxaIPCError.server(String(localized: "Muxa could not tell which option is selected. Open the pane to choose."))
+                }
                 if let words = words?.trimmingCharacters(in: .whitespacesAndNewlines), !words.isEmpty {
-                    try await Task.sleep(nanoseconds: 400_000_000)
+                    if !moves.isEmpty {
+                        try await model.client.sendFleetKeys(host: hosted.host, pane: pane, keys: moves)
+                        try await Task.sleep(nanoseconds: 200_000_000)
+                    }
                     try await model.client.sendFleetPrompt(host: hosted.host, pane: pane, text: words, submit: true)
                     ownWords = ""
+                } else {
+                    try await model.client.sendFleetKeys(host: hosted.host, pane: pane, keys: moves + ["enter"])
                 }
-                status = String(localized: "Sent \(option.number). \(option.label)")
-                try? await Task.sleep(nanoseconds: 800_000_000)
-                dialog = try? await capture()
+                try await Task.sleep(nanoseconds: 900_000_000)
+                let after = try? await capture()
+                if let after, after.question == shown.question {
+                    dialog = after
+                    throw MuxaIPCError.server(String(localized: "The choice did not go through; the question is still on screen. Open the pane to answer."))
+                }
+                dialog = after
+                status = String(localized: "Chose \(option.number). \(option.label)")
             } catch {
                 self.error = error.localizedDescription
             }

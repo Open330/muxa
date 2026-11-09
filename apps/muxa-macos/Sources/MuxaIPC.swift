@@ -1370,6 +1370,30 @@ actor MuxaIPCClient {
         )
     }
 
+    /// Presses navigation keys in a pane (`fleet_keys_v1`): "up", "down",
+    /// "enter", "escape", "tab". Used to answer a choice dialog.
+    func sendFleetKeys(host: MuxaFleetHostIdentity, pane: MuxaPaneInfo, keys: [String]) async throws {
+        guard capabilities.contains("fleet_keys_v1") else {
+            throw MuxaIPCError.server("Choosing from Home needs an updated muxad; update muxa and restart muxad")
+        }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "fleet_command",
+            "host": host.alias,
+            "operation": [
+                "kind": "send_keys",
+                "pane": Self.paneKey(pane),
+                "keys": keys,
+            ],
+        ])
+        guard let result = response.fleetResult else {
+            throw MuxaIPCError.missingField("fleet_result")
+        }
+        guard result.accepted else {
+            throw MuxaIPCError.server(result.message ?? "Keys were rejected")
+        }
+    }
+
     func sendFleetPrompt(
         host: MuxaFleetHostIdentity,
         pane: MuxaPaneInfo,

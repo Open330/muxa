@@ -437,6 +437,16 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "send_prompt", text.len());
                 local_send_prompt(&self.backends, pane, text, submit).await
             }
+            FleetOperation::SendKeys { pane, keys } => {
+                if keys.is_empty() || keys.len() > muxa::fleet::FLEET_MAX_KEYS {
+                    return Err(format!(
+                        "send_keys takes 1 to {} keys",
+                        muxa::fleet::FLEET_MAX_KEYS
+                    ));
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "send_keys", keys.len());
+                local_send_keys(&self.backends, pane, keys).await
+            }
             FleetOperation::CollaborationSend { pane, request } => {
                 exact_local_backend(&self.backends, &pane).await?;
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_send", request.body.len());
@@ -829,6 +839,35 @@ async fn local_send_prompt(
     .map_err(|error| format!("local send task panicked: {error}"))?
     .ok_or_else(|| "backend refused text injection".to_string())?;
     Ok(FleetCommandResult::sent(outcome))
+}
+
+async fn local_send_keys(
+    backends: &[SharedBackend],
+    pane: PaneKey,
+    keys: Vec<muxa::fleet::FleetKey>,
+) -> Result<FleetCommandResult, String> {
+    let backend = exact_local_backend(backends, &pane).await?;
+    if !backend.caps().send_text {
+        return Err(format!(
+            "{} backend does not support key input",
+            backend.kind()
+        ));
+    }
+    let socket = pane.window.session.endpoint.socket;
+    let pane_id = pane.pane_id;
+    let pressed = tokio::task::spawn_blocking(move || {
+        muxa::fleet::press_keys(backend.as_ref(), Some(&socket), &pane_id, &keys)
+    })
+    .await
+    .map_err(|error| format!("local key task panicked: {error}"))?;
+    if !pressed {
+        return Err("backend refused key input".to_string());
+    }
+    Ok(FleetCommandResult::sent(muxa::ipc::SendPromptOutcome {
+        sent: true,
+        submitted: false,
+        submission_confirmed: None,
+    }))
 }
 
 fn local_hostname() -> String {
@@ -1235,6 +1274,7 @@ impl HostTask {
                     if matches!(
                         command.operation,
                         FleetOperation::SendPrompt { .. }
+                            | FleetOperation::SendKeys { .. }
                             | FleetOperation::CollaborationSend { .. }
                             | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
@@ -1342,6 +1382,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::SendPrompt { request_id: id, pane, text, submit }
+                        }
+                        FleetOperation::SendKeys { pane, keys } => {
+                            audit_operation(&self.alias, "send_keys", keys.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::SendKeys { request_id: id, pane, keys }
                         }
                         FleetOperation::CollaborationSend { pane, request } => {
                             audit_operation(&self.alias, "collaboration_send", request.body.len());

@@ -20,6 +20,16 @@ struct FleetChoiceDialog: Equatable, Sendable {
 
     let question: String
     let options: [Option]
+    /// The option the dialog's cursor is on.
+    var selected: Int?
+
+    /// Keys that move the cursor from where it is to `number`: arrows only,
+    /// so nothing is typed into the dialog. Nil when the cursor is unknown.
+    func moves(to number: Int) -> [String]? {
+        guard let selected, options.contains(where: { $0.number == number }) else { return nil }
+        let steps = number - selected
+        return Array(repeating: steps > 0 ? "down" : "up", count: abs(steps))
+    }
 
     /// The question and options of the newest numbered choice on `screen`:
     /// a block of `N. label` rows (one of them selected with ❯ › or >),
@@ -33,10 +43,12 @@ struct FleetChoiceDialog: Equatable, Sendable {
         // The last option row, then walk up to option 1.
         guard let lastRow = lines.indices.last(where: { optionRow(lines[$0]) != nil }) else { return nil }
         var rows: [(index: Int, number: Int, label: String)] = []
+        var selected: Int?
         var index = lastRow
         while index >= 0 {
             if let row = optionRow(lines[index]) {
                 rows.insert((index, row.number, row.label), at: 0)
+                if isSelected(lines[index]) { selected = row.number }
                 if row.number == 1 { break }
             } else if isRule(lines[index]) {
                 // Claude sets "Chat about this" apart below a rule.
@@ -78,7 +90,7 @@ struct FleetChoiceDialog: Equatable, Sendable {
         }
         let text = question.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return nil }
-        return FleetChoiceDialog(question: text, options: options)
+        return FleetChoiceDialog(question: text, options: options, selected: selected)
     }
 
     private static func optionRow(_ line: String) -> (number: Int, label: String)? {
@@ -98,6 +110,11 @@ struct FleetChoiceDialog: Equatable, Sendable {
         if line.isEmpty { return true }
         let inner = line.drop(while: { $0 == "│" })
         return inner.hasPrefix("   ") && optionRow(line) == nil && !inner.trimmingCharacters(in: .whitespaces).hasPrefix("─")
+    }
+
+    private static func isSelected(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: CharacterSet(charactersIn: "│ "))
+        return trimmed.first.map { "❯›>".contains($0) } ?? false
     }
 
     private static func isRule(_ line: String) -> Bool {
