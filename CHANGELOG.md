@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Menu-bar chips unfold without a dwell delay, retain hover across a small
+  margin, and fold after 0.2 seconds (0.45 seconds toward the peek). Pixel-only
+  render keys and scale-specific bitmaps avoid hidden-value redraws and keep
+  Retina chips sharp. Badges and hit testing follow the same avatar stack.
+
 - Dedicated Claude workers declare a process-local inbound-message policy so
   permission-mode differences do not strand delegated messages. Existing
   operator settings and tool approval permissions remain in effect.
