@@ -662,3 +662,29 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     let specific = try agent(["state": "waiting_input", "last_notification": "Where should the sandbox live?"], id: "c")
     #expect(FleetBoard.question(for: specific, now: .now) == "Where should the sandbox live?")
 }
+
+@Test func aChoiceWithAnOptionBelowARuleIsStillRead() throws {
+    let screen = """
+    ────────────────────────────────────────────────────────────────────────
+     ☐ 점심 메뉴
+
+    데모: 오늘 점심 메뉴를 고르세요
+
+    ❯ 1. 김치찌개
+         얼큰한 한식
+      2. 파스타
+         양식 면 요리
+      3. 샐러드
+         가벼운 한 끼
+      4. Type something.
+    ────────────────────────────────────────────────────────────────────────
+      5. Chat about this
+
+    Enter to select · ↑/↓ to navigate · Esc to cancel
+    """
+    let dialog = try #require(FleetChoiceDialog.parse(screen))
+    #expect(dialog.question == "☐ 점심 메뉴\n데모: 오늘 점심 메뉴를 고르세요")
+    #expect(dialog.options.map(\.label) == ["김치찌개", "파스타", "샐러드", "Type something.", "Chat about this"])
+    #expect(dialog.options[1].detail == "양식 면 요리")
+    #expect(dialog.options[3].detail == nil)
+}

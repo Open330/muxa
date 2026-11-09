@@ -38,6 +38,8 @@ struct FleetChoiceDialog: Equatable, Sendable {
             if let row = optionRow(lines[index]) {
                 rows.insert((index, row.number, row.label), at: 0)
                 if row.number == 1 { break }
+            } else if isRule(lines[index]) {
+                // Claude sets "Chat about this" apart below a rule.
             } else if !isDetail(lines[index]) {
                 return nil
             }
@@ -49,7 +51,7 @@ struct FleetChoiceDialog: Equatable, Sendable {
         for (offset, row) in rows.enumerated() {
             let end = offset + 1 < rows.count ? rows[offset + 1].index : min(lines.count, row.index + 4)
             let detail = lines[(row.index + 1)..<end]
-                .filter(isDetail)
+                .filter { isDetail($0) && !isRule($0) }
                 .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "│ ")) }
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
@@ -96,6 +98,11 @@ struct FleetChoiceDialog: Equatable, Sendable {
         if line.isEmpty { return true }
         let inner = line.drop(while: { $0 == "│" })
         return inner.hasPrefix("   ") && optionRow(line) == nil && !inner.trimmingCharacters(in: .whitespaces).hasPrefix("─")
+    }
+
+    private static func isRule(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: CharacterSet(charactersIn: "│ "))
+        return trimmed.count >= 6 && trimmed.allSatisfy { "─━".contains($0) }
     }
 
     /// The dialog's own column: a TUI that splits the pane draws another
