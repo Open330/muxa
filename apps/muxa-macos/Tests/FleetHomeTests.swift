@@ -354,3 +354,33 @@ private func member(_ id: String, _ state: String, alias: String, pane paneID: S
     #expect(cut.count <= 61)
     #expect(cut.hasSuffix("…") || cut.hasSuffix("."))
 }
+
+@Test func theBoardGroupsByProjectFiltersAndFoldsOldFinishes() throws {
+    func solo(_ id: String, path: String?, state: String, at: String) throws -> FleetWork {
+        var fields: [String: Any] = ["state": state, "state_entered_at": at]
+        if let path { fields["cwd"] = path }
+        return FleetBoard.work(for: MuxaHostedAgent(host: host, agent: try agent(fields, id: id), pane: nil), now: .now)
+    }
+    let works = [
+        try solo("a", path: "/src/muxa", state: "working", at: "2026-11-09T03:00:00Z"),
+        try solo("b", path: "/src/site", state: "working", at: "2026-11-09T02:00:00Z"),
+        try solo("c", path: "/src/muxa", state: "working", at: "2026-11-09T01:00:00Z"),
+        try solo("d", path: nil, state: "working", at: "2026-11-09T00:00:00Z"),
+    ]
+    let groups = FleetBoard.byProject(works)
+    #expect(groups.map(\.project) == ["muxa", "site", nil])
+    #expect(groups[0].works.map(\.id) == ["agent:mini:a", "agent:mini:c"])
+    #expect(FleetBoard.filter(works, host: nil, project: "site").map(\.id) == ["agent:mini:b"])
+    #expect(FleetBoard.filter(works, host: "other", project: nil).isEmpty)
+
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    #expect(FleetBoard.isRecent(try solo("e", path: nil, state: "idle", at: "2026-11-09T01:00:00Z"), now: now))
+    #expect(!FleetBoard.isRecent(try solo("f", path: nil, state: "idle", at: "2026-11-07T01:00:00Z"), now: now))
+}
+
+@Test func aWorkIDIsMadeFromTheTask() throws {
+    let date = try #require(MuxaUsageTimestamp.parse("2026-11-09T03:04:00Z"))
+    let id = WorkStartID.make(task: "Fix the login timeout on slow networks", at: date)
+    #expect(id.hasPrefix("fix-the-login-timeout-"))
+    #expect(WorkStartID.make(task: "로그인 오류 고치기", at: date).hasPrefix("work-"))
+}

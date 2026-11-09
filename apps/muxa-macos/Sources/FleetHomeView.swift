@@ -7,7 +7,8 @@ struct FleetHomeView: View {
 
     @State private var selectedID: String?
     @State private var showsHosts = false
-    @State private var assignment = ""
+    @State private var hostFilter: String?
+    @State private var projectFilter: String?
     @State private var reviewed = FleetReviewMarks(defaults: .standard)
     @State private var showsReviewed = false
     /// Reply drafts per unit, kept while the inspector closes or the unit's
@@ -24,7 +25,6 @@ struct FleetHomeView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            assignBar
             board
         }
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
@@ -51,8 +51,9 @@ struct FleetHomeView: View {
             Text("Home")
                 .font(.system(size: 17, weight: .semibold))
             Spacer(minLength: 8)
-            FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
+            filterMenu
             hostsButton
+            FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
             Button {
                 model.presentWorkStart()
             } label: {
@@ -63,6 +64,46 @@ struct FleetHomeView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    /// Narrows the board to one host and/or one project.
+    private var filterMenu: some View {
+        let all = allWorks
+        let hosts = Array(Set(all.flatMap(\.hostAliases))).sorted()
+        let projects = Array(Set(all.compactMap(\.repo))).sorted()
+        let active = hostFilter != nil || projectFilter != nil
+        return Menu {
+            Picker("Host", selection: $hostFilter) {
+                Text("All hosts").tag(String?.none)
+                ForEach(hosts, id: \.self) { Text($0).tag(String?.some($0)) }
+            }
+            Picker("Project", selection: $projectFilter) {
+                Text("All projects").tag(String?.none)
+                ForEach(projects, id: \.self) { Text($0).tag(String?.some($0)) }
+            }
+            if active {
+                Divider()
+                Button("Clear Filters") {
+                    hostFilter = nil
+                    projectFilter = nil
+                }
+            }
+        } label: {
+            Label(filterLabel, systemImage: active ? "line.3.horizontal.decrease.circle.fill" : "line.3.horizontal.decrease.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .foregroundStyle(active ? Color.accentColor : Color.primary)
+        .help("Show one host or one project")
+    }
+
+    private var filterLabel: String {
+        switch (hostFilter, projectFilter) {
+        case (nil, nil): String(localized: "Filter")
+        case (let host?, nil): host
+        case (nil, let project?): project
+        case (let host?, let project?): "\(project) · \(host)"
+        }
     }
 
     private var hostsButton: some View {
@@ -89,40 +130,10 @@ struct FleetHomeView: View {
         }
     }
 
-    // MARK: - Assign
-
-    /// Always there: say what to do, then pick who does it in the sheet.
-    private var assignBar: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "text.bubble")
-                .foregroundStyle(.secondary)
-            TextField("What should an agent do?", text: $assignment, axis: .vertical)
-                .textFieldStyle(.plain)
-                .lineLimit(1...4)
-                .onSubmit(assign)
-            Button("Assign", action: assign)
-                .buttonStyle(.muxaPrimary)
-                .disabled(!model.isConnected || assignment.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-                .help("Choose the host, folder and agent, then start it with this task")
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 9)
-        .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-        .padding(.horizontal, 16)
-        .padding(.top, 14)
-    }
-
-    private func assign() {
-        let task = assignment.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard model.isConnected, !task.isEmpty else { return }
-        model.presentNewAgent(prompt: task)
-        assignment = ""
-    }
-
     // MARK: - Board
 
     private var board: some View {
-        let all = allWorks
+        let all = FleetBoard.filter(allWorks, host: hostFilter, project: projectFilter)
         let works = all.filter { showsReviewed || !reviewed.hides($0) }
         let hiddenCount = all.filter { reviewed.hides($0) }.count
         let selected = all.first { $0.id == selectedID }
@@ -277,6 +288,17 @@ private struct FleetLaneColumn: View {
     let open: (MuxaHostedAgent) -> Void
     var reviewedCount = 0
     @Binding var showsReviewed: Bool
+    @State private var showsOlder = false
+
+    /// Finished units older than a day fold away behind one row.
+    private var shown: [FleetWork] {
+        guard lane == .finished, !showsOlder else { return works }
+        return works.filter { FleetBoard.isRecent($0) }
+    }
+
+    private var olderCount: Int {
+        lane == .finished ? works.filter { !FleetBoard.isRecent($0) }.count : 0
+    }
 
     private var title: String {
         switch lane {
@@ -330,13 +352,27 @@ private struct FleetLaneColumn: View {
                             .frame(maxWidth: .infinity)
                             .padding(.vertical, 24)
                     }
-                    ForEach(works) { work in
-                        FleetWorkCard(
-                            work: work,
-                            isSelected: work.id == selectedID,
-                            select: { select(work.id) },
-                            open: open
-                        )
+                    let groups = FleetBoard.byProject(shown)
+                    ForEach(groups) { group in
+                        if groups.count > 1 {
+                            FleetProjectHeader(project: group.project, count: group.works.count)
+                        }
+                        ForEach(group.works) { work in
+                            FleetWorkCard(
+                                work: work,
+                                isSelected: work.id == selectedID,
+                                select: { select(work.id) },
+                                open: open
+                            )
+                        }
+                    }
+                    if olderCount > 0 {
+                        Button(showsOlder ? String(localized: "Hide older") : String(localized: "\(olderCount) older")) {
+                            showsOlder.toggle()
+                        }
+                        .buttonStyle(.muxaGhost)
+                        .controlSize(.small)
+                        .padding(.top, 2)
                     }
                     if reviewedCount > 0 || (lane == .finished && showsReviewed) {
                         Button(showsReviewed ? String(localized: "Hide reviewed") : String(localized: "Show \(reviewedCount) reviewed")) {
@@ -353,6 +389,31 @@ private struct FleetLaneColumn: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(MuxaTheme.panelFill, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
+    }
+}
+
+/// A project's name over its units in a lane.
+private struct FleetProjectHeader: View {
+    let project: String?
+    let count: Int
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "folder")
+                .font(.system(size: 10))
+            Text(project ?? String(localized: "No project"))
+                .font(.system(size: 11, weight: .semibold))
+                .lineLimit(1)
+            Text("\(count)")
+                .font(.system(size: 11))
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(.secondary)
+        .padding(.horizontal, 4)
+        .padding(.top, 6)
+        .accessibilityElement(children: .combine)
     }
 }
 

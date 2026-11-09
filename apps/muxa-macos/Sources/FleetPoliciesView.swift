@@ -9,21 +9,16 @@ struct FleetAutomationButton: View {
     let addApproval: () -> Void
     @State private var showsPolicies = false
 
-    private var handledCount: Int { FleetAutomationSummary.handled(store.log).count }
-
     var body: some View {
         Button {
             showsPolicies.toggle()
         } label: {
-            HStack(spacing: 6) {
-                Image(systemName: isActive ? "wand.and.stars" : "wand.and.rays.inverse")
-                    .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
-                Text(label)
-                    .monospacedDigit()
-            }
+            Image(systemName: isActive ? "wand.and.stars" : "wand.and.rays.inverse")
+                .foregroundStyle(isActive ? Color.accentColor : Color.secondary)
         }
         .buttonStyle(.muxaGhost)
-        .help("What Muxa handles on its own")
+        .help(label)
+        .accessibilityLabel(label)
         .popover(isPresented: $showsPolicies, arrowEdge: .bottom) {
             FleetAutomationPopover(model: model, store: store, addApproval: {
                 showsPolicies = false
@@ -43,9 +38,7 @@ struct FleetAutomationButton: View {
         guard store.isSupported else { return String(localized: "Automatic: unavailable") }
         guard store.snapshot.enabled else { return String(localized: "Automatic: off") }
         if store.snapshot.isPaused() { return String(localized: "Automatic: paused") }
-        return handledCount > 0
-            ? String(localized: "Handled \(handledCount) today")
-            : String(localized: "Automatic: on")
+        return String(localized: "Automatic: on")
     }
 }
 

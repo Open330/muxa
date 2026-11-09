@@ -846,22 +846,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Leaves Start Work for the template manager; its Start buttons come
-    /// back here (see `presentWorkStart`).
+    /// Opens the template manager over Start Work, which stays open with
+    /// its form; a template's Start button returns to it (see
+    /// `presentWorkStart`).
     func presentTemplates() {
-        isPresentingWorkStart = false
-        // One sheet closes before the next opens on the same window.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-            self?.isPresentingTemplates = true
-        }
+        isPresentingTemplates = true
     }
 
     func presentWorkStart(pipeline: String? = nil, host: String? = nil) {
-        if isPresentingTemplates {
+        if isPresentingWorkStart && isPresentingTemplates {
+            // Chosen in the template manager over an open Start Work: close
+            // the manager and choose that template in the kept form.
+            workStartPreselectedPipeline = nil
+            workStartPreselectedPipeline = pipeline
             isPresentingTemplates = false
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
-                self?.presentWorkStart(pipeline: pipeline, host: host)
-            }
             return
         }
         workStartError = nil

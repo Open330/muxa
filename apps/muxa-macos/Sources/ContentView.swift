@@ -116,9 +116,7 @@ struct ContentView: View {
         )) { target in
             PipelineEditorView(target: target, model: model)
         }
-        .sheet(isPresented: $model.isPresentingTemplates) {
-            WorkTemplatesSheet(model: model)
-        }
+
         .muxaNewAgentPresentation(model: model, openEditor: openEditor) // WS-B: new agent
         .muxaSwapSheet(model: model)
         .task {
@@ -415,6 +413,14 @@ struct ContentView: View {
             openInbox: { openEditor(.inbox) },
             selectSidebar: { model.show($0) },
             focusSidebar: {
+                // Home folds the lists away; bring the current one out so
+                // there is a filter to focus, then ask once it is built.
+                if model.isSidebarListCollapsed {
+                    model.show(model.sidebarMode)
+                    sidebarVisible = true
+                    DispatchQueue.main.async { sidebarFocusRequest = UUID() }
+                    return
+                }
                 guard !sidebarVisible else {
                     sidebarFocusRequest = UUID()
                     return

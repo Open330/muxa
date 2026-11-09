@@ -28,15 +28,25 @@ struct WorkStartView: View {
         isLocalHost ? $cwd : $remoteFolder
     }
 
+    @State private var showsMore = false
+    @State private var startedAt = Date()
+
+    /// The Work ID the launch uses: the typed one, else one made from the
+    /// task, so the task is all a person has to write.
+    private var effectiveWork: String {
+        let typed = work.trimmingCharacters(in: .whitespacesAndNewlines)
+        return typed.isEmpty ? WorkStartID.make(task: taskBody, at: startedAt) : typed
+    }
+
     private var matchedRoute: MuxaWorkOptions.Route? {
-        options?.route(matching: work)
+        options?.route(matching: effectiveWork)
     }
 
     /// The pipeline the launch would use: the explicit choice, else the
     /// matching route's pipeline.
     private var effectivePipeline: MuxaWorkOptions.Pipeline? {
         guard let options else { return nil }
-        if pipeline.isEmpty { return options.defaultPipeline(for: work) }
+        if pipeline.isEmpty { return options.defaultPipeline(for: effectiveWork) }
         return options.pipeline(named: pipeline)
     }
 
@@ -78,7 +88,9 @@ struct WorkStartView: View {
     }
 
     private var canSubmit: Bool {
-        guard !work.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, !model.isStartingWork else {
+        let hasTask = !taskBody.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        let hasID = !work.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard hasTask || hasID, !model.isStartingWork else {
             return false
         }
         // With a loaded config the launch is predictable: refuse the combos
@@ -91,13 +103,10 @@ struct WorkStartView: View {
     var body: some View {
         VStack(spacing: 0) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: "play.square.stack.fill")
-                    .font(.system(size: 28))
-                    .foregroundStyle(.tint)
                 VStack(alignment: .leading, spacing: 3) {
                     Text("Start Work")
-                        .font(.system(size: 14, weight: .semibold))
-                    Text("Create or converge a collaborator pipeline without leaving Muxa.")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Say what needs to get done. The agents work out the rest.")
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
@@ -110,49 +119,43 @@ struct WorkStartView: View {
             Divider()
 
             Form {
-                Section("Identity") {
-                    hostPicker
-                    TextField("Work ID, for example auth-cleanup", text: $work)
-                    routeSummary
-                    HStack {
-                        TextField("Workspace (optional)", text: $workspace)
-                        if !workspaceSuggestions.isEmpty {
-                            Menu {
-                                ForEach(workspaceSuggestions, id: \.self) { suggestion in
-                                    Button(suggestion) { workspace = suggestion }
-                                }
-                            } label: {
-                                Image(systemName: "chevron.up.chevron.down")
+                Section {
+                    TextEditor(text: $taskBody)
+                        .font(.body)
+                        .frame(minHeight: 120)
+                        .overlay(alignment: .topLeading) {
+                            if taskBody.isEmpty {
+                                Text("What needs to get done? For example: fix the login timeout on slow networks and add a test.")
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, 7)
+                                    .padding(.leading, 5)
+                                    .allowsHitTesting(false)
                             }
-                            .menuStyle(.borderlessButton)
-                            .fixedSize()
-                            .help("Use the route's workspace or an existing session")
                         }
-                    }
+                }
+
+                Section("Where") {
+                    hostPicker
                     HStack {
                         TextField(
-                            isLocalHost
-                                ? "Project folder (use configured route when empty)"
-                                : "Project folder on \(host) (use its route when empty)",
+                            isLocalHost ? "Project folder" : "Project folder on \(host)",
                             text: folderBinding
                         )
                         if isLocalHost {
                             Button("Choose…", action: chooseDirectory)
                         }
                     }
-                    if folderBinding.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty, options != nil {
-                        Group {
-                            if routePinsDirectory {
-                                Text("The route decides the folder.")
-                            } else if isLocalHost {
-                                Text("Defaults to your home folder because the route names none; choose the project you want the agents to work in.")
-                            } else {
-                                Text("The route on \(host) names no folder; type the project path on that host.")
-                            }
-                        }
-                        .font(MuxaType.detail)
-                        .foregroundStyle(routePinsDirectory ? Color.secondary : Color.orange)
+                    if folderBinding.wrappedValue.trimmingCharacters(in: .whitespaces).isEmpty, options != nil, !routePinsDirectory {
+                        Text(isLocalHost
+                            ? "Defaults to your home folder; choose the project the agents should work in."
+                            : "Type the project path on \(host).")
+                            .font(MuxaType.detail)
+                            .foregroundStyle(.orange)
                     }
+                }
+
+                Section("Team") {
+                    pipelineSection
                 }
 
                 if let plan = model.workStartPlan {
@@ -164,28 +167,26 @@ struct WorkStartView: View {
                     }
                 }
 
-                Section("Pipeline") {
-                    pipelineSection
-                }
-
-                Section("Task") {
-                    TextField("External issue, for example ENG-1234 (optional)", text: $external)
-                    Text("An empty external issue creates a local Muxa Work; the issue never becomes the Work identity.")
-                        .font(MuxaType.detail)
-                        .foregroundStyle(.secondary)
-                    TextEditor(text: $taskBody)
-                        .font(.body)
-                        .frame(minHeight: 86)
-                        .overlay(alignment: .topLeading) {
-                            if taskBody.isEmpty {
-                                Text("What should the collaborators accomplish?")
-                                    .foregroundStyle(.secondary)
-                                    .padding(.top, 7)
-                                    .padding(.leading, 5)
-                                    .allowsHitTesting(false)
+                Section {
+                    DisclosureGroup("More options", isExpanded: $showsMore) {
+                        TextField("Work ID", text: $work, prompt: Text(WorkStartID.make(task: taskBody, at: startedAt)))
+                        routeSummary
+                        HStack {
+                            TextField("Workspace (optional)", text: $workspace)
+                            if !workspaceSuggestions.isEmpty {
+                                Menu {
+                                    ForEach(workspaceSuggestions, id: \.self) { suggestion in
+                                        Button(suggestion) { workspace = suggestion }
+                                    }
+                                } label: {
+                                    Image(systemName: "chevron.up.chevron.down")
+                                }
+                                .menuStyle(.borderlessButton)
+                                .fixedSize()
+                                .help("Use the route's workspace or an existing session")
                             }
                         }
-                    DisclosureGroup("Advanced context") {
+                        TextField("External issue, for example ENG-1234 (optional)", text: $external)
                         skillField
                         TextField("Additional context (optional)", text: $context)
                         Toggle("Plan only — do not create agents", isOn: $dryRun)
@@ -229,9 +230,6 @@ struct WorkStartView: View {
             Divider()
 
             HStack {
-                Text("Runs the bundled canonical `muxa work up` implementation through owner-only muxad IPC.")
-                    .font(MuxaType.meta)
-                    .foregroundStyle(.secondary)
                 Spacer()
                 Button("Cancel") { isPresented = false }
                     .disabled(model.isStartingWork)
@@ -242,7 +240,15 @@ struct WorkStartView: View {
             }
             .padding(16)
         }
-        .frame(width: 700, height: 720)
+        .frame(width: 620, height: 640)
+        // Templates open over this sheet, so the form above is kept.
+        .sheet(isPresented: $model.isPresentingTemplates) {
+            WorkTemplatesSheet(model: model)
+        }
+        .onChange(of: model.workStartPreselectedPipeline) { chosen in
+            // A template's Start button chose it in the template manager.
+            if let chosen { pipeline = chosen }
+        }
         .onAppear {
             if let preselected = model.workStartPreselectedPipeline {
                 pipeline = preselected
@@ -431,7 +437,7 @@ struct WorkStartView: View {
 
     private func submit() {
         let request = MuxaWorkStartRequest(
-            work: work,
+            work: effectiveWork,
             workspace: workspace,
             pipeline: pipeline,
             cwd: effectiveDirectory,
@@ -1152,8 +1158,7 @@ struct WorkTemplatesSheet: View {
                 Text("Work Templates")
                     .font(.title3.weight(.semibold))
                 Spacer()
-                Button("Back to Start Work") { model.presentWorkStart() }
-                Button("Done") { dismiss() }
+                Button("Done") { model.isPresentingTemplates = false }
                     .buttonStyle(.muxaPrimary)
                     .keyboardShortcut(.defaultAction)
             }
@@ -1165,5 +1170,22 @@ struct WorkTemplatesSheet: View {
         .sheet(item: $model.pipelineEditorTarget) { target in
             PipelineEditorView(target: target, model: model)
         }
+    }
+}
+
+/// A Work ID made from the task, for a launch that names none: the task's
+/// first few words in lower case, joined by hyphens, then the time, so two
+/// launches never collide. A task with no Latin words gets `work-…`.
+enum WorkStartID {
+    static func make(task: String, at date: Date) -> String {
+        let words = task.lowercased()
+            .split { !($0.isASCII && ($0.isLetter || $0.isNumber)) }
+            .prefix(4)
+            .map(String.init)
+        let stem = words.isEmpty ? "work" : String(words.joined(separator: "-").prefix(32))
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.dateFormat = "MMdd-HHmm"
+        return "\(stem)-\(formatter.string(from: date))"
     }
 }

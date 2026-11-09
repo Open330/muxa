@@ -318,6 +318,51 @@ enum FleetBoard {
     }
 }
 
+// MARK: - Arranging the board
+
+/// The units of one project within a lane.
+struct FleetProjectGroup: Identifiable, Sendable {
+    /// The repository name; nil for units with no known folder.
+    let project: String?
+    let works: [FleetWork]
+
+    var id: String { project ?? "" }
+}
+
+extension FleetBoard {
+    /// How long a finished unit stays in the Finished lane's main list.
+    static let recentFinish: TimeInterval = 24 * 3600
+
+    /// Units grouped by project, a project placed where its first unit
+    /// is, so the lane's order (the longest wait, the latest change) still
+    /// decides which project comes first.
+    static func byProject(_ works: [FleetWork]) -> [FleetProjectGroup] {
+        var order: [String?] = []
+        var groups: [String: [FleetWork]] = [:]
+        for work in works {
+            let key = work.repo ?? ""
+            if groups[key] == nil { order.append(work.repo) }
+            groups[key, default: []].append(work)
+        }
+        return order.map { FleetProjectGroup(project: $0, works: groups[$0 ?? ""] ?? []) }
+    }
+
+    /// A finished unit that changed within `recentFinish`, or one with no
+    /// known time.
+    static func isRecent(_ work: FleetWork, now: Date = .now) -> Bool {
+        guard let since = work.since else { return true }
+        return now.timeIntervalSince(since) <= recentFinish
+    }
+
+    /// The units on the chosen host and in the chosen project.
+    static func filter(_ works: [FleetWork], host: String?, project: String?) -> [FleetWork] {
+        works.filter { work in
+            (host == nil || work.hostAliases.contains(host!))
+                && (project == nil || work.repo == project)
+        }
+    }
+}
+
 // MARK: - Acting on a unit
 
 /// What the person can type to a unit's agent from the inspector.
