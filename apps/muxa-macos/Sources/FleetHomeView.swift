@@ -16,6 +16,8 @@ struct FleetHomeView: View {
     @State private var drafts: [String: FleetReplyDraft] = [:]
     @State private var approvalSeed: FleetApprovalSeed?
     @State private var quickLook: FleetQuickLookTarget?
+    @State private var showsReview = false
+    @AppStorage("home.review.scope") private var reviewScope: FleetReviewScope = .day
 
     private var allWorks: [FleetWork] {
         FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
@@ -30,6 +32,20 @@ struct FleetHomeView: View {
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
         .sheet(item: $approvalSeed) { seed in
             FleetApprovalRuleSheet(model: model, seed: seed)
+        }
+        .sheet(isPresented: $showsReview) {
+            FleetReviewView(
+                model: model,
+                works: { allWorks },
+                marks: $reviewed,
+                draft: draftBinding,
+                submit: { submit(for: $0) },
+                open: open,
+                markReviewed: { work in
+                    reviewed.markReviewed(work)
+                    reviewed.save(to: .standard)
+                }
+            )
         }
         .sheet(item: $quickLook) { target in
             let work = allWorks.first { work in
@@ -53,6 +69,7 @@ struct FleetHomeView: View {
             Text("Home")
                 .font(.system(size: 17, weight: .semibold))
             Spacer(minLength: 8)
+            reviewButton
             filterMenu
             hostsButton
             FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
@@ -66,6 +83,34 @@ struct FleetHomeView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    /// Results the person asked for and has not reviewed, in the chosen
+    /// range: the way to go through Finished quickly.
+    private var reviewButton: some View {
+        let count = FleetBoard.reviewQueue(allWorks, marks: reviewed, scope: reviewScope).count
+        return Button {
+            showsReview = true
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "checklist")
+                Text("Review")
+                if count > 0 {
+                    Text(verbatim: count > 99 ? "99+" : "\(count)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.horizontal, 5)
+                        .background(Color.accentColor, in: Capsule())
+                }
+            }
+        }
+        .buttonStyle(.muxaSecondary)
+        .fixedSize()
+        .keyboardShortcut("r", modifiers: [.command, .shift])
+        .help("Review the results of work you asked for (⇧⌘R)")
     }
 
     /// Narrows the board to one host and/or one project.

@@ -534,3 +534,54 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(FleetBoard.isEmpty(try agent(["recap": "  "], id: "x")))
     #expect(!FleetBoard.isEmpty(try agent(["last_response": "Done."], id: "y")))
 }
+
+@Test func theReviewQueueHoldsUnreviewedResultsThePersonAskedFor() throws {
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    func finished(_ id: String, prompt: String?, at: String) throws -> MuxaHostedAgent {
+        var fields: [String: Any] = ["state": "idle", "state_entered_at": at, "last_response": "Done."]
+        if let prompt { fields["last_prompt"] = prompt }
+        return MuxaHostedAgent(host: host, agent: try agent(fields, id: id), pane: nil)
+    }
+    let mine = try finished("mine", prompt: "Fix the README", at: "2026-11-09T11:00:00Z")
+    let old = try finished("old", prompt: "Write the docs", at: "2026-11-02T11:00:00Z")
+    let notice = try finished("notice", prompt: "[muxa:req_1_2] Completed reply from codex@%13 is ready.", at: "2026-11-09T11:30:00Z")
+    let background = try finished("bg", prompt: "<task-notification>\n<summary>x</summary>", at: "2026-11-09T11:40:00Z")
+    let works = FleetBoard.works(groups: [], agents: [mine, old, notice, background], now: now)
+
+    let day = FleetBoard.reviewQueue(works, marks: FleetReviewMarks(), scope: .day, now: now)
+    #expect(day.map { $0.focus?.id } == [mine.id])
+    let all = FleetBoard.reviewQueue(works, marks: FleetReviewMarks(), scope: .all, now: now)
+    #expect(all.map { $0.focus?.id } == [mine.id, old.id], "newest first")
+
+    var marks = FleetReviewMarks()
+    marks.markReviewed(try #require(day.first))
+    #expect(FleetBoard.reviewQueue(works, marks: marks, scope: .all, now: now).map { $0.focus?.id } == [old.id])
+}
+
+@Test func reviewScopesStartWhereTheirNamesSay() throws {
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = try #require(TimeZone(identifier: "UTC"))
+    #expect(FleetReviewScope.today.start(now: now, calendar: calendar) == MuxaUsageTimestamp.parse("2026-11-09T00:00:00Z"))
+    #expect(FleetReviewScope.day.start(now: now) == MuxaUsageTimestamp.parse("2026-11-08T12:00:00Z"))
+    #expect(FleetReviewScope.week.start(now: now) == MuxaUsageTimestamp.parse("2026-11-02T12:00:00Z"))
+    #expect(FleetReviewScope.all.start(now: now) == nil)
+}
+
+@Test func menuBarGlyphsNameProvidersAndCustomHostIcons() throws {
+    #expect(MuxaMenuBarAgentAppearance(identity: "a", kind: "claude_code").symbol == MuxaGlyph.claude)
+    #expect(MuxaMenuBarAgentAppearance(identity: "a", kind: "codex").symbol == MuxaGlyph.codex)
+    #expect(MuxaGlyph.kind(MuxaGlyph.claude) == .claude)
+    #expect(MuxaGlyph.kind(MuxaGlyph.codex) == .codex)
+    #expect(MuxaGlyph.kind("text:🚀") == .text("🚀"))
+    #expect(MuxaGlyph.kind("server.rack") == .symbol("server.rack"))
+    #expect(MuxaGlyph.cleanedText("  mini host ") == "mi")
+
+    let defaults = try #require(UserDefaults(suiteName: "host-icons-\(UUID().uuidString)"))
+    #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "server.rack")
+    #expect(MuxaHostIcons.icon(for: "me", local: true, defaults: defaults) == "laptopcomputer")
+    MuxaHostIcons.set("text:🚀", for: "mini", defaults: defaults)
+    #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "text:🚀")
+    MuxaHostIcons.set(nil, for: "mini", defaults: defaults)
+    #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "server.rack")
+}

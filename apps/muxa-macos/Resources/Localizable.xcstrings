@@ -51,6 +51,26 @@
         }
       }
     },
+    "1 of %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "1 / %lld"
+          }
+        }
+      }
+    },
+    "24 hours" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "24시간"
+          }
+        }
+      }
+    },
     "Add Approval Rule…" : {
       "localizations" : {
         "ko" : {
@@ -67,6 +87,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "열렸지만 아무 일도 받지 않은 에이전트입니다"
+          }
+        }
+      }
+    },
+    "All caught up" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모두 확인했습니다"
           }
         }
       }
@@ -3910,12 +3940,32 @@
         }
       }
     },
+    "Cards" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "카드"
+          }
+        }
+      }
+    },
     "Choose a draft, edit it, then Reply. This records your decision only." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "초안을 골라 고친 뒤 답장하세요. 결정만 기록됩니다."
+          }
+        }
+      }
+    },
+    "Choose a symbol" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "심볼 고르기"
           }
         }
       }
@@ -5681,6 +5731,16 @@
         }
       }
     },
+    "Digest" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요약"
+          }
+        }
+      }
+    },
     "Directory" : {
       "localizations" : {
         "ko" : {
@@ -6208,6 +6268,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "보낸 사람과 무관하게 모든 요청이 텍스트로 전달됩니다."
+          }
+        }
+      }
+    },
+    "Every result you asked for has been reviewed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청한 일의 결과를 모두 확인했습니다."
           }
         }
       }
@@ -6774,6 +6844,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "지정된 동작"
+          }
+        }
+      }
+    },
+    "Fleet host icons" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "플릿 호스트 아이콘"
           }
         }
       }
@@ -7779,6 +7859,16 @@
         }
       }
     },
+    "J/K Move" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "J/K 이동"
+          }
+        }
+      }
+    },
     "Jitter" : {
       "localizations" : {
         "ko" : {
@@ -8076,6 +8166,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "지연 시간"
+          }
+        }
+      }
+    },
+    "Later" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "나중에"
           }
         }
       }
@@ -8460,6 +8560,16 @@
         }
       }
     },
+    "Looks Good (→)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "확인 완료 (→)"
+          }
+        }
+      }
+    },
     "Mailbox" : {
       "localizations" : {
         "ko" : {
@@ -8510,12 +8620,52 @@
         }
       }
     },
+    "Mark All" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모두 표시"
+          }
+        }
+      }
+    },
+    "Mark all %lld reviewed?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개를 모두 확인 완료로 표시할까요?"
+          }
+        }
+      }
+    },
     "Mark All Agents as Read" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "모든 에이전트를 읽음으로 표시"
+          }
+        }
+      }
+    },
+    "Mark All Reviewed…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모두 확인 완료…"
+          }
+        }
+      }
+    },
+    "Mark Project Reviewed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프로젝트 모두 확인"
           }
         }
       }
@@ -9582,6 +9732,16 @@
         }
       }
     },
+    "No fleet hosts yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 플릿 호스트가 없습니다."
+          }
+        }
+      }
+    },
     "No Hosts" : {
       "localizations" : {
         "ko" : {
@@ -10401,6 +10561,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "아직 실행된 규칙이 없습니다. 실행과 건너뛴 실행이 모두 최신순으로 여기에 남습니다."
+          }
+        }
+      }
+    },
+    "Nothing left to review in this range. Widen the range to see older results." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 기간에는 남은 결과가 없습니다. 기간을 넓히면 이전 결과를 볼 수 있습니다."
           }
         }
       }
@@ -11994,6 +12164,16 @@
         }
       }
     },
+    "Range" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기간"
+          }
+        }
+      }
+    },
     "Rate limited" : {
       "localizations" : {
         "ko" : {
@@ -12963,6 +13143,16 @@
         }
       }
     },
+    "Reset" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "초기화"
+          }
+        }
+      }
+    },
     "Reset preview" : {
       "localizations" : {
         "ko" : {
@@ -13251,6 +13441,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "리뷰를 보냈습니다"
+          }
+        }
+      }
+    },
+    "Review the results of work you asked for (⇧⌘R)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청한 일의 결과 검토 (⇧⌘R)"
           }
         }
       }
@@ -13675,12 +13875,32 @@
         }
       }
     },
+    "Show the whole result" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과 전체 보기"
+          }
+        }
+      }
+    },
     "Show this switch's progress and result in the status bar's Account Switches" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 전환의 진행 상황과 결과를 상태 표시줄의 계정 전환에서 보여 줍니다"
+          }
+        }
+      }
+    },
+    "Shown when activity is grouped by host. Agents show their provider: a spark for Claude, >_ for Codex." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "활동을 호스트별로 묶을 때 보입니다. 에이전트는 제공자를 보여 줍니다: Claude는 별 모양, Codex는 >_."
           }
         }
       }
@@ -16315,6 +16535,16 @@
         }
       }
     },
+    "This agent is not at its prompt; open it to send it back." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트가 입력을 기다리는 상태가 아닙니다. 열어서 다시 시키세요."
+          }
+        }
+      }
+    },
     "This agent is not attached to a pane" : {
       "localizations" : {
         "ko" : {
@@ -16656,6 +16886,16 @@
         }
       }
     },
+    "This week" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이번 주"
+          }
+        }
+      }
+    },
     "This workflow would not launch." : {
       "localizations" : {
         "ko" : {
@@ -16672,6 +16912,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트 셋: 플래너, 구현자, 테스터. 테스터는 두 에이전트 다음에 실행"
+          }
+        }
+      }
+    },
+    "Three ways through the same results; pick the one that works best" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "같은 결과를 세 가지 방식으로 볼 수 있습니다. 편한 쪽을 고르세요"
           }
         }
       }
@@ -16712,6 +16962,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "제목 행"
+          }
+        }
+      }
+    },
+    "Today" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오늘"
           }
         }
       }
@@ -16988,6 +17248,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "최대 %@의 무작위 지연이 추가됩니다."
+          }
+        }
+      }
+    },
+    "Up to two characters or an emoji instead of a symbol" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "심볼 대신 두 글자 이내 또는 이모지"
           }
         }
       }
@@ -19351,6 +19621,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "• 위의 마스터 스위치와 일시 정지가 모든 규칙을 멈춥니다."
+          }
+        }
+      }
+    },
+    "← Later   R Send Back   Space Open   → Looks Good" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "← 나중에   R 다시 시키기   Space 열기   → 확인 완료"
           }
         }
       }

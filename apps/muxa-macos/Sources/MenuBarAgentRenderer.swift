@@ -57,7 +57,7 @@ enum MuxaMenuBarAgentRenderer {
             shape.stroke()
             NSGraphicsContext.saveGraphicsState()
             shape.addClip()
-            drawSymbol(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha))
+            MuxaGlyph.draw(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha))
             if isPill {
                 let text = agent.pillLabel as NSString
                 let textSize = text.size(withAttributes: [.font: pillFont])
