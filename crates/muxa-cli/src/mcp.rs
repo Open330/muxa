@@ -8582,7 +8582,15 @@ mod tests {
             format!("#!/bin/sh\nprintf p >> '{}'\nexit 1\n", probes.display()),
         )
         .unwrap();
-        tokio::time::sleep(UPGRADE_POLL_INTERVAL * 6).await;
+        // A poll schedules an OS process; its completion is not bounded by
+        // a few timer ticks on a busy host. Wait for the probe's evidence.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !std::fs::read_to_string(&probes).is_ok_and(|text| !text.is_empty()) {
+                tokio::time::sleep(UPGRADE_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("replacement binary was not probed");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(std::fs::read_to_string(&probes).unwrap(), "p");
         tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
@@ -8597,6 +8605,13 @@ mod tests {
 
         // Replaced: the next idle poll hands over to the new binary once.
         std::fs::write(&binary, b"#!/bin/sh\n# validated new build\nexit 0\n").unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(UPGRADE_POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("validated replacement did not trigger reexec");
         tokio::time::sleep(UPGRADE_POLL_INTERVAL * 3).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1);
 

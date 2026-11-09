@@ -1,8 +1,8 @@
 //! End-to-end test: spawn the real `muxad` binary, drive it via the real
 //! `muxa` CLI, assert observable state.
 //!
-//! Cargo sets `CARGO_BIN_EXE_<name>` for binaries in sibling packages of
-//! the same workspace when `cargo test` is invoked.
+//! Cargo supplies the CLI path from this package. Build the sibling `muxad`
+//! binary in the same target/profile directory before running these tests.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -11,20 +11,9 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn bin(name: &str) -> PathBuf {
-    // `CARGO_BIN_EXE_*` is the canonical way to locate workspace binaries
-    // from integration tests. Falls back to a dev-profile path if not set.
-    if let Some(path) = option_env!("CARGO_BIN_EXE_muxad") {
-        // `muxa` and `muxad` live in the same target/<profile>/ directory.
-        let muxad = PathBuf::from(path);
-        return muxad.with_file_name(name);
-    }
-    let target = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("target/debug");
-    target.join(name)
+    // Cargo only supplies paths for this package's binaries. Use the CLI as
+    // the anchor so custom CARGO_TARGET_DIR and non-debug profiles also work.
+    Path::new(env!("CARGO_BIN_EXE_muxa")).with_file_name(name)
 }
 
 fn wait_for_socket(path: &Path, deadline: Duration) {

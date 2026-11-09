@@ -289,11 +289,8 @@ fn no_prompt_launch_registers_the_observed_provider_immediately() {
 /// looks for it rather than reading the pane once.
 #[test]
 fn a_launch_whose_agent_starts_late_is_still_registered() {
-    if !tmux_installed()
-        || Command::new("cc").arg("--version").output().is_err()
-        || Command::new("bash").arg("--version").output().is_err()
-    {
-        eprintln!("skipping: tmux, cc and bash are required");
+    if !tmux_installed() || Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: tmux and cc are required");
         return;
     }
     launch_registers("codex", true);
@@ -324,7 +321,9 @@ fn launch_registers(program: &str, late: bool) {
         )
         .unwrap();
         let binary = if late {
-            stub_bin.join("agent-bin")
+            let real_bin = stub_bin.join("real");
+            std::fs::create_dir(&real_bin).unwrap();
+            real_bin.join(program)
         } else {
             stub_bin.join(program)
         };
@@ -336,13 +335,14 @@ fn launch_registers(program: &str, late: bool) {
             .unwrap()
             .success());
         if late {
-            // The pane runs `sleep` first, then the agent under its name.
+            // macOS tmux reports the executable basename, not exec -a's
+            // argv[0]. Give the delayed executable the real provider name.
             let script = stub_bin.join(program);
             std::fs::write(
                 &script,
                 format!(
-                    "#!/usr/bin/env bash\nsleep 1\nexec -a {program} {}\n",
-                    binary.display()
+                    "#!/bin/sh\nsleep 1\nexec {}\n",
+                    muxa::shell::Dialect::Posix.quote(&binary.to_string_lossy())
                 ),
             )
             .unwrap();

@@ -1456,8 +1456,10 @@ mod tests {
     #[tokio::test]
     async fn run_loop_converges_then_exits_on_shutdown() {
         let store = Store::shared();
-        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t0 = OffsetDateTime::now_utc();
         store.apply(&started("ghost", "%99", t0)).await;
+        store.apply(&started("live", "%1", t0)).await;
+        let mut changes = store.subscribe_changes();
         let fake = Arc::new(FakeLiveness::new(vec![pane("%1")]));
         let fake_for_runner = Arc::clone(&fake);
 
@@ -1471,27 +1473,38 @@ mod tests {
         );
         let task = tokio::spawn(runner.run(rx));
 
-        // Give the loop a couple of ticks to converge.
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        assert_eq!(
-            store.snapshot().await.len(),
-            0,
-            "ghost agent should have been reaped",
-        );
-
-        // Add another stale entry, expand live set, and verify next tick
-        // converges again — proves idempotent re-entry.
-        store.apply(&started("ghost2", "%88", t0)).await;
-        fake.set(vec![pane("%1"), pane("%88")]);
-        tokio::time::sleep(Duration::from_millis(80)).await;
+        // The tick includes blocking process scans; their duration is not the
+        // scheduler interval. Wait for convergence instead of guessing 80ms.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while store.by_session("ghost").await.is_some() {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("ghost agent should have been reaped");
         let snap = store.snapshot().await;
-        assert_eq!(snap.len(), 1, "second ghost should also be reaped");
-        assert_eq!(snap[0].session_id, "ghost2");
+        assert_eq!(snap.len(), 1, "live agent should remain after convergence");
+        assert_eq!(snap[0].session_id, "live");
 
-        let _ = tx.send(());
+        // Remove the formerly live pane and add another absent row. An old
+        // in-flight observation may still keep `live`; a subsequent pass must
+        // use the new observation and converge again without restarting.
+        fake.set(Vec::new());
+        store.apply(&started("ghost2", "%77", t0)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !store.snapshot().await.is_empty() {
+                changes.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("closed pane and second ghost should both be reaped");
+
+        tx.send(()).unwrap();
         // Task must observe shutdown; bounded wait so the test doesn't hang.
-        let exited = tokio::time::timeout(Duration::from_millis(500), task).await;
-        assert!(exited.is_ok(), "reconciler did not honor shutdown");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("reconciler did not honor shutdown")
+            .expect("reconciler panicked");
     }
 
     /// Two real `Started`s on the same pane (e.g. user closed the agent

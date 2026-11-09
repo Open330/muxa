@@ -29,6 +29,17 @@ sessions and primary sessions keep their own inbound policy. Muxa coordination
 uses the Muxa mailbox and request IDs; Claude's native `SendMessage` channel is
 not a substitute for a Muxa delivery receipt.
 
+To apply the same receive policy to sessions that are already running, set
+`"crossSessionInbound": "accept"` in `~/.claude/settings.json`. Claude
+[reloads settings](https://code.claude.com/docs/en/settings#when-edits-take-effect)
+without restarting sessions and
+[rechecks held messages](https://code.claude.com/docs/en/cross-session-messaging#non-interactive-sessions). This is a
+user-wide choice affecting every Claude session on this machine; Muxa does not
+set it automatically. It changes message receipt, not tool execution permissions.
+Explicit stricter project/local policies still apply, and messages already
+declined or expired cannot be recovered by changing the policy. Keep Muxa
+coordination on its durable mailbox rather than resending through native tools.
+
 After a request is handed over, a provider permission prompt is tracked as
 `peer_interrupted` with reason `approval_required` (or `input_required` for
 provider input and legacy permission notifications). Muxa immediately creates one
