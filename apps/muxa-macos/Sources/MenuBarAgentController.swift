@@ -27,6 +27,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     private var pointerOnChip = false
     private var foldIntent = MuxaMenuBarFoldIntent()
     private var lastPoint: NSPoint?
+    private var menuBarBands: [NSRect]?
     private var timer: Timer?
     private var popover: NSPopover?
     private var keyMonitor: Any?
@@ -265,7 +266,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
             let wasInside = pointerInside
             let wasOnChip = pointerOnChip
             pointerOnChip = false
-            if let frame = itemFrame(near: point) {
+            if (focus != nil || pointerInside || isNearMenuBar(point)), let frame = itemFrame(near: point) {
                 switch MuxaMenuBarHoverPolicy.zone(point: point, item: frame, peek: peek?.frame) {
                 case .item:
                     pointerInside = true
@@ -345,6 +346,18 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         timer.tolerance = interval / 4
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+    }
+
+    /// Most pointer movement is nowhere near a menu bar. Avoid asking AppKit
+    /// for the replicated status window's frame on those idle movements.
+    private func isNearMenuBar(_ point: NSPoint) -> Bool {
+        let bands = menuBarBands ?? NSScreen.screens.map { screen in
+            let height = max(screen.frame.maxY - screen.visibleFrame.maxY, NSStatusBar.system.thickness, 40) + 12
+            return NSRect(x: screen.frame.minX, y: screen.frame.maxY - height,
+                          width: screen.frame.width, height: height + 1)
+        }
+        menuBarBands = bands
+        return bands.contains { $0.contains(point) }
     }
 
     /// Translate the offscreen stand-in to the pointer's display, retaining
@@ -524,6 +537,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     }
 
     private func dismissForScreenChange() {
+        menuBarBands = nil
         foldIntent.cancel()
         setFocus(nil)
         hidePeek()

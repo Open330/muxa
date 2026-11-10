@@ -38,8 +38,9 @@ enum MuxaMenuBarAgentRenderer {
     static func image(
         chips: [MuxaMenuBarChip], positions: [CGFloat], focus: Int?, pillWidth: CGFloat,
         lead: CGFloat, markOpacity: CGFloat, overflow: Int, selectedID: String?,
-        liveIDs: Set<String>, dark: Bool, mark: String, scales: [CGFloat]? = nil
+        liveIDs: Set<String>, dark: Bool, mark: String, scales: [CGFloat]? = nil, glyphCache: MuxaMenuBarGlyphCache? = .shared
     ) -> NSImage {
+        let scales = scales ?? backingScales
         let geometry = MuxaMenuBarGeometry(count: chips.count)
         let size = NSSize(width: ceil(geometry.width + lead + (overflow > 0 ? MuxaMenuBarGeometry.overflowWidth : 0)), height: 24)
         let draw = {
@@ -70,7 +71,7 @@ enum MuxaMenuBarAgentRenderer {
                 shape.stroke()
                 NSGraphicsContext.saveGraphicsState()
                 shape.addClip()
-                drawSymbol(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha))
+                drawSymbol(appearance.symbol, in: NSRect(x: face.minX + 3, y: face.midY - 6, width: height - 6, height: 12), color: .white.withAlphaComponent(alpha), scales: scales, cache: glyphCache)
                 if isPill {
                     let text = agent.pillLabel as NSString
                     let textSize = text.size(withAttributes: [.font: pillFont])
@@ -89,7 +90,7 @@ enum MuxaMenuBarAgentRenderer {
                     ring.stroke()
                 }
                 // Badge and face are one layer: the next chip covers both.
-                if let rect = paint.badges[index] { drawBadge(chips[index], in: rect.offsetBy(dx: lead, dy: 0), dark: dark) }
+                if let rect = paint.badges[index] { drawBadge(chips[index], in: rect.offsetBy(dx: lead, dy: 0), dark: dark, scales: scales, cache: glyphCache) }
             }
             NSGraphicsContext.current?.cgContext.endTransparencyLayer()
             if overflow > 0 {
@@ -103,8 +104,12 @@ enum MuxaMenuBarAgentRenderer {
                 text.draw(at: NSPoint(x: capsule.midX - textWidth / 2, y: 6), withAttributes: attributes)
             }
         }
+        return rasterized(size: size, scales: scales, draw: draw)
+    }
+
+    static func rasterized(size: NSSize, scales: [CGFloat], draw: () -> Void) -> NSImage {
         let image = NSImage(size: size)
-        for scale in Set(scales ?? backingScales).sorted() where scale > 0 && scale.isFinite {
+        for scale in Set(scales).sorted() where scale > 0 && scale.isFinite {
             guard let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
                 pixelsWide: Int(ceil(size.width * scale)), pixelsHigh: Int(ceil(size.height * scale)),
                 bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
@@ -122,7 +127,18 @@ enum MuxaMenuBarAgentRenderer {
         return image
     }
 
-    private static func drawSymbol(_ name: String, in rect: NSRect, color: NSColor) {
+    private static func drawSymbol(_ name: String, in rect: NSRect, color: NSColor, scales: [CGFloat], cache: MuxaMenuBarGlyphCache?) {
+        if let image = cache?.glyph(name, size: rect.size, scales: scales) {
+            // Glyphs are white; badge glyphs can use dark ink.
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.cgContext.beginTransparencyLayer(auxiliaryInfo: nil)
+            image.draw(in: rect)
+            color.setFill()
+            rect.fill(using: .sourceAtop)
+            NSGraphicsContext.current?.cgContext.endTransparencyLayer()
+            NSGraphicsContext.restoreGraphicsState()
+            return
+        }
         guard let source = NSImage(systemSymbolName: name, accessibilityDescription: nil) else { return }
         let configured = source.withSymbolConfiguration(.init(pointSize: 11, weight: .semibold)) ?? source
         let scale = min(rect.width / configured.size.width, rect.height / configured.size.height)
@@ -137,7 +153,7 @@ enum MuxaMenuBarAgentRenderer {
         NSGraphicsContext.restoreGraphicsState()
     }
 
-    private static func drawBadge(_ agent: MuxaMenuBarChip, in rect: NSRect, dark: Bool) {
+    private static func drawBadge(_ agent: MuxaMenuBarChip, in rect: NSRect, dark: Bool, scales: [CGFloat], cache: MuxaMenuBarGlyphCache?) {
         let background: NSColor = dark ? NSColor(white: 0.12, alpha: 1) : .white
         background.setFill()
         NSBezierPath(ovalIn: rect.insetBy(dx: -0.8, dy: -0.8)).fill()
@@ -153,7 +169,45 @@ enum MuxaMenuBarAgentRenderer {
         fill.setFill()
         NSBezierPath(ovalIn: rect).fill()
         let color: NSColor = style == .input ? NSColor(white: 0.12, alpha: 1) : .white
-        drawSymbol(glyph, in: rect.insetBy(dx: 1.5, dy: 1.4), color: color)
+        drawSymbol(glyph, in: rect.insetBy(dx: 1.5, dy: 1.4), color: color, scales: scales, cache: cache)
     }
 
+}
+
+/// Bounded white glyph bitmaps, shared by animation frames and display scales.
+/// Tint and stale opacity are applied when compositing, not baked into the key.
+@MainActor
+final class MuxaMenuBarGlyphCache {
+    static let shared = MuxaMenuBarGlyphCache()
+    static let limit = 96
+    private struct Key: Hashable {
+        let name: String
+        let width: Int
+        let height: Int
+        let scales: [CGFloat]
+    }
+    private var images: [Key: NSImage] = [:]
+    var count: Int { images.count }
+
+    func glyph(_ name: String, size: NSSize, scales: [CGFloat]) -> NSImage? {
+        let key = Key(name: name, width: Int((size.width * 4).rounded()),
+                      height: Int((size.height * 4).rounded()), scales: scales)
+        guard key.width > 0, key.height > 0 else { return nil }
+        if let image = images[key] { return image }
+        guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: 11, weight: .semibold)) else { return nil }
+        let size = NSSize(width: CGFloat(key.width) / 4, height: CGFloat(key.height) / 4)
+        let ratio = min(size.width / symbol.size.width, size.height / symbol.size.height)
+        let fitted = NSSize(width: symbol.size.width * ratio, height: symbol.size.height * ratio)
+        let bounds = NSRect(x: (size.width - fitted.width) / 2, y: (size.height - fitted.height) / 2,
+                            width: fitted.width, height: fitted.height)
+        let image = MuxaMenuBarAgentRenderer.rasterized(size: size, scales: scales) {
+            symbol.draw(in: bounds, from: .zero, operation: .sourceOver, fraction: 1, respectFlipped: true, hints: nil)
+            NSColor.white.setFill()
+            NSRect(origin: .zero, size: size).fill(using: .sourceAtop)
+        }
+        if images.count >= Self.limit { images.removeAll(keepingCapacity: true) }
+        images[key] = image
+        return image
+    }
 }

@@ -583,3 +583,62 @@ private struct MenuReplyError: LocalizedError {
         #expect(maxY > Int(CGFloat(rep.pixelsHigh) * 0.65))
     }
 }
+
+
+@Test @MainActor func menuBarGlyphCacheReusesBitmapsAndSeparatesDisplayScales() throws {
+    let cache = MuxaMenuBarGlyphCache()
+    let first = try #require(cache.glyph("terminal", size: NSSize(width: 12, height: 12), scales: [1]))
+    let again = cache.glyph("terminal", size: NSSize(width: 12, height: 12), scales: [1])
+    #expect(first === again)
+    let retina = try #require(cache.glyph("terminal", size: NSSize(width: 12, height: 12), scales: [1, 2]))
+    #expect(first !== retina)
+    #expect(retina.representations.map(\.pixelsWide).sorted() == [12, 24])
+    for width in 1...200 {
+        _ = cache.glyph("terminal", size: NSSize(width: width, height: 12), scales: [1])
+    }
+    #expect(cache.count <= MuxaMenuBarGlyphCache.limit)
+}
+
+@Test @MainActor func menuBarCachedGlyphsPreserveVisibleRendering() throws {
+    let snap = try menuBarSnapshot([("coder", "waiting_input", "1")])
+    let chip = MuxaMenuBarChip.agent(MuxaMenuBarAgent(hosted: snap.hostedAgents[0], unread: true))
+    func image(_ cache: MuxaMenuBarGlyphCache?) -> NSImage {
+        MuxaMenuBarAgentRenderer.image(chips: [chip], positions: [0], focus: nil, pillWidth: 18,
+            lead: 0, markOpacity: 1, overflow: 0, selectedID: nil, liveIDs: [chip.id], dark: false,
+            mark: "terminal", scales: [1, 2], glyphCache: cache)
+    }
+    let cached = image(MuxaMenuBarGlyphCache()).representations.compactMap { $0 as? NSBitmapImageRep }
+    let fresh = image(nil).representations.compactMap { $0 as? NSBitmapImageRep }
+    for (a, b) in zip(cached, fresh) {
+        #expect(a.pixelsWide == b.pixelsWide && a.pixelsHigh == b.pixelsHigh)
+        var error: CGFloat = 0
+        for y in 0..<a.pixelsHigh {
+            for x in 0..<a.pixelsWide {
+                let c = try #require(a.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
+                let d = try #require(b.colorAt(x: x, y: y)?.usingColorSpace(.deviceRGB))
+                error += abs(c.alphaComponent - d.alphaComponent)
+                    + abs(c.redComponent * c.alphaComponent - d.redComponent * d.alphaComponent)
+                    + abs(c.greenComponent * c.alphaComponent - d.greenComponent * d.alphaComponent)
+                    + abs(c.blueComponent * c.alphaComponent - d.blueComponent * d.alphaComponent)
+            }
+        }
+        // Intermediate rasterization may change antialiasing on a glyph edge;
+        // the overall chip and badge must preserve the reference rendering.
+        #expect(error / CGFloat(a.pixelsWide * a.pixelsHigh * 4) < 0.015)
+    }
+}
+
+@Test @MainActor func homeProjectionRefreshesOnPolicyChangesWithoutALiveDaemon() async throws {
+    let model = AppModel()
+    model.ingestExecutionSnapshotForTesting(try menuBarSnapshot([("first", "working", "1")]))
+    NotificationCenter.default.post(name: MuxaLimitCoverage.didChange, object: nil)
+    for _ in 0..<200 where model.homeWorks.isEmpty { try await Task.sleep(for: .milliseconds(10)) }
+    #expect(model.homeWorks.flatMap(\.agents).map(\.agent.agentSessionID) == ["first"])
+    model.ingestExecutionSnapshotForTesting(try menuBarSnapshot([("second", "waiting_input", "2")]))
+    NotificationCenter.default.post(name: MuxaLimitCoverage.didChange, object: nil)
+    for _ in 0..<200 where model.homeWorks.first?.agents.first?.agent.agentSessionID != "second" {
+        try await Task.sleep(for: .milliseconds(10))
+    }
+    #expect(model.homeWorks.first?.agents.first?.agent.agentSessionID == "second")
+    #expect(model.homeWorks.first?.lane == .needsYou)
+}

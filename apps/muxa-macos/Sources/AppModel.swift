@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 enum MuxaSidebarSelection: Codable, Hashable, Sendable {
     case workBoard
@@ -108,6 +109,8 @@ final class AppModel: ObservableObject {
     }
     @Published private(set) var workGroups: [MuxaWorkGroup] = []
     @Published private(set) var hostedAgents: [MuxaHostedAgent] = []
+    /// Materialized off the main actor, once per workspace projection.
+    @Published private(set) var homeWorks: [FleetWork] = []
     @Published private(set) var workspaceRevision: UInt64 = 0
     @Published var sidebarSelection: MuxaSidebarSelection? {
         didSet {
@@ -234,6 +237,8 @@ final class AppModel: ObservableObject {
     private var pipelineEventRefreshTask: Task<Void, Never>?
     private var connectionGeneration: UInt64 = 0
     private var projectionGeneration: UInt64 = 0
+    private var projectionBuiltAt = Date.distantPast
+    private var coverageSubscription: AnyCancellable?
     private var refreshInFlight = false
     private var fleetRefreshPending = false
     private var askRefreshPending = false
@@ -286,6 +291,10 @@ final class AppModel: ObservableObject {
             }
             MuxaUserNotifications.shared.attention = attention
         }
+        coverageSubscription = NotificationCenter.default.publisher(for: MuxaLimitCoverage.didChange)
+            .sink { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.rebuildWorkspaceProjections() }
+            }
     }
 
     /// Test seam. The app ingests execution snapshots through `refresh`, which
@@ -439,7 +448,9 @@ final class AppModel: ObservableObject {
             if sessionsChanged { sessions = updated }
             if runsChanged { pipelineRuns = sortedRuns }
             if executionChanged { executionSnapshot = listedExecution }
-            if runsChanged || executionChanged { await rebuildWorkspaceProjections() }
+            if runsChanged || executionChanged || Date().timeIntervalSince(projectionBuiltAt) >= 15 {
+                await rebuildWorkspaceProjections()
+            }
             if let generation, connectionGeneration != generation { return }
             if let listedAskEntries, askEntries != listedAskEntries {
                 askEntries = listedAskEntries
@@ -768,6 +779,7 @@ final class AppModel: ObservableObject {
         projectionGeneration &+= 1
         let token = projectionGeneration, connection = connectionGeneration
         let snapshot = executionSnapshot, runs = pipelineRuns
+        let now = Date()
         let result = await Task.detached(priority: .userInitiated) {
             let agents = snapshot.hostedAgents
                 .filter { $0.agent.state != "stopped" }
@@ -779,12 +791,15 @@ final class AppModel: ObservableObject {
                     if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
                     return left.agent.agentSessionID < right.agent.agentSessionID
                 }
-            return (agents, snapshot.workGroups(pipelineRuns: runs))
+            let groups = snapshot.workGroups(pipelineRuns: runs)
+            return (agents, groups, FleetBoard.works(groups: groups, agents: agents, now: now))
         }.value
         // Another pipeline/Fleet event or reconnection may have overtaken us.
         guard token == projectionGeneration, connection == connectionGeneration else { return }
         hostedAgents = result.0
         workGroups = result.1
+        homeWorks = result.2
+        projectionBuiltAt = now
     }
 
     func createShell() {

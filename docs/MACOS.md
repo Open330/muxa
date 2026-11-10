@@ -752,3 +752,12 @@ Fleet snapshot construction indexes panes per host and then resolves only the
 matching pane ID's candidates. Matching retains the same socket precedence and
 ambiguity rules; the index is rebuilt for each snapshot, so it does not retain
 a pane target after a host's topology changes.
+
+Menu-bar glyph bitmaps are cached by glyph, quarter-point size and display
+scales, with a maximum of 96 entries. Tint is applied during compositing, so
+status changes do not create additional cache entries. Pointer movement away
+from every menu-bar band skips replicated-window frame lookup.
+
+Home reuses the work projection built by the model's detached workspace task.
+It rebuilds on execution/pipeline changes, limit-policy notifications, and the
+15-second reconciliation path so time-based limits do not remain cached.
