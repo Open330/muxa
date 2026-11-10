@@ -7,17 +7,19 @@ preferences. This script finds what a Muxa install left on this machine and
 renames it in place.
 
 It only shows what it would do unless you pass --apply. Every file it edits is
-copied first to `<file>.muxa-migrate-<timestamp>`. Run it once on every host
-that ran Muxa, after installing Tend and before starting `tendd`.
+copied first to `<file>.muxa-migrate-<timestamp>` (for a symlinked dotfile,
+the file the link points to). Run it once on every host that ran Muxa, after
+installing Tend and before starting `tendd`.
 
     python3 scripts/migrate-from-muxa.py            # show the plan
     python3 scripts/migrate-from-muxa.py --apply    # do it
 
-Standard library only; needs Python 3.8+.
+Standard library only; needs Python 3.8+ (3.11+ also validates TOML edits).
 """
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import platform
@@ -26,13 +28,22 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+try:  # Python 3.11+
+    import tomllib
+except ImportError:  # pragma: no cover
+    tomllib = None
 
 HOME = Path.home()
 MACOS = platform.system() == "Darwin"
 STAMP = time.strftime("%Y%m%d-%H%M%S")
 UID = os.getuid()
+
+OLD_SERVICE = "dev.muxa.mac.ask-provider"
+NEW_SERVICE = "dev.tend.mac.ask-provider"
 
 # --------------------------------------------------------------------------- #
 # Text transforms
@@ -43,66 +54,159 @@ FULL_PAIRS = [("MUXAD", "TENDD"), ("Muxad", "Tendd"), ("muxad", "tendd"),
 
 
 def full_rename(text: str) -> str:
-    """Every spelling of the old name. Only for text that Muxa wrote itself."""
+    """Every spelling of the old name. Only for documents Muxa authored
+    entirely (its bootstrap and skill files, its managed blocks), never for
+    user values."""
     for old, new in FULL_PAIRS:
         text = text.replace(old, new)
     return text
 
 
-# Muxa's own directory and socket names inside paths, e.g.
-# ".../Application Support/muxa/agent-integration/bootstrap.md",
-# "~/.config/muxa/config.toml", "/tmp/muxa-501.sock".
+# Directories this run moves, filled in by move_directories(): every path
+# that pointed into one of them is rewritten to the new location, wherever
+# XDG put it.
+MOVES: list[tuple[str, str]] = []
+
+# Muxa's own directory and socket names at their default locations, for
+# paths written on another machine or before an XDG change.
 PATH_FRAGMENTS = [
     (re.compile(r"(Application Support/|\.config/|\.local/share/|\.cache/|Caches/)muxa(?=/|\"|'|\s|$)"), r"\1tend"),
     (re.compile(r"\bmuxa(-\d+)?\.sock\b"), r"tend\1.sock"),
-    (re.compile(r"\bmuxa(-\d+\.sock)"), r"tend\1"),
     (re.compile(r"/tmp/muxad\.(log|err)\b"), r"/tmp/tendd.\1"),
 ]
-# The CLI and daemon as commands: a bare word not inside a path or a name.
+# The CLI and daemon as a bare command word, not part of a path or a name.
 COMMAND_WORD = re.compile(r"(?<![\w./@-])muxa(d?)(?![\w.-])")
 ENV_NAME = re.compile(r"\bMUXA_([A-Z0-9_]+)")
 TMUX_OPTION = re.compile(r"@muxa([_-])")
 
 
+def moved_paths(text: str) -> str:
+    for src, dst in MOVES:
+        variants = [(src, dst)]
+        if src.startswith(str(HOME) + "/"):
+            rel_s, rel_d = src[len(str(HOME)):], dst[len(str(HOME)):]
+            variants += [("~" + rel_s, "~" + rel_d), ("$HOME" + rel_s, "$HOME" + rel_d)]
+        for s, d in variants:
+            text = re.sub(re.escape(s) + r"(?=/|\"|'|\s|$)", lambda _m, d=d: d, text, flags=re.M)
+    return text
+
+
+def rename_executable(command: str) -> str:
+    """`muxa …`, `/opt/bin/muxa …` or `…/muxad` as the program of a command
+    line: rename the program, keep its directory and the arguments."""
+    match = re.match(r"\s*[\"']?(\S*?)[\"']?(?:\s|$)", command)
+    if not match:
+        return command
+    program = match.group(1)
+    head, slash, base = program.rpartition("/")
+    if base not in ("muxa", "muxad"):
+        return command
+    renamed = head + slash + ("tend" if base == "muxa" else "tendd")
+    return command[:match.start(1)] + renamed + command[match.end(1):]
+
+
 def surgical_rename(text: str) -> str:
-    """For files that mix Muxa's lines with the user's own (tmux.conf, shell
-    rc, CLAUDE.md): rename commands, env vars, tmux options, managed-block
-    markers and Muxa's own paths, but leave other paths (a repo checked out
-    at ~/code/muxa, say) alone. Managed blocks are renamed in full."""
+    """For files that mix Muxa's entries with the user's own: rename commands,
+    env vars, tmux options and Muxa's own paths, but leave other values (a
+    repo checked out at ~/code/muxa, a cwd, a URL) alone. Muxa's managed
+    blocks are its own text and are renamed in full."""
     out, inside = [], False
     for line in text.splitlines(keepends=True):
-        opens = ">>> muxa managed (" in line
-        closes = "<<< muxa managed (" in line
-        if opens:
+        if ">>> muxa managed (" in line:
             inside = True
         if inside:
-            line = full_rename(line)
+            # Muxa's own text, except the home directory in its absolute
+            # paths: a home or parent folder named like "muxa" keeps its name.
+            line = moved_paths(line).replace(str(HOME), "\0HOME\0")
+            line = full_rename(line).replace("\0HOME\0", str(HOME))
         else:
+            line = moved_paths(line)
             for pattern, repl in PATH_FRAGMENTS:
                 line = pattern.sub(repl, line)
             line = ENV_NAME.sub(r"TEND_\1", line)
             line = TMUX_OPTION.sub(r"@tend\1", line)
             line = COMMAND_WORD.sub(lambda m: "tend" + ("d" if m.group(1) else ""), line)
             line = line.replace("muxa-collaboration", "tend-collaboration")
-        if closes:
+        if inside and "<<< tend managed (" in line:
             inside = False
         out.append(line)
     return "".join(out)
 
 
-def json_rename_values(value, fn):
+def json_strings(value, fn):
     if isinstance(value, str):
         return fn(value)
     if isinstance(value, list):
-        return [json_rename_values(v, fn) for v in value]
+        return [json_strings(v, fn) for v in value]
     if isinstance(value, dict):
-        return {k: json_rename_values(v, fn) for k, v in value.items()}
+        return {k: json_strings(v, fn) for k, v in value.items()}
     return value
 
 
+def fix_commands(node):
+    """Hook structures: the `command` of an entry is a command line; any
+    other string only has Muxa's paths and names renamed."""
+    if isinstance(node, list):
+        return [fix_commands(v) for v in node]
+    if isinstance(node, dict):
+        return {k: (surgical_rename(rename_executable(v)) if k == "command" and isinstance(v, str)
+                    else fix_commands(v)) for k, v in node.items()}
+    if isinstance(node, str) and ("muxa" in node or "MUXA" in node):
+        return surgical_rename(node)
+    return node
+
+
 # --------------------------------------------------------------------------- #
-# Plan / apply plumbing
+# Safe writes
 # --------------------------------------------------------------------------- #
+
+def real(path: Path) -> Path:
+    """Edit what a dotfile symlink points to, keeping the link."""
+    return Path(os.path.realpath(path)) if path.is_symlink() else path
+
+
+@contextlib.contextmanager
+def owner_lock(path: Path):
+    """Claude Code guards `.claude.json` with proper-lockfile: a `<file>.lock`
+    directory, stale after 10 s. Take the same lock while editing it, as
+    `tend init` does."""
+    if path.name != ".claude.json" or not path.parent.is_dir():
+        yield
+        return
+    lock = path.with_name(".claude.json.lock")
+    deadline = time.time() + 5
+    while True:
+        try:
+            lock.mkdir()
+            break
+        except FileExistsError:
+            with contextlib.suppress(OSError):
+                if time.time() - lock.stat().st_mtime > 10:
+                    lock.rmdir()
+                    continue
+            if time.time() > deadline:
+                raise RuntimeError(f"{path} is locked by Claude Code; run the script again")
+            time.sleep(0.1)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            lock.rmdir()
+
+
+def atomic_write(path: Path, text: str):
+    mode = path.stat().st_mode & 0o7777 if path.exists() else 0o600
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=f".{path.name}.tend-migrate-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
 
 class Migration:
     def __init__(self, apply: bool, verbose: bool):
@@ -118,48 +222,74 @@ class Migration:
     def note(self, what: str):
         self.notes.append(what)
 
-    def backup(self, path: Path):
-        if path.is_file() and not path.is_symlink():
-            shutil.copy2(path, path.with_name(f"{path.name}.muxa-migrate-{STAMP}"))
-
-    def rewrite(self, path: Path, transform, label: str | None = None):
-        """Rewrite one text file with `transform`; skip if unchanged."""
-        if not path.is_file():
+    def edit(self, path: Path, transform, validate=None):
+        """Read, transform and write one text file safely: the symlink
+        target, Claude Code's lock, a check that nobody wrote it meanwhile,
+        a backup, and an atomic replace that keeps the file mode."""
+        target = real(path)
+        if not target.is_file():
             return
         try:
-            old = path.read_text(encoding="utf-8")
+            with owner_lock(target):
+                old = target.read_text(encoding="utf-8")
+                new = transform(old)
+                if new == old:
+                    return
+                if validate and not validate(new):
+                    self.note(f"{path}: the renamed file would not parse, so it was left unchanged. Edit it by hand.")
+                    return
+                self.step(f"rewrite {path}" + (f" (→ {target})" if target != path else ""))
+                if self.verbose:
+                    for a, b in zip(old.splitlines(), new.splitlines()):
+                        if a != b:
+                            print(f"      - {a.strip()[:110]}\n      + {b.strip()[:110]}")
+                if not self.apply:
+                    return
+                if target.read_text(encoding="utf-8") != old:
+                    self.note(f"{path} changed while migrating; run the script again.")
+                    return
+                shutil.copy2(target, target.with_name(f"{target.name}.muxa-migrate-{STAMP}"))
+                atomic_write(target, new)
         except (UnicodeDecodeError, PermissionError):
             return
-        new = transform(old)
-        if new == old:
-            return
-        self.step(f"rewrite {label or path}")
-        if self.verbose:
-            for a, b in zip(old.splitlines(), new.splitlines()):
-                if a != b:
-                    print(f"      - {a.strip()[:110]}\n      + {b.strip()[:110]}")
-        if self.apply:
-            self.backup(path)
-            path.write_text(new, encoding="utf-8")
+        except RuntimeError as err:
+            self.note(str(err))
 
-    def move(self, src: Path, dst: Path, rename_inside: bool = False):
+    def edit_json(self, path: Path, transform):
+        def text_transform(text: str) -> str:
+            try:
+                data = json.loads(text)
+            except json.JSONDecodeError:
+                self.note(f"{path} is not valid JSON; check it by hand for muxa entries.")
+                return text
+            new = transform(json.loads(text))
+            return text if new == data else json.dumps(new, indent=2, ensure_ascii=False) + "\n"
+        self.edit(path, text_transform)
+
+    def move(self, src: Path, dst: Path):
         if not src.exists() and not src.is_symlink():
             return
-        if dst.exists():
-            if any(dst.iterdir()) if dst.is_dir() else True:
-                self.note(f"{dst} already exists, so {src} was left in place. Merge them by hand.")
-                return
-            if self.apply:
-                dst.rmdir()
+        if dst.exists() and (not dst.is_dir() or any(dst.iterdir())):
+            self.note(f"{dst} already exists, so {src} was left in place. Merge them by hand.")
+            return
+        MOVES.append((str(src), str(dst)))
         self.step(f"move {src} → {dst}")
         if self.apply:
+            if dst.exists():
+                dst.rmdir()
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
 
-    def run(self, cmd: list[str], label: str, check: bool = False):
+    def run(self, cmd: list[str], label: str):
         self.step(label)
         if self.apply:
-            subprocess.run(cmd, check=check, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def remove(self, path: Path, label: str):
+        self.step(label)
+        if self.apply:
+            shutil.copy2(path, path.with_name(f"{path.name}.muxa-migrate-{STAMP}"))
+            path.unlink()
 
 
 def capture(cmd: list[str]) -> str:
@@ -178,6 +308,16 @@ def xdg(var: str, default: Path) -> Path:
     return Path(value) if value and os.path.isabs(value) else default
 
 
+def valid_toml(text: str) -> bool:
+    if tomllib is None:
+        return True
+    try:
+        tomllib.loads(text)
+        return True
+    except tomllib.TOMLDecodeError:
+        return False
+
+
 # --------------------------------------------------------------------------- #
 # Steps
 # --------------------------------------------------------------------------- #
@@ -186,28 +326,22 @@ def stop_services(m: Migration):
     print("\nServices")
     if MACOS:
         agents = HOME / "Library/LaunchAgents"
+        loaded = capture(["launchctl", "list"])
         for label in ("dev.open330.muxad", "dev.open330.muxa-restore"):
-            plist = agents / f"{label}.plist"
-            loaded = label in capture(["launchctl", "list"])
-            if loaded:
+            if label in loaded:
                 m.run(["launchctl", "bootout", f"gui/{UID}/{label}"], f"stop launchd job {label}")
+            plist = agents / f"{label}.plist"
             if plist.exists():
-                m.step(f"remove {plist} (tend init installs dev.open330.tendd)")
-                if m.apply:
-                    m.backup(plist)
-                    plist.unlink()
+                m.remove(plist, f"remove {plist} (tend init installs the Tend one)")
     if have("systemctl"):
         for unit in ("muxad.service", "muxa-restore.service"):
-            if capture(["systemctl", "--user", "list-unit-files", unit]).count(unit):
+            if unit in capture(["systemctl", "--user", "list-unit-files", unit]):
                 m.run(["systemctl", "--user", "disable", "--now", unit], f"disable systemd unit {unit}")
         for base in (xdg("XDG_DATA_HOME", HOME / ".local/share"), xdg("XDG_CONFIG_HOME", HOME / ".config")):
             for unit in ("muxad.service", "muxa-restore.service"):
                 path = base / "systemd/user" / unit
                 if path.exists():
-                    m.step(f"remove {path}")
-                    if m.apply:
-                        m.backup(path)
-                        path.unlink()
+                    m.remove(path, f"remove {path}")
     if have("brew") and "muxa" in capture(["brew", "services", "list"]).split():
         m.run(["brew", "services", "stop", "muxa"], "stop brew service muxa")
     if capture(["pgrep", "-x", "muxad"]).strip():
@@ -215,29 +349,27 @@ def stop_services(m: Migration):
 
 
 def move_directories(m: Migration) -> list[Path]:
-    """Returns Tend's directories after the move (for later rewrites)."""
     print("\nDirectories")
     if MACOS:
         support = HOME / "Library/Application Support"
-        pairs = [(xdg("XDG_DATA_HOME", support) / "muxa", xdg("XDG_DATA_HOME", support) / "tend"),
-                 (HOME / "Library/Caches/muxa", HOME / "Library/Caches/tend")]
-        cfg = xdg("XDG_CONFIG_HOME", support)
-        if cfg != xdg("XDG_DATA_HOME", support):
+        data, cfg = xdg("XDG_DATA_HOME", support), xdg("XDG_CONFIG_HOME", support)
+        pairs = [(data / "muxa", data / "tend"), (HOME / "Library/Caches/muxa", HOME / "Library/Caches/tend")]
+        if cfg != data:
             pairs.append((cfg / "muxa", cfg / "tend"))
     else:
-        pairs = [(xdg("XDG_DATA_HOME", HOME / ".local/share") / "muxa", xdg("XDG_DATA_HOME", HOME / ".local/share") / "tend"),
-                 (xdg("XDG_CONFIG_HOME", HOME / ".config") / "muxa", xdg("XDG_CONFIG_HOME", HOME / ".config") / "tend"),
-                 (xdg("XDG_CACHE_HOME", HOME / ".cache") / "muxa", xdg("XDG_CACHE_HOME", HOME / ".cache") / "tend")]
+        pairs = [(xdg(v, d) / "muxa", xdg(v, d) / "tend") for v, d in (
+            ("XDG_DATA_HOME", HOME / ".local/share"),
+            ("XDG_CONFIG_HOME", HOME / ".config"),
+            ("XDG_CACHE_HOME", HOME / ".cache"))]
     for src, dst in pairs:
         m.move(src, dst)
     return [dst for _, dst in pairs]
 
 
 def rewrite_own_files(m: Migration, dirs: list[Path]):
-    """Files Muxa wrote inside its own directories: rename everything."""
     print("\nTend's own files")
     for base in dirs:
-        # When only planning, the directory has not moved yet: look at the source.
+        # When only planning, nothing has moved yet: read the source.
         look = base if base.exists() else base.with_name("muxa")
         if not look.exists():
             continue
@@ -247,14 +379,17 @@ def rewrite_own_files(m: Migration, dirs: list[Path]):
             m.step(f"rename {old_skill.name} → tend-collaboration in {bundle}")
             if m.apply:
                 old_skill.rename(bundle / "skills/tend-collaboration")
-        for name in ("config.toml", "agent-integration/manifest.json", "agent-integration/bootstrap.md"):
-            m.rewrite(look / name, full_rename)
-        for path in sorted((bundle / "skills").rglob("*.md")) if (bundle / "skills").exists() else []:
-            m.rewrite(path, full_rename)
-        agents = look / "agents"
-        if agents.exists():
-            for path in agents.glob("*.toml"):
-                m.rewrite(path, surgical_rename)
+        # config.toml and agent definitions hold user values (cwd, commands,
+        # fleet destinations): rename only Muxa's own entries in them.
+        m.edit(look / "config.toml", surgical_rename, validate=valid_toml)
+        for path in sorted((look / "agents").glob("*.toml")) if (look / "agents").exists() else []:
+            m.edit(path, surgical_rename, validate=valid_toml)
+        m.edit_json(bundle / "manifest.json", lambda d: json_strings(d, surgical_rename))
+        # The bootstrap and skill documents are Muxa's text throughout.
+        m.edit(bundle / "bootstrap.md", full_rename)
+        skills = bundle / "skills"
+        for path in sorted(skills.rglob("*.md")) if skills.exists() else []:
+            m.edit(path, full_rename)
 
 
 def claude_homes(extra: list[str]) -> list[Path]:
@@ -264,125 +399,125 @@ def claude_homes(extra: list[str]) -> list[Path]:
     homes += [Path(p).expanduser() for p in extra]
     seen, out = set(), []
     for h in homes:
-        if h.resolve() not in seen and h.exists():
+        if h.exists() and h.resolve() not in seen:
             seen.add(h.resolve())
             out.append(h)
     return out
 
 
-def rewrite_json(m: Migration, path: Path, transform):
-    if not path.is_file():
-        return
-    try:
-        old = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        m.note(f"{path} is not valid JSON; check it by hand for muxa entries.")
-        return
-    new = transform(json.loads(json.dumps(old)))
-    if new == old:
-        return
-    m.step(f"rewrite {path}")
-    if m.apply:
-        m.backup(path)
-        path.write_text(json.dumps(new, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-
-
-def hook_command(cmd: str) -> str:
-    cmd = re.sub(r"(?<![\w./-])muxa( hook\b)", r"tend\1", cmd)
-    return surgical_rename(cmd)
-
-
-def fix_hooks(node):
-    """Rename `muxa hook …` commands anywhere in a hooks structure."""
-    return json_rename_values(node, lambda s: hook_command(s) if "muxa" in s else s)
-
-
-def fix_mcp_servers(servers: dict) -> dict:
+def fix_mcp_servers(m: Migration, where: Path, servers):
     if not isinstance(servers, dict) or "muxa" not in servers:
         return servers
-    entry = json_rename_values(servers.pop("muxa"), surgical_rename)
-    if isinstance(entry, dict) and isinstance(entry.get("env"), dict):
-        entry["env"] = {ENV_NAME.sub(r"TEND_\1", k): v for k, v in entry["env"].items()}
-    servers.setdefault("tend", entry)
+    if "tend" in servers:
+        m.note(f"{where} already has an MCP server named tend; its muxa entry was left in place. Remove it once tend works.")
+        return servers
+    entry = servers.pop("muxa")
+    if isinstance(entry, dict):
+        entry = {k: (surgical_rename(rename_executable(v)) if k == "command" and isinstance(v, str)
+                     else json_strings(v, surgical_rename)) for k, v in entry.items()}
+        if isinstance(entry.get("env"), dict):
+            entry["env"] = {ENV_NAME.sub(r"TEND_\1", k): v for k, v in entry["env"].items()}
+    servers["tend"] = entry
     return servers
+
+
+def migrate_codex_toml(m: Migration, path: Path):
+    def transform(text: str) -> str:
+        has_tend = re.search(r"^\s*\[mcp_servers\.tend\]", text, re.M) is not None
+        out, kept_old = [], False
+        for chunk in re.split(r"(?m)^(?=\s*\[)", text):
+            header = chunk.lstrip().split("\n", 1)[0]
+            if re.match(r"\[mcp_servers\.muxa(\]|\.)", header):
+                if has_tend:
+                    kept_old = True
+                    out.append(chunk)  # both exist: leave the old server for the user
+                    continue
+                chunk = re.sub(r"\[mcp_servers\.muxa(\]|\.)", r"[mcp_servers.tend\1", chunk, count=1)
+            chunk = re.sub(r'(\bcommand\s*=\s*")([^"]*)(")',
+                           lambda mm: mm.group(1) + rename_executable(mm.group(2)) + mm.group(3), chunk)
+            out.append(surgical_rename(chunk))
+        if kept_old:
+            m.note(f"{path} already has [mcp_servers.tend]; [mcp_servers.muxa] was left in place. Remove it once tend works.")
+        return "".join(out)
+    m.edit(path, transform, validate=valid_toml)
 
 
 def migrate_agents(m: Migration, extra_claude: list[str]):
     print("\nAgent integrations")
-    for home in claude_homes(extra_claude):
-        rewrite_json(m, home / "settings.json", lambda d: {**d, **({"hooks": fix_hooks(d["hooks"])} if "hooks" in d else {}),
-                                                         **({"statusLine": fix_hooks(d["statusLine"])} if "statusLine" in d else {})})
-        m.rewrite(home / "CLAUDE.md", surgical_rename)
+    homes = claude_homes(extra_claude)
+    for home in homes:
+        def fix_settings(d):
+            for key in ("hooks", "statusLine"):
+                if key in d:
+                    d[key] = fix_commands(d[key])
+            return d
+        m.edit_json(home / "settings.json", fix_settings)
+        m.edit(home / "CLAUDE.md", surgical_rename)
         migrate_skill_link(m, home / "skills")
-    for claude_json in {HOME / ".claude.json", *[h / ".claude.json" for h in claude_homes(extra_claude)]}:
-        def fix(d):
+    for claude_json in dict.fromkeys([HOME / ".claude.json", *[h / ".claude.json" for h in homes]]):
+        def fix(d, where=claude_json):
             if "mcpServers" in d:
-                d["mcpServers"] = fix_mcp_servers(d["mcpServers"])
+                d["mcpServers"] = fix_mcp_servers(m, where, d["mcpServers"])
             for proj in (d.get("projects") or {}).values():
                 if isinstance(proj, dict) and "mcpServers" in proj:
-                    proj["mcpServers"] = fix_mcp_servers(proj["mcpServers"])
+                    proj["mcpServers"] = fix_mcp_servers(m, where, proj["mcpServers"])
             return d
-        rewrite_json(m, claude_json, fix)
+        m.edit_json(claude_json, fix)
 
     codex = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
-    def fix_codex_toml(text: str) -> str:
-        text = re.sub(r"\[mcp_servers\.muxa(\]|\.)", r"[mcp_servers.tend\1", text)
-        return surgical_rename(text)
-    m.rewrite(codex / "config.toml", fix_codex_toml)
+    migrate_codex_toml(m, codex / "config.toml")
     for name in ("AGENTS.md", "AGENTS.override.md"):
-        m.rewrite(codex / name, surgical_rename)
+        m.edit(codex / name, surgical_rename)
     migrate_skill_link(m, HOME / ".agents/skills")
 
-    rewrite_json(m, HOME / ".gemini/settings.json", lambda d: {**d, **({"hooks": fix_hooks(d["hooks"])} if "hooks" in d else {})})
+    m.edit_json(HOME / ".gemini/settings.json",
+                lambda d: {**d, **({"hooks": fix_commands(d["hooks"])} if "hooks" in d else {})})
+
     def fix_agy(d):
         if isinstance(d, dict) and "muxa" in d:
-            d.setdefault("tend", fix_hooks(d.pop("muxa")))
+            if "tend" in d:
+                m.note(f"{HOME / '.gemini/config/hooks.json'} already has tend hooks; its muxa hooks were left in place.")
+            else:
+                d["tend"] = fix_commands(d.pop("muxa"))
         return d
-    rewrite_json(m, HOME / ".gemini/config/hooks.json", fix_agy)
+    m.edit_json(HOME / ".gemini/config/hooks.json", fix_agy)
 
-    opencode = (HOME / "Library/Application Support" if MACOS else xdg("XDG_CONFIG_HOME", HOME / ".config")) / "opencode/plugins"
-    old_plugin = opencode / "muxa.ts"
+    plugins = (HOME / "Library/Application Support" if MACOS else xdg("XDG_CONFIG_HOME", HOME / ".config")) / "opencode/plugins"
+    old_plugin, new_plugin = plugins / "muxa.ts", plugins / "tend.ts"
     if old_plugin.exists():
-        m.step(f"move {old_plugin} → tend.ts")
-        if m.apply:
-            m.backup(old_plugin)
-            new_plugin = opencode / "tend.ts"
-            new_plugin.write_text(full_rename(old_plugin.read_text(encoding="utf-8")), encoding="utf-8")
-            old_plugin.unlink()
+        if new_plugin.exists():
+            m.note(f"{new_plugin} already exists, so {old_plugin} was left in place. Delete it once tend works.")
+        else:
+            m.step(f"move {old_plugin} → {new_plugin.name}")
+            if m.apply:
+                atomic_write(new_plugin, full_rename(old_plugin.read_text(encoding="utf-8")))
+                old_plugin.rename(old_plugin.with_name(f"muxa.ts.muxa-migrate-{STAMP}"))
 
 
 def migrate_skill_link(m: Migration, skills_dir: Path):
     old = skills_dir / "muxa-collaboration"
-    if not old.is_symlink() and not old.exists():
+    if not old.is_symlink():
+        if old.exists():
+            m.note(f"{old} is a real directory, not Muxa's symlink; left in place.")
         return
-    target = os.readlink(old) if old.is_symlink() else None
     new = skills_dir / "tend-collaboration"
-    if target:
-        new_target = surgical_rename(target).replace("muxa-collaboration", "tend-collaboration")
-        m.step(f"relink {new} → {new_target}")
-        if m.apply:
-            old.unlink()
-            if not new.exists() and not new.is_symlink():
-                new.symlink_to(new_target)
-    else:
-        m.note(f"{old} is a real directory, not Muxa's symlink; left in place.")
+    if new.exists() or new.is_symlink():
+        m.note(f"{new} already exists; remove the old {old} link once tend works.")
+        return
+    target = surgical_rename(os.readlink(old)).replace("muxa-collaboration", "tend-collaboration")
+    m.step(f"relink {new} → {target}")
+    if m.apply:
+        new.symlink_to(target)
+        old.unlink()
 
 
 def migrate_shell_and_tmux(m: Migration):
     print("\nShell and tmux configuration")
-    for rc in (HOME / ".zshrc", HOME / ".bashrc", HOME / ".bash_profile", HOME / ".profile",
-               HOME / ".config/fish/config.fish", HOME / ".zprofile", HOME / ".zshenv"):
-        m.rewrite(rc, surgical_rename)
+    for rc in (HOME / ".zshrc", HOME / ".zprofile", HOME / ".zshenv", HOME / ".bashrc", HOME / ".bash_profile",
+               HOME / ".profile", HOME / ".config/fish/config.fish"):
+        m.edit(rc, surgical_rename)
     for conf in (HOME / ".tmux.conf", xdg("XDG_CONFIG_HOME", HOME / ".config") / "tmux/tmux.conf", HOME / ".rmux.conf"):
-        m.rewrite(conf, surgical_rename)
-
-
-def tmux_servers() -> list[list[str]]:
-    servers = [["tmux"]]
-    for var in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET"):
-        if os.environ.get(var):
-            servers.append(["tmux", "-S", os.environ[var]])
-    return servers
+        m.edit(conf, surgical_rename)
 
 
 def migrate_live_tmux(m: Migration):
@@ -391,42 +526,38 @@ def migrate_live_tmux(m: Migration):
     print("\nLive tmux options")
     if not have("tmux"):
         return
-    for tmux in tmux_servers():
-        if not capture(tmux + ["list-sessions", "-F", "#{session_id}"]).strip():
-            continue
+    servers = [["tmux"]] + [["tmux", "-S", os.environ[v]] for v in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET") if os.environ.get(v)]
+    for tmux in servers:
         sessions = capture(tmux + ["list-sessions", "-F", "#{session_id}"]).split()
+        if not sessions:
+            continue
         windows = capture(tmux + ["list-windows", "-a", "-F", "#{window_id}"]).split()
         panes = capture(tmux + ["list-panes", "-a", "-F", "#{pane_id}"]).split()
-        targets = [("", t) for t in sessions] + [("-w", t) for t in windows] + [("-p", t) for t in panes]
-        count = 0
+        targets = [([], t) for t in sessions] + [(["-w"], t) for t in windows] + [(["-p"], t) for t in panes]
+        found = []
         for scope, target in targets:
-            args = [a for a in (scope,) if a]
-            listing = capture(tmux + ["show-options"] + args + ["-t", target])
-            for line in listing.splitlines():
+            for line in capture(tmux + ["show-options"] + scope + ["-t", target]).splitlines():
                 name = line.split(" ", 1)[0]
-                if not (name.startswith("@muxa_") or name.startswith("@muxa-")):
-                    continue
-                value = capture(tmux + ["show-options"] + args + ["-qv", "-t", target, name]).rstrip("\n")
-                new_name = TMUX_OPTION.sub(r"@tend\1", name)
-                count += 1
-                if m.apply:
-                    subprocess.run(tmux + ["set-option"] + args + ["-t", target, new_name, value], capture_output=True)
-                    subprocess.run(tmux + ["set-option"] + args + ["-u", "-t", target, name], capture_output=True)
-        env = capture(tmux + ["show-environment", "-g"])
-        sock = re.search(r"^MUXA_SOCKET=(.*)$", env, re.M)
-        if count:
-            m.step(f"{' '.join(tmux)}: rename {count} @muxa_* options to @tend_*")
-        if sock:
-            m.step(f"{' '.join(tmux)}: TEND_SOCKET={surgical_rename(sock.group(1))} in the global environment")
+                if name.startswith(("@muxa_", "@muxa-")):
+                    found.append((scope, target, name))
+        if found:
+            m.step(f"{' '.join(tmux)}: rename {len(found)} @muxa_* options to @tend_*")
             if m.apply:
-                subprocess.run(tmux + ["set-environment", "-g", "TEND_SOCKET", surgical_rename(sock.group(1))], capture_output=True)
+                for scope, target, name in found:
+                    value = capture(tmux + ["show-options"] + scope + ["-qv", "-t", target, name]).rstrip("\n")
+                    new_name = TMUX_OPTION.sub(r"@tend\1", name)
+                    subprocess.run(tmux + ["set-option"] + scope + ["-t", target, new_name, value], capture_output=True)
+                    subprocess.run(tmux + ["set-option"] + scope + ["-u", "-t", target, name], capture_output=True)
+        sock = re.search(r"^MUXA_SOCKET=(.*)$", capture(tmux + ["show-environment", "-g"]), re.M)
+        if sock:
+            value = surgical_rename(sock.group(1))
+            m.step(f"{' '.join(tmux)}: TEND_SOCKET={value} in the global environment")
+            if m.apply:
+                subprocess.run(tmux + ["set-environment", "-g", "TEND_SOCKET", value], capture_output=True)
                 subprocess.run(tmux + ["set-environment", "-gu", "MUXA_SOCKET"], capture_output=True)
 
 
-PREF_KEY_RENAMES = [(re.compile(r"^muxa\."), "tend."), (re.compile(r"^Muxa"), "Tend")]
-
-
-def migrate_macos_app(m: Migration):
+def migrate_macos_app(m: Migration, keychain: str | None):
     if not MACOS:
         return
     print("\nmacOS app")
@@ -437,59 +568,72 @@ def migrate_macos_app(m: Migration):
         merged = plistlib.loads(current.stdout) if current.returncode == 0 and current.stdout else {}
         added = 0
         for key, value in old.items():
-            new_key = key
-            for pattern, repl in PREF_KEY_RENAMES:
-                new_key = pattern.sub(repl, new_key)
+            new_key = re.sub(r"^Muxa", "Tend", re.sub(r"^muxa\.", "tend.", key))
             if new_key not in merged:
                 merged[new_key] = value
                 added += 1
         if added:
             m.step(f"copy {added} preferences from dev.muxa.mac to dev.tend.mac")
             if m.apply:
-                tmp = Path(os.environ.get("TMPDIR", "/tmp")) / f"tend-prefs-{os.getpid()}.plist"
-                tmp.write_bytes(plistlib.dumps(merged))
-                subprocess.run(["defaults", "import", "dev.tend.mac", str(tmp)], check=True)
-                tmp.unlink()
-    migrate_keychain(m)
+                with tempfile.NamedTemporaryFile(suffix=".plist", delete=False) as fh:
+                    fh.write(plistlib.dumps(merged))
+                subprocess.run(["defaults", "import", "dev.tend.mac", fh.name], check=True)
+                os.unlink(fh.name)
+    migrate_keychain(m, keychain)
     for app in (Path("/Applications/Muxa.app"), HOME / "Applications/Muxa.app"):
         if app.exists():
             m.note(f"{app} is still installed. Quit it and move it to the Trash once Tend.app works.")
 
 
-def migrate_keychain(m: Migration):
-    """Ask provider API keys: copy dev.muxa.mac.ask-provider items to
-    dev.tend.mac.ask-provider. macOS asks once per key to allow the read."""
-    dump = capture(["security", "dump-keychain"])
-    accounts, current = set(), {}
-    for line in dump.splitlines():
+def keychain_accounts(service: str, keychain: str | None) -> set[str]:
+    dump = capture(["security", "dump-keychain"] + ([keychain] if keychain else []))
+    accounts, item = set(), {}
+    for line in dump.splitlines() + ["keychain: end"]:
         if line.startswith("keychain:"):
-            if current.get("svce") == "dev.muxa.mac.ask-provider" and current.get("acct"):
-                accounts.add(current["acct"])
-            current = {}
-        match = re.search(r'"(acct|svce)"<blob>="([^"]*)"', line)
-        if match:
-            current[match.group(1)] = match.group(2)
-    if current.get("svce") == "dev.muxa.mac.ask-provider" and current.get("acct"):
-        accounts.add(current["acct"])
-    for account in sorted(accounts):
-        m.step(f"copy Ask API key {account} to the dev.tend.mac.ask-provider keychain service")
-        if m.apply:
-            secret = subprocess.run(["security", "find-generic-password", "-s", "dev.muxa.mac.ask-provider",
-                                     "-a", account, "-w"], capture_output=True, text=True)
-            if secret.returncode != 0:
-                m.note(f"Could not read the {account} key; enter it again in Tend › Settings › Ask.")
-                continue
-            subprocess.run(["security", "add-generic-password", "-U", "-s", "dev.tend.mac.ask-provider",
-                            "-a", account, "-w", secret.stdout.rstrip("\n")], capture_output=True)
+            if item.get("svce") == service and item.get("acct"):
+                accounts.add(item["acct"])
+            item = {}
+        found = re.search(r'"(acct|svce)"<blob>="([^"]*)"', line)
+        if found:
+            item[found.group(1)] = found.group(2)
+    return accounts
+
+
+def security_quote(value: str) -> str:
+    return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def migrate_keychain(m: Migration, keychain: str | None):
+    """Ask provider API keys move from dev.muxa.mac.ask-provider to
+    dev.tend.mac.ask-provider. A key already saved under Tend wins. The
+    secret goes to `security -i` on stdin, never on a command line."""
+    kc = [keychain] if keychain else []
+    existing = keychain_accounts(NEW_SERVICE, keychain)
+    for account in sorted(keychain_accounts(OLD_SERVICE, keychain)):
+        if account in existing:
+            continue  # Tend already has its own key for this provider
+        m.step(f"copy Ask API key {account} to the {NEW_SERVICE} keychain service")
+        if not m.apply:
+            continue
+        secret = subprocess.run(["security", "find-generic-password", "-s", OLD_SERVICE, "-a", account, "-w"] + kc,
+                                capture_output=True, text=True)
+        if secret.returncode != 0:
+            m.note(f"Could not read the {account} key; enter it again in Tend › Settings › Ask.")
+            continue
+        command = " ".join(["add-generic-password", "-s", security_quote(NEW_SERVICE), "-a", security_quote(account),
+                            "-w", security_quote(secret.stdout.rstrip("\n"))] + [security_quote(k) for k in kc]) + "\n"
+        added = subprocess.run(["security", "-i"], input=command, capture_output=True, text=True)
+        if added.returncode != 0 or account not in keychain_accounts(NEW_SERVICE, keychain):
+            m.note(f"Could not save the {account} key under Tend; enter it again in Tend › Settings › Ask.")
 
 
 def report_leftovers(m: Migration):
-    print("\nBinaries")
     for name in ("muxa", "muxad"):
         path = shutil.which(name)
         if path:
-            m.note(f"{path} is still on PATH. Remove it once Tend works "
-                   f"({'brew uninstall muxa' if '/Cellar/' in os.path.realpath(path) or 'homebrew' in path else 'cargo uninstall muxa-cli muxad, or delete the file'}).")
+            how = ("brew uninstall muxa" if "Cellar" in os.path.realpath(path) or "homebrew" in path
+                   else "cargo uninstall muxa-cli muxad, or delete the file")
+            m.note(f"{path} is still on PATH. Remove it once Tend works ({how}).")
     if not shutil.which("tend"):
         m.note("`tend` is not on PATH yet. Install it first: brew install open330/tap/tend")
     env = sorted(k for k in os.environ if k.startswith("MUXA_"))
@@ -507,10 +651,16 @@ def main() -> int:
     parser.add_argument("--only-files", action="store_true",
                         help="only move directories and rewrite files; leave services, live tmux, "
                              "macOS preferences and the keychain alone")
+    parser.add_argument("--keychain", metavar="PATH", help=argparse.SUPPRESS)  # tests use a scratch keychain
+    parser.add_argument("--only-keychain", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     m = Migration(apply=args.apply, verbose=args.verbose)
     print("Migrating Muxa → Tend" + ("" if args.apply else " (plan only; pass --apply to make these changes)"))
+    if args.only_keychain:
+        migrate_keychain(m, args.keychain)
+        print(f"{m.done} keychain changes" + ("" if args.apply else " planned"))
+        return 0
     if not args.only_files:
         stop_services(m)
     dirs = move_directories(m)
@@ -520,7 +670,7 @@ def main() -> int:
     if not (args.skip_tmux or args.only_files):
         migrate_live_tmux(m)
     if not args.only_files:
-        migrate_macos_app(m)
+        migrate_macos_app(m, args.keychain)
     report_leftovers(m)
 
     print()

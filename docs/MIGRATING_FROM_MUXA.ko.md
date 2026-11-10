@@ -50,15 +50,19 @@ Muxa를 돌리던 호스트마다 실행하세요. Python이 없는 호스트는
 
 - `muxad`와 그 launchd 작업, systemd 유닛, brew 서비스를 멈추고 옛 유닛 파일을 지웁니다.
 - Muxa의 데이터, 설정, 캐시 폴더를 `tend`로 옮깁니다. `tend` 폴더가 이미 있으면 둘 다 그대로 두고 알려 줍니다.
-- Muxa가 직접 만든 파일은 이름을 전부 바꿉니다: `config.toml`, 사용자 에이전트 정의,
-  에이전트 연동 번들(`bootstrap.md`, `manifest.json`, 협업 스킬).
-- 다른 도구의 설정에서는 Muxa가 쓴 부분만 바꿉니다: 훅 명령, MCP 서버 항목, 관리 블록,
-  `MUXA_*` 변수, `@muxa_*` 옵션, Muxa의 경로. `~/code/muxa`에 받아 둔 저장소 경로는 그대로 둡니다.
+- 에이전트 연동 번들(`bootstrap.md`, 협업 스킬)은 이름을 전부 바꿉니다. `config.toml`, 사용자 에이전트 정의,
+  다른 도구의 설정에서는 Muxa가 쓴 부분만 바꿉니다: 훅 명령(절대 경로 `/opt/bin/muxa` 포함), MCP 서버 항목,
+  관리 블록, `MUXA_*` 변수, `@muxa_*` 옵션, 옮긴 폴더를 가리키는 경로. 사용자가 넣은 값은 그대로 둡니다:
+  `~/code/muxa`의 `cwd`나 저장소, URL, 프로젝트 신뢰 항목.
+- Tend 쪽 항목이 이미 있으면 둘 다 그대로 두고 알려 줍니다: `tend`라는 MCP 서버, Codex의 `[mcp_servers.tend]`,
+  `tend.ts`, `tend-collaboration` 링크, 키체인의 Tend 키.
+- `.claude.json`은 Claude Code의 잠금을 잡고 고치고, 심볼릭 링크로 된 dotfile은 링크를 유지한 채 대상 파일을
+  고치며, 고친 뒤 읽을 수 없게 되는 Codex 설정이나 `config.toml`은 쓰지 않습니다.
 - Claude Code와 Codex의 `tend-collaboration` 스킬 링크를 다시 겁니다.
 - 실행 중인 tmux 세션, 창, pane의 `@muxa_*` 옵션을 `@tend_*`로 복사해, 이미 돌고 있는 Work가 정체성을 유지하게 합니다.
 - macOS: 앱 설정을 `dev.muxa.mac`에서 `dev.tend.mac`으로, Ask 공급자 API 키를
   `dev.muxa.mac.ask-provider` 키체인 서비스에서 `dev.tend.mac.ask-provider`로 복사합니다.
-  키마다 macOS가 읽기 허락을 한 번 묻습니다.
+  키는 명령 인자가 아니라 표준 입력으로 `security`에 넘깁니다. 키마다 macOS가 읽기 허락을 한 번 묻습니다.
 
 고치는 파일은 먼저 `<파일>.muxa-migrate-<시각>`으로 복사해 둡니다. 성공한 뒤 다시 실행하면 할 일이 없다고 나옵니다.
 

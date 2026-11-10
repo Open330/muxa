@@ -53,18 +53,27 @@ to a host that has it, or follow the table above by hand.
 - Stops `muxad` and its launchd job, systemd unit or brew service, and removes the old unit files.
 - Moves Muxa's data, config and cache directories to `tend`. If a `tend`
   directory already exists, it leaves both in place and tells you.
-- Renames Muxa's own files in full: `config.toml`, user agent definitions,
-  and the agent integration bundle (`bootstrap.md`, `manifest.json`, the collaboration skill).
-- In other tools' config it changes only what Muxa wrote: hook commands,
-  the MCP server entry, managed blocks, `MUXA_*` variables, `@muxa_*`
-  options and Muxa's own paths. A repository checked out at `~/code/muxa`
-  keeps its path.
+- Renames the agent integration bundle (`bootstrap.md`, the collaboration
+  skill) in full. In `config.toml`, user agent definitions and every other
+  tool's config it changes only what Muxa wrote: hook commands (including an
+  absolute `/opt/bin/muxa`), the MCP server entry, managed blocks, `MUXA_*`
+  variables, `@muxa_*` options and paths into the directories it moved.
+  Your own values keep their spelling: a `cwd` or repository at
+  `~/code/muxa`, a URL, a project trust entry.
+- Leaves both entries in place and tells you when Tend's already exists:
+  an MCP server named `tend`, `[mcp_servers.tend]` in Codex, `tend.ts`, a
+  `tend-collaboration` link, or a Tend key in the keychain.
+- Edits `.claude.json` under Claude Code's own lock, edits the file a
+  symlinked dotfile points to (keeping the link), and refuses to write a
+  Codex config or `config.toml` that would no longer parse.
 - Relinks the `tend-collaboration` skill for Claude Code and Codex.
 - Copies `@muxa_*` options on running tmux sessions, windows and panes to
   `@tend_*`, so Work that is already running keeps its identity.
 - macOS: copies app preferences from `dev.muxa.mac` to `dev.tend.mac`, and
   Ask provider API keys from the `dev.muxa.mac.ask-provider` keychain
-  service to `dev.tend.mac.ask-provider`. macOS asks once per key to allow the read.
+  service to `dev.tend.mac.ask-provider`. The key is handed to `security`
+  on standard input, never on a command line. macOS asks once per key to
+  allow the read.
 
 Every edited file is first copied to `<file>.muxa-migrate-<timestamp>`.
 Running the script again after a successful run finds nothing to do.
