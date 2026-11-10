@@ -122,7 +122,11 @@ def config_toml(text: str) -> str:
     such as a cwd under ~/code/muxa, keep their spelling."""
     text = re.sub(r"\bmuxa_path(\s*=\s*)([\"'])(.*?)\2",
                   lambda m: f"tend_path{m.group(1)}{m.group(2)}{rename_program_path(m.group(3))}{m.group(2)}", text)
-    return surgical_rename(text)
+    # A value that is exactly "muxa" is an identifier the user registered
+    # elsewhere (a dashboard OAuth client_id): keep it. Commands inside longer
+    # text, like a pipeline prompt's `muxa work done`, are still renamed.
+    text = re.sub(r"(=\s*)([\"'])muxa\2", lambda m: f"{m.group(1)}{m.group(2)}\0KEEP\0{m.group(2)}", text)
+    return surgical_rename(text).replace("\0KEEP\0", "muxa")
 
 
 def surgical_rename(text: str) -> str:
@@ -254,7 +258,7 @@ class Migration:
                 old = target.read_text(encoding="utf-8")
                 new = transform(old)
                 if new == old:
-                    return
+                    return False
                 noted = len(self.notes)
                 if validate and not validate(new):
                     if len(self.notes) > noted:
@@ -271,12 +275,13 @@ class Migration:
                         if a != b:
                             print(f"      - {a.strip()[:110]}\n      + {b.strip()[:110]}")
                 if not self.apply:
-                    return
+                    return True
                 if target.read_text(encoding="utf-8") != old:
                     self.note(f"{path} changed while migrating; run the script again.")
-                    return
+                    return False
                 shutil.copy2(target, target.with_name(f"{target.name}.muxa-migrate-{STAMP}"))
                 atomic_write(target, new)
+                return True
         except (UnicodeDecodeError, PermissionError):
             return
         except RuntimeError as err:
@@ -782,7 +787,35 @@ def migrate_shell_and_tmux(m: Migration):
                HOME / ".profile", HOME / ".config/fish/config.fish"):
         m.edit(rc, surgical_rename)
     for conf in (HOME / ".tmux.conf", xdg("XDG_CONFIG_HOME", HOME / ".config") / "tmux/tmux.conf", HOME / ".rmux.conf"):
-        m.edit(conf, surgical_rename)
+        if m.edit(conf, surgical_rename):
+            EDITED_MUX_CONFS.append(conf)
+
+
+EDITED_MUX_CONFS: list[Path] = []
+
+
+def mux_servers() -> list[list[str]]:
+    """Command prefixes for every multiplexer server to migrate: the default
+    tmux and rmux servers and tmux on an explicitly configured socket."""
+    servers = [[mux] for mux in ("tmux", "rmux") if have(mux)]
+    if have("tmux"):
+        for var in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET"):
+            prefix = ["tmux", "-S", os.environ[var]] if os.environ.get(var) else None
+            if prefix and prefix not in servers:
+                servers.append(prefix)
+    return servers
+
+
+def reload_mux_configs(m: Migration):
+    """A running tmux/rmux server keeps the old key bindings (prefix+s runs
+    `muxa watch`) until it re-reads its config, as `tend init` makes it do."""
+    for prefix in mux_servers():
+        if not capture(prefix + ["list-sessions", "-F", "#{session_id}"]).strip():
+            continue
+        for conf in EDITED_MUX_CONFS:
+            if conf.name == ".rmux.conf" and prefix[0] != "rmux":
+                continue
+            m.run(prefix + ["source-file", str(conf)], f"{' '.join(prefix)}: reload {conf}")
 
 
 # Global multiplexer variables whose values are paths or backend names.
@@ -793,9 +826,7 @@ def migrate_live_tmux(m: Migration):
     """Copy @muxa_* user options on live sessions/windows/panes to @tend_*,
     so running Work keeps its identity, then unset the old ones."""
     print("\nLive tmux and rmux options")
-    servers = [[mux] for mux in ("tmux", "rmux") if have(mux)]
-    if have("tmux"):
-        servers += [["tmux", "-S", os.environ[v]] for v in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET") if os.environ.get(v)]
+    servers = mux_servers()
     for tmux in servers:
         sessions = capture(tmux + ["list-sessions", "-F", "#{session_id}"]).split()
         if not sessions:
@@ -979,6 +1010,7 @@ def main() -> int:
     migrate_shell_and_tmux(m)
     if not (args.skip_tmux or args.only_files):
         migrate_live_tmux(m)
+        reload_mux_configs(m)
     if not args.only_files:
         migrate_macos_app(m, args.keychain)
         start_services(m)
