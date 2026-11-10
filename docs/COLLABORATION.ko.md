@@ -775,16 +775,22 @@ LaunchAgent에 기록합니다. 평소 에이전트를 실행하는 셸에서 �
 나뉜 알려진 폴더 신뢰 확인창도 처리합니다. pane의 launch ID·프로세스 시작 시점·
 작업 디렉터리를 키 입력 전에 검사하고, 준비 완료 응답에 `input_readiness`를 담습니다.
 
-이 과정은 모델에게 초기화를 맡기거나 전역 설정 파일을 바꾸지 않습니다. 폴더 설정,
+초기화는 모델을 호출하지 않으며 Muxa가 전역 설정 파일을 직접 편집하지 않습니다.
+다만 폴더 신뢰를 수락하면 provider가 해당 cwd의 신뢰를 저장하고 프로젝트 설정
+(hook·MCP 등)을 활성화할 수 있습니다. 폴더 설정,
 도구 실행 승인, 로그인, 알 수 없는 질문, 입력 중인 초안은 임의로 승인하거나 지우지
 않습니다. 프로세스 교체·키 입력 실패·30초 시간 초과가 발생하면 성공으로 표시하지
 않고 pane을 남겨 원인을 확인할 수 있게 합니다. 이후의 사용량 제한·도구 승인이
 발생하지 않는다는 뜻은 아닙니다. 이 입력 검증기는 현재 Claude·Codex에 적용됩니다.
 
-요청 `paths`의 실제로 존재하는 외부 입력 디렉터리는 provider의 `--add-dir`에 명시해
-작업 디렉터리 밖 리뷰 자료를 읽는 첫 확인창을 방지합니다. 읽기 전용 계약과 기존
-승인 모드는 유지하며, 존재하지 않는 출력 경로나 파일시스템 전체 루트는 허용하지
-않습니다. 정확한 기존 worker만 다시 준비하려면 다음처럼 실행합니다.
+새 Claude peer에는 `paths`의 기존 디렉터리만 `--add-dir=PATH`로 전달합니다.
+파일의 부모 디렉터리, 없는 경로, 파일시스템 루트, 홈 및 홈의 비공개 설정 경로는
+추가하지 않습니다. 기존 peer에는 새 경로를 소급 적용하지 않습니다. Codex의
+`--add-dir`는 쓰기 권한을 넓히므로 자동 추가하지 않습니다. Claude의 추가 경로도
+승인 모드에 따라 편집이 가능하며, 읽기 전용 요청 계약은 파일시스템 격리가 아닙니다.
+직접 시작하는 worker도 이제 `collaboration.worker_bypass_permissions`(기본 false)를
+따르며 무조건 승인을 우회하지 않습니다. 설정된 Work 파이프라인의 기존 실행 프로필은
+유지합니다. 정확한 기존 worker만 다시 준비하려면 다음처럼 실행합니다.
 
 ```sh
 muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux-socket default
@@ -792,4 +798,10 @@ muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux
 
 이 명령은 JSON 결과를 출력하며 실제 입력 준비가 검증되지 않으면 0 이외로 종료합니다.
 
-worker에는 기존 Muxa 관리 `agent-integration` bootstrap·skill 디렉터리도 입력 경로로 제공합니다. 다른 사용자 설정 디렉터리는 추가하지 않습니다.
+Claude worker에는 기존 Muxa 관리 `agent-integration` bootstrap·skill 디렉터리도 입력 경로로 제공합니다. 다른 사용자 설정 디렉터리는 추가하지 않습니다.
+
+Codex 폴더 신뢰 확인창은 sandbox 영향 검증 전까지 자동 수락하지 않습니다.
+입력 준비가 pending·blocked인 worker에는 새 고수준 peer 요청을 보내지 않습니다.
+
+확인창을 수동 해결한 후에도 `muxa agent prepare`를 다시 실행해 준비 상태를 갱신해야 합니다.
+Codex 자동 준비는 폴더 신뢰 확인이 필요 없는 cwd에서 지원됩니다.

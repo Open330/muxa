@@ -39,9 +39,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fresh Claude/Codex peer workers now prepare recognized startup gates and
   verify a stable empty input composer before dispatch. Narrow folder-trust
   dialogs are handled without a model turn; changed launch identities,
-  unknown approvals and timeouts never count as ready. Explicit peer input
-  paths become scoped provider context directories rather than prompting
-  for unrestricted external reads.
+  unknown approvals and timeouts never count as ready. New Claude peers receive only existing, non-private directory
+  inputs as provider context roots; files never grant their parent directory.
+  Codex receives no automatic additional writable roots. Folder trust may be
+  persisted by the provider and enables project configuration. Direct worker
+  starts now honor `worker_bypass_permissions` (default false) instead of
+  unconditionally bypassing approvals; Work pipelines keep their execution profile.
 
 - Dedicated Claude workers declare a process-local inbound-message policy so
   permission-mode differences do not strand delegated messages. Existing

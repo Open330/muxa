@@ -10,6 +10,7 @@ struct Fence {
     process: muxa::collaboration::ProcessFence,
     cwd: PathBuf,
     launch: String,
+    kind: muxa::event::AgentKind,
 }
 
 fn observe(control: &Control, pane: &str) -> Option<Fence> {
@@ -19,15 +20,16 @@ fn observe(control: &Control, pane: &str) -> Option<Fence> {
             "-p",
             "-t",
             pane,
-            "#{pane_pid}\t#{pane_current_path}\t#{@muxa_launch_id}",
+            "#{pane_pid}\t#{pane_current_path}\t#{@muxa_launch_id}\t#{@muxa_agent}",
         ])
         .ok()?;
-    let mut parts = value.trim_end().splitn(3, '\t');
+    let mut parts = value.trim_end().splitn(4, '\t');
     let pid = parts.next()?.parse().ok()?;
     Some(Fence {
         process: muxa::collaboration::ProcessFence::capture(pid)?,
         cwd: muxa::paths::canonicalize(Path::new(parts.next()?)).ok()?,
         launch: parts.next()?.to_owned(),
+        kind: muxa::discovery::classify_command(parts.next()?)?,
     })
 }
 
@@ -41,7 +43,16 @@ pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<
         "worker pane {pane} no longer belongs to this launch and directory"
     );
     let matches = || observe(&control, pane).as_ref() == Some(&fence);
-    Ok(worker_startup::prepare(
+    control.run(&[
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        "@muxa_input_readiness",
+        "pending",
+    ])?;
+    let report = worker_startup::prepare(
+        fence.kind,
         || {
             if !matches() {
                 return None;
@@ -67,7 +78,24 @@ pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<
         },
         bypass,
         Duration::from_secs(30),
-    ))
+    );
+    if !matches() {
+        anyhow::bail!("worker changed before readiness could be recorded");
+    }
+    let state = if report.state == worker_startup::State::Ready {
+        "ready"
+    } else {
+        "blocked"
+    };
+    control.run(&[
+        "set-option",
+        "-p",
+        "-t",
+        pane,
+        "@muxa_input_readiness",
+        state,
+    ])?;
+    Ok(report)
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -182,6 +210,9 @@ while True:
                 "fixture-launch",
             ])
             .unwrap();
+        control
+            .run(&["set-option", "-p", "-t", pane, "@muxa_agent", "claude"])
+            .unwrap();
         // A wrong launch id is rejected before any key can be sent.
         crate::mux_control::with_endpoint(Some(endpoint.clone()), || {
             assert!(prepare(pane, dir.path(), "wrong-launch", false).is_err());
@@ -192,6 +223,20 @@ while True:
         .unwrap();
         assert_eq!(report.state, worker_startup::State::Ready);
         assert_eq!(report.answered, ["trusted the folder"]);
+        assert_eq!(
+            control
+                .output(&[
+                    "show-options",
+                    "-p",
+                    "-v",
+                    "-t",
+                    pane,
+                    "@muxa_input_readiness"
+                ])
+                .unwrap()
+                .trim(),
+            "ready"
+        );
         assert_eq!(
             std::fs::read_to_string(dir.path().join("keys.hex")).unwrap(),
             "1b5b420d"

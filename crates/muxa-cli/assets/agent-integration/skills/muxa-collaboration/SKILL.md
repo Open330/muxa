@@ -166,8 +166,9 @@ ask for it again. An authorized peer task may reuse or create a worker through
 `muxa_call_peer` with configured provider permissions. Automatic creation defaults
 to enabled (`collaboration.auto_spawn_workers`); `spawn_if_missing` overrides it
 per call. `collaboration.worker_bypass_permissions=true` explicitly enables
-bypass flags for these workers. Direct `muxa_start_agent` launches still use
-bypass flags and require authorization for that launch. A review does not grant
+bypass flags for these workers. Direct worker `muxa_start_agent` launches also
+honor this setting; primary launches retain their existing execution profile.
+A review does not grant
 editing authority. Never add bypass flags to work around a permission prompt.
 
 When MCP is missing, report that setup/restart is needed and use `muxa doctor`

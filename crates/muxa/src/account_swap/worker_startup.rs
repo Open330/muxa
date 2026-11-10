@@ -82,27 +82,37 @@ fn normalize_capture(screen: String) -> String {
 /// The permission profile is retained: bypass consent is possible only when
 /// the caller explicitly launched with it. Folder settings remain a blocker.
 pub fn prepare(
+    kind: AgentKind,
     capture: impl FnMut() -> Option<String>,
     alive: impl FnMut() -> bool,
     send_key: impl FnMut(&str) -> bool,
     bypass_requested: bool,
     timeout: Duration,
 ) -> Report {
+    if !matches!(kind, AgentKind::ClaudeCode | AgentKind::Codex) {
+        return Report {
+            state: State::Blocked,
+            answered: vec![],
+            reason: Some("provider has no verified startup/composer probe".into()),
+        };
+    }
     prepare_with(
         &io::RealClock,
+        kind,
         capture,
         alive,
         send_key,
         bypass_requested,
         timeout,
         READY_QUIET,
-        Duration::from_millis(100),
+        Duration::from_millis(250),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn prepare_with(
     clock: &dyn Clock,
+    kind: AgentKind,
     mut capture: impl FnMut() -> Option<String>,
     mut alive: impl FnMut() -> bool,
     mut send_key: impl FnMut(&str) -> bool,
@@ -116,7 +126,12 @@ fn prepare_with(
     let resume = wait_for_resume_answering(
         clock,
         || {
-            let screen = normalize_capture(capture()?);
+            let raw = capture()?;
+            let screen = if kind == AgentKind::ClaudeCode {
+                normalize_capture(raw)
+            } else {
+                raw
+            };
             last.replace(screen.clone());
             Some(screen)
         },
@@ -128,6 +143,13 @@ fn prepare_with(
             let dialog = pending_dialog(&screen, STARTUP_DIALOGS, &[]);
             let allowed = dialog.is_some_and(|d| {
                 (d.label == "trusted the folder"
+                    && match kind {
+                        AgentKind::ClaudeCode => d.pick == Some("Yes, I trust this folder"),
+                        // Codex trust can alter sandbox defaults; keep it blocked
+                        // until its cold trust flow is independently verified.
+                        AgentKind::Codex => false,
+                        _ => false,
+                    }
                     && option_rows(&screen).is_some_and(|(rows, _)| {
                         rows.len() == 2
                             && rows.iter().any(|row| {
@@ -147,9 +169,7 @@ fn prepare_with(
     );
     let (state, reason) = match resume {
         Resume::Ready
-            if turn_running(&last.borrow())
-                || composer_draft(&last.borrow(), AgentKind::ClaudeCode).is_some()
-                || composer_draft(&last.borrow(), AgentKind::Codex).is_some() =>
+            if turn_running(&last.borrow()) || composer_draft(&last.borrow(), kind).is_some() =>
         {
             (
                 State::Blocked,
@@ -192,6 +212,28 @@ mod tests {
             self.elapsed.set(self.elapsed.get() + d);
         }
     }
+    #[test]
+    fn codex_folder_trust_remains_blocked_without_a_verified_sandbox_flow() {
+        let clock = FakeClock {
+            base: Instant::now(),
+            elapsed: Cell::new(Duration::ZERO),
+        };
+        let report = prepare_with(
+            &clock,
+            AgentKind::Codex,
+            || {
+                Some("Trust this folder\n› 1. Trust and continue\n  2. Quit\n  enter continue · esc quit".into())
+            },
+            || true,
+            |_| panic!("must not accept Codex trust"),
+            false,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        );
+        assert_ne!(report.state, State::Ready);
+        assert!(report.answered.is_empty());
+    }
     const TRUST: &str =
         " ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel";
     const READY: &str = "Claude Code\n❯ \n ? for shortcuts";
@@ -205,6 +247,7 @@ mod tests {
                 base: Instant::now(),
                 elapsed: Cell::new(Duration::ZERO),
             },
+            AgentKind::ClaudeCode,
             screen,
             alive,
             send,

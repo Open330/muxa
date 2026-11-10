@@ -783,9 +783,7 @@ fn configure_worker_bootstrap_context(
     options: &mut Vec<String>,
     directory: Option<&Path>,
 ) {
-    if purpose != muxa::collaboration::LaunchPurpose::Worker
-        || !matches!(agent, AgentProgram::Claude | AgentProgram::Codex)
-    {
+    if purpose != muxa::collaboration::LaunchPurpose::Worker || agent != AgentProgram::Claude {
         return;
     }
     let Some(directory) = directory.filter(|p| p.join("bootstrap.md").is_file()) else {
@@ -800,7 +798,7 @@ fn configure_worker_bootstrap_context(
         .unwrap_or(options.len());
     options.splice(
         at..at,
-        ["--add-dir".into(), directory.to_string_lossy().into_owned()],
+        [format!("--add-dir={}", directory.to_string_lossy())],
     );
 }
 
@@ -1020,6 +1018,18 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             }
         })
         .context("record worker launch identity; pane left for reconciliation")?;
+        if prompt.is_none() && matches!(request.agent, AgentProgram::Claude | AgentProgram::Codex) {
+            crate::mux_control::Control::Ambient
+                .run(&[
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &pane,
+                    "@muxa_input_readiness",
+                    "pending",
+                ])
+                .context("record worker preparation state")?;
+        }
     }
 
     let managed = work.is_some();
@@ -2191,12 +2201,15 @@ mod tests {
             &mut options,
             Some(root.path()),
         );
-        assert_eq!(&options[..3], ["--permission-mode", "default", "--add-dir"]);
+        assert_eq!(&options[..2], ["--permission-mode", "default"]);
         assert_eq!(
-            std::path::Path::new(&options[3]),
-            muxa::paths::canonicalize(root.path()).unwrap()
+            options[2],
+            format!(
+                "--add-dir={}",
+                muxa::paths::canonicalize(root.path()).unwrap().display()
+            )
         );
-        assert_eq!(&options[4..], ["--", "body"]);
+        assert_eq!(&options[3..], ["--", "body"]);
         let before = options.clone();
         configure_worker_bootstrap_context(
             AgentProgram::Claude,
@@ -2205,5 +2218,36 @@ mod tests {
             Some(root.path()),
         );
         assert_eq!(before, options);
+    }
+    #[test]
+    fn codex_bootstrap_does_not_add_write_roots() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("bootstrap.md"), "managed instructions").unwrap();
+        let mut options = vec![];
+        configure_worker_bootstrap_context(
+            AgentProgram::Codex,
+            muxa::collaboration::LaunchPurpose::Worker,
+            &mut options,
+            Some(root.path()),
+        );
+        assert!(options.is_empty());
+    }
+    #[test]
+    fn direct_worker_starts_follow_the_configured_bypass_grant() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(flatten)]
+            start: StartArgs,
+        }
+        let args = Harness::parse_from(["start", "--agent", "claude", "--purpose", "worker"]).start;
+        let mut config = muxa::config::Config::default();
+        assert!(
+            !StartRequest::from_args(&args, Path::new("/tmp/daemon"), &config).bypass_permissions
+        );
+        config.collaboration.worker_bypass_permissions = true;
+        assert!(
+            StartRequest::from_args(&args, Path::new("/tmp/daemon"), &config).bypass_permissions
+        );
     }
 }
