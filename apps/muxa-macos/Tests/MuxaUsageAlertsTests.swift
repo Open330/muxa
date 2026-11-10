@@ -42,6 +42,29 @@ private func group(_ percent: Double, reset: Date? = now.addingTimeInterval(3600
     #expect(MuxaUsageAlerts.due(groups: [group(85, hosts: ["mini", "mbp"])], notified: notified, now: now).alerts.isEmpty)
 }
 
+@Test func accountsThatOnlyShareAResetDoNotSilenceEachOther() {
+    let reset = now.addingTimeInterval(3600)
+    let due = MuxaUsageAlerts.due(
+        groups: [group(96, reset: reset, hosts: ["mini"]), group(96, reset: reset, hosts: ["rtzr"])],
+        notified: [], now: now
+    )
+    #expect(due.alerts.count == 2)
+    let later = MuxaUsageAlerts.due(groups: [group(96, reset: reset, hosts: ["mbp"])], notified: Set(due.alerts.flatMap(\.crossed)), now: now)
+    #expect(later.alerts.count == 1)
+}
+
+@Test func resetsInTheSameMinuteAreDifferentWindows() {
+    let first = MuxaUsageAlerts.due(groups: [group(85, reset: now.addingTimeInterval(3600))], notified: [], now: now)
+    let other = group(85, reset: now.addingTimeInterval(3610))
+    #expect(MuxaUsageAlerts.due(groups: [other], notified: Set(first.alerts.flatMap(\.crossed)), now: now).alerts.count == 1)
+}
+
+@Test func aHostLeavingKeepsTheHistory() {
+    let first = MuxaUsageAlerts.due(groups: [group(85, hosts: ["mini", "mbp"])], notified: [], now: now)
+    #expect(first.alerts.count == 1)
+    #expect(MuxaUsageAlerts.due(groups: [group(85, hosts: ["mbp"])], notified: Set(first.alerts.flatMap(\.crossed)), now: now).alerts.isEmpty)
+}
+
 @Test func aNewWindowStartsOver() {
     let first = MuxaUsageAlerts.due(groups: [group(85)], notified: [], now: now)
     let notified = Set(first.alerts.flatMap(\.crossed))

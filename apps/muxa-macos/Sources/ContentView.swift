@@ -144,12 +144,7 @@ struct ContentView: View {
         .focusedSceneValue(\.muxaEditorCommands, editorCommands)
         .background(MuxaWorkbenchCommandBridge(actions: editorCommands))
         // The shortcut that works from any app opens the agents palette.
-        .onReceive(NotificationCenter.default.publisher(for: MuxaGlobalHotKey.showAgents)) { _ in
-            if MuxaGlobalHotKey.shared.takePendingShowAgents() { paletteMode = .agents }
-        }
-        .onAppear {
-            if MuxaGlobalHotKey.shared.takePendingShowAgents() { paletteMode = .agents }
-        }
+        .background(MuxaHotKeyReceiver(paletteOpen: paletteMode != nil) { paletteMode = .agents })
     }
 
     /// The window's own actions, at the trailing end of the last editor

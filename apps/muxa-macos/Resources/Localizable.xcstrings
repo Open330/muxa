@@ -2369,6 +2369,16 @@
         }
       }
     },
+    "Muxa could not listen for the shortcut. Restart Muxa and try again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa가 단축키를 받을 수 없습니다. Muxa를 다시 시작한 뒤 다시 시도하세요."
+          }
+        }
+      }
+    },
     "Notify before a usage limit runs out" : {
       "localizations" : {
         "ko" : {
@@ -9246,6 +9256,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa가 사용량이 가장 많이 남은 aas 계정에서 같은 대화를 다시 실행하고 끊긴 작업을 이어 갑니다. aas와 두 번째 계정이 필요합니다."
+          }
+        }
+      }
+    },
+    "macOS refused %@ (error %lld). Pick another shortcut." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "macOS가 %@를 거부했습니다(오류 %lld). 다른 단축키를 고르세요."
           }
         }
       }

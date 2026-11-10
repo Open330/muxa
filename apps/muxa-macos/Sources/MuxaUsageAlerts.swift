@@ -16,9 +16,7 @@ enum MuxaUsageAlerts {
     static let rearmBelow = 50.0
 
     struct Alert: Equatable, Sendable {
-        /// The provider, the window and the window's reset: the same window
-        /// alerts once per threshold, wherever its hosts are, and a new
-        /// window starts over.
+        /// The keys this alert answers for, one per host: see `keys`.
         let key: String
         let provider: String
         let hostAliases: [String]
@@ -32,13 +30,15 @@ enum MuxaUsageAlerts {
         defaults.object(forKey: enabledKey) as? Bool ?? true
     }
 
-    /// Accounts are inferred, not known (see `MuxaUsageGroup`), so a window
-    /// is named by what identifies it across hosts: its provider, its kind
-    /// and its reset. Without a reset, the hosts stand in for the account.
-    static func cycle(_ group: MuxaUsageGroup, _ window: MuxaUsageWindow) -> String {
-        let reset = window.resetsAt.map { String(Int($0.timeIntervalSince1970 / 60)) }
-            ?? "none:" + group.hostAliases.joined(separator: "+")
-        return [group.provider, window.kind.rawValue, reset].joined(separator: "\u{1F}")
+    /// One window as seen from each of its hosts: provider, host, kind and
+    /// the exact reset (or "none"). Accounts are inferred, not known (see
+    /// `MuxaUsageGroup`), so a key never speaks for another host: two
+    /// accounts that merely share a reset never silence each other, while a
+    /// host joining a group that already announced finds its partner's key
+    /// and stays quiet, and one leaving keeps the rest.
+    static func cycles(_ group: MuxaUsageGroup, _ window: MuxaUsageWindow) -> [String] {
+        let reset = window.resetsAt.map { String(Int($0.timeIntervalSince1970)) } ?? "none"
+        return group.hostAliases.map { [group.provider, $0, window.kind.rawValue, reset].joined(separator: "\u{1F}") }
     }
 
     static func key(cycle: String, threshold: Double) -> String {
@@ -46,13 +46,13 @@ enum MuxaUsageAlerts {
     }
 
     /// The alerts due now: per window with a fresh reading, the highest
-    /// threshold it has crossed that was not announced in this window yet.
-    /// An account already capped is left to the limit notification.
-    /// `crossed` lists every key the alert covers, lower thresholds
-    /// included, so a jump from 79% to 96% announces 95% only, and a figure
-    /// that falls back within the window does not announce again.
-    /// `rearmed` lists reset-less windows whose fresh reading fell low
-    /// enough to count as a new window.
+    /// threshold it has crossed that none of its hosts announced in this
+    /// window yet. An account already capped is left to the limit
+    /// notification. `crossed` lists every key the alert covers, every host
+    /// and lower thresholds included, so a jump from 79% to 96% announces
+    /// 95% only and a figure that falls back does not announce again.
+    /// Within one call a key is announced once. `rearmed` lists reset-less
+    /// cycles whose fresh reading fell low enough to count as a new window.
     static func due(
         groups: [MuxaUsageGroup],
         notified: Set<String>,
@@ -60,21 +60,23 @@ enum MuxaUsageAlerts {
     ) -> (alerts: [(alert: Alert, crossed: [String])], rearmed: [String]) {
         var alerts: [(Alert, [String])] = []
         var rearmed: [String] = []
+        var seen = notified
         for group in groups where group.capped.isEmpty {
             for window in group.windows {
                 guard let sampled = window.sampledAt, now.timeIntervalSince(sampled) <= freshness else { continue }
-                let cycle = cycle(group, window)
+                let cycles = cycles(group, window)
                 if window.resetsAt == nil, window.percent < rearmBelow {
-                    rearmed.append(cycle)
+                    rearmed.append(contentsOf: cycles)
                     continue
                 }
                 let passed = thresholds.filter { window.percent >= $0 }
                 guard let top = passed.max() else { continue }
-                let topKey = key(cycle: cycle, threshold: top)
-                guard !notified.contains(topKey) else { continue }
+                guard !cycles.contains(where: { seen.contains(key(cycle: $0, threshold: top)) }) else { continue }
+                let crossed = cycles.flatMap { cycle in passed.map { key(cycle: cycle, threshold: $0) } }
+                seen.formUnion(crossed)
                 alerts.append((
                     Alert(
-                        key: topKey,
+                        key: key(cycle: cycles.joined(separator: "+"), threshold: top),
                         provider: group.provider,
                         hostAliases: group.hostAliases,
                         kind: window.kind,
@@ -82,7 +84,7 @@ enum MuxaUsageAlerts {
                         threshold: top,
                         resetsAt: window.resetsAt
                     ),
-                    passed.map { key(cycle: cycle, threshold: $0) }
+                    crossed
                 ))
             }
         }
