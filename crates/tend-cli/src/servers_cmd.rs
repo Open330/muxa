@@ -7,7 +7,9 @@ use std::fmt::Write as _;
 
 use anyhow::Result;
 use tend::ipc::Client;
-use tend::listener_inventory::{Association, Bind, Coverage, ListenerInventory, ListenerStatus};
+use tend::listener_inventory::{
+    printable, Association, Bind, Coverage, ListenerInventory, ListenerStatus,
+};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {
@@ -33,8 +35,10 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
 fn coverage(label: &str, coverage: &Coverage) -> Option<String> {
     match coverage {
         Coverage::Complete => None,
-        Coverage::Partial { reason } => Some(format!("{label} partial: {reason}")),
-        Coverage::Unavailable { reason } => Some(format!("{label} unavailable: {reason}")),
+        Coverage::Partial { reason } => Some(format!("{label} partial: {}", printable(reason))),
+        Coverage::Unavailable { reason } => {
+            Some(format!("{label} unavailable: {}", printable(reason)))
+        }
     }
 }
 
@@ -95,13 +99,13 @@ fn render(inventory: &ListenerInventory) -> String {
                     Bind::Wildcard => " (all interfaces)",
                     Bind::Interface => " (non-loopback)",
                 };
-                format!("{}:{}{note}", e.address, e.port)
+                format!("{}:{}{note}", printable(&e.address), e.port)
             })
             .collect();
         let _ = writeln!(
             out,
             "{}  pid {}  {}  — {}",
-            row.process_name,
+            printable(&row.process_name),
             row.pid,
             ports.join(", "),
             status_text(row.status, row.state_for_secs)
@@ -112,14 +116,21 @@ fn render(inventory: &ListenerInventory) -> String {
                 pane_id,
                 agent_kind,
                 ..
-            } => format!("under {agent_kind} pane {pane_id} ({endpoint})"),
-            Association::Worktree { path, origin, .. } => {
-                format!("in worktree {} ({origin})", path.display())
-            }
+            } => format!(
+                "under {} pane {} ({})",
+                printable(agent_kind),
+                printable(pane_id),
+                printable(endpoint)
+            ),
+            Association::Worktree { path, origin, .. } => format!(
+                "in worktree {} ({})",
+                printable(&path.to_string_lossy()),
+                printable(origin)
+            ),
         };
         let _ = writeln!(out, "    {via}");
         if let Some(cwd) = &row.cwd {
-            let _ = writeln!(out, "    cwd {cwd}");
+            let _ = writeln!(out, "    cwd {}", printable(cwd));
         }
     }
     out

@@ -508,7 +508,8 @@ fn tracked_agent<'a>(pane: &PaneRoot, agents: &'a [Agent]) -> Option<&'a Agent> 
 }
 
 /// Control characters replaced, so a name or path cannot rewrite a terminal.
-fn printable(text: &str) -> String {
+#[must_use]
+pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect()
@@ -911,7 +912,10 @@ mod tests {
         assert!(associate(101, &table[&101], &table, &ev, &mut cache, now).is_none());
 
         // Two agents claiming the pane: ambiguous, not guessed.
-        let two = vec![agent("%3", "default", "idle", 10), agent("%3", "default", "working", 10)];
+        let two = vec![
+            agent("%3", "default", "idle", 10),
+            agent("%3", "default", "working", 10),
+        ];
         let ev = evidence(&two, HashMap::from([(100, Some(root.clone()))]));
         assert!(associate(101, &table[&101], &table, &ev, &mut cache, now).is_none());
 

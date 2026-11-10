@@ -202,9 +202,9 @@ pub(crate) fn bounded_status(program: &str, args: &[&std::ffi::OsStr]) -> Option
     std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut pipe = stderr;
-        let _ = (&mut pipe).take(64 * 1024).read_to_end(&mut kept);
-        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-        let _ = err_sender.send(kept);
+        let read = (&mut pipe).take(64 * 1024).read_to_end(&mut kept);
+        let drained = std::io::copy(&mut pipe, &mut std::io::sink());
+        let _ = err_sender.send((read.is_ok() && drained.is_ok()).then_some(kept));
     });
     // Read on another thread so a chatty child never blocks on a full pipe.
     // Past the cap the rest is drained and the output reported as cut
@@ -232,10 +232,15 @@ pub(crate) fn bounded_status(program: &str, args: &[&std::ffi::OsStr]) -> Option
             .ok()
             .flatten()
     });
-    if let (Some(status), Some(output)) = (status, output) {
-        let stderr = err_receiver
+    // stderr must close within the budget too: a helper holding it open
+    // would otherwise pass for a run that printed no diagnostics.
+    let stderr = output.as_ref().and_then(|_| {
+        err_receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-            .unwrap_or_default();
+            .ok()
+            .flatten()
+    });
+    if let (Some(status), Some(output), Some(stderr)) = (status, output, stderr) {
         Some(BoundedRun {
             code: status.code(),
             stdout: String::from_utf8_lossy(&output).into_owned(),
@@ -875,6 +880,25 @@ mod tests {
         assert_eq!(
             bounded("echo", &["hi".as_ref()]),
             Some((true, "hi\n".into()))
+        );
+    }
+
+    #[test]
+    fn a_helper_holding_stderr_open_cannot_pass_for_a_quiet_run() {
+        DEADLINE.with(|cell| cell.set(Some(Instant::now() + Duration::from_millis(300))));
+        let started = Instant::now();
+        let script = "sleep 5 >/dev/null & exit 1";
+        assert!(bounded_status("sh", &["-c".as_ref(), script.as_ref()]).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        DEADLINE.with(|cell| cell.set(None));
+        let run = bounded_status("sh", &["-c".as_ref(), "echo oops >&2; exit 1".as_ref()]).unwrap();
+        assert_eq!(
+            (run.code, run.stdout.as_str(), run.stderr.trim()),
+            (Some(1), "", "oops")
         );
     }
 
