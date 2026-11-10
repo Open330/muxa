@@ -189,8 +189,9 @@ fn check(
             Some(_) => {}
             None => reasons.push(format!("its commits are not in {base}")),
         }
-        // Kept elsewhere means on a remote too; muxa does not fetch, so a
-        // stale remote view only keeps more.
+        // Kept elsewhere means on a remote too, as far as this clone's
+        // remote-tracking refs say. muxa does not fetch; those refs are
+        // local evidence, not proof the server still holds the commit.
         let remote = git(&receipt.repo, &["branch", "--remotes", "--contains", &head]);
         if remote.as_deref().is_none_or(|out| out.trim().is_empty()) {
             reasons.push("its commits are not on any remote branch".into());
