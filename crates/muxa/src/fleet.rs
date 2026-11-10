@@ -842,6 +842,10 @@ pub struct FleetCommandResult {
     /// The host's receipted worktrees, for `worktree_inventory`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktrees: Option<Vec<crate::worktree_inventory::WorktreeRow>>,
+    /// How many receipts the host has in all; more than `worktrees` holds
+    /// when the reply was cut to [`crate::worktree_inventory::FLEET_MAX_ROWS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees_total: Option<usize>,
 }
 
 impl FleetCommandResult {
@@ -863,13 +867,15 @@ impl FleetCommandResult {
             command_stdout: None,
             command_stderr: None,
             worktrees: None,
+            worktrees_total: None,
         }
     }
 
     #[must_use]
-    pub fn worktrees(rows: Vec<crate::worktree_inventory::WorktreeRow>) -> Self {
+    pub fn worktrees(inventory: crate::worktree_inventory::Inventory) -> Self {
         Self {
-            worktrees: Some(rows),
+            worktrees: Some(inventory.rows),
+            worktrees_total: Some(inventory.total),
             ..Self::accepted("worktree inventory")
         }
     }
@@ -892,6 +898,7 @@ impl FleetCommandResult {
             command_stdout: None,
             command_stderr: None,
             worktrees: None,
+            worktrees_total: None,
         }
     }
 
@@ -915,6 +922,7 @@ impl FleetCommandResult {
             command_stdout: None,
             command_stderr: None,
             worktrees: None,
+            worktrees_total: None,
         }
     }
 
@@ -936,6 +944,7 @@ impl FleetCommandResult {
             command_stdout: None,
             command_stderr: None,
             worktrees: None,
+            worktrees_total: None,
         }
     }
 
@@ -957,6 +966,7 @@ impl FleetCommandResult {
             command_stdout: None,
             command_stderr: None,
             worktrees: None,
+            worktrees_total: None,
         }
     }
 
@@ -978,6 +988,7 @@ impl FleetCommandResult {
             command_stdout: None,
             command_stderr: None,
             worktrees: None,
+            worktrees_total: None,
         }
     }
 
@@ -1019,6 +1030,7 @@ impl FleetCommandResult {
             command_stdout: None,
             command_stderr: None,
             worktrees: None,
+            worktrees_total: None,
         }
     }
 
@@ -1041,6 +1053,7 @@ impl FleetCommandResult {
             command_stdout: Some(output.stdout),
             command_stderr: Some(output.stderr),
             worktrees: None,
+            worktrees_total: None,
         }
     }
 

@@ -38,18 +38,35 @@ pub struct WorktreeRow {
     pub bytes: Option<u64>,
 }
 
-/// Inspects every receipted worktree; blocking (git and pane scans).
-/// `all` also lists attempts that never finished or failed.
+/// The worktrees an inventory inspected, and how many receipts it had in
+/// all, so a caller that set a limit can say what it left out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Inventory {
+    pub rows: Vec<WorktreeRow>,
+    /// Receipts that matched, before any limit.
+    pub total: usize,
+}
+
+/// Inspects receipted worktrees; blocking (git and pane scans), bounded by
+/// [`SCAN_BUDGET`]. `all` also lists attempts that never finished or
+/// failed. With a `limit`, trees still on disk come first, newest receipts
+/// first, and the rest are counted in `total` but not inspected.
 #[must_use]
-pub fn inventory(all: bool) -> Vec<WorktreeRow> {
+pub fn inventory(all: bool, limit: Option<usize>) -> Inventory {
     let deadline = Instant::now() + SCAN_BUDGET;
     DEADLINE.with(|cell| cell.set(Some(deadline)));
     let panes = observe_panes();
-    let rows = crate::worktree_receipt::list()
+    let mut receipts: Vec<WorktreeReceipt> = crate::worktree_receipt::list()
         .into_iter()
         .rev()
         .filter(|receipt| all || receipt.state == ReceiptState::Created)
-        .take(MAX_ROWS)
+        .collect();
+    // Stable: newest first within each group.
+    receipts.sort_by_key(|receipt| !receipt.path.exists());
+    let total = receipts.len();
+    let rows = receipts
+        .into_iter()
+        .take(limit.unwrap_or(usize::MAX))
         .map(|receipt| {
             if Instant::now() >= deadline {
                 return out_of_time(receipt);
@@ -64,7 +81,7 @@ pub fn inventory(all: bool) -> Vec<WorktreeRow> {
         })
         .collect();
     DEADLINE.with(|cell| cell.set(None));
-    rows
+    Inventory { rows, total }
 }
 
 /// The whole scan's budget: a host answers within it, however many trees
@@ -73,9 +90,9 @@ pub fn inventory(all: bool) -> Vec<WorktreeRow> {
 pub const SCAN_BUDGET: Duration = Duration::from_secs(20);
 /// One git or du call's budget; a child that overruns is killed.
 pub const COMMAND_BUDGET: Duration = Duration::from_secs(5);
-/// At most this many rows, newest receipts first, so a reply stays far below
-/// the relay frame ceiling.
-pub const MAX_ROWS: usize = 300;
+/// At most this many rows in a Fleet reply, so it stays far below the relay
+/// frame ceiling; the reply says how many there were in all.
+pub const FLEET_MAX_ROWS: usize = 300;
 /// At most this much of a child's output is kept.
 const MAX_OUTPUT: u64 = 1024 * 1024;
 const OUT_OF_TIME: &str = "muxa ran out of time checking it";
@@ -96,9 +113,11 @@ fn out_of_time(receipt: WorktreeReceipt) -> WorktreeRow {
 }
 
 /// Runs `program args` and returns whether it exited 0 and up to 1 MiB of
-/// its stdout, or None when it could not start or ran past its budget (the
-/// smaller of [`COMMAND_BUDGET`] and what the scan has left); an overrunning
-/// child is killed and reaped.
+/// its stdout, or None when it could not start, ran past its budget (the
+/// smaller of [`COMMAND_BUDGET`] and what the scan has left), or left its
+/// output open past that budget. The child runs in its own process group,
+/// and the whole group is killed on expiry, so a helper that git or du
+/// started and that holds the pipe open cannot outlive the budget either.
 pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String)> {
     use std::io::Read as _;
     let now = Instant::now();
@@ -108,41 +127,65 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
     if budget.is_zero() {
         return None;
     }
-    let mut child = std::process::Command::new(program)
+    let deadline = now + budget;
+    let mut command = std::process::Command::new(program);
+    command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut command, 0);
+    let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     // Read on another thread so a chatty child never blocks on a full pipe;
-    // keep the first MiB and throw the rest away.
-    let reader = std::thread::spawn(move || {
+    // keep the first MiB and throw the rest away. The thread reports back
+    // over a channel, so waiting for it is bounded too.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut pipe = stdout;
         let _ = (&mut pipe).take(MAX_OUTPUT).read_to_end(&mut kept);
         let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-        kept
+        let _ = sender.send(kept);
     });
-    let deadline = now + budget;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
+            _ => break None,
         }
     };
-    let output = reader.join().unwrap_or_default();
-    let status = status?;
-    Some((
-        status.success(),
-        String::from_utf8_lossy(&output).into_owned(),
-    ))
+    let output = status.and_then(|_| {
+        receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+    });
+    if let (Some(status), Some(output)) = (status, output) {
+        Some((
+            status.success(),
+            String::from_utf8_lossy(&output).into_owned(),
+        ))
+    } else {
+        kill_group(&mut child);
+        None
+    }
+}
+
+/// Kills the child and everything in its process group, then reaps it.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let group = format!("-{}", child.id());
+        let _ = std::process::Command::new("kill")
+            .args(["-KILL", "--", &group])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Every pane's directory on every active backend, and whether every
@@ -395,6 +438,31 @@ mod tests {
             Some((true, "hi\n".into()))
         );
     }
+
+    #[test]
+    fn a_helper_holding_the_pipe_cannot_outlive_the_budget() {
+        // The direct child exits at once; its background helper keeps the
+        // pipe open for 5 s.
+        DEADLINE.with(|cell| cell.set(Some(Instant::now() + Duration::from_millis(300))));
+        let started = Instant::now();
+        assert!(bounded("sh", &["-c".as_ref(), "sleep 5 & exit 0".as_ref()]).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        // And when the direct child itself overruns.
+        DEADLINE.with(|cell| cell.set(Some(Instant::now() + Duration::from_millis(300))));
+        let started = Instant::now();
+        assert!(bounded("sh", &["-c".as_ref(), "sleep 5 & sleep 5".as_ref()]).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        DEADLINE.with(|cell| cell.set(None));
+    }
+
     use crate::worktree_receipt::ReceiptOrigin;
     use time::OffsetDateTime;
 

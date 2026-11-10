@@ -2519,6 +2519,16 @@
         }
       }
     },
+    "Showing %lld of %lld, those still on disk first. Run muxa worktrees on %@ for all." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%2$lld개 중 %1$lld개만 보여 줍니다(디스크에 남아 있는 것 먼저). 전체는 %3$@에서 muxa worktrees를 실행하세요."
+          }
+        }
+      }
+    },
     "Use for This Question" : {
       "localizations" : {
         "ko" : {

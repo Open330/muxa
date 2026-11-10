@@ -52,6 +52,14 @@ struct MuxaWorktreeRow: Decodable, Hashable, Identifiable, Sendable {
     }
 }
 
+/// A host's answer: the rows it sent and how many receipts it has in all.
+struct MuxaWorktreeInventory: Hashable, Sendable {
+    let rows: [MuxaWorktreeRow]
+    let total: Int
+
+    var isCut: Bool { total > rows.count }
+}
+
 enum FleetLeftovers {
     /// Candidates first, then the biggest.
     static func sorted(_ rows: [MuxaWorktreeRow]) -> [MuxaWorktreeRow] {
@@ -73,7 +81,7 @@ struct FleetLeftoversView: View {
 
     private enum HostState {
         case loading
-        case rows([MuxaWorktreeRow])
+        case rows(MuxaWorktreeInventory)
         case failed(String)
     }
 
@@ -133,7 +141,8 @@ struct FleetLeftoversView: View {
                 Image(systemName: MuxaHostIcons.icon(for: host.alias, local: host.local))
                     .foregroundStyle(.secondary)
                 Text(host.alias).font(.system(size: 13, weight: .semibold))
-                if case .rows(let rows) = states[host.alias] {
+                if case .rows(let inventory) = states[host.alias] {
+                    let rows = inventory.rows
                     let candidates = rows.filter(\.candidate)
                     Text(String(localized: "\(rows.count) worktrees · \(candidates.count) with no blocker · \(FleetLeftovers.size(candidates.compactMap(\.bytes).reduce(0, +)))"))
                         .font(MuxaType.meta)
@@ -149,12 +158,20 @@ struct FleetLeftoversView: View {
                 Label(message, systemImage: "exclamationmark.circle")
                     .font(MuxaType.meta)
                     .foregroundStyle(.orange)
-            case .rows(let rows) where rows.isEmpty:
+            case .rows(let inventory) where inventory.rows.isEmpty:
                 Text("No worktrees muxa created on this host.")
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
-            case .rows(let rows):
-                ForEach(FleetLeftovers.sorted(rows)) { row in
+            case .rows(let inventory):
+                if inventory.isCut {
+                    Label(
+                        String(localized: "Showing \(inventory.rows.count) of \(inventory.total), those still on disk first. Run muxa worktrees on \(host.alias) for all."),
+                        systemImage: "info.circle"
+                    )
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.secondary)
+                }
+                ForEach(FleetLeftovers.sorted(inventory.rows)) { row in
                     worktreeRow(row)
                 }
             }

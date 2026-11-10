@@ -600,10 +600,15 @@ fn spawn_worktree_inventory(command: HostCommand) -> Option<HostCommand> {
     };
     audit_operation(LOCAL_HOST_ALIAS, "worktree_inventory", 0);
     tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(|| muxa::worktree_inventory::inventory(false))
-            .await
-            .map(FleetCommandResult::worktrees)
-            .map_err(|error| format!("worktree inventory failed: {error}"));
+        let result = tokio::task::spawn_blocking(|| {
+            muxa::worktree_inventory::inventory(
+                false,
+                Some(muxa::worktree_inventory::FLEET_MAX_ROWS),
+            )
+        })
+        .await
+        .map(FleetCommandResult::worktrees)
+        .map_err(|error| format!("worktree inventory failed: {error}"));
         drop(permit);
         let _ = reply.send(result);
     });

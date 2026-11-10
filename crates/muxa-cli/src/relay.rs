@@ -417,9 +417,14 @@ async fn handle_request(
             let Ok(_permit) = SCAN.try_acquire() else {
                 bail!("a worktree check is already running on this host");
             };
-            let rows = tokio::task::spawn_blocking(|| muxa::worktree_inventory::inventory(false))
-                .await
-                .context("worktree inventory task panicked")?;
+            let rows = tokio::task::spawn_blocking(|| {
+                muxa::worktree_inventory::inventory(
+                    false,
+                    Some(muxa::worktree_inventory::FLEET_MAX_ROWS),
+                )
+            })
+            .await
+            .context("worktree inventory task panicked")?;
             Ok(RelayFrame::Result {
                 request_id,
                 result: FleetCommandResult::worktrees(rows),

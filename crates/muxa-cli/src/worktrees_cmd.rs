@@ -48,8 +48,10 @@ pub(crate) struct Args {
 }
 
 pub(crate) async fn run(args: Args) -> Result<()> {
-    let rows =
-        tokio::task::spawn_blocking(move || muxa::worktree_inventory::inventory(args.all)).await?;
+    let rows = tokio::task::spawn_blocking(move || {
+        muxa::worktree_inventory::inventory(args.all, None).rows
+    })
+    .await?;
     if args.json {
         println!("{}", serde_json::to_string_pretty(&rows)?);
     } else {

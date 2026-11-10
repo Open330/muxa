@@ -937,9 +937,11 @@ private struct MuxaFleetCommandResult: Decodable, Sendable {
     let collaborationReadToken: String?
     let collaborationUnchanged: Bool?
     let worktrees: [MuxaWorktreeRow]?
+    let worktreesTotal: Int?
 
     enum CodingKeys: String, CodingKey {
         case accepted, message, capture, worktrees
+        case worktreesTotal = "worktrees_total"
         case captureRawBase64 = "capture_raw_base64"
         case collaborationRequest = "collaboration_request"
         case collaborationIncoming = "collaboration_incoming"
@@ -1397,12 +1399,13 @@ actor MuxaIPCClient {
 
     /// The host's receipted worktrees and what would stop a cleanup from
     /// taking each. Read-only.
-    func fleetWorktrees(host: MuxaFleetHostIdentity) async throws -> [MuxaWorktreeRow] {
+    func fleetWorktrees(host: MuxaFleetHostIdentity) async throws -> MuxaWorktreeInventory {
         guard capabilities.contains("fleet_worktrees_v1") else {
             throw MuxaIPCError.server(String(localized: "Listing worktrees needs an updated muxad; update muxa and restart muxad"))
         }
         let result = try await fleetCommand(host: host, operation: ["kind": "worktree_inventory"])
-        return result.worktrees ?? []
+        let rows = result.worktrees ?? []
+        return MuxaWorktreeInventory(rows: rows, total: max(result.worktreesTotal ?? rows.count, rows.count))
     }
 
     func sendFleetPrompt(
