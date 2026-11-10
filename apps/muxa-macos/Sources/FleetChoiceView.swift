@@ -203,3 +203,96 @@ struct FleetChoicePanel<Fallback: View>: View {
         }
     }
 }
+
+/// Another agent in the same unit that waits on the person: who it is, what
+/// it asks, and its own answer, so one unit with several asking agents does
+/// not hide all but the first.
+struct FleetWaitingAgent: View {
+    @ObservedObject var model: AppModel
+    let hosted: MuxaHostedAgent
+    let open: (MuxaHostedAgent) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 6) {
+                AgentStatusTag(status: hosted.agent.status, showsLabel: false)
+                Text(FleetBoard.owner(hosted))
+                    .font(MuxaType.body.weight(.medium))
+                Spacer(minLength: 4)
+                Button("Open") { open(hosted) }
+                    .buttonStyle(.muxaSecondary)
+                    .controlSize(.small)
+            }
+            Text(FleetBoard.question(for: hosted.agent, now: .now))
+                .font(MuxaType.body)
+                .fixedSize(horizontal: false, vertical: true)
+                .textSelection(.enabled)
+            if hosted.pane != nil, ["waiting_input", "waiting_choice"].contains(hosted.agent.state) {
+                FleetChoicePanel(model: model, hosted: hosted) {
+                    FleetAgentAnswerField(model: model, hosted: hosted)
+                }
+                .id(hosted.id)
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// Words sent straight to one agent's pane, for an agent that is not the
+/// unit's reply target.
+struct FleetAgentAnswerField: View {
+    @ObservedObject var model: AppModel
+    let hosted: MuxaHostedAgent
+    @State private var text = ""
+    @State private var sending = false
+    @State private var error: String?
+    @State private var sent = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .bottom, spacing: 8) {
+                TextField("Answer \(FleetBoard.owner(hosted))", text: $text, axis: .vertical)
+                    .textFieldStyle(.roundedBorder)
+                    .lineLimit(1...5)
+                    .disabled(sending)
+                Button("Send", action: send)
+                    .buttonStyle(.muxaPrimary)
+                    .disabled(sending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            if let error {
+                Label(error, systemImage: "exclamationmark.circle.fill")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.red)
+            } else if sent {
+                Label("Sent", systemImage: "checkmark.circle.fill")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.green)
+            }
+        }
+    }
+
+    private func send() {
+        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty, let pane = hosted.pane else { return }
+        sending = true
+        error = nil
+        sent = false
+        Task {
+            defer { sending = false }
+            do {
+                guard let live = model.hostedAgents.first(where: { $0.id == hosted.id }),
+                      live.agent.agentSessionID == hosted.agent.agentSessionID,
+                      live.agent.status.needsAttention else {
+                    throw MuxaIPCError.server(String(localized: "The agent moved on. Open its pane to see where it is."))
+                }
+                try await model.client.sendFleetPrompt(host: hosted.host, pane: pane, text: words, submit: true)
+                text = ""
+                sent = true
+            } catch {
+                if FleetChoicePanel<EmptyView>.isCancellation(error) { return }
+                self.error = error.localizedDescription
+            }
+        }
+    }
+}

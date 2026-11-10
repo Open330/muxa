@@ -13,6 +13,35 @@ enum FleetLane: Int, CaseIterable, Identifiable, Sendable {
     case finished
 
     var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .needsYou: String(localized: "Your turn")
+        case .running: String(localized: "In progress")
+        case .finished: String(localized: "Finished")
+        }
+    }
+}
+
+extension FleetBoard {
+    /// Units that changed lane since `previous`, with the lane each came
+    /// from. A unit new to the board did not move.
+    static func laneMoves(previous: [String: FleetLane], current: [FleetWork]) -> [String: FleetLane] {
+        var moves: [String: FleetLane] = [:]
+        for work in current {
+            if let before = previous[work.id], before != work.lane { moves[work.id] = before }
+        }
+        return moves
+    }
+
+    /// Every agent in the unit, helpers included, that waits on the person,
+    /// most urgent first. The focus answers on the card; the others answer
+    /// from their own row in the inspector.
+    static func waiting(_ work: FleetWork, now: Date = .now) -> [MuxaHostedAgent] {
+        (work.agents + work.helpers)
+            .filter { $0.agent.status(at: now).needsAttention }
+            .sorted { $0.agent.status(at: now).priority < $1.agent.status(at: now).priority }
+    }
 }
 
 struct FleetWorkStage: Hashable, Sendable {

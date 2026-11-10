@@ -694,3 +694,26 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     let fromFour = FleetChoiceDialog(question: dialog.question, options: dialog.options, selected: 4)
     #expect(fromFour.moves(to: 1) == ["up", "up", "up"])
 }
+
+@Test func cardsThatChangeLaneRememberWhereTheyCameFrom() throws {
+    let impl = try member("impl", "idle", alias: "impl", pane: "%1")
+    let fresh = MuxaHostedAgent(host: host, agent: try agent(["state": "working"], id: "new"), pane: nil)
+    let works = FleetBoard.works(groups: [], agents: [impl, fresh])
+    let finished = try #require(works.first { $0.lane == .finished })
+
+    let moves = FleetBoard.laneMoves(previous: [finished.id: .running], current: works)
+
+    #expect(moves == [finished.id: .running])
+    #expect(FleetBoard.laneMoves(previous: [finished.id: .finished], current: works).isEmpty)
+}
+
+@Test func everyAgentWaitingInOneUnitIsListed() throws {
+    let impl = try member("impl", "waiting_choice", alias: "impl", pane: "%1")
+    let review = try member("review", "waiting_input", alias: "review", pane: "%2")
+    let work = FleetBoard.work(for: try group([:], [impl, review]), now: .now)
+
+    #expect(work.lane == .needsYou)
+    let waiting = FleetBoard.waiting(work)
+    #expect(Set(waiting.map(\.agent.agentSessionID)) == ["impl", "review"])
+    #expect(waiting.first?.id == work.focus?.id)
+}

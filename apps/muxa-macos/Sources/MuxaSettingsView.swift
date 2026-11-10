@@ -43,6 +43,7 @@ enum MuxaSettingsTab: String, CaseIterable, Identifiable {
 enum MuxaPreferences {
     static let appearanceKey = "muxa.appearance"
     static let showWorkbenchOnLaunchKey = "muxa.showWorkbenchOnLaunch"
+    static let homeAnimatesMovesKey = "muxa.home.animatesMoves"
     static let settingsTabKey = "muxa.settings.selectedTab"
     static let workDirectoryKey = "nativeWorkDirectory"
     static let menuBarAgentLimitKey = "muxa.menuBar.maximumAgentIcons"
@@ -242,6 +243,7 @@ private struct MuxaMenuBarSettingsView: View {
 private struct MuxaGeneralSettingsView: View {
     @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
     @AppStorage(MuxaPreferences.showWorkbenchOnLaunchKey) private var showWorkbenchOnLaunch = true
+    @AppStorage(MuxaPreferences.homeAnimatesMovesKey) private var homeAnimatesMoves = true
     @AppStorage(MuxaPreferences.workDirectoryKey) private var workDirectory = ""
     @Environment(\.openWindow) private var openWindow
 
@@ -264,6 +266,13 @@ private struct MuxaGeneralSettingsView: View {
             }
 
             MuxaLanguageSettingsSection()
+
+            Section("Home") {
+                Toggle("Animate cards moving between lanes", isOn: $homeAnimatesMoves)
+                Text("A card glides to its new lane and shows where it came from for a few seconds.")
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.secondary)
+            }
 
             Section("Startup") {
                 Toggle("Show the Workbench when Muxa launches", isOn: $showWorkbenchOnLaunch)

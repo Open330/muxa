@@ -1,6 +1,16 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "%lld agents wait on you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 %lld개가 답을 기다림"
+          }
+        }
+      }
+    },
     "%lld empty sessions" : {
       "localizations" : {
         "ko" : {
@@ -81,6 +91,16 @@
         }
       }
     },
+    "A card glides to its new lane and shows where it came from for a few seconds." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "카드가 새 칸으로 부드럽게 이동하고, 몇 초 동안 어디에서 왔는지 표시합니다."
+          }
+        }
+      }
+    },
     "Add Approval Rule…" : {
       "localizations" : {
         "ko" : {
@@ -141,6 +161,16 @@
         }
       }
     },
+    "Also waiting on you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "함께 답을 기다리는 에이전트"
+          }
+        }
+      }
+    },
     "Always Approve This Command" : {
       "localizations" : {
         "ko" : {
@@ -161,12 +191,32 @@
         }
       }
     },
+    "Animate cards moving between lanes" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "카드가 칸 사이를 옮겨 갈 때 애니메이션으로 보여 주기"
+          }
+        }
+      }
+    },
     "Answer" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "답하기"
+          }
+        }
+      }
+    },
+    "Answer %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에게 답하기"
           }
         }
       }
@@ -2285,6 +2335,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "대기 중인 에이전트를 최상위 프롬프트에서만 깨우고, 턴 도중에는 건드리지 않습니다."
+          }
+        }
+      }
+    },
+    "From %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@에서 옴"
           }
         }
       }

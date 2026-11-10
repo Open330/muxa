@@ -18,6 +18,13 @@ struct FleetHomeView: View {
     @State private var quickLook: FleetQuickLookTarget?
     @State private var showsReview = false
     @AppStorage("home.review.scope") private var reviewScope: FleetReviewScope = .day
+    @AppStorage(MuxaPreferences.homeAnimatesMovesKey) private var animatesMoves = true
+    @Namespace private var cardSpace
+    /// Each unit's lane at the last update, to tell which cards moved.
+    @State private var lastLanes: [String: FleetLane] = [:]
+    /// Cards that just changed lane, with the lane they left; cleared a few
+    /// seconds later.
+    @State private var movedFrom: [String: FleetLane] = [:]
 
     private var allWorks: [FleetWork] {
         FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
@@ -214,12 +221,30 @@ struct FleetHomeView: View {
         .onExitCommand { selectedID = nil }
         // Display filters hide units; they are not gone. Prune review marks
         // against the whole board.
+        .onAppear { lastLanes = Dictionary(allWorks.map { ($0.id, $0.lane) }, uniquingKeysWith: { first, _ in first }) }
+        .onChange(of: allWorks.map { "\($0.id)|\($0.lane.rawValue)" }) { _ in noteMoves() }
         .onChange(of: allWorks.map(\.id)) { ids in
             // Only a live board says a unit is gone; a disconnect is not.
             guard model.isConnected, !ids.isEmpty else { return }
             var pruned = reviewed
             pruned.prune(keeping: Set(ids))
             if pruned != reviewed { reviewed = pruned; reviewed.save(to: .standard) }
+        }
+    }
+
+    /// Marks the cards that changed lane so they can show where they came
+    /// from, and forgets the mark after a few seconds.
+    private func noteMoves() {
+        let works = allWorks
+        let moves = FleetBoard.laneMoves(previous: lastLanes, current: works)
+        lastLanes = Dictionary(works.map { ($0.id, $0.lane) }, uniquingKeysWith: { first, _ in first })
+        guard animatesMoves, !moves.isEmpty else { return }
+        movedFrom.merge(moves) { _, new in new }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            withAnimation(.easeOut(duration: 0.4)) {
+                for (id, lane) in moves where movedFrom[id] == lane { movedFrom[id] = nil }
+            }
         }
     }
 
@@ -297,10 +322,16 @@ struct FleetHomeView: View {
                             select: { id in selectedID = selectedID == id ? nil : id },
                             open: peek,
                             reviewedCount: lane == .finished ? reviewedCount : 0,
-                            showsReviewed: $showsReviewed
+                            showsReviewed: $showsReviewed,
+                            cardSpace: animatesMoves ? cardSpace : nil,
+                            movedFrom: movedFrom
                         )
                     }
                 }
+                .animation(
+                    animatesMoves ? .spring(response: 0.5, dampingFraction: 0.86) : nil,
+                    value: works.map { "\($0.id)|\($0.lane.rawValue)" }
+                )
                 .padding(16)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
@@ -340,6 +371,9 @@ private struct FleetLaneColumn: View {
     let open: (MuxaHostedAgent) -> Void
     var reviewedCount = 0
     @Binding var showsReviewed: Bool
+    /// Set when cards should glide between lanes.
+    var cardSpace: Namespace.ID?
+    var movedFrom: [String: FleetLane] = [:]
     @State private var showsOlder = false
     @State private var showsProbable = false
     @State private var showsEmpty = false
@@ -372,13 +406,7 @@ private struct FleetLaneColumn: View {
     private var probableCount: Int { works.filter { fold($0) == .probable }.count }
     private var olderCount: Int { works.filter { fold($0) == .older }.count }
 
-    private var title: String {
-        switch lane {
-        case .needsYou: String(localized: "Your turn")
-        case .running: String(localized: "In progress")
-        case .finished: String(localized: "Finished")
-        }
-    }
+    private var title: String { lane.title }
 
     private var subtitle: String {
         switch lane {
@@ -433,8 +461,10 @@ private struct FleetLaneColumn: View {
                             FleetWorkCard(
                                 work: work,
                                 isSelected: work.id == selectedID,
-                                select: { select(work.id) }
+                                select: { select(work.id) },
+                                movedFrom: movedFrom[work.id]
                             )
+                            .modifier(FleetCardMotion(id: work.id, space: cardSpace))
                         }
                     }
                     if emptyCount > 0 {
@@ -514,7 +544,16 @@ private struct FleetWorkCard: View {
     let work: FleetWork
     let isSelected: Bool
     let select: () -> Void
+    var movedFrom: FleetLane?
     @Environment(\.colorScheme) private var colorScheme
+
+    private var laneTint: Color {
+        switch work.lane {
+        case .needsYou: .orange
+        case .running: .blue
+        case .finished: .green
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -532,6 +571,16 @@ private struct FleetWorkCard: View {
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if let movedFrom {
+                    Label(String(localized: "From \(movedFrom.title)"), systemImage: "arrow.turn.down.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(laneTint.opacity(0.18), in: Capsule())
+                        .foregroundStyle(laneTint)
+                        .fixedSize()
+                        .transition(.opacity)
+                }
             }
             if work.lane != .finished || work.stages.count > 1 {
                 FleetStageBar(work: work)
@@ -545,6 +594,11 @@ private struct FleetWorkCard: View {
                 Label("Rate limited · the limit policy will resume it", systemImage: "arrow.triangle.2.circlepath")
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
+            }
+            if work.lane == .needsYou, FleetBoard.waiting(work).count > 1 {
+                Label(String(localized: "\(FleetBoard.waiting(work).count) agents wait on you"), systemImage: "person.2.badge.gearshape")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.orange)
             }
             HStack(spacing: 6) {
                 if let repo = work.repo {
@@ -570,6 +624,12 @@ private struct FleetWorkCard: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(isSelected ? Color.accentColor : MuxaTheme.border(colorScheme), lineWidth: isSelected ? 1.5 : 1)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(laneTint, lineWidth: 2)
+                .opacity(movedFrom == nil ? 0 : 0.9)
+                .allowsHitTesting(false)
         )
         .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .onTapGesture(perform: select)
@@ -729,6 +789,19 @@ private struct FleetWorkInspector: View {
                 .id(focus.id)
             } else if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
                 FleetReplyField(work: work, draft: $draft, submit: submit)
+            }
+            let others = FleetBoard.waiting(work).filter { $0.id != work.focus?.id }
+            if work.lane == .needsYou, !others.isEmpty {
+                // One unit, several agents asking: each answers on its own.
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Also waiting on you")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.orange)
+                    ForEach(others) { hosted in
+                        FleetWaitingAgent(model: model, hosted: hosted, open: open)
+                    }
+                }
+                .padding(.top, 4)
             }
             HStack(spacing: 8) {
                 if let focus = work.focus {
@@ -1003,6 +1076,23 @@ struct FleetHostBadges: View {
                 }
                 .help(host.local ? String(localized: "\(host.alias) (this Mac)") : host.alias)
             }
+        }
+    }
+}
+
+/// Lets a card glide from its old lane to its new one: the same id in one
+/// namespace across the lanes. Off when the setting is.
+private struct FleetCardMotion: ViewModifier {
+    let id: String
+    let space: Namespace.ID?
+
+    func body(content: Content) -> some View {
+        if let space {
+            content
+                .matchedGeometryEffect(id: id, in: space)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+        } else {
+            content
         }
     }
 }
