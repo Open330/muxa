@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.9] - 2026-11-10
+
+### Added
+
+- macOS: **Home** replaces the Command Center and the Work list. Units of work
+  sit in three lanes (Your turn, In progress, Finished), grouped by project,
+  with host and project filters, host icons, and helper and empty sessions
+  folded away. A card opens a quick look with a summary; the full pane is one
+  step further. Start Work asks only for the task.
+- Home answers, assigns and sends back work. A question shows option buttons
+  when a choice is on screen and an answer field otherwise. Options are picked
+  with arrow keys from the detected cursor, only after a fresh read shows the
+  same question at the same pane and wait. A unit where several agents wait
+  lets each be answered on its own.
+- Home review (⇧⌘R) goes through results the person asked for, by time range:
+  a digest (default), cards with swipes and home-row keys, or an inbox. The
+  default Ask provider can summarize the batch and turn one reply into a
+  message per agent, each shown and editable before sending.
+- Permission prompts the user names can be approved from Home by rule, checked
+  against both the screen and the agent's hook.
+- Cards glide between lanes and show where they came from (Settings › General
+  › Home). The menu bar shows Claude and Codex marks, and fleet host icons can
+  be chosen.
+- Daemon: `ask_one_shot` runs the configured Ask provider once in plan mode
+  (`ask_one_shot_v1`). Fleet `send_keys` sends Up, Down, Enter, Escape and Tab
+  only, refused on observe-only hosts and on relays without `send_keys_v1`.
+
 ### Fixed
 
 - Dedicated Claude workers declare a process-local inbound-message policy so
