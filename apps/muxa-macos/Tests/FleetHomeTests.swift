@@ -732,3 +732,16 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(shown.options.map(\.label) == now.options.map(\.label))
     #expect(shown.options != now.options)
 }
+
+@MainActor
+@Test func aSecondChoiceForTheSameAgentWaitsForTheFirst() {
+    let sends = FleetChoiceSends()
+    #expect(sends.begin("a"))
+    #expect(!sends.begin("a"))
+    #expect(sends.begin("b"))
+    sends.finish("a", .init(succeeded: true, message: "Chose 1"))
+    #expect(!sends.isPending("a"))
+    #expect(sends.outcome("a")?.succeeded == true)
+    #expect(sends.begin("a"))
+    #expect(sends.outcome("a") == nil)
+}

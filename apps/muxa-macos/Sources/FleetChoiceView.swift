@@ -17,10 +17,32 @@ struct FleetChoicePanel<Fallback: View>: View {
     /// holds them.
     @State private var seen: Seen?
     @State private var loading = false
-    @State private var sending = false
     @State private var ownWords = ""
-    @State private var status: String?
+    /// The question the own words were written for; set when typing starts.
+    @State private var ownWordsFor: Fingerprint?
     @State private var error: String?
+    /// Sends outlive the panel: closing and reopening it shows the one in
+    /// flight and cannot start a second.
+    @ObservedObject private var sends = FleetChoiceSends.shared
+
+    private var sending: Bool { sends.isPending(hosted.id) }
+
+    /// The dialog on screen, as the person sees it, from that pane and wait.
+    struct Fingerprint: Equatable {
+        let seen: Seen
+        let question: String
+        let options: [FleetChoiceDialog.Option]
+    }
+
+    private var fingerprint: Fingerprint? {
+        guard let dialog, let seen else { return nil }
+        return Fingerprint(seen: seen, question: dialog.question, options: dialog.options)
+    }
+
+    /// Own words written for a question that is no longer the one shown.
+    private var ownWordsAreStale: Bool {
+        !ownWords.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && ownWordsFor != fingerprint
+    }
 
     init(model: AppModel, hosted: MuxaHostedAgent, @ViewBuilder fallback: @escaping () -> Fallback) {
         self.model = model
@@ -97,14 +119,43 @@ struct FleetChoicePanel<Fallback: View>: View {
                     }
                 }
                 if let typed = dialog.options.first(where: \.takesText) {
+                    if ownWordsAreStale {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Label("Written for an earlier question. It was not sent.", systemImage: "exclamationmark.triangle.fill")
+                                .font(MuxaType.meta)
+                                .foregroundStyle(.orange)
+                            HStack(spacing: 8) {
+                                Button("Use for This Question") { ownWordsFor = fingerprint }
+                                    .buttonStyle(.muxaSecondary)
+                                    .controlSize(.small)
+                                Button("Discard", role: .destructive) {
+                                    ownWords = ""
+                                    ownWordsFor = nil
+                                }
+                                .buttonStyle(.muxaGhost)
+                                .controlSize(.small)
+                            }
+                            .disabled(sending)
+                        }
+                    }
                     HStack(alignment: .bottom, spacing: 8) {
-                        TextField("Your own answer", text: $ownWords, axis: .vertical)
+                        TextField("Your own answer", text: Binding(
+                            get: { ownWords },
+                            set: { text in
+                                ownWords = text
+                                if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                                    ownWordsFor = nil
+                                } else if ownWordsFor == nil {
+                                    ownWordsFor = fingerprint
+                                }
+                            }
+                        ), axis: .vertical)
                             .textFieldStyle(.roundedBorder)
                             .lineLimit(1...5)
                             .disabled(sending)
                         Button("Answer") { choose(typed, words: ownWords) }
                             .buttonStyle(.muxaPrimary)
-                            .disabled(sending || ownWords.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                            .disabled(sending || ownWordsAreStale || ownWords.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
                     }
                 }
             } else if !loading {
@@ -118,10 +169,10 @@ struct FleetChoicePanel<Fallback: View>: View {
                 Label(error, systemImage: "exclamationmark.circle.fill")
                     .font(MuxaType.meta)
                     .foregroundStyle(.red)
-            } else if let status {
-                Label(status, systemImage: "checkmark.circle.fill")
+            } else if let outcome = sends.outcome(hosted.id) {
+                Label(outcome.message, systemImage: outcome.succeeded ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
                     .font(MuxaType.meta)
-                    .foregroundStyle(.green)
+                    .foregroundStyle(outcome.succeeded ? Color.green : Color.red)
             }
         }
     }
@@ -187,12 +238,14 @@ struct FleetChoicePanel<Fallback: View>: View {
     /// person's words are typed on that row and submitted. Then the screen
     /// is read once more: a question still there means it did not go through.
     private func choose(_ option: FleetChoiceDialog.Option, words: String?) {
-        guard let shown = dialog, let seen else { return }
-        sending = true
+        guard let shown = dialog, let seen, let fingerprint else { return }
+        // Own words go only to the question they were written for.
+        if words != nil, ownWordsFor != fingerprint { return }
+        // One choice per agent at a time, wherever it was started from.
+        let agentID = hosted.id
+        guard sends.begin(agentID) else { return }
         error = nil
-        status = nil
         Task {
-            defer { sending = false }
             do {
                 var target = try live(seen)
                 let current = try await capture(host: target.host, pane: target.pane)
@@ -222,10 +275,10 @@ struct FleetChoicePanel<Fallback: View>: View {
                     throw MuxaIPCError.server(String(localized: "The choice did not go through; the question is still on screen. Open the pane to answer."))
                 }
                 dialog = after
-                status = String(localized: "Chose \(option.number). \(option.label)")
+                ownWordsFor = nil
+                sends.finish(agentID, .init(succeeded: true, message: String(localized: "Chose \(option.number). \(option.label)")))
             } catch {
-                if Self.isCancellation(error) { return }
-                self.error = error.localizedDescription
+                sends.finish(agentID, Self.isCancellation(error) ? nil : .init(succeeded: false, message: error.localizedDescription))
             }
         }
     }
@@ -262,5 +315,37 @@ struct FleetWaitingAgent<Answer: View>: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+/// Choices being sent, by agent, kept outside any one panel: a panel closed
+/// and reopened mid-send shows the send in flight, and no second choice
+/// starts for that agent until the first one ends.
+@MainActor
+final class FleetChoiceSends: ObservableObject {
+    static let shared = FleetChoiceSends()
+
+    struct Outcome: Equatable {
+        let succeeded: Bool
+        let message: String
+    }
+
+    @Published private var pending: Set<String> = []
+    @Published private var outcomes: [String: Outcome] = [:]
+
+    func isPending(_ agentID: String) -> Bool { pending.contains(agentID) }
+    func outcome(_ agentID: String) -> Outcome? { outcomes[agentID] }
+
+    /// Starts a send for the agent; false when one is already in flight.
+    func begin(_ agentID: String) -> Bool {
+        guard !pending.contains(agentID) else { return false }
+        pending.insert(agentID)
+        outcomes[agentID] = nil
+        return true
+    }
+
+    func finish(_ agentID: String, _ outcome: Outcome?) {
+        pending.remove(agentID)
+        outcomes[agentID] = outcome
     }
 }

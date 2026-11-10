@@ -2339,6 +2339,26 @@
         }
       }
     },
+    "Use for This Question" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 질문에 사용"
+          }
+        }
+      }
+    },
+    "Written for an earlier question. It was not sent." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이전 질문에 쓴 답입니다. 보내지 않았습니다."
+          }
+        }
+      }
+    },
     "aas account" : {
       "localizations" : {
         "ko" : {
