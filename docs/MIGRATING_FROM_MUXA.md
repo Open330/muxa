@@ -41,8 +41,8 @@ before relying on peer requests again.
    python3 scripts/migrate-from-muxa.py --apply
    ```
 
-4. Run `tend init` to install the `tendd` service, open a new shell, and
-   restart your agents so their hooks and MCP server call `tend`.
+4. Open a new shell and restart your agents so their hooks and MCP server call `tend`.
+   If you never had a Muxa service, `tend init` installs one.
 5. Remove Muxa once Tend works: `brew uninstall muxa` (or
    `cargo uninstall muxa-cli muxad`) and move `Muxa.app` to the Trash.
 
@@ -53,7 +53,9 @@ edit instead. `brew install python` gives a newer one.
 
 ## What the script does
 
-- Stops `muxad` and its launchd job, systemd unit or brew service, and removes the old unit files.
+- Stops `muxad` and its brew service, and moves its launchd job or systemd unit (and the restore job) to the Tend name.
+  The job keeps its environment, such as a PATH you tuned for your agents; its label, program and log paths are renamed.
+  It is started again at the end, if Tend is installed where the job expects it.
 - Moves Muxa's data, config and cache directories to `tend`. If a `tend`
   directory already exists, it leaves both in place and tells you.
 - Renames the agent integration bundle (`bootstrap.md`, the collaboration
