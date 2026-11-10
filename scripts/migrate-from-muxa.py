@@ -364,7 +364,10 @@ def stop_services(m: Migration):
             if unit in capture(["systemctl", "--user", "list-unit-files", unit]):
                 m.run(["systemctl", "--user", "disable", "--now", unit], f"disable systemd unit {unit}")
 
-    if have("brew") and "muxa" in capture(["brew", "services", "list"]).split():
+    # `brew services list` lists every formula with a service block; only
+    # one whose status is not "none"/"stopped" actually runs as a service.
+    brew_status = re.search(r"^muxa\s+(\S+)", capture(["brew", "services", "list"]) if have("brew") else "", re.M)
+    if brew_status and brew_status.group(1) not in ("none", "stopped"):
         m.run(["brew", "services", "stop", "muxa"], "stop brew service muxa")
         NEW_SERVICES.append(("brew", Path("tend"), "tend"))
     if capture(["pgrep", "-x", "muxad"]).strip():
