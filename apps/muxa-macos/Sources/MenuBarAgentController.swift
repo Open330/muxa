@@ -22,10 +22,14 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     private var hostIcons = MuxaHostIcons.all()
     private let registry = MuxaModuleRegistry.shared
     private var selectedChipID: String?
+    private var cardDestination: String?
     private var showAasChip = UserDefaults.standard.object(forKey: MuxaPreferences.menuBarAasChipKey) as? Bool ?? true
     private var focus: Int?
     private var pointerInside = false
+    private var pointerOnChip = false
+    private var foldIntent = MuxaMenuBarFoldIntent()
     private var lastPoint: NSPoint?
+    private var menuBarBands: [NSRect]?
     private var timer: Timer?
     private var popover: NSPopover?
     private var keyMonitor: Any?
@@ -33,7 +37,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     private var focusSince = Date()
     private var previousLook: NSAppearance.Name?
     private var appearanceObservation: NSKeyValueObservation?
-    private var closingClickAt: Date?
+    private var closingClick: (destination: String?, at: Date)?
     private var animationFrom: [CGFloat] = []
     private var positions: [CGFloat] = []
     private var pillWidth = MuxaMenuBarGeometry.disc
@@ -55,6 +59,12 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     private var usageRefreshAt = Date()
     private var screenSleeping = false
     private var sleepObservers: [NSObjectProtocol] = []
+
+    /// Read-only AppKit surface for focused integration tests.
+    var presentedCard: NSPopover? { popover }
+    var presentationDiagnostics: String {
+        "active=\(NSApp.isActive), anchor=\(String(describing: item.button?.window?.frame)), visible=\(String(describing: item.button?.window?.isVisible)), shown=\(popover?.isShown == true)"
+    }
 
     private var geometry: MuxaMenuBarGeometry { MuxaMenuBarGeometry(count: chips.count) }
 
@@ -190,7 +200,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         availableChips = activity + (usage.map { [$0] } ?? [])
         // Freeze membership, capsule width and overflow while pointing or reading.
         // Existing chips still receive live status; vanished sessions cannot act.
-        if !pointerInside && popover?.isShown != true && animationStarted == nil {
+        if !pointerInside && focus == nil && popover?.isShown != true && animationStarted == nil {
             // Bound physical width rather than agent count. Leave most of the
             // menu bar to the active app and the user's other status items.
             let screen = item.button?.window?.screen ?? NSScreen.main
@@ -235,6 +245,15 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         drawnPillWidth = animationPillFrom
         animationLeadFrom = lead
         animationStarted = Date()
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion {
+            animationStarted = nil
+            positions = geometry.layout(focus: index, pillWidth: pillWidth)
+            markOpacity = geometry.hidesMark(index) ? 0 : 1
+            drawnPillWidth = index == nil ? MuxaMenuBarGeometry.disc : pillWidth
+            lead = index == nil ? 0 : geometry.hoverLead(pillWidth: pillWidth)
+            render()
+            if index == nil && !pointerInside && popover?.isShown != true { refresh() }
+        }
         updatePollingRate()
         updateAccessibility()
     }
@@ -251,26 +270,44 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
                 Task { await aas.store.refresh() }
             }
         }
+        let now = Date()
         let point = NSEvent.mouseLocation
         if point != lastPoint {
             lastPoint = point
-            let inside = itemFrame(near: point).map { frame in
-                point.x >= frame.minX && point.x < frame.maxX && point.y >= frame.minY && point.y <= frame.maxY + 1
-            } ?? false
             let wasInside = pointerInside
-            pointerInside = inside
-            if inside, let frame = itemFrame(near: point) {
-                setFocus(chipIndex(near: point, frame: frame))
-            } else if wasInside {
-                hidePeek()
-                if popover?.isShown != true {
-                    setFocus(nil)
-                    if animationStarted == nil { refresh() }
+            let wasOnChip = pointerOnChip
+            pointerOnChip = false
+            if (focus != nil || pointerInside || isNearMenuBar(point)), let frame = itemFrame(near: point) {
+                switch MuxaMenuBarHoverPolicy.zone(point: point, item: frame, peek: peek?.frame) {
+                case .item:
+                    pointerInside = true
+                    if let index = chipIndex(near: point, frame: frame) {
+                        pointerOnChip = true
+                        foldIntent.cancel()
+                        if !wasOnChip { focusSince = now }
+                        setFocus(index) // No dwell delay before unfolding.
+                    } else {
+                        scheduleFold(grace: MuxaMenuBarHoverPolicy.exitGrace, now: now)
+                    }
+                case .margin:
+                    pointerInside = focus != nil
+                    foldIntent.cancel()
+                case .peek:
+                    pointerInside = false
+                    scheduleFold(grace: MuxaMenuBarHoverPolicy.peekGrace, now: now)
+                case .outside:
+                    pointerInside = false
+                    scheduleFold(grace: MuxaMenuBarHoverPolicy.exitGrace, now: now)
                 }
+            } else {
+                pointerInside = false
+                scheduleFold(grace: MuxaMenuBarHoverPolicy.exitGrace, now: now)
             }
+            if wasInside && !pointerInside && focus == nil && animationStarted == nil && popover?.isShown != true { refresh() }
         }
+        if popover?.isShown != true, foldIntent.consume(now: now) { setFocus(nil) }
         if let start = animationStarted {
-            let t = min(1, Date().timeIntervalSince(start) / 0.16)
+            let t = min(1, Date().timeIntervalSince(start) / (focus == nil ? MuxaMenuBarHoverPolicy.foldDuration : MuxaMenuBarHoverPolicy.unfoldDuration))
             let ease = CGFloat(1 - pow(1 - t, 3))
             let targets = geometry.layout(focus: focus, pillWidth: pillWidth)
             positions = chips.indices.map { index in
@@ -290,11 +327,16 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
             }
             render()
         }
-        if pointerInside, popover?.isShown != true, peek == nil,
+        if pointerOnChip, popover?.isShown != true, peek == nil,
            let focus, Date().timeIntervalSince(focusSince) >= 0.3 {
             showPeek(focus)
         }
         updatePollingRate()
+    }
+
+    private func scheduleFold(grace: TimeInterval, now: Date = .now) {
+        guard focus != nil, popover?.isShown != true else { return }
+        foldIntent.schedule(now: now, grace: grace)
     }
 
     private func updatePollingRate() {
@@ -305,7 +347,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
             pollingInterval = 0
             return
         }
-        let interval = MuxaMenuBarPolling.interval(pointerInside: pointerInside, animating: animationStarted != nil, popoverShown: popover?.isShown == true)
+        let interval = MuxaMenuBarPolling.interval(pointerInside: pointerInside, animating: animationStarted != nil, popoverShown: popover?.isShown == true, waitingToFold: foldIntent.deadline != nil)
         guard interval != pollingInterval else { return }
         pollingInterval = interval
         timer?.invalidate()
@@ -315,6 +357,18 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         timer.tolerance = interval / 4
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+    }
+
+    /// Most pointer movement is nowhere near a menu bar. Avoid asking AppKit
+    /// for the replicated status window's frame on those idle movements.
+    private func isNearMenuBar(_ point: NSPoint) -> Bool {
+        let bands = menuBarBands ?? NSScreen.screens.map { screen in
+            let height = max(screen.frame.maxY - screen.visibleFrame.maxY, NSStatusBar.system.thickness, 40) + 12
+            return NSRect(x: screen.frame.minX, y: screen.frame.maxY - height,
+                          width: screen.frame.width, height: height + 1)
+        }
+        menuBarBands = bands
+        return bands.contains { $0.contains(point) }
     }
 
     /// Translate the offscreen stand-in to the pointer's display, retaining
@@ -330,21 +384,36 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     }
 
     @objc private func clicked() {
-        // A transient popover may have closed on this click's mouse-down.
-        if let closingClickAt, Date().timeIntervalSince(closingClickAt) < 0.6 {
-            self.closingClickAt = nil
-            return
-        }
+        foldIntent.cancel()
         let point = NSEvent.mouseLocation
         if NSApp.currentEvent?.type != .rightMouseUp,
            let frame = itemFrame(near: point),
            let index = chipIndex(near: point, frame: frame), chips.indices.contains(index) {
             showChip(chips[index])
         } else {
-            state.scope = nil
-            state.showingUsage = false
-            selectedChipID = nil
-            show(selected: nil)
+            showOverview()
+        }
+    }
+
+    func showOverview() {
+        guard !toggleCard(destination: nil) else { return }
+        state.scope = nil
+        state.showingUsage = false
+        selectedChipID = nil
+        cardDestination = nil
+        show(selected: nil)
+    }
+
+    private func toggleCard(destination: String?) -> Bool {
+        let closing = closingClick
+        closingClick = nil
+        let action = MuxaMenuBarCardInteraction.action(
+            requested: destination, current: cardDestination, shown: popover?.isShown == true,
+            closed: closing?.destination, closedAt: closing?.at, now: .now)
+        switch action {
+        case .close: popover?.performClose(nil); return true
+        case .ignore: return true
+        case .open: return false
         }
     }
 
@@ -353,9 +422,10 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         show(selected: id)
     }
 
-    private func showChip(_ chip: MuxaMenuBarChip) {
-        if popover?.isShown == true { popover?.performClose(nil); return }
+    func showChip(_ chip: MuxaMenuBarChip) {
+        guard !toggleCard(destination: chip.id) else { return }
         selectedChipID = chip.id
+        cardDestination = chip.id
         switch chip.destination {
         case .agent(let id):
             state.scope = nil
@@ -375,11 +445,15 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     }
 
     private func show(selected: String?) {
+        foldIntent.cancel()
         hidePeek()
         if popover?.isShown == true {
-            if state.selectedID == selected { popover?.performClose(nil); return }
             state.selectedID = selected
             acknowledge(selected)
+            setFocus(chips.firstIndex { $0.id == selectedChipID })
+            NSApp.activate(ignoringOtherApps: true)
+            popover?.contentViewController?.view.window?.makeKey()
+            render()
             return
         }
         state.selectedID = selected
@@ -399,6 +473,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         popover = surface
         let index = chips.firstIndex { $0.id == selectedChipID }
         if let index { setFocus(index) }
+        NSApp.activate(ignoringOtherApps: true)
         surface.show(relativeTo: index.map(chipRect) ?? markRect, of: button, preferredEdge: .minY)
         if surface.isShown { acknowledge(selected) }
         surface.contentViewController?.view.window?.makeKey()
@@ -406,7 +481,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         render()
     }
 
-    private func selectInCard(_ id: String?) {
+    func selectInCard(_ id: String?) {
         state.selectedID = id
         acknowledge(id)
         state.showingUsage = false
@@ -434,7 +509,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
-        if NSApp.currentEvent?.type == .leftMouseDown || NSApp.currentEvent?.type == .rightMouseDown { closingClickAt = Date() }
+        if NSApp.currentEvent?.type == .leftMouseDown || NSApp.currentEvent?.type == .rightMouseDown { closingClick = (cardDestination, Date()) }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
         popover?.contentViewController = nil
@@ -443,7 +518,8 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         state.scope = nil
         state.showingUsage = false
         selectedChipID = nil
-        if !pointerInside { setFocus(nil) }
+        cardDestination = nil
+        if !pointerInside { scheduleFold(grace: MuxaMenuBarHoverPolicy.exitGrace) }
         if animationStarted == nil { refresh() } else { render() }
     }
 
@@ -492,6 +568,9 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     }
 
     private func dismissForScreenChange() {
+        menuBarBands = nil
+        foldIntent.cancel()
+        setFocus(nil)
         hidePeek()
         popover?.close()
         pointerInside = false
@@ -536,13 +615,14 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         let liveIDs = Set(availableChips.map(\.id)).union(chips.filter { !$0.memberIDs.isDisjoint(with: liveAgents) }.map(\.id))
         let current = MuxaMenuBarRenderState(chips: chips, positions: positions, focus: focus, pillWidth: drawnPillWidth,
             lead: lead, markOpacity: markOpacity, overflow: overflow, selectedID: selectedChipID,
-            liveIDs: liveIDs, dark: previousLook == .darkAqua, mark: mark)
+            liveIDs: liveIDs, dark: previousLook == .darkAqua, mark: mark,
+            backingScales: MuxaMenuBarAgentRenderer.backingScales)
         guard current != lastRendered else { return }
         lastRendered = current
         let image = MuxaMenuBarAgentRenderer.image(
             chips: chips, positions: positions, focus: focus, pillWidth: drawnPillWidth,
             lead: lead, markOpacity: markOpacity, overflow: overflow, selectedID: selectedChipID,
-            liveIDs: liveIDs, dark: previousLook == .darkAqua, mark: mark
+            liveIDs: liveIDs, dark: previousLook == .darkAqua, mark: mark, scales: current.backingScales
         )
         item.length = image.size.width
         button.image = image
@@ -566,10 +646,10 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
                 rect: chipRect(index)) { [weak self] in self?.showChip(agent) }
             elements.append(element)
         }
-        elements.append(MuxaMenuBarElement(label: "Muxa", parent: button, rect: markRect) { [weak self] in self?.show(selected: nil) })
+        elements.append(MuxaMenuBarElement(label: "Muxa", parent: button, rect: markRect) { [weak self] in self?.showOverview() })
         if overflow > 0 {
             elements.append(MuxaMenuBarElement(label: String(localized: "\(overflow) more items"), parent: button,
-                rect: NSRect(x: clusterOrigin + geometry.width, y: 0, width: MuxaMenuBarGeometry.overflowWidth, height: 24)) { [weak self] in self?.show(selected: nil) })
+                rect: NSRect(x: clusterOrigin + geometry.width, y: 0, width: MuxaMenuBarGeometry.overflowWidth, height: 24)) { [weak self] in self?.showOverview() })
         }
         button.setAccessibilityChildren(elements)
         button.toolTip = nil // The hover panel follows the individual chip.

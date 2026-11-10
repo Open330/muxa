@@ -27,7 +27,7 @@ struct FleetHomeView: View {
     @State private var movedFrom: [String: FleetLane] = [:]
 
     private var allWorks: [FleetWork] {
-        FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
+        model.homeWorks
     }
 
     var body: some View {

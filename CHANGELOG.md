@@ -36,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Menu-bar chips unfold without a dwell delay, retain hover across a small
+  margin, and fold after 0.2 seconds (0.45 seconds toward the peek). Pixel-only
+  render keys and scale-specific bitmaps avoid hidden-value redraws and keep
+  Retina chips sharp. Badges and hit testing follow the same avatar stack.
+  A bounded glyph bitmap cache reuses symbols across animation frames.
+  Cards activate the app for keyboard focus and switch directly between chips
+  or overview; only a repeated click on the same destination closes the card.
+- Home builds its work projection off the main thread once per snapshot,
+  rather than repeatedly parsing agent history while drawing the board.
+  Policy changes and periodic reconciliation keep time-based states fresh.
+  Bursts keep one computation in flight and replace pending work with the latest
+  input, rather than launching parallel calculations and discarding their results.
+  The Home sidebar badge reuses this projection instead of rebuilding every Work
+  during SwiftUI rendering.
 - Fresh Claude/Codex peer workers now prepare recognized startup gates and
   verify a stable empty input composer before dispatch. Narrow folder-trust
   dialogs are handled without a model turn; changed launch identities,
