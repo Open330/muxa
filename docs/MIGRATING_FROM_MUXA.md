@@ -53,7 +53,7 @@ edit instead. `brew install python` gives a newer one.
 
 ## What the script does
 
-- Stops `muxad`, restarts a brew service under `tend` (or tells you how), and moves its launchd job or systemd unit (and the restore job) to the Tend name.
+- Stops `muxad`, restarts a brew service under `tend` (or tells you how), and moves its launchd job or systemd unit (and the restore job, and `.d/` drop-ins in any user unit directory) to the Tend name.
   The job keeps its environment, such as a PATH you tuned for your agents; its label, program and log paths are renamed.
   It is started again at the end, if Tend is installed where the job expects it.
 - Moves Muxa's data, config and cache directories to `tend`. If a `tend`
@@ -72,8 +72,10 @@ edit instead. `brew install python` gives a newer one.
   symlinked dotfile points to (keeping the link), and writes a TOML file
   only after checking that the result still parses.
 - Relinks the `tend-collaboration` skill for Claude Code and Codex.
-- Copies `@muxa_*` options on running tmux sessions, windows and panes to
-  `@tend_*`, so Work that is already running keeps its identity.
+- Copies `@muxa_*` options on running tmux and rmux sessions, windows and panes
+  to `@tend_*`, so Work that is already running keeps its identity, and moves
+  `MUXA_SOCKET`, `MUXA_CONFIG` and `MUXA_HOST(S)` in their global environment to
+  `TEND_*`. Any other `MUXA_*` there may hold a secret, so it is only named for you to move.
 - macOS: copies app preferences from `dev.muxa.mac` to `dev.tend.mac`, and
   Ask provider API keys from the `dev.muxa.mac.ask-provider` keychain
   service to `dev.tend.mac.ask-provider`. The key is handed to `security`

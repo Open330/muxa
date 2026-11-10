@@ -364,7 +364,10 @@ def stop_services(m: Migration):
             if unit in capture(["systemctl", "--user", "list-unit-files", unit]):
                 m.run(["systemctl", "--user", "disable", "--now", unit], f"disable systemd unit {unit}")
 
-    if have("brew") and "muxa" in capture(["brew", "services", "list"]).split():
+    # `brew services list` lists every formula with a service block; only
+    # one whose status is not "none"/"stopped" actually runs as a service.
+    brew_status = re.search(r"^muxa\s+(\S+)", capture(["brew", "services", "list"]) if have("brew") else "", re.M)
+    if brew_status and brew_status.group(1) not in ("none", "stopped"):
         m.run(["brew", "services", "stop", "muxa"], "stop brew service muxa")
         NEW_SERVICES.append(("brew", Path("tend"), "tend"))
     if capture(["pgrep", "-x", "muxad"]).strip():
@@ -384,11 +387,20 @@ def convert_services(m: Migration):
             plist = agents / f"{label}.plist"
             if plist.exists():
                 move_launchd_job(m, plist, agents / f"{full_rename(label)}.plist")
-    for base in (xdg("XDG_DATA_HOME", HOME / ".local/share"), xdg("XDG_CONFIG_HOME", HOME / ".config")):
-        for unit in ("muxad.service", "muxa-restore.service"):
-            path = base / "systemd/user" / unit
-            if path.exists():
-                move_systemd_unit(m, path, path.with_name(full_rename(unit)))
+    roots = [xdg("XDG_CONFIG_HOME", HOME / ".config") / "systemd/user",
+             xdg("XDG_DATA_HOME", HOME / ".local/share") / "systemd/user"]
+    for unit in ("muxad.service", "muxa-restore.service"):
+        new_unit = full_rename(unit)
+        for root in roots:
+            if (root / unit).is_file():
+                move_systemd_unit(m, root / unit, root / new_unit)
+        for root in roots:
+            if (root / f"{unit}.d").is_dir():
+                program = move_systemd_dropins(m, root / f"{unit}.d", root / f"{new_unit}.d")
+                if program:  # a drop-in ExecStart= overrides the unit's for the start check
+                    for i, (kind, path, _) in enumerate(NEW_SERVICES):
+                        if kind == "systemd" and path.name == new_unit:
+                            NEW_SERVICES[i] = (kind, path, program)
 
 
 def move_launchd_job(m: Migration, old: Path, new: Path):
@@ -419,12 +431,13 @@ def move_launchd_job(m: Migration, old: Path, new: Path):
     NEW_SERVICES.append(("launchd", new, program))
 
 
-def move_systemd_unit(m: Migration, old: Path, new: Path):
-    if new.exists():
-        m.note(f"{new} already exists, so {old} was left in place. Remove it once tend works.")
-        return
+def systemd_text(text: str) -> tuple[str, str]:
+    """Rename a unit file or drop-in: Exec lines get the executable renamed by
+    file name (keeping systemd quoting), everything else the surgical
+    rename (MUXA_* variables, moved paths). Returns the text and the first
+    executable."""
     lines, program = [], ""
-    for line in old.read_text(encoding="utf-8").splitlines(keepends=True):
+    for line in text.splitlines(keepends=True):
         exec_line = re.match(r"(\s*Exec\w*=[-@:+!]*)(?:\"([^\"]*)\"|'([^']*)'|(\S+))(.*)", line, re.S)
         if exec_line:
             raw = next(g for g in exec_line.group(2, 3, 4) if g is not None)
@@ -435,11 +448,40 @@ def move_systemd_unit(m: Migration, old: Path, new: Path):
         else:
             line = surgical_rename(line)
         lines.append(line)
+    return "".join(lines), program
+
+
+def move_systemd_unit(m: Migration, old: Path, new: Path):
+    if new.exists():
+        m.note(f"{new} already exists, so {old} was left in place. Remove it once tend works.")
+        return
+    text, program = systemd_text(old.read_text(encoding="utf-8"))
     m.step(f"move systemd unit {old.name} → {new.name}")
     if m.apply:
-        atomic_write(new, "".join(lines))
+        atomic_write(new, text)
         old.rename(old.with_name(f"{old.name}.muxa-migrate-{STAMP}"))
     NEW_SERVICES.append(("systemd", new, program.replace("%h", str(HOME))))
+
+
+def move_systemd_dropins(m: Migration, old: Path, new: Path):
+    """`<unit>.d/` overrides (an Environment= line, say) can live in any user
+    unit root, with or without the unit file beside them. Returns the
+    ExecStart a drop-in sets, if any."""
+    if new.exists():
+        m.note(f"{new} already exists, so {old} was left in place. Merge them by hand.")
+        return ""
+    confs = sorted(old.glob("*.conf"))
+    m.step(f"move systemd drop-ins {old} → {new.name}/ ({len(confs)} files)")
+    program = ""
+    for conf in confs:
+        _, conf_program = systemd_text(conf.read_text(encoding="utf-8"))
+        program = conf_program or program
+    if m.apply:
+        new.mkdir()
+        for conf in confs:
+            atomic_write(new / conf.name, systemd_text(conf.read_text(encoding="utf-8"))[0])
+        old.rename(old.with_name(f"{old.name}.muxa-migrate-{STAMP}"))
+    return program.replace("%h", str(HOME))
 
 
 def start_services(m: Migration):
@@ -684,13 +726,17 @@ def migrate_shell_and_tmux(m: Migration):
         m.edit(conf, surgical_rename)
 
 
+# Global multiplexer variables whose values are paths or backend names.
+SAFE_GLOBAL_ENV = {"MUXA_SOCKET", "MUXA_CONFIG", "MUXA_HOST", "MUXA_HOSTS", "MUXA_TMUX_SOCKET"}
+
+
 def migrate_live_tmux(m: Migration):
     """Copy @muxa_* user options on live sessions/windows/panes to @tend_*,
     so running Work keeps its identity, then unset the old ones."""
-    print("\nLive tmux options")
-    if not have("tmux"):
-        return
-    servers = [["tmux"]] + [["tmux", "-S", os.environ[v]] for v in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET") if os.environ.get(v)]
+    print("\nLive tmux and rmux options")
+    servers = [[mux] for mux in ("tmux", "rmux") if have(mux)]
+    if have("tmux"):
+        servers += [["tmux", "-S", os.environ[v]] for v in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET") if os.environ.get(v)]
     for tmux in servers:
         sessions = capture(tmux + ["list-sessions", "-F", "#{session_id}"]).split()
         if not sessions:
@@ -712,13 +758,22 @@ def migrate_live_tmux(m: Migration):
                     new_name = TMUX_OPTION.sub(r"@tend\1", name)
                     subprocess.run(tmux + ["set-option"] + scope + ["-t", target, new_name, value], capture_output=True)
                     subprocess.run(tmux + ["set-option"] + scope + ["-u", "-t", target, name], capture_output=True)
-        sock = re.search(r"^MUXA_SOCKET=(.*)$", capture(tmux + ["show-environment", "-g"]), re.M)
-        if sock:
-            value = surgical_rename(sock.group(1))
-            m.step(f"{' '.join(tmux)}: TEND_SOCKET={value} in the global environment")
+        # MUXA_SOCKET, MUXA_HOST(S)… in the server's global environment are
+        # inherited by every agent it starts: move them all.
+        # Only variables known to hold no secret are moved (their values go on
+        # a command line and into this output); any other MUXA_* (a dashboard
+        # token, say) is reported by name for you to move.
+        for name, value in re.findall(r"^(MUXA_[A-Z0-9_]+)=(.*)$", capture(tmux + ["show-environment", "-g"]), re.M):
+            new_name = ENV_NAME.sub(r"TEND_\1", name)
+            if name not in SAFE_GLOBAL_ENV:
+                m.note(f"{' '.join(tmux)}: {name} in the global environment was left as is (it may hold a secret). "
+                       f"Set {new_name} yourself and unset {name}.")
+                continue
+            new_value = surgical_rename(value)
+            m.step(f"{' '.join(tmux)}: {new_name}={new_value} in the global environment")
             if m.apply:
-                subprocess.run(tmux + ["set-environment", "-g", "TEND_SOCKET", value], capture_output=True)
-                subprocess.run(tmux + ["set-environment", "-gu", "MUXA_SOCKET"], capture_output=True)
+                subprocess.run(tmux + ["set-environment", "-g", new_name, new_value], capture_output=True)
+                subprocess.run(tmux + ["set-environment", "-gu", name], capture_output=True)
 
 
 def migrate_macos_app(m: Migration, keychain: str | None):
