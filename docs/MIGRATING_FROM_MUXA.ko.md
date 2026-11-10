@@ -64,7 +64,7 @@ Muxa를 돌리던 호스트마다 실행하세요. Python 3.8 이상이 필요�
   고치며, TOML 파일은 고친 결과를 읽을 수 있는지 확인한 뒤에만 씁니다.
 - Claude Code와 Codex의 `tend-collaboration` 스킬 링크를 다시 겁니다.
 - 실행 중인 tmux와 rmux 세션, 창, pane의 `@muxa_*` 옵션을 `@tend_*`로 복사해 이미 돌고 있는 Work가 정체성을 유지하게 하고,
-  전역 환경의 `MUXA_*` 변수를 `TEND_*`로 옮깁니다.
+  전역 환경의 `MUXA_SOCKET`, `MUXA_CONFIG`, `MUXA_HOST(S)`를 `TEND_*`로 옮깁니다. 그 밖의 `MUXA_*`는 비밀 값일 수 있어 이름만 알려 줍니다.
 - macOS: 앱 설정을 `dev.muxa.mac`에서 `dev.tend.mac`으로, Ask 공급자 API 키를
   `dev.muxa.mac.ask-provider` 키체인 서비스에서 `dev.tend.mac.ask-provider`로 복사합니다.
   키는 명령 인자가 아니라 표준 입력으로 `security`에 넘깁니다. 키마다 macOS가 읽기 허락을 한 번 묻습니다.

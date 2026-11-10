@@ -74,7 +74,8 @@ edit instead. `brew install python` gives a newer one.
 - Relinks the `tend-collaboration` skill for Claude Code and Codex.
 - Copies `@muxa_*` options on running tmux and rmux sessions, windows and panes
   to `@tend_*`, so Work that is already running keeps its identity, and moves
-  `MUXA_*` variables in their global environment to `TEND_*`.
+  `MUXA_SOCKET`, `MUXA_CONFIG` and `MUXA_HOST(S)` in their global environment to
+  `TEND_*`. Any other `MUXA_*` there may hold a secret, so it is only named for you to move.
 - macOS: copies app preferences from `dev.muxa.mac` to `dev.tend.mac`, and
   Ask provider API keys from the `dev.muxa.mac.ask-provider` keychain
   service to `dev.tend.mac.ask-provider`. The key is handed to `security`

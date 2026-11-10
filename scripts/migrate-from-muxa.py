@@ -726,6 +726,10 @@ def migrate_shell_and_tmux(m: Migration):
         m.edit(conf, surgical_rename)
 
 
+# Global multiplexer variables whose values are paths or backend names.
+SAFE_GLOBAL_ENV = {"MUXA_SOCKET", "MUXA_CONFIG", "MUXA_HOST", "MUXA_HOSTS", "MUXA_TMUX_SOCKET"}
+
+
 def migrate_live_tmux(m: Migration):
     """Copy @muxa_* user options on live sessions/windows/panes to @tend_*,
     so running Work keeps its identity, then unset the old ones."""
@@ -756,8 +760,16 @@ def migrate_live_tmux(m: Migration):
                     subprocess.run(tmux + ["set-option"] + scope + ["-u", "-t", target, name], capture_output=True)
         # MUXA_SOCKET, MUXA_HOST(S)… in the server's global environment are
         # inherited by every agent it starts: move them all.
+        # Only variables known to hold no secret are moved (their values go on
+        # a command line and into this output); any other MUXA_* (a dashboard
+        # token, say) is reported by name for you to move.
         for name, value in re.findall(r"^(MUXA_[A-Z0-9_]+)=(.*)$", capture(tmux + ["show-environment", "-g"]), re.M):
-            new_name, new_value = ENV_NAME.sub(r"TEND_\1", name), surgical_rename(value)
+            new_name = ENV_NAME.sub(r"TEND_\1", name)
+            if name not in SAFE_GLOBAL_ENV:
+                m.note(f"{' '.join(tmux)}: {name} in the global environment was left as is (it may hold a secret). "
+                       f"Set {new_name} yourself and unset {name}.")
+                continue
+            new_value = surgical_rename(value)
             m.step(f"{' '.join(tmux)}: {new_name}={new_value} in the global environment")
             if m.apply:
                 subprocess.run(tmux + ["set-environment", "-g", new_name, new_value], capture_output=True)
