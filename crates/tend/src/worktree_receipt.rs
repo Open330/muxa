@@ -24,6 +24,52 @@ pub enum ReceiptState {
     Created,
     /// `git worktree add` failed; nothing was created.
     Failed,
+    /// Moved aside by `tend worktrees set-aside`; see [`SetAside`].
+    SetAside,
+    /// Deleted for good after being set aside; its last commit stays pinned.
+    Deleted,
+}
+
+/// A change tend can make to one of its worktrees.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeAction {
+    /// Move the worktree with git into `.tend-set-aside` next to it.
+    SetAside,
+    /// Move a set-aside worktree back to where it was.
+    Restore,
+    /// Delete a set-aside worktree with `git worktree remove`.
+    Delete,
+}
+
+/// Where a set-aside worktree went and what it held when it moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetAside {
+    pub dest: PathBuf,
+    /// The commit checked out when it moved, full id.
+    pub head: String,
+    /// The branch checked out when it moved; None when detached.
+    pub branch: Option<String>,
+    /// Refs that keep its commits reachable (`refs/tend/set-aside/...`).
+    pub pins: Vec<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
+}
+
+/// A change written down before git runs, so an interrupted one can be
+/// finished or undone from what is on disk, never guessed or repeated.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingChange {
+    pub op_id: String,
+    pub action: ChangeAction,
+    /// Where the worktree was before the change.
+    pub from: PathBuf,
+    /// Where it is after (the same path for a delete).
+    pub to: PathBuf,
+    pub head: String,
+    pub branch: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub started_at: OffsetDateTime,
 }
 
 /// What asked for a worktree.
@@ -68,6 +114,26 @@ pub struct WorktreeReceipt {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub state: ReceiptState,
+    /// Goes up by one with every change tend finishes, so a request made
+    /// from an older listing is refused instead of acting on a newer state.
+    #[serde(default)]
+    pub generation: u64,
+    /// Set while the worktree is set aside (and kept after a delete).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub set_aside: Option<SetAside>,
+    /// A change started and not yet known to have finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending: Option<PendingChange>,
+    /// The operation that made the last finished change, so a retried
+    /// request with the same id reads as done.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_op: Option<String>,
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub deleted_at: Option<OffsetDateTime>,
 }
 
 /// Where receipts live: `<tend data>/worktrees/<id>.json`.
@@ -100,6 +166,11 @@ impl WorktreeReceipt {
             common_dir: None,
             created_at: OffsetDateTime::now_utc(),
             state: ReceiptState::Creating,
+            generation: 0,
+            set_aside: None,
+            pending: None,
+            last_op: None,
+            deleted_at: None,
         };
         receipt.save()?;
         Ok(receipt)
@@ -132,9 +203,16 @@ impl WorktreeReceipt {
     /// shares the recorded common git directory. None when git cannot say.
     #[must_use]
     pub fn still_owns(&self) -> Option<bool> {
-        let admin = admin_dir(&self.path)?;
+        self.owns_at(&self.path)
+    }
+
+    /// Whether the worktree at `path` carries this receipt's mark and the
+    /// recorded common git directory. None when git cannot say.
+    #[must_use]
+    pub fn owns_at(&self, path: &Path) -> Option<bool> {
+        let admin = admin_dir(path)?;
         let mark = std::fs::read_to_string(admin.join(MARK_FILE)).unwrap_or_default();
-        let same_repo = match (&self.common_dir, common_dir(&self.path)) {
+        let same_repo = match (&self.common_dir, common_dir(path)) {
             (Some(recorded), Some(current)) => *recorded == current,
             _ => false,
         };
@@ -147,12 +225,22 @@ impl WorktreeReceipt {
         self.save()
     }
 
-    fn save(&self) -> std::io::Result<()> {
+    /// Where the worktree is now: its set-aside folder while set aside,
+    /// otherwise where it was made.
+    #[must_use]
+    pub fn location(&self) -> &Path {
+        match (&self.state, &self.set_aside) {
+            (ReceiptState::SetAside | ReceiptState::Deleted, Some(aside)) => &aside.dest,
+            _ => &self.path,
+        }
+    }
+
+    pub(crate) fn save(&self) -> std::io::Result<()> {
         let dir = dir().ok_or_else(|| std::io::Error::other("no tend data directory"))?;
         self.save_in(&dir)
     }
 
-    fn save_in(&self, dir: &Path) -> std::io::Result<()> {
+    pub(crate) fn save_in(&self, dir: &Path) -> std::io::Result<()> {
         std::fs::create_dir_all(dir)?;
         let body = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         // Write then rename, so a reader never sees half a receipt.
@@ -162,12 +250,15 @@ impl WorktreeReceipt {
             file.write_all(&body)?;
             file.sync_all()?;
         }
-        std::fs::rename(tmp, dir.join(format!("{}.json", self.id)))
+        std::fs::rename(tmp, dir.join(format!("{}.json", self.id)))?;
+        // The rename is durable only once the directory is synced: a change
+        // journal must be on disk before git runs.
+        std::fs::File::open(dir)?.sync_all()
     }
 }
 
 /// The worktree's own administrative directory (`.git/worktrees/<name>`).
-fn admin_dir(path: &Path) -> Option<PathBuf> {
+pub(crate) fn admin_dir(path: &Path) -> Option<PathBuf> {
     git_path(path, "--absolute-git-dir")
 }
 
@@ -200,7 +291,7 @@ pub fn list() -> Vec<WorktreeReceipt> {
     dir().map(|dir| list_in(&dir)).unwrap_or_default()
 }
 
-fn list_in(dir: &Path) -> Vec<WorktreeReceipt> {
+pub(crate) fn list_in(dir: &Path) -> Vec<WorktreeReceipt> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -236,6 +327,11 @@ mod tests {
             common_dir: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             state: ReceiptState::Creating,
+            generation: 0,
+            set_aside: None,
+            pending: None,
+            last_op: None,
+            deleted_at: None,
         };
         receipt.save_in(dir.path()).unwrap();
         assert_eq!(list_in(dir.path())[0].state, ReceiptState::Creating);

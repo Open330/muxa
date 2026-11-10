@@ -291,7 +291,7 @@ async fn handle_request(
         }
         RelayRequest::Ping { request_id } => Ok(RelayFrame::Result {
             request_id,
-            result: FleetCommandResult::accepted("pong"),
+            result: Box::new(FleetCommandResult::accepted("pong")),
         }),
         RelayRequest::Capture { request_id, pane } => {
             let backend = exact_backend(&backends, &pane).await?;
@@ -304,7 +304,7 @@ async fn handle_request(
             .context("capture task panicked")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::capture_with_raw(capture),
+                result: Box::new(FleetCommandResult::capture_with_raw(capture)),
             })
         }
         RelayRequest::CaptureWindow { request_id, window } => {
@@ -371,7 +371,7 @@ async fn handle_request(
             .context("window capture task panicked")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::window_capture(capture),
+                result: Box::new(FleetCommandResult::window_capture(capture)),
             })
         }
         RelayRequest::SendPrompt {
@@ -407,7 +407,7 @@ async fn handle_request(
             .context("backend refused text injection")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::sent(outcome),
+                result: Box::new(FleetCommandResult::sent(outcome)),
             })
         }
         RelayRequest::WorktreeInventory { request_id } => {
@@ -427,7 +427,20 @@ async fn handle_request(
             .context("worktree inventory task panicked")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::worktrees(rows),
+                result: Box::new(FleetCommandResult::worktrees(rows)),
+            })
+        }
+        RelayRequest::WorktreeChange { request_id, change } => {
+            // The change takes the host-wide lock and bounds itself (see
+            // `tend::worktree_change`).
+            let outcomes =
+                tokio::task::spawn_blocking(move || tend::worktree_change::change(&change))
+                    .await
+                    .context("worktree change task panicked")?
+                    .map_err(anyhow::Error::msg)?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: Box::new(FleetCommandResult::worktree_changes(outcomes)),
             })
         }
         RelayRequest::SendKeys {
@@ -454,11 +467,11 @@ async fn handle_request(
             }
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::sent(tend::ipc::SendPromptOutcome {
+                result: Box::new(FleetCommandResult::sent(tend::ipc::SendPromptOutcome {
                     sent: true,
                     submitted: false,
                     submission_confirmed: None,
-                }),
+                })),
             })
         }
         RelayRequest::WorkCommand {
@@ -485,7 +498,7 @@ async fn handle_request(
             .await?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::command(output),
+                result: Box::new(FleetCommandResult::command(output)),
             })
         }
         RelayRequest::CollaborationSend {
@@ -510,7 +523,7 @@ async fn handle_request(
                 .context("sending collaboration request")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::collaboration_request(request),
+                result: Box::new(FleetCommandResult::collaboration_request(request)),
             })
         }
         RelayRequest::CollaborationMailbox {
@@ -532,7 +545,7 @@ async fn handle_request(
                 .context("reading collaboration mailbox")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::collaboration_snapshot(snapshot),
+                result: Box::new(FleetCommandResult::collaboration_snapshot(snapshot)),
             })
         }
         RelayRequest::CollaborationGet {
@@ -547,7 +560,7 @@ async fn handle_request(
                 .context("reading collaboration request")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::collaboration_request(request),
+                result: Box::new(FleetCommandResult::collaboration_request(request)),
             })
         }
         RelayRequest::CollaborationClaim { request_id, pane } => {
@@ -559,7 +572,10 @@ async fn handle_request(
                 .context("claiming collaboration inbox")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::collaboration_mailbox(incoming, Vec::new()),
+                result: Box::new(FleetCommandResult::collaboration_mailbox(
+                    incoming,
+                    Vec::new(),
+                )),
             })
         }
         RelayRequest::CollaborationUpdate {
@@ -577,7 +593,7 @@ async fn handle_request(
                 .await?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::collaboration_request(request),
+                result: Box::new(FleetCommandResult::collaboration_request(request)),
             })
         }
         RelayRequest::CollaborationReply {
@@ -626,7 +642,7 @@ async fn handle_request(
                 .context("replying to collaboration request")?;
             Ok(RelayFrame::Result {
                 request_id,
-                result: FleetCommandResult::collaboration_request(request),
+                result: Box::new(FleetCommandResult::collaboration_request(request)),
             })
         }
     }
