@@ -16,8 +16,9 @@ use muxa::fleet::{
     FleetCapturedWindowPane, FleetCommandEnvelope, FleetCommandReceiver, FleetCommandResult,
     FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
-    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_SEND_KEYS_CAPABILITY, FLEET_MAX_DIAGNOSTIC_BYTES,
-    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
+    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
+    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
 use muxa::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -577,11 +578,19 @@ async fn run_local_work_command(
 
 /// Navigation keys reach only a relay that says it takes them; an older one
 /// would drop the request and leave the caller waiting.
-fn send_keys_refusal(alias: &str, hello: &RelayHello, operation: &FleetOperation) -> Option<String> {
+fn send_keys_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
     if !matches!(operation, FleetOperation::SendKeys { .. }) {
         return None;
     }
-    if hello.capabilities.iter().any(|capability| capability == FLEET_SEND_KEYS_CAPABILITY) {
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_SEND_KEYS_CAPABILITY)
+    {
         return None;
     }
     Some(format!(
