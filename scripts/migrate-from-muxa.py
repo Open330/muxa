@@ -14,7 +14,9 @@ installing Tend and before starting `tendd`.
     python3 scripts/migrate-from-muxa.py            # show the plan
     python3 scripts/migrate-from-muxa.py --apply    # do it
 
-Standard library only; needs Python 3.8+ (3.11+ also validates TOML edits).
+Standard library only; needs Python 3.8+. TOML files (Tend's config.toml,
+Codex's config.toml) are only edited under Python 3.11+, which can check the
+result; with an older Python they are reported for a manual edit.
 """
 from __future__ import annotations
 
@@ -103,6 +105,24 @@ def rename_executable(command: str) -> str:
         return command
     renamed = head + slash + ("tend" if base == "muxa" else "tendd")
     return command[:match.start(1)] + renamed + command[match.end(1):]
+
+
+def rename_program_path(path: str) -> str:
+    """An MCP `command` or a fleet `tend_path` is the executable itself, spaces
+    and all: rename only its file name."""
+    head, slash, base = path.rpartition("/")
+    if base in ("muxa", "muxad"):
+        return head + slash + ("tend" if base == "muxa" else "tendd")
+    return path
+
+
+def config_toml(text: str) -> str:
+    """Tend's config.toml: the fleet key `muxa_path` is now `tend_path` (its
+    value renamed by file name), then the surgical rename. Other values,
+    such as a cwd under ~/code/muxa, keep their spelling."""
+    text = re.sub(r"\bmuxa_path(\s*=\s*)([\"'])(.*?)\2",
+                  lambda m: f"tend_path{m.group(1)}{m.group(2)}{rename_program_path(m.group(3))}{m.group(2)}", text)
+    return surgical_rename(text)
 
 
 def surgical_rename(text: str) -> str:
@@ -236,7 +256,11 @@ class Migration:
                 if new == old:
                     return
                 if validate and not validate(new):
-                    self.note(f"{path}: the renamed file would not parse, so it was left unchanged. Edit it by hand.")
+                    if validate is valid_toml and tomllib is None:
+                        self.note(f"{path} needs renaming, but editing TOML safely needs Python 3.11+. "
+                                  f"Run the script with python3.11 (or newer), or edit it by hand.")
+                    else:
+                        self.note(f"{path}: the renamed file would not parse, so it was left unchanged. Edit it by hand.")
                     return
                 self.step(f"rewrite {path}" + (f" (→ {target})" if target != path else ""))
                 if self.verbose:
@@ -309,8 +333,9 @@ def xdg(var: str, default: Path) -> Path:
 
 
 def valid_toml(text: str) -> bool:
+    """TOML edits are written only when they can be checked (Python 3.11+)."""
     if tomllib is None:
-        return True
+        return False
     try:
         tomllib.loads(text)
         return True
@@ -381,7 +406,7 @@ def rewrite_own_files(m: Migration, dirs: list[Path]):
                 old_skill.rename(bundle / "skills/tend-collaboration")
         # config.toml and agent definitions hold user values (cwd, commands,
         # fleet destinations): rename only Muxa's own entries in them.
-        m.edit(look / "config.toml", surgical_rename, validate=valid_toml)
+        m.edit(look / "config.toml", config_toml, validate=valid_toml)
         for path in sorted((look / "agents").glob("*.toml")) if (look / "agents").exists() else []:
             m.edit(path, surgical_rename, validate=valid_toml)
         m.edit_json(bundle / "manifest.json", lambda d: json_strings(d, surgical_rename))
@@ -413,7 +438,7 @@ def fix_mcp_servers(m: Migration, where: Path, servers):
         return servers
     entry = servers.pop("muxa")
     if isinstance(entry, dict):
-        entry = {k: (surgical_rename(rename_executable(v)) if k == "command" and isinstance(v, str)
+        entry = {k: (surgical_rename(rename_program_path(v)) if k == "command" and isinstance(v, str)
                      else json_strings(v, surgical_rename)) for k, v in entry.items()}
         if isinstance(entry.get("env"), dict):
             entry["env"] = {ENV_NAME.sub(r"TEND_\1", k): v for k, v in entry["env"].items()}
@@ -421,20 +446,26 @@ def fix_mcp_servers(m: Migration, where: Path, servers):
     return servers
 
 
+MCP_HEADER = r"\[\s*mcp_servers\s*\.\s*(?:{name}|\"{name}\"|'{name}')\s*(\]|\.)"
+
+
 def migrate_codex_toml(m: Migration, path: Path):
     def transform(text: str) -> str:
-        has_tend = re.search(r"^\s*\[mcp_servers\.tend\]", text, re.M) is not None
+        has_tend = re.search(r"(?m)^\s*" + MCP_HEADER.format(name="tend"), text) is not None
         out, kept_old = [], False
         for chunk in re.split(r"(?m)^(?=\s*\[)", text):
             header = chunk.lstrip().split("\n", 1)[0]
-            if re.match(r"\[mcp_servers\.muxa(\]|\.)", header):
+            in_mcp = re.match(r"\[\s*mcp_servers\b", header) is not None
+            if re.match(MCP_HEADER.format(name="muxa"), header):
                 if has_tend:
                     kept_old = True
                     out.append(chunk)  # both exist: leave the old server for the user
                     continue
-                chunk = re.sub(r"\[mcp_servers\.muxa(\]|\.)", r"[mcp_servers.tend\1", chunk, count=1)
-            chunk = re.sub(r'(\bcommand\s*=\s*")([^"]*)(")',
-                           lambda mm: mm.group(1) + rename_executable(mm.group(2)) + mm.group(3), chunk)
+                chunk = re.sub(MCP_HEADER.format(name="muxa"), r"[mcp_servers.tend\1", chunk, count=1)
+            # An MCP server's command is an executable path; a hook's is a command line.
+            rename = rename_program_path if in_mcp else rename_executable
+            chunk = re.sub(r"(\bcommand\s*=\s*)([\"'])(.*?)\2",
+                           lambda mm: mm.group(1) + mm.group(2) + rename(mm.group(3)) + mm.group(2), chunk)
             out.append(surgical_rename(chunk))
         if kept_old:
             m.note(f"{path} already has [mcp_servers.tend]; [mcp_servers.muxa] was left in place. Remove it once tend works.")

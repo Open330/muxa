@@ -45,8 +45,10 @@ before relying on peer requests again.
 5. Remove Muxa once Tend works: `brew uninstall muxa` (or
    `cargo uninstall muxa-cli muxad`) and move `Muxa.app` to the Trash.
 
-Run the script on every host that ran Muxa. Without Python, copy the script
-to a host that has it, or follow the table above by hand.
+Run the script on every host that ran Muxa. It needs Python 3.8+, and 3.11+
+to edit TOML (Tend's `config.toml`, Codex's `config.toml`): with an older
+Python, such as the one macOS ships, those two files are reported for a manual
+edit instead. `brew install python` gives a newer one.
 
 ## What the script does
 
@@ -54,7 +56,7 @@ to a host that has it, or follow the table above by hand.
 - Moves Muxa's data, config and cache directories to `tend`. If a `tend`
   directory already exists, it leaves both in place and tells you.
 - Renames the agent integration bundle (`bootstrap.md`, the collaboration
-  skill) in full. In `config.toml`, user agent definitions and every other
+  skill) in full. Renames the fleet key `muxa_path` to `tend_path`. In `config.toml`, user agent definitions and every other
   tool's config it changes only what Muxa wrote: hook commands (including an
   absolute `/opt/bin/muxa`), the MCP server entry, managed blocks, `MUXA_*`
   variables, `@muxa_*` options and paths into the directories it moved.
@@ -64,8 +66,8 @@ to a host that has it, or follow the table above by hand.
   an MCP server named `tend`, `[mcp_servers.tend]` in Codex, `tend.ts`, a
   `tend-collaboration` link, or a Tend key in the keychain.
 - Edits `.claude.json` under Claude Code's own lock, edits the file a
-  symlinked dotfile points to (keeping the link), and refuses to write a
-  Codex config or `config.toml` that would no longer parse.
+  symlinked dotfile points to (keeping the link), and writes a TOML file
+  only after checking that the result still parses.
 - Relinks the `tend-collaboration` skill for Claude Code and Codex.
 - Copies `@muxa_*` options on running tmux sessions, windows and panes to
   `@tend_*`, so Work that is already running keeps its identity.

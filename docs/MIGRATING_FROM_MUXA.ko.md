@@ -44,20 +44,22 @@ Muxa의 새 이름은 Tend입니다. Tend는 Muxa의 이름을 하나도 읽지 
 5. Tend가 잘 돌면 Muxa를 지웁니다: `brew uninstall muxa`(또는 `cargo uninstall muxa-cli muxad`),
    `Muxa.app`은 휴지통으로.
 
-Muxa를 돌리던 호스트마다 실행하세요. Python이 없는 호스트는 위 표를 보고 직접 바꿉니다.
+Muxa를 돌리던 호스트마다 실행하세요. Python 3.8 이상이 필요하고, TOML 파일(Tend의 `config.toml`, Codex의
+`config.toml`)을 고치려면 3.11 이상이 필요합니다. macOS에 기본으로 든 것처럼 더 오래된 Python에서는 그 두 파일을
+고치지 않고 직접 고치라고 알려 줍니다. `brew install python`으로 새 버전을 설치할 수 있습니다.
 
 ## 스크립트가 하는 일
 
 - `muxad`와 그 launchd 작업, systemd 유닛, brew 서비스를 멈추고 옛 유닛 파일을 지웁니다.
 - Muxa의 데이터, 설정, 캐시 폴더를 `tend`로 옮깁니다. `tend` 폴더가 이미 있으면 둘 다 그대로 두고 알려 줍니다.
-- 에이전트 연동 번들(`bootstrap.md`, 협업 스킬)은 이름을 전부 바꿉니다. `config.toml`, 사용자 에이전트 정의,
+- 에이전트 연동 번들(`bootstrap.md`, 협업 스킬)은 이름을 전부 바꿉니다. fleet 설정 키 `muxa_path`는 `tend_path`로 바꿉니다. `config.toml`, 사용자 에이전트 정의,
   다른 도구의 설정에서는 Muxa가 쓴 부분만 바꿉니다: 훅 명령(절대 경로 `/opt/bin/muxa` 포함), MCP 서버 항목,
   관리 블록, `MUXA_*` 변수, `@muxa_*` 옵션, 옮긴 폴더를 가리키는 경로. 사용자가 넣은 값은 그대로 둡니다:
   `~/code/muxa`의 `cwd`나 저장소, URL, 프로젝트 신뢰 항목.
 - Tend 쪽 항목이 이미 있으면 둘 다 그대로 두고 알려 줍니다: `tend`라는 MCP 서버, Codex의 `[mcp_servers.tend]`,
   `tend.ts`, `tend-collaboration` 링크, 키체인의 Tend 키.
 - `.claude.json`은 Claude Code의 잠금을 잡고 고치고, 심볼릭 링크로 된 dotfile은 링크를 유지한 채 대상 파일을
-  고치며, 고친 뒤 읽을 수 없게 되는 Codex 설정이나 `config.toml`은 쓰지 않습니다.
+  고치며, TOML 파일은 고친 결과를 읽을 수 있는지 확인한 뒤에만 씁니다.
 - Claude Code와 Codex의 `tend-collaboration` 스킬 링크를 다시 겁니다.
 - 실행 중인 tmux 세션, 창, pane의 `@muxa_*` 옵션을 `@tend_*`로 복사해, 이미 돌고 있는 Work가 정체성을 유지하게 합니다.
 - macOS: 앱 설정을 `dev.muxa.mac`에서 `dev.tend.mac`으로, Ask 공급자 API 키를
