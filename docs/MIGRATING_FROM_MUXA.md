@@ -33,15 +33,16 @@ before relying on peer requests again.
    ```
 
    Add `--claude-home DIR` for each extra Claude Code config directory
-   (a `CLAUDE_CONFIG_DIR` other than `~/.claude`), and `-v` to see each changed line.
+   (a `CLAUDE_CONFIG_DIR` other than `~/.claude`), `--codex-home DIR` for each
+   extra Codex one (a `CODEX_HOME` other than `~/.codex`), and `-v` to see each changed line.
 3. Apply it:
 
    ```bash
    python3 scripts/migrate-from-muxa.py --apply
    ```
 
-4. Run `tend init` to install the `tendd` service, open a new shell, and
-   restart your agents so their hooks and MCP server call `tend`.
+4. Open a new shell and restart your agents so their hooks and MCP server call `tend`.
+   If the script moved no Muxa service (it says so), `tend init` installs one.
 5. Remove Muxa once Tend works: `brew uninstall muxa` (or
    `cargo uninstall muxa-cli muxad`) and move `Muxa.app` to the Trash.
 
@@ -52,7 +53,9 @@ edit instead. `brew install python` gives a newer one.
 
 ## What the script does
 
-- Stops `muxad` and its launchd job, systemd unit or brew service, and removes the old unit files.
+- Stops `muxad`, restarts a brew service under `tend` (or tells you how), and moves its launchd job or systemd unit (and the restore job) to the Tend name.
+  The job keeps its environment, such as a PATH you tuned for your agents; its label, program and log paths are renamed.
+  It is started again at the end, if Tend is installed where the job expects it.
 - Moves Muxa's data, config and cache directories to `tend`. If a `tend`
   directory already exists, it leaves both in place and tells you.
 - Renames the agent integration bundle (`bootstrap.md`, the collaboration
@@ -76,6 +79,9 @@ edit instead. `brew install python` gives a newer one.
   service to `dev.tend.mac.ask-provider`. The key is handed to `security`
   on standard input, never on a command line. macOS asks once per key to
   allow the read.
+
+Your own launchd jobs, systemd units and crontab entries that run muxa are
+listed at the end for you to update; the script does not edit them.
 
 Every edited file is first copied to `<file>.muxa-migrate-<timestamp>`.
 Running the script again after a successful run finds nothing to do.

@@ -358,22 +358,117 @@ def stop_services(m: Migration):
         for label in ("dev.open330.muxad", "dev.open330.muxa-restore"):
             if label in loaded:
                 m.run(["launchctl", "bootout", f"gui/{UID}/{label}"], f"stop launchd job {label}")
-            plist = agents / f"{label}.plist"
-            if plist.exists():
-                m.remove(plist, f"remove {plist} (tend init installs the Tend one)")
+
     if have("systemctl"):
         for unit in ("muxad.service", "muxa-restore.service"):
             if unit in capture(["systemctl", "--user", "list-unit-files", unit]):
                 m.run(["systemctl", "--user", "disable", "--now", unit], f"disable systemd unit {unit}")
-        for base in (xdg("XDG_DATA_HOME", HOME / ".local/share"), xdg("XDG_CONFIG_HOME", HOME / ".config")):
-            for unit in ("muxad.service", "muxa-restore.service"):
-                path = base / "systemd/user" / unit
-                if path.exists():
-                    m.remove(path, f"remove {path}")
+
     if have("brew") and "muxa" in capture(["brew", "services", "list"]).split():
         m.run(["brew", "services", "stop", "muxa"], "stop brew service muxa")
+        NEW_SERVICES.append(("brew", Path("tend"), "tend"))
     if capture(["pgrep", "-x", "muxad"]).strip():
         m.run(["pkill", "-x", "muxad"], "stop the running muxad")
+
+
+# Services moved to their Tend names, started once everything else is done.
+NEW_SERVICES: list[tuple[str, Path, str]] = []
+
+
+def convert_services(m: Migration):
+    """After the directories moved (so MOVES is known): rewrite the stopped
+    Muxa jobs under their Tend names."""
+    if MACOS:
+        agents = HOME / "Library/LaunchAgents"
+        for label in ("dev.open330.muxad", "dev.open330.muxa-restore"):
+            plist = agents / f"{label}.plist"
+            if plist.exists():
+                move_launchd_job(m, plist, agents / f"{full_rename(label)}.plist")
+    for base in (xdg("XDG_DATA_HOME", HOME / ".local/share"), xdg("XDG_CONFIG_HOME", HOME / ".config")):
+        for unit in ("muxad.service", "muxa-restore.service"):
+            path = base / "systemd/user" / unit
+            if path.exists():
+                move_systemd_unit(m, path, path.with_name(full_rename(unit)))
+
+
+def move_launchd_job(m: Migration, old: Path, new: Path):
+    """Keep the job's environment (a hand-tuned PATH, say) and settings;
+    rename its label, program and log paths."""
+    if new.exists():
+        m.note(f"{new} already exists, so {old} was left in place. Remove it once tend works.")
+        return
+    job = plistlib.loads(old.read_bytes())
+    job["Label"] = full_rename(job.get("Label", ""))
+    args = job.get("ProgramArguments") or []
+    if args:
+        job["ProgramArguments"] = [rename_program_path(args[0])] + [surgical_rename(a) for a in args[1:]]
+    if "Program" in job:
+        job["Program"] = rename_program_path(job["Program"])
+    if isinstance(job.get("EnvironmentVariables"), dict):
+        job["EnvironmentVariables"] = {ENV_NAME.sub(r"TEND_\1", k): surgical_rename(v) if isinstance(v, str) else v
+                                       for k, v in job["EnvironmentVariables"].items()}
+    for key in ("StandardOutPath", "StandardErrorPath", "WorkingDirectory"):
+        if isinstance(job.get(key), str):
+            job[key] = surgical_rename(job[key])
+    program = (job.get("ProgramArguments") or [job.get("Program", "")])[0]
+    m.step(f"move launchd job {old.name} → {new.name} (runs {program})")
+    if m.apply:
+        new.write_bytes(plistlib.dumps(job))
+        os.chmod(new, old.stat().st_mode & 0o7777)
+        old.rename(old.with_name(f"{old.name}.muxa-migrate-{STAMP}"))
+    NEW_SERVICES.append(("launchd", new, program))
+
+
+def move_systemd_unit(m: Migration, old: Path, new: Path):
+    if new.exists():
+        m.note(f"{new} already exists, so {old} was left in place. Remove it once tend works.")
+        return
+    lines, program = [], ""
+    for line in old.read_text(encoding="utf-8").splitlines(keepends=True):
+        exec_line = re.match(r"(\s*Exec\w*=[-@:+!]*)(?:\"([^\"]*)\"|'([^']*)'|(\S+))(.*)", line, re.S)
+        if exec_line:
+            raw = next(g for g in exec_line.group(2, 3, 4) if g is not None)
+            quote = '"' if exec_line.group(2) is not None else "'" if exec_line.group(3) is not None else ""
+            renamed = rename_program_path(raw)
+            line = exec_line.group(1) + quote + renamed + quote + surgical_rename(exec_line.group(5))
+            program = program or renamed
+        else:
+            line = surgical_rename(line)
+        lines.append(line)
+    m.step(f"move systemd unit {old.name} → {new.name}")
+    if m.apply:
+        atomic_write(new, "".join(lines))
+        old.rename(old.with_name(f"{old.name}.muxa-migrate-{STAMP}"))
+    NEW_SERVICES.append(("systemd", new, program.replace("%h", str(HOME))))
+
+
+def start_services(m: Migration):
+    """Start the moved services once the data is in place, if Tend is
+    installed where they expect it."""
+    if not NEW_SERVICES:
+        return
+    print("\nStart Tend services")
+    reloaded = False
+    for kind, path, program in NEW_SERVICES:
+        if program and "/" in program and not os.path.exists(os.path.expanduser(program)):
+            m.note(f"{path.name} runs {program}, which is not installed yet. Install Tend, then start it "
+                   + (f"with: launchctl bootstrap gui/{UID} '{path}'" if kind == "launchd"
+                      else f"with: systemctl --user enable --now {path.name}"))
+            continue
+        if kind == "brew":
+            if "tend" in capture(["brew", "list", "--formula"]).split():
+                m.run(["brew", "services", "start", "tend"], "start brew service tend")
+            else:
+                m.note("Muxa ran as a brew service. Install Tend and start it: "
+                       "brew install open330/tap/tend && brew services start tend")
+            continue
+        if kind == "launchd":
+            m.run(["launchctl", "bootstrap", f"gui/{UID}", str(path)], f"start launchd job {path.stem}")
+        else:
+            if not reloaded:
+                m.run(["systemctl", "--user", "daemon-reload"], "reload systemd user units")
+                reloaded = True
+            m.run(["systemctl", "--user", "enable", "--now", path.name], f"enable and start {path.name}")
 
 
 def move_directories(m: Migration) -> list[Path]:
@@ -418,6 +513,16 @@ def rewrite_own_files(m: Migration, dirs: list[Path]):
         skills = bundle / "skills"
         for path in sorted(skills.rglob("*.md")) if skills.exists() else []:
             m.edit(path, full_rename)
+
+
+def codex_homes(extra: list[str]) -> list[Path]:
+    homes = [Path(os.environ.get("CODEX_HOME") or HOME / ".codex")] + [Path(p).expanduser() for p in extra]
+    seen, out = set(), []
+    for h in homes:
+        if h.exists() and h.resolve() not in seen:
+            seen.add(h.resolve())
+            out.append(h)
+    return out
 
 
 def claude_homes(extra: list[str]) -> list[Path]:
@@ -501,7 +606,7 @@ def migrate_codex_toml(m: Migration, path: Path):
     m.edit(path, transform, validate=valid)
 
 
-def migrate_agents(m: Migration, extra_claude: list[str]):
+def migrate_agents(m: Migration, extra_claude: list[str], extra_codex: list[str]):
     print("\nAgent integrations")
     homes = claude_homes(extra_claude)
     for home in homes:
@@ -523,10 +628,10 @@ def migrate_agents(m: Migration, extra_claude: list[str]):
             return d
         m.edit_json(claude_json, fix)
 
-    codex = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
-    migrate_codex_toml(m, codex / "config.toml")
-    for name in ("AGENTS.md", "AGENTS.override.md"):
-        m.edit(codex / name, surgical_rename)
+    for codex in codex_homes(extra_codex):
+        migrate_codex_toml(m, codex / "config.toml")
+        for name in ("AGENTS.md", "AGENTS.override.md"):
+            m.edit(codex / name, surgical_rename)
     migrate_skill_link(m, HOME / ".agents/skills")
 
     m.edit_json(HOME / ".gemini/settings.json",
@@ -686,6 +791,33 @@ def migrate_keychain(m: Migration, keychain: str | None):
             m.note(f"Could not save the {account} key under Tend; enter it again in Tend › Settings › Ask.")
 
 
+def report_custom_jobs(m: Migration):
+    """Your own launchd jobs, systemd units and crontab entries are not
+    Muxa's to rename, but one that runs muxa (directly or through a script)
+    stops working once Muxa is removed: list every one that mentions it."""
+    known = {"dev.open330.muxad.plist", "dev.open330.muxa-restore.plist", "muxad.service", "muxa-restore.service"}
+    candidates = []
+    if MACOS:
+        candidates += sorted((HOME / "Library/LaunchAgents").glob("*.plist"))
+    for base in (xdg("XDG_CONFIG_HOME", HOME / ".config"), xdg("XDG_DATA_HOME", HOME / ".local/share")):
+        candidates += sorted((base / "systemd/user").glob("*.service")) if (base / "systemd/user").exists() else []
+    for path in candidates:
+        if path.name in known or ".muxa-migrate-" in path.name:
+            continue
+        with contextlib.suppress(OSError):
+            data = path.read_bytes()
+            if path.suffix == ".plist":
+                with contextlib.suppress(Exception):
+                    data = json.dumps(plistlib.loads(data)).encode()
+            if b"muxa" in data.lower():
+                m.note(f"{path} mentions muxa. It is your own job, so it was left as is; "
+                       f"if it runs Muxa, point it at tend.")
+    cron = capture(["crontab", "-l"]) if have("crontab") else ""
+    for line in cron.splitlines():
+        if not line.lstrip().startswith("#") and "muxa" in line.lower():
+            m.note(f"a crontab entry mentions muxa: {line.strip()[:100]}")
+
+
 def report_leftovers(m: Migration):
     for name in ("muxa", "muxad"):
         path = shutil.which(name)
@@ -706,6 +838,8 @@ def main() -> int:
     parser.add_argument("--verbose", "-v", action="store_true", help="show each changed line")
     parser.add_argument("--claude-home", action="append", default=[], metavar="DIR",
                         help="another Claude Code config dir to migrate (repeatable)")
+    parser.add_argument("--codex-home", action="append", default=[], metavar="DIR",
+                        help="another Codex config dir (CODEX_HOME) to migrate (repeatable)")
     parser.add_argument("--skip-tmux", action="store_true", help="leave live tmux sessions alone")
     parser.add_argument("--only-files", action="store_true",
                         help="only move directories and rewrite files; leave services, live tmux, "
@@ -723,13 +857,17 @@ def main() -> int:
     if not args.only_files:
         stop_services(m)
     dirs = move_directories(m)
+    if not args.only_files:
+        convert_services(m)
     rewrite_own_files(m, dirs)
-    migrate_agents(m, args.claude_home)
+    migrate_agents(m, args.claude_home, args.codex_home)
     migrate_shell_and_tmux(m)
     if not (args.skip_tmux or args.only_files):
         migrate_live_tmux(m)
     if not args.only_files:
         migrate_macos_app(m, args.keychain)
+        start_services(m)
+    report_custom_jobs(m)
     report_leftovers(m)
 
     print()
@@ -737,7 +875,9 @@ def main() -> int:
         print("Nothing from Muxa found on this machine.")
     elif args.apply:
         print(f"Done: {m.done} changes. Backups end in .muxa-migrate-{STAMP}.")
-        print("Next: run `tend init` to install the tendd service, then restart your agents so their hooks call `tend`.")
+        print("Next: open a new shell and restart your agents so their hooks and MCP server call `tend`.")
+        if not NEW_SERVICES and not args.only_files:
+            print("No Muxa service was found to move; run `tend init` to install the tendd service.")
     else:
         print(f"{m.done} changes planned. Run again with --apply to make them.")
     if m.notes:
