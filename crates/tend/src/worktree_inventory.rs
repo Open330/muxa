@@ -677,7 +677,11 @@ fn check_activity(
         // about this dispatch. Failed, preparing, missing or unreadable
         // records keep it.
         let own_run_finished = matching.iter().any(|run| {
-            run.finished() && lenient_canonical(&run.cwd) == lenient_canonical(&receipt.path)
+            !run.desired.is_empty()
+                && run.finished()
+                && workspace.is_some_and(|ws| run.identity.workspace_id.eq_ignore_ascii_case(ws))
+                && run.identity.work_id.eq_ignore_ascii_case(work)
+                && lenient_canonical(&run.cwd) == lenient_canonical(&receipt.path)
         });
         match dispatch_state(live.dispatches.as_deref(), dispatch_id) {
             Ok(Some(state)) if state == "completed" => {}

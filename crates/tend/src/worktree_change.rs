@@ -1071,7 +1071,11 @@ mod tests {
             ..quiet()
         };
         assert!(!worktree_inventory::inspect(f.current(), &live).candidate);
+    }
 
+    #[test]
+    fn a_dispatch_is_finished_only_by_its_own_record_or_run() {
+        let f = fixture();
         // A dispatch with no Work run and nothing running in the tree is
         // finished only when its record says so.
         let dispatches = f.receipts.parent().unwrap().join("dispatches");
@@ -1127,6 +1131,30 @@ mod tests {
             ..quiet()
         };
         assert!(worktree_inventory::inspect(by_dispatch.clone(), &own).candidate);
+        // A finished Run of another Work at exactly this checkout does not.
+        let other_work = Liveness {
+            runs: Ok(vec![run_json("different-work", &f.tree, false)]),
+            dispatches: Some(dispatches.clone()),
+            ..quiet()
+        };
+        let row = worktree_inventory::inspect(by_dispatch.clone(), &other_work);
+        assert!(
+            row.blockers
+                .iter()
+                .any(|b| b.contains("dispatch is launched")),
+            "{:?}",
+            row.blockers
+        );
+        // Nor does a Run with nothing to do.
+        let mut empty = run_json("run", &f.tree, false);
+        empty.desired.clear();
+        empty.aliases.clear();
+        let unstarted = Liveness {
+            runs: Ok(vec![empty]),
+            dispatches: Some(dispatches.clone()),
+            ..quiet()
+        };
+        assert!(!worktree_inventory::inspect(by_dispatch.clone(), &unstarted).candidate);
         std::fs::write(
             dispatches.join(format!("{id}.json")),
             r#"{"state":"failed"}"#,
