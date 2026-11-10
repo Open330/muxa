@@ -244,6 +244,8 @@ private struct MuxaGeneralSettingsView: View {
     @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
     @AppStorage(MuxaPreferences.showWorkbenchOnLaunchKey) private var showWorkbenchOnLaunch = true
     @AppStorage(MuxaPreferences.homeAnimatesMovesKey) private var homeAnimatesMoves = true
+    @AppStorage(MuxaHotKeyPreset.defaultsKey) private var agentsHotKey = MuxaHotKeyPreset.optionSpace.rawValue
+    @ObservedObject private var globalHotKey = MuxaGlobalHotKey.shared
     @AppStorage(MuxaPreferences.workDirectoryKey) private var workDirectory = ""
     @Environment(\.openWindow) private var openWindow
 
@@ -272,6 +274,23 @@ private struct MuxaGeneralSettingsView: View {
                 Text("A card glides to its new lane and shows where it came from for a few seconds.")
                     .font(MuxaType.detail)
                     .foregroundStyle(.secondary)
+                Picker("Show agents from any app", selection: $agentsHotKey) {
+                    ForEach(MuxaHotKeyPreset.allCases) { preset in
+                        Text(preset.title).tag(preset.rawValue)
+                    }
+                }
+                .onChange(of: agentsHotKey) { value in
+                    globalHotKey.apply(MuxaHotKeyPreset(rawValue: value) ?? .off)
+                }
+                if let problem = globalHotKey.problem {
+                    Label(problem, systemImage: "exclamationmark.triangle.fill")
+                        .font(MuxaType.detail)
+                        .foregroundStyle(.orange)
+                } else {
+                    Text("Brings Muxa forward with the agents palette, those waiting on you first.")
+                        .font(MuxaType.detail)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Section("Startup") {
