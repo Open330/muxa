@@ -255,8 +255,11 @@ class Migration:
                 new = transform(old)
                 if new == old:
                     return
+                noted = len(self.notes)
                 if validate and not validate(new):
-                    if validate is valid_toml and tomllib is None:
+                    if len(self.notes) > noted:
+                        pass  # the validator already explained why
+                    elif tomllib is None:
                         self.note(f"{path} needs renaming, but editing TOML safely needs Python 3.11+. "
                                   f"Run the script with python3.11 (or newer), or edit it by hand.")
                     else:
@@ -452,6 +455,11 @@ MCP_HEADER = r"\[\s*mcp_servers\s*\.\s*(?:{name}|\"{name}\"|'{name}')\s*(\]|\.)"
 def migrate_codex_toml(m: Migration, path: Path):
     def transform(text: str) -> str:
         has_tend = re.search(r"(?m)^\s*" + MCP_HEADER.format(name="tend"), text) is not None
+        if tomllib is not None:
+            with contextlib.suppress(tomllib.TOMLDecodeError):
+                has_tend = "tend" in (tomllib.loads(text).get("mcp_servers") or {})
+        if not has_tend:  # dotted keys: mcp_servers.muxa.command = …
+            text = re.sub(r"\bmcp_servers\s*\.\s*(?:muxa|\"muxa\"|'muxa')\s*\.", "mcp_servers.tend.", text)
         out, kept_old = [], False
         for chunk in re.split(r"(?m)^(?=\s*\[)", text):
             header = chunk.lstrip().split("\n", 1)[0]
@@ -463,14 +471,34 @@ def migrate_codex_toml(m: Migration, path: Path):
                     continue
                 chunk = re.sub(MCP_HEADER.format(name="muxa"), r"[mcp_servers.tend\1", chunk, count=1)
             # An MCP server's command is an executable path; a hook's is a command line.
-            rename = rename_program_path if in_mcp else rename_executable
-            chunk = re.sub(r"(\bcommand\s*=\s*)([\"'])(.*?)\2",
-                           lambda mm: mm.group(1) + mm.group(2) + rename(mm.group(3)) + mm.group(2), chunk)
-            out.append(surgical_rename(chunk))
+            # An MCP server's command is an executable path; a hook's is a
+            # command line. Inline (`mcp_servers = { muxa = { … } }`) and
+            # dotted (`mcp_servers.muxa.command = …`) spellings count as MCP.
+            lines = []
+            for line in chunk.splitlines(keepends=True):
+                if has_tend and re.search(r"\bmcp_servers\s*\.\s*(?:muxa|\"muxa\"|'muxa')\s*\.", line):
+                    kept_old = True
+                    lines.append(line.replace("muxa", "\0MUXA\0"))  # left as is (restored below)
+                    continue
+                rename = rename_program_path if in_mcp or re.search(r"\bmcp_servers\b", line) else rename_executable
+                lines.append(re.sub(r"(\bcommand\s*=\s*)([\"'])(.*?)\2",
+                                    lambda mm, f=rename: mm.group(1) + mm.group(2) + f(mm.group(3)) + mm.group(2), line))
+            out.append(surgical_rename("".join(lines)).replace("\0MUXA\0", "muxa"))
         if kept_old:
             m.note(f"{path} already has [mcp_servers.tend]; [mcp_servers.muxa] was left in place. Remove it once tend works.")
         return "".join(out)
-    m.edit(path, transform, validate=valid_toml)
+    def valid(text: str) -> bool:
+        """Parses, and no migrated MCP server still runs a Muxa binary."""
+        if not valid_toml(text):
+            return False
+        servers = tomllib.loads(text).get("mcp_servers") or {}
+        stale = [name for name, entry in servers.items() if name != "muxa" and isinstance(entry, dict)
+                 and os.path.basename(str(entry.get("command", ""))) in ("muxa", "muxad")]
+        if stale:
+            m.note(f"{path}: MCP server {', '.join(stale)} would still run a Muxa binary; left unchanged. Edit it by hand.")
+            return False
+        return True
+    m.edit(path, transform, validate=valid)
 
 
 def migrate_agents(m: Migration, extra_claude: list[str]):
