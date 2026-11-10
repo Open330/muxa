@@ -298,7 +298,8 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         let groups = MuxaUsageGroup.groups(from: snapshot.hostedAgents, now: date)
         var notified = MuxaUsageAlerts.loadNotified(defaults)
         let due = MuxaUsageAlerts.due(groups: groups, notified: Set(notified.keys), now: date)
-        guard !due.alerts.isEmpty || !due.rearmed.isEmpty else { return }
+        guard !due.alerts.isEmpty || !due.rearmed.isEmpty || !due.silent.isEmpty else { return }
+        for key in due.silent { notified[key] = date }
         for cycle in due.rearmed {
             for key in notified.keys where key.hasPrefix(cycle + "\u{1F}") { notified.removeValue(forKey: key) }
         }

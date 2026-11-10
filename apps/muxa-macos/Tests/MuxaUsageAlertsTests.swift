@@ -65,6 +65,16 @@ private func group(_ percent: Double, reset: Date? = now.addingTimeInterval(3600
     #expect(MuxaUsageAlerts.due(groups: [group(85, hosts: ["mbp"])], notified: Set(first.alerts.flatMap(\.crossed)), now: now).alerts.isEmpty)
 }
 
+@Test func aHostThatJoinedKeepsTheHistoryAfterTheFirstLeaves() {
+    let first = MuxaUsageAlerts.due(groups: [group(96, hosts: ["mini"])], notified: [], now: now)
+    var notified = Set(first.alerts.flatMap(\.crossed))
+    let joined = MuxaUsageAlerts.due(groups: [group(96, hosts: ["mini", "mbp"])], notified: notified, now: now)
+    #expect(joined.alerts.isEmpty)
+    #expect(!joined.silent.isEmpty)
+    notified.formUnion(joined.silent)
+    #expect(MuxaUsageAlerts.due(groups: [group(96, hosts: ["mbp"])], notified: notified, now: now).alerts.isEmpty)
+}
+
 @Test func aNewWindowStartsOver() {
     let first = MuxaUsageAlerts.due(groups: [group(85)], notified: [], now: now)
     let notified = Set(first.alerts.flatMap(\.crossed))

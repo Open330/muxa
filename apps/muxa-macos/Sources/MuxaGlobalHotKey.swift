@@ -141,8 +141,10 @@ struct MuxaHotKeyReceiver: NSViewRepresentable {
             observers = []
             guard let window else { return }
             let center = NotificationCenter.default
+            // Any window becoming key: the workbench itself, or its own
+            // palette sheet.
             for (name, object) in [
-                (NSWindow.didBecomeKeyNotification, window as AnyObject?),
+                (NSWindow.didBecomeKeyNotification, nil),
                 (NSWindow.didEndSheetNotification, window as AnyObject?),
                 (MuxaGlobalHotKey.showAgents, nil),
             ] {
@@ -156,9 +158,15 @@ struct MuxaHotKeyReceiver: NSViewRepresentable {
             attempt()
         }
 
+        /// Takes the request when this workbench is the one in front: the
+        /// window itself is key with no other sheet over it, or its open
+        /// palette sheet is key (the palette then switches to agents).
         func attempt() {
-            guard let window, window.isKeyWindow, MuxaGlobalHotKey.shared.hasPending else { return }
-            guard paletteOpen || window.attachedSheet == nil else { return }
+            guard let window, MuxaGlobalHotKey.shared.hasPending else { return }
+            let ready = paletteOpen
+                ? window.isKeyWindow || window.attachedSheet?.isKeyWindow == true
+                : window.isKeyWindow && window.attachedSheet == nil
+            guard ready else { return }
             if MuxaGlobalHotKey.shared.takePending() { showAgents?() }
         }
     }

@@ -52,14 +52,17 @@ enum MuxaUsageAlerts {
     /// and lower thresholds included, so a jump from 79% to 96% announces
     /// 95% only and a figure that falls back does not announce again.
     /// Within one call a key is announced once. `rearmed` lists reset-less
-    /// cycles whose fresh reading fell low enough to count as a new window.
+    /// cycles whose fresh reading fell low enough to count as a new window;
+    /// `silent` lists keys to record without announcing, for hosts that
+    /// joined a window another host already announced.
     static func due(
         groups: [MuxaUsageGroup],
         notified: Set<String>,
         now: Date
-    ) -> (alerts: [(alert: Alert, crossed: [String])], rearmed: [String]) {
+    ) -> (alerts: [(alert: Alert, crossed: [String])], rearmed: [String], silent: [String]) {
         var alerts: [(Alert, [String])] = []
         var rearmed: [String] = []
+        var silent: [String] = []
         var seen = notified
         for group in groups where group.capped.isEmpty {
             for window in group.windows {
@@ -71,8 +74,16 @@ enum MuxaUsageAlerts {
                 }
                 let passed = thresholds.filter { window.percent >= $0 }
                 guard let top = passed.max() else { continue }
-                guard !cycles.contains(where: { seen.contains(key(cycle: $0, threshold: top)) }) else { continue }
                 let crossed = cycles.flatMap { cycle in passed.map { key(cycle: cycle, threshold: $0) } }
+                if cycles.contains(where: { seen.contains(key(cycle: $0, threshold: top)) }) {
+                    // Announced already through another host: pass the
+                    // history on to hosts that joined since, so it outlives
+                    // the host that announced it.
+                    let missing = crossed.filter { !seen.contains($0) }
+                    silent.append(contentsOf: missing)
+                    seen.formUnion(missing)
+                    continue
+                }
                 seen.formUnion(crossed)
                 alerts.append((
                     Alert(
@@ -88,7 +99,7 @@ enum MuxaUsageAlerts {
                 ))
             }
         }
-        return (alerts, rearmed)
+        return (alerts, rearmed, silent)
     }
 
     static func notification(for alert: Alert, sound: Bool) -> MuxaAgentNotification {
