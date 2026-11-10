@@ -19,6 +19,25 @@ use anyhow::Result;
 use muxa::worktree_receipt::{ReceiptState, WorktreeReceipt};
 use serde::Serialize;
 
+/// Writes the receipt for a worktree muxa is about to create. A receipt
+/// that cannot be written only costs cleanup its proof, so failure is
+/// logged, not raised. Unit tests make worktrees in temporary directories;
+/// their receipts would land in the user's muxa data, so tests write none.
+pub(crate) fn begin_receipt(
+    repo: &Path,
+    path: &Path,
+    branch: Option<String>,
+    base: Option<String>,
+    origin: muxa::worktree_receipt::ReceiptOrigin,
+) -> Option<WorktreeReceipt> {
+    if cfg!(test) {
+        return None;
+    }
+    WorktreeReceipt::begin(repo, path, branch, base, origin)
+        .map_err(|error| tracing::warn!(%error, "worktree receipt not written"))
+        .ok()
+}
+
 #[derive(Debug, clap::Args)]
 pub(crate) struct Args {
     /// Also list attempts that never finished or failed.
