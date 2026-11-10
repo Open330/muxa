@@ -22,10 +22,8 @@ pub(super) trait Clock {
 }
 
 /// The wall clock, for tests that drive a probe in real time.
-#[cfg(test)]
 pub(super) struct RealClock;
 
-#[cfg(test)]
 impl Clock for RealClock {
     fn now(&self) -> Instant {
         Instant::now()

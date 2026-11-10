@@ -63,6 +63,11 @@ fn print_result(result: &Value) -> Result<()> {
     // Keep correlation data even on timeout; never hide an already-sent request.
     let receipt: Value = serde_json::from_str(text).context("invalid peer receipt")?;
     println!("{text}");
+    if receipt["sent"] == false {
+        bail!(
+            "peer request was not dispatched; inspect the readiness/launch receipt before retrying"
+        );
+    }
     if receipt["reason"] == "timeout" {
         bail!("peer reply timed out; resume the same request with muxa msg wait REQUEST_ID");
     }
@@ -91,5 +96,16 @@ mod tests {
         )
         .is_err());
         assert!(print_result(&json!({"content":[{"text":"{\"request_id\":\"req_1\",\"reason\":\"sent_without_waiting\"}"}]})).is_ok());
+    }
+    #[test]
+    fn a_created_but_unready_worker_is_not_cli_success() {
+        for reason in [
+            "launch_pending",
+            "worker_spawn_failed",
+            "worker_spawn_disabled",
+        ] {
+            let text = json!({"sent": false, "reason": reason, "launch_id":"known"}).to_string();
+            assert!(print_result(&json!({"content":[{"text":text}]})).is_err());
+        }
     }
 }

@@ -15,6 +15,9 @@ pub(super) async fn run_agent_cmd(
         AgentCmd::Search(args) => agent_records::search(args),
         AgentCmd::Read(args) => agent_records::read(args),
         AgentCmd::Start(args) => agent_launch::run(args, client, socket_path, cfg).await,
+        AgentCmd::Prepare(args) => {
+            tokio::task::spawn_blocking(move || crate::worker_startup::run(args)).await?
+        }
         AgentCmd::Control(args) => tmux_work::run_agent_control(args, client).await,
         AgentCmd::Move(args) => agent_move::run(args, Some(client.socket().to_path_buf())).await,
     }

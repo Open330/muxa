@@ -59,6 +59,7 @@ mod work_options;
 mod work_pipeline;
 mod work_up;
 mod worker_cmd;
+mod worker_startup;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -936,6 +937,8 @@ enum AgentCmd {
     Read(agent_records::ReadArgs),
     /// Start an allowlisted agent in tmux or a muxa-owned PTY session.
     Start(agent_launch::StartArgs),
+    /// Mechanically prepare an exact worker launch and verify its input prompt.
+    Prepare(worker_startup::Args),
     /// Interrupt or terminate one muxa-managed tmux pane or native PTY session.
     Control(tmux_work::AgentControlArgs),
     /// Move a running agent without restarting its conversation.

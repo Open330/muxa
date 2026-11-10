@@ -422,7 +422,8 @@ impl StartRequest {
         Self {
             creator: None,
             worker_spawn: None,
-            bypass_permissions: true,
+            bypass_permissions: args.purpose != muxa::collaboration::LaunchPurpose::Worker
+                || cfg.collaboration.worker_bypass_permissions,
             purpose: args.purpose,
             agent: args.agent,
             options: cfg.launch_options(args.agent.label(), explicit_options(&args.options)),
@@ -446,6 +447,9 @@ impl StartRequest {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StartResult {
+    /// Verified composer state; process creation alone is not readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_readiness: Option<muxa::account_swap::worker_startup::Report>,
     pub launch_id: Option<String>,
     pub launch_receipt: Option<Box<muxa::launch_identity::LaunchReceipt>>,
     pub host: LaunchHost,
@@ -483,6 +487,8 @@ pub struct StartResult {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct AgentStartOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
+    input_readiness: Option<muxa::account_swap::worker_startup::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     launch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     launch_receipt: Option<Box<muxa::launch_identity::LaunchReceipt>>,
@@ -509,6 +515,7 @@ struct AgentStartOutput {
 impl AgentStartOutput {
     fn tmux(result: &StartResult) -> Self {
         Self {
+            input_readiness: result.input_readiness.clone(),
             schema_version: 1,
             launch_id: result.launch_id.clone(),
             launch_receipt: result.launch_receipt.clone(),
@@ -623,6 +630,7 @@ async fn run_native(
         .await
         .context("spawning native muxa agent session")?;
     let result = AgentStartOutput {
+        input_readiness: None,
         launch_id: None,
         launch_receipt: None,
         schema_version: 1,
@@ -766,12 +774,47 @@ fn configure_worker_inbound(
     }
 }
 
+/// Muxa's own bootstrap/skill files live outside the project. Make only that
+/// managed directory available to workers so reading AGENTS instructions does
+/// not itself trigger an external-read approval on a fresh account.
+fn configure_worker_bootstrap_context(
+    agent: AgentProgram,
+    purpose: muxa::collaboration::LaunchPurpose,
+    options: &mut Vec<String>,
+    directory: Option<&Path>,
+) {
+    if purpose != muxa::collaboration::LaunchPurpose::Worker || agent != AgentProgram::Claude {
+        return;
+    }
+    let Some(directory) = directory.filter(|p| p.join("bootstrap.md").is_file()) else {
+        return;
+    };
+    let Ok(directory) = muxa::paths::canonicalize(directory) else {
+        return;
+    };
+    let at = options
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(options.len());
+    options.splice(
+        at..at,
+        [format!("--add-dir={}", directory.to_string_lossy())],
+    );
+}
+
 /// Start one allowlisted agent in a detached tmux surface and return its exact
 /// pane id. The operation is synchronous and should be wrapped in
 /// `spawn_blocking` by async callers.
 #[allow(clippy::too_many_lines)] // launch, metadata stamping, and rollback form one physical transaction
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
     configure_worker_inbound(request.agent, request.purpose, &mut request.options);
+    let bootstrap = muxa::paths::data_dir().map(|root| root.join("muxa/agent-integration"));
+    configure_worker_bootstrap_context(
+        request.agent,
+        request.purpose,
+        &mut request.options,
+        bootstrap.as_deref(),
+    );
     let launch_id = request.worker_spawn.as_ref().map_or_else(
         || uuid::Uuid::new_v4().to_string(),
         |ticket| ticket.launch_id.clone(),
@@ -954,7 +997,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         }
     }
 
-    if request.worker_spawn.is_some() {
+    if request.purpose == muxa::collaboration::LaunchPurpose::Worker {
         // Launching was persisted before creation. A crash in the small
         // create-to-stamp gap remains Uncertain and cannot trigger a respawn.
         // Once stamped, any daemon client can reconcile this exact launch.
@@ -975,6 +1018,18 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
             }
         })
         .context("record worker launch identity; pane left for reconciliation")?;
+        if prompt.is_none() && matches!(request.agent, AgentProgram::Claude | AgentProgram::Codex) {
+            crate::mux_control::Control::Ambient
+                .run(&[
+                    "set-option",
+                    "-p",
+                    "-t",
+                    &pane,
+                    "@muxa_input_readiness",
+                    "pending",
+                ])
+                .context("record worker preparation state")?;
+        }
     }
 
     let managed = work.is_some();
@@ -1046,6 +1101,20 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         }
     }
     crate::spawn_provenance::record(&request, &pane, &launch_id);
+    let input_readiness = if request.purpose == muxa::collaboration::LaunchPurpose::Worker
+        && prompt.is_none()
+        && matches!(request.agent, AgentProgram::Claude | AgentProgram::Codex)
+    {
+        let report =
+            crate::worker_startup::prepare(&pane, &cwd, &launch_id, request.bypass_permissions)?;
+        anyhow::ensure!(report.state == muxa::account_swap::worker_startup::State::Ready,
+            "worker pane {pane}, launch {launch_id}, was created but is not input-ready ({:?}): {}; the pane is retained, no task was sent",
+            report.state, report.reason.as_deref().unwrap_or("startup did not finish"));
+        Some(report)
+    } else {
+        None
+    };
+
     // Minting belongs to the agent's session-start hook, which reaches the
     // room's arbiter. Doing it here too would allocate from a namespace this
     // process cannot see all of — the bug the arbiter exists to close — so an
@@ -1054,6 +1123,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     let alias = request.alias;
 
     Ok(StartResult {
+        input_readiness,
         launch_id: Some(launch_id),
         launch_receipt: Some(Box::new(receipt)),
         host: LaunchHost::Tmux,
@@ -1982,6 +2052,7 @@ mod tests {
     #[test]
     fn agent_start_json_uses_one_schema_for_tmux_and_native() {
         let tmux = AgentStartOutput {
+            input_readiness: None,
             launch_id: None,
             launch_receipt: None,
             schema_version: 1,
@@ -2112,6 +2183,71 @@ mod tests {
         assert_eq!(
             unique_session_name("review".into(), |name| existing.contains(&name)),
             "review-3"
+        );
+    }
+    #[test]
+    fn workers_read_only_the_managed_bootstrap_context_without_changing_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("bootstrap.md"), "managed instructions").unwrap();
+        let mut options = vec![
+            "--permission-mode".into(),
+            "default".into(),
+            "--".into(),
+            "body".into(),
+        ];
+        configure_worker_bootstrap_context(
+            AgentProgram::Claude,
+            muxa::collaboration::LaunchPurpose::Worker,
+            &mut options,
+            Some(root.path()),
+        );
+        assert_eq!(&options[..2], ["--permission-mode", "default"]);
+        assert_eq!(
+            options[2],
+            format!(
+                "--add-dir={}",
+                muxa::paths::canonicalize(root.path()).unwrap().display()
+            )
+        );
+        assert_eq!(&options[3..], ["--", "body"]);
+        let before = options.clone();
+        configure_worker_bootstrap_context(
+            AgentProgram::Claude,
+            muxa::collaboration::LaunchPurpose::Primary,
+            &mut options,
+            Some(root.path()),
+        );
+        assert_eq!(before, options);
+    }
+    #[test]
+    fn codex_bootstrap_does_not_add_write_roots() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("bootstrap.md"), "managed instructions").unwrap();
+        let mut options = vec![];
+        configure_worker_bootstrap_context(
+            AgentProgram::Codex,
+            muxa::collaboration::LaunchPurpose::Worker,
+            &mut options,
+            Some(root.path()),
+        );
+        assert!(options.is_empty());
+    }
+    #[test]
+    fn direct_worker_starts_follow_the_configured_bypass_grant() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(flatten)]
+            start: StartArgs,
+        }
+        let args = Harness::parse_from(["start", "--agent", "claude", "--purpose", "worker"]).start;
+        let mut config = muxa::config::Config::default();
+        assert!(
+            !StartRequest::from_args(&args, Path::new("/tmp/daemon"), &config).bypass_permissions
+        );
+        config.collaboration.worker_bypass_permissions = true;
+        assert!(
+            StartRequest::from_args(&args, Path::new("/tmp/daemon"), &config).bypass_permissions
         );
     }
 }
