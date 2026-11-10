@@ -36,6 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Claude worker readiness recognizes its framed composer when a custom status
+  line replaces the default shortcut footer. The worker-only probe requires a
+  composer at the screen tail and rejects relaunch echoes or unsent drafts;
+  account-swap resume retains its existing prompt policy.
+
+
 - Menu-bar chips unfold without a dwell delay, retain hover across a small
   margin, and fold after 0.2 seconds (0.45 seconds toward the peek). Pixel-only
   render keys and scale-specific bitmaps avoid hidden-value redraws and keep

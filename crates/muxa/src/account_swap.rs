@@ -3948,6 +3948,32 @@ fn wait_for_resume(
 #[allow(clippy::too_many_arguments)] // the probes and timings tests drive one by one
 fn wait_for_resume_answering(
     clock: &dyn Clock,
+    capture: impl FnMut() -> Option<String>,
+    alive: impl FnMut() -> bool,
+    answer: impl FnMut(&[&str]) -> bool,
+    granted: &dyn Fn(Consent) -> bool,
+    timeout: Duration,
+    quiet: Duration,
+    tick: Duration,
+    answered: &mut Vec<&'static str>,
+) -> Resume {
+    wait_for_resume_answering_with_probe(
+        clock,
+        capture,
+        alive,
+        answer,
+        granted,
+        timeout,
+        quiet,
+        tick,
+        answered,
+        &agent_prompt_visible,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_resume_answering_with_probe(
+    clock: &dyn Clock,
     mut capture: impl FnMut() -> Option<String>,
     mut alive: impl FnMut() -> bool,
     mut answer: impl FnMut(&[&str]) -> bool,
@@ -3956,6 +3982,7 @@ fn wait_for_resume_answering(
     quiet: Duration,
     tick: Duration,
     answered: &mut Vec<&'static str>,
+    prompt_visible: &dyn Fn(&str) -> bool,
 ) -> Resume {
     let started = clock.now();
     let mut last = String::new();
@@ -4012,7 +4039,7 @@ fn wait_for_resume_answering(
             // Quiet is not ready: a wrapper or the agent itself can sit on
             // the shell's echo of the relaunch for seconds before the TUI
             // (or a trust dialog) draws. Wait for the agent's own prompt.
-            if !agent_prompt_visible(&last) {
+            if !prompt_visible(&last) {
                 if clock.now().saturating_duration_since(started) >= timeout {
                     return Resume::Unsettled;
                 }
