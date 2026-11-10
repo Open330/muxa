@@ -6573,11 +6573,23 @@ mod tests {
     /// it and the request can follow a replaced holder: a
     /// `workspace/work/role` path (which local peer selection does not
     /// know) and a `role:` target alike.
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one isolated transport lifecycle, including origin env
     async fn call_peer_sends_named_slots_as_slots() {
+        use std::os::unix::fs::PermissionsExt;
         const PROBE: &str = "MUXA_CALL_PEER_SLOT_PROBE";
         if std::env::var_os(PROBE).is_none() {
+            // This fixture models routing and has no real terminal backend.
+            // Make metadata explicit instead of querying the developer's tmux.
+            let control = tempfile::tempdir().unwrap();
+            let tmux = control.path().join("tmux");
+            std::fs::write(&tmux, "#!/bin/sh\ncase \"$*\" in\n*-V*) printf 'tmux 3.6\\n';;\n*display-message*) printf '\\t\\t\\n';;\n*) exit 1;;\nesac\n").unwrap();
+            std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut paths = vec![control.path().to_owned()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -6585,6 +6597,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(PROBE, "1")
+                .env("PATH", std::env::join_paths(paths).unwrap())
                 .env_remove("MUXA_HOST")
                 .env_remove("MUXA_HOSTS")
                 .env_remove("RMUX")
