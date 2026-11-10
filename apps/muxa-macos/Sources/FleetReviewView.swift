@@ -169,24 +169,30 @@ private struct FleetReviewKeyMonitor: NSViewRepresentable {
 
     func makeCoordinator() -> Coordinator { Coordinator() }
 
+    @MainActor
     final class Coordinator {
         var handle: ((FleetReviewKey) -> Bool)?
-        private var monitor: Any?
+        nonisolated(unsafe) private var monitor: Any?
 
         func install(handle: @escaping (FleetReviewKey) -> Bool) {
             self.handle = handle
             monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-                // Leave modified keys and typing in a text field alone.
-                guard event.modifierFlags.intersection([.command, .control, .option]).isEmpty,
-                      !(NSApp.keyWindow?.firstResponder is NSTextView),
-                      let key = FleetReviewKey.from(keyCode: event.keyCode, characters: event.charactersIgnoringModifiers),
-                      let handle = self?.handle,
-                      handle(key) else { return event }
-                return nil
+                // Local monitors run on the main thread; say so, so the
+                // compiler lets the key window be read here.
+                let modified = !event.modifierFlags.intersection([.command, .control, .option]).isEmpty
+                let key = FleetReviewKey.from(keyCode: event.keyCode, characters: event.charactersIgnoringModifiers)
+                let used = MainActor.assumeIsolated { () -> Bool in
+                    // Leave modified keys and typing in a text field alone.
+                    guard !modified, let key,
+                          !(NSApp.keyWindow?.firstResponder is NSTextView),
+                          let handle = self?.handle else { return false }
+                    return handle(key)
+                }
+                return used ? nil : event
             }
         }
 
-        func remove() {
+        nonisolated func remove() {
             if let monitor { NSEvent.removeMonitor(monitor) }
             monitor = nil
         }
