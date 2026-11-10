@@ -150,6 +150,18 @@ enum TendWhatsNew {
 
     static var catalog: [Release] {
         [
+            Release(version: "0.10.0", highlights: [
+                Highlight(
+                    systemImage: "character.cursor.ibeam",
+                    title: String(localized: "Muxa is now Tend"),
+                    detail: String(localized: "The app, CLI and daemon are tend and tendd. If you used Muxa, run scripts/migrate-from-muxa.py once on each Mac to move your settings, hooks and data over.")
+                ),
+                Highlight(
+                    systemImage: "square.split.2x2",
+                    title: String(localized: "A menu bar mark that shows your fleet"),
+                    detail: String(localized: "Each room of the new mark lights for one state anywhere in your fleet: waiting on you, error, working, or finished.")
+                ),
+            ]),
             Release(version: "0.8.55", highlights: [
                 Highlight(
                     systemImage: "folder",

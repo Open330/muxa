@@ -131,6 +131,16 @@
         }
       }
     },
+    "A menu bar mark that shows your fleet" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "함대 상태를 보여주는 메뉴바 마크"
+          }
+        }
+      }
+    },
     "Add Approval Rule…" : {
       "localizations" : {
         "ko" : {
@@ -2389,6 +2399,16 @@
         }
       }
     },
+    "Each room of the new mark lights for one state anywhere in your fleet: waiting on you, error, working, or finished." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "새 마크의 네 칸이 각각 함대 어딘가의 상태 하나를 켭니다: 당신 차례, 오류, 작업 중, 끝남."
+          }
+        }
+      }
+    },
     "From %@" : {
       "localizations" : {
         "ko" : {
@@ -2435,6 +2455,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "worktree 목록을 보려면 새 tendd가 필요합니다. tend를 업데이트하고 tendd를 다시 시작하세요."
+          }
+        }
+      }
+    },
+    "Muxa is now Tend" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Muxa의 새 이름은 Tend입니다"
           }
         }
       }
@@ -2525,6 +2555,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%2$lld개 중 %1$lld개만 보여 줍니다(디스크에 남아 있는 것 먼저). 전체는 %3$@에서 tend worktrees를 실행하세요."
+          }
+        }
+      }
+    },
+    "The app, CLI and daemon are tend and tendd. If you used Muxa, run scripts/migrate-from-muxa.py once on each Mac to move your settings, hooks and data over." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "앱, CLI, 데몬 이름이 tend와 tendd로 바뀌었습니다. Muxa를 쓰고 있었다면 Mac마다 scripts/migrate-from-muxa.py를 한 번 실행해 설정, 훅, 데이터를 옮기세요."
           }
         }
       }

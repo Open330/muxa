@@ -2679,107 +2679,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
-name = "tend"
-version = "0.9.10"
-dependencies = [
- "axum",
- "base64 0.22.1",
- "dirs",
- "futures",
- "http-body-util",
- "nix 0.29.0",
- "notify-rust",
- "openidconnect",
- "portable-pty",
- "regex",
- "reqwest",
- "rusqlite",
- "rust-embed",
- "serde",
- "serde_json",
- "sha2",
- "strum",
- "subtle",
- "sysinfo",
- "tempfile",
- "thiserror 2.0.21",
- "time",
- "tokio",
- "tokio-stream",
- "toml",
- "toml_edit 0.22.27",
- "tower",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "wiremock",
-]
-
-[[package]]
-name = "tend-cli"
-version = "0.9.10"
-dependencies = [
- "ansi-to-tui",
- "anyhow",
- "clap 4.6.1",
- "cliclack",
- "comfy-table",
- "console 0.15.11",
- "crossterm 0.29.0",
- "dirs",
- "futures-util",
- "insta",
- "tend",
- "nix 0.29.0",
- "owo-colors 4.3.0",
- "rand 0.8.6",
- "ratatui",
- "serde",
- "serde_json",
- "sha2",
- "signal-hook",
- "sysinfo",
- "tempfile",
- "time",
- "tokio",
- "tokio-tungstenite",
- "toml",
- "toml_edit 0.22.27",
- "tracing",
- "tracing-subscriber",
- "unicode-width 0.2.2",
- "uuid",
- "which",
-]
-
-[[package]]
-name = "tend-zellij-plugin"
-version = "0.9.10"
-dependencies = [
- "serde",
- "serde_json",
- "zellij-tile",
-]
-
-[[package]]
-name = "tendd"
-version = "0.9.10"
-dependencies = [
- "anyhow",
- "clap 4.6.1",
- "tend",
- "serde_json",
- "tempfile",
- "time",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "names"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4720,6 +4619,107 @@ dependencies = [
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "tend"
+version = "0.10.0"
+dependencies = [
+ "axum",
+ "base64 0.22.1",
+ "dirs",
+ "futures",
+ "http-body-util",
+ "nix 0.29.0",
+ "notify-rust",
+ "openidconnect",
+ "portable-pty",
+ "regex",
+ "reqwest",
+ "rusqlite",
+ "rust-embed",
+ "serde",
+ "serde_json",
+ "sha2",
+ "strum",
+ "subtle",
+ "sysinfo",
+ "tempfile",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "tokio-stream",
+ "toml",
+ "toml_edit 0.22.27",
+ "tower",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
+name = "tend-cli"
+version = "0.10.0"
+dependencies = [
+ "ansi-to-tui",
+ "anyhow",
+ "clap 4.6.1",
+ "cliclack",
+ "comfy-table",
+ "console 0.15.11",
+ "crossterm 0.29.0",
+ "dirs",
+ "futures-util",
+ "insta",
+ "nix 0.29.0",
+ "owo-colors 4.3.0",
+ "rand 0.8.6",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signal-hook",
+ "sysinfo",
+ "tempfile",
+ "tend",
+ "time",
+ "tokio",
+ "tokio-tungstenite",
+ "toml",
+ "toml_edit 0.22.27",
+ "tracing",
+ "tracing-subscriber",
+ "unicode-width 0.2.2",
+ "uuid",
+ "which",
+]
+
+[[package]]
+name = "tend-zellij-plugin"
+version = "0.10.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "zellij-tile",
+]
+
+[[package]]
+name = "tendd"
+version = "0.10.0"
+dependencies = [
+ "anyhow",
+ "clap 4.6.1",
+ "serde_json",
+ "tempfile",
+ "tend",
+ "time",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
