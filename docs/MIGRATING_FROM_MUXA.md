@@ -33,7 +33,8 @@ before relying on peer requests again.
    ```
 
    Add `--claude-home DIR` for each extra Claude Code config directory
-   (a `CLAUDE_CONFIG_DIR` other than `~/.claude`), and `-v` to see each changed line.
+   (a `CLAUDE_CONFIG_DIR` other than `~/.claude`), `--codex-home DIR` for each
+   extra Codex one (a `CODEX_HOME` other than `~/.codex`), and `-v` to see each changed line.
 3. Apply it:
 
    ```bash
@@ -76,6 +77,9 @@ edit instead. `brew install python` gives a newer one.
   service to `dev.tend.mac.ask-provider`. The key is handed to `security`
   on standard input, never on a command line. macOS asks once per key to
   allow the read.
+
+Your own launchd jobs, systemd units and crontab entries that run muxa are
+listed at the end for you to update; the script does not edit them.
 
 Every edited file is first copied to `<file>.muxa-migrate-<timestamp>`.
 Running the script again after a successful run finds nothing to do.

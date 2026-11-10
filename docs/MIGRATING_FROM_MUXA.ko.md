@@ -32,7 +32,7 @@ Muxa의 새 이름은 Tend입니다. Tend는 Muxa의 이름을 하나도 읽지 
    ```
 
    `~/.claude` 말고 다른 Claude Code 설정 폴더(`CLAUDE_CONFIG_DIR`)를 쓴다면 폴더마다
-   `--claude-home DIR`을 붙입니다. 바뀌는 줄을 하나씩 보려면 `-v`를 붙입니다.
+   `--claude-home DIR`을, `~/.codex` 말고 다른 Codex 설정 폴더(`CODEX_HOME`)를 쓴다면 `--codex-home DIR`을 붙입니다. 바뀌는 줄을 하나씩 보려면 `-v`를 붙입니다.
 3. 적용:
 
    ```bash
@@ -65,6 +65,8 @@ Muxa를 돌리던 호스트마다 실행하세요. Python 3.8 이상이 필요�
 - macOS: 앱 설정을 `dev.muxa.mac`에서 `dev.tend.mac`으로, Ask 공급자 API 키를
   `dev.muxa.mac.ask-provider` 키체인 서비스에서 `dev.tend.mac.ask-provider`로 복사합니다.
   키는 명령 인자가 아니라 표준 입력으로 `security`에 넘깁니다. 키마다 macOS가 읽기 허락을 한 번 묻습니다.
+
+muxa를 부르는 사용자 launchd 작업, systemd 유닛, crontab 항목은 고치지 않고 마지막에 목록으로 알려 줍니다.
 
 고치는 파일은 먼저 `<파일>.muxa-migrate-<시각>`으로 복사해 둡니다. 성공한 뒤 다시 실행하면 할 일이 없다고 나옵니다.
 

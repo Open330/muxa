@@ -420,6 +420,16 @@ def rewrite_own_files(m: Migration, dirs: list[Path]):
             m.edit(path, full_rename)
 
 
+def codex_homes(extra: list[str]) -> list[Path]:
+    homes = [Path(os.environ.get("CODEX_HOME") or HOME / ".codex")] + [Path(p).expanduser() for p in extra]
+    seen, out = set(), []
+    for h in homes:
+        if h.exists() and h.resolve() not in seen:
+            seen.add(h.resolve())
+            out.append(h)
+    return out
+
+
 def claude_homes(extra: list[str]) -> list[Path]:
     homes = [HOME / ".claude"]
     if os.environ.get("CLAUDE_CONFIG_DIR"):
@@ -501,7 +511,7 @@ def migrate_codex_toml(m: Migration, path: Path):
     m.edit(path, transform, validate=valid)
 
 
-def migrate_agents(m: Migration, extra_claude: list[str]):
+def migrate_agents(m: Migration, extra_claude: list[str], extra_codex: list[str]):
     print("\nAgent integrations")
     homes = claude_homes(extra_claude)
     for home in homes:
@@ -523,10 +533,10 @@ def migrate_agents(m: Migration, extra_claude: list[str]):
             return d
         m.edit_json(claude_json, fix)
 
-    codex = Path(os.environ.get("CODEX_HOME", HOME / ".codex"))
-    migrate_codex_toml(m, codex / "config.toml")
-    for name in ("AGENTS.md", "AGENTS.override.md"):
-        m.edit(codex / name, surgical_rename)
+    for codex in codex_homes(extra_codex):
+        migrate_codex_toml(m, codex / "config.toml")
+        for name in ("AGENTS.md", "AGENTS.override.md"):
+            m.edit(codex / name, surgical_rename)
     migrate_skill_link(m, HOME / ".agents/skills")
 
     m.edit_json(HOME / ".gemini/settings.json",
@@ -686,6 +696,33 @@ def migrate_keychain(m: Migration, keychain: str | None):
             m.note(f"Could not save the {account} key under Tend; enter it again in Tend › Settings › Ask.")
 
 
+def report_custom_jobs(m: Migration):
+    """Your own launchd jobs, systemd units and crontab entries are not
+    Muxa's to rename, but one that runs muxa (directly or through a script)
+    stops working once Muxa is removed: list every one that mentions it."""
+    known = {"dev.open330.muxad.plist", "dev.open330.muxa-restore.plist", "muxad.service", "muxa-restore.service"}
+    candidates = []
+    if MACOS:
+        candidates += sorted((HOME / "Library/LaunchAgents").glob("*.plist"))
+    for base in (xdg("XDG_CONFIG_HOME", HOME / ".config"), xdg("XDG_DATA_HOME", HOME / ".local/share")):
+        candidates += sorted((base / "systemd/user").glob("*.service")) if (base / "systemd/user").exists() else []
+    for path in candidates:
+        if path.name in known or ".muxa-migrate-" in path.name:
+            continue
+        with contextlib.suppress(OSError):
+            data = path.read_bytes()
+            if path.suffix == ".plist":
+                with contextlib.suppress(Exception):
+                    data = json.dumps(plistlib.loads(data)).encode()
+            if b"muxa" in data.lower():
+                m.note(f"{path} mentions muxa. It is your own job, so it was left as is; "
+                       f"if it runs Muxa, point it at tend.")
+    cron = capture(["crontab", "-l"]) if have("crontab") else ""
+    for line in cron.splitlines():
+        if not line.lstrip().startswith("#") and "muxa" in line.lower():
+            m.note(f"a crontab entry mentions muxa: {line.strip()[:100]}")
+
+
 def report_leftovers(m: Migration):
     for name in ("muxa", "muxad"):
         path = shutil.which(name)
@@ -706,6 +743,8 @@ def main() -> int:
     parser.add_argument("--verbose", "-v", action="store_true", help="show each changed line")
     parser.add_argument("--claude-home", action="append", default=[], metavar="DIR",
                         help="another Claude Code config dir to migrate (repeatable)")
+    parser.add_argument("--codex-home", action="append", default=[], metavar="DIR",
+                        help="another Codex config dir (CODEX_HOME) to migrate (repeatable)")
     parser.add_argument("--skip-tmux", action="store_true", help="leave live tmux sessions alone")
     parser.add_argument("--only-files", action="store_true",
                         help="only move directories and rewrite files; leave services, live tmux, "
@@ -724,12 +763,13 @@ def main() -> int:
         stop_services(m)
     dirs = move_directories(m)
     rewrite_own_files(m, dirs)
-    migrate_agents(m, args.claude_home)
+    migrate_agents(m, args.claude_home, args.codex_home)
     migrate_shell_and_tmux(m)
     if not (args.skip_tmux or args.only_files):
         migrate_live_tmux(m)
     if not args.only_files:
         migrate_macos_app(m, args.keychain)
+    report_custom_jobs(m)
     report_leftovers(m)
 
     print()
