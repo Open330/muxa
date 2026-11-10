@@ -148,7 +148,13 @@ impl Client {
         launch_id: &str,
         reason: &str,
     ) -> Result<(), RuntimeError> {
-        self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawn_release", "origin":origin, "launch_id":launch_id, "reason":reason})).await?;
+        // Release probes the launch's process fence across every pane, which
+        // outlasts the default budget on a busy host; a timeout would hide
+        // the daemon's actual answer (released, or why it refused).
+        let response = self.call_with_timeout(&serde_json::json!({"protocol":PROTOCOL_VERSION, "kind":"collaboration_worker_spawn_release", "origin":origin, "launch_id":launch_id, "reason":reason}), std::time::Duration::from_secs(25)).await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(response_error(&response));
+        }
         Ok(())
     }
 

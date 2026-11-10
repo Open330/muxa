@@ -69,8 +69,8 @@ impl ProcessFence {
         }
         #[cfg(all(unix, not(target_os = "linux")))]
         {
-            false
-        } // No authoritative negative process observation on this path.
+            pid_gone(self.pid)
+        }
         #[cfg(windows)]
         {
             !crate::process_snapshot::pid_exists(self.pid)
@@ -117,6 +117,22 @@ impl ProcessFence {
             birth: process_birth(pid)?,
         })
     }
+}
+
+/// The kernel's own answer that no process has this pid. `ps` printing
+/// nothing cannot tell an exited pid from a failed spawn; ESRCH can. EPERM
+/// means the pid is alive under another user, so it is not an exit.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn pid_gone(pid: u32) -> bool {
+    let Ok(raw) = i32::try_from(pid) else {
+        return false;
+    };
+    // 0 and negatives address process groups, never a single process.
+    raw > 0
+        && matches!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
+            Err(nix::errno::Errno::ESRCH)
+        )
 }
 
 fn process_birth(pid: u32) -> Option<String> {
@@ -575,6 +591,35 @@ impl CollaborationStore {
 mod tests {
     use super::*;
     use crate::collaboration::{CollaborationOptions, NewRequest, RequestStatus};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_process_is_definitely_exited_and_a_live_one_is_not() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let birth = process_birth(pid).expect("a running child has a birth");
+        let fence = ProcessFence { pid, birth };
+        assert!(!fence.definitely_exited());
+        assert_eq!(fence.exited_status(), Some(false));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The pane closed and the pid is gone: release must be able to prove it.
+        assert!(fence.definitely_exited());
+        assert_eq!(fence.exited_status(), Some(true));
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    #[test]
+    fn pid_gone_never_mistakes_groups_or_live_pids_for_exits() {
+        assert!(!pid_gone(0));
+        assert!(!pid_gone(u32::MAX));
+        assert!(!pid_gone(std::process::id()));
+        // pid 1 belongs to root: EPERM is a live process, not an exit.
+        assert!(!pid_gone(1));
+    }
 
     fn participant(session: &str) -> Participant {
         serde_json::from_value(serde_json::json!({

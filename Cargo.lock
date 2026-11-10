@@ -2684,6 +2684,7 @@ dependencies = [
  "dirs",
  "futures",
  "http-body-util",
+ "nix 0.29.0",
  "notify-rust",
  "openidconnect",
  "portable-pty",

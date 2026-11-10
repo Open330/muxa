@@ -119,7 +119,7 @@ struct MuxaMenuBarGeometry {
         let end = focus == count - 1 ? positions[focus] + pill + 2 * Self.inset : positions[count - 1] + Self.slot
         // Cover the chip's former place, including a stationary pointer at
         // either side of the visible folded slice.
-        let cover = CGFloat(focus) * Self.step - (positions[focus] + Self.inset)
+        let cover = CGFloat(focus) * Self.step - positions[focus]
         let shift = min(0, width - end, cover)
         return positions.map { $0 + shift }
     }
@@ -138,7 +138,7 @@ struct MuxaMenuBarGeometry {
         let positions = layout(focus: focus, pillWidth: pillWidth)
         guard hidesMark(focus), let focus else {
             guard x >= 0, x < stackWidth else { return nil }
-            if let front = (0..<count).reversed().first(where: {
+            if let front = (0..<count).first(where: {
                 let left = positions[$0] + Self.inset
                 return left <= x && x <= left + Self.disc
             }) { return front }
@@ -154,7 +154,7 @@ struct MuxaMenuBarGeometry {
             return start...(start + (index == focus ? pill : Self.disc))
         }
         if span(focus).contains(x) { return focus }
-        if let front = (0..<count).reversed().first(where: { span($0).contains(x) }) { return front }
+        if let front = (0..<count).first(where: { span($0).contains(x) }) { return front }
         func distance(_ index: Int) -> CGFloat {
             let range = span(index)
             return x < range.lowerBound ? range.lowerBound - x : x - range.upperBound
@@ -180,7 +180,7 @@ struct MuxaMenuBarPaintGeometry {
     init(count: Int, positions: [CGFloat], focus: Int?, pillWidth: CGFloat, badged: Set<Int>) {
         let geometry = MuxaMenuBarGeometry(count: count)
         let focus = focus.flatMap { (0..<geometry.count).contains($0) ? $0 : nil }
-        var order = Array(0..<geometry.count)
+        var order = Array((0..<geometry.count).reversed())
         if let focus { order.removeAll { $0 == focus }; order.append(focus) }
         drawOrder = order
         faces = (0..<geometry.count).map { index in
@@ -192,20 +192,25 @@ struct MuxaMenuBarPaintGeometry {
         var badgeRects: [Int: CGRect] = [:]
         for index in badged where faces.indices.contains(index) {
             let face = faces[index]
-            badgeRects[index] = CGRect(x: face.maxX - 5.5, y: face.minY - 1, width: 7, height: 7)
+            badgeRects[index] = CGRect(x: face.maxX - 5.5, y: face.maxY - 6, width: 7, height: 7)
         }
         badges = badgeRects
         bounds = min(0, (faces.map(\.minX).min() ?? 0) - MuxaMenuBarGeometry.inset)...max(geometry.stackWidth, (faces.map(\.maxX).max() ?? 0) + MuxaMenuBarGeometry.inset)
     }
 
+    private static func contains(_ point: CGPoint, in rect: CGRect) -> Bool {
+        guard rect.contains(point) else { return false }
+        let radius = rect.height / 2
+        let centerX = min(max(point.x, rect.minX + radius), rect.maxX - radius)
+        return pow(point.x - centerX, 2) + pow(point.y - rect.midY, 2) <= radius * radius
+    }
+
     func index(at point: CGPoint) -> Int? {
-        // Badges sit ABOVE the face layer, including badges of covered chips.
+        // Match each painted layer, front to back. A covered badge must
+        // never steal a click from the face visibly painted over it.
         for index in drawOrder.reversed() {
-            guard let badge = badges[index] else { continue }
-            let rim = badge.insetBy(dx: -0.8, dy: -0.8)
-            let dx = (point.x - rim.midX) / (rim.width / 2)
-            let dy = (point.y - rim.midY) / (rim.height / 2)
-            if dx * dx + dy * dy <= 1 { return index }
+            if let badge = badges[index], Self.contains(point, in: badge.insetBy(dx: -0.8, dy: -0.8)) { return index }
+            if Self.contains(point, in: faces[index].insetBy(dx: -0.8, dy: -0.8)) { return index }
         }
         guard !faces.isEmpty, bounds.contains(point.x) else { return nil }
         // Full menu-bar height remains a target; gaps choose the nearest

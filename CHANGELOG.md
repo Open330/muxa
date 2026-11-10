@@ -9,12 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Menu-bar chips unfold without a dwell delay, retain hover across a small
+  margin, and fold after 0.2 seconds (0.45 seconds toward the peek). Pixel-only
+  render keys and scale-specific bitmaps avoid hidden-value redraws and keep
+  Retina chips sharp. Badges and hit testing follow the same avatar stack.
+  A bounded glyph bitmap cache reuses symbols across animation frames.
+- Home builds its work projection off the main thread once per snapshot,
+  rather than repeatedly parsing agent history while drawing the board.
+  Policy changes and periodic reconciliation keep time-based states fresh.
+
 - Dedicated Claude workers declare a process-local inbound-message policy so
   permission-mode differences do not strand delegated messages. Existing
   operator settings and tool approval permissions remain in effect.
 - Provider approval pauses on handed-over collaboration requests now create a
   durable, immediate Muxa Inbox recovery item. The original request stays open
   across restart and resumes without resending when the recipient continues.
+- On macOS, a worker launch whose process has exited is now recognised as
+  exited, so `muxa workers release` frees it and muxad closes it on its own.
+  Before, a closed pane left the launch holding room capacity forever, and
+  the release command timed out after 3s instead of showing muxad's answer.
 
 ## [0.9.8] - 2026-11-06
 
