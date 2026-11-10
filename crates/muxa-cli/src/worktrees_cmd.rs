@@ -95,7 +95,7 @@ fn inspect(receipt: WorktreeReceipt, panes: &Panes) -> Row {
     match receipt.state {
         ReceiptState::Created => {}
         ReceiptState::Creating => {
-            reasons.push("creation never finished; not proof muxa made it".into())
+            reasons.push("creation never finished; not proof muxa made it".into());
         }
         ReceiptState::Failed => {
             reasons.push("creation failed".into());
@@ -128,7 +128,7 @@ fn check(
     match receipt.still_owns() {
         Some(true) => {}
         Some(false) => {
-            reasons.push("not the worktree muxa created (it was replaced or never marked)".into())
+            reasons.push("not the worktree muxa created (it was replaced or never marked)".into());
         }
         None => reasons.push("could not confirm it is the worktree muxa created".into()),
     }
