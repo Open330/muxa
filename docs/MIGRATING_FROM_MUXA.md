@@ -53,7 +53,7 @@ edit instead. `brew install python` gives a newer one.
 
 ## What the script does
 
-- Stops `muxad`, restarts a brew service under `tend` (or tells you how), and moves its launchd job or systemd unit (and the restore job, and a unit's `.d/` drop-ins) to the Tend name.
+- Stops `muxad`, restarts a brew service under `tend` (or tells you how), and moves its launchd job or systemd unit (and the restore job, and `.d/` drop-ins in any user unit directory) to the Tend name.
   The job keeps its environment, such as a PATH you tuned for your agents; its label, program and log paths are renamed.
   It is started again at the end, if Tend is installed where the job expects it.
 - Moves Muxa's data, config and cache directories to `tend`. If a `tend`

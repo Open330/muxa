@@ -387,11 +387,20 @@ def convert_services(m: Migration):
             plist = agents / f"{label}.plist"
             if plist.exists():
                 move_launchd_job(m, plist, agents / f"{full_rename(label)}.plist")
-    for base in (xdg("XDG_DATA_HOME", HOME / ".local/share"), xdg("XDG_CONFIG_HOME", HOME / ".config")):
-        for unit in ("muxad.service", "muxa-restore.service"):
-            path = base / "systemd/user" / unit
-            if path.exists():
-                move_systemd_unit(m, path, path.with_name(full_rename(unit)))
+    roots = [xdg("XDG_CONFIG_HOME", HOME / ".config") / "systemd/user",
+             xdg("XDG_DATA_HOME", HOME / ".local/share") / "systemd/user"]
+    for unit in ("muxad.service", "muxa-restore.service"):
+        new_unit = full_rename(unit)
+        for root in roots:
+            if (root / unit).is_file():
+                move_systemd_unit(m, root / unit, root / new_unit)
+        for root in roots:
+            if (root / f"{unit}.d").is_dir():
+                program = move_systemd_dropins(m, root / f"{unit}.d", root / f"{new_unit}.d")
+                if program:  # a drop-in ExecStart= overrides the unit's for the start check
+                    for i, (kind, path, _) in enumerate(NEW_SERVICES):
+                        if kind == "systemd" and path.name == new_unit:
+                            NEW_SERVICES[i] = (kind, path, program)
 
 
 def move_launchd_job(m: Migration, old: Path, new: Path):
@@ -443,28 +452,36 @@ def systemd_text(text: str) -> tuple[str, str]:
 
 
 def move_systemd_unit(m: Migration, old: Path, new: Path):
-    """The unit and its `<unit>.d/` drop-ins (an Environment= override, say)
-    move together under the Tend name."""
-    old_dropins, new_dropins = old.with_name(old.name + ".d"), new.with_name(new.name + ".d")
-    if new.exists() or new_dropins.exists():
+    if new.exists():
         m.note(f"{new} already exists, so {old} was left in place. Remove it once tend works.")
         return
     text, program = systemd_text(old.read_text(encoding="utf-8"))
     m.step(f"move systemd unit {old.name} → {new.name}")
-    confs = sorted(old_dropins.glob("*.conf")) if old_dropins.is_dir() else []
-    if old_dropins.is_dir():
-        m.step(f"move its drop-ins {old_dropins.name}/ → {new_dropins.name}/ ({len(confs)} files)")
     if m.apply:
         atomic_write(new, text)
         old.rename(old.with_name(f"{old.name}.muxa-migrate-{STAMP}"))
-        if old_dropins.is_dir():
-            new_dropins.mkdir()
-            for conf in confs:
-                conf_text, conf_program = systemd_text(conf.read_text(encoding="utf-8"))
-                atomic_write(new_dropins / conf.name, conf_text)
-                program = conf_program or program  # a drop-in ExecStart= overrides the unit's
-            old_dropins.rename(old_dropins.with_name(f"{old_dropins.name}.muxa-migrate-{STAMP}"))
     NEW_SERVICES.append(("systemd", new, program.replace("%h", str(HOME))))
+
+
+def move_systemd_dropins(m: Migration, old: Path, new: Path):
+    """`<unit>.d/` overrides (an Environment= line, say) can live in any user
+    unit root, with or without the unit file beside them. Returns the
+    ExecStart a drop-in sets, if any."""
+    if new.exists():
+        m.note(f"{new} already exists, so {old} was left in place. Merge them by hand.")
+        return ""
+    confs = sorted(old.glob("*.conf"))
+    m.step(f"move systemd drop-ins {old} → {new.name}/ ({len(confs)} files)")
+    program = ""
+    for conf in confs:
+        _, conf_program = systemd_text(conf.read_text(encoding="utf-8"))
+        program = conf_program or program
+    if m.apply:
+        new.mkdir()
+        for conf in confs:
+            atomic_write(new / conf.name, systemd_text(conf.read_text(encoding="utf-8"))[0])
+        old.rename(old.with_name(f"{old.name}.muxa-migrate-{STAMP}"))
+    return program.replace("%h", str(HOME))
 
 
 def start_services(m: Migration):
