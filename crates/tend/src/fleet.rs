@@ -91,6 +91,8 @@ pub const FLEET_SEND_KEYS_CAPABILITY: &str = "send_keys_v1";
 pub const FLEET_WORKTREE_INVENTORY_CAPABILITY: &str = "worktree_inventory_v1";
 /// Relay capability: the relay applies [`RelayRequest::WorktreeChange`].
 pub const FLEET_WORKTREE_CHANGE_CAPABILITY: &str = "worktree_change_v1";
+/// Relay capability: the relay answers [`RelayRequest::ServerInventory`].
+pub const FLEET_SERVER_INVENTORY_CAPABILITY: &str = "server_inventory_v1";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
@@ -111,6 +113,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     FLEET_SEND_KEYS_CAPABILITY,
     FLEET_WORKTREE_INVENTORY_CAPABILITY,
     FLEET_WORKTREE_CHANGE_CAPABILITY,
+    FLEET_SERVER_INVENTORY_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -561,6 +564,10 @@ pub enum RelayRequest {
         request_id: String,
         change: crate::worktree_change::ChangeRequest,
     },
+    /// The relay host's TCP listeners associated with tend; read-only.
+    ServerInventory {
+        request_id: String,
+    },
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
@@ -637,6 +644,7 @@ impl RelayRequest {
             | Self::SendKeys { request_id, .. }
             | Self::WorktreeInventory { request_id }
             | Self::WorktreeChange { request_id, .. }
+            | Self::ServerInventory { request_id }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
@@ -768,6 +776,9 @@ pub enum FleetOperation {
     WorktreeChange {
         change: crate::worktree_change::ChangeRequest,
     },
+    /// `fleet_servers_v1`: TCP listeners on the host associated with tend
+    /// (see `tend::listener_inventory`). Read-only.
+    ServerInventory,
     CollaborationSend {
         pane: PaneKey,
         request: Box<NewRequest>,
@@ -867,6 +878,9 @@ pub struct FleetCommandResult {
     /// Per-worktree outcomes of a `worktree_change`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_changes: Option<Vec<crate::worktree_change::ChangeOutcome>>,
+    /// The host's listeners associated with tend, for `server_inventory`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub servers: Option<crate::listener_inventory::ListenerInventory>,
 }
 
 impl FleetCommandResult {
@@ -891,6 +905,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -901,6 +916,15 @@ impl FleetCommandResult {
             worktrees_total: Some(inventory.total),
             worktrees_node: crate::worktree_change::local_node(),
             ..Self::accepted("worktree inventory")
+        }
+    }
+
+    #[must_use]
+    pub fn servers(inventory: crate::listener_inventory::ListenerInventory) -> Self {
+        Self {
+            servers: Some(inventory),
+            worktrees_node: crate::worktree_change::local_node(),
+            ..Self::accepted("server inventory")
         }
     }
 
@@ -933,6 +957,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -959,6 +984,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -983,6 +1009,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -1007,6 +1034,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -1031,6 +1059,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -1075,6 +1104,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -1100,6 +1130,7 @@ impl FleetCommandResult {
             worktrees_total: None,
             worktrees_node: None,
             worktree_changes: None,
+            servers: None,
         }
     }
 
@@ -2014,6 +2045,16 @@ mod fleet_key_tests {
             serde_json::from_value(serde_json::json!({"accepted": true})).unwrap();
         assert!(result.worktrees.is_none());
         assert!(result.worktree_changes.is_none());
+        assert!(result.servers.is_none());
+        let servers: FleetOperation =
+            serde_json::from_value(serde_json::json!({"kind": "server_inventory"})).unwrap();
+        assert!(matches!(servers, FleetOperation::ServerInventory));
+        let request = RelayRequest::ServerInventory {
+            request_id: "r3".into(),
+        };
+        let back: RelayRequest =
+            serde_json::from_str(&serde_json::to_string(&request).unwrap()).unwrap();
+        assert_eq!(back.request_id(), "r3");
         assert_eq!(FleetKey::Up.bytes(), "\u{1b}[A");
         assert_eq!(FleetKey::Enter.bytes(), "\r");
     }

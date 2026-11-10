@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tend servers` lists TCP servers still listening on this host that tend
+  is associated with: under a pane where tend tracks an agent (matched by
+  socket and pane, through ancestors older than the process), or inside a
+  worktree tend created. Each row keeps that evidence and an honest status:
+  its Work completed, agent stopped, idle, in error, needs input, working,
+  or unknown. Association is not proof an agent started a process, and
+  nothing is stopped. Only this user's processes are listed, by executable
+  name and working directory, never argv; agent CLIs' own listeners are
+  left out. A scan that could not run says so instead of reading as "no
+  servers", and partial association (cmux panes, a missing daemon) is
+  stated. Fleet `server_inventory` (`fleet_servers_v1`, relays
+  `server_inventory_v1`) carries it, read-only.
+- macOS: Home › Hosts › Leftovers has Worktrees and Servers tabs.
 - `tend worktrees set-aside`, `restore` and `delete` clean up the worktrees
   tend created. Set aside moves a worktree with no blocker into
   `.tend-set-aside` next to it with `git worktree move`, so its files,

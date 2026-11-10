@@ -18,8 +18,8 @@ use tend::fleet::{
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
     FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
-    FLEET_WORKTREE_CHANGE_CAPABILITY, FLEET_WORKTREE_INVENTORY_CAPABILITY,
-    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    FLEET_SERVER_INVENTORY_CAPABILITY, FLEET_WORKTREE_CHANGE_CAPABILITY,
+    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use tend::tmux::SessionInfo;
 use tend::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -351,6 +351,7 @@ impl LocalTask {
                     let Some(command) = self.spawn_work_command(command) else { continue; };
                     let Some(command) = spawn_worktree_inventory(command) else { continue; };
                     let Some(command) = spawn_worktree_change(command) else { continue; };
+                    let Some(command) = spawn_server_inventory(command, &self.agents) else { continue; };
                     let result = self.execute(command.operation).await;
                     let _ = command.reply.send(result);
                 }
@@ -452,7 +453,9 @@ impl LocalTask {
                 local_send_keys(&self.backends, pane, keys).await
             }
             // Runs in its own task; see `spawn_worktree_inventory`.
-            FleetOperation::WorktreeInventory | FleetOperation::WorktreeChange { .. } => {
+            FleetOperation::WorktreeInventory
+            | FleetOperation::WorktreeChange { .. }
+            | FleetOperation::ServerInventory => {
                 Err("worktree operations run in their own task".into())
             }
             FleetOperation::CollaborationSend { pane, request } => {
@@ -636,13 +639,66 @@ fn spawn_worktree_change(command: HostCommand) -> Option<HostCommand> {
     None
 }
 
+static SERVER_SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Lists this host's listeners associated with tend in its own task, with
+/// the agents the daemon tracks; one scan at a time.
+fn spawn_server_inventory(command: HostCommand, agents: &SharedStore) -> Option<HostCommand> {
+    if !matches!(command.operation, FleetOperation::ServerInventory) {
+        return Some(command);
+    }
+    let reply = command.reply;
+    let Ok(permit) = SERVER_SCAN.try_acquire() else {
+        let _ = reply.send(Err("a server check is already running on this host".into()));
+        return None;
+    };
+    audit_operation(LOCAL_HOST_ALIAS, "server_inventory", 0);
+    let agents = agents.clone();
+    tokio::spawn(async move {
+        let snapshot = agents.snapshot().await;
+        let result = tokio::task::spawn_blocking(move || {
+            tend::listener_inventory::inventory(
+                &Ok(snapshot),
+                Some(tend::worktree_inventory::FLEET_MAX_ROWS),
+            )
+        })
+        .await
+        .map(FleetCommandResult::servers)
+        .map_err(|error| format!("server inventory failed: {error}"));
+        drop(permit);
+        let _ = reply.send(result);
+    });
+    None
+}
+
+/// The server inventory goes only to a relay that says it answers it.
+fn server_inventory_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::ServerInventory) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_SERVER_INVENTORY_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot list its servers; upgrade tend on that host"
+    ))
+}
+
 /// How long the controller waits for a relay's answer to `operation`:
 /// the configured command timeout, or longer for the worktree operations,
 /// which bound themselves and must not be cut off before they answer.
 fn relay_timeout(configured: Duration, operation: &FleetOperation) -> Duration {
     let slack = Duration::from_secs(10);
     match operation {
-        FleetOperation::WorktreeInventory => {
+        FleetOperation::WorktreeInventory | FleetOperation::ServerInventory => {
             configured.max(tend::worktree_inventory::SCAN_BUDGET + slack)
         }
         FleetOperation::WorktreeChange { .. } => {
@@ -1464,6 +1520,13 @@ impl HostTask {
                                     &command.operation,
                                 )
                             })
+                            .or_else(|| {
+                                server_inventory_refusal(
+                                    &self.alias,
+                                    &connected.hello,
+                                    &command.operation,
+                                )
+                            })
                     {
                         let _ = command.reply.send(Err(refusal));
                         continue;
@@ -1572,6 +1635,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::WorktreeChange { request_id: id, change }
+                        }
+                        FleetOperation::ServerInventory => {
+                            audit_operation(&self.alias, "server_inventory", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::ServerInventory { request_id: id }
                         }
                         FleetOperation::CollaborationSend { pane, request } => {
                             audit_operation(&self.alias, "collaboration_send", request.body.len());
@@ -2166,6 +2237,14 @@ mod tests {
         assert!(relay_timeout(configured, &inventory) > tend::worktree_inventory::SCAN_BUDGET);
         assert!(relay_timeout(configured, &change) > tend::worktree_change::CHANGE_BUDGET);
         assert_eq!(relay_timeout(configured, &capture), configured);
+        // The server inventory: read-only, refused by older relays, and
+        // given time to answer.
+        let servers = FleetOperation::ServerInventory;
+        let refusal = server_inventory_refusal("remote", &older, &servers).unwrap();
+        assert!(refusal.contains("upgrade tend"), "{refusal}");
+        assert!(server_inventory_refusal("remote", &current, &servers).is_none());
+        assert!(server_inventory_refusal("remote", &older, &inventory).is_none());
+        assert!(relay_timeout(configured, &servers) > tend::worktree_inventory::SCAN_BUDGET);
     }
 
     #[test]

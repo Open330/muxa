@@ -39,6 +39,7 @@ mod peek;
 mod peer_cli;
 mod relay;
 mod reload;
+mod servers_cmd;
 mod sidebar;
 mod spawn_provenance;
 mod stale_agents;
@@ -236,6 +237,9 @@ enum Cmd {
     /// cleaned up, and the cleanup: set aside, restore, delete. Lists only
     /// worktrees tend holds a receipt for; changes need --yes.
     Worktrees(worktrees_cmd::Args),
+    /// TCP servers still listening on this host that tend's agents or
+    /// worktrees are associated with. Read-only.
+    Servers(servers_cmd::Args),
     /// Former name of `tend fleet host`. Tend.app still invokes it, and an
     /// app may run against an older or newer CLI, so keep this alias.
     #[command(hide = true)]

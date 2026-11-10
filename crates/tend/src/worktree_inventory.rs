@@ -164,6 +164,20 @@ fn out_of_time(receipt: WorktreeReceipt) -> WorktreeRow {
 /// and the whole group is killed on expiry, so a helper that git or du
 /// started and that holds the pipe open cannot outlive the budget either.
 pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String)> {
+    bounded_status(program, args).map(|run| (run.code == Some(0), run.stdout))
+}
+
+/// A bounded child's exit code (None when a signal ended it), all of its
+/// stdout, and the start of its stderr.
+pub(crate) struct BoundedRun {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+/// [`bounded`], keeping the exit code and up to 64 KiB of stderr, for a
+/// caller that must tell "nothing matched" from "failed".
+pub(crate) fn bounded_status(program: &str, args: &[&std::ffi::OsStr]) -> Option<BoundedRun> {
     use std::io::Read as _;
     let now = Instant::now();
     let budget = DEADLINE.with(Cell::get).map_or(COMMAND_BUDGET, |deadline| {
@@ -178,11 +192,20 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let (err_sender, err_receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut pipe = stderr;
+        let read = (&mut pipe).take(64 * 1024).read_to_end(&mut kept);
+        let drained = std::io::copy(&mut pipe, &mut std::io::sink());
+        let _ = err_sender.send((read.is_ok() && drained.is_ok()).then_some(kept));
+    });
     // Read on another thread so a chatty child never blocks on a full pipe.
     // Past the cap the rest is drained and the output reported as cut
     // (None), never passed off as complete. The thread reports back over a
@@ -209,11 +232,20 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
             .ok()
             .flatten()
     });
-    if let (Some(status), Some(output)) = (status, output) {
-        Some((
-            status.success(),
-            String::from_utf8_lossy(&output).into_owned(),
-        ))
+    // stderr must close within the budget too: a helper holding it open
+    // would otherwise pass for a run that printed no diagnostics.
+    let stderr = output.as_ref().and_then(|_| {
+        err_receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .ok()
+            .flatten()
+    });
+    if let (Some(status), Some(output), Some(stderr)) = (status, output, stderr) {
+        Some(BoundedRun {
+            code: status.code(),
+            stdout: String::from_utf8_lossy(&output).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
     } else {
         kill_group(&mut child);
         None
@@ -695,6 +727,42 @@ fn check_activity(
     }
 }
 
+/// Whether the Work or dispatch that asked for `receipt` completed, from
+/// its own durable evidence only: its dispatch record saying completed, or
+/// a finished Run with desired agents, of exactly its Work, at exactly
+/// where the worktree is.
+pub(crate) fn work_completed(
+    receipt: &WorktreeReceipt,
+    runs: &[PipelineRun],
+    dispatches: Option<&Path>,
+) -> bool {
+    let (workspace, work) = match &receipt.origin {
+        ReceiptOrigin::Work { workspace, work } => (workspace.as_deref(), work.as_str()),
+        ReceiptOrigin::Dispatch {
+            workspace, work, ..
+        } => (Some(workspace.as_str()), work.as_str()),
+    };
+    let at = lenient_canonical(receipt.location());
+    let run_done = runs.iter().any(|run| {
+        !run.desired.is_empty()
+            && run.finished()
+            && workspace.is_some_and(|ws| run.identity.workspace_id.eq_ignore_ascii_case(ws))
+            && run.identity.work_id.eq_ignore_ascii_case(work)
+            && lenient_canonical(&run.cwd) == at
+    });
+    match &receipt.origin {
+        ReceiptOrigin::Dispatch { dispatch_id, .. } => {
+            matches!(dispatch_state(dispatches, dispatch_id), Ok(Some(state)) if state == "completed")
+                || (run_done
+                    && matches!(
+                        dispatch_state(dispatches, dispatch_id),
+                        Ok(Some(state)) if matches!(state.as_str(), "launched" | "blocked" | "unknown")
+                    ))
+        }
+        ReceiptOrigin::Work { .. } => run_done,
+    }
+}
+
 fn dispatch_state(dir: Option<&Path>, dispatch_id: &str) -> Result<Option<String>, String> {
     let Some(dir) = dir else {
         return Err("no tend data directory".into());
@@ -718,7 +786,7 @@ fn dispatch_state(dir: Option<&Path>, dispatch_id: &str) -> Result<Option<String
 /// `path` with its longest existing ancestor resolved, so a pane in
 /// `/var/…/tree/src` matches a tree recorded as `/private/var/…/tree`
 /// even when `src` is gone.
-fn lenient_canonical(path: &Path) -> PathBuf {
+pub(crate) fn lenient_canonical(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut current = path;
     loop {
@@ -812,6 +880,25 @@ mod tests {
         assert_eq!(
             bounded("echo", &["hi".as_ref()]),
             Some((true, "hi\n".into()))
+        );
+    }
+
+    #[test]
+    fn a_helper_holding_stderr_open_cannot_pass_for_a_quiet_run() {
+        DEADLINE.with(|cell| cell.set(Some(Instant::now() + Duration::from_millis(300))));
+        let started = Instant::now();
+        let script = "sleep 5 >/dev/null & exit 1";
+        assert!(bounded_status("sh", &["-c".as_ref(), script.as_ref()]).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
+        DEADLINE.with(|cell| cell.set(None));
+        let run = bounded_status("sh", &["-c".as_ref(), "echo oops >&2; exit 1".as_ref()]).unwrap();
+        assert_eq!(
+            (run.code, run.stdout.as_str(), run.stderr.trim()),
+            (Some(1), "", "oops")
         );
     }
 
