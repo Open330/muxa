@@ -5,9 +5,9 @@ use super::{
     cmd_watch, cmd_zellij_plugin_snapshot, collaboration_client_kind, config_cmd, daemon, doctor,
     fleet_cli, graph, handle_hook, init, logs, mcp, message_skill, mux_control, onboarding,
     parse_args, paths, peek, relay, reload, run_agent_cmd, run_window_cmd, run_work_cmd,
-    run_workspace_cmd, set_icon_set, sidebar, start, stats, swap, timeline, upgrade, worker_cmd,
-    worktrees_cmd, AgentCmd, AgentViewCmd, AskOptions, Client, Cmd, Config, Context, ProcCmd,
-    RegistryCmd, Result, WatchInvocation, WindowCmd, WorkCmd, WorkspaceCmd, CALLER_CLIENT,
+    run_workspace_cmd, servers_cmd, set_icon_set, sidebar, start, stats, swap, timeline, upgrade,
+    worker_cmd, worktrees_cmd, AgentCmd, AgentViewCmd, AskOptions, Client, Cmd, Config, Context,
+    ProcCmd, RegistryCmd, Result, WatchInvocation, WindowCmd, WorkCmd, WorkspaceCmd, CALLER_CLIENT,
 };
 
 #[allow(clippy::too_many_lines)] // top-level CLI subcommand wiring
@@ -165,6 +165,7 @@ pub(super) async fn main() -> Result<()> {
         Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
         Cmd::Workers(a) => worker_cmd::run(a, &Client::new(socket.clone())).await,
         Cmd::Worktrees(a) => worktrees_cmd::run(a).await,
+        Cmd::Servers(a) => servers_cmd::run(a, &Client::new(socket.clone())).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
         Cmd::Fleet(a) => {
             Box::pin(fleet_cli::run_fleet(

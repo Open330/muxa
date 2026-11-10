@@ -49,3 +49,33 @@ import Testing
     #expect(detached.changeItem.json["branch"] is NSNull)
     #expect(JSONSerialization.isValidJSONObject(detached.changeItem.json))
 }
+
+@Test func aServerInventoryDecodesWithHonestCoverage() throws {
+    let json = """
+    {"rows":[{"pid":42,"process_start":"epoch:100","started_at":"2026-11-10T09:00:00Z","uid":501,
+              "process_name":"node","cwd":"/src/wt",
+              "endpoints":[{"address":"*","port":3000,"bind":"wildcard"},{"address":"::1","port":3000,"bind":"loopback"}],
+              "association":{"kind":"pane","endpoint":"default","pane_id":"%3","agent_kind":"codex","agent_session_id":"s"},
+              "status":"agent_idle","state_for_secs":7200},
+             {"pid":43,"process_start":null,"uid":501,"process_name":"Python","cwd":null,"endpoints":[],
+              "association":{"kind":"worktree","receipt_id":"r","path":"/src/wt","origin":"Work ws/srv"},
+              "status":"unknown","state_for_secs":null}],
+     "total":5,"collection":{"state":"complete"},
+     "attribution":{"state":"partial","reason":"Cmux does not list its panes"},
+     "observed_at":"2026-11-10T10:00:00Z"}
+    """
+    let inventory = try JSONDecoder().decode(TendServerInventory.self, from: Data(json.utf8))
+    #expect(inventory.isCut)
+    #expect(inventory.attribution.reason == "Cmux does not list its panes")
+    let idle = inventory.rows[0]
+    #expect(idle.association.paneID == "%3")
+    #expect(idle.portsText.contains("all interfaces"))
+    #expect(idle.id == "42-epoch:100")
+    #expect(inventory.rows[1].association.kind == "worktree")
+
+    let failed = try JSONDecoder().decode(TendServerInventory.self, from: Data("""
+    {"rows":[],"total":0,"collection":{"state":"unavailable","reason":"lsof failed"},
+     "attribution":{"state":"complete"},"observed_at":"2026-11-10T10:00:00Z"}
+    """.utf8))
+    #expect(failed.collection.state == "unavailable")
+}

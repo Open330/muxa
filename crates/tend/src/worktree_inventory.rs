@@ -164,6 +164,20 @@ fn out_of_time(receipt: WorktreeReceipt) -> WorktreeRow {
 /// and the whole group is killed on expiry, so a helper that git or du
 /// started and that holds the pipe open cannot outlive the budget either.
 pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String)> {
+    bounded_status(program, args).map(|run| (run.code == Some(0), run.stdout))
+}
+
+/// A bounded child's exit code (None when a signal ended it), all of its
+/// stdout, and the start of its stderr.
+pub(crate) struct BoundedRun {
+    pub(crate) code: Option<i32>,
+    pub(crate) stdout: String,
+    pub(crate) stderr: String,
+}
+
+/// [`bounded`], keeping the exit code and up to 64 KiB of stderr, for a
+/// caller that must tell "nothing matched" from "failed".
+pub(crate) fn bounded_status(program: &str, args: &[&std::ffi::OsStr]) -> Option<BoundedRun> {
     use std::io::Read as _;
     let now = Instant::now();
     let budget = DEADLINE.with(Cell::get).map_or(COMMAND_BUDGET, |deadline| {
@@ -178,11 +192,20 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null());
+        .stderr(std::process::Stdio::piped());
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let (err_sender, err_receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut pipe = stderr;
+        let _ = (&mut pipe).take(64 * 1024).read_to_end(&mut kept);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+        let _ = err_sender.send(kept);
+    });
     // Read on another thread so a chatty child never blocks on a full pipe.
     // Past the cap the rest is drained and the output reported as cut
     // (None), never passed off as complete. The thread reports back over a
@@ -210,10 +233,14 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
             .flatten()
     });
     if let (Some(status), Some(output)) = (status, output) {
-        Some((
-            status.success(),
-            String::from_utf8_lossy(&output).into_owned(),
-        ))
+        let stderr = err_receiver
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .unwrap_or_default();
+        Some(BoundedRun {
+            code: status.code(),
+            stdout: String::from_utf8_lossy(&output).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        })
     } else {
         kill_group(&mut child);
         None
@@ -695,6 +722,42 @@ fn check_activity(
     }
 }
 
+/// Whether the Work or dispatch that asked for `receipt` completed, from
+/// its own durable evidence only: its dispatch record saying completed, or
+/// a finished Run with desired agents, of exactly its Work, at exactly
+/// where the worktree is.
+pub(crate) fn work_completed(
+    receipt: &WorktreeReceipt,
+    runs: &[PipelineRun],
+    dispatches: Option<&Path>,
+) -> bool {
+    let (workspace, work) = match &receipt.origin {
+        ReceiptOrigin::Work { workspace, work } => (workspace.as_deref(), work.as_str()),
+        ReceiptOrigin::Dispatch {
+            workspace, work, ..
+        } => (Some(workspace.as_str()), work.as_str()),
+    };
+    let at = lenient_canonical(receipt.location());
+    let run_done = runs.iter().any(|run| {
+        !run.desired.is_empty()
+            && run.finished()
+            && workspace.is_some_and(|ws| run.identity.workspace_id.eq_ignore_ascii_case(ws))
+            && run.identity.work_id.eq_ignore_ascii_case(work)
+            && lenient_canonical(&run.cwd) == at
+    });
+    match &receipt.origin {
+        ReceiptOrigin::Dispatch { dispatch_id, .. } => {
+            matches!(dispatch_state(dispatches, dispatch_id), Ok(Some(state)) if state == "completed")
+                || (run_done
+                    && matches!(
+                        dispatch_state(dispatches, dispatch_id),
+                        Ok(Some(state)) if matches!(state.as_str(), "launched" | "blocked" | "unknown")
+                    ))
+        }
+        ReceiptOrigin::Work { .. } => run_done,
+    }
+}
+
 fn dispatch_state(dir: Option<&Path>, dispatch_id: &str) -> Result<Option<String>, String> {
     let Some(dir) = dir else {
         return Err("no tend data directory".into());
@@ -718,7 +781,7 @@ fn dispatch_state(dir: Option<&Path>, dispatch_id: &str) -> Result<Option<String
 /// `path` with its longest existing ancestor resolved, so a pane in
 /// `/var/…/tree/src` matches a tree recorded as `/private/var/…/tree`
 /// even when `src` is gone.
-fn lenient_canonical(path: &Path) -> PathBuf {
+pub(crate) fn lenient_canonical(path: &Path) -> PathBuf {
     let mut rest = Vec::new();
     let mut current = path;
     loop {

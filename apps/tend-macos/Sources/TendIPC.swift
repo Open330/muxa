@@ -940,9 +940,10 @@ private struct TendFleetCommandResult: Decodable, Sendable {
     let worktreesTotal: Int?
     let worktreesNode: String?
     let worktreeChanges: [TendWorktreeChangeOutcome]?
+    let servers: TendServerInventory?
 
     enum CodingKeys: String, CodingKey {
-        case accepted, message, capture, worktrees
+        case accepted, message, capture, worktrees, servers
         case worktreesTotal = "worktrees_total"
         case worktreesNode = "worktrees_node"
         case worktreeChanges = "worktree_changes"
@@ -1420,6 +1421,25 @@ actor TendIPCClient {
             total: max(result.worktreesTotal ?? rows.count, rows.count),
             node: result.worktreesNode
         )
+    }
+
+    /// TCP listeners on `host` associated with tend. Read-only. The host
+    /// bounds the scan to 20 seconds, so this waits longer, on its own
+    /// transport.
+    func fleetServers(host: TendFleetHostIdentity) async throws -> TendServerInventory {
+        guard capabilities.contains("fleet_servers_v1") else {
+            throw TendIPCError.server(String(localized: "Listing servers needs an updated tendd; update tend and restart tendd"))
+        }
+        let result = try await fleetCommand(
+            host: host,
+            operation: ["kind": "server_inventory"],
+            requestTransport: workTransport(for: "servers-\(host.alias)"),
+            timeout: 35
+        )
+        guard let servers = result.servers else {
+            throw TendIPCError.missingField("servers")
+        }
+        return servers
     }
 
     /// Sets aside, restores or deletes worktrees on `host`, each named with

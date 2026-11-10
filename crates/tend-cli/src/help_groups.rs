@@ -32,7 +32,14 @@ pub(crate) const GROUPS: &[(&str, &[&str])] = &[
     ),
     (
         "Work & layout",
-        &["work", "workspace", "worktrees", "window", "agent"],
+        &[
+            "work",
+            "workspace",
+            "worktrees",
+            "servers",
+            "window",
+            "agent",
+        ],
     ),
     ("Analytics", &["stats", "timeline"]),
     ("Save & restore", &["snapshot", "restore", "reload"]),

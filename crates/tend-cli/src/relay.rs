@@ -430,6 +430,28 @@ async fn handle_request(
                 result: Box::new(FleetCommandResult::worktrees(rows)),
             })
         }
+        RelayRequest::ServerInventory { request_id } => {
+            static SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+            let Ok(_permit) = SCAN.try_acquire() else {
+                bail!("a server check is already running on this host");
+            };
+            // Without the daemon's agents, rows lean on worktrees and the
+            // reply says attribution was partial; never an empty agent list
+            // passed off as "no agents".
+            let agents = client.snapshot().await.map_err(|error| error.to_string());
+            let inventory = tokio::task::spawn_blocking(move || {
+                tend::listener_inventory::inventory(
+                    &agents,
+                    Some(tend::worktree_inventory::FLEET_MAX_ROWS),
+                )
+            })
+            .await
+            .context("server inventory task panicked")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: Box::new(FleetCommandResult::servers(inventory)),
+            })
+        }
         RelayRequest::WorktreeChange { request_id, change } => {
             // The change takes the host-wide lock and bounds itself (see
             // `tend::worktree_change`).

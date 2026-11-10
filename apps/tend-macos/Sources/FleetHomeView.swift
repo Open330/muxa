@@ -1055,7 +1055,7 @@ private struct FleetHostsPopover: View {
                 .buttonStyle(.plain)
             }
             Divider()
-            Button("Leftover Worktrees…", action: showLeftovers)
+            Button("Leftovers…", action: showLeftovers)
                 .buttonStyle(.tendGhost)
                 .help("Worktrees tend created on each host, and what keeps them")
         }

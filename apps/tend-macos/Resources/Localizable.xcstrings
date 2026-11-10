@@ -21,6 +21,26 @@
         }
       }
     },
+    "%@:%@ (all interfaces)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@:%2$@ (모든 인터페이스)"
+          }
+        }
+      }
+    },
+    "%@:%@ (non-loopback)" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@:%2$@ (루프백 아님)"
+          }
+        }
+      }
+    },
     "%lld agents wait on you" : {
       "localizations" : {
         "ko" : {
@@ -57,6 +77,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "최근 1시간 %lld건"
+          }
+        }
+      }
+    },
+    "%lld listening" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 열림"
           }
         }
       }
@@ -147,6 +177,76 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "승인 규칙 추가…"
+          }
+        }
+      }
+    },
+    "Agent idle" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 대기"
+          }
+        }
+      }
+    },
+    "Agent idle for %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 대기 %@째"
+          }
+        }
+      }
+    },
+    "Agent in error" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 오류"
+          }
+        }
+      }
+    },
+    "Agent needs input" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 입력 필요"
+          }
+        }
+      }
+    },
+    "Agent stopped" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 멈춤"
+          }
+        }
+      }
+    },
+    "Agent stopped for %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 멈춤 %@째"
+          }
+        }
+      }
+    },
+    "Agent working" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트 작업 중"
           }
         }
       }
@@ -2399,6 +2499,16 @@
         }
       }
     },
+    "Could not list servers: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "서버 목록을 가져오지 못했습니다: %@"
+          }
+        }
+      }
+    },
     "Delete for Good" : {
       "localizations" : {
         "ko" : {
@@ -2489,6 +2599,26 @@
         }
       }
     },
+    "In worktree %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "worktree 안 (%@)"
+          }
+        }
+      }
+    },
+    "Its Work completed" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work 완료됨"
+          }
+        }
+      }
+    },
     "Kept" : {
       "localizations" : {
         "ko" : {
@@ -2499,22 +2629,32 @@
         }
       }
     },
-    "Leftover Worktrees…" : {
+    "Leftovers" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "남은 worktree…"
+            "value" : "남은 것"
           }
         }
       }
     },
-    "Leftover worktrees" : {
+    "Leftovers…" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "남은 worktree"
+            "value" : "남은 것…"
+          }
+        }
+      }
+    },
+    "Listing servers needs an updated tendd; update tend and restart tendd" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "서버 목록을 보려면 새 tendd가 필요합니다. tend를 업데이트하고 tendd를 다시 시작하세요."
           }
         }
       }
@@ -2559,6 +2699,16 @@
         }
       }
     },
+    "No listening servers associated with tend on this host." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 호스트에는 tend와 연관된 열린 서버가 없습니다."
+          }
+        }
+      }
+    },
     "Observe-only host: changes are made on that host or with control access." : {
       "localizations" : {
         "ko" : {
@@ -2585,6 +2735,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "치워 둘 항목으로 선택"
+          }
+        }
+      }
+    },
+    "Servers" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "서버"
+          }
+        }
+      }
+    },
+    "Servers still listening that tend's agents or worktrees are associated with. Association is not proof an agent started them; nothing is stopped from here." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tend의 에이전트나 worktree와 연관된, 아직 열려 있는 서버입니다. 연관이 있다고 에이전트가 띄웠다는 증거는 아니며, 여기서는 아무것도 멈추지 않습니다."
           }
         }
       }
@@ -2625,6 +2795,26 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%2$@의 worktree %1$lld개를 치워 둘까요?"
+          }
+        }
+      }
+    },
+    "Showing %lld of %lld. Run tend servers on %@ for all." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%2$lld개 중 %1$lld개만 보여 줍니다. 전체는 %3$@에서 tend servers를 실행하세요."
+          }
+        }
+      }
+    },
+    "Status unknown" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "상태 모름"
           }
         }
       }
@@ -2729,6 +2919,16 @@
         }
       }
     },
+    "Under %@ pane %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@ pane %2$@ 아래"
+          }
+        }
+      }
+    },
     "Use for This Question" : {
       "localizations" : {
         "ko" : {
@@ -2745,6 +2945,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Work %@"
+          }
+        }
+      }
+    },
+    "Worktrees" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "worktree"
           }
         }
       }

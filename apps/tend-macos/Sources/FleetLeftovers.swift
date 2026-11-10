@@ -163,6 +163,9 @@ struct FleetLeftoversView: View {
         let node: String?
     }
 
+    private enum Tab: Hashable { case worktrees, servers }
+
+    @State private var tab: Tab = .worktrees
     @State private var states: [String: HostState] = [:]
     /// Selected rows to set aside, per host.
     @State private var selected: [String: Set<String>] = [:]
@@ -178,9 +181,41 @@ struct FleetLeftoversView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
+                Text("Leftovers")
+                    .font(.system(size: 16, weight: .semibold))
+                Spacer()
+                TendSegmented(selection: $tab, options: [.worktrees, .servers]) { tab in
+                    switch tab {
+                    case .worktrees: Text("Worktrees")
+                    case .servers: Text("Servers")
+                    }
+                }
+                .disabled(running || confirming != nil)
+            }
+            if tab == .servers {
+                FleetServersList(model: model)
+            } else {
+                worktreesBody
+            }
+            if let confirming {
+                confirmationPanel(confirming)
+            } else {
+                HStack {
+                    Spacer()
+                    Button("Close") { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                }
+            }
+        }
+        .padding(20)
+        .frame(width: 660, height: 560)
+        .task { await load() }
+    }
+
+    private var worktreesBody: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Leftover worktrees")
-                        .font(.system(size: 16, weight: .semibold))
                     Text("Worktrees tend created, by host. Set aside moves a folder into .tend-set-aside next to it with git; nothing is deleted until you delete it for good.")
                         .font(TendType.meta)
                         .foregroundStyle(.secondary)
@@ -208,19 +243,7 @@ struct FleetLeftoversView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
-            if let confirming {
-                confirmationPanel(confirming)
-            } else {
-                HStack {
-                    Spacer()
-                    Button("Close") { dismiss() }
-                        .keyboardShortcut(.cancelAction)
-                }
-            }
         }
-        .padding(20)
-        .frame(width: 660, height: 560)
-        .task { await load() }
     }
 
     private func canChange(_ host: TendFleetHost) -> Bool {
