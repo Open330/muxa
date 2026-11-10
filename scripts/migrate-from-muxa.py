@@ -419,12 +419,13 @@ def move_launchd_job(m: Migration, old: Path, new: Path):
     NEW_SERVICES.append(("launchd", new, program))
 
 
-def move_systemd_unit(m: Migration, old: Path, new: Path):
-    if new.exists():
-        m.note(f"{new} already exists, so {old} was left in place. Remove it once tend works.")
-        return
+def systemd_text(text: str) -> tuple[str, str]:
+    """Rename a unit file or drop-in: Exec lines get the executable renamed by
+    file name (keeping systemd quoting), everything else the surgical
+    rename (MUXA_* variables, moved paths). Returns the text and the first
+    executable."""
     lines, program = [], ""
-    for line in old.read_text(encoding="utf-8").splitlines(keepends=True):
+    for line in text.splitlines(keepends=True):
         exec_line = re.match(r"(\s*Exec\w*=[-@:+!]*)(?:\"([^\"]*)\"|'([^']*)'|(\S+))(.*)", line, re.S)
         if exec_line:
             raw = next(g for g in exec_line.group(2, 3, 4) if g is not None)
@@ -435,10 +436,31 @@ def move_systemd_unit(m: Migration, old: Path, new: Path):
         else:
             line = surgical_rename(line)
         lines.append(line)
+    return "".join(lines), program
+
+
+def move_systemd_unit(m: Migration, old: Path, new: Path):
+    """The unit and its `<unit>.d/` drop-ins (an Environment= override, say)
+    move together under the Tend name."""
+    old_dropins, new_dropins = old.with_name(old.name + ".d"), new.with_name(new.name + ".d")
+    if new.exists() or new_dropins.exists():
+        m.note(f"{new} already exists, so {old} was left in place. Remove it once tend works.")
+        return
+    text, program = systemd_text(old.read_text(encoding="utf-8"))
     m.step(f"move systemd unit {old.name} → {new.name}")
+    confs = sorted(old_dropins.glob("*.conf")) if old_dropins.is_dir() else []
+    if old_dropins.is_dir():
+        m.step(f"move its drop-ins {old_dropins.name}/ → {new_dropins.name}/ ({len(confs)} files)")
     if m.apply:
-        atomic_write(new, "".join(lines))
+        atomic_write(new, text)
         old.rename(old.with_name(f"{old.name}.muxa-migrate-{STAMP}"))
+        if old_dropins.is_dir():
+            new_dropins.mkdir()
+            for conf in confs:
+                conf_text, conf_program = systemd_text(conf.read_text(encoding="utf-8"))
+                atomic_write(new_dropins / conf.name, conf_text)
+                program = conf_program or program  # a drop-in ExecStart= overrides the unit's
+            old_dropins.rename(old_dropins.with_name(f"{old_dropins.name}.muxa-migrate-{STAMP}"))
     NEW_SERVICES.append(("systemd", new, program.replace("%h", str(HOME))))
 
 
