@@ -358,26 +358,37 @@ def stop_services(m: Migration):
         for label in ("dev.open330.muxad", "dev.open330.muxa-restore"):
             if label in loaded:
                 m.run(["launchctl", "bootout", f"gui/{UID}/{label}"], f"stop launchd job {label}")
-            plist = agents / f"{label}.plist"
-            if plist.exists():
-                move_launchd_job(m, plist, agents / f"{full_rename(label)}.plist")
+
     if have("systemctl"):
         for unit in ("muxad.service", "muxa-restore.service"):
             if unit in capture(["systemctl", "--user", "list-unit-files", unit]):
                 m.run(["systemctl", "--user", "disable", "--now", unit], f"disable systemd unit {unit}")
-        for base in (xdg("XDG_DATA_HOME", HOME / ".local/share"), xdg("XDG_CONFIG_HOME", HOME / ".config")):
-            for unit in ("muxad.service", "muxa-restore.service"):
-                path = base / "systemd/user" / unit
-                if path.exists():
-                    move_systemd_unit(m, path, path.with_name(full_rename(unit)))
+
     if have("brew") and "muxa" in capture(["brew", "services", "list"]).split():
         m.run(["brew", "services", "stop", "muxa"], "stop brew service muxa")
+        NEW_SERVICES.append(("brew", Path("tend"), "tend"))
     if capture(["pgrep", "-x", "muxad"]).strip():
         m.run(["pkill", "-x", "muxad"], "stop the running muxad")
 
 
 # Services moved to their Tend names, started once everything else is done.
 NEW_SERVICES: list[tuple[str, Path, str]] = []
+
+
+def convert_services(m: Migration):
+    """After the directories moved (so MOVES is known): rewrite the stopped
+    Muxa jobs under their Tend names."""
+    if MACOS:
+        agents = HOME / "Library/LaunchAgents"
+        for label in ("dev.open330.muxad", "dev.open330.muxa-restore"):
+            plist = agents / f"{label}.plist"
+            if plist.exists():
+                move_launchd_job(m, plist, agents / f"{full_rename(label)}.plist")
+    for base in (xdg("XDG_DATA_HOME", HOME / ".local/share"), xdg("XDG_CONFIG_HOME", HOME / ".config")):
+        for unit in ("muxad.service", "muxa-restore.service"):
+            path = base / "systemd/user" / unit
+            if path.exists():
+                move_systemd_unit(m, path, path.with_name(full_rename(unit)))
 
 
 def move_launchd_job(m: Migration, old: Path, new: Path):
@@ -414,10 +425,13 @@ def move_systemd_unit(m: Migration, old: Path, new: Path):
         return
     lines, program = [], ""
     for line in old.read_text(encoding="utf-8").splitlines(keepends=True):
-        exec_line = re.match(r"(\s*Exec\w*=[-@:+!]*)(\S+)(.*)", line, re.S)
+        exec_line = re.match(r"(\s*Exec\w*=[-@:+!]*)(?:\"([^\"]*)\"|'([^']*)'|(\S+))(.*)", line, re.S)
         if exec_line:
-            line = exec_line.group(1) + rename_program_path(exec_line.group(2)) + surgical_rename(exec_line.group(3))
-            program = program or rename_program_path(exec_line.group(2))
+            raw = next(g for g in exec_line.group(2, 3, 4) if g is not None)
+            quote = '"' if exec_line.group(2) is not None else "'" if exec_line.group(3) is not None else ""
+            renamed = rename_program_path(raw)
+            line = exec_line.group(1) + quote + renamed + quote + surgical_rename(exec_line.group(5))
+            program = program or renamed
         else:
             line = surgical_rename(line)
         lines.append(line)
@@ -440,6 +454,13 @@ def start_services(m: Migration):
             m.note(f"{path.name} runs {program}, which is not installed yet. Install Tend, then start it "
                    + (f"with: launchctl bootstrap gui/{UID} '{path}'" if kind == "launchd"
                       else f"with: systemctl --user enable --now {path.name}"))
+            continue
+        if kind == "brew":
+            if "tend" in capture(["brew", "list", "--formula"]).split():
+                m.run(["brew", "services", "start", "tend"], "start brew service tend")
+            else:
+                m.note("Muxa ran as a brew service. Install Tend and start it: "
+                       "brew install open330/tap/tend && brew services start tend")
             continue
         if kind == "launchd":
             m.run(["launchctl", "bootstrap", f"gui/{UID}", str(path)], f"start launchd job {path.stem}")
@@ -836,6 +857,8 @@ def main() -> int:
     if not args.only_files:
         stop_services(m)
     dirs = move_directories(m)
+    if not args.only_files:
+        convert_services(m)
     rewrite_own_files(m, dirs)
     migrate_agents(m, args.claude_home, args.codex_home)
     migrate_shell_and_tmux(m)
@@ -853,6 +876,8 @@ def main() -> int:
     elif args.apply:
         print(f"Done: {m.done} changes. Backups end in .muxa-migrate-{STAMP}.")
         print("Next: open a new shell and restart your agents so their hooks and MCP server call `tend`.")
+        if not NEW_SERVICES and not args.only_files:
+            print("No Muxa service was found to move; run `tend init` to install the tendd service.")
     else:
         print(f"{m.done} changes planned. Run again with --apply to make them.")
     if m.notes:

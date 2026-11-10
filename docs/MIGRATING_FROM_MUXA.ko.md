@@ -40,7 +40,7 @@ Muxa의 새 이름은 Tend입니다. Tend는 Muxa의 이름을 하나도 읽지 
    ```
 
 4. 새 셸을 열고 에이전트를 다시 시작합니다. 그래야 훅과 MCP 서버가 `tend`를 부릅니다.
-   Muxa 서비스를 쓴 적이 없다면 `tend init`이 서비스를 설치합니다.
+   스크립트가 옮긴 Muxa 서비스가 없다고 알리면 `tend init`으로 서비스를 설치합니다.
 5. Tend가 잘 돌면 Muxa를 지웁니다: `brew uninstall muxa`(또는 `cargo uninstall muxa-cli muxad`),
    `Muxa.app`은 휴지통으로.
 
@@ -50,7 +50,7 @@ Muxa를 돌리던 호스트마다 실행하세요. Python 3.8 이상이 필요�
 
 ## 스크립트가 하는 일
 
-- `muxad`와 brew 서비스를 멈추고, launchd 작업이나 systemd 유닛(복구 작업 포함)을 Tend 이름으로 옮깁니다.
+- `muxad`를 멈추고, brew 서비스는 `tend`로 다시 시작하거나 방법을 알려 주며, launchd 작업이나 systemd 유닛(복구 작업 포함)을 Tend 이름으로 옮깁니다.
   에이전트에 맞춰 손본 PATH 같은 환경은 그대로 두고, 이름, 실행 파일, 로그 경로만 바꿉니다.
   Tend가 그 작업이 기대하는 위치에 설치돼 있으면 마지막에 다시 시작합니다.
 - Muxa의 데이터, 설정, 캐시 폴더를 `tend`로 옮깁니다. `tend` 폴더가 이미 있으면 둘 다 그대로 두고 알려 줍니다.
