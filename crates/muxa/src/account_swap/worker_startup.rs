@@ -255,6 +255,29 @@ mod tests {
         )
     }
     #[test]
+    fn custom_claude_statusline_does_not_hide_its_framed_composer() {
+        let screen = "Claude Code v2.1.322\n─────────────────\n❯ \u{a0}\n─────────────────\n ~/p/muxa Opus 5.5 0 0\n ⎇ main 453ms $0.00";
+        assert_eq!(
+            run(|| Some(screen.into()), || true, |_| panic!()).state,
+            State::Ready
+        );
+        for unproven in [
+            "Claude Code\n❯ ",
+            "$ claude\n─────\n❯ \n─────",
+            "Claude Code\n─────\nLoading\n─────",
+        ] {
+            assert_eq!(
+                run(|| Some(unproven.into()), || true, |_| panic!()).state,
+                State::Unsettled
+            );
+        }
+        let draft = screen.replace("❯ \u{a0}", "❯ unsent draft");
+        assert_eq!(
+            run(|| Some(draft.clone()), || true, |_| panic!()).state,
+            State::Blocked
+        );
+    }
+    #[test]
     fn trust_is_answered_then_a_real_prompt_is_required() {
         let keys = std::cell::RefCell::new(Vec::new());
         let result = run(

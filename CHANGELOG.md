@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Claude worker readiness recognizes its framed composer when a custom status
+  line replaces the default shortcut footer. Bare shell prompts and unsent
+  drafts still do not count as input-ready.
+
 - Fresh Claude/Codex peer workers now prepare recognized startup gates and
   verify a stable empty input composer before dispatch. Narrow folder-trust
   dialogs are handled without a model turn; changed launch identities,

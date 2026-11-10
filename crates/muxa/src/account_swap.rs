@@ -4059,6 +4059,28 @@ fn agent_prompt_visible(screen: &str) -> bool {
     let tail = screen_tail(screen, 10);
     PROMPT_MARKS.iter().any(|mark| tail.contains(mark))
         || tail.lines().any(|line| line.starts_with("› "))
+        // A custom Claude statusLine replaces the shortcut/permission footer.
+        // Require its provider header and the actual composer between two
+        // full rules; a shell's bare prompt is never sufficient.
+        || (screen.contains("Claude Code") && claude_composer_visible(screen))
+}
+
+fn claude_composer_visible(screen: &str) -> bool {
+    let lines: Vec<_> = screen.lines().collect();
+    let rules: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            (line.chars().count() >= 5 && line.chars().all(|c| c == '─')).then_some(index)
+        })
+        .collect();
+    let [.., top, bottom] = rules[..] else {
+        return false;
+    };
+    lines[top + 1..bottom]
+        .first()
+        .is_some_and(|line| line.trim_start().starts_with('❯'))
 }
 
 /// How many non-blank lines at the bottom of the screen a startup banner or
