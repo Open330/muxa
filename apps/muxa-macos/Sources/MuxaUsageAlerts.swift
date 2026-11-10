@@ -72,13 +72,20 @@ enum MuxaUsageAlerts {
                     rearmed.append(contentsOf: cycles)
                     continue
                 }
+                // A threshold any host announced in this window covers every
+                // host now in the group, whatever the current figure: pass it
+                // on, so it outlives the host that announced it.
+                for threshold in thresholds {
+                    let keys = cycles.map { key(cycle: $0, threshold: threshold) }
+                    guard keys.contains(where: seen.contains) else { continue }
+                    let missing = keys.filter { !seen.contains($0) }
+                    silent.append(contentsOf: missing)
+                    seen.formUnion(missing)
+                }
                 let passed = thresholds.filter { window.percent >= $0 }
                 guard let top = passed.max() else { continue }
                 let crossed = cycles.flatMap { cycle in passed.map { key(cycle: cycle, threshold: $0) } }
-                if cycles.contains(where: { seen.contains(key(cycle: $0, threshold: top)) }) {
-                    // Announced already through another host: pass the
-                    // history on to hosts that joined since, so it outlives
-                    // the host that announced it.
+                guard !cycles.contains(where: { seen.contains(key(cycle: $0, threshold: top)) }) else {
                     let missing = crossed.filter { !seen.contains($0) }
                     silent.append(contentsOf: missing)
                     seen.formUnion(missing)
