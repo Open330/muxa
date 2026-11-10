@@ -18,7 +18,7 @@ use muxa::fleet::{
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
     FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
-    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
 use muxa::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -348,6 +348,7 @@ impl LocalTask {
                     // A `work` child may run for its whole budget; never let
                     // it stall local refreshes and transition handling.
                     let Some(command) = self.spawn_work_command(command) else { continue; };
+                    let Some(command) = spawn_worktree_inventory(command) else { continue; };
                     let result = self.execute(command.operation).await;
                     let _ = command.reply.send(result);
                 }
@@ -447,6 +448,10 @@ impl LocalTask {
                 }
                 audit_operation(LOCAL_HOST_ALIAS, "send_keys", keys.len());
                 local_send_keys(&self.backends, pane, keys).await
+            }
+            // Runs in its own task; see `spawn_worktree_inventory`.
+            FleetOperation::WorktreeInventory => {
+                Err("worktree inventory runs in its own task".into())
             }
             FleetOperation::CollaborationSend { pane, request } => {
                 exact_local_backend(&self.backends, &pane).await?;
@@ -574,6 +579,62 @@ async fn run_local_work_command(
     .await
     .map(FleetCommandResult::command)
     .map_err(|error| error.to_string())
+}
+
+/// One worktree scan at a time on this host.
+static WORKTREE_SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Runs the local worktree inventory in its own task, so a slow disk never
+/// stalls refreshes, transitions or other commands, or hands any other
+/// command back. A second request while one runs is refused.
+fn spawn_worktree_inventory(command: HostCommand) -> Option<HostCommand> {
+    if !matches!(command.operation, FleetOperation::WorktreeInventory) {
+        return Some(command);
+    }
+    let reply = command.reply;
+    let Ok(permit) = WORKTREE_SCAN.try_acquire() else {
+        let _ = reply.send(Err(
+            "a worktree check is already running on this host".into()
+        ));
+        return None;
+    };
+    audit_operation(LOCAL_HOST_ALIAS, "worktree_inventory", 0);
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(|| {
+            muxa::worktree_inventory::inventory(
+                false,
+                Some(muxa::worktree_inventory::FLEET_MAX_ROWS),
+            )
+        })
+        .await
+        .map(FleetCommandResult::worktrees)
+        .map_err(|error| format!("worktree inventory failed: {error}"));
+        drop(permit);
+        let _ = reply.send(result);
+    });
+    None
+}
+
+/// The worktree inventory goes only to a relay that says it answers it; an
+/// older one would drop the request and leave the caller waiting.
+fn worktree_inventory_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::WorktreeInventory) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_WORKTREE_INVENTORY_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot list its worktrees; upgrade muxa on that host"
+    ))
 }
 
 /// Navigation keys reach only a relay that says it takes them; an older one
@@ -1330,6 +1391,13 @@ impl HostTask {
                     }
                     if let Some(refusal) =
                         send_keys_refusal(&self.alias, &connected.hello, &command.operation)
+                            .or_else(|| {
+                                worktree_inventory_refusal(
+                                    &self.alias,
+                                    &connected.hello,
+                                    &command.operation,
+                                )
+                            })
                     {
                         let _ = command.reply.send(Err(refusal));
                         continue;
@@ -1419,6 +1487,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::SendKeys { request_id: id, pane, keys }
+                        }
+                        FleetOperation::WorktreeInventory => {
+                            audit_operation(&self.alias, "worktree_inventory", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::WorktreeInventory { request_id: id }
                         }
                         FleetOperation::CollaborationSend { pane, request } => {
                             audit_operation(&self.alias, "collaboration_send", request.body.len());
@@ -1988,6 +2064,12 @@ mod tests {
         assert!(send_keys_refusal("remote", &legacy, &capture).is_none());
         let current = hello(FLEET_CAPABILITIES);
         assert!(send_keys_refusal("remote", &current, &keys).is_none());
+        // The worktree inventory follows the same rule.
+        let inventory = FleetOperation::WorktreeInventory;
+        let refusal = worktree_inventory_refusal("remote", &legacy, &inventory).unwrap();
+        assert!(refusal.contains("upgrade muxa"), "{refusal}");
+        assert!(worktree_inventory_refusal("remote", &legacy, &keys).is_none());
+        assert!(worktree_inventory_refusal("remote", &current, &inventory).is_none());
     }
 
     #[test]

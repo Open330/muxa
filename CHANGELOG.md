@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   does not yet know whether a Work is finished and removes nothing. Muxa now
   writes a receipt, marked inside the worktree's git directory, when it
   creates a worktree for a Work route or a dispatch, and lists only those.
+- macOS: Home › Hosts › Leftover Worktrees shows every online host's
+  receipted worktrees and what keeps each, read-only. The daemon answers a
+  new Fleet `worktree_inventory` operation (`fleet_worktrees_v1`); relays
+  advertise `worktree_inventory_v1`, and older relays are refused with an
+  upgrade message.
 
 ## [0.9.9] - 2026-11-10
 
