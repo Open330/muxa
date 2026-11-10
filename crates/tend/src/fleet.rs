@@ -89,6 +89,8 @@ pub const FLEET_BOUNDED_CLAIM_CAPABILITY: &str = "collaboration_claim_bounded_v1
 pub const FLEET_SEND_KEYS_CAPABILITY: &str = "send_keys_v1";
 /// Relay capability: the relay answers [`RelayRequest::WorktreeInventory`].
 pub const FLEET_WORKTREE_INVENTORY_CAPABILITY: &str = "worktree_inventory_v1";
+/// Relay capability: the relay applies [`RelayRequest::WorktreeChange`].
+pub const FLEET_WORKTREE_CHANGE_CAPABILITY: &str = "worktree_change_v1";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
@@ -108,6 +110,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     FLEET_WORK_COMMAND_CAPABILITY,
     FLEET_SEND_KEYS_CAPABILITY,
     FLEET_WORKTREE_INVENTORY_CAPABILITY,
+    FLEET_WORKTREE_CHANGE_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -553,6 +556,11 @@ pub enum RelayRequest {
     WorktreeInventory {
         request_id: String,
     },
+    /// Set aside, restore or delete some of the relay host's worktrees.
+    WorktreeChange {
+        request_id: String,
+        change: crate::worktree_change::ChangeRequest,
+    },
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
@@ -628,6 +636,7 @@ impl RelayRequest {
             | Self::SendPrompt { request_id, .. }
             | Self::SendKeys { request_id, .. }
             | Self::WorktreeInventory { request_id }
+            | Self::WorktreeChange { request_id, .. }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
@@ -666,7 +675,7 @@ pub enum RelayFrame {
     },
     Result {
         request_id: String,
-        result: FleetCommandResult,
+        result: Box<FleetCommandResult>,
     },
     Error {
         request_id: String,
@@ -754,6 +763,11 @@ pub enum FleetOperation {
     /// `fleet_worktrees_v1`: the host's receipted worktrees and what would
     /// stop a cleanup from taking each. Read-only.
     WorktreeInventory,
+    /// `fleet_worktree_change_v1`: set aside, restore or delete worktrees
+    /// the host listed (see `tend::worktree_change`). A control action.
+    WorktreeChange {
+        change: crate::worktree_change::ChangeRequest,
+    },
     CollaborationSend {
         pane: PaneKey,
         request: Box<NewRequest>,
@@ -846,6 +860,13 @@ pub struct FleetCommandResult {
     /// when the reply was cut to [`crate::worktree_inventory::FLEET_MAX_ROWS`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktrees_total: Option<usize>,
+    /// The answering host's node id, with `worktrees`, so a change request
+    /// can name the host it listed them on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees_node: Option<String>,
+    /// Per-worktree outcomes of a `worktree_change`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_changes: Option<Vec<crate::worktree_change::ChangeOutcome>>,
 }
 
 impl FleetCommandResult {
@@ -868,6 +889,8 @@ impl FleetCommandResult {
             command_stderr: None,
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -876,7 +899,16 @@ impl FleetCommandResult {
         Self {
             worktrees: Some(inventory.rows),
             worktrees_total: Some(inventory.total),
+            worktrees_node: crate::worktree_change::local_node(),
             ..Self::accepted("worktree inventory")
+        }
+    }
+
+    #[must_use]
+    pub fn worktree_changes(outcomes: Vec<crate::worktree_change::ChangeOutcome>) -> Self {
+        Self {
+            worktree_changes: Some(outcomes),
+            ..Self::accepted("worktree change")
         }
     }
 
@@ -899,6 +931,8 @@ impl FleetCommandResult {
             command_stderr: None,
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -923,6 +957,8 @@ impl FleetCommandResult {
             command_stderr: None,
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -945,6 +981,8 @@ impl FleetCommandResult {
             command_stderr: None,
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -967,6 +1005,8 @@ impl FleetCommandResult {
             command_stderr: None,
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -989,6 +1029,8 @@ impl FleetCommandResult {
             command_stderr: None,
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -1031,6 +1073,8 @@ impl FleetCommandResult {
             command_stderr: None,
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -1054,6 +1098,8 @@ impl FleetCommandResult {
             command_stderr: Some(output.stderr),
             worktrees: None,
             worktrees_total: None,
+            worktrees_node: None,
+            worktree_changes: None,
         }
     }
 
@@ -1945,10 +1991,29 @@ mod fleet_key_tests {
         let wire = serde_json::to_string(&request).unwrap();
         let back: RelayRequest = serde_json::from_str(&wire).unwrap();
         assert_eq!(back.request_id(), "r1");
+        let change: FleetOperation = serde_json::from_value(serde_json::json!({
+            "kind": "worktree_change",
+            "change": {"op_id": "op", "action": "set_aside",
+                       "items": [{"id": "r", "generation": 2, "head": "abc", "branch": null}],
+                       "expected_node": "n"}
+        }))
+        .unwrap();
+        let FleetOperation::WorktreeChange { change } = change else {
+            panic!("not a worktree change");
+        };
+        assert_eq!(change.items[0].generation, 2);
+        let request = RelayRequest::WorktreeChange {
+            request_id: "r2".into(),
+            change,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        let back: RelayRequest = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.request_id(), "r2");
         // A reply without the field (an older relay) still reads.
         let result: FleetCommandResult =
             serde_json::from_value(serde_json::json!({"accepted": true})).unwrap();
         assert!(result.worktrees.is_none());
+        assert!(result.worktree_changes.is_none());
         assert_eq!(FleetKey::Up.bytes(), "\u{1b}[A");
         assert_eq!(FleetKey::Enter.bytes(), "\r");
     }

@@ -938,10 +938,14 @@ private struct TendFleetCommandResult: Decodable, Sendable {
     let collaborationUnchanged: Bool?
     let worktrees: [TendWorktreeRow]?
     let worktreesTotal: Int?
+    let worktreesNode: String?
+    let worktreeChanges: [TendWorktreeChangeOutcome]?
 
     enum CodingKeys: String, CodingKey {
         case accepted, message, capture, worktrees
         case worktreesTotal = "worktrees_total"
+        case worktreesNode = "worktrees_node"
+        case worktreeChanges = "worktree_changes"
         case captureRawBase64 = "capture_raw_base64"
         case collaborationRequest = "collaboration_request"
         case collaborationIncoming = "collaboration_incoming"
@@ -1398,14 +1402,52 @@ actor TendIPCClient {
     }
 
     /// The host's receipted worktrees and what would stop a cleanup from
-    /// taking each. Read-only.
+    /// taking each. Read-only. The host bounds the scan to 20 seconds, so
+    /// this waits longer than an ordinary call, on its own transport.
     func fleetWorktrees(host: TendFleetHostIdentity) async throws -> TendWorktreeInventory {
         guard capabilities.contains("fleet_worktrees_v1") else {
             throw TendIPCError.server(String(localized: "Listing worktrees needs an updated tendd; update tend and restart tendd"))
         }
-        let result = try await fleetCommand(host: host, operation: ["kind": "worktree_inventory"])
+        let result = try await fleetCommand(
+            host: host,
+            operation: ["kind": "worktree_inventory"],
+            requestTransport: workTransport(for: "worktrees-\(host.alias)"),
+            timeout: 35
+        )
         let rows = result.worktrees ?? []
-        return TendWorktreeInventory(rows: rows, total: max(result.worktreesTotal ?? rows.count, rows.count))
+        return TendWorktreeInventory(
+            rows: rows,
+            total: max(result.worktreesTotal ?? rows.count, rows.count),
+            node: result.worktreesNode
+        )
+    }
+
+    /// Sets aside, restores or deletes worktrees on `host`, each named with
+    /// the generation, branch and commit it was listed with; the host checks
+    /// them again and refuses any that changed. The host bounds a change to
+    /// a minute, so this waits longer than that.
+    func fleetChangeWorktrees(
+        host: TendFleetHostIdentity,
+        action: TendWorktreeAction,
+        items: [TendWorktreeChangeItem],
+        node: String?
+    ) async throws -> [TendWorktreeChangeOutcome] {
+        guard capabilities.contains("fleet_worktree_change_v1") else {
+            throw TendIPCError.server(String(localized: "Changing worktrees needs an updated tendd; update tend and restart tendd"))
+        }
+        var change: [String: Any] = [
+            "op_id": UUID().uuidString.lowercased(),
+            "action": action.rawValue,
+            "items": items.map(\.json),
+        ]
+        if let node { change["expected_node"] = node }
+        let result = try await fleetCommand(
+            host: host,
+            operation: ["kind": "worktree_change", "change": change],
+            requestTransport: workTransport(for: "worktrees-\(host.alias)"),
+            timeout: 85
+        )
+        return result.worktreeChanges ?? []
     }
 
     func sendFleetPrompt(
@@ -1979,7 +2021,8 @@ actor TendIPCClient {
     private func fleetCommand(
         host: TendFleetHostIdentity,
         operation: [String: Any],
-        requestTransport: SerializedIPCTransport? = nil
+        requestTransport: SerializedIPCTransport? = nil,
+        timeout: TimeInterval = 3
     ) async throws -> TendFleetCommandResult {
         guard capabilities.contains("fleet_v1") else {
             throw TendIPCError.server("This operation requires tendd multi-host support (fleet_v1)")
@@ -1991,7 +2034,8 @@ actor TendIPCClient {
                 "host": host.alias,
                 "operation": operation,
             ],
-            using: requestTransport
+            using: requestTransport,
+            timeout: timeout
         )
         guard let result = response.fleetResult else {
             throw TendIPCError.missingField("fleet_result")

@@ -240,6 +240,74 @@ pub struct PipelineRunStore {
     revision: watch::Sender<u64>,
 }
 
+/// The durable Runs as they are on disk, for a reader that must not touch
+/// the file (no permission fix-up, unlike [`PipelineRunStore::load`]).
+/// Missing state reads as no Runs; malformed or unsupported state is an
+/// error, so a caller never takes unreadable state for "nothing running".
+pub fn read_runs(path: &std::path::Path) -> Result<Vec<PipelineRun>, PipelineRunError> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let file: PipelineRunFile = serde_json::from_slice(&bytes).map_err(|error| {
+        PipelineRunError::Invalid(format!("cannot parse {}: {error}", path.display()))
+    })?;
+    if file.version != PIPELINE_RUN_SCHEMA_VERSION {
+        return Err(PipelineRunError::Invalid(format!(
+            "unsupported schema version {} in {}; expected {}",
+            file.version,
+            path.display(),
+            PIPELINE_RUN_SCHEMA_VERSION
+        )));
+    }
+    Ok(file.runs)
+}
+
+impl PipelineRun {
+    /// Whether nothing is left to do: every desired alias is Done, and no
+    /// alias waits on a restart or holds a launch claim.
+    #[must_use]
+    pub fn finished(&self) -> bool {
+        self.desired.iter().all(|agent| {
+            self.aliases.get(&agent.alias).is_some_and(|state| {
+                state.status == PipelineAliasStatus::Done
+                    && !state.reconcile_pending
+                    && state.claim_started_at.is_none()
+            })
+        }) && self.aliases.values().all(|state| {
+            state.status == PipelineAliasStatus::Done
+                && !state.reconcile_pending
+                && state.claim_started_at.is_none()
+        })
+    }
+
+    /// The first alias that is not finished, and why, for a message.
+    #[must_use]
+    pub fn unfinished_alias(&self) -> Option<String> {
+        for agent in &self.desired {
+            match self.aliases.get(&agent.alias) {
+                None => return Some(format!("{}: not started", agent.alias)),
+                Some(state) if state.status != PipelineAliasStatus::Done => {
+                    return Some(format!("{}: {}", agent.alias, state.status));
+                }
+                Some(state) if state.reconcile_pending || state.claim_started_at.is_some() => {
+                    return Some(format!("{}: restart pending", agent.alias));
+                }
+                Some(_) => {}
+            }
+        }
+        self.aliases
+            .values()
+            .find(|state| {
+                state.status != PipelineAliasStatus::Done
+                    || state.reconcile_pending
+                    || state.claim_started_at.is_some()
+            })
+            .map(|state| format!("{}: {}", state.alias, state.status))
+    }
+}
+
 impl PipelineRunStore {
     #[must_use]
     pub fn in_memory() -> std::sync::Arc<Self> {

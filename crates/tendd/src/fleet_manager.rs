@@ -18,7 +18,8 @@ use tend::fleet::{
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
     FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
-    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    FLEET_WORKTREE_CHANGE_CAPABILITY, FLEET_WORKTREE_INVENTORY_CAPABILITY,
+    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use tend::tmux::SessionInfo;
 use tend::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -349,6 +350,7 @@ impl LocalTask {
                     // it stall local refreshes and transition handling.
                     let Some(command) = self.spawn_work_command(command) else { continue; };
                     let Some(command) = spawn_worktree_inventory(command) else { continue; };
+                    let Some(command) = spawn_worktree_change(command) else { continue; };
                     let result = self.execute(command.operation).await;
                     let _ = command.reply.send(result);
                 }
@@ -450,8 +452,8 @@ impl LocalTask {
                 local_send_keys(&self.backends, pane, keys).await
             }
             // Runs in its own task; see `spawn_worktree_inventory`.
-            FleetOperation::WorktreeInventory => {
-                Err("worktree inventory runs in its own task".into())
+            FleetOperation::WorktreeInventory | FleetOperation::WorktreeChange { .. } => {
+                Err("worktree operations run in their own task".into())
             }
             FleetOperation::CollaborationSend { pane, request } => {
                 exact_local_backend(&self.backends, &pane).await?;
@@ -613,6 +615,62 @@ fn spawn_worktree_inventory(command: HostCommand) -> Option<HostCommand> {
         let _ = reply.send(result);
     });
     None
+}
+
+/// Applies a worktree change on this host in its own task. The change takes
+/// the host-wide lock itself (see `tend::worktree_change`), shared with the
+/// CLI and relays, so nothing here serializes it further.
+fn spawn_worktree_change(command: HostCommand) -> Option<HostCommand> {
+    let FleetOperation::WorktreeChange { change } = command.operation else {
+        return Some(command);
+    };
+    let reply = command.reply;
+    audit_operation(LOCAL_HOST_ALIAS, "worktree_change", change.items.len());
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(move || tend::worktree_change::change(&change))
+            .await
+            .map_err(|error| format!("worktree change failed: {error}"))
+            .and_then(|result| result.map(FleetCommandResult::worktree_changes));
+        let _ = reply.send(result);
+    });
+    None
+}
+
+/// How long the controller waits for a relay's answer to `operation`:
+/// the configured command timeout, or longer for the worktree operations,
+/// which bound themselves and must not be cut off before they answer.
+fn relay_timeout(configured: Duration, operation: &FleetOperation) -> Duration {
+    let slack = Duration::from_secs(10);
+    match operation {
+        FleetOperation::WorktreeInventory => {
+            configured.max(tend::worktree_inventory::SCAN_BUDGET + slack)
+        }
+        FleetOperation::WorktreeChange { .. } => {
+            configured.max(tend::worktree_change::CHANGE_BUDGET + slack)
+        }
+        _ => configured,
+    }
+}
+
+/// A worktree change goes only to a relay that says it applies it.
+fn worktree_change_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::WorktreeChange { .. }) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_WORKTREE_CHANGE_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot change its worktrees; upgrade tend on that host"
+    ))
 }
 
 /// The worktree inventory goes only to a relay that says it answers it; an
@@ -1359,6 +1417,7 @@ impl HostTask {
                         command.operation,
                         FleetOperation::SendPrompt { .. }
                             | FleetOperation::SendKeys { .. }
+                            | FleetOperation::WorktreeChange { .. }
                             | FleetOperation::CollaborationSend { .. }
                             | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
@@ -1393,6 +1452,13 @@ impl HostTask {
                         send_keys_refusal(&self.alias, &connected.hello, &command.operation)
                             .or_else(|| {
                                 worktree_inventory_refusal(
+                                    &self.alias,
+                                    &connected.hello,
+                                    &command.operation,
+                                )
+                            })
+                            .or_else(|| {
+                                worktree_change_refusal(
                                     &self.alias,
                                     &connected.hello,
                                     &command.operation,
@@ -1447,7 +1513,10 @@ impl HostTask {
                         continue;
                     }
                     let id = request_id();
-                    let command_timeout = Duration::from_secs(self.fleet.command_timeout_secs);
+                    let command_timeout = relay_timeout(
+                        Duration::from_secs(self.fleet.command_timeout_secs),
+                        &command.operation,
+                    );
                     let request = match command.operation {
                         FleetOperation::Refresh => {
                             pending.insert(
@@ -1495,6 +1564,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::WorktreeInventory { request_id: id }
+                        }
+                        FleetOperation::WorktreeChange { change } => {
+                            audit_operation(&self.alias, "worktree_change", change.items.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::WorktreeChange { request_id: id, change }
                         }
                         FleetOperation::CollaborationSend { pane, request } => {
                             audit_operation(&self.alias, "collaboration_send", request.body.len());
@@ -1745,7 +1822,7 @@ impl HostTask {
                 }
             }
             RelayFrame::Result { request_id, result } => {
-                let result = sanitize_command_result(result);
+                let result = sanitize_command_result(*result);
                 if let Some(request) = pending.remove(&request_id) {
                     match request.reply {
                         PendingReply::Command(reply) | PendingReply::Refresh(reply) => {
@@ -2070,6 +2147,25 @@ mod tests {
         assert!(refusal.contains("upgrade tend"), "{refusal}");
         assert!(worktree_inventory_refusal("remote", &legacy, &keys).is_none());
         assert!(worktree_inventory_refusal("remote", &current, &inventory).is_none());
+        // And the worktree change.
+        let change = FleetOperation::WorktreeChange {
+            change: tend::worktree_change::ChangeRequest {
+                op_id: "op".into(),
+                action: tend::worktree_receipt::ChangeAction::SetAside,
+                items: vec![],
+                expected_node: None,
+            },
+        };
+        let older = hello(&["capture", FLEET_WORKTREE_INVENTORY_CAPABILITY]);
+        let refusal = worktree_change_refusal("remote", &older, &change).unwrap();
+        assert!(refusal.contains("upgrade tend"), "{refusal}");
+        assert!(worktree_change_refusal("remote", &older, &inventory).is_none());
+        assert!(worktree_change_refusal("remote", &current, &change).is_none());
+        // Both worktree operations outlast their own time limits.
+        let configured = Duration::from_secs(10);
+        assert!(relay_timeout(configured, &inventory) > tend::worktree_inventory::SCAN_BUDGET);
+        assert!(relay_timeout(configured, &change) > tend::worktree_change::CHANGE_BUDGET);
+        assert_eq!(relay_timeout(configured, &capture), configured);
     }
 
     #[test]

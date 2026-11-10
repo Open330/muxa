@@ -232,8 +232,9 @@ enum Cmd {
     /// Worker agents tend launched for peer work, across every room: state,
     /// observed idle time, open requests, and what is left behind.
     Workers(worker_cmd::Args),
-    /// Git worktrees tend created on this host and whether each could be
-    /// cleaned up. Read-only: lists only worktrees tend holds a receipt for.
+    /// Git worktrees tend created on this host, whether each could be
+    /// cleaned up, and the cleanup: set aside, restore, delete. Lists only
+    /// worktrees tend holds a receipt for; changes need --yes.
     Worktrees(worktrees_cmd::Args),
     /// Former name of `tend fleet host`. Tend.app still invokes it, and an
     /// app may run against an older or newer CLI, so keep this alias.

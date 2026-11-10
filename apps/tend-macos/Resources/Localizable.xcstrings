@@ -91,12 +91,12 @@
         }
       }
     },
-    "%lld worktrees · %lld with no blocker · %@" : {
+    "%lld worktrees · %lld can be set aside · %@" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "worktree %lld개 · 막는 사유 없음 %lld개 · %@"
+            "value" : "worktree %1$lld개 · 치워 둘 수 있음 %2$lld개 · %3$@"
           }
         }
       }
@@ -2379,6 +2379,16 @@
         }
       }
     },
+    "Changing worktrees needs an updated tendd; update tend and restart tendd" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "worktree를 바꾸려면 새 tendd가 필요합니다. tend를 업데이트하고 tendd를 다시 시작하세요."
+          }
+        }
+      }
+    },
     "Check again" : {
       "localizations" : {
         "ko" : {
@@ -2389,12 +2399,72 @@
         }
       }
     },
+    "Delete for Good" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "완전히 삭제"
+          }
+        }
+      }
+    },
+    "Delete for Good…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "완전히 삭제…"
+          }
+        }
+      }
+    },
+    "Delete this worktree for good on %@?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@의 이 worktree를 완전히 삭제할까요?"
+          }
+        }
+      }
+    },
+    "Deleted" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "삭제됨"
+          }
+        }
+      }
+    },
+    "Deletes the folder with git. Its local files and worktree-specific git data cannot be restored; only its last commit stays in the repository, under refs/tend/set-aside/." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "git으로 폴더를 삭제합니다. 로컬 파일과 이 worktree만의 git 데이터는 되살릴 수 없고, 마지막 커밋만 저장소의 refs/tend/set-aside/ 아래에 남습니다."
+          }
+        }
+      }
+    },
     "Dispatch %@" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Dispatch %@"
+          }
+        }
+      }
+    },
+    "Each folder moves into .tend-set-aside next to it, with its files and git data. Nothing is deleted; Restore moves the preserved folder back. Branches stay." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "각 폴더를 파일과 git 데이터째 바로 옆 .tend-set-aside로 옮깁니다. 아무것도 지우지 않으며, 복원하면 보존된 폴더를 제자리로 되돌립니다. 브랜치는 그대로 남습니다."
           }
         }
       }
@@ -2459,12 +2529,102 @@
         }
       }
     },
+    "Moves the preserved folder back to where it was." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "보존된 폴더를 원래 자리로 되돌립니다."
+          }
+        }
+      }
+    },
     "Muxa is now Tend" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa의 새 이름은 Tend입니다"
+          }
+        }
+      }
+    },
+    "No answer from %@ (%@). It may have finished; check again to see." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@에서 응답이 없습니다(%2$@). 이미 끝났을 수도 있으니 다시 확인해 보세요."
+          }
+        }
+      }
+    },
+    "Observe-only host: changes are made on that host or with control access." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "관찰 전용 호스트입니다. 변경은 그 호스트에서 하거나 제어 권한으로 하세요."
+          }
+        }
+      }
+    },
+    "Restore this worktree on %@?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@의 이 worktree를 복원할까요?"
+          }
+        }
+      }
+    },
+    "Select to set aside" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "치워 둘 항목으로 선택"
+          }
+        }
+      }
+    },
+    "Set Aside" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "치워 두기"
+          }
+        }
+      }
+    },
+    "Set Aside %lld…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 치워 두기…"
+          }
+        }
+      }
+    },
+    "Set aside" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "치워 둠"
+          }
+        }
+      }
+    },
+    "Set aside %lld worktrees on %@?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%2$@의 worktree %1$lld개를 치워 둘까요?"
           }
         }
       }
@@ -2599,12 +2759,12 @@
         }
       }
     },
-    "Worktrees tend created, by host. Read-only: tend does not know yet whether a Work is finished, so nothing is removed." : {
+    "Worktrees tend created, by host. Set aside moves a folder into .tend-set-aside next to it with git; nothing is deleted until you delete it for good." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "호스트별로 tend가 만든 worktree입니다. 읽기 전용입니다. tend가 아직 Work가 끝났는지 모르기 때문에 아무것도 지우지 않습니다."
+            "value" : "호스트별로 tend가 만든 worktree입니다. 치워 두기는 git으로 폴더를 바로 옆 .tend-set-aside로 옮깁니다. 완전히 삭제하기 전에는 아무것도 지우지 않습니다."
           }
         }
       }

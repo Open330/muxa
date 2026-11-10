@@ -2,38 +2,50 @@
 //! cleanup from taking each. Shared by `tend worktrees` and the daemon's
 //! Fleet `worktree_inventory` operation, so Home can show every host.
 //!
-//!
-//! Read-only. A worktree is listed only when tend holds a receipt for it
-//! (see `tend::worktree_receipt`), and it counts as tend's only while its
-//! git administrative directory still carries that receipt's mark. Each is
+//! Read-only: it never changes a file, not even permissions. A worktree is
+//! listed only when tend holds a receipt for it (see
+//! `tend::worktree_receipt`), and it counts as tend's only while its git
+//! administrative directory still carries that receipt's mark. Each is
 //! checked for blockers: replaced or unregistered, locked, anything
-//! uncommitted, untracked or ignored in it, a pane working inside it (or
-//! panes tend could not see), and commits not kept elsewhere (a named branch
-//! must be in its base and on a remote branch; a detached checkout must
-//! still be at the commit it started from). Anything tend cannot check is a
-//! blocker. A worktree with no blocker is only a candidate: tend does not
-//! yet know whether its Work is finished, and nothing is removed.
+//! uncommitted, untracked or ignored in it, files git is told not to look at
+//! (assume-unchanged, skip-worktree, sparse checkout), a merge, rebase or
+//! bisect in progress or settings and refs of its own, a pane or process
+//! working inside it (or panes and processes tend could not see), its Work
+//! or dispatch not finished, made within the last hour, and commits not
+//! kept elsewhere (a named branch must be in its base and on a remote
+//! branch; a detached checkout must still be at the commit it started
+//! from). Anything tend cannot check is a blocker. No blocker makes it a
+//! candidate for the next step (`tend::worktree_change`): set aside for a
+//! worktree in place, deleted for good for one already set aside.
 
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
-use crate::worktree_receipt::{ReceiptState, WorktreeReceipt};
+use crate::pipeline_run::PipelineRun;
+use crate::worktree_receipt::{ReceiptOrigin, ReceiptState, WorktreeReceipt};
 
 /// One receipted worktree and its blockers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeRow {
     #[serde(flatten)]
     pub receipt: WorktreeReceipt,
-    /// No blocker was found. Not a verdict that it may go: whether its Work
-    /// is finished is not known yet.
+    /// No blocker was found for the next step: setting it aside when it is
+    /// in place, deleting it when it is set aside.
     pub candidate: bool,
-    /// What would stop a cleanup, in plain words.
+    /// What would stop that step, in plain words.
     pub blockers: Vec<String>,
     /// The checked-out branch, or None when detached.
     pub current_branch: Option<String>,
+    /// The checked-out commit, full id; a change request must name it.
+    #[serde(default)]
+    pub current_head: Option<String>,
+    /// A set-aside worktree whose original path is free to move back to.
+    #[serde(default)]
+    pub restorable: bool,
     /// Size on disk, best effort.
     pub bytes: Option<u64>,
 }
@@ -47,22 +59,30 @@ pub struct Inventory {
     pub total: usize,
 }
 
-/// Inspects receipted worktrees; blocking (git and pane scans), bounded by
-/// [`SCAN_BUDGET`]. `all` also lists attempts that never finished or
-/// failed. With a `limit`, trees still on disk come first, newest receipts
-/// first, and the rest are counted in `total` but not inspected.
+/// Deleted worktrees stay in the default listing this long.
+const DELETED_SHOWN_FOR: time::Duration = time::Duration::days(7);
+/// A worktree made more recently than this is not offered: its Work may not
+/// have started yet. A heuristic on top of the checks, not evidence.
+const MIN_AGE: time::Duration = time::Duration::hours(1);
+
+/// Inspects receipted worktrees; blocking (git, pane and process scans),
+/// bounded by [`SCAN_BUDGET`]. `all` also lists attempts that never
+/// finished or failed, and every deleted one. With a `limit`, trees still
+/// on disk come first, newest receipts first, and the rest are counted in
+/// `total` but not inspected.
 #[must_use]
 pub fn inventory(all: bool, limit: Option<usize>) -> Inventory {
     let deadline = Instant::now() + SCAN_BUDGET;
     DEADLINE.with(|cell| cell.set(Some(deadline)));
-    let panes = observe_panes();
+    let live = Liveness::observe();
+    let now = OffsetDateTime::now_utc();
     let mut receipts: Vec<WorktreeReceipt> = crate::worktree_receipt::list()
         .into_iter()
         .rev()
-        .filter(|receipt| all || receipt.state == ReceiptState::Created)
+        .filter(|receipt| all || listed_by_default(receipt, now))
         .collect();
     // Stable: newest first within each group.
-    receipts.sort_by_key(|receipt| !receipt.path.exists());
+    receipts.sort_by_key(|receipt| !receipt.location().exists());
     let total = receipts.len();
     let rows = receipts
         .into_iter()
@@ -71,7 +91,7 @@ pub fn inventory(all: bool, limit: Option<usize>) -> Inventory {
             if Instant::now() >= deadline {
                 return out_of_time(receipt);
             }
-            let mut row = inspect(receipt, &panes);
+            let mut row = inspect(receipt, &live);
             if Instant::now() >= deadline && row.candidate {
                 // A check cut short reads as a failure; say why.
                 row.candidate = false;
@@ -84,6 +104,27 @@ pub fn inventory(all: bool, limit: Option<usize>) -> Inventory {
     Inventory { rows, total }
 }
 
+fn listed_by_default(receipt: &WorktreeReceipt, now: OffsetDateTime) -> bool {
+    match receipt.state {
+        ReceiptState::Created | ReceiptState::SetAside => true,
+        ReceiptState::Deleted => {
+            receipt.pending.is_some()
+                || receipt
+                    .deleted_at
+                    .is_some_and(|at| now - at < DELETED_SHOWN_FOR)
+        }
+        ReceiptState::Creating | ReceiptState::Failed => false,
+    }
+}
+
+/// Runs `work` with every bounded command limited to `deadline`.
+pub fn with_deadline<T>(deadline: Instant, work: impl FnOnce() -> T) -> T {
+    let previous = DEADLINE.with(|cell| cell.replace(Some(deadline)));
+    let result = work();
+    DEADLINE.with(|cell| cell.set(previous));
+    result
+}
+
 /// The whole scan's budget: a host answers within it, however many trees
 /// or however slow its disks. Trees left when it runs out are listed as not
 /// checked.
@@ -93,8 +134,10 @@ pub const COMMAND_BUDGET: Duration = Duration::from_secs(5);
 /// At most this many rows in a Fleet reply, so it stays far below the relay
 /// frame ceiling; the reply says how many there were in all.
 pub const FLEET_MAX_ROWS: usize = 300;
-/// At most this much of a child's output is kept.
-const MAX_OUTPUT: u64 = 1024 * 1024;
+/// At most this much of a child's output is read. Output longer than this
+/// makes the call fail: every caller reads safety evidence, and a prefix of
+/// a file list or process list is not evidence of the rest.
+const MAX_OUTPUT: u64 = 32 * 1024 * 1024;
 const OUT_OF_TIME: &str = "tend ran out of time checking it";
 
 thread_local! {
@@ -108,14 +151,16 @@ fn out_of_time(receipt: WorktreeReceipt) -> WorktreeRow {
         candidate: false,
         blockers: vec![OUT_OF_TIME.into()],
         current_branch: None,
+        current_head: None,
+        restorable: false,
         bytes: None,
     }
 }
 
-/// Runs `program args` and returns whether it exited 0 and up to 1 MiB of
-/// its stdout, or None when it could not start, ran past its budget (the
-/// smaller of [`COMMAND_BUDGET`] and what the scan has left), or left its
-/// output open past that budget. The child runs in its own process group,
+/// Runs `program args` and returns whether it exited 0 and all of its
+/// stdout, or None when it could not start, wrote more than
+/// [`MAX_OUTPUT`], ran past its budget (the smaller of [`COMMAND_BUDGET`]
+/// and what the scan has left), or left its output open past that budget. The child runs in its own process group,
 /// and the whole group is killed on expiry, so a helper that git or du
 /// started and that holds the pipe open cannot outlive the budget either.
 pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String)> {
@@ -138,16 +183,18 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
-    // Read on another thread so a chatty child never blocks on a full pipe;
-    // keep the first MiB and throw the rest away. The thread reports back
-    // over a channel, so waiting for it is bounded too.
+    // Read on another thread so a chatty child never blocks on a full pipe.
+    // Past the cap the rest is drained and the output reported as cut
+    // (None), never passed off as complete. The thread reports back over a
+    // channel, so waiting for it is bounded too.
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut pipe = stdout;
-        let _ = (&mut pipe).take(MAX_OUTPUT).read_to_end(&mut kept);
+        let read = (&mut pipe).take(MAX_OUTPUT + 1).read_to_end(&mut kept);
         let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-        let _ = sender.send(kept);
+        let complete = read.is_ok() && kept.len() as u64 <= MAX_OUTPUT;
+        let _ = sender.send(complete.then_some(kept));
     });
     let status = loop {
         match child.try_wait() {
@@ -160,6 +207,7 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
         receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .ok()
+            .flatten()
     });
     if let (Some(status), Some(output)) = (status, output) {
         Some((
@@ -188,70 +236,210 @@ fn kill_group(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
-/// Every pane's directory on every active backend, and whether every
-/// backend answered in full.
-struct Panes {
-    cwds: Vec<PathBuf>,
-    complete: bool,
+/// What could be working in a worktree: panes, processes and Work.
+pub(crate) struct Liveness {
+    /// Every pane's directory on every active backend.
+    pub(crate) panes: Vec<PathBuf>,
+    /// Whether every backend answered in full.
+    pub(crate) panes_complete: bool,
+    /// Every visible process's working directory; None when tend could not
+    /// list them.
+    pub(crate) processes: Option<Vec<PathBuf>>,
+    /// The daemon's durable Work runs, or why they could not be read.
+    pub(crate) runs: Result<Vec<PipelineRun>, String>,
+    /// Where dispatch records live (`<tend data>/dispatches/worker`).
+    pub(crate) dispatches: Option<PathBuf>,
 }
 
-fn observe_panes() -> Panes {
-    let mut cwds = Vec::new();
-    let mut complete = true;
-    for backend in crate::active_backends() {
-        let observation = backend.observe_panes();
-        complete &= matches!(
-            observation.completeness,
-            crate::backend::ObservationCompleteness::Complete
-        );
-        cwds.extend(
-            observation
-                .panes
-                .into_iter()
-                .map(|pane| PathBuf::from(pane.current_path)),
-        );
+impl Liveness {
+    pub(crate) fn observe() -> Self {
+        let mut panes = Vec::new();
+        let mut panes_complete = true;
+        for backend in crate::active_backends() {
+            let observation = backend.observe_panes();
+            panes_complete &= matches!(
+                observation.completeness,
+                crate::backend::ObservationCompleteness::Complete
+            );
+            panes.extend(
+                observation
+                    .panes
+                    .into_iter()
+                    .map(|pane| PathBuf::from(pane.current_path)),
+            );
+        }
+        let runs = match crate::paths::default_pipeline_run_file() {
+            Some(path) => crate::pipeline_run::read_runs(&path).map_err(|error| error.to_string()),
+            None => Err("no tend data directory".into()),
+        };
+        let dispatches = crate::paths::default_node_id_file()
+            .and_then(|file| file.parent().map(Path::to_path_buf))
+            .map(|data| data.join("dispatches").join("worker"));
+        Self {
+            panes,
+            panes_complete,
+            processes: process_cwds(),
+            runs,
+            dispatches,
+        }
     }
-    Panes { cwds, complete }
 }
 
-fn inspect(receipt: WorktreeReceipt, panes: &Panes) -> WorktreeRow {
+/// Every visible process's working directory. Processes that end while
+/// being read are skipped; another user's process tend may not read is
+/// skipped too (it cannot write into this user's tree without this user's
+/// permission bits, which a worktree tend made does not grant); one of this
+/// user's own that cannot be read makes the list incomplete (None).
+fn process_cwds() -> Option<Vec<PathBuf>> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let me = std::fs::metadata("/proc/self").ok()?.uid();
+        let mut cwds = Vec::new();
+        for entry in std::fs::read_dir("/proc").ok()? {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+                continue;
+            }
+            match std::fs::read_link(entry.path().join("cwd")) {
+                Ok(cwd) => cwds.push(cwd),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    match entry.metadata() {
+                        Ok(meta) if meta.uid() != me => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        _ => return None,
+                    }
+                }
+                Err(_) => {
+                    if entry.path().exists() {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(cwds)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // lsof lists the processes this user may inspect; another user's
+        // are left out, as above. -F0 ends every field with NUL, so a path
+        // holding a newline still parses.
+        let (ok, out) = bounded(
+            "lsof",
+            &[
+                "-nPw".as_ref(),
+                "-d".as_ref(),
+                "cwd".as_ref(),
+                "-F0n".as_ref(),
+            ],
+        )?;
+        lsof_cwds(ok, &out)
+    }
+}
+
+/// The working directories in `lsof -F0n` output. A failed run may have
+/// printed some processes and not others, and lsof always reports at least
+/// itself, so a failure or nothing at all reads as unavailable.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn lsof_cwds(ok: bool, out: &str) -> Option<Vec<PathBuf>> {
+    let cwds: Vec<PathBuf> = out
+        .split('\0')
+        .map(|field| field.trim_start_matches('\n'))
+        .filter_map(|field| field.strip_prefix('n'))
+        .map(PathBuf::from)
+        .collect();
+    (ok && !cwds.is_empty()).then_some(cwds)
+}
+
+pub(crate) fn inspect(receipt: WorktreeReceipt, live: &Liveness) -> WorktreeRow {
     let mut reasons = Vec::new();
     let mut current_branch = None;
+    let mut current_head = None;
+    let mut restorable = false;
     let mut bytes = None;
+    if let Some(pending) = &receipt.pending {
+        reasons.push(format!(
+            "an earlier {} did not finish; tend checks it before the next change",
+            action_word(pending.action)
+        ));
+    }
     match receipt.state {
-        ReceiptState::Created => {}
+        ReceiptState::Created | ReceiptState::SetAside => {}
         ReceiptState::Creating => {
             reasons.push("creation never finished; not proof tend made it".into());
         }
         ReceiptState::Failed => {
             reasons.push("creation failed".into());
         }
-    }
-    if receipt.state == ReceiptState::Created {
-        if receipt.path.exists() {
-            check(&receipt, panes, &mut reasons, &mut current_branch);
-            bytes = size(&receipt.path);
-        } else {
-            reasons.push("already gone".into());
+        ReceiptState::Deleted => {
+            reasons.push("deleted for good".into());
         }
+    }
+    match receipt.state {
+        ReceiptState::Created => {
+            if receipt.path.exists() {
+                let state = check(&receipt, &receipt.path, live, &mut reasons);
+                current_branch = state.branch;
+                current_head = state.head;
+                if OffsetDateTime::now_utc() - receipt.created_at < MIN_AGE {
+                    reasons.push("made less than an hour ago".into());
+                }
+                bytes = size(&receipt.path);
+            } else {
+                reasons.push("already gone".into());
+            }
+        }
+        ReceiptState::SetAside => {
+            let dest = receipt.location().to_path_buf();
+            if dest.exists() {
+                let state = check(&receipt, &dest, live, &mut reasons);
+                current_branch = state.branch;
+                current_head = state.head;
+                bytes = size(&dest);
+                restorable = receipt.pending.is_none()
+                    && std::fs::symlink_metadata(&receipt.path)
+                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+            } else {
+                reasons.push("its set-aside folder is gone".into());
+            }
+        }
+        _ => {}
     }
     WorktreeRow {
         candidate: reasons.is_empty(),
         blockers: reasons,
         current_branch,
+        current_head,
+        restorable,
         bytes,
         receipt,
     }
 }
 
+pub(crate) fn action_word(action: crate::worktree_receipt::ChangeAction) -> &'static str {
+    match action {
+        crate::worktree_receipt::ChangeAction::SetAside => "set-aside",
+        crate::worktree_receipt::ChangeAction::Restore => "restore",
+        crate::worktree_receipt::ChangeAction::Delete => "delete",
+    }
+}
+
+/// What a check read about the checkout.
+struct Checkout {
+    head: Option<String>,
+    branch: Option<String>,
+}
+
+/// Checks the worktree tend made, now at `path`.
 fn check(
     receipt: &WorktreeReceipt,
-    panes: &Panes,
+    path: &Path,
+    live: &Liveness,
     reasons: &mut Vec<String>,
-    current_branch: &mut Option<String>,
-) {
-    let path = &receipt.path;
-    match receipt.still_owns() {
+) -> Checkout {
+    match receipt.owns_at(path) {
         Some(true) => {}
         Some(false) => {
             reasons.push("not the worktree tend created (it was replaced or never marked)".into());
@@ -269,48 +457,46 @@ fn check(
         &[
             "status",
             "--porcelain=v1",
+            "-z",
             "--untracked-files=all",
             "--ignored=matching",
         ],
     ) {
         Some(status) => {
-            if status.lines().any(|line| !line.starts_with("!!")) {
+            let entries: Vec<&str> = status.split('\0').filter(|e| !e.is_empty()).collect();
+            if entries.iter().any(|entry| !entry.starts_with("!!")) {
                 reasons.push("has uncommitted or untracked changes".into());
             }
-            if status.lines().any(|line| line.starts_with("!!")) {
+            if entries.iter().any(|entry| entry.starts_with("!!")) {
                 reasons.push("has ignored files (build output or local settings)".into());
             }
         }
         None => reasons.push("could not read its git status".into()),
     }
+    check_hidden_files(path, reasons);
+    check_admin_state(path, reasons);
     if path.join(".gitmodules").exists() {
         reasons.push("has submodules".into());
     }
-    if panes
-        .cwds
-        .iter()
-        .any(|pane| lenient_canonical(pane).starts_with(path) || pane.starts_with(path))
-    {
-        reasons.push("a pane is working in it".into());
-    } else if !panes.complete {
-        reasons.push("could not see every pane, so one may be working in it".into());
-    }
-    let head = git(path, &["rev-parse", "HEAD"]).map(|out| out.trim().to_string());
-    *current_branch = git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
+    check_activity(receipt, path, live, reasons);
+    let head = git(path, &["rev-parse", "HEAD"])
+        .map(|out| out.trim().to_string())
+        .filter(|head| !head.is_empty());
+    let branch = git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
         .map(|out| out.trim().to_string())
         .filter(|branch| !branch.is_empty());
-    let Some(head) = head else {
+    let Some(head_id) = head.clone() else {
         reasons.push("could not read its commit".into());
-        return;
+        return Checkout { head, branch };
     };
-    if current_branch.is_some() {
+    if branch.is_some() {
         let Some(base) = receipt.base.clone().or_else(|| default_base(&receipt.repo)) else {
             reasons.push("no base branch to compare with".into());
-            return;
+            return Checkout { head, branch };
         };
         match git(
             &receipt.repo,
-            &["merge-base", "--is-ancestor", &head, &base],
+            &["merge-base", "--is-ancestor", &head_id, &base],
         ) {
             Some(_) => {}
             None => reasons.push(format!("its commits are not in {base}")),
@@ -318,7 +504,10 @@ fn check(
         // Kept elsewhere means on a remote too, as far as this clone's
         // remote-tracking refs say. tend does not fetch; those refs are
         // local evidence, not proof the server still holds the commit.
-        let remote = git(&receipt.repo, &["branch", "--remotes", "--contains", &head]);
+        let remote = git(
+            &receipt.repo,
+            &["branch", "--remotes", "--contains", &head_id],
+        );
         if remote.as_deref().is_none_or(|out| out.trim().is_empty()) {
             reasons.push("its commits are not on any remote branch".into());
         }
@@ -333,10 +522,197 @@ fn check(
                 )
             })
             .map(|out| out.trim().to_string());
-        if start.as_deref() != Some(head.as_str()) {
+        if start.as_deref() != Some(head_id.as_str()) {
             reasons.push("detached at a commit other than the one it started from".into());
         }
     }
+    Checkout { head, branch }
+}
+
+/// Files git is told not to look at: an edit to one leaves `git status`
+/// empty, and `git worktree remove` would delete it.
+fn check_hidden_files(path: &Path, reasons: &mut Vec<String>) {
+    match git(path, &["ls-files", "-v", "-z"]) {
+        Some(listing) => {
+            let hidden = listing.split('\0').any(|entry| {
+                entry
+                    .chars()
+                    .next()
+                    .is_some_and(|tag| tag.is_ascii_lowercase() || tag == 'S')
+            });
+            if hidden {
+                reasons.push(
+                    "has files git is told to ignore changes in (assume-unchanged or skip-worktree)"
+                        .into(),
+                );
+            }
+        }
+        None => reasons.push("could not list its tracked files".into()),
+    }
+    let args: [&std::ffi::OsStr; 5] = [
+        "-C".as_ref(),
+        path.as_os_str(),
+        "config".as_ref(),
+        "--bool".as_ref(),
+        "core.sparseCheckout".as_ref(),
+    ];
+    // Exit 1 with no output means the setting is unset.
+    match bounded("git", &args) {
+        Some((true, out)) if out.trim() == "true" => {
+            reasons.push("uses a sparse checkout".into());
+        }
+        Some((true, _)) => {}
+        Some((false, out)) if out.trim().is_empty() => {}
+        _ => reasons.push("could not read its sparse-checkout setting".into()),
+    }
+}
+
+/// A merge, rebase, cherry-pick, revert or bisect in progress, or settings
+/// and refs of its own: all live in its administrative directory, which a
+/// delete takes with it.
+fn check_admin_state(path: &Path, reasons: &mut Vec<String>) {
+    let Some(admin) = crate::worktree_receipt::admin_dir(path) else {
+        reasons.push("could not find its git administrative directory".into());
+        return;
+    };
+    let in_progress = [
+        "MERGE_HEAD",
+        "CHERRY_PICK_HEAD",
+        "REVERT_HEAD",
+        "BISECT_LOG",
+        "rebase-merge",
+        "rebase-apply",
+    ];
+    if in_progress.iter().any(|name| admin.join(name).exists()) {
+        reasons.push("has a merge, rebase, cherry-pick or bisect in progress".into());
+    }
+    if admin.join("config.worktree").exists() {
+        reasons.push("has git settings of its own (config.worktree)".into());
+    }
+    if admin.join("info/sparse-checkout").exists() {
+        reasons.push("uses a sparse checkout".into());
+    }
+    let refs = admin.join("refs");
+    if refs.exists() && has_files(&refs) != Some(false) {
+        reasons.push("has refs of its own (refs/worktree or refs/bisect)".into());
+    }
+}
+
+/// Whether a directory holds any file, at any depth; None when unreadable.
+fn has_files(dir: &Path) -> Option<bool> {
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let kind = entry.file_type().ok()?;
+        if kind.is_dir() {
+            if has_files(&entry.path())? {
+                return Some(true);
+            }
+        } else {
+            return Some(true);
+        }
+    }
+    Some(false)
+}
+
+/// Panes, processes, and the Work or dispatch that asked for it.
+fn check_activity(
+    receipt: &WorktreeReceipt,
+    path: &Path,
+    live: &Liveness,
+    reasons: &mut Vec<String>,
+) {
+    let inside = |dir: &PathBuf| lenient_canonical(dir).starts_with(path) || dir.starts_with(path);
+    // A pane works through processes, so a full process list covers panes
+    // a backend could not list (cmux, for one, never lists them all). Only
+    // when both are incomplete is it unknown.
+    let pane_inside = live.panes.iter().any(inside);
+    if pane_inside {
+        reasons.push("a pane is working in it".into());
+    }
+    match &live.processes {
+        Some(cwds) if cwds.iter().any(inside) => {
+            if !pane_inside {
+                reasons.push("a process is running in it".into());
+            }
+        }
+        Some(_) => {}
+        None if !live.panes_complete => reasons
+            .push("could not see every pane or list processes, so one may be working in it".into()),
+        None => reasons.push("could not list processes, so one may be running in it".into()),
+    }
+    let runs = match &live.runs {
+        Ok(runs) => runs,
+        Err(error) => {
+            reasons.push(format!("could not read Work state: {error}"));
+            return;
+        }
+    };
+    let (workspace, work) = match &receipt.origin {
+        ReceiptOrigin::Work { workspace, work } => (workspace.as_deref(), work.as_str()),
+        ReceiptOrigin::Dispatch {
+            workspace, work, ..
+        } => (Some(workspace.as_str()), work.as_str()),
+    };
+    let matching: Vec<&PipelineRun> = runs
+        .iter()
+        .filter(|run| {
+            let same_work = run.identity.work_id.eq_ignore_ascii_case(work)
+                && workspace.is_none_or(|ws| run.identity.workspace_id.eq_ignore_ascii_case(ws));
+            same_work || inside(&run.cwd) || lenient_canonical(&run.cwd).starts_with(&receipt.path)
+        })
+        .collect();
+    if let Some(run) = matching.iter().find(|run| !run.finished()) {
+        let what = run
+            .unfinished_alias()
+            .unwrap_or_else(|| "unfinished".into());
+        reasons.push(format!("its Work is not finished ({what})"));
+        return;
+    }
+    if let ReceiptOrigin::Dispatch { dispatch_id, .. } = &receipt.origin {
+        // The dispatch's own record decides. It is finished when it says
+        // completed, or when it says launched, blocked or unknown (states a
+        // record keeps until someone refreshes it) and the Run for exactly
+        // its checkout finished: the evidence `tend dispatch status` uses to
+        // mark it completed. A Run for the same Work elsewhere proves nothing
+        // about this dispatch. Failed, preparing, missing or unreadable
+        // records keep it.
+        let own_run_finished = matching.iter().any(|run| {
+            !run.desired.is_empty()
+                && run.finished()
+                && workspace.is_some_and(|ws| run.identity.workspace_id.eq_ignore_ascii_case(ws))
+                && run.identity.work_id.eq_ignore_ascii_case(work)
+                && lenient_canonical(&run.cwd) == lenient_canonical(&receipt.path)
+        });
+        match dispatch_state(live.dispatches.as_deref(), dispatch_id) {
+            Ok(Some(state)) if state == "completed" => {}
+            Ok(Some(state))
+                if own_run_finished
+                    && matches!(state.as_str(), "launched" | "blocked" | "unknown") => {}
+            Ok(Some(state)) => reasons.push(format!("its dispatch is {state}")),
+            Ok(None) => reasons.push("tend has no record of its dispatch".into()),
+            Err(error) => reasons.push(format!("could not read its dispatch: {error}")),
+        }
+    }
+}
+
+fn dispatch_state(dir: Option<&Path>, dispatch_id: &str) -> Result<Option<String>, String> {
+    let Some(dir) = dir else {
+        return Err("no tend data directory".into());
+    };
+    let Ok(id) = uuid::Uuid::parse_str(dispatch_id) else {
+        return Ok(None);
+    };
+    let body = match std::fs::read(dir.join(format!("{id}.json"))) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let record: serde_json::Value =
+        serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+    Ok(record
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string))
 }
 
 /// `path` with its longest existing ancestor resolved, so a pane in
@@ -359,13 +735,13 @@ fn lenient_canonical(path: &Path) -> PathBuf {
     }
 }
 
-enum Registration {
+pub(crate) enum Registration {
     Registered,
     Locked,
     Missing,
 }
 
-fn registration(repo: &Path, path: &Path) -> Option<Registration> {
+pub(crate) fn registration(repo: &Path, path: &Path) -> Option<Registration> {
     let listing = git(repo, &["worktree", "list", "--porcelain"])?;
     let wanted = crate::paths::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     for block in listing.split("\n\n") {
@@ -440,6 +816,26 @@ mod tests {
     }
 
     #[test]
+    fn output_past_the_cap_fails_instead_of_passing_as_complete() {
+        let over = (MAX_OUTPUT + 1).to_string();
+        let script = format!("head -c {over} /dev/zero");
+        assert!(bounded("sh", &["-c".as_ref(), script.as_ref()]).is_none());
+        let fits = bounded("sh", &["-c".as_ref(), "head -c 2000000 /dev/zero".as_ref()]).unwrap();
+        assert_eq!(fits.1.len(), 2_000_000);
+    }
+
+    #[test]
+    fn a_failed_or_empty_lsof_is_no_process_list() {
+        let out = "p1\0\nfcwd\0n/tmp\0\np2\0\nfcwd\0n/with\nnewline\0\n";
+        assert_eq!(
+            lsof_cwds(true, out),
+            Some(vec![PathBuf::from("/tmp"), PathBuf::from("/with\nnewline")])
+        );
+        assert_eq!(lsof_cwds(false, out), None);
+        assert_eq!(lsof_cwds(true, ""), None);
+    }
+
+    #[test]
     fn a_helper_holding_the_pipe_cannot_outlive_the_budget() {
         // The direct child exits at once; its background helper keeps the
         // pipe open for 5 s.
@@ -463,9 +859,6 @@ mod tests {
         DEADLINE.with(|cell| cell.set(None));
     }
 
-    use crate::worktree_receipt::ReceiptOrigin;
-    use time::OffsetDateTime;
-
     fn run_git(dir: &Path, args: &[&str]) {
         let status = std::process::Command::new("git")
             .arg("-C")
@@ -480,10 +873,13 @@ mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
-    fn all_panes_seen(cwds: Vec<PathBuf>) -> Panes {
-        Panes {
-            cwds,
-            complete: true,
+    fn all_panes_seen(cwds: Vec<PathBuf>) -> Liveness {
+        Liveness {
+            panes: cwds,
+            panes_complete: true,
+            processes: Some(vec![]),
+            runs: Ok(vec![]),
+            dispatches: None,
         }
     }
 
@@ -509,6 +905,11 @@ mod tests {
             common_dir: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             state: ReceiptState::Creating,
+            generation: 0,
+            set_aside: None,
+            pending: None,
+            last_op: None,
+            deleted_at: None,
         };
         receipt.mark_created(start).unwrap();
         receipt
@@ -556,11 +957,19 @@ mod tests {
 
         // A pane inside it, or panes tend could not see, block it.
         assert!(!inspect(receipt.clone(), &all_panes_seen(vec![tree.join("src")])).candidate);
-        let unseen = Panes {
-            cwds: vec![],
-            complete: false,
+        // Panes a backend could not list are covered by a full process
+        // list; with neither it is unknown.
+        let unseen = Liveness {
+            panes_complete: false,
+            ..all_panes_seen(vec![])
         };
-        let row = inspect(receipt.clone(), &unseen);
+        assert!(inspect(receipt.clone(), &unseen).candidate);
+        let blind = Liveness {
+            panes_complete: false,
+            processes: None,
+            ..all_panes_seen(vec![])
+        };
+        let row = inspect(receipt.clone(), &blind);
         assert!(
             row.blockers.iter().any(|r| r.contains("every pane")),
             "{:?}",

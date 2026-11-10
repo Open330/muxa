@@ -943,6 +943,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "ask_one_shot_v1",
     "fleet_keys_v1",
     "fleet_worktrees_v1",
+    "fleet_worktree_change_v1",
     "automation_v1",
     "automation_ask_v1",
     "config_launch_v1",

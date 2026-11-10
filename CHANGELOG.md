@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tend worktrees set-aside`, `restore` and `delete` clean up the worktrees
+  tend created. Set aside moves a worktree with no blocker into
+  `.tend-set-aside` next to it with `git worktree move`, so its files,
+  ignored ones included, and its git data are kept; restore moves it back.
+  Delete removes a set-aside worktree with `git worktree remove` (never
+  `--force`); its local files cannot be brought back. Before either, the
+  checked-out commit is pinned under `refs/tend/set-aside/<id>/<commit>`,
+  which tend never removes. Each command prints its plan and needs `--yes`.
+- Every change takes one lock shared by the CLI, the daemon and relays,
+  checks the worktree again right before acting, and refuses when the
+  request names another host, an older receipt generation, or a different
+  branch or commit. The change is written down before git runs; an
+  interrupted one is finished or undone from what is on disk at the next
+  change, never repeated, and is reported as uncertain when the disk does
+  not say.
+- macOS: Home › Hosts › Leftover Worktrees sets worktrees aside (checkboxes
+  and an in-sheet confirmation), restores them, and deletes set-aside ones
+  for good, on hosts with control access. Fleet `worktree_change`
+  (`fleet_worktree_change_v1`, relays `worktree_change_v1`) carries it;
+  observe-only hosts and older relays are refused.
+
+### Changed
+
+- A worktree is offered for cleanup only when it also has no files git is
+  told to ignore changes in (assume-unchanged, skip-worktree, sparse
+  checkout), no merge, rebase, cherry-pick or bisect in progress, no git
+  settings or refs of its own, no process running in it, no unfinished Work
+  run (a Done stage waiting on a restart counts as unfinished) or dispatch,
+  and is at least an hour old. A full process list now covers panes a
+  backend cannot list, so cmux being active no longer blocks every
+  worktree.
+- Reading Work state for the inventory no longer touches the state file.
+
+### Fixed
+
+- Home and remote hosts no longer give up on a worktree listing before the
+  host's 20-second scan can answer: the app waited 3 seconds and the Fleet
+  controller 10.
+
 ## [0.10.0] - 2026-11-10
 
 ### Changed
