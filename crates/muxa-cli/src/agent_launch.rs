@@ -774,12 +774,49 @@ fn configure_worker_inbound(
     }
 }
 
+/// Muxa's own bootstrap/skill files live outside the project. Make only that
+/// managed directory available to workers so reading AGENTS instructions does
+/// not itself trigger an external-read approval on a fresh account.
+fn configure_worker_bootstrap_context(
+    agent: AgentProgram,
+    purpose: muxa::collaboration::LaunchPurpose,
+    options: &mut Vec<String>,
+    directory: Option<&Path>,
+) {
+    if purpose != muxa::collaboration::LaunchPurpose::Worker
+        || !matches!(agent, AgentProgram::Claude | AgentProgram::Codex)
+    {
+        return;
+    }
+    let Some(directory) = directory.filter(|p| p.join("bootstrap.md").is_file()) else {
+        return;
+    };
+    let Ok(directory) = muxa::paths::canonicalize(directory) else {
+        return;
+    };
+    let at = options
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(options.len());
+    options.splice(
+        at..at,
+        ["--add-dir".into(), directory.to_string_lossy().into_owned()],
+    );
+}
+
 /// Start one allowlisted agent in a detached tmux surface and return its exact
 /// pane id. The operation is synchronous and should be wrapped in
 /// `spawn_blocking` by async callers.
 #[allow(clippy::too_many_lines)] // launch, metadata stamping, and rollback form one physical transaction
 pub fn start(mut request: StartRequest) -> Result<StartResult> {
     configure_worker_inbound(request.agent, request.purpose, &mut request.options);
+    let bootstrap = muxa::paths::data_dir().map(|root| root.join("muxa/agent-integration"));
+    configure_worker_bootstrap_context(
+        request.agent,
+        request.purpose,
+        &mut request.options,
+        bootstrap.as_deref(),
+    );
     let launch_id = request.worker_spawn.as_ref().map_or_else(
         || uuid::Uuid::new_v4().to_string(),
         |ticket| ticket.launch_id.clone(),
@@ -2137,5 +2174,36 @@ mod tests {
             unique_session_name("review".into(), |name| existing.contains(&name)),
             "review-3"
         );
+    }
+    #[test]
+    fn workers_read_only_the_managed_bootstrap_context_without_changing_modes() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("bootstrap.md"), "managed instructions").unwrap();
+        let mut options = vec![
+            "--permission-mode".into(),
+            "default".into(),
+            "--".into(),
+            "body".into(),
+        ];
+        configure_worker_bootstrap_context(
+            AgentProgram::Claude,
+            muxa::collaboration::LaunchPurpose::Worker,
+            &mut options,
+            Some(root.path()),
+        );
+        assert_eq!(&options[..3], ["--permission-mode", "default", "--add-dir"]);
+        assert_eq!(
+            std::path::Path::new(&options[3]),
+            muxa::paths::canonicalize(root.path()).unwrap()
+        );
+        assert_eq!(&options[4..], ["--", "body"]);
+        let before = options.clone();
+        configure_worker_bootstrap_context(
+            AgentProgram::Claude,
+            muxa::collaboration::LaunchPurpose::Primary,
+            &mut options,
+            Some(root.path()),
+        );
+        assert_eq!(before, options);
     }
 }

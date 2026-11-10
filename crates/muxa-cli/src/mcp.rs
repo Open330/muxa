@@ -888,7 +888,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "skill": { "type": "string", "description": "Registered local Muxa message skill name, with or without leading /. Its prompt is expanded before sending." },
                     "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
                     "execute": { "type": "boolean", "description": "Default false. Requires intent=task, explicit user authorization, and a control-mode host." },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory task path scope. Existing external input directories are passed as bounded --add-dir context roots for new Claude/Codex peers; does not change the read-only contract or approval mode." },
                     "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true. For a quick check with no independent local work, this avoids a separate send receipt and later wait. Use false while doing independent work." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id." },
@@ -975,7 +975,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_call_peer",
-            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. Generic work reuses a worker or automatically creates one using configured provider permissions. Set context_bound=true only when the exact target conversation is required. Automatic creation can be disabled in collaboration settings.",
+            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. Generic work reuses a worker or automatically creates one using configured provider permissions. New empty Claude/Codex workers mechanically prepare known startup gates and verify an empty input composer before dispatch, without a model turn. Set context_bound=true only when the exact target conversation is required. Automatic creation can be disabled in collaboration settings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1443,7 +1443,8 @@ async fn call_tool_inner(
             let request = crate::agent_launch::StartRequest {
                 creator,
                 worker_spawn: None,
-                bypass_permissions: true,
+                bypass_permissions: purpose != muxa::collaboration::LaunchPurpose::Worker
+                    || config.collaboration.worker_bypass_permissions,
                 purpose,
                 socket: client.socket().to_path_buf(),
                 agent,

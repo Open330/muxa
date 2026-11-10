@@ -1049,3 +1049,5 @@ muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux
 The command verifies the worker launch marker, process birth and directory
 before each setup key; it refuses a primary or recycled pane. It reports JSON
 and exits nonzero unless a stable empty input composer is observed.
+
+Workers also receive the existing Muxa-managed `agent-integration` bootstrap/skill directory as a context root; unrelated user configuration directories are not added.

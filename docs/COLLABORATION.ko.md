@@ -791,3 +791,5 @@ muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux
 ```
 
 이 명령은 JSON 결과를 출력하며 실제 입력 준비가 검증되지 않으면 0 이외로 종료합니다.
+
+worker에는 기존 Muxa 관리 `agent-integration` bootstrap·skill 디렉터리도 입력 경로로 제공합니다. 다른 사용자 설정 디렉터리는 추가하지 않습니다.
