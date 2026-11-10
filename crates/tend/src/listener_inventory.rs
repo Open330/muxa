@@ -571,12 +571,12 @@ fn process_table() -> Option<HashMap<u32, Proc>> {
         };
         let name = stat[open + 1..close].to_string();
         let fields: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-        let ppid = fields.get(1).and_then(|f| f.parse().ok()).unwrap_or(0);
+        let parent = fields.get(1).and_then(|f| f.parse().ok()).unwrap_or(0);
         let ticks = fields.get(19).and_then(|f| f.parse::<i64>().ok());
         table.insert(
             pid,
             Proc {
-                ppid,
+                ppid: parent,
                 uid: entry.metadata().ok().map(|meta| meta.uid()),
                 start: ticks.map(|ticks| format!("ticks:{ticks}")),
                 // Clock ticks are 100 per second on every Linux tend runs on.
