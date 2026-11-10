@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- macOS: a notification when a 5-hour or weekly usage window crosses 80%
+  and again at 95%, once per window on a fresh reading (Settings ›
+  Notifications).
+- macOS: a shortcut that works from any app (⌥Space by default, or
+  ⌃⌥Space, ⇧⌘Space, Off in Settings › General › Home) brings Muxa forward
+  with the agents palette, those waiting on you first.
 - `muxa worktrees` lists the git worktrees muxa created on this host and what
   would stop a cleanup from taking each: replaced or unregistered, locked,
   uncommitted, untracked or ignored files, a pane working in it (or panes muxa
