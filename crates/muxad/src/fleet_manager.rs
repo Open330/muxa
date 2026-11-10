@@ -18,7 +18,7 @@ use muxa::fleet::{
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
     FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
-    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
 use muxa::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -448,6 +448,13 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "send_keys", keys.len());
                 local_send_keys(&self.backends, pane, keys).await
             }
+            FleetOperation::WorktreeInventory => {
+                audit_operation(LOCAL_HOST_ALIAS, "worktree_inventory", 0);
+                tokio::task::spawn_blocking(|| muxa::worktree_inventory::inventory(false))
+                    .await
+                    .map(FleetCommandResult::worktrees)
+                    .map_err(|error| format!("worktree inventory failed: {error}"))
+            }
             FleetOperation::CollaborationSend { pane, request } => {
                 exact_local_backend(&self.backends, &pane).await?;
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_send", request.body.len());
@@ -574,6 +581,28 @@ async fn run_local_work_command(
     .await
     .map(FleetCommandResult::command)
     .map_err(|error| error.to_string())
+}
+
+/// The worktree inventory goes only to a relay that says it answers it; an
+/// older one would drop the request and leave the caller waiting.
+fn worktree_inventory_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::WorktreeInventory) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_WORKTREE_INVENTORY_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot list its worktrees; upgrade muxa on that host"
+    ))
 }
 
 /// Navigation keys reach only a relay that says it takes them; an older one
@@ -1330,6 +1359,13 @@ impl HostTask {
                     }
                     if let Some(refusal) =
                         send_keys_refusal(&self.alias, &connected.hello, &command.operation)
+                            .or_else(|| {
+                                worktree_inventory_refusal(
+                                    &self.alias,
+                                    &connected.hello,
+                                    &command.operation,
+                                )
+                            })
                     {
                         let _ = command.reply.send(Err(refusal));
                         continue;
@@ -1419,6 +1455,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::SendKeys { request_id: id, pane, keys }
+                        }
+                        FleetOperation::WorktreeInventory => {
+                            audit_operation(&self.alias, "worktree_inventory", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::WorktreeInventory { request_id: id }
                         }
                         FleetOperation::CollaborationSend { pane, request } => {
                             audit_operation(&self.alias, "collaboration_send", request.body.len());
@@ -1988,6 +2032,12 @@ mod tests {
         assert!(send_keys_refusal("remote", &legacy, &capture).is_none());
         let current = hello(FLEET_CAPABILITIES);
         assert!(send_keys_refusal("remote", &current, &keys).is_none());
+        // The worktree inventory follows the same rule.
+        let inventory = FleetOperation::WorktreeInventory;
+        let refusal = worktree_inventory_refusal("remote", &legacy, &inventory).unwrap();
+        assert!(refusal.contains("upgrade muxa"), "{refusal}");
+        assert!(worktree_inventory_refusal("remote", &legacy, &keys).is_none());
+        assert!(worktree_inventory_refusal("remote", &current, &inventory).is_none());
     }
 
     #[test]

@@ -91,6 +91,16 @@
         }
       }
     },
+    "%lld worktrees · %lld with no blocker · %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "worktree %lld개 · 막는 사유 없음 %lld개 · %@"
+          }
+        }
+      }
+    },
     "1 of %lld" : {
       "localizations" : {
         "ko" : {
@@ -2359,6 +2369,26 @@
         }
       }
     },
+    "Check again" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다시 확인"
+          }
+        }
+      }
+    },
+    "Dispatch %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dispatch %@"
+          }
+        }
+      }
+    },
     "From %@" : {
       "localizations" : {
         "ko" : {
@@ -2369,12 +2399,82 @@
         }
       }
     },
+    "Kept" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "남겨 둠"
+          }
+        }
+      }
+    },
+    "Leftover Worktrees…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "남은 worktree…"
+          }
+        }
+      }
+    },
+    "Leftover worktrees" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "남은 worktree"
+          }
+        }
+      }
+    },
+    "Listing worktrees needs an updated muxad; update muxa and restart muxad" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "worktree 목록을 보려면 새 muxad가 필요합니다. muxa를 업데이트하고 muxad를 다시 시작하세요."
+          }
+        }
+      }
+    },
     "Muxa could not listen for the shortcut. Restart Muxa and try again." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Muxa가 단축키를 받을 수 없습니다. Muxa를 다시 시작한 뒤 다시 시도하세요."
+          }
+        }
+      }
+    },
+    "No blocker" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "막는 사유 없음"
+          }
+        }
+      }
+    },
+    "No host is online." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "온라인 호스트가 없습니다."
+          }
+        }
+      }
+    },
+    "No worktrees muxa created on this host." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 호스트에 muxa가 만든 worktree가 없습니다."
           }
         }
       }
@@ -2425,6 +2525,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이 질문에 사용"
+          }
+        }
+      }
+    },
+    "Work %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Work %@"
+          }
+        }
+      }
+    },
+    "Worktrees muxa created on each host, and what keeps them" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트마다 muxa가 만든 worktree와 남겨 두는 이유"
+          }
+        }
+      }
+    },
+    "Worktrees muxa created, by host. Read-only: muxa does not know yet whether a Work is finished, so nothing is removed." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호스트별로 muxa가 만든 worktree입니다. 읽기 전용입니다. muxa가 아직 Work가 끝났는지 모르기 때문에 아무것도 지우지 않습니다."
           }
         }
       }
@@ -20010,6 +20140,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "worktree"
+          }
+        }
+      }
+    },
+    "• %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "• %@"
           }
         }
       }

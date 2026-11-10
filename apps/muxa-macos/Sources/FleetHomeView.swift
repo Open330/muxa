@@ -17,6 +17,7 @@ struct FleetHomeView: View {
     @State private var approvalSeed: FleetApprovalSeed?
     @State private var quickLook: FleetQuickLookTarget?
     @State private var showsReview = false
+    @State private var showsLeftovers = false
     @AppStorage("home.review.scope") private var reviewScope: FleetReviewScope = .day
     @AppStorage(MuxaPreferences.homeAnimatesMovesKey) private var animatesMoves = true
     @Namespace private var cardSpace
@@ -55,6 +56,9 @@ struct FleetHomeView: View {
                 send: { text, target in try await send(text, to: target) },
                 ask: { prompt in try await model.client.askOneShot(prompt) }
             )
+        }
+        .sheet(isPresented: $showsLeftovers) {
+            FleetLeftoversView(model: model)
         }
         .sheet(item: $quickLook) { target in
             let work = allWorks.first { work in
@@ -179,10 +183,13 @@ struct FleetHomeView: View {
         .buttonStyle(.muxaGhost)
         .help("Host connections")
         .popover(isPresented: $showsHosts, arrowEdge: .bottom) {
-            FleetHostsPopover(hosts: hosts) { host in
+            FleetHostsPopover(hosts: hosts, select: { host in
                 showsHosts = false
                 model.select(.host(host.id))
-            }
+            }, showLeftovers: {
+                showsHosts = false
+                showsLeftovers = true
+            })
         }
     }
 
@@ -1020,6 +1027,7 @@ private struct FleetStageRow: View {
 private struct FleetHostsPopover: View {
     let hosts: [MuxaFleetHost]
     let select: (MuxaFleetHost) -> Void
+    var showLeftovers: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1046,6 +1054,10 @@ private struct FleetHostsPopover: View {
                 }
                 .buttonStyle(.plain)
             }
+            Divider()
+            Button("Leftover Worktrees…", action: showLeftovers)
+                .buttonStyle(.muxaGhost)
+                .help("Worktrees muxa created on each host, and what keeps them")
         }
         .padding(14)
         .frame(width: 260)

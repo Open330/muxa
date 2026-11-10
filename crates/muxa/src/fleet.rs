@@ -87,6 +87,8 @@ pub const FLEET_BOUNDED_CLAIM_CAPABILITY: &str = "collaboration_claim_bounded_v1
 /// relay cannot read the request and answers without its id, so the
 /// controller refuses before sending instead of waiting out a timeout.
 pub const FLEET_SEND_KEYS_CAPABILITY: &str = "send_keys_v1";
+/// Relay capability: the relay answers [`RelayRequest::WorktreeInventory`].
+pub const FLEET_WORKTREE_INVENTORY_CAPABILITY: &str = "worktree_inventory_v1";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
@@ -105,6 +107,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "raw_capture_base64",
     FLEET_WORK_COMMAND_CAPABILITY,
     FLEET_SEND_KEYS_CAPABILITY,
+    FLEET_WORKTREE_INVENTORY_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow
@@ -546,6 +549,10 @@ pub enum RelayRequest {
         pane: PaneKey,
         keys: Vec<FleetKey>,
     },
+    /// The relay host's receipted worktrees; read-only.
+    WorktreeInventory {
+        request_id: String,
+    },
     CollaborationSend {
         request_id: String,
         pane: PaneKey,
@@ -620,6 +627,7 @@ impl RelayRequest {
             | Self::CaptureWindow { request_id, .. }
             | Self::SendPrompt { request_id, .. }
             | Self::SendKeys { request_id, .. }
+            | Self::WorktreeInventory { request_id }
             | Self::CollaborationSend { request_id, .. }
             | Self::CollaborationMailbox { request_id, .. }
             | Self::CollaborationGet { request_id, .. }
@@ -743,6 +751,9 @@ pub enum FleetOperation {
         pane: PaneKey,
         keys: Vec<FleetKey>,
     },
+    /// `fleet_worktrees_v1`: the host's receipted worktrees and what would
+    /// stop a cleanup from taking each. Read-only.
+    WorktreeInventory,
     CollaborationSend {
         pane: PaneKey,
         request: Box<NewRequest>,
@@ -828,6 +839,9 @@ pub struct FleetCommandResult {
     pub command_stdout: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command_stderr: Option<String>,
+    /// The host's receipted worktrees, for `worktree_inventory`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktrees: Option<Vec<crate::worktree_inventory::WorktreeRow>>,
 }
 
 impl FleetCommandResult {
@@ -848,6 +862,15 @@ impl FleetCommandResult {
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
+            worktrees: None,
+        }
+    }
+
+    #[must_use]
+    pub fn worktrees(rows: Vec<crate::worktree_inventory::WorktreeRow>) -> Self {
+        Self {
+            worktrees: Some(rows),
+            ..Self::accepted("worktree inventory")
         }
     }
 
@@ -868,6 +891,7 @@ impl FleetCommandResult {
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
+            worktrees: None,
         }
     }
 
@@ -890,6 +914,7 @@ impl FleetCommandResult {
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
+            worktrees: None,
         }
     }
 
@@ -910,6 +935,7 @@ impl FleetCommandResult {
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
+            worktrees: None,
         }
     }
 
@@ -930,6 +956,7 @@ impl FleetCommandResult {
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
+            worktrees: None,
         }
     }
 
@@ -950,6 +977,7 @@ impl FleetCommandResult {
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
+            worktrees: None,
         }
     }
 
@@ -990,6 +1018,7 @@ impl FleetCommandResult {
             command_exit_code: None,
             command_stdout: None,
             command_stderr: None,
+            worktrees: None,
         }
     }
 
@@ -1011,6 +1040,7 @@ impl FleetCommandResult {
             command_exit_code: Some(output.exit_code),
             command_stdout: Some(output.stdout),
             command_stderr: Some(output.stderr),
+            worktrees: None,
         }
     }
 
@@ -1893,6 +1923,19 @@ mod fleet_key_tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(serde_json::from_value::<FleetKey>(serde_json::json!("rm -rf")).is_err());
+        let inventory: FleetOperation =
+            serde_json::from_value(serde_json::json!({"kind": "worktree_inventory"})).unwrap();
+        assert!(matches!(inventory, FleetOperation::WorktreeInventory));
+        let request = RelayRequest::WorktreeInventory {
+            request_id: "r1".into(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        let back: RelayRequest = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.request_id(), "r1");
+        // A reply without the field (an older relay) still reads.
+        let result: FleetCommandResult =
+            serde_json::from_value(serde_json::json!({"accepted": true})).unwrap();
+        assert!(result.worktrees.is_none());
         assert_eq!(FleetKey::Up.bytes(), "\u{1b}[A");
         assert_eq!(FleetKey::Enter.bytes(), "\r");
     }

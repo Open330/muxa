@@ -410,6 +410,15 @@ async fn handle_request(
                 result: FleetCommandResult::sent(outcome),
             })
         }
+        RelayRequest::WorktreeInventory { request_id } => {
+            let rows = tokio::task::spawn_blocking(|| muxa::worktree_inventory::inventory(false))
+                .await
+                .context("worktree inventory task panicked")?;
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::worktrees(rows),
+            })
+        }
         RelayRequest::SendKeys {
             request_id,
             pane,
