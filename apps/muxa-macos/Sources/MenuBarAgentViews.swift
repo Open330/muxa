@@ -60,7 +60,7 @@ struct MuxaMenuBarContent: View {
                                             if case .group(let scope) = chip.destination { selectScope(scope) }
                                         } label: {
                                             HStack {
-                                                Image(systemName: chip.appearance.symbol).foregroundStyle(.white)
+                                                MuxaGlyphView(value: chip.appearance.symbol, size: 12)
                                                     .frame(width: 28, height: 28).background(chip.appearance.gradient, in: Circle())
                                                 VStack(alignment: .leading) {
                                                     Text(verbatim: chip.name).font(.subheadline.weight(.semibold))

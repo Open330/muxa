@@ -79,11 +79,13 @@ private struct MuxaWorkComposeEnvelope: Decodable {
     let error: String?
     let workCompose: MuxaWorkComposeResult?
     let askProviders: [MuxaWorkComposeProvider]?
+    let askOneShot: String?
 
     enum CodingKeys: String, CodingKey {
         case ok, error
         case workCompose = "work_compose"
         case askProviders = "ask_providers"
+        case askOneShot = "ask_one_shot"
     }
 }
 
@@ -171,6 +173,24 @@ final class MuxaWorkComposeClient: Sendable {
         return result
     }
 
+    /// One read-only turn of a configured Ask provider, recorded nowhere
+    /// (`ask_one_shot`). `agent` nil uses the ask store's selection.
+    func askOneShot(_ prompt: String, agent: String?) async throws -> String {
+        var request: [String: Any] = [
+            "protocol": MuxaIPCClient.protocolVersion,
+            "kind": "ask_one_shot",
+            "prompt": prompt,
+            "agent": NSNull(),
+            "credential": NSNull(),
+        ]
+        if let agent, !agent.isEmpty { request["agent"] = agent }
+        let response = try await call(request)
+        guard let answer = response.askOneShot else {
+            throw MuxaIPCError.missingField("ask_one_shot")
+        }
+        return answer
+    }
+
     /// The daemon's provider list (`ask_providers`), for the composer's picker.
     func providers() async throws -> [MuxaWorkComposeProvider] {
         let response = try await call([
@@ -195,6 +215,16 @@ final class MuxaWorkComposeClient: Sendable {
 }
 
 extension MuxaIPCClient {
+    static let askOneShotCapability = "ask_one_shot_v1"
+
+    /// Asks the configured Ask provider once, outside any conversation.
+    func askOneShot(_ prompt: String, agent: String? = nil) async throws -> String {
+        guard supports(Self.askOneShotCapability) else {
+            throw MuxaIPCError.server("This muxad cannot answer one-off questions; update muxa and restart muxad")
+        }
+        return try await makeWorkComposeClient().askOneShot(prompt, agent: agent)
+    }
+
     static let workComposeCapability = "work_compose_v1"
     /// The capability behind the daemon's provider list. The Ask settings
     /// read the same string; this constant is named apart so the two files

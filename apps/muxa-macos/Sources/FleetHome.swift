@@ -13,6 +13,35 @@ enum FleetLane: Int, CaseIterable, Identifiable, Sendable {
     case finished
 
     var id: Int { rawValue }
+
+    var title: String {
+        switch self {
+        case .needsYou: String(localized: "Your turn")
+        case .running: String(localized: "In progress")
+        case .finished: String(localized: "Finished")
+        }
+    }
+}
+
+extension FleetBoard {
+    /// Units that changed lane since `previous`, with the lane each came
+    /// from. A unit new to the board did not move.
+    static func laneMoves(previous: [String: FleetLane], current: [FleetWork]) -> [String: FleetLane] {
+        var moves: [String: FleetLane] = [:]
+        for work in current {
+            if let before = previous[work.id], before != work.lane { moves[work.id] = before }
+        }
+        return moves
+    }
+
+    /// Every agent in the unit, helpers included, that waits on the person,
+    /// most urgent first. The focus answers on the card; the others answer
+    /// from their own row in the inspector.
+    static func waiting(_ work: FleetWork, now: Date = .now) -> [MuxaHostedAgent] {
+        (work.agents + work.helpers)
+            .filter { $0.agent.status(at: now).needsAttention }
+            .sorted { $0.agent.status(at: now).priority < $1.agent.status(at: now).priority }
+    }
 }
 
 struct FleetWorkStage: Hashable, Sendable {
@@ -82,6 +111,14 @@ struct FleetWork: Identifiable, Sendable {
     /// never hides a helper's question.
     var hostAliases: [String] {
         Array(Set((agents + helpers).map(\.host.alias))).sorted()
+    }
+
+    /// The hosts behind `hostAliases`, one each, in the same order.
+    var hosts: [MuxaFleetHostIdentity] {
+        var seen = Set<String>()
+        return (agents + helpers).map(\.host)
+            .filter { seen.insert($0.alias).inserted }
+            .sorted { $0.alias < $1.alias }
     }
 
     /// The stage to name on a card. Stages form a dependency graph, not a
@@ -501,8 +538,24 @@ enum FleetBoard {
 
     /// What the agent asks of the person, in one line.
     static func question(for agent: MuxaAgent, now: Date) -> String {
-        if let note = agent.lastNotification.flatMap(firstLine) { return note }
+        if let note = agent.lastNotification.flatMap(firstLine) {
+            // A generic notice says nothing about the question; say what
+            // kind of answer is wanted and where to see it.
+            if isGenericNotice(note) {
+                return agent.state == "waiting_choice"
+                    ? String(localized: "Asks you to choose. Open to see the question.")
+                    : String(localized: "Waits for your answer. Open to see the question.")
+            }
+            return note
+        }
         return agent.status(at: now).label(now: now)
+    }
+
+    /// Notices that only say an agent waits, not what for.
+    static func isGenericNotice(_ note: String) -> Bool {
+        let lower = note.lowercased()
+        return ["needs your permission", "waiting for your input", "approval required", "needs your attention", "waiting on askuserquestion"]
+            .contains { lower.contains($0) }
     }
 
     /// What the agent is doing or did last, in one line.

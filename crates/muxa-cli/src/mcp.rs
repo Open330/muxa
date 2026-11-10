@@ -888,7 +888,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
                     "skill": { "type": "string", "description": "Registered local Muxa message skill name, with or without leading /. Its prompt is expanded before sending." },
                     "context": { "type": "string", "description": "Optional bounded context appended after the skill/body. Muxa never attaches transcripts or diffs implicitly." },
                     "execute": { "type": "boolean", "description": "Default false. Requires intent=task, explicit user authorization, and a control-mode host." },
-                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory path scope, especially for execute work." },
+                    "paths": { "type": "array", "items": { "type": "string" }, "description": "Advisory task path scope. For new Claude peers only, existing non-private directory entries may become --add-dir context roots. Files do not grant parent directories; Codex receives no automatic write roots. Provider approval mode still governs edits; the task contract is not a filesystem ACL." },
                     "wait": { "type": "boolean", "description": "Wait for the structured reply in this call. Default true. For a quick check with no independent local work, this avoids a separate send receipt and later wait. Use false while doing independent work." },
                     "timeout_secs": { "type": "integer", "minimum": 1, "maximum": 600, "description": "Reply wait timeout. Default 300." },
                     "thread_id": { "type": "string", "description": "Stable id shared by one causal conversation. Omit for a root request; muxa assigns its request id." },
@@ -975,7 +975,7 @@ fn tool_definitions(config: &muxa::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "muxa_call_peer",
-            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. Generic work reuses a worker or automatically creates one using configured provider permissions. Set context_bound=true only when the exact target conversation is required. Automatic creation can be disabled in collaboration settings.",
+            "description": "Create a new natural colleague request for Muxa-reserved @peer/@muxa-peer routing. Deterministically selects a healthy same-window worker (or an explicit provider, @alias, role, or pane), optionally expands a registered Muxa /skill, sends one durable request, and optionally waits for its structured reply. Use muxa_peer_report instead when the user asks about an existing peer report, reply, findings, or conversation. Defaults to review + read_only. Set execute=true only after explicit user authorization. Generic work reuses a worker or automatically creates one using configured provider permissions. New empty Claude/Codex workers mechanically prepare known startup gates and verify an empty input composer before dispatch, without a model turn. Set context_bound=true only when the exact target conversation is required. Automatic creation can be disabled in collaboration settings.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1443,7 +1443,8 @@ async fn call_tool_inner(
             let request = crate::agent_launch::StartRequest {
                 creator,
                 worker_spawn: None,
-                bypass_permissions: true,
+                bypass_permissions: purpose != muxa::collaboration::LaunchPurpose::Worker
+                    || config.collaboration.worker_bypass_permissions,
                 purpose,
                 socket: client.socket().to_path_buf(),
                 agent,
@@ -2959,6 +2960,70 @@ pub(crate) async fn call_peer(
         }
     }
 
+    if let Some(selected) = &selection {
+        let host = muxa::backend::pane_id_host_kind(&selected.pane);
+        if let Some(host) = host.filter(|host| crate::mux_control::supported(*host)) {
+            let socket = selected
+                .peer
+                .as_ref()
+                .and_then(|peer| peer.socket.clone())
+                .or_else(|| room.current.socket.clone());
+            let endpoint =
+                match select_lifecycle_endpoint(host, socket.clone().into_iter().collect()) {
+                    Ok(endpoint) => endpoint,
+                    Err(error) => return error_result(&error),
+                };
+            let pane = selected
+                .pane
+                .strip_prefix("rmux:")
+                .unwrap_or(&selected.pane);
+            let observed = crate::mux_control::Control::Endpoint(endpoint.clone()).output(&[
+                "display-message",
+                "-p",
+                "-t",
+                pane,
+                "#{@muxa_worker_launch}\t#{@muxa_agent}\t#{@muxa_input_readiness}",
+            ]);
+            let (mut allowed, launch_id) =
+                worker_dispatch_readiness(observed.as_deref().map_err(|_| ()));
+            // Older releases stamped the launch but had no readiness marker.
+            // Re-probe an idle registered worker; registration alone never proves
+            // it is past folder trust. Pending/blocked workers need explicit recovery.
+            if !allowed
+                && legacy_worker_needs_probe(
+                    observed.as_deref().map_err(|_| ()),
+                    selected
+                        .peer
+                        .as_ref()
+                        .is_some_and(|peer| peer.state == muxa::event::AgentState::Idle),
+                )
+            {
+                if let (Some(launch), Some(cwd)) = (
+                    launch_id.clone(),
+                    selected.peer.as_ref().and_then(|peer| peer.cwd.clone()),
+                ) {
+                    let pane = pane.to_owned();
+                    let result = tokio::task::spawn_blocking(move || {
+                        crate::mux_control::with_endpoint(Some(endpoint), || {
+                            crate::worker_startup::prepare(
+                                &pane,
+                                std::path::Path::new(&cwd),
+                                &launch,
+                                false,
+                            )
+                        })
+                    })
+                    .await;
+                    allowed = matches!(result, Ok(Ok(report)) if report.state == muxa::account_swap::worker_startup::State::Ready);
+                }
+            }
+            if !allowed {
+                return json_result(&json!({"sent": false, "reason": "worker_not_input_ready",
+                    "pane": selected.pane, "socket": socket, "launch_id": launch_id,
+                    "next_step": "Run muxa agent prepare with this pane, socket, launch id and its authorized cwd before retrying; no task was sent."}));
+            }
+        }
+    }
     let (selected_peer, selection_reason, pane_selector) = match selection {
         Some(selection) => (
             selection.peer,
@@ -3957,6 +4022,132 @@ fn spawned_peer_role<'a>(target: &'a str, args: &Value) -> &'a str {
     })
 }
 
+fn legacy_worker_needs_probe(
+    observed: std::result::Result<&str, ()>,
+    registered_idle: bool,
+) -> bool {
+    let Ok(observed) = observed else {
+        return false;
+    };
+    let fields: Vec<_> = observed
+        .trim_end_matches(['\r', '\n'])
+        .splitn(3, '\t')
+        .collect();
+    registered_idle
+        && fields.len() == 3
+        && !fields[0].is_empty()
+        && fields[2].is_empty()
+        && matches!(
+            muxa::discovery::classify_command(fields[1]),
+            Some(muxa::event::AgentKind::ClaudeCode | muxa::event::AgentKind::Codex)
+        )
+}
+
+// Missing metadata on an old/primary pane remains compatible. A marked,
+// supported worker must positively prove ready; lookup errors never authorize.
+fn worker_dispatch_readiness(observed: std::result::Result<&str, ()>) -> (bool, Option<String>) {
+    let Ok(observed) = observed else {
+        return (false, None);
+    };
+    let mut parts = observed.trim_end_matches(['\r', '\n']).splitn(3, '\t');
+    let launch = parts.next().unwrap_or_default();
+    let kind = parts.next().unwrap_or_default();
+    let state = parts.next().unwrap_or_default();
+    let supported = matches!(
+        muxa::discovery::classify_command(kind),
+        Some(muxa::event::AgentKind::ClaudeCode | muxa::event::AgentKind::Codex)
+    );
+    (
+        launch.is_empty() || (!supported && !kind.is_empty()) || state == "ready",
+        (!launch.is_empty()).then(|| launch.to_owned()),
+    )
+}
+
+/// Explicit peer input paths become bounded provider context directories before
+/// startup. This does not change the provider's tool approval mode or the
+/// request's read-only contract. Missing future output paths grant nothing.
+fn peer_context_options(
+    program: crate::agent_launch::AgentProgram,
+    mut options: Vec<String>,
+    args: &Value,
+    cwd: Option<&str>,
+) -> std::result::Result<Vec<String>, String> {
+    use crate::agent_launch::AgentProgram;
+    // Codex --add-dir grants additional write roots, not read context.
+    if program != AgentProgram::Claude {
+        return Ok(options);
+    }
+    let base = cwd
+        .map(std::path::PathBuf::from)
+        .map_or_else(std::env::current_dir, Ok)
+        .map_err(|e| e.to_string())?;
+    let base = muxa::paths::canonicalize(&base).map_err(|e| e.to_string())?;
+    let home = dirs::home_dir().and_then(|p| muxa::paths::canonicalize(&p).ok());
+    let mut roots = std::collections::BTreeSet::new();
+    for path in args
+        .get("paths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = path.as_str().ok_or("peer paths must be strings")?;
+        let path = std::path::Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            base.join(path)
+        };
+        let Ok(path) = muxa::paths::canonicalize(&path) else {
+            continue;
+        };
+        // A file is not authority for its entire parent directory. These are
+        // advisory input paths: skip missing/private/root/file entries.
+        if path.is_dir()
+            && safe_peer_context_directory(&path, home.as_deref())
+            && !path.starts_with(&base)
+        {
+            roots.insert(path);
+        }
+    }
+    let at = options
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(options.len());
+    let extra = roots
+        .into_iter()
+        .take(32)
+        .map(|dir| format!("--add-dir={}", dir.to_string_lossy()));
+    options.splice(at..at, extra);
+    Ok(options)
+}
+
+fn safe_peer_context_directory(
+    directory: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> bool {
+    if directory.parent().is_none() {
+        return false;
+    }
+    let Some(home) = home else {
+        return false;
+    };
+    if directory == home {
+        return false;
+    }
+    if let Ok(relative) = directory.strip_prefix(home) {
+        if let Some(first) = relative.components().next() {
+            let name = first.as_os_str().to_string_lossy();
+            if name.starts_with('.')
+                || name.eq_ignore_ascii_case("Library")
+                || name.eq_ignore_ascii_case("AppData")
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 async fn acquire_peer_capacity(
     client: &Client,
     origin: &CollaborationOrigin,
@@ -4042,7 +4233,12 @@ async fn spawn_peer(
         purpose: muxa::collaboration::LaunchPurpose::Worker,
         socket: client.socket().to_path_buf(),
         agent: program,
-        options: config.launch_options(program.label(), None),
+        options: peer_context_options(
+            program,
+            config.launch_options(program.label(), None),
+            args,
+            room.current.cwd.as_deref(),
+        )?,
         placement: crate::agent_launch::Placement::Pane,
         target: Some(native_pane.to_string()),
         cwd: room.current.cwd.as_deref().map(std::path::PathBuf::from),
@@ -6377,11 +6573,23 @@ mod tests {
     /// it and the request can follow a replaced holder: a
     /// `workspace/work/role` path (which local peer selection does not
     /// know) and a `role:` target alike.
+    #[cfg(unix)]
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one isolated transport lifecycle, including origin env
     async fn call_peer_sends_named_slots_as_slots() {
+        use std::os::unix::fs::PermissionsExt;
         const PROBE: &str = "MUXA_CALL_PEER_SLOT_PROBE";
         if std::env::var_os(PROBE).is_none() {
+            // This fixture models routing and has no real terminal backend.
+            // Make metadata explicit instead of querying the developer's tmux.
+            let control = tempfile::tempdir().unwrap();
+            let tmux = control.path().join("tmux");
+            std::fs::write(&tmux, "#!/bin/sh\ncase \"$*\" in\n*-V*) printf 'tmux 3.6\\n';;\n*display-message*) printf '\\t\\t\\n';;\n*) exit 1;;\nesac\n").unwrap();
+            std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let mut paths = vec![control.path().to_owned()];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
             let result = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -6389,6 +6597,7 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(PROBE, "1")
+                .env("PATH", std::env::join_paths(paths).unwrap())
                 .env_remove("MUXA_HOST")
                 .env_remove("MUXA_HOSTS")
                 .env_remove("RMUX")
@@ -7854,6 +8063,34 @@ mod tests {
     /// pane became ready. Opencode has neither a discovery classification nor
     /// a screen manifest, so its spawns must keep failing fast.
     #[test]
+    fn legacy_workers_are_probed_instead_of_assuming_registration_is_ready() {
+        assert!(legacy_worker_needs_probe(Ok("launch\tclaude\t"), true));
+        assert!(!legacy_worker_needs_probe(Ok("launch\tclaude\t"), false));
+        assert!(!legacy_worker_needs_probe(
+            Ok("launch\tclaude\tpending"),
+            true
+        ));
+        assert!(!legacy_worker_needs_probe(Err(()), true));
+        assert!(!legacy_worker_needs_probe(Ok("\tclaude\t"), true));
+    }
+
+    #[test]
+    fn marked_workers_require_positive_readiness_before_dispatch() {
+        assert!(!worker_dispatch_readiness(Err(())).0);
+        for state in ["", "pending", "blocked", "unexpected"] {
+            let screen = format!("launch\tclaude\t{state}");
+            assert_eq!(
+                worker_dispatch_readiness(Ok(&screen)),
+                (false, Some("launch".into()))
+            );
+        }
+        assert!(worker_dispatch_readiness(Ok("launch\tcodex\tready")).0);
+        assert!(worker_dispatch_readiness(Ok("\tclaude\t")).0);
+        assert!(worker_dispatch_readiness(Ok("launch\tgemini\t")).0);
+        assert!(!worker_dispatch_readiness(Ok("launch\t\t")).0);
+    }
+
+    #[test]
     fn only_providers_with_a_readiness_signal_fall_back_to_the_pane() {
         use crate::agent_launch::AgentProgram;
         assert!(has_pane_readiness_signal(AgentProgram::Codex));
@@ -8849,5 +9086,98 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unknown request kind"));
         server.await.unwrap();
+    }
+    #[test]
+    fn peer_context_is_bounded_deduplicated_and_before_flag_separator() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let inputs = root.path().join("inputs");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&inputs).unwrap();
+        let file = inputs.join("evidence.json");
+        std::fs::write(&file, "{}").unwrap();
+        let args = json!({"paths":[inputs, file, cwd.join("future-output")]});
+        let options = vec![
+            "--permission-mode".into(),
+            "default".into(),
+            "--".into(),
+            "body".into(),
+        ];
+        let out = peer_context_options(
+            crate::agent_launch::AgentProgram::Claude,
+            options,
+            &args,
+            cwd.to_str(),
+        )
+        .unwrap();
+        assert_eq!(&out[..2], ["--permission-mode", "default"]);
+        assert_eq!(
+            out[2],
+            format!(
+                "--add-dir={}",
+                muxa::paths::canonicalize(&inputs).unwrap().display()
+            )
+        );
+        assert_eq!(&out[3..], ["--", "body"]);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn peer_context_never_authorizes_the_filesystem_root() {
+        let args = json!({"paths":["/"]});
+        assert!(peer_context_options(
+            crate::agent_launch::AgentProgram::Claude,
+            vec![],
+            &args,
+            Some("/tmp")
+        )
+        .unwrap()
+        .is_empty());
+    }
+    #[test]
+    fn peer_context_files_and_codex_do_not_expand_directory_permissions() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let inputs = root.path().join("inputs");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&inputs).unwrap();
+        let file = inputs.join("one.txt");
+        std::fs::write(&file, "data").unwrap();
+        let original = vec!["--model".into(), "configured".into()];
+        for (program, args) in [
+            (
+                crate::agent_launch::AgentProgram::Claude,
+                json!({"paths":[file]}),
+            ),
+            (
+                crate::agent_launch::AgentProgram::Codex,
+                json!({"paths":[inputs]}),
+            ),
+        ] {
+            assert_eq!(
+                peer_context_options(program, original.clone(), &args, cwd.to_str()).unwrap(),
+                original
+            );
+        }
+    }
+    #[test]
+    fn peer_context_never_adds_home_or_private_configuration_roots() {
+        let home = std::path::Path::new("/Users/fixture");
+        for path in [
+            "/",
+            "/Users/fixture",
+            "/Users/fixture/.ssh",
+            "/Users/fixture/.config/asx",
+            "/Users/fixture/Library/Keychains",
+            "/Users/fixture/AppData/Roaming",
+        ] {
+            assert!(
+                !safe_peer_context_directory(std::path::Path::new(path), Some(home)),
+                "{path}"
+            );
+        }
+        assert!(safe_peer_context_directory(
+            std::path::Path::new("/Users/fixture/src/project/.context"),
+            Some(home)
+        ));
     }
 }

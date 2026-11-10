@@ -1015,3 +1015,51 @@ explain how to cancel that queued request before using worker routing.
 On macOS, `muxa init --component muxad-launchd --yes` records the installing
 shell's PATH in the LaunchAgent so headless providers can find user-installed
 CLIs and account shims. Run it from the shell that normally launches your agents.
+
+
+### Mechanical worker startup
+
+Fresh Claude and Codex workers without an initial prompt are prepared before
+`muxa peer` sends its durable request. The launcher joins wrapped terminal lines,
+checks a stable input composer, and answers only recognized initial setup gates
+for the explicitly requested working directory. Folder settings, tool approvals,
+logins, unknown dialogs, drafts and running turns are never silently accepted.
+Muxa retains the configured approval mode and does not directly rewrite global
+permission or trust files. Accepting folder trust lets the provider persist trust
+for that cwd and enable its project configuration (including hooks or MCP).
+Explicitly configured bypass consent is not inferred. Direct worker starts now
+also honor `collaboration.worker_bypass_permissions` (default false), rather than
+unconditionally bypassing approvals. Configured Work pipelines retain their
+existing execution profile.
+
+A verified launch reports `input_readiness.state = "ready"` and the setup gates
+it answered. Exiting, changing the pane/process/directory, failing a key write,
+or missing the 30-second deadline returns failure and retains the pane for
+inspection. Launch creation alone is never reported as input readiness. This is
+an observation at startup, not a guarantee against later tool approvals or caps.
+
+For newly spawned Claude peers, existing directory entries in `paths` become
+`--add-dir=PATH` context roots. Files are not promoted to their parent directory.
+Missing paths, filesystem roots, the home directory and its private configuration
+subtrees are skipped. Reused peers do not acquire new context roots. Codex gets
+no automatic `--add-dir`: that option grants additional writable roots. Claude
+context roots follow its configured permission mode and can allow edits; the
+read-only request contract is an agent instruction, not a filesystem sandbox.
+Providers without the Claude/Codex startup probe retain their existing behavior
+and do not claim a verified input-ready receipt.
+
+An exact dedicated worker can be rechecked without a model turn:
+
+```sh
+muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux-socket default
+```
+
+The command verifies the worker launch marker, process birth and directory
+before each setup key; it refuses a primary or recycled pane. It reports JSON
+and exits nonzero unless a stable empty input composer is observed.
+
+Claude workers also receive the existing Muxa-managed `agent-integration` bootstrap/skill directory as a context root; unrelated user configuration directories are not added.
+
+Codex folder-trust dialogs remain blocked pending verification of their sandbox effects. A retained worker marked pending or blocked cannot receive a new high-level peer request until preparation succeeds.
+
+After resolving a dialog manually, rerun `muxa agent prepare` to update the retained readiness marker. Codex automatic preparation currently requires a cwd that needs no folder-trust confirmation.

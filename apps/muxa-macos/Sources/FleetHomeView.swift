@@ -16,6 +16,15 @@ struct FleetHomeView: View {
     @State private var drafts: [String: FleetReplyDraft] = [:]
     @State private var approvalSeed: FleetApprovalSeed?
     @State private var quickLook: FleetQuickLookTarget?
+    @State private var showsReview = false
+    @AppStorage("home.review.scope") private var reviewScope: FleetReviewScope = .day
+    @AppStorage(MuxaPreferences.homeAnimatesMovesKey) private var animatesMoves = true
+    @Namespace private var cardSpace
+    /// Each unit's lane at the last update, to tell which cards moved.
+    @State private var lastLanes: [String: FleetLane] = [:]
+    /// Cards that just changed lane, with the lane they left; cleared a few
+    /// seconds later.
+    @State private var movedFrom: [String: FleetLane] = [:]
 
     private var allWorks: [FleetWork] {
         model.homeWorks
@@ -30,6 +39,22 @@ struct FleetHomeView: View {
         .background(MuxaSurfacePalette.workspace(for: colorScheme).ignoresSafeArea())
         .sheet(item: $approvalSeed) { seed in
             FleetApprovalRuleSheet(model: model, seed: seed)
+        }
+        .sheet(isPresented: $showsReview) {
+            FleetReviewView(
+                model: model,
+                works: { allWorks },
+                marks: $reviewed,
+                draft: draftBinding,
+                submit: { submit(for: $0) },
+                open: open,
+                markReviewed: { work in
+                    reviewed.markReviewed(work)
+                    reviewed.save(to: .standard)
+                },
+                send: { text, target in try await send(text, to: target) },
+                ask: { prompt in try await model.client.askOneShot(prompt) }
+            )
         }
         .sheet(item: $quickLook) { target in
             let work = allWorks.first { work in
@@ -53,6 +78,7 @@ struct FleetHomeView: View {
             Text("Home")
                 .font(.system(size: 17, weight: .semibold))
             Spacer(minLength: 8)
+            reviewButton
             filterMenu
             hostsButton
             FleetAutomationButton(model: model) { approvalSeed = FleetApprovalSeed() }
@@ -66,6 +92,34 @@ struct FleetHomeView: View {
         }
         .padding(.horizontal, 20)
         .padding(.vertical, 12)
+    }
+
+    /// Results the person asked for and has not reviewed, in the chosen
+    /// range: the way to go through Finished quickly.
+    private var reviewButton: some View {
+        let count = FleetBoard.reviewQueue(allWorks, marks: reviewed, scope: reviewScope).count
+        return Button {
+            showsReview = true
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "checklist")
+                Text("Review")
+                if count > 0 {
+                    Text(verbatim: count > 99 ? "99+" : "\(count)")
+                        .font(.system(size: 11, weight: .semibold))
+                        .monospacedDigit()
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.horizontal, 5)
+                        .background(Color.accentColor, in: Capsule())
+                }
+            }
+        }
+        .buttonStyle(.muxaSecondary)
+        .fixedSize()
+        .keyboardShortcut("r", modifiers: [.command, .shift])
+        .help("Review the results of work you asked for (⇧⌘R)")
     }
 
     /// Narrows the board to one host and/or one project.
@@ -167,6 +221,8 @@ struct FleetHomeView: View {
         .onExitCommand { selectedID = nil }
         // Display filters hide units; they are not gone. Prune review marks
         // against the whole board.
+        .onAppear { lastLanes = Dictionary(allWorks.map { ($0.id, $0.lane) }, uniquingKeysWith: { first, _ in first }) }
+        .onChange(of: allWorks.map { "\($0.id)|\($0.lane.rawValue)" }) { _ in noteMoves() }
         .onChange(of: allWorks.map(\.id)) { ids in
             // Only a live board says a unit is gone; a disconnect is not.
             guard model.isConnected, !ids.isEmpty else { return }
@@ -176,8 +232,30 @@ struct FleetHomeView: View {
         }
     }
 
+    /// Marks the cards that changed lane so they can show where they came
+    /// from, and forgets the mark after a few seconds.
+    private func noteMoves() {
+        let works = allWorks
+        let moves = FleetBoard.laneMoves(previous: lastLanes, current: works)
+        lastLanes = Dictionary(works.map { ($0.id, $0.lane) }, uniquingKeysWith: { first, _ in first })
+        guard animatesMoves, !moves.isEmpty else { return }
+        movedFrom.merge(moves) { _, new in new }
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            withAnimation(.easeOut(duration: 0.4)) {
+                for (id, lane) in moves where movedFrom[id] == lane { movedFrom[id] = nil }
+            }
+        }
+    }
+
+    /// A draft for one of the unit's other waiting agents.
+    private static func agentDraftKey(_ work: FleetWork, _ hosted: MuxaHostedAgent) -> String {
+        "\(work.id)#\(hosted.id)"
+    }
+
     private func inspector(_ work: FleetWork) -> some View {
         FleetWorkInspector(
+            model: model,
             work: work,
             isReviewed: reviewed.hides(work),
             close: { selectedID = nil },
@@ -194,7 +272,9 @@ struct FleetHomeView: View {
                 reviewed.markReviewed(work)
                 reviewed.save(to: .standard)
                 selectedID = nil
-            }
+            },
+            agentDraft: { draftBinding(Self.agentDraftKey(work, $0)) },
+            submitAgent: { submit(for: Self.agentDraftKey(work, $0)) }
         )
         .id(work.id)
     }
@@ -249,10 +329,16 @@ struct FleetHomeView: View {
                             select: { id in selectedID = selectedID == id ? nil : id },
                             open: peek,
                             reviewedCount: lane == .finished ? reviewedCount : 0,
-                            showsReviewed: $showsReviewed
+                            showsReviewed: $showsReviewed,
+                            cardSpace: animatesMoves ? cardSpace : nil,
+                            movedFrom: movedFrom
                         )
                     }
                 }
+                .animation(
+                    animatesMoves ? .spring(response: 0.5, dampingFraction: 0.86) : nil,
+                    value: works.map { "\($0.id)|\($0.lane.rawValue)" }
+                )
                 .padding(16)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             }
@@ -292,6 +378,9 @@ private struct FleetLaneColumn: View {
     let open: (MuxaHostedAgent) -> Void
     var reviewedCount = 0
     @Binding var showsReviewed: Bool
+    /// Set when cards should glide between lanes.
+    var cardSpace: Namespace.ID?
+    var movedFrom: [String: FleetLane] = [:]
     @State private var showsOlder = false
     @State private var showsProbable = false
     @State private var showsEmpty = false
@@ -324,13 +413,7 @@ private struct FleetLaneColumn: View {
     private var probableCount: Int { works.filter { fold($0) == .probable }.count }
     private var olderCount: Int { works.filter { fold($0) == .older }.count }
 
-    private var title: String {
-        switch lane {
-        case .needsYou: String(localized: "Your turn")
-        case .running: String(localized: "In progress")
-        case .finished: String(localized: "Finished")
-        }
-    }
+    private var title: String { lane.title }
 
     private var subtitle: String {
         switch lane {
@@ -386,8 +469,9 @@ private struct FleetLaneColumn: View {
                                 work: work,
                                 isSelected: work.id == selectedID,
                                 select: { select(work.id) },
-                                open: open
+                                movedFrom: movedFrom[work.id]
                             )
+                            .modifier(FleetCardMotion(id: work.id, space: cardSpace))
                         }
                     }
                     if emptyCount > 0 {
@@ -467,8 +551,16 @@ private struct FleetWorkCard: View {
     let work: FleetWork
     let isSelected: Bool
     let select: () -> Void
-    let open: (MuxaHostedAgent) -> Void
+    var movedFrom: FleetLane?
     @Environment(\.colorScheme) private var colorScheme
+
+    private var laneTint: Color {
+        switch work.lane {
+        case .needsYou: .orange
+        case .running: .blue
+        case .finished: .green
+        }
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -486,6 +578,16 @@ private struct FleetWorkCard: View {
                     .font(.system(size: 13, weight: .semibold))
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
+                if let movedFrom {
+                    Label(String(localized: "From \(movedFrom.title)"), systemImage: "arrow.turn.down.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(laneTint.opacity(0.18), in: Capsule())
+                        .foregroundStyle(laneTint)
+                        .fixedSize()
+                        .transition(.opacity)
+                }
             }
             if work.lane != .finished || work.stages.count > 1 {
                 FleetStageBar(work: work)
@@ -500,17 +602,16 @@ private struct FleetWorkCard: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
-            if work.lane == .needsYou, let focus = work.focus {
-                Button("Open") { open(focus) }
-                    .buttonStyle(.muxaPrimary)
-                    .controlSize(.small)
+            if work.lane == .needsYou, FleetBoard.waiting(work).count > 1 {
+                Label(String(localized: "\(FleetBoard.waiting(work).count) agents wait on you"), systemImage: "person.2.badge.gearshape")
+                    .font(MuxaType.meta)
+                    .foregroundStyle(.orange)
             }
             HStack(spacing: 6) {
                 if let repo = work.repo {
                     Text(repo)
                 }
-                Text(work.hostAliases.joined(separator: ", "))
-                    .lineLimit(1)
+                FleetHostBadges(hosts: work.hosts)
                 if !work.helpers.isEmpty {
                     Label("\(work.helpers.count)", systemImage: "person.2")
                         .labelStyle(.titleAndIcon)
@@ -530,6 +631,12 @@ private struct FleetWorkCard: View {
         .overlay(
             RoundedRectangle(cornerRadius: 8, style: .continuous)
                 .strokeBorder(isSelected ? Color.accentColor : MuxaTheme.border(colorScheme), lineWidth: isSelected ? 1.5 : 1)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .strokeBorder(laneTint, lineWidth: 2)
+                .opacity(movedFrom == nil ? 0 : 0.9)
+                .allowsHitTesting(false)
         )
         .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         .onTapGesture(perform: select)
@@ -593,6 +700,7 @@ extension FleetWorkStage.State {
 // MARK: - Inspector
 
 private struct FleetWorkInspector: View {
+    @ObservedObject var model: AppModel
     let work: FleetWork
     let isReviewed: Bool
     let close: () -> Void
@@ -602,6 +710,10 @@ private struct FleetWorkInspector: View {
     let submit: () -> Void
     let approveLikeThis: () -> Void
     let markReviewed: () -> Void
+    /// Drafts and sends for the unit's other waiting agents, kept by the
+    /// board like the unit's own.
+    let agentDraft: (MuxaHostedAgent) -> Binding<FleetReplyDraft>
+    let submitAgent: (MuxaHostedAgent) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -676,8 +788,38 @@ private struct FleetWorkInspector: View {
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
             }
-            if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
+            if work.lane == .needsYou, let focus = work.focus, focus.pane != nil,
+               ["waiting_input", "waiting_choice"].contains(focus.agent.state) {
+                // The screen decides: option buttons for a choice, the answer
+                // field for a question that takes words.
+                FleetChoicePanel(model: model, hosted: focus) {
+                    if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
+                        FleetReplyField(work: work, draft: $draft, submit: submit)
+                    }
+                }
+                .id(focus.id)
+            } else if FleetBoard.replyTarget(for: work) != nil || !draft.isIdle {
                 FleetReplyField(work: work, draft: $draft, submit: submit)
+            }
+            let others = FleetBoard.waiting(work).filter { $0.id != work.focus?.id }
+            if work.lane == .needsYou, !others.isEmpty {
+                // One unit, several agents asking: each answers on its own.
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Also waiting on you")
+                        .font(.system(size: 11, weight: .bold))
+                        .foregroundStyle(.orange)
+                    ForEach(others) { hosted in
+                        FleetWaitingAgent(model: model, hosted: hosted, open: open) {
+                            FleetReplyField(
+                                work: work,
+                                draft: agentDraft(hosted),
+                                submit: { submitAgent(hosted) },
+                                agent: hosted
+                            )
+                        }
+                    }
+                }
+                .padding(.top, 4)
             }
             HStack(spacing: 8) {
                 if let focus = work.focus {
@@ -759,8 +901,14 @@ struct FleetReplyField: View {
     let work: FleetWork
     @Binding var draft: FleetReplyDraft
     let submit: () -> Void
+    /// The agent the field answers when it is not the unit's reply target:
+    /// another agent in the unit waiting for words.
+    var agent: MuxaHostedAgent?
 
-    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
+    private var currentTarget: FleetReplyTarget? {
+        guard let agent else { return FleetBoard.replyTarget(for: work) }
+        return agent.agent.state == "waiting_input" ? FleetReplyTarget(kind: .answer, agent: agent) : nil
+    }
 
     /// Text written for a question the unit has moved past.
     private var isStale: Bool {
@@ -933,3 +1081,42 @@ private struct FleetEmptyBoard: View {
     }
 }
 
+
+/// Each host a unit runs on: its icon (the one set for the menu bar) and
+/// its name.
+struct FleetHostBadges: View {
+    let hosts: [MuxaFleetHostIdentity]
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(hosts, id: \.alias) { host in
+                let icon = MuxaHostIcons.icon(for: host.alias, local: host.local)
+                HStack(spacing: 3) {
+                    MuxaGlyphView(value: icon, size: 7)
+                        .frame(width: 14, height: 14)
+                        .background(MuxaMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                    Text(verbatim: host.alias)
+                        .lineLimit(1)
+                }
+                .help(host.local ? String(localized: "\(host.alias) (this Mac)") : host.alias)
+            }
+        }
+    }
+}
+
+/// Lets a card glide from its old lane to its new one: the same id in one
+/// namespace across the lanes. Off when the setting is.
+private struct FleetCardMotion: ViewModifier {
+    let id: String
+    let space: Namespace.ID?
+
+    func body(content: Content) -> some View {
+        if let space {
+            content
+                .matchedGeometryEffect(id: id, in: space)
+                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+        } else {
+            content
+        }
+    }
+}

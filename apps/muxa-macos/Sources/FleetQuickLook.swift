@@ -85,9 +85,19 @@ struct FleetQuickLookView: View {
         VStack(alignment: .leading, spacing: 14) {
             header
             if let hosted {
-                summary(hosted)
-                if showsReply, let work {
-                    FleetReplyField(work: work, draft: $draft, submit: submit)
+                if ["waiting_input", "waiting_choice"].contains(hosted.agent.state), hosted.pane != nil {
+                    // The screen decides: option buttons or the answer field.
+                    FleetChoicePanel(model: model, hosted: hosted) {
+                        if showsReply, let work {
+                            FleetReplyField(work: work, draft: $draft, submit: submit)
+                        }
+                    }
+                    summary(hosted)
+                } else {
+                    summary(hosted)
+                    if showsReply, let work {
+                        FleetReplyField(work: work, draft: $draft, submit: submit)
+                    }
                 }
             } else {
                 Text("This agent is no longer running.")
@@ -262,6 +272,7 @@ struct FleetQuickLookView: View {
                     screen = capture.screenText.map { FleetQuickLookText.plain($0) } ?? ""
                     captureError = nil
                 } catch {
+                    if Task.isCancelled || error is CancellationError { return }
                     captureError = error.localizedDescription
                 }
             }

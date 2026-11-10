@@ -534,3 +534,214 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(FleetBoard.isEmpty(try agent(["recap": "  "], id: "x")))
     #expect(!FleetBoard.isEmpty(try agent(["last_response": "Done."], id: "y")))
 }
+
+@Test func theReviewQueueHoldsUnreviewedResultsThePersonAskedFor() throws {
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    func finished(_ id: String, prompt: String?, at: String) throws -> MuxaHostedAgent {
+        var fields: [String: Any] = ["state": "idle", "state_entered_at": at, "last_response": "Done."]
+        if let prompt { fields["last_prompt"] = prompt }
+        return MuxaHostedAgent(host: host, agent: try agent(fields, id: id), pane: nil)
+    }
+    let mine = try finished("mine", prompt: "Fix the README", at: "2026-11-09T11:00:00Z")
+    let old = try finished("old", prompt: "Write the docs", at: "2026-11-02T11:00:00Z")
+    let notice = try finished("notice", prompt: "[muxa:req_1_2] Completed reply from codex@%13 is ready.", at: "2026-11-09T11:30:00Z")
+    let background = try finished("bg", prompt: "<task-notification>\n<summary>x</summary>", at: "2026-11-09T11:40:00Z")
+    let works = FleetBoard.works(groups: [], agents: [mine, old, notice, background], now: now)
+
+    let day = FleetBoard.reviewQueue(works, marks: FleetReviewMarks(), scope: .day, now: now)
+    #expect(day.map { $0.focus?.id } == [mine.id])
+    let all = FleetBoard.reviewQueue(works, marks: FleetReviewMarks(), scope: .all, now: now)
+    #expect(all.map { $0.focus?.id } == [mine.id, old.id], "newest first")
+
+    var marks = FleetReviewMarks()
+    marks.markReviewed(try #require(day.first))
+    #expect(FleetBoard.reviewQueue(works, marks: marks, scope: .all, now: now).map { $0.focus?.id } == [old.id])
+}
+
+@Test func reviewScopesStartWhereTheirNamesSay() throws {
+    let now = try #require(MuxaUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = try #require(TimeZone(identifier: "UTC"))
+    #expect(FleetReviewScope.today.start(now: now, calendar: calendar) == MuxaUsageTimestamp.parse("2026-11-09T00:00:00Z"))
+    #expect(FleetReviewScope.day.start(now: now) == MuxaUsageTimestamp.parse("2026-11-08T12:00:00Z"))
+    #expect(FleetReviewScope.week.start(now: now) == MuxaUsageTimestamp.parse("2026-11-02T12:00:00Z"))
+    #expect(FleetReviewScope.all.start(now: now) == nil)
+}
+
+@Test func menuBarGlyphsNameProvidersAndCustomHostIcons() throws {
+    #expect(MuxaMenuBarAgentAppearance(identity: "a", kind: "claude_code").symbol == MuxaGlyph.claude)
+    #expect(MuxaMenuBarAgentAppearance(identity: "a", kind: "codex").symbol == MuxaGlyph.codex)
+    #expect(MuxaGlyph.kind(MuxaGlyph.claude) == .claude)
+    #expect(MuxaGlyph.kind(MuxaGlyph.codex) == .codex)
+    #expect(MuxaGlyph.kind("text:🚀") == .text("🚀"))
+    #expect(MuxaGlyph.kind("server.rack") == .symbol("server.rack"))
+    #expect(MuxaGlyph.cleanedText("  mini host ") == "mi")
+
+    let defaults = try #require(UserDefaults(suiteName: "host-icons-\(UUID().uuidString)"))
+    #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "server.rack")
+    #expect(MuxaHostIcons.icon(for: "me", local: true, defaults: defaults) == "laptopcomputer")
+    MuxaHostIcons.set("text:🚀", for: "mini", defaults: defaults)
+    #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "text:🚀")
+    MuxaHostIcons.set(nil, for: "mini", defaults: defaults)
+    #expect(MuxaHostIcons.icon(for: "mini", local: false, defaults: defaults) == "server.rack")
+}
+
+@Test func reviewKeysAreOnTheHomeRowWithArrowsAsWell() {
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "E") == .looksGood)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "l") == .looksGood)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "h") == .later)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "j") == .next)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "k") == .previous)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "r") == .sendBack)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "o") == .open)
+    #expect(FleetReviewKey.from(keyCode: 36, characters: "\r") == .open)
+    #expect(FleetReviewKey.from(keyCode: 124, characters: nil) == .looksGood)
+    #expect(FleetReviewKey.from(keyCode: 123, characters: nil) == .later)
+    #expect(FleetReviewKey.from(keyCode: 0, characters: "x") == nil)
+}
+
+@Test func theAskProviderTailorsOneReplyPerAgent() throws {
+    let a = FleetBoard.work(for: MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Make the intro shorter", "last_response": "Cut it to 20s."], id: "a"), pane: nil), now: .now)
+    let b = FleetBoard.work(for: MuxaHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Pick a thumbnail", "last_response": "Option 2 is brightest."], id: "b"), pane: nil), now: .now)
+    let prompt = FleetReviewAssist.tailorPrompt(reply: "좋아요, 둘 다 진행해 주세요", targets: [(id: "a", work: a), (id: "b", work: b)])
+    #expect(prompt.contains("id: a") && prompt.contains("id: b"))
+    #expect(prompt.contains("좋아요, 둘 다 진행해 주세요"))
+    #expect(prompt.contains("Cut it to 20s."))
+    #expect(FleetReviewAssist.summaryPrompt([a, b]).contains("Option 2 is brightest."))
+
+    let answer = """
+    Here you go:
+    {"messages":[{"id":"a","message":" 20초 버전으로 진행해 주세요. "},{"id":"b","message":""},{"id":"zzz","message":"x"}]}
+    """
+    let parsed = try #require(FleetReviewAssist.parseTailored(answer, ids: ["a", "b"]))
+    #expect(parsed == ["a": "20초 버전으로 진행해 주세요.", "b": ""])
+    #expect(FleetReviewAssist.parseTailored("no json here", ids: ["a"]) == nil)
+}
+
+@Test func digestIsTheDefaultReviewMode() {
+    #expect(FleetReviewMode.allCases.first == .digest)
+}
+
+@Test func aChoiceDialogIsReadOffTheScreen() throws {
+    // The Main Claude screen from jiun-mbp, with a code panel on the right.
+    let screen = """
+      Ran 1 shell command                                                 │ 13      var resetPosition: () -> Void = {}
+    ──────────────────────────────────────────────────────────────────────│ 14      var heightChanged: (CGFloat) -> Void = { _ in
+     ☐ MBP AFM                                                            │     }
+                                                                          │ 15 +    var resting: Binding<Bool>? = nil
+    │ MBP에서 Apple Intelligence(AFM)가 modelNotReady입니다. Mac 언어가   │ 16      @FocusState private var inputFocused: Bool
+    │ English(South Korea)인데 Siri는 이미 한국어라서 둘이 달라 다운로드가│ 17 +    @FocusState private var searchFocused: Bool
+    │ 막혀 있습니다. 어떻게 맞출까요?                                     │ 18      @Environment(\\.colorScheme) private var colorS
+                                                                          │ 19 +    @AppStorage("mac.compactConversationShowsExcha
+    ❯ 1. Siri를 영어로 (Recommended)                                      │    +nge") private var showsExchange = true
+         Siri 언어만 English(US 등)로 바꿉니다. Mac UI는 그대로입니다.    │ 20 +    @AppStorage(DesktopConversationTextSize.prefer
+      2. Mac 언어를 한국어로                                              │    +enceKey) private var textSize: DesktopConversation
+         MBP 전체 UI가 한국어로 바뀝니다.                                 │ 21 +    @State private var readingPosition = ScrollPos
+      3. 그대로 두기                                                      │    +ition(edge: .bottom)
+         MBP AFM은 쓰지 않고, AFM 시험은 Mini에서만 합니다.               │ 22 +    @State private var followsLatest = true
+      4. Type something.                                                  │ 23 +    @State private var userScrolling = false
+    """
+    let dialog = try #require(FleetChoiceDialog.parse(screen))
+    #expect(dialog.question.hasPrefix("☐ MBP AFM\nMBP에서 Apple Intelligence"))
+    #expect(dialog.question.hasSuffix("어떻게 맞출까요?"))
+    #expect(dialog.options.map(\.number) == [1, 2, 3, 4])
+    #expect(dialog.options[0].label == "Siri를 영어로 (Recommended)")
+    #expect(dialog.options[0].detail?.hasPrefix("Siri 언어만") == true)
+    #expect(dialog.options[3].takesText)
+    #expect(!dialog.options[0].takesText)
+
+    #expect(FleetChoiceDialog.parse("just some output\n❯ ") == nil)
+    #expect(FleetChoiceDialog.parse("Pick one\n  2. B\n  3. C") == nil, "numbering must start at 1")
+}
+
+@Test func aGenericNoticeSaysWhatKindOfAnswerIsWanted() throws {
+    let choosing = try agent(["state": "waiting_choice", "last_notification": "Claude approval required: Claude needs your permission"], id: "a")
+    #expect(FleetBoard.question(for: choosing, now: .now) == "Asks you to choose. Open to see the question.")
+    let typing = try agent(["state": "waiting_input", "last_notification": "Claude is waiting for your input"], id: "b")
+    #expect(FleetBoard.question(for: typing, now: .now) == "Waits for your answer. Open to see the question.")
+    let specific = try agent(["state": "waiting_input", "last_notification": "Where should the sandbox live?"], id: "c")
+    #expect(FleetBoard.question(for: specific, now: .now) == "Where should the sandbox live?")
+}
+
+@Test func aChoiceWithAnOptionBelowARuleIsStillRead() throws {
+    let screen = """
+    ────────────────────────────────────────────────────────────────────────
+     ☐ 점심 메뉴
+
+    데모: 오늘 점심 메뉴를 고르세요
+
+    ❯ 1. 김치찌개
+         얼큰한 한식
+      2. 파스타
+         양식 면 요리
+      3. 샐러드
+         가벼운 한 끼
+      4. Type something.
+    ────────────────────────────────────────────────────────────────────────
+      5. Chat about this
+
+    Enter to select · ↑/↓ to navigate · Esc to cancel
+    """
+    let dialog = try #require(FleetChoiceDialog.parse(screen))
+    #expect(dialog.question == "☐ 점심 메뉴\n데모: 오늘 점심 메뉴를 고르세요")
+    #expect(dialog.options.map(\.label) == ["김치찌개", "파스타", "샐러드", "Type something.", "Chat about this"])
+    #expect(dialog.options[1].detail == "양식 면 요리")
+    #expect(dialog.options[3].detail == nil)
+    #expect(dialog.selected == 1)
+    #expect(dialog.moves(to: 3) == ["down", "down"])
+    #expect(dialog.moves(to: 1) == [])
+    #expect(dialog.moves(to: 9) == nil)
+    let fromFour = FleetChoiceDialog(question: dialog.question, options: dialog.options, selected: 4)
+    #expect(fromFour.moves(to: 1) == ["up", "up", "up"])
+}
+
+@Test func cardsThatChangeLaneRememberWhereTheyCameFrom() throws {
+    let impl = try member("impl", "idle", alias: "impl", pane: "%1")
+    let fresh = MuxaHostedAgent(host: host, agent: try agent(["state": "working"], id: "new"), pane: nil)
+    let works = FleetBoard.works(groups: [], agents: [impl, fresh])
+    let finished = try #require(works.first { $0.lane == .finished })
+
+    let moves = FleetBoard.laneMoves(previous: [finished.id: .running], current: works)
+
+    #expect(moves == [finished.id: .running])
+    #expect(FleetBoard.laneMoves(previous: [finished.id: .finished], current: works).isEmpty)
+}
+
+@Test func everyAgentWaitingInOneUnitIsListed() throws {
+    let impl = try member("impl", "waiting_choice", alias: "impl", pane: "%1")
+    let review = try member("review", "waiting_input", alias: "review", pane: "%2")
+    let work = FleetBoard.work(for: try group([:], [impl, review]), now: .now)
+
+    #expect(work.lane == .needsYou)
+    let waiting = FleetBoard.waiting(work)
+    #expect(Set(waiting.map(\.agent.agentSessionID)) == ["impl", "review"])
+    #expect(waiting.first?.id == work.focus?.id)
+}
+
+@Test func twoCursorsLeaveTheSelectionUnknown() throws {
+    let screen = "Choose a permission\n❯ 1. Yes, once\n❯ 2. Always allow\n  3. No\nEnter to select"
+    let dialog = try #require(FleetChoiceDialog.parse(screen))
+    #expect(dialog.selected == nil)
+    #expect(dialog.moves(to: 1) == nil)
+}
+
+@Test func aChangedDescriptionIsADifferentChoice() throws {
+    let shown = try #require(FleetChoiceDialog.parse("Choose action\n❯ 1. Continue\n     Run npm test\n  2. Cancel"))
+    let now = try #require(FleetChoiceDialog.parse("Choose action\n❯ 1. Continue\n     Delete production data\n  2. Cancel"))
+    #expect(shown.question == now.question)
+    #expect(shown.options.map(\.label) == now.options.map(\.label))
+    #expect(shown.options != now.options)
+}
+
+@MainActor
+@Test func aSecondChoiceForTheSameAgentWaitsForTheFirst() {
+    let sends = FleetChoiceSends()
+    #expect(sends.begin("a"))
+    #expect(!sends.begin("a"))
+    #expect(sends.begin("b"))
+    sends.finish("a", .init(succeeded: true, message: "Chose 1"))
+    #expect(!sends.isPending("a"))
+    #expect(sends.outcome("a")?.succeeded == true)
+    #expect(sends.begin("a"))
+    #expect(sends.outcome("a") == nil)
+}

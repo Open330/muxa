@@ -81,7 +81,13 @@ struct MuxaMenuBarChip: Identifiable, Equatable {
             let location = grouping == .fleet ? count : "\(first.hosted.host.alias) › \(first.hosted.pane?.workIdentity?.workspaceID ?? first.hosted.pane?.session ?? "") · \(count)"
             return Self(id: key, name: title, location: location, pillLabel: "\(members.count) · \(first.pillLabel)",
                 menuStatusLabel: first.menuStatusLabel,
-                appearance: MuxaMenuBarAgentAppearance(identity: key, symbol: grouping == .fleet ? "server.rack" : "square.stack.3d.up", provider: grouping.title),
+                appearance: MuxaMenuBarAgentAppearance(
+                    identity: key,
+                    symbol: grouping == .fleet
+                        ? MuxaHostIcons.icon(for: first.hosted.host.alias, local: first.hosted.host.local)
+                        : "square.stack.3d.up",
+                    provider: grouping.title
+                ),
                 status: first.status, unread: members.contains(where: \.unread), memberIDs: Set(members.map(\.id)), destination: .group(scope))
         }
     }
@@ -100,7 +106,7 @@ struct MuxaMenuBarChipPeek: View {
     let item: MuxaMenuBarChip
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: item.appearance.symbol).foregroundStyle(.white)
+            MuxaGlyphView(value: item.appearance.symbol, size: 12)
                 .frame(width: 26, height: 26).background(item.appearance.gradient, in: Circle())
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
