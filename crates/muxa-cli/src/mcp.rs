@@ -6774,6 +6774,10 @@ mod tests {
                     "--nocapture",
                 ])
                 .env(PROBE, "1")
+                // The probe parses the whole CLI, as `muxa` does on its 8 MiB
+                // main thread; a 2 MiB test thread is too tight for an
+                // unoptimized clap tree.
+                .env("RUST_MIN_STACK", "8388608")
                 .env_remove("MUXA_HOST")
                 .env_remove("MUXA_HOSTS")
                 .env_remove("RMUX")

@@ -60,6 +60,7 @@ mod work_pipeline;
 mod work_up;
 mod worker_cmd;
 mod worker_startup;
+mod worktrees_cmd;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
@@ -231,6 +232,9 @@ enum Cmd {
     /// Worker agents muxa launched for peer work, across every room: state,
     /// observed idle time, open requests, and what is left behind.
     Workers(worker_cmd::Args),
+    /// Git worktrees muxa created on this host and whether each could be
+    /// cleaned up. Read-only: lists only worktrees muxa holds a receipt for.
+    Worktrees(worktrees_cmd::Args),
     /// Former name of `muxa fleet host`. Muxa.app still invokes it, and an
     /// app may run against an older or newer CLI, so keep this alias.
     #[command(hide = true)]

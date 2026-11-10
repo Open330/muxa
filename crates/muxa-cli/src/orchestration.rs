@@ -349,6 +349,42 @@ async fn git(args: &[String], socket: &Path) -> Result<String> {
     Ok(result.stdout.trim().into())
 }
 
+/// Runs `git worktree add` for the dispatch's run directory with a receipt
+/// around it (see `muxa::worktree_receipt`). A receipt that cannot be
+/// written only costs cleanup its proof.
+async fn add_worktree_with_receipt(
+    args: &[String],
+    plan: &DispatchPlan,
+    paths: &muxa::orchestration::ResolvedPaths,
+    socket: &Path,
+) -> Result<()> {
+    let receipt = muxa::worktree_receipt::WorktreeReceipt::begin(
+        &paths.repo,
+        &paths.run,
+        None,
+        Some(plan.request.commit.clone()),
+        muxa::worktree_receipt::ReceiptOrigin::Dispatch {
+            dispatch_id: plan.request.dispatch_id.clone(),
+            workspace: plan.request.workspace.clone(),
+            work: plan.request.work.clone(),
+        },
+    )
+    .map_err(|error| tracing::warn!(%error, "worktree receipt not written"))
+    .ok();
+    if let Err(error) = git(args, socket).await {
+        if let Some(receipt) = receipt {
+            let _ = receipt.fail();
+        }
+        return Err(error);
+    }
+    if let Some(receipt) = receipt {
+        if let Err(error) = receipt.finish(Some(plan.request.commit.clone())) {
+            tracing::warn!(%error, "worktree receipt not completed");
+        }
+    }
+    Ok(())
+}
+
 async fn prepare_checkout(
     plan: &DispatchPlan,
     paths: &muxa::orchestration::ResolvedPaths,
@@ -418,7 +454,8 @@ async fn prepare_checkout(
         paths.run.display().to_string(),
         plan.request.commit.clone(),
     ]);
-    git(&args, socket).await?;
+    // Boxed: the dispatch future runs on small test-thread stacks.
+    Box::pin(add_worktree_with_receipt(&args, plan, paths, socket)).await?;
     if paths.run.join(".gitmodules").exists() {
         git(
             &[
@@ -484,7 +521,7 @@ pub async fn execute(
     };
     reserve(&path, &record)?;
     let outcome: Result<Value> = async {
-        prepare_checkout(&plan, &paths, client.socket()).await?;
+        Box::pin(prepare_checkout(&plan, &paths, client.socket())).await?;
         let request = WorkUpRequest {
             work: plan.request.work.clone(), external: None,
             pipeline: Some(plan.pipeline.clone()), workspace: Some(plan.request.workspace.clone()),
