@@ -307,16 +307,35 @@ class Migration:
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(src), str(dst))
 
-    def run(self, cmd: list[str], label: str):
+    def run(self, cmd: list[str], label: str) -> bool:
+        """Run one service command; a failure is reported, never shown as done."""
         self.step(label)
-        if self.apply:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if not self.apply:
+            return True
+        done = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if done.returncode != 0:
+            why = (done.stderr.strip().splitlines() or ["exit status %d" % done.returncode])[-1]
+            self.note(f"{label} failed: {why[:160]}")
+            return False
+        return True
 
     def remove(self, path: Path, label: str):
         self.step(label)
         if self.apply:
             shutil.copy2(path, path.with_name(f"{path.name}.muxa-migrate-{STAMP}"))
             path.unlink()
+
+
+def systemd_user_available() -> bool:
+    """A systemd user manager we can talk to. Over ssh XDG_RUNTIME_DIR is often
+    unset; containers have no systemd at all."""
+    if not have("systemctl"):
+        return False
+    runtime = Path(f"/run/user/{UID}")
+    if not os.environ.get("XDG_RUNTIME_DIR") and runtime.is_dir():
+        os.environ["XDG_RUNTIME_DIR"] = str(runtime)
+    return subprocess.run(["systemctl", "--user", "show-environment"],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
 
 def capture(cmd: list[str]) -> str:
@@ -359,7 +378,7 @@ def stop_services(m: Migration):
             if label in loaded:
                 m.run(["launchctl", "bootout", f"gui/{UID}/{label}"], f"stop launchd job {label}")
 
-    if have("systemctl"):
+    if systemd_user_available():
         for unit in ("muxad.service", "muxa-restore.service"):
             if unit in capture(["systemctl", "--user", "list-unit-files", unit]):
                 m.run(["systemctl", "--user", "disable", "--now", unit], f"disable systemd unit {unit}")
@@ -370,8 +389,13 @@ def stop_services(m: Migration):
     if brew_status and brew_status.group(1) not in ("none", "stopped"):
         m.run(["brew", "services", "stop", "muxa"], "stop brew service muxa")
         NEW_SERVICES.append(("brew", Path("tend"), "tend"))
-    if capture(["pgrep", "-x", "muxad"]).strip():
-        m.run(["pkill", "-x", "muxad"], "stop the running muxad")
+    # Only this user's daemon: on a shared host another account's muxad is not ours.
+    if capture(["pgrep", "-u", str(UID), "-x", "muxad"]).strip():
+        m.run(["pkill", "-u", str(UID), "-x", "muxad"], "stop the running muxad")
+        if m.apply:
+            time.sleep(1)
+            if capture(["pgrep", "-u", str(UID), "-x", "muxad"]).strip():
+                m.note("muxad is still running; stop it before starting tendd, or it keeps writing Muxa's directories.")
 
 
 # Services moved to their Tend names, started once everything else is done.
@@ -506,6 +530,9 @@ def start_services(m: Migration):
             continue
         if kind == "launchd":
             m.run(["launchctl", "bootstrap", f"gui/{UID}", str(path)], f"start launchd job {path.stem}")
+        elif not systemd_user_available():
+            m.note(f"{path.name} was moved, but there is no systemd user manager here (a container, or no login "
+                   f"session). Start the daemon with: tend daemon start")
         else:
             if not reloaded:
                 m.run(["systemctl", "--user", "daemon-reload"], "reload systemd user units")
@@ -549,7 +576,7 @@ def rewrite_own_files(m: Migration, dirs: list[Path]):
         m.edit(look / "config.toml", config_toml, validate=valid_toml)
         for path in sorted((look / "agents").glob("*.toml")) if (look / "agents").exists() else []:
             m.edit(path, surgical_rename, validate=valid_toml)
-        m.edit_json(bundle / "manifest.json", lambda d: json_strings(d, surgical_rename))
+        m.edit_json(bundle / "manifest.json", fix_manifest)
         # The bootstrap and skill documents are Muxa's text throughout.
         m.edit(bundle / "bootstrap.md", full_rename)
         skills = bundle / "skills"
@@ -565,6 +592,38 @@ def codex_homes(extra: list[str]) -> list[Path]:
             seen.add(h.resolve())
             out.append(h)
     return out
+
+
+def fix_mcp_entry(entry):
+    if not isinstance(entry, dict):
+        return entry
+    out = {k: (surgical_rename(rename_program_path(v)) if k == "command" and isinstance(v, str)
+               else json_strings(v, surgical_rename)) for k, v in entry.items()}
+    if isinstance(out.get("env"), dict):
+        out["env"] = {ENV_NAME.sub(r"TEND_\1", k): v for k, v in out["env"].items()}
+    return out
+
+
+def fix_manifest(manifest):
+    """The integration manifest is what `tend init` compares against: an asset
+    record holds the generated document itself (renamed in full, like the
+    file), an MCP record holds server entries whose env keys are variable
+    names (MUXA_MCP_BINARY_REVISION must become TEND_…, or init sees the
+    registration as changed); paths and link targets get the usual rename."""
+    for record in manifest.get("records", []) if isinstance(manifest, dict) else []:
+        if not isinstance(record, dict):
+            continue
+        kind = record.get("kind")
+        for key, value in list(record.items()):
+            if key in ("kind", "component", "host"):
+                continue
+            if kind == "asset" and key in ("installed", "previous") and isinstance(value, str):
+                record[key] = full_rename(value)
+            elif kind == "mcp" and key in ("installed", "previous", "before_apply"):
+                record[key] = fix_mcp_entry(value)
+            else:
+                record[key] = json_strings(value, surgical_rename)
+    return manifest
 
 
 def claude_homes(extra: list[str]) -> list[Path]:
@@ -850,7 +909,8 @@ def report_custom_jobs(m: Migration):
     """Your own launchd jobs, systemd units and crontab entries are not
     Muxa's to rename, but one that runs muxa (directly or through a script)
     stops working once Muxa is removed: list every one that mentions it."""
-    known = {"dev.open330.muxad.plist", "dev.open330.muxa-restore.plist", "muxad.service", "muxa-restore.service"}
+    known = {"dev.open330.muxad.plist", "dev.open330.muxa-restore.plist", "muxad.service", "muxa-restore.service",
+             "dev.open330.tendd.plist", "dev.open330.tend-restore.plist", "tendd.service", "tend-restore.service"}
     candidates = []
     if MACOS:
         candidates += sorted((HOME / "Library/LaunchAgents").glob("*.plist"))
