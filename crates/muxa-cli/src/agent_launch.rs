@@ -422,7 +422,8 @@ impl StartRequest {
         Self {
             creator: None,
             worker_spawn: None,
-            bypass_permissions: true,
+            bypass_permissions: args.purpose != muxa::collaboration::LaunchPurpose::Worker
+                || cfg.collaboration.worker_bypass_permissions,
             purpose: args.purpose,
             agent: args.agent,
             options: cfg.launch_options(args.agent.label(), explicit_options(&args.options)),
@@ -446,6 +447,9 @@ impl StartRequest {
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct StartResult {
+    /// Verified composer state; process creation alone is not readiness.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_readiness: Option<muxa::account_swap::worker_startup::Report>,
     pub launch_id: Option<String>,
     pub launch_receipt: Option<Box<muxa::launch_identity::LaunchReceipt>>,
     pub host: LaunchHost,
@@ -483,6 +487,8 @@ pub struct StartResult {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct AgentStartOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
+    input_readiness: Option<muxa::account_swap::worker_startup::Report>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     launch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     launch_receipt: Option<Box<muxa::launch_identity::LaunchReceipt>>,
@@ -509,6 +515,7 @@ struct AgentStartOutput {
 impl AgentStartOutput {
     fn tmux(result: &StartResult) -> Self {
         Self {
+            input_readiness: result.input_readiness.clone(),
             schema_version: 1,
             launch_id: result.launch_id.clone(),
             launch_receipt: result.launch_receipt.clone(),
@@ -623,6 +630,7 @@ async fn run_native(
         .await
         .context("spawning native muxa agent session")?;
     let result = AgentStartOutput {
+        input_readiness: None,
         launch_id: None,
         launch_receipt: None,
         schema_version: 1,
@@ -954,7 +962,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         }
     }
 
-    if request.worker_spawn.is_some() {
+    if request.purpose == muxa::collaboration::LaunchPurpose::Worker {
         // Launching was persisted before creation. A crash in the small
         // create-to-stamp gap remains Uncertain and cannot trigger a respawn.
         // Once stamped, any daemon client can reconcile this exact launch.
@@ -1046,6 +1054,20 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         }
     }
     crate::spawn_provenance::record(&request, &pane, &launch_id);
+    let input_readiness = if request.purpose == muxa::collaboration::LaunchPurpose::Worker
+        && prompt.is_none()
+        && matches!(request.agent, AgentProgram::Claude | AgentProgram::Codex)
+    {
+        let report =
+            crate::worker_startup::prepare(&pane, &cwd, &launch_id, request.bypass_permissions)?;
+        anyhow::ensure!(report.state == muxa::account_swap::worker_startup::State::Ready,
+            "worker pane {pane}, launch {launch_id}, was created but is not input-ready ({:?}): {}; the pane is retained, no task was sent",
+            report.state, report.reason.as_deref().unwrap_or("startup did not finish"));
+        Some(report)
+    } else {
+        None
+    };
+
     // Minting belongs to the agent's session-start hook, which reaches the
     // room's arbiter. Doing it here too would allocate from a namespace this
     // process cannot see all of — the bug the arbiter exists to close — so an
@@ -1054,6 +1076,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     let alias = request.alias;
 
     Ok(StartResult {
+        input_readiness,
         launch_id: Some(launch_id),
         launch_receipt: Some(Box::new(receipt)),
         host: LaunchHost::Tmux,
@@ -1982,6 +2005,7 @@ mod tests {
     #[test]
     fn agent_start_json_uses_one_schema_for_tmux_and_native() {
         let tmux = AgentStartOutput {
+            input_readiness: None,
             launch_id: None,
             launch_receipt: None,
             schema_version: 1,

@@ -90,7 +90,10 @@ pub(super) async fn main() -> Result<()> {
     let invalidates_directory = matches!(
         &cmd,
         Cmd::Agent {
-            action: AgentCmd::Start(_) | AgentCmd::Control(_) | AgentCmd::Move(_)
+            action: AgentCmd::Start(_)
+                | AgentCmd::Prepare(_)
+                | AgentCmd::Control(_)
+                | AgentCmd::Move(_)
         } | Cmd::Window { .. }
             | Cmd::Reload(_)
             | Cmd::Restore(_)

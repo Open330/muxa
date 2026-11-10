@@ -21,6 +21,7 @@ pub(crate) mod effects;
 mod executor_tests;
 mod io;
 pub(crate) mod preflight;
+pub mod worker_startup;
 
 use crate::backend::SharedBackend;
 use crate::event::{AgentKind, AgentState};

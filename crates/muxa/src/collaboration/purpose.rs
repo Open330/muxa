@@ -45,6 +45,19 @@ pub struct ProcessFence {
 }
 
 impl ProcessFence {
+    /// A launch-scoped process identity, including macOS and Windows births.
+    pub fn capture(pid: u32) -> Option<Self> {
+        Some(Self {
+            pid,
+            birth: process_birth(pid)?,
+        })
+    }
+
+    /// Unknown liveness is not permission to type into a reused pane.
+    pub fn is_current(&self) -> bool {
+        process_birth(self.pid).as_deref() == Some(self.birth.as_str())
+    }
+
     pub(crate) fn exited_status(&self) -> Option<bool> {
         if let Some(birth) = process_birth(self.pid) {
             Some(birth != self.birth)

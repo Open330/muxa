@@ -253,14 +253,7 @@ impl Control {
                 if let Some(rmux) = ambient_rmux() {
                     return rmux.capture_control(args).map_err(anyhow::Error::msg);
                 }
-                let output = ambient_command().args(args).output()?;
-                anyhow::ensure!(
-                    output.status.success(),
-                    "{}: {}",
-                    args[0],
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-                Ok(String::from_utf8(output.stdout)?)
+                muxa::tmux::capture_control_on(None, args).map_err(anyhow::Error::msg)
             }
         }
     }

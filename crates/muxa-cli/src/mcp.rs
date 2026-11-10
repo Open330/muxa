@@ -3957,6 +3957,69 @@ fn spawned_peer_role<'a>(target: &'a str, args: &Value) -> &'a str {
     })
 }
 
+/// Explicit peer input paths become bounded provider context directories before
+/// startup. This does not change the provider's tool approval mode or the
+/// request's read-only contract. Missing future output paths grant nothing.
+fn peer_context_options(
+    program: crate::agent_launch::AgentProgram,
+    mut options: Vec<String>,
+    args: &Value,
+    cwd: Option<&str>,
+) -> std::result::Result<Vec<String>, String> {
+    use crate::agent_launch::AgentProgram;
+    if !matches!(program, AgentProgram::Claude | AgentProgram::Codex) {
+        return Ok(options);
+    }
+    let base = cwd
+        .map(std::path::PathBuf::from)
+        .map_or_else(std::env::current_dir, Ok)
+        .map_err(|e| e.to_string())?;
+    let base = muxa::paths::canonicalize(&base).map_err(|e| e.to_string())?;
+    let mut roots = std::collections::BTreeSet::new();
+    for path in args
+        .get("paths")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let path = path.as_str().ok_or("peer paths must be strings")?;
+        let path = std::path::Path::new(path);
+        let path = if path.is_absolute() {
+            path.to_owned()
+        } else {
+            base.join(path)
+        };
+        let Ok(path) = muxa::paths::canonicalize(&path) else {
+            continue;
+        };
+        let dir = if path.is_dir() {
+            path
+        } else {
+            path.parent()
+                .ok_or("peer input has no directory")?
+                .to_owned()
+        };
+        if dir.parent().is_none() {
+            return Err("peer context cannot be the filesystem root".into());
+        }
+        if !dir.starts_with(&base) {
+            roots.insert(dir);
+        }
+    }
+    if roots.len() > 32 {
+        return Err("peer context is limited to 32 directories".into());
+    }
+    let at = options
+        .iter()
+        .position(|a| a == "--")
+        .unwrap_or(options.len());
+    let extra = roots
+        .into_iter()
+        .flat_map(|dir| ["--add-dir".into(), dir.to_string_lossy().into_owned()]);
+    options.splice(at..at, extra);
+    Ok(options)
+}
+
 async fn acquire_peer_capacity(
     client: &Client,
     origin: &CollaborationOrigin,
@@ -4042,7 +4105,12 @@ async fn spawn_peer(
         purpose: muxa::collaboration::LaunchPurpose::Worker,
         socket: client.socket().to_path_buf(),
         agent: program,
-        options: config.launch_options(program.label(), None),
+        options: peer_context_options(
+            program,
+            config.launch_options(program.label(), None),
+            args,
+            room.current.cwd.as_deref(),
+        )?,
         placement: crate::agent_launch::Placement::Pane,
         target: Some(native_pane.to_string()),
         cwd: room.current.cwd.as_deref().map(std::path::PathBuf::from),
@@ -8849,5 +8917,48 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("unknown request kind"));
         server.await.unwrap();
+    }
+    #[test]
+    fn peer_context_is_bounded_deduplicated_and_before_flag_separator() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("cwd");
+        let inputs = root.path().join("inputs");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&inputs).unwrap();
+        let file = inputs.join("evidence.json");
+        std::fs::write(&file, "{}").unwrap();
+        let args = json!({"paths":[inputs, file, cwd.join("future-output")]});
+        let options = vec![
+            "--permission-mode".into(),
+            "default".into(),
+            "--".into(),
+            "body".into(),
+        ];
+        let out = peer_context_options(
+            crate::agent_launch::AgentProgram::Claude,
+            options,
+            &args,
+            cwd.to_str(),
+        )
+        .unwrap();
+        assert_eq!(&out[..2], ["--permission-mode", "default"]);
+        assert_eq!(out[2], "--add-dir");
+        assert_eq!(
+            std::path::Path::new(&out[3]),
+            muxa::paths::canonicalize(&inputs).unwrap()
+        );
+        assert_eq!(&out[4..], ["--", "body"]);
+    }
+    #[test]
+    #[cfg(unix)]
+    fn peer_context_never_authorizes_the_filesystem_root() {
+        let args = json!({"paths":["/"]});
+        assert!(peer_context_options(
+            crate::agent_launch::AgentProgram::Claude,
+            vec![],
+            &args,
+            Some("/tmp")
+        )
+        .is_err());
     }
 }

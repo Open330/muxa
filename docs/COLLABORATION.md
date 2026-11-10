@@ -1015,3 +1015,37 @@ explain how to cancel that queued request before using worker routing.
 On macOS, `muxa init --component muxad-launchd --yes` records the installing
 shell's PATH in the LaunchAgent so headless providers can find user-installed
 CLIs and account shims. Run it from the shell that normally launches your agents.
+
+
+### Mechanical worker startup
+
+Fresh Claude and Codex workers without an initial prompt are prepared before
+`muxa peer` sends its durable request. The launcher joins wrapped terminal lines,
+checks a stable input composer, and answers only recognized initial setup gates
+for the explicitly requested working directory. Folder settings, tool approvals,
+logins, unknown dialogs, drafts and running turns are never silently accepted.
+The provider's configured approval mode is retained; no global permission or
+trust file is rewritten. Explicitly configured bypass consent is not inferred.
+
+A verified launch reports `input_readiness.state = "ready"` and the setup gates
+it answered. Exiting, changing the pane/process/directory, failing a key write,
+or missing the 30-second deadline returns failure and retains the pane for
+inspection. Launch creation alone is never reported as input readiness. This is
+an observation at startup, not a guarantee against later tool approvals or caps.
+
+Existing input directories named in a peer request's `paths` are passed as
+bounded provider `--add-dir` context roots. This avoids first-read prompts for
+explicit review inputs outside the worker cwd, without changing the request's
+read-only contract. Missing future paths grant no extra root; filesystem roots
+are refused. Providers without the Claude/Codex startup probe retain their
+existing behavior and do not claim a verified input-ready receipt.
+
+An exact dedicated worker can be rechecked without a model turn:
+
+```sh
+muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux-socket default
+```
+
+The command verifies the worker launch marker, process birth and directory
+before each setup key; it refuses a primary or recycled pane. It reports JSON
+and exits nonzero unless a stable empty input composer is observed.
