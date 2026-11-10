@@ -4,8 +4,8 @@
 use super::{
     composer_draft,
     io::{self, Clock},
-    option_rows, pending_dialog, turn_running, type_keys, wait_for_resume_answering, Consent,
-    Resume, READY_QUIET, STARTUP_DIALOGS,
+    option_rows, pending_dialog, turn_running, type_keys, wait_for_resume_answering_with_probe,
+    Consent, Resume, READY_QUIET, STARTUP_DIALOGS,
 };
 use crate::event::AgentKind;
 use serde::Serialize;
@@ -77,6 +77,44 @@ fn normalize_capture(screen: String) -> String {
     screen
 }
 
+// Custom statusLine replaces Claude's default prompt hints. This probe is
+// worker-only: account-swap resume must never accept an old composer's frame.
+// Restrict the actual composer to the bottom of the screen, leaving at most
+// three footer lines and rejecting shell/relaunch output underneath it.
+fn claude_composer_visible(screen: &str) -> bool {
+    let tail = super::screen_tail(screen, 12);
+    let lines: Vec<_> = tail.lines().collect();
+    let rules: Vec<_> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = line.trim();
+            (line.chars().count() >= 5 && line.chars().all(|c| c == '─')).then_some(index)
+        })
+        .collect();
+    let [.., top, bottom] = rules[..] else {
+        return false;
+    };
+    let footer: Vec<_> = lines[bottom + 1..]
+        .iter()
+        .map(|line| line.trim())
+        .filter(|line| !line.is_empty())
+        .collect();
+    footer.len() <= 3
+        && !footer.iter().any(|line| {
+            line.starts_with(['$', '❯', '›', '>', '#', '%'])
+                || line.starts_with("claude ")
+                || line.starts_with("exec ")
+                || line.contains(" $ ")
+                || line.contains(" % ")
+                || line.contains(" --resume")
+                || line.contains(" --session-id")
+        })
+        && lines[top + 1..bottom]
+            .first()
+            .is_some_and(|line| line.trim_start().starts_with('❯'))
+}
+
 /// Reuses the account-switch startup parser and settling rules. `alive` must
 /// check the original launch identity, not merely that a pane still exists.
 /// The permission profile is retained: bypass consent is possible only when
@@ -123,7 +161,7 @@ fn prepare_with(
 ) -> Report {
     let last = std::cell::RefCell::new(String::new());
     let mut answered = Vec::new();
-    let resume = wait_for_resume_answering(
+    let resume = wait_for_resume_answering_with_probe(
         clock,
         || {
             let raw = capture()?;
@@ -163,6 +201,10 @@ fn prepare_with(
         quiet,
         tick,
         &mut answered,
+        &|screen| {
+            super::agent_prompt_visible(screen)
+                || (kind == AgentKind::ClaudeCode && claude_composer_visible(screen))
+        },
     );
     let (state, reason) = match resume {
         Resume::Ready
@@ -261,16 +303,32 @@ mod tests {
             run(|| Some(screen.into()), || true, |_| panic!()).state,
             State::Ready
         );
-        for unproven in [
-            "Claude Code\n❯ ",
-            "$ claude\n─────\n❯ \n─────",
-            "Claude Code\n─────\nLoading\n─────",
-        ] {
+        for unproven in ["Claude Code\n❯ ", "Claude Code\n─────\nLoading\n─────"]
+        {
             assert_eq!(
                 run(|| Some(unproven.into()), || true, |_| panic!()).state,
                 State::Unsettled
             );
         }
+        for suffix in [
+            "\n$ claude --resume old",
+            "\n❯ exec claude",
+            "\nuser@host % claude --session-id new",
+            "\nline1\nline2\nline3\nline4",
+        ] {
+            assert_eq!(
+                run(|| Some(format!("{screen}{suffix}")), || true, |_| panic!()).state,
+                State::Unsettled
+            );
+        }
+        // The shared account-swap probe must retain its old policy: a dead
+        // composer's frame can remain above a fresh relaunch.
+        assert!(!super::super::agent_prompt_visible(screen));
+        let without_header = screen.lines().skip(1).collect::<Vec<_>>().join("\n");
+        assert_eq!(
+            run(|| Some(without_header.clone()), || true, |_| panic!()).state,
+            State::Ready
+        );
         let draft = screen.replace("❯ \u{a0}", "❯ unsent draft");
         assert_eq!(
             run(|| Some(draft.clone()), || true, |_| panic!()).state,
