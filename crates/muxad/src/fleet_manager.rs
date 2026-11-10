@@ -16,7 +16,7 @@ use muxa::fleet::{
     FleetCapturedWindowPane, FleetCommandEnvelope, FleetCommandReceiver, FleetCommandResult,
     FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
-    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
+    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_SEND_KEYS_CAPABILITY, FLEET_MAX_DIAGNOSTIC_BYTES,
     FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
@@ -573,6 +573,20 @@ async fn run_local_work_command(
     .await
     .map(FleetCommandResult::command)
     .map_err(|error| error.to_string())
+}
+
+/// Navigation keys reach only a relay that says it takes them; an older one
+/// would drop the request and leave the caller waiting.
+fn send_keys_refusal(alias: &str, hello: &RelayHello, operation: &FleetOperation) -> Option<String> {
+    if !matches!(operation, FleetOperation::SendKeys { .. }) {
+        return None;
+    }
+    if hello.capabilities.iter().any(|capability| capability == FLEET_SEND_KEYS_CAPABILITY) {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot take navigation keys; upgrade muxa on that host"
+    ))
 }
 
 fn relay_supports_work_command(capabilities: &[String]) -> bool {
@@ -1306,6 +1320,12 @@ impl HostTask {
                         continue;
                     }
                     if let Some(refusal) =
+                        send_keys_refusal(&self.alias, &connected.hello, &command.operation)
+                    {
+                        let _ = command.reply.send(Err(refusal));
+                        continue;
+                    }
+                    if let Some(refusal) =
                         unbounded_claim_refusal(&self.alias, &connected.hello, &command.operation)
                     {
                         let _ = command.reply.send(Err(refusal));
@@ -1915,6 +1935,50 @@ mod tests {
         assert!(FLEET_CAPABILITIES.contains(&FLEET_BOUNDED_CLAIM_CAPABILITY));
         assert!(unbounded_claim_refusal("remote", &current, &claim).is_none());
         assert!(unbounded_claim_refusal("remote", &current, &list).is_none());
+    }
+
+    #[test]
+    fn navigation_keys_reach_only_relays_that_take_them() {
+        let pane = PaneKey {
+            window: WindowKey {
+                session: muxa::SessionKey {
+                    endpoint: muxa::BackendEndpoint {
+                        host: HostKind::Tmux,
+                        socket: "default".into(),
+                    },
+                    session_id: "$1".into(),
+                },
+                window_id: "@1".into(),
+            },
+            pane_id: "%1".into(),
+        };
+        let hello = |capabilities: &[&str]| RelayHello {
+            fleet_protocol: FLEET_PROTOCOL_VERSION,
+            min_fleet_protocol: FLEET_PROTOCOL_VERSION,
+            node_id: NodeId::generate(),
+            hostname: "remote".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            muxa_version: "0.0.0".into(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            daemon_generation: None,
+            boot_id: "boot".into(),
+            backends: Vec::new(),
+            server_time: OffsetDateTime::now_utc(),
+        };
+        let keys = FleetOperation::SendKeys {
+            pane: pane.clone(),
+            keys: vec![muxa::fleet::FleetKey::Down, muxa::fleet::FleetKey::Enter],
+        };
+        let capture = FleetOperation::Capture { pane };
+        // A relay from before navigation keys advertised send_prompt only.
+        let legacy = hello(&["capture", "send_prompt"]);
+        let refusal = send_keys_refusal("remote", &legacy, &keys).unwrap();
+        assert!(refusal.contains("host 'remote'"), "{refusal}");
+        assert!(refusal.contains("upgrade muxa"), "{refusal}");
+        assert!(send_keys_refusal("remote", &legacy, &capture).is_none());
+        let current = hello(FLEET_CAPABILITIES);
+        assert!(send_keys_refusal("remote", &current, &keys).is_none());
     }
 
     #[test]

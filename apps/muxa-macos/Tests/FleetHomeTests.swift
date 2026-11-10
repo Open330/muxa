@@ -717,3 +717,18 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(Set(waiting.map(\.agent.agentSessionID)) == ["impl", "review"])
     #expect(waiting.first?.id == work.focus?.id)
 }
+
+@Test func twoCursorsLeaveTheSelectionUnknown() throws {
+    let screen = "Choose a permission\n❯ 1. Yes, once\n❯ 2. Always allow\n  3. No\nEnter to select"
+    let dialog = try #require(FleetChoiceDialog.parse(screen))
+    #expect(dialog.selected == nil)
+    #expect(dialog.moves(to: 1) == nil)
+}
+
+@Test func aChangedDescriptionIsADifferentChoice() throws {
+    let shown = try #require(FleetChoiceDialog.parse("Choose action\n❯ 1. Continue\n     Run npm test\n  2. Cancel"))
+    let now = try #require(FleetChoiceDialog.parse("Choose action\n❯ 1. Continue\n     Delete production data\n  2. Cancel"))
+    #expect(shown.question == now.question)
+    #expect(shown.options.map(\.label) == now.options.map(\.label))
+    #expect(shown.options != now.options)
+}

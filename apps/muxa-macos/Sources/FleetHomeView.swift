@@ -248,6 +248,11 @@ struct FleetHomeView: View {
         }
     }
 
+    /// A draft for one of the unit's other waiting agents.
+    private static func agentDraftKey(_ work: FleetWork, _ hosted: MuxaHostedAgent) -> String {
+        "\(work.id)#\(hosted.id)"
+    }
+
     private func inspector(_ work: FleetWork) -> some View {
         FleetWorkInspector(
             model: model,
@@ -267,7 +272,9 @@ struct FleetHomeView: View {
                 reviewed.markReviewed(work)
                 reviewed.save(to: .standard)
                 selectedID = nil
-            }
+            },
+            agentDraft: { draftBinding(Self.agentDraftKey(work, $0)) },
+            submitAgent: { submit(for: Self.agentDraftKey(work, $0)) }
         )
         .id(work.id)
     }
@@ -703,6 +710,10 @@ private struct FleetWorkInspector: View {
     let submit: () -> Void
     let approveLikeThis: () -> Void
     let markReviewed: () -> Void
+    /// Drafts and sends for the unit's other waiting agents, kept by the
+    /// board like the unit's own.
+    let agentDraft: (MuxaHostedAgent) -> Binding<FleetReplyDraft>
+    let submitAgent: (MuxaHostedAgent) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -798,7 +809,14 @@ private struct FleetWorkInspector: View {
                         .font(.system(size: 11, weight: .bold))
                         .foregroundStyle(.orange)
                     ForEach(others) { hosted in
-                        FleetWaitingAgent(model: model, hosted: hosted, open: open)
+                        FleetWaitingAgent(model: model, hosted: hosted, open: open) {
+                            FleetReplyField(
+                                work: work,
+                                draft: agentDraft(hosted),
+                                submit: { submitAgent(hosted) },
+                                agent: hosted
+                            )
+                        }
                     }
                 }
                 .padding(.top, 4)
@@ -883,8 +901,14 @@ struct FleetReplyField: View {
     let work: FleetWork
     @Binding var draft: FleetReplyDraft
     let submit: () -> Void
+    /// The agent the field answers when it is not the unit's reply target:
+    /// another agent in the unit waiting for words.
+    var agent: MuxaHostedAgent?
 
-    private var currentTarget: FleetReplyTarget? { FleetBoard.replyTarget(for: work) }
+    private var currentTarget: FleetReplyTarget? {
+        guard let agent else { return FleetBoard.replyTarget(for: work) }
+        return agent.agent.state == "waiting_input" ? FleetReplyTarget(kind: .answer, agent: agent) : nil
+    }
 
     /// Text written for a question the unit has moved past.
     private var isStale: Bool {

@@ -83,6 +83,10 @@ pub const FLEET_MAILBOX_WATCH_CAPABILITY: &str = "mailbox_watch";
 /// requests. An older relay claims the whole inbox and then truncates the
 /// reply, leaving the overflow claimed but never shown.
 pub const FLEET_BOUNDED_CLAIM_CAPABILITY: &str = "collaboration_claim_bounded_v1";
+/// Relay capability: the relay takes [`RelayRequest::SendKeys`]. An older
+/// relay cannot read the request and answers without its id, so the
+/// controller refuses before sending instead of waiting out a timeout.
+pub const FLEET_SEND_KEYS_CAPABILITY: &str = "send_keys_v1";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
@@ -100,6 +104,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "orchestration_v1",
     "raw_capture_base64",
     FLEET_WORK_COMMAND_CAPABILITY,
+    FLEET_SEND_KEYS_CAPABILITY,
 ];
 
 /// Read one UTF-8 line without allowing a peer that withholds `\n` to grow

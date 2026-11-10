@@ -43,12 +43,12 @@ struct FleetChoiceDialog: Equatable, Sendable {
         // The last option row, then walk up to option 1.
         guard let lastRow = lines.indices.last(where: { optionRow(lines[$0]) != nil }) else { return nil }
         var rows: [(index: Int, number: Int, label: String)] = []
-        var selected: Int?
+        var cursors: [Int] = []
         var index = lastRow
         while index >= 0 {
             if let row = optionRow(lines[index]) {
                 rows.insert((index, row.number, row.label), at: 0)
-                if isSelected(lines[index]) { selected = row.number }
+                if isSelected(lines[index]) { cursors.append(row.number) }
                 if row.number == 1 { break }
             } else if isRule(lines[index]) {
                 // Claude sets "Chat about this" apart below a rule.
@@ -59,6 +59,8 @@ struct FleetChoiceDialog: Equatable, Sendable {
         }
         guard let first = rows.first, first.number == 1,
               rows.map(\.number) == Array(1...rows.count) else { return nil }
+        // Exactly one cursor, or nobody can tell which option Enter takes.
+        let selected = cursors.count == 1 ? cursors[0] : nil
         var options: [Option] = []
         for (offset, row) in rows.enumerated() {
             let end = offset + 1 < rows.count ? rows[offset + 1].index : min(lines.count, row.index + 4)

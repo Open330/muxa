@@ -12,6 +12,10 @@ struct FleetChoicePanel<Fallback: View>: View {
     @ViewBuilder var fallback: () -> Fallback
 
     @State private var dialog: FleetChoiceDialog?
+    /// Who and where the dialog was read from: the pane and the agent's
+    /// session at that wait. Input goes only to that pane while it still
+    /// holds them.
+    @State private var seen: Seen?
     @State private var loading = false
     @State private var sending = false
     @State private var ownWords = ""
@@ -122,19 +126,43 @@ struct FleetChoicePanel<Fallback: View>: View {
         }
     }
 
-    private func capture() async throws -> FleetChoiceDialog? {
-        guard let pane = hosted.pane else { return nil }
-        let capture = try await model.client.captureFleetPane(host: hosted.host, pane: pane)
+    struct Seen: Equatable {
+        let pane: MuxaWatchPaneIdentity
+        let target: FleetReplyTarget
+    }
+
+    private func capture(host: MuxaFleetHostIdentity, pane: MuxaPaneInfo) async throws -> FleetChoiceDialog? {
+        let capture = try await model.client.captureFleetPane(host: host, pane: pane)
         return capture.screenText.flatMap(FleetChoiceDialog.parse)
+    }
+
+    /// The pane the dialog was read from, as it is now; throws unless it
+    /// still holds the same agent session at the same wait.
+    private func live(_ seen: Seen) throws -> MuxaWatchPane {
+        guard let current = model.executionSnapshot.watchPane(id: seen.pane),
+              seen.target.matches(current.agent),
+              ["waiting_choice", "waiting_input"].contains(current.agent?.state ?? "") else {
+            throw MuxaIPCError.server(String(localized: "The agent moved on. Open its pane to see where it is."))
+        }
+        return current
     }
 
     private func load() async {
         loading = true
         defer { loading = false }
         do {
-            let read = try await capture()
+            guard let pane = hosted.pane, let paneID = MuxaAgentAttentionCenter.paneIdentity(for: hosted) else {
+                dialog = nil
+                seen = nil
+                return
+            }
+            // Taken before the read, so a wait that ends during it shows up
+            // as a mismatch when choosing.
+            let target = FleetReplyTarget(kind: .answer, agent: hosted)
+            let read = try await capture(host: hosted.host, pane: pane)
             guard !Task.isCancelled else { return }
             dialog = read
+            seen = read == nil ? nil : Seen(pane: paneID, target: target)
             error = nil
         } catch {
             // A read cut short (the agent moved on, the view went away) is
@@ -151,46 +179,45 @@ struct FleetChoicePanel<Fallback: View>: View {
     }
 
     /// Moves the dialog's cursor to the option with the arrow keys and
-    /// presses Enter, after reading the screen again: the same agent
-    /// session, still waiting, with the same question and the same option
-    /// at that number. For "Type something", the person's words are typed
-    /// on that row and submitted. Then the screen is read once more: a
-    /// question still there means the choice did not go through.
+    /// presses Enter. Before any key, the pane the dialog was read from must
+    /// still hold the same agent session at the same wait, and a fresh read
+    /// must show the same question and the same options (labels and
+    /// descriptions; only the cursor may differ); the pane is checked again
+    /// after that read, right before input. For "Type something", the
+    /// person's words are typed on that row and submitted. Then the screen
+    /// is read once more: a question still there means it did not go through.
     private func choose(_ option: FleetChoiceDialog.Option, words: String?) {
-        guard let shown = dialog, let pane = hosted.pane else { return }
+        guard let shown = dialog, let seen else { return }
         sending = true
         error = nil
         status = nil
         Task {
             defer { sending = false }
             do {
-                guard let live = model.hostedAgents.first(where: { $0.id == hosted.id }),
-                      live.agent.agentSessionID == hosted.agent.agentSessionID,
-                      live.agent.state == "waiting_choice" || live.agent.state == "waiting_input" else {
-                    throw MuxaIPCError.server(String(localized: "The agent moved on. Open its pane to see where it is."))
-                }
-                let current = try await capture()
-                guard let current, current.question == shown.question,
-                      current.options.first(where: { $0.number == option.number })?.label == option.label else {
+                var target = try live(seen)
+                let current = try await capture(host: target.host, pane: target.pane)
+                guard let current, current.question == shown.question, current.options == shown.options else {
                     dialog = current
                     throw MuxaIPCError.server(String(localized: "The question on screen changed. Check it again before choosing."))
                 }
                 guard let moves = current.moves(to: option.number) else {
                     throw MuxaIPCError.server(String(localized: "Muxa could not tell which option is selected. Open the pane to choose."))
                 }
+                target = try live(seen)
                 if let words = words?.trimmingCharacters(in: .whitespacesAndNewlines), !words.isEmpty {
                     if !moves.isEmpty {
-                        try await model.client.sendFleetKeys(host: hosted.host, pane: pane, keys: moves)
+                        try await model.client.sendFleetKeys(host: target.host, pane: target.pane, keys: moves)
                         try await Task.sleep(nanoseconds: 200_000_000)
+                        target = try live(seen)
                     }
-                    try await model.client.sendFleetPrompt(host: hosted.host, pane: pane, text: words, submit: true)
+                    try await model.client.sendFleetPrompt(host: target.host, pane: target.pane, text: words, submit: true)
                     ownWords = ""
                 } else {
-                    try await model.client.sendFleetKeys(host: hosted.host, pane: pane, keys: moves + ["enter"])
+                    try await model.client.sendFleetKeys(host: target.host, pane: target.pane, keys: moves + ["enter"])
                 }
                 try await Task.sleep(nanoseconds: 900_000_000)
-                let after = try? await capture()
-                if let after, after.question == shown.question {
+                let after = try? await capture(host: target.host, pane: target.pane)
+                if let after, after.question == shown.question, after.options == shown.options {
                     dialog = after
                     throw MuxaIPCError.server(String(localized: "The choice did not go through; the question is still on screen. Open the pane to answer."))
                 }
@@ -207,10 +234,11 @@ struct FleetChoicePanel<Fallback: View>: View {
 /// Another agent in the same unit that waits on the person: who it is, what
 /// it asks, and its own answer, so one unit with several asking agents does
 /// not hide all but the first.
-struct FleetWaitingAgent: View {
+struct FleetWaitingAgent<Answer: View>: View {
     @ObservedObject var model: AppModel
     let hosted: MuxaHostedAgent
     let open: (MuxaHostedAgent) -> Void
+    @ViewBuilder var answer: () -> Answer
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -228,71 +256,11 @@ struct FleetWaitingAgent: View {
                 .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
             if hosted.pane != nil, ["waiting_input", "waiting_choice"].contains(hosted.agent.state) {
-                FleetChoicePanel(model: model, hosted: hosted) {
-                    FleetAgentAnswerField(model: model, hosted: hosted)
-                }
-                .id(hosted.id)
+                FleetChoicePanel(model: model, hosted: hosted, fallback: answer)
+                    .id(hosted.id)
             }
         }
         .padding(10)
         .background(Color.orange.opacity(0.07), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
-    }
-}
-
-/// Words sent straight to one agent's pane, for an agent that is not the
-/// unit's reply target.
-struct FleetAgentAnswerField: View {
-    @ObservedObject var model: AppModel
-    let hosted: MuxaHostedAgent
-    @State private var text = ""
-    @State private var sending = false
-    @State private var error: String?
-    @State private var sent = false
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack(alignment: .bottom, spacing: 8) {
-                TextField("Answer \(FleetBoard.owner(hosted))", text: $text, axis: .vertical)
-                    .textFieldStyle(.roundedBorder)
-                    .lineLimit(1...5)
-                    .disabled(sending)
-                Button("Send", action: send)
-                    .buttonStyle(.muxaPrimary)
-                    .disabled(sending || text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
-            }
-            if let error {
-                Label(error, systemImage: "exclamationmark.circle.fill")
-                    .font(MuxaType.meta)
-                    .foregroundStyle(.red)
-            } else if sent {
-                Label("Sent", systemImage: "checkmark.circle.fill")
-                    .font(MuxaType.meta)
-                    .foregroundStyle(.green)
-            }
-        }
-    }
-
-    private func send() {
-        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !words.isEmpty, let pane = hosted.pane else { return }
-        sending = true
-        error = nil
-        sent = false
-        Task {
-            defer { sending = false }
-            do {
-                guard let live = model.hostedAgents.first(where: { $0.id == hosted.id }),
-                      live.agent.agentSessionID == hosted.agent.agentSessionID,
-                      live.agent.status.needsAttention else {
-                    throw MuxaIPCError.server(String(localized: "The agent moved on. Open its pane to see where it is."))
-                }
-                try await model.client.sendFleetPrompt(host: hosted.host, pane: pane, text: words, submit: true)
-                text = ""
-                sent = true
-            } catch {
-                if FleetChoicePanel<EmptyView>.isCancellation(error) { return }
-                self.error = error.localizedDescription
-            }
-        }
     }
 }

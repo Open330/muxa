@@ -211,16 +211,6 @@
         }
       }
     },
-    "Answer %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@에게 답하기"
-          }
-        }
-      }
-    },
     "App build" : {
       "localizations" : {
         "ko" : {
