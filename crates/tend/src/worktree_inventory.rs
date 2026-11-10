@@ -134,8 +134,10 @@ pub const COMMAND_BUDGET: Duration = Duration::from_secs(5);
 /// At most this many rows in a Fleet reply, so it stays far below the relay
 /// frame ceiling; the reply says how many there were in all.
 pub const FLEET_MAX_ROWS: usize = 300;
-/// At most this much of a child's output is kept.
-const MAX_OUTPUT: u64 = 1024 * 1024;
+/// At most this much of a child's output is read. Output longer than this
+/// makes the call fail: every caller reads safety evidence, and a prefix of
+/// a file list or process list is not evidence of the rest.
+const MAX_OUTPUT: u64 = 32 * 1024 * 1024;
 const OUT_OF_TIME: &str = "tend ran out of time checking it";
 
 thread_local! {
@@ -155,10 +157,10 @@ fn out_of_time(receipt: WorktreeReceipt) -> WorktreeRow {
     }
 }
 
-/// Runs `program args` and returns whether it exited 0 and up to 1 MiB of
-/// its stdout, or None when it could not start, ran past its budget (the
-/// smaller of [`COMMAND_BUDGET`] and what the scan has left), or left its
-/// output open past that budget. The child runs in its own process group,
+/// Runs `program args` and returns whether it exited 0 and all of its
+/// stdout, or None when it could not start, wrote more than
+/// [`MAX_OUTPUT`], ran past its budget (the smaller of [`COMMAND_BUDGET`]
+/// and what the scan has left), or left its output open past that budget. The child runs in its own process group,
 /// and the whole group is killed on expiry, so a helper that git or du
 /// started and that holds the pipe open cannot outlive the budget either.
 pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String)> {
@@ -181,16 +183,18 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
-    // Read on another thread so a chatty child never blocks on a full pipe;
-    // keep the first MiB and throw the rest away. The thread reports back
-    // over a channel, so waiting for it is bounded too.
+    // Read on another thread so a chatty child never blocks on a full pipe.
+    // Past the cap the rest is drained and the output reported as cut
+    // (None), never passed off as complete. The thread reports back over a
+    // channel, so waiting for it is bounded too.
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut kept = Vec::new();
         let mut pipe = stdout;
-        let _ = (&mut pipe).take(MAX_OUTPUT).read_to_end(&mut kept);
+        let read = (&mut pipe).take(MAX_OUTPUT + 1).read_to_end(&mut kept);
         let _ = std::io::copy(&mut pipe, &mut std::io::sink());
-        let _ = sender.send(kept);
+        let complete = read.is_ok() && kept.len() as u64 <= MAX_OUTPUT;
+        let _ = sender.send(complete.then_some(kept));
     });
     let status = loop {
         match child.try_wait() {
@@ -203,6 +207,7 @@ pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool,
         receiver
             .recv_timeout(deadline.saturating_duration_since(Instant::now()))
             .ok()
+            .flatten()
     });
     if let (Some(status), Some(output)) = (status, output) {
         Some((
@@ -321,7 +326,7 @@ fn process_cwds() -> Option<Vec<PathBuf>> {
         // lsof lists the processes this user may inspect; another user's
         // are left out, as above. -F0 ends every field with NUL, so a path
         // holding a newline still parses.
-        let (_, out) = bounded(
+        let (ok, out) = bounded(
             "lsof",
             &[
                 "-nPw".as_ref(),
@@ -330,15 +335,22 @@ fn process_cwds() -> Option<Vec<PathBuf>> {
                 "-F0n".as_ref(),
             ],
         )?;
-        let cwds: Vec<PathBuf> = out
-            .split('\0')
-            .map(|field| field.trim_start_matches('\n'))
-            .filter_map(|field| field.strip_prefix('n'))
-            .map(PathBuf::from)
-            .collect();
-        // lsof always reports at least itself; nothing means it failed.
-        (!cwds.is_empty()).then_some(cwds)
+        lsof_cwds(ok, &out)
     }
+}
+
+/// The working directories in `lsof -F0n` output. A failed run may have
+/// printed some processes and not others, and lsof always reports at least
+/// itself, so a failure or nothing at all reads as unavailable.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn lsof_cwds(ok: bool, out: &str) -> Option<Vec<PathBuf>> {
+    let cwds: Vec<PathBuf> = out
+        .split('\0')
+        .map(|field| field.trim_start_matches('\n'))
+        .filter_map(|field| field.strip_prefix('n'))
+        .map(PathBuf::from)
+        .collect();
+    (ok && !cwds.is_empty()).then_some(cwds)
 }
 
 pub(crate) fn inspect(receipt: WorktreeReceipt, live: &Liveness) -> WorktreeRow {
@@ -657,14 +669,21 @@ fn check_activity(
         return;
     }
     if let ReceiptOrigin::Dispatch { dispatch_id, .. } = &receipt.origin {
-        // A dispatch counts as finished when its record says completed, or
-        // when its Work run finished; anything else, a missing record
-        // included, keeps it.
-        if !matching.is_empty() {
-            return;
-        }
+        // The dispatch's own record decides. It is finished when it says
+        // completed, or when it says launched, blocked or unknown (states a
+        // record keeps until someone refreshes it) and the Run for exactly
+        // its checkout finished: the evidence `tend dispatch status` uses to
+        // mark it completed. A Run for the same Work elsewhere proves nothing
+        // about this dispatch. Failed, preparing, missing or unreadable
+        // records keep it.
+        let own_run_finished = matching.iter().any(|run| {
+            run.finished() && lenient_canonical(&run.cwd) == lenient_canonical(&receipt.path)
+        });
         match dispatch_state(live.dispatches.as_deref(), dispatch_id) {
             Ok(Some(state)) if state == "completed" => {}
+            Ok(Some(state))
+                if own_run_finished
+                    && matches!(state.as_str(), "launched" | "blocked" | "unknown") => {}
             Ok(Some(state)) => reasons.push(format!("its dispatch is {state}")),
             Ok(None) => reasons.push("tend has no record of its dispatch".into()),
             Err(error) => reasons.push(format!("could not read its dispatch: {error}")),
@@ -790,6 +809,26 @@ mod tests {
             bounded("echo", &["hi".as_ref()]),
             Some((true, "hi\n".into()))
         );
+    }
+
+    #[test]
+    fn output_past_the_cap_fails_instead_of_passing_as_complete() {
+        let over = (MAX_OUTPUT + 1).to_string();
+        let script = format!("head -c {over} /dev/zero");
+        assert!(bounded("sh", &["-c".as_ref(), script.as_ref()]).is_none());
+        let fits = bounded("sh", &["-c".as_ref(), "head -c 2000000 /dev/zero".as_ref()]).unwrap();
+        assert_eq!(fits.1.len(), 2_000_000);
+    }
+
+    #[test]
+    fn a_failed_or_empty_lsof_is_no_process_list() {
+        let out = "p1\0\nfcwd\0n/tmp\0\np2\0\nfcwd\0n/with\nnewline\0\n";
+        assert_eq!(
+            lsof_cwds(true, out),
+            Some(vec![PathBuf::from("/tmp"), PathBuf::from("/with\nnewline")])
+        );
+        assert_eq!(lsof_cwds(false, out), None);
+        assert_eq!(lsof_cwds(true, ""), None);
     }
 
     #[test]

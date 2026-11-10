@@ -1106,6 +1106,33 @@ mod tests {
             "{:?}",
             row.blockers
         );
+        // A finished Run for the same Work in another folder says nothing
+        // about this dispatch; the Run for exactly its checkout does.
+        let elsewhere = Liveness {
+            runs: Ok(vec![run_json("run", &f.repo, false)]),
+            dispatches: Some(dispatches.clone()),
+            ..quiet()
+        };
+        let row = worktree_inventory::inspect(by_dispatch.clone(), &elsewhere);
+        assert!(
+            row.blockers
+                .iter()
+                .any(|b| b.contains("dispatch is launched")),
+            "{:?}",
+            row.blockers
+        );
+        let own = Liveness {
+            runs: Ok(vec![run_json("run", &f.tree, false)]),
+            dispatches: Some(dispatches.clone()),
+            ..quiet()
+        };
+        assert!(worktree_inventory::inspect(by_dispatch.clone(), &own).candidate);
+        std::fs::write(
+            dispatches.join(format!("{id}.json")),
+            r#"{"state":"failed"}"#,
+        )
+        .unwrap();
+        assert!(!worktree_inventory::inspect(by_dispatch.clone(), &own).candidate);
         std::fs::write(
             dispatches.join(format!("{id}.json")),
             r#"{"state":"completed"}"#,
