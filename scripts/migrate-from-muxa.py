@@ -709,10 +709,10 @@ def migrate_shell_and_tmux(m: Migration):
 def migrate_live_tmux(m: Migration):
     """Copy @muxa_* user options on live sessions/windows/panes to @tend_*,
     so running Work keeps its identity, then unset the old ones."""
-    print("\nLive tmux options")
-    if not have("tmux"):
-        return
-    servers = [["tmux"]] + [["tmux", "-S", os.environ[v]] for v in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET") if os.environ.get(v)]
+    print("\nLive tmux and rmux options")
+    servers = [[mux] for mux in ("tmux", "rmux") if have(mux)]
+    if have("tmux"):
+        servers += [["tmux", "-S", os.environ[v]] for v in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET") if os.environ.get(v)]
     for tmux in servers:
         sessions = capture(tmux + ["list-sessions", "-F", "#{session_id}"]).split()
         if not sessions:
@@ -734,13 +734,14 @@ def migrate_live_tmux(m: Migration):
                     new_name = TMUX_OPTION.sub(r"@tend\1", name)
                     subprocess.run(tmux + ["set-option"] + scope + ["-t", target, new_name, value], capture_output=True)
                     subprocess.run(tmux + ["set-option"] + scope + ["-u", "-t", target, name], capture_output=True)
-        sock = re.search(r"^MUXA_SOCKET=(.*)$", capture(tmux + ["show-environment", "-g"]), re.M)
-        if sock:
-            value = surgical_rename(sock.group(1))
-            m.step(f"{' '.join(tmux)}: TEND_SOCKET={value} in the global environment")
+        # MUXA_SOCKET, MUXA_HOST(S)… in the server's global environment are
+        # inherited by every agent it starts: move them all.
+        for name, value in re.findall(r"^(MUXA_[A-Z0-9_]+)=(.*)$", capture(tmux + ["show-environment", "-g"]), re.M):
+            new_name, new_value = ENV_NAME.sub(r"TEND_\1", name), surgical_rename(value)
+            m.step(f"{' '.join(tmux)}: {new_name}={new_value} in the global environment")
             if m.apply:
-                subprocess.run(tmux + ["set-environment", "-g", "TEND_SOCKET", value], capture_output=True)
-                subprocess.run(tmux + ["set-environment", "-gu", "MUXA_SOCKET"], capture_output=True)
+                subprocess.run(tmux + ["set-environment", "-g", new_name, new_value], capture_output=True)
+                subprocess.run(tmux + ["set-environment", "-gu", name], capture_output=True)
 
 
 def migrate_macos_app(m: Migration, keychain: str | None):

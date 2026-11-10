@@ -72,8 +72,9 @@ edit instead. `brew install python` gives a newer one.
   symlinked dotfile points to (keeping the link), and writes a TOML file
   only after checking that the result still parses.
 - Relinks the `tend-collaboration` skill for Claude Code and Codex.
-- Copies `@muxa_*` options on running tmux sessions, windows and panes to
-  `@tend_*`, so Work that is already running keeps its identity.
+- Copies `@muxa_*` options on running tmux and rmux sessions, windows and panes
+  to `@tend_*`, so Work that is already running keeps its identity, and moves
+  `MUXA_*` variables in their global environment to `TEND_*`.
 - macOS: copies app preferences from `dev.muxa.mac` to `dev.tend.mac`, and
   Ask provider API keys from the `dev.muxa.mac.ask-provider` keychain
   service to `dev.tend.mac.ask-provider`. The key is handed to `security`
