@@ -143,20 +143,17 @@ fn prepare_with(
             let dialog = pending_dialog(&screen, STARTUP_DIALOGS, &[]);
             let allowed = dialog.is_some_and(|d| {
                 (d.label == "trusted the folder"
-                    && match kind {
-                        AgentKind::ClaudeCode => d.pick == Some("Yes, I trust this folder"),
-                        // Codex trust can alter sandbox defaults; keep it blocked
-                        // until its cold trust flow is independently verified.
-                        AgentKind::Codex => false,
-                        _ => false,
-                    }
+                    // Codex trust can alter sandbox defaults; keep it blocked
+                    // until its cold trust flow is independently verified.
+                    && kind == AgentKind::ClaudeCode
+                    && d.pick == Some("Yes, I trust this folder")
                     && option_rows(&screen).is_some_and(|(rows, _)| {
                         rows.len() == 2
                             && rows.iter().any(|row| {
                                 matches!(row.as_str(), "No, exit" | "No, exit Claude Code" | "Quit")
                             })
                     }))
-                    || d.label == "skipped the Codex update prompt"
+                    || (kind == AgentKind::Codex && d.label == "skipped the Codex update prompt")
                     || (bypass_requested && d.consent == Consent::Bypass)
             });
             allowed && type_keys(clock, &mut send_key, keys)
