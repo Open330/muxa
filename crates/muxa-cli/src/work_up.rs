@@ -1051,11 +1051,7 @@ fn ensure_worktree(
         (Some(plan.branch.clone()), None)
     };
     // A receipt that cannot be written only costs cleanup its proof.
-    let receipt = muxa::worktree_receipt::WorktreeReceipt::begin(
-        &plan.repo, &plan.path, branch, base, origin,
-    )
-    .map_err(|error| tracing::warn!(%error, "worktree receipt not written"))
-    .ok();
+    let receipt = crate::worktrees_cmd::begin_receipt(&plan.repo, &plan.path, branch, base, origin);
     if let Err(error) = git(&plan.repo, &args) {
         if let Some(receipt) = receipt {
             let _ = receipt.fail();

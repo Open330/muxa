@@ -358,7 +358,7 @@ async fn add_worktree_with_receipt(
     paths: &muxa::orchestration::ResolvedPaths,
     socket: &Path,
 ) -> Result<()> {
-    let receipt = muxa::worktree_receipt::WorktreeReceipt::begin(
+    let receipt = crate::worktrees_cmd::begin_receipt(
         &paths.repo,
         &paths.run,
         None,
@@ -368,9 +368,7 @@ async fn add_worktree_with_receipt(
             workspace: plan.request.workspace.clone(),
             work: plan.request.work.clone(),
         },
-    )
-    .map_err(|error| tracing::warn!(%error, "worktree receipt not written"))
-    .ok();
+    );
     if let Err(error) = git(args, socket).await {
         if let Some(receipt) = receipt {
             let _ = receipt.fail();
