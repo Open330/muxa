@@ -151,6 +151,7 @@ struct MuxaAppNotificationsSection: View {
     @AppStorage(MuxaNotificationPreferences.finishedKey) private var notifyFinished = true
     @AppStorage(MuxaNotificationPreferences.soundKey) private var sound = true
     @AppStorage(MuxaNotificationPreferences.dockBadgeKey) private var dockBadge = true
+    @AppStorage(MuxaUsageAlerts.enabledKey) private var notifyUsage = true
     @State private var authorization: MuxaUserNotifications.Authorization?
 
     var body: some View {
@@ -161,6 +162,10 @@ struct MuxaAppNotificationsSection: View {
                 .disabled(!notifyAttention && !notifyFinished)
             Toggle("Show the count on the Dock icon", isOn: $dockBadge)
                 .onChange(of: dockBadge) { _ in attention.refreshDockBadge() }
+            Toggle("Notify before a usage limit runs out", isOn: $notifyUsage)
+            Text("Once at 80% and once at 95% of a 5-hour or weekly window, with a sound at 95%.")
+                .font(MuxaType.detail)
+                .foregroundStyle(.secondary)
             Text("Muxa skips the pane you are looking at and repeats for the same agent within 30 seconds. An agent that finished or started waiting since you last opened it keeps a dot until you do.")
                 .font(MuxaType.detail)
                 .foregroundStyle(.secondary)

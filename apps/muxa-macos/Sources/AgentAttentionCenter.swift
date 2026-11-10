@@ -288,7 +288,25 @@ final class MuxaAgentAttentionCenter: ObservableObject {
         if changed || !stale.isEmpty { persist() }
 
         postTransitions(in: snapshot, at: date)
+        postUsageAlerts(in: snapshot, at: date)
         recompute()
+    }
+
+    /// Announces each account window crossing a usage threshold, once.
+    private func postUsageAlerts(in snapshot: MuxaExecutionSnapshot, at date: Date) {
+        guard let defaults, let poster, MuxaUsageAlerts.isEnabled(defaults) else { return }
+        let groups = MuxaUsageGroup.groups(from: snapshot.hostedAgents, now: date)
+        var notified = MuxaUsageAlerts.loadNotified(defaults)
+        let due = MuxaUsageAlerts.due(groups: groups, notified: Set(notified.keys), now: date)
+        guard !due.alerts.isEmpty || !due.rearmed.isEmpty else { return }
+        for cycle in due.rearmed {
+            for key in notified.keys where key.hasPrefix(cycle + "\u{1F}") { notified.removeValue(forKey: key) }
+        }
+        for (alert, crossed) in due.alerts {
+            poster.post(MuxaUsageAlerts.notification(for: alert, sound: settings().sound))
+            for key in crossed { notified[key] = date }
+        }
+        MuxaUsageAlerts.saveNotified(notified, to: defaults, now: date)
     }
 
     /// Explicit human decisions are durable requests, independent of agent state

@@ -47,6 +47,9 @@ private final class MuxaApplicationDelegate: NSObject, NSApplicationDelegate {
         // WS-A: set before launch completes so a notification click that
         // launched Muxa still reaches its pane.
         if !AppModel.isRunningTests() { MuxaUserNotifications.shared.installDelegate() }
+        if !AppModel.isRunningTests() {
+            MuxaGlobalHotKey.shared.apply()
+        }
         if UserDefaults.standard.bool(forKey: MuxaPreferences.showWorkbenchOnLaunchKey) {
             presentWorkbench(remainingAttempts: 50)
         }
