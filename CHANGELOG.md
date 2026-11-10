@@ -9,12 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- `muxa worktrees` lists the git worktrees muxa created on this host and
-  whether each could be cleaned up, with the reasons it is kept otherwise
-  (uncommitted, untracked or ignored files, a pane working in it, commits not
-  in its base, still locked or unregistered). Read-only. Muxa now writes a
-  receipt when it creates a worktree for a Work route or a dispatch, and
-  lists only worktrees it holds a receipt for.
+- `muxa worktrees` lists the git worktrees muxa created on this host and what
+  would stop a cleanup from taking each: replaced or unregistered, locked,
+  uncommitted, untracked or ignored files, a pane working in it (or panes muxa
+  could not see), commits not in its base or on no remote. Read-only; muxa
+  does not yet know whether a Work is finished and removes nothing. Muxa now
+  writes a receipt, marked inside the worktree's git directory, when it
+  creates a worktree for a Work route or a dispatch, and lists only those.
 
 ## [0.9.9] - 2026-11-10
 

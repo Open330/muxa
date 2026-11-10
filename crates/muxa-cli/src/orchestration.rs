@@ -363,7 +363,11 @@ async fn add_worktree_with_receipt(
         &paths.run,
         None,
         Some(plan.request.commit.clone()),
-        format!("dispatch:{}", paths.run.display()),
+        muxa::worktree_receipt::ReceiptOrigin::Dispatch {
+            dispatch_id: plan.request.dispatch_id.clone(),
+            workspace: plan.request.workspace.clone(),
+            work: plan.request.work.clone(),
+        },
     )
     .map_err(|error| tracing::warn!(%error, "worktree receipt not written"))
     .ok();

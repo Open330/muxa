@@ -798,7 +798,11 @@ fn resolve_cwd(
             );
         }
         let plan = pipeline::worktree_plan(config, vars, &|value| expand_tilde(value));
-        let created = ensure_worktree(&plan, &format!("work:{}", args.work))?;
+        let origin = muxa::worktree_receipt::ReceiptOrigin::Work {
+            workspace: args.workspace.clone(),
+            work: args.work.clone(),
+        };
+        let created = ensure_worktree(&plan, origin)?;
         let cwd = muxa::paths::canonicalize(&plan.path)
             .with_context(|| format!("resolve worktree {}", plan.path.display()))?;
         return Ok((cwd, Some(plan), created));
@@ -999,7 +1003,10 @@ fn store_ticket(id: &str, ticket: &Ticket) {
 /// Create the work's git worktree, or confirm the one already there.
 /// Returns whether this call created it. A worktree this call creates gets
 /// a receipt (see `muxa::worktree_receipt`); one already there does not.
-fn ensure_worktree(plan: &WorktreePlan, origin: &str) -> Result<bool> {
+fn ensure_worktree(
+    plan: &WorktreePlan,
+    origin: muxa::worktree_receipt::ReceiptOrigin,
+) -> Result<bool> {
     if plan.path.exists() {
         if !plan.path.join(".git").exists() {
             bail!(

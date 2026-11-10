@@ -3,9 +3,11 @@
 //! A path that looks like one of muxa's worktrees proves nothing: a person
 //! can make or reuse a directory there. So muxa writes a receipt when it is
 //! about to run `git worktree add`, and marks it created only after git
-//! succeeds. A crash in between leaves a `creating` receipt, which never
-//! counts as proof. Only `created` receipts let `muxa worktrees` call a tree
-//! muxa's own; everything it cannot prove stays out of cleanup.
+//! succeeds and the receipt's id is written into the worktree's own git
+//! administrative directory. A crash in between leaves a `creating`
+//! receipt, which never counts as proof. Git deletes that directory with the
+//! worktree, so a tree later made at the same path carries no mark and is
+//! not taken for muxa's: the path alone proves nothing.
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -24,6 +26,27 @@ pub enum ReceiptState {
     Failed,
 }
 
+/// What asked for a worktree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReceiptOrigin {
+    /// A Work route's worktree, from `muxa work up`.
+    Work {
+        workspace: Option<String>,
+        work: String,
+    },
+    /// A dispatch's detached run checkout.
+    Dispatch {
+        dispatch_id: String,
+        workspace: String,
+        work: String,
+    },
+}
+
+/// The file in a worktree's git administrative directory that holds the id
+/// of the receipt that created it.
+pub const MARK_FILE: &str = "muxa-receipt";
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorktreeReceipt {
     pub id: String,
@@ -37,8 +60,11 @@ pub struct WorktreeReceipt {
     pub base: Option<String>,
     /// The commit checked out when it was created.
     pub start_head: Option<String>,
-    /// What asked for it: `work:<workspace>/<work>` or `dispatch:<id>`.
-    pub origin: String,
+    /// What asked for it.
+    pub origin: ReceiptOrigin,
+    /// The repository's common git directory, canonical, once created.
+    #[serde(default)]
+    pub common_dir: Option<PathBuf>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub state: ReceiptState,
@@ -61,7 +87,7 @@ impl WorktreeReceipt {
         path: &Path,
         branch: Option<String>,
         base: Option<String>,
-        origin: impl Into<String>,
+        origin: ReceiptOrigin,
     ) -> std::io::Result<Self> {
         let receipt = Self {
             id: uuid::Uuid::new_v4().to_string(),
@@ -70,7 +96,8 @@ impl WorktreeReceipt {
             branch,
             base,
             start_head: None,
-            origin: origin.into(),
+            origin,
+            common_dir: None,
             created_at: OffsetDateTime::now_utc(),
             state: ReceiptState::Creating,
         };
@@ -78,13 +105,40 @@ impl WorktreeReceipt {
         Ok(receipt)
     }
 
-    /// Marks the worktree created, with the commit it checked out.
+    /// Marks the worktree created, with the commit it checked out, after
+    /// writing the receipt's id into the worktree's git administrative
+    /// directory. Without that mark the receipt stays `creating`.
     pub fn finish(mut self, start_head: Option<String>) -> std::io::Result<Self> {
-        self.path = crate::paths::canonicalize(&self.path).unwrap_or(self.path);
-        self.start_head = start_head;
-        self.state = ReceiptState::Created;
+        self.mark_created(start_head)?;
         self.save()?;
         Ok(self)
+    }
+
+    /// Writes the mark and records the created state, without saving.
+    pub fn mark_created(&mut self, start_head: Option<String>) -> std::io::Result<()> {
+        self.path = crate::paths::canonicalize(&self.path).unwrap_or_else(|_| self.path.clone());
+        let admin = admin_dir(&self.path).ok_or_else(|| {
+            std::io::Error::other("git did not name the worktree's administrative directory")
+        })?;
+        std::fs::write(admin.join(MARK_FILE), &self.id)?;
+        self.common_dir = common_dir(&self.path);
+        self.start_head = start_head;
+        self.state = ReceiptState::Created;
+        Ok(())
+    }
+
+    /// Whether the worktree now at `path` is the one this receipt created:
+    /// its git administrative directory holds this receipt's id and it
+    /// shares the recorded common git directory. None when git cannot say.
+    #[must_use]
+    pub fn still_owns(&self) -> Option<bool> {
+        let admin = admin_dir(&self.path)?;
+        let mark = std::fs::read_to_string(admin.join(MARK_FILE)).unwrap_or_default();
+        let same_repo = match (&self.common_dir, common_dir(&self.path)) {
+            (Some(recorded), Some(current)) => *recorded == current,
+            _ => false,
+        };
+        Some(mark.trim() == self.id && same_repo)
     }
 
     /// Marks the attempt failed; nothing was created.
@@ -110,6 +164,32 @@ impl WorktreeReceipt {
         }
         std::fs::rename(tmp, dir.join(format!("{}.json", self.id)))
     }
+}
+
+/// The worktree's own administrative directory (`.git/worktrees/<name>`).
+fn admin_dir(path: &Path) -> Option<PathBuf> {
+    git_path(path, "--absolute-git-dir")
+}
+
+fn common_dir(path: &Path) -> Option<PathBuf> {
+    git_path(path, "--git-common-dir")
+}
+
+fn git_path(path: &Path, flag: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--path-format=absolute", flag])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return None;
+    }
+    Some(crate::paths::canonicalize(&text).unwrap_or_else(|_| PathBuf::from(text)))
 }
 
 /// Every readable receipt, oldest first. Unreadable files are skipped.
@@ -147,7 +227,11 @@ mod tests {
             branch: Some("feat".into()),
             base: Some("origin/main".into()),
             start_head: None,
-            origin: "work:ws/feat".into(),
+            origin: ReceiptOrigin::Work {
+                workspace: Some("ws".into()),
+                work: "feat".into(),
+            },
+            common_dir: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
             state: ReceiptState::Creating,
         };

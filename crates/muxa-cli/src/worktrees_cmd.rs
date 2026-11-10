@@ -1,13 +1,16 @@
-//! `muxa worktrees` — the git worktrees muxa created on this host, and
-//! whether each could be cleaned up.
+//! `muxa worktrees` — the git worktrees muxa created on this host, and what
+//! would stop a cleanup from taking each.
 //!
-//! Read-only. A worktree is listed only when muxa holds a receipt saying it
-//! created it (see `muxa::worktree_receipt`); a matching path is never taken
-//! as proof. Each one is checked against the rules a cleanup would need:
-//! still registered with git, nothing uncommitted, untracked or ignored in
-//! it, no pane working inside it, and its commits kept elsewhere (a named
-//! branch merged into its base, or a detached checkout still at the commit
-//! it started from). Anything muxa cannot check counts against it.
+//! Read-only. A worktree is listed only when muxa holds a receipt for it
+//! (see `muxa::worktree_receipt`), and it counts as muxa's only while its
+//! git administrative directory still carries that receipt's mark. Each is
+//! checked for blockers: replaced or unregistered, locked, anything
+//! uncommitted, untracked or ignored in it, a pane working inside it (or
+//! panes muxa could not see), and commits not kept elsewhere (a named branch
+//! must be in its base and on a remote branch; a detached checkout must
+//! still be at the commit it started from). Anything muxa cannot check is a
+//! blocker. A worktree with no blocker is only a candidate: muxa does not
+//! yet know whether its Work is finished, and nothing is removed.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -29,10 +32,11 @@ pub(crate) struct Args {
 struct Row {
     #[serde(flatten)]
     receipt: WorktreeReceipt,
-    /// Every rule held: a cleanup could take it.
-    cleanable: bool,
-    /// Why it is kept, in plain words; empty when cleanable.
-    reasons: Vec<String>,
+    /// No blocker was found. Not a verdict that it may go: whether its Work
+    /// is finished is not known yet.
+    candidate: bool,
+    /// What would stop a cleanup, in plain words.
+    blockers: Vec<String>,
     /// The checked-out branch, or None when detached.
     current_branch: Option<String>,
     /// Size on disk, best effort.
@@ -41,12 +45,8 @@ struct Row {
 
 pub(crate) async fn run(args: Args) -> Result<()> {
     let receipts = muxa::worktree_receipt::list();
-    let panes: Vec<PathBuf> = crate::navigation::all_panes()
-        .await
-        .into_iter()
-        .map(|pane| PathBuf::from(pane.current_path))
-        .collect();
     let rows: Vec<Row> = tokio::task::spawn_blocking(move || {
+        let panes = observe_panes();
         receipts
             .into_iter()
             .filter(|receipt| args.all || receipt.state == ReceiptState::Created)
@@ -62,7 +62,33 @@ pub(crate) async fn run(args: Args) -> Result<()> {
     Ok(())
 }
 
-fn inspect(receipt: WorktreeReceipt, panes: &[PathBuf]) -> Row {
+/// Every pane's directory on every active backend, and whether every
+/// backend answered in full.
+struct Panes {
+    cwds: Vec<PathBuf>,
+    complete: bool,
+}
+
+fn observe_panes() -> Panes {
+    let mut cwds = Vec::new();
+    let mut complete = true;
+    for backend in muxa::active_backends() {
+        let observation = backend.observe_panes();
+        complete &= matches!(
+            observation.completeness,
+            muxa::backend::ObservationCompleteness::Complete
+        );
+        cwds.extend(
+            observation
+                .panes
+                .into_iter()
+                .map(|pane| PathBuf::from(pane.current_path)),
+        );
+    }
+    Panes { cwds, complete }
+}
+
+fn inspect(receipt: WorktreeReceipt, panes: &Panes) -> Row {
     let mut reasons = Vec::new();
     let mut current_branch = None;
     let mut bytes = None;
@@ -84,8 +110,8 @@ fn inspect(receipt: WorktreeReceipt, panes: &[PathBuf]) -> Row {
         }
     }
     Row {
-        cleanable: reasons.is_empty(),
-        reasons,
+        candidate: reasons.is_empty(),
+        blockers: reasons,
         current_branch,
         bytes,
         receipt,
@@ -94,11 +120,18 @@ fn inspect(receipt: WorktreeReceipt, panes: &[PathBuf]) -> Row {
 
 fn check(
     receipt: &WorktreeReceipt,
-    panes: &[PathBuf],
+    panes: &Panes,
     reasons: &mut Vec<String>,
     current_branch: &mut Option<String>,
 ) {
     let path = &receipt.path;
+    match receipt.still_owns() {
+        Some(true) => {}
+        Some(false) => {
+            reasons.push("not the worktree muxa created (it was replaced or never marked)".into())
+        }
+        None => reasons.push("could not confirm it is the worktree muxa created".into()),
+    }
     match registration(&receipt.repo, path) {
         Some(Registration::Registered) => {}
         Some(Registration::Locked) => reasons.push("locked in git".into()),
@@ -128,10 +161,13 @@ fn check(
         reasons.push("has submodules".into());
     }
     if panes
+        .cwds
         .iter()
         .any(|pane| lenient_canonical(pane).starts_with(path) || pane.starts_with(path))
     {
         reasons.push("a pane is working in it".into());
+    } else if !panes.complete {
+        reasons.push("could not see every pane, so one may be working in it".into());
     }
     let head = git(path, &["rev-parse", "HEAD"]).map(|out| out.trim().to_string());
     *current_branch = git(path, &["symbolic-ref", "--quiet", "--short", "HEAD"])
@@ -152,6 +188,12 @@ fn check(
         ) {
             Some(_) => {}
             None => reasons.push(format!("its commits are not in {base}")),
+        }
+        // Kept elsewhere means on a remote too; muxa does not fetch, so a
+        // stale remote view only keeps more.
+        let remote = git(&receipt.repo, &["branch", "--remotes", "--contains", &head]);
+        if remote.as_deref().is_none_or(|out| out.trim().is_empty()) {
+            reasons.push("its commits are not on any remote branch".into());
         }
     } else {
         let start = receipt
@@ -267,17 +309,25 @@ fn render(rows: &[Row]) -> String {
         let _ = writeln!(out, "No worktrees muxa created on this host.");
         return out;
     }
-    let cleanable: Vec<&Row> = rows.iter().filter(|row| row.cleanable).collect();
-    let total: u64 = cleanable.iter().filter_map(|row| row.bytes).sum();
+    let candidates: Vec<&Row> = rows.iter().filter(|row| row.candidate).collect();
+    let total: u64 = candidates.iter().filter_map(|row| row.bytes).sum();
     let _ = writeln!(
         out,
-        "{} worktree(s) muxa created; {} could be cleaned up ({}).",
+        "{} worktree(s) muxa created; {} with no blocker ({}).",
         rows.len(),
-        cleanable.len(),
+        candidates.len(),
         human(total)
     );
+    let _ = writeln!(
+        out,
+        "Read-only: muxa does not yet know whether a Work is finished, and removes nothing."
+    );
     for row in rows {
-        let mark = if row.cleanable { "ready" } else { "kept " };
+        let mark = if row.candidate {
+            "candidate"
+        } else {
+            "blocked  "
+        };
         let branch = row.current_branch.as_deref().unwrap_or("(detached)");
         let size = row.bytes.map_or_else(|| "-".into(), human);
         let _ = writeln!(
@@ -285,8 +335,8 @@ fn render(rows: &[Row]) -> String {
             "{mark}  {}  {branch}  {size}",
             row.receipt.path.display()
         );
-        for reason in &row.reasons {
-            let _ = writeln!(out, "       - {reason}");
+        for reason in &row.blockers {
+            let _ = writeln!(out, "           - {reason}");
         }
     }
     out
@@ -311,6 +361,7 @@ fn human(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use muxa::worktree_receipt::ReceiptOrigin;
     use time::OffsetDateTime;
 
     fn run_git(dir: &Path, args: &[&str]) {
@@ -327,36 +378,56 @@ mod tests {
         assert!(status.success(), "git {args:?}");
     }
 
-    fn receipt(
+    fn all_panes_seen(cwds: Vec<PathBuf>) -> Panes {
+        Panes {
+            cwds,
+            complete: true,
+        }
+    }
+
+    /// A receipt as muxa writes it after creating `path`, mark included.
+    fn created(
         repo: &Path,
         path: &Path,
         branch: Option<&str>,
         base: Option<&str>,
         start: Option<String>,
     ) -> WorktreeReceipt {
-        WorktreeReceipt {
-            id: "r".into(),
+        let mut receipt = WorktreeReceipt {
+            id: uuid::Uuid::new_v4().to_string(),
             repo: repo.to_path_buf(),
-            path: muxa::paths::canonicalize(path).unwrap(),
+            path: path.to_path_buf(),
             branch: branch.map(Into::into),
             base: base.map(Into::into),
-            start_head: start,
-            origin: "work:test".into(),
+            start_head: None,
+            origin: ReceiptOrigin::Work {
+                workspace: None,
+                work: "test".into(),
+            },
+            common_dir: None,
             created_at: OffsetDateTime::UNIX_EPOCH,
-            state: ReceiptState::Created,
-        }
+            state: ReceiptState::Creating,
+        };
+        receipt.mark_created(start).unwrap();
+        receipt
     }
 
-    #[test]
-    fn only_clean_merged_unused_worktrees_are_cleanable() {
-        let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
+    /// A repository with a pushed `main` and a worktree on `feat` from it.
+    fn fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let remote = root.join("remote.git");
+        run_git(root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        let repo = root.join("repo");
         std::fs::create_dir(&repo).unwrap();
         run_git(&repo, &["init", "-q", "-b", "main"]);
         std::fs::write(repo.join("a"), "a").unwrap();
         run_git(&repo, &["add", "a"]);
         run_git(&repo, &["commit", "-qm", "a"]);
-        let tree = root.path().join("wt");
+        run_git(
+            &repo,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        run_git(&repo, &["push", "-q", "-u", "origin", "main"]);
+        let tree = root.join("wt");
         run_git(
             &repo,
             &[
@@ -369,62 +440,99 @@ mod tests {
                 "main",
             ],
         );
+        (repo, tree)
+    }
 
-        // Clean and merged (no new commits): cleanable.
-        let row = inspect(receipt(&repo, &tree, Some("feat"), Some("main"), None), &[]);
-        assert!(row.cleanable, "{:?}", row.reasons);
+    #[test]
+    fn a_clean_pushed_unused_worktree_has_no_blocker() {
+        let root = tempfile::tempdir().unwrap();
+        let (repo, tree) = fixture(root.path());
+        let receipt = created(&repo, &tree, Some("feat"), Some("main"), None);
 
-        // A pane inside it keeps it.
-        let row = inspect(
-            receipt(&repo, &tree, Some("feat"), Some("main"), None),
-            &[tree.join("src")],
+        let row = inspect(receipt.clone(), &all_panes_seen(vec![]));
+        assert!(row.candidate, "{:?}", row.blockers);
+
+        // A pane inside it, or panes muxa could not see, block it.
+        assert!(!inspect(receipt.clone(), &all_panes_seen(vec![tree.join("src")])).candidate);
+        let unseen = Panes {
+            cwds: vec![],
+            complete: false,
+        };
+        let row = inspect(receipt.clone(), &unseen);
+        assert!(
+            row.blockers.iter().any(|r| r.contains("every pane")),
+            "{:?}",
+            row.blockers
         );
-        assert!(!row.cleanable);
 
-        // An ignored file keeps it.
+        // A local commit merged into main but on no remote blocks it.
+        std::fs::write(tree.join("b"), "b").unwrap();
+        run_git(&tree, &["add", "b"]);
+        run_git(&tree, &["commit", "-qm", "b"]);
+        run_git(&repo, &["merge", "-q", "--ff-only", "feat"]);
+        let row = inspect(receipt.clone(), &all_panes_seen(vec![]));
+        assert!(
+            row.blockers.iter().any(|r| r.contains("remote")),
+            "{:?}",
+            row.blockers
+        );
+
+        // Ignored and untracked files block it.
         std::fs::write(tree.join(".gitignore"), "build/\n").unwrap();
-        run_git(&tree, &["add", ".gitignore"]);
-        run_git(&tree, &["commit", "-qm", "ignore"]);
         std::fs::create_dir(tree.join("build")).unwrap();
         std::fs::write(tree.join("build/out"), "x").unwrap();
-        let row = inspect(receipt(&repo, &tree, Some("feat"), Some("main"), None), &[]);
+        let row = inspect(receipt, &all_panes_seen(vec![]));
         assert!(
-            row.reasons.iter().any(|r| r.contains("ignored")),
+            row.blockers.iter().any(|r| r.contains("ignored")),
             "{:?}",
-            row.reasons
+            row.blockers
         );
-        // ...and its new commit is not in main.
         assert!(
-            row.reasons.iter().any(|r| r.contains("not in main")),
+            row.blockers.iter().any(|r| r.contains("uncommitted")),
             "{:?}",
-            row.reasons
-        );
-
-        // Untracked changes keep it.
-        std::fs::remove_dir_all(tree.join("build")).unwrap();
-        std::fs::write(tree.join("new"), "n").unwrap();
-        let row = inspect(receipt(&repo, &tree, Some("feat"), Some("main"), None), &[]);
-        assert!(
-            row.reasons.iter().any(|r| r.contains("uncommitted")),
-            "{:?}",
-            row.reasons
+            row.blockers
         );
     }
 
     #[test]
-    fn unfinished_receipts_and_detached_moves_are_kept() {
+    fn a_worktree_made_again_at_the_same_path_is_not_muxas() {
         let root = tempfile::tempdir().unwrap();
-        let repo = root.path().join("repo");
-        std::fs::create_dir(&repo).unwrap();
-        run_git(&repo, &["init", "-q", "-b", "main"]);
-        std::fs::write(repo.join("a"), "a").unwrap();
-        run_git(&repo, &["add", "a"]);
-        run_git(&repo, &["commit", "-qm", "a"]);
+        let (repo, tree) = fixture(root.path());
+        let receipt = created(&repo, &tree, Some("feat"), Some("main"), None);
+        run_git(&repo, &["worktree", "remove", tree.to_str().unwrap()]);
+        run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "mine",
+                tree.to_str().unwrap(),
+                "main",
+            ],
+        );
+
+        let row = inspect(receipt, &all_panes_seen(vec![]));
+        assert!(!row.candidate);
+        assert!(
+            row.blockers
+                .iter()
+                .any(|r| r.contains("not the worktree muxa created")),
+            "{:?}",
+            row.blockers
+        );
+    }
+
+    #[test]
+    fn unfinished_receipts_and_detached_moves_are_blocked() {
+        let root = tempfile::tempdir().unwrap();
+        let (repo, _) = fixture(root.path());
         let start = git(&repo, &["rev-parse", "HEAD"])
             .unwrap()
             .trim()
             .to_string();
-        let tree = root.path().join("run");
+        let run = root.path().join("run");
         run_git(
             &repo,
             &[
@@ -432,26 +540,27 @@ mod tests {
                 "add",
                 "-q",
                 "--detach",
-                tree.to_str().unwrap(),
+                run.to_str().unwrap(),
                 &start,
             ],
         );
 
-        let row = inspect(receipt(&repo, &tree, None, None, Some(start.clone())), &[]);
-        assert!(row.cleanable, "{:?}", row.reasons);
+        let receipt = created(&repo, &run, None, None, Some(start.clone()));
+        let row = inspect(receipt.clone(), &all_panes_seen(vec![]));
+        assert!(row.candidate, "{:?}", row.blockers);
 
-        let mut creating = receipt(&repo, &tree, None, None, Some(start.clone()));
+        let mut creating = receipt.clone();
         creating.state = ReceiptState::Creating;
-        assert!(!inspect(creating, &[]).cleanable);
+        assert!(!inspect(creating, &all_panes_seen(vec![])).candidate);
 
-        std::fs::write(tree.join("b"), "b").unwrap();
-        run_git(&tree, &["add", "b"]);
-        run_git(&tree, &["commit", "-qm", "b"]);
-        let row = inspect(receipt(&repo, &tree, None, None, Some(start)), &[]);
+        std::fs::write(run.join("b"), "b").unwrap();
+        run_git(&run, &["add", "b"]);
+        run_git(&run, &["commit", "-qm", "b"]);
+        let row = inspect(receipt, &all_panes_seen(vec![]));
         assert!(
-            row.reasons.iter().any(|r| r.contains("detached")),
+            row.blockers.iter().any(|r| r.contains("detached")),
             "{:?}",
-            row.reasons
+            row.blockers
         );
     }
 }
