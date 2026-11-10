@@ -50,6 +50,12 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 # spaces, which cuts values under `~/Library/Application Support`.
 sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
 
+[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+# `kill(pid, 0)` answering ESRCH is the authoritative "this pid is gone" on
+# macOS, which has no `/proc`. Without it a worker whose pane closed can never
+# be proven exited, so its launch holds room capacity forever.
+nix = { version = "0.29", features = ["signal"] }
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
 tempfile = "3"

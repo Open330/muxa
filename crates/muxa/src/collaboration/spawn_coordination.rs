@@ -767,7 +767,12 @@ async fn observe_fence(
     panes: Vec<PaneInfo>,
 ) -> (bool, Option<PaneInfo>) {
     tokio::task::spawn_blocking(move || {
-        let exited = fence.definitely_exited();
+        // An exited fence matches no live pane (a reused pid has a new
+        // birth), so probing every pane would only burn the caller's budget.
+        if fence.definitely_exited() {
+            return (true, None);
+        }
+        let exited = false;
         let matches = |p: &&PaneInfo| ProcessFence::observe(p, kind).as_ref() == Some(&fence);
         // The fast path avoids probing unrelated panes on ordinary calls.
         if let Some(found) = pane
