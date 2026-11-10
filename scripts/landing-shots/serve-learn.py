@@ -10,7 +10,7 @@ from urllib.parse import unquote, urlsplit
 
 REPO = Path(__file__).resolve().parents[2]
 SITE = REPO / "site"
-WEB = REPO / "crates/muxa/src/dashboard/web"
+WEB = REPO / "crates/tend/src/dashboard/web"
 
 
 class PreviewHandler(SimpleHTTPRequestHandler):
@@ -43,7 +43,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=8766)
     args = parser.parse_args()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), PreviewHandler)
-    print(f"muxa browser practice: http://127.0.0.1:{args.port}/learn/", flush=True)
+    print(f"tend browser practice: http://127.0.0.1:{args.port}/learn/", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

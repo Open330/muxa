@@ -1,18 +1,18 @@
 [workspace]
 resolver = "2"
-members = ["crates/muxa", "crates/muxa-cli", "crates/muxad", "crates/muxa-zellij-plugin"]
+members = ["crates/tend", "crates/tend-cli", "crates/tendd", "crates/tend-zellij-plugin"]
 
 [workspace.package]
 version = "0.9.10"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Open330/muxa"
+repository = "https://github.com/Open330/tend"
 authors = ["Open330 Contributors"]
 
 [workspace.dependencies]
 # internal
-muxa = { path = "crates/muxa", version = "0.9.10" }
+tend = { path = "crates/tend", version = "0.9.10" }
 
 # external
 anyhow = "1.0.103"

@@ -1,23 +1,23 @@
 # Activity Ledger
 
-`muxa` keeps duration data in `activity.ndjson`. This is the source for
-`muxa stats`, `muxa stats report`, and the raw `muxa stats activity` query command.
+`tend` keeps duration data in `activity.ndjson`. This is the source for
+`tend stats`, `tend stats report`, and the raw `tend stats activity` query command.
 
 ## Quick Views
 
 ```bash
-muxa stats --since today
-muxa stats --since yesterday --group-by session
-muxa stats --since week --group-by project
-muxa stats --since month --exclude-session 'monitor*'
-muxa stats report --since week
-muxa stats report --since last-month --exclude-pane '%42'
-muxa timeline --since today --session main
-muxa stats activity --since today --type human
-muxa stats activity --since today --type agent --format json
+tend stats --since today
+tend stats --since yesterday --group-by session
+tend stats --since week --group-by project
+tend stats --since month --exclude-session 'monitor*'
+tend stats report --since week
+tend stats report --since last-month --exclude-pane '%42'
+tend timeline --since today --session main
+tend stats activity --since today --type human
+tend stats activity --since today --type agent --format json
 ```
 
-Session groups in `muxa stats` and `muxa stats report` fold generated views such as
+Session groups in `tend stats` and `tend stats report` fold generated views such as
 `webapp~view~123` into `webapp`, including retained history. Grouping happens
 before sorting and limiting rows. Overlapping human-presence intervals and
 ACT/WACT time are not counted twice for those views; agent work remains additive.
@@ -37,14 +37,14 @@ ACT/WACT time are not counted twice for those views; agent work remains additive
 
 ## Sorting
 
-`muxa stats` rows are ordered by prompt count by default. Use `--sort` to
+`tend stats` rows are ordered by prompt count by default. Use `--sort` to
 order by any column and `--reverse` to flip the direction. Numeric columns
 default to descending (largest first); `name` defaults to ascending.
 
 ```bash
-muxa stats --since today --sort wait              # longest waiting first
-muxa stats --since today --sort work --reverse    # least working first
-muxa stats --since today --group-by session --sort name
+tend stats --since today --sort wait              # longest waiting first
+tend stats --since today --sort work --reverse    # least working first
+tend stats --since today --group-by session --sort name
 ```
 
 Use `--exclude-pane` and `--exclude-session` to remove long-lived monitoring
@@ -57,12 +57,12 @@ patterns are case-sensitive and support `*` and `?`, e.g.
 
 ## Stats Time Graph
 
-Add `--graph` to `muxa stats` to render only a terminal-native time graph for
+Add `--graph` to `tend stats` to render only a terminal-native time graph for
 `WACT`, the hands-on subset of active human time:
 
 ```bash
-muxa stats --since today --graph
-muxa stats --since week --graph
+tend stats --since today --graph
+tend stats --since week --graph
 ```
 
 The bucket size follows the selected window: ranges up to two days use hourly
@@ -80,15 +80,15 @@ triggers:
 - **tmux input** — the daemon samples each client's `client_activity` and records
   a `tmux_input` interaction whenever it advances (a keypress or scroll), so
   *reading* a session while attached is credited, not just typing. (Visible via
-  `muxa stats activity --type human`.)
+  `tend stats activity --type human`.)
 - **Thinking** — time present while an agent is blocked on you
   (`WaitingInput`/`WaitingChoice`/`Error`): reading its question and deciding.
 
 Unlike `HUMAN` (raw presence: tmux foreground, prompt input, attach, or
-`muxa watch`), a pane left attached and untouched accrues none of these, so it
+`tend watch`), a pane left attached and untouched accrues none of these, so it
 does not inflate `ACTIVE`. Prompt and tmux-input windows are clipped to matching
 active presence (tmux foreground, prompt input, or attach; not a plain open
-`muxa watch` interval), so padding cannot make a single session's `ACT` exceed
+`tend watch` interval), so padding cannot make a single session's `ACT` exceed
 its observed foreground/interaction time.
 
 Across sessions, `ACTIVE` is **de-duplicated**: a human does one thing at a time,
@@ -117,14 +117,14 @@ above it.
 
 ## Stats Timeline
 
-Add `--timeline` to `muxa stats` to see *when* each project had an agent
+Add `--timeline` to `tend stats` to see *when* each project had an agent
 working, drawn on a real clock axis:
 
 ```bash
-muxa stats --timeline                          # last 7 days, one block per day
-muxa stats --timeline --since today --hours 9-24
-muxa stats --timeline --layout range --since month --limit 0
-muxa stats --timeline --group-by session
+tend stats --timeline                          # last 7 days, one block per day
+tend stats --timeline --since today --hours 9-24
+tend stats --timeline --layout range --since month --limit 0
+tend stats --timeline --group-by session
 ```
 
 Each row is one project (the agent's working directory name). With
@@ -149,25 +149,25 @@ time differ from the `WORK` column, which sums every agent.
 The timeline is table output only; it cannot be combined with `--graph`,
 `--format`, `--json`, `--markdown`, `--sort` or `--reverse`.
 
-`muxa timeline` (below) is the interactive per-agent view; `stats --timeline`
+`tend timeline` (below) is the interactive per-agent view; `stats --timeline`
 is the per-project summary.
 
 ## Timeline
 
-`muxa timeline` renders the same duration source as an interactive TUI.
+`tend timeline` renders the same duration source as an interactive TUI.
 The overview groups lanes by session by default, with agent, human, and tmux
 foreground lanes inside each session; focus view follows the selected lane as
 timestamped intervals.
 
 ```bash
-muxa timeline --since today
-muxa timeline --since today --session main
-muxa timeline --since today --exclude-session 'monitor*'
-muxa timeline --since 24h --agent codex
-muxa timeline --since today --group-by kind --sort waiting
-muxa timeline --view heatmap --since 12w
-muxa timeline --day 2026-06-06
-muxa timeline --since today --format json
+tend timeline --since today
+tend timeline --since today --session main
+tend timeline --since today --exclude-session 'monitor*'
+tend timeline --since 24h --agent codex
+tend timeline --since today --group-by kind --sort waiting
+tend timeline --view heatmap --since 12w
+tend timeline --day 2026-06-06
+tend timeline --since today --format json
 ```
 
 Agent transition rows render the state they left. For example, a ledger row
@@ -179,13 +179,13 @@ details, see [docs/TIMELINE.md](TIMELINE.md).
 
 ## Ledger Types
 
-`muxa stats activity --type ...` filters the raw ledger:
+`tend stats activity --type ...` filters the raw ledger:
 
 | Type | Meaning |
 | ---- | ------- |
 | `agent` | Agent state transition intervals, such as working, waiting, or error. |
 | `tmux` | Closed tmux foreground intervals observed from interactive tmux clients. |
-| `human` | Human interaction intervals recorded by muxa itself. |
+| `human` | Human interaction intervals recorded by tend itself. |
 
 `--type state` is kept as a hidden compatibility alias for `--type agent`.
 
@@ -202,7 +202,7 @@ JSON and Markdown exports.
 | `WAIT` | Time spent waiting for input or choice. |
 | `ERR` | Time spent in error states, including quota/rate-limit style blocks when the agent reports them as error. |
 | `TMUX` | Time a tmux session was foregrounded by an interactive tmux client. |
-| `HUMAN` | Union of tmux foreground time plus muxa human interaction intervals. |
+| `HUMAN` | Union of tmux foreground time plus tend human interaction intervals. |
 | `THINK` | Overlap of attention states with human presence. |
 | `ACT` | Engaged human time from prompts, tmux input ticks, and thinking. |
 | `WACT` | Hands-on subset of `ACT`; excludes scrollback-owned engaged time. |
@@ -211,8 +211,8 @@ JSON and Markdown exports.
 
 `THINK` is intentionally narrower than `HUMAN`. It counts time where the
 agent needs attention (`WaitingInput`, `WaitingChoice`, or `Error`) and
-there is human presence from tmux foreground, muxa prompt input, or tmux
-attach. A plain open `muxa watch` interval counts toward `HUMAN`, but not
+there is human presence from tmux foreground, tend prompt input, or tmux
+attach. A plain open `tend watch` interval counts toward `HUMAN`, but not
 `THINK`, because simply watching the dashboard can be idle time.
 
 ## Retention

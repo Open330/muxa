@@ -5,7 +5,7 @@
 
 Scenes are close copies of what Claude Code, Codex and a terminal editor
 show in the states the film needs (working, a permission prompt, a
-multiple-choice question). Like docs/demo-paint.sh they are fixtures: muxa
+multiple-choice question). Like docs/demo-paint.sh they are fixtures: tend
 itself is real in the film, only the agents' screens are painted.
 """
 

@@ -1,15 +1,15 @@
 # Configuration
 
-`muxad` reads `$XDG_CONFIG_HOME/muxa/config.toml` when present. Start from
+`tendd` reads `$XDG_CONFIG_HOME/tend/config.toml` when present. Start from
 `config.example.toml` for a full annotated file.
 
 ## Socket
 
 ```toml
-socket = "/tmp/muxa.sock"
+socket = "/tmp/tend.sock"
 ```
 
-The CLI also honors `MUXA_SOCKET`. tmux environments are healed on daemon
+The CLI also honors `TEND_SOCKET`. tmux environments are healed on daemon
 startup so existing panes can reach the current socket.
 
 ## History
@@ -17,25 +17,25 @@ startup so existing panes can reach the current socket.
 ```toml
 [history]
 enabled = true
-path = "$XDG_DATA_HOME/muxa/prompts.ndjson"
+path = "$XDG_DATA_HOME/tend/prompts.ndjson"
 max_per_pane = 50
 max_age_days = 30
 ```
 
-Prompt history is retained, not an unbounded warehouse. `muxa recap` and
-prompt totals in `muxa stats` use this retained window.
+Prompt history is retained, not an unbounded warehouse. `tend recap` and
+prompt totals in `tend stats` use this retained window.
 
 ## Activity
 
 ```toml
 [activity]
 enabled = true
-path = "$XDG_DATA_HOME/muxa/activity.ndjson"
+path = "$XDG_DATA_HOME/tend/activity.ndjson"
 max_age_days = 30
 ```
 
 The activity ledger stores agent state intervals, tmux foreground
-intervals, and muxa human interaction intervals. See
+intervals, and tend human interaction intervals. See
 [ACTIVITY.md](ACTIVITY.md).
 
 ## Session Activity
@@ -43,7 +43,7 @@ intervals, and muxa human interaction intervals. See
 ```toml
 [session_activity]
 enabled = true
-path = "$XDG_DATA_HOME/muxa/session-activity.json"
+path = "$XDG_DATA_HOME/tend/session-activity.json"
 interval_secs = 5
 ```
 
@@ -58,21 +58,21 @@ auto_interval_minutes = 15   # 0 turns automatic snapshots off
 keep_auto = 10               # newest automatic snapshots kept
 ```
 
-muxad takes an automatic workspace snapshot (`muxa snapshot --auto`) every
+tendd takes an automatic workspace snapshot (`tend snapshot --auto`) every
 `auto_interval_minutes`, starting one interval after it starts. Nothing is
 written when the workspace has not changed since the newest snapshot of the
 same server — the comparison covers sessions, windows, layouts, pane
 directories, commands and agent conversation ids, not timestamps or which
 window has focus. Only the newest `keep_auto` automatic snapshots are kept;
-snapshots taken with `muxa snapshot`, Save Snapshot in Muxa.app, or `muxa
-reload` are never pruned. When muxa's agents span several multiplexer servers
-the automatic snapshot is skipped with a warning in muxad's log.
+snapshots taken with `tend snapshot`, Save Snapshot in Tend.app, or `tend
+reload` are never pruned. When tend's agents span several multiplexer servers
+the automatic snapshot is skipped with a warning in tendd's log.
 
-Snapshots live in `$XDG_DATA_HOME/muxa/snapshots/<id>/snapshot.json`
-(`~/Library/Application Support/muxa/snapshots` on macOS). `muxa snapshot
---list` shows them, `muxa snapshot --delete <id>` removes one, and `muxa
+Snapshots live in `$XDG_DATA_HOME/tend/snapshots/<id>/snapshot.json`
+(`~/Library/Application Support/tend/snapshots` on macOS). `tend snapshot
+--list` shows them, `tend snapshot --delete <id>` removes one, and `tend
 restore --only-missing` recreates only the sessions the server does not
-already have. `muxa restore` with no argument uses the newest snapshot,
+already have. `tend restore` with no argument uses the newest snapshot,
 automatic or manual. Its dry run also lists the sessions and windows that are
 new since the snapshot, which a restore never closes; with `--json` each
 recorded session, window and pane carries a `state` of `missing` or
@@ -80,7 +80,7 @@ recorded session, window and pane carries a `state` of `missing` or
 
 ## MCP orchestration guide
 
-`muxa init` can install a canonical collaboration skill and global agent entry
+`tend init` can install a canonical collaboration skill and global agent entry
 points beside this config. Keep user preferences here; see
 [Global agent integration](AGENT_INTEGRATION.md) for the bundle and host adapters.
 
@@ -93,10 +93,10 @@ direction = "right"  # right (default) | down
 instructions = "Keep one task per window; use a new session for unrelated projects."
 ```
 
-This section records how the user normally organizes agent work. Muxa includes
-it in the MCP initialization instructions and exposes it through `muxa_guide`,
+This section records how the user normally organizes agent work. Tend includes
+it in the MCP initialization instructions and exposes it through `tend_guide`,
 so a connected agent does not have to guess whether a new task belongs in a
-pane, window, or separate session. `muxa_start_agent` also uses these values
+pane, window, or separate session. `tend_start_agent` also uses these values
 when the matching arguments are omitted. If `agent` is not configured, the
 tool still requires the caller to choose one.
 
@@ -120,16 +120,16 @@ options = ["--model", "gpt-5-codex", "--search"]
 
 Which model an agent runs is not a property of the surface it lands on, so this
 is keyed by the provider rather than attached to any one launcher. Every path
-that starts an agent resolves here — `muxa agent start`, `muxa work start`, a
-`muxa work up` pipeline, `muxa_start_agent`, and the automatic peer spawn behind
-`muxa_call_peer` — so a model configured once applies to all of them.
+that starts an agent resolves here — `tend agent start`, `tend work start`, a
+`tend work up` pipeline, `tend_start_agent`, and the automatic peer spawn behind
+`tend_call_peer` — so a model configured once applies to all of them.
 
 Keying by provider is also what makes it safe: `--model` names different things
 to different CLIs, and a single shared list either fits one provider or has to
 be guarded at every launch site to keep one CLI's model name away from another.
 An unrecognised key (`[agent.claud]`) fails the load rather than sitting inert.
 
-Arguments land after Muxa's built-in provider profile — `codex` already gets
+Arguments land after Tend's built-in provider profile — `codex` already gets
 `--yolo`, `claude` `--dangerously-skip-permissions` — and before any initial
 prompt. Each value is shell-quoted independently.
 
@@ -138,7 +138,7 @@ it, so an override never puts `--model` on the command line twice:
 
 | Named by | Wins over |
 | --- | --- |
-| `muxa agent start --option`, `muxa work start --option` | `[agent.<program>]` |
+| `tend agent start --option`, `tend work start --option` | `[agent.<program>]` |
 | An MCP `options` array | `[agent.<program>]` |
 | A pipeline agent's own `options` | `[agent.<program>]` |
 
@@ -156,7 +156,7 @@ role    = 'reviewer'
 options = ['--model', 'claude-sonnet-5']
 ```
 
-`muxa work up --dry-run` prints the resolved list for every pane, so what it
+`tend work up --dry-run` prints the resolved list for every pane, so what it
 shows is what the launch will use.
 
 ### Starting on an account
@@ -186,13 +186,13 @@ swap](ACCOUNT_SWAP.md)):
 When there is no provider, `aas` takes longer than 5 seconds, or no account
 has quota left, the agent starts bare as before, which may still be the
 capped account. The reason goes to stderr and to the `account` field of
-`muxa agent start --json`. An agent already capped mid-run is
-[`muxa swap`](ACCOUNT_SWAP.md)'s job, and with no accounts at all the
+`tend agent start --json`. An agent already capped mid-run is
+[`tend swap`](ACCOUNT_SWAP.md)'s job, and with no accounts at all the
 `resume-after-limit` rule, once enabled, resumes it after its reset.
 
 ### Advanced launch options form
 
-In Muxa.app, **Settings → Advanced** has a segmented **Launch options / Raw
+In Tend.app, **Settings → Advanced** has a segmented **Launch options / Raw
 TOML** editor. The form edits provider defaults under `[agent.<program>]`
 and options for **existing** pipeline agent panes. Create or restructure
 pipelines in Raw TOML; the form does not edit the CLI runtime `--option`
@@ -210,7 +210,7 @@ One row is **one literal argument**. There is no shell splitting: enter
 `--model` and its value on separate rows, and enter a value containing spaces
 in a single row without adding shell quotes. An empty string row (`[""]`)
 passes one empty argument; it is not the same as an empty list (`[]`).
-An empty list suppresses extra options, not Muxa's built-in provider profile.
+An empty list suppresses extra options, not Tend's built-in provider profile.
 
 Replacement precedence is **explicit CLI options → pipeline pane options →
 provider defaults → legacy `[mcp.guide].options` → no extra options**. Only
@@ -229,7 +229,7 @@ can be edited in Raw TOML. Unsaved raw and form edits are kept from overwriting
 each other; reload asks before discarding unsaved changes.
 
 Saved options apply to **new launches**, not existing sessions. Launchers
-that read the file afresh see the new configuration; restart `muxad` for
+that read the file afresh see the new configuration; restart `tendd` for
 daemon-held launch defaults and reconnect/restart MCP processes that loaded
 their defaults at startup. Reloading the editor only refreshes its view of
 the file. The form requires daemon capability `config_launch_v1`; use Raw
@@ -280,13 +280,13 @@ engine = "apple"
 model = "private-cloud"             # on-device (default) | private-cloud (macOS 27+)
 ```
 
-Opt-in headless questions from `muxa watch`: `a` composes one, `A` browses
-the answers. muxad runs the agent in print mode and captures the reply, so
+Opt-in headless questions from `tend watch`: `a` composes one, `A` browses
+the answers. tendd runs the agent in print mode and captures the reply, so
 there is no session to manage and completion is an exit code rather than a
 guess. Each provider can keep several resumable conversations; `Ctrl-E` in
 the composer marks a draft as new, while `n` in the panel opens a new draft.
 The conversation and its first turn are created together on send. `path` defaults to
-`$XDG_DATA_HOME/muxa/ask.json` and holds both the history and conversation
+`$XDG_DATA_HOME/tend/ask.json` and holds both the history and conversation
 ids. Off by default because enabling it lets the daemon spawn a CLI
 that bills your account. See [WATCH.md](WATCH.md).
 
@@ -302,7 +302,7 @@ example `["/nfs/home/june"]` when `/home/june/workspace` points there.
 persistent worker. Reaching it terminates the headless agent process; it is a
 wall-clock safety limit, not an inactivity detector. `plan` is a read-only
 mode (claude `--permission-mode plan`, codex `--sandbox read-only`, gemini
-`--approval-mode plan`); `muxa work compose` always drafts under it.
+`--approval-mode plan`); `tend work compose` always drafts under it.
 
 ### Providers
 
@@ -322,7 +322,7 @@ agent CLIs in print mode (`claude -p`, `codex exec --json`, `gemini -p
 --output-format json`) and resume their own sessions between questions;
 `anthropic` and `openai` call the Messages and Chat Completions APIs
 directly over HTTPS; `apple` runs the Mac's own Foundation Models. API
-engines have no session to resume, so muxad replays the conversation's
+engines have no session to resume, so tendd replays the conversation's
 earlier turns from its own history — the most recent 40 turns or 60k
 characters — ahead of each question; `cwd`, `additional_dirs`, and
 `permission_mode` do not apply to them.
@@ -338,10 +338,10 @@ signed with a Developer ID, was refused by the system with
 `ModelManagerError 1046` — whatever Private Cloud Compute requires of a
 process, a command-line helper does not have it. The option stays so a
 future build can pick it up; a turn on it says why it cannot answer. The
-framework is Swift-only, so muxad reaches it through `muxa-afm`, a small
-helper that ships in `Muxa.app/Contents/Helpers`. muxad looks for it beside
-its own executable, then in `/Applications/Muxa.app`, then in
-`~/Applications/Muxa.app`, then on `PATH`;
+framework is Swift-only, so tendd reaches it through `tend-afm`, a small
+helper that ships in `Tend.app/Contents/Helpers`. tendd looks for it beside
+its own executable, then in `/Applications/Tend.app`, then in
+`~/Applications/Tend.app`, then on `PATH`;
 `executable` names another copy. Like the APIs it keeps no session, so the
 conversation is replayed — cut to 6k characters to fit the on-device
 window, and cut further by the helper if the model still reports an
@@ -351,14 +351,14 @@ these models answer questions and touch no files.
 The agent CLIs can look at your workspace because they have a shell; a bare
 model cannot, and would answer that it has no access to other applications.
 So on a Global Ask turn the helper gives the model two read-only tools,
-answered by `muxa status --json` and `muxa recap` against the daemon the
+answered by `tend status --json` and `tend recap` against the daemon the
 question came from: `list_agent_sessions` (every tracked agent — pane, state,
 title, directory, latest prompt and reply) and `read_agent_session` (one pane
 in detail). It can read; it cannot send input to an agent or change anything.
 The model decides when to call them, so nothing is read for a question that
 is not about your agents. With `on-device` what it reads never leaves the
 Mac; with `private-cloud` it is sent to Apple's Private Cloud Compute along
-with the question. One-shot turns such as `muxa work init` get no tools. The
+with the question. One-shot turns such as `tend work init` get no tools. The
 built-in `apple` provider is listed on every host, so one config.toml can
 serve a Mac and a Linux box; a turn on a host that cannot run it fails with a
 plain "runs only on macOS".
@@ -368,11 +368,11 @@ yours to pick (a TOML bare key: letters, digits, `-`, `_`), and `engine`
 says which of the six drives it. Several providers may share one engine —
 a work and a personal OpenAI account, two Anthropic keys, a second `claude`
 binary — and each keeps its own conversation, so switching between them
-resumes rather than restarts. `[ask] agent` and `muxa ask --agent` name a
+resumes rather than restarts. `[ask] agent` and `tend ask --agent` name a
 provider id, not an engine.
 
 The engine ids are also providers of themselves, so a fresh install
-works with no `[ask.providers]` at all: `muxa ask providers` lists what you
+works with no `[ask.providers]` at all: `tend ask providers` lists what you
 composed first, then every built-in no id of yours has taken over. A table
 named after a built-in and *without* `engine` tunes that built-in — which
 is why an `[ask.providers.anthropic] model = "…"` written before any of
@@ -380,7 +380,7 @@ this still means what it always did. Removing such a table clears the
 settings; the built-in itself stays.
 
 An API key comes from, in order: the one-turn key a client sends, the
-engine's own variable in muxad's environment (`ANTHROPIC_API_KEY`,
+engine's own variable in tendd's environment (`ANTHROPIC_API_KEY`,
 `OPENAI_API_KEY`; `CODEX_API_KEY` and `GEMINI_API_KEY` for the CLIs), then
 the variable that provider's `api_key_env` names. The key itself is never
 written to config.toml. Two providers on one engine share the engine's
@@ -392,20 +392,20 @@ particular binary.
 The same daemon-owned history is available without opening the TUI:
 
 ```bash
-muxa ask --agent codex "summarize the current implementation"
-muxa ask --agent claude --detach --json "review the deployment plan"
-muxa ask --agent anthropic "which files does the reaper touch?"
+tend ask --agent codex "summarize the current implementation"
+tend ask --agent claude --detach --json "review the deployment plan"
+tend ask --agent anthropic "which files does the reaper touch?"
 security find-generic-password -w -s my-codex-key \
-  | muxa ask --agent codex --api-key-stdin "review this repository"
-muxa ask --agent anthropic-work "…"   # a provider you added, by its id (until the next restart)
-muxa ask provider use codex           # make it the default; rewrites [ask] agent
-muxa ask providers [--json]           # every provider: engine, kind, model, whether a key resolves, selected
-muxa ask provider add anthropic-work --engine anthropic \
+  | tend ask --agent codex --api-key-stdin "review this repository"
+tend ask --agent anthropic-work "…"   # a provider you added, by its id (until the next restart)
+tend ask provider use codex           # make it the default; rewrites [ask] agent
+tend ask providers [--json]           # every provider: engine, kind, model, whether a key resolves, selected
+tend ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
-muxa ask provider add claude-work --engine claude --executable /opt/homebrew/bin/claude
-muxa ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
-muxa ask provider set anthropic --clear-model         # flags you omit leave that key unchanged
-muxa ask provider remove anthropic-work               # a built-in id only loses its settings
+tend ask provider add claude-work --engine claude --executable /opt/homebrew/bin/claude
+tend ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
+tend ask provider set anthropic --clear-model         # flags you omit leave that key unchanged
+tend ask provider remove anthropic-work               # a built-in id only loses its settings
 ```
 
 `add` refuses an id that already exists, an id that is not a TOML bare key,
@@ -418,7 +418,7 @@ points at hands the selection to the first one left.
 
 `--api-key-stdin` refuses an interactive terminal, crosses only the owner-only
 Unix socket, and supplies the key to one matching provider child. It is never
-stored in muxa config/history or placed in argv. Without it, the headless CLI
+stored in tend config/history or placed in argv. Without it, the headless CLI
 uses its existing login or provider environment as before.
 
 ## Collaboration
@@ -432,19 +432,19 @@ wake = "idle_only" # idle_only | never
 wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
 max_message_bytes = 16384
-# path = "$XDG_DATA_HOME/muxa/collaboration.json"
+# path = "$XDG_DATA_HOME/tend/collaboration.json"
 # retention_days = 90 # omitted: retain indefinitely
 ```
 
 `auto_spawn_workers` lets high-level peer calls reuse a worker or create one
 when missing. `worker_bypass_permissions` defaults to false: worker launches
 inherit provider permissions/options and do not add bypass flags. Enable it
-explicitly to use Muxa's bypass profile for automatic workers. These settings
+explicitly to use Tend's bypass profile for automatic workers. These settings
 do not change manual launches or pipeline launch profiles.
 
 Opt-in durable request/reply between agents in the same stable tmux window.
 The historical optional `path` default is
-`$XDG_DATA_HOME/muxa/collaboration.json`; muxa imports that JSON once into the
+`$XDG_DATA_HOME/tend/collaboration.json`; tend imports that JSON once into the
 authoritative sibling `collaboration.sqlite3` and retains the JSON as a
 migration backup. A configured `.sqlite`, `.sqlite3`, or `.db` path is used
 directly. The database stores mailbox state and exact-session aliases/roles.
@@ -471,7 +471,7 @@ an actionable handoff; `notify=false` is pull-only. These overrides still respec
 
 Reusable prompt templates live in a regular TOML table. They are shared by the
 watch and dashboard `m` composers, the watch `a` composer, and MCP
-`muxa_call_peer` requests:
+`tend_call_peer` requests:
 
 ```toml
 [message.skills]
@@ -481,22 +481,22 @@ agent-review = "create a new pane with codex (use the cx alias), then pass our c
 Manage the table without hand-editing it:
 
 ```bash
-muxa skill add agent-review 'create a new pane with codex (use the cx alias), then pass our changes to it for review'
-muxa skill list
-muxa skill show agent-review
-muxa skill remove agent-review
+tend skill add agent-review 'create a new pane with codex (use the cx alias), then pass our changes to it for review'
+tend skill list
+tend skill show agent-review
+tend skill remove agent-review
 ```
 
 At any point in a draft, press `/`, type to filter, move with arrow keys or
 `Tab`, then press `Enter`. Selection inserts the prompt at the current cursor
 without replacing existing text; inspect or edit it and press `Enter` again to
-send. Multiple skills can be combined in one draft. In `muxa watch`, `F2` opens
+send. Multiple skills can be combined in one draft. In `tend watch`, `F2` opens
 an add/update form inside the palette and `Delete` removes the selected skill
 after confirmation. `Ctrl-A` and `Ctrl-D` remain compatibility aliases.
 Pass `-` as the CLI add prompt to read a multi-line template from stdin.
 
 In an MCP-connected agent conversation, `/name` selects the same template for
-`muxa_call_peer`; its optional body and context are appended without changing
+`tend_call_peer`; its optional body and context are appended without changing
 the template. The MCP process loads the skill table at startup, so restart an
 already-running agent after adding, updating, or removing a skill.
 
@@ -547,7 +547,7 @@ icons = "unicode"
 Shared visual defaults for human-facing terminal output (`status`,
 `status-line`, `attend`, and `watch`).
 
-- `theme` — visual preset: `classic`, `oh-my-muxa`, `focus`, `ops`, or a
+- `theme` — visual preset: `classic`, `oh-my-tend`, `focus`, `ops`, or a
   monochrome preset. A one-shot `--theme` flag overrides it per run.
 - `icons` — agent-state glyph set:
   - `unicode` (default) — Geometric Shapes glyphs (`●` working, `▶` input,
@@ -568,7 +568,7 @@ interval_secs = 30
 Discovery scans tmux panes for known agent CLIs (`claude` / `codex` /
 `gemini`/`agy`) and backfills the registry without waiting for a hook to fire. It
 runs once at daemon startup and then every `interval_secs`, so a fresh agent
-session in a new tmux session shows up in `muxa status` within that window
+session in a new tmux session shows up in `tend status` within that window
 instead of only after its first hook. Set `interval_secs = 0` to keep the
 legacy run-once-at-startup behavior; `enabled = false` turns discovery off
 entirely. The rescan reuses the same `tmux list-panes` the reconciler
@@ -582,7 +582,7 @@ restart_on_new_binary = true
 binary_poll_secs = 30
 ```
 
-Installing a new muxa does not restart the daemon on its own. The package
+Installing a new tend does not restart the daemon on its own. The package
 manager writes the new build and repoints whatever is on `PATH`, while the
 running process keeps its open inode and serves the old logic — and no service
 manager intervenes, because `KeepAlive` and `Restart=always` react to a process
@@ -590,7 +590,7 @@ manager intervenes, because `KeepAlive` and `Restart=always` react to a process
 weeks old, answering `protocol mismatch` to every CLI call once the wire format
 moves on.
 
-So muxad watches the binary it would re-exec through and, when that path
+So tendd watches the binary it would re-exec through and, when that path
 resolves to a different file for two consecutive polls, re-execs onto it. The
 confirmation poll is what keeps a half-finished install from being adopted. The
 daemon replaces itself in place (same pid), so this behaves identically under
@@ -599,17 +599,17 @@ running rather than nothing at all.
 
 Set `restart_on_new_binary = false` when something else owns the upgrade
 sequence — say a deploy that installs several binaries and restarts them in a
-particular order. `muxa daemon restart` then does it on demand, and `muxa
+particular order. `tend daemon restart` then does it on demand, and `tend
 doctor` reports a daemon whose version has drifted from the CLI's.
 
 ## Reconciler
 
-Native PTY references are checked against muxad's own session registry at
+Native PTY references are checked against tendd's own session registry at
 startup and on each reconciler pass. A missing session clears the reference
 and stops the agent row; an exited session stops it while retaining its output
 surface for capture. Failed session observations leave rows unchanged. A
 surviving pid-tracked task remains governed by process liveness even if its old
-PTY was lost on daemon restart. `muxa registry prune` also checks missing PTY references,
+PTY was lost on daemon restart. `tend registry prune` also checks missing PTY references,
 including when periodic reconciliation is disabled, and retains its age filter.
 
 ```toml
@@ -625,7 +625,7 @@ paneless_max_live_rows = 256
 
 The reconciler keeps stale states from staying misleading forever. Timeout
 values of `0` disable that timeout. The same loop also runs the pid-liveness
-sweep that flips registered background tasks (see `muxa proc register`) to
+sweep that flips registered background tasks (see `tend proc register`) to
 `stopped` once their process exits.
 
 Codex rollout polling runs every two seconds independently of the full
@@ -642,9 +642,9 @@ minutes. `0` disables the cap.
 ## Sharing settings between hosts
 
 ```sh
-muxa config export -o muxa-settings.toml      # on the host you set up
-muxa config diff  muxa-settings.toml          # on another host: preview
-muxa config apply muxa-settings.toml          # then apply
+tend config export -o tend-settings.toml      # on the host you set up
+tend config diff  tend-settings.toml          # on another host: preview
+tend config apply tend-settings.toml          # then apply
 ```
 
 The bundle is a plain TOML file, so move it however you move dotfiles: a git
@@ -661,7 +661,7 @@ repo, `scp`, a gist. It works the way editor and dotfile sync tools do:
   An automation rule that switches accounts (`swap_account`) stays home
   whole, since it depends on tooling only that host has; export says so.
 - **Apply is three-way.** Each host remembers what it last applied from a
-  source (`$XDG_DATA_HOME/muxa/config-sync/`). An item changes only where the
+  source (`$XDG_DATA_HOME/tend/config-sync/`). An item changes only where the
   local copy still matches that base: a local edit survives an unchanged
   upstream, an upstream removal deletes only what sync put there, and an item
   changed on both sides is a conflict. Conflicts stop the apply until you
@@ -672,8 +672,8 @@ repo, `scp`, a gist. It works the way editor and dotfile sync tools do:
   the changed items, never the neighbouring config.
 - **Safe writes.** `apply` edits only the planned items, so comments and
   layout elsewhere stay as they were; it backs the file up, writes through
-  muxad (validated, and refused if the file changed meanwhile), and shares
-  Fleet sync's lock and recovery. Restart muxad afterwards to load it.
+  tendd (validated, and refused if the file changed meanwhile), and shares
+  Fleet sync's lock and recovery. Restart tendd afterwards to load it.
 
 A bundle remembers which host it came from. Applying one from a different
 source needs `--switch-source`, after which its items count as a first sync.
@@ -689,7 +689,7 @@ ignore = ["pipeline.solo", "automation.rule.confirm-selected-yes", "ticket"]
 Free-form text travels as written: pipeline prompts, skills, ticket prompts
 and provider options can hold paths or secrets, so read a bundle before you
 publish it, or `ignore` what should stay. Agent integration (hooks, MCP,
-skills) is not part of the bundle; run `muxa init` on each host, setting
+skills) is not part of the bundle; run `tend init` on each host, setting
 `CLAUDE_CONFIG_DIR` / `CODEX_HOME` for every provider home you use.
 
 ## Fleet
@@ -709,22 +709,22 @@ capture_policy = "selected" # selected | never
 environment = "development"
 
 [fleet.local.annotations]
-"muxa.dev/owner" = "platform"
+"tend.dev/owner" = "platform"
 
 [fleet.hosts.dev]
-ssh = "muxa-devbox"
-muxa_path = "muxa"
+ssh = "tend-devbox"
+tend_path = "tend"
 enabled = true
 connect = "auto"            # auto | on_demand
 mode = "observe"            # observe | control
-# remote_socket = "/run/user/1000/muxa.sock"
+# remote_socket = "/run/user/1000/tend.sock"
 
 [fleet.hosts.dev.labels]
 environment = "development"
 region = "icn"
 
 [fleet.hosts.dev.annotations]
-"muxa.dev/owner" = "platform"
+"tend.dev/owner" = "platform"
 ```
 
 Fleet always publishes the controller as the first `local` host using an
@@ -736,12 +736,12 @@ and concurrency values must be non-zero. `capture_policy = "never"` disables
 both pane and window capture at the manager even on control hosts.
 
 `ssh` is an OpenSSH destination/Host alias, not a place for flags. Put port,
-identity, ProxyJump, and host-key policy in `~/.ssh/config`. `muxa_path` and
+identity, ProxyJump, and host-key policy in `~/.ssh/config`. `tend_path` and
 `remote_socket` are validated as fixed remote command tokens. Labels implement
 Kubernetes-style selectors; annotations allow descriptive values but use the
-same namespaced key syntax. Prefer `muxa fleet host add/label/annotate` to edit the
-inventory atomically. Use `muxa fleet host label local` and `muxa fleet host annotate
-local` for controller metadata; muxad-managed identity labels cannot be
+same namespaced key syntax. Prefer `tend fleet host add/label/annotate` to edit the
+inventory atomically. Use `tend fleet host label local` and `tend fleet host annotate
+local` for controller metadata; tendd-managed identity labels cannot be
 overridden. See [FLEET.md](FLEET.md).
 
 ## Dashboard
@@ -773,15 +773,15 @@ provider is unreachable.
 
 ```toml
 [dashboard.login]
-public_url = "https://muxa.example.com"
+public_url = "https://tend.example.com"
 issuer_url = "https://login.example.com"
-client_id = "muxa-dashboard"
+client_id = "tend-dashboard"
 # Optional while enrollment is on; required when enrollment = false.
-required_group = "muxa-operators"
+required_group = "tend-operators"
 # Optional: let a token holder enroll accounts outside the group (default true).
 # enrollment = true
 # Optional: provider group whose members may view the dashboard read-only.
-# viewer_group = "muxa-viewers"
+# viewer_group = "tend-viewers"
 # Optional: viewer rules, shown read-only next to the ones operators add in
 # the dashboard: "email:<address>", "email:*@<domain>" or "sub:<subject>".
 # viewer_rules = ["email:*@example.com"]
@@ -790,17 +790,17 @@ required_group = "muxa-operators"
 # Optional: scopes requested in addition to "openid email".
 # scopes = ["groups"]
 # Optional: environment variable NAME for a confidential client's secret.
-# client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"
+# client_secret_env = "TEND_LOGIN_CLIENT_SECRET"
 ```
 
-Register `https://muxa.example.com/auth/callback` with the provider and enable
+Register `https://tend.example.com/auth/callback` with the provider and enable
 authorization code flow with PKCE S256. If `[dashboard.sharing]` is also
 configured, both must use the same `public_url`. Unknown keys are rejected.
 
 With `enrollment` on, a verified account outside `required_group` (or any
 account when `required_group` is omitted) is sent to an enrollment page that
 asks for the dashboard token; entering it registers that account by issuer and
-subject in `$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3`. Remove
+subject in `$XDG_DATA_HOME/tend/dashboard-operators/operators.sqlite3`. Remove
 accounts from the dashboard's **access** dialog. `enrollment = false` restores
 group-only operator sign-in and stops honoring enrolled accounts.
 
@@ -821,17 +821,17 @@ or prompt permission, expiry and revocation; do not give them the operator token
 
 ```toml
 [dashboard.sharing]
-public_url = "https://muxa.example.com"
+public_url = "https://tend.example.com"
 issuer_url = "https://login.example.com"
-client_id = "muxa-dashboard"
+client_id = "tend-dashboard"
 # Optional: environment variable NAME, supplied to the daemon service.
-client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+client_secret_env = "TEND_SHARING_CLIENT_SECRET"
 # Optional: absolute path on a private local filesystem.
 # storage_path = "/absolute/path/to/shares.sqlite3"
 ```
 
 `public_url` must be an origin without a path, query or fragment. Register
-`https://muxa.example.com/share/auth/callback` with the OIDC provider and enable
+`https://tend.example.com/share/auth/callback` with the OIDC provider and enable
 verified email claims in ID tokens. Use an HTTPS reverse proxy for external
 access; HTTP is allowed only on loopback. Restart after configuration changes.
 
@@ -839,7 +839,7 @@ Window invitations pin up to 16 existing pane processes; new panes are not
 included. Prompt permission can execute shell commands when the pane runs a shell.
 Invitations survive daemon restarts, but recipients must sign in again and the
 original pane process must still exist. Private SQLite storage defaults to
-`muxa/dashboard-sharing/shares.sqlite3` under the platform data directory. Only
+`tend/dashboard-sharing/shares.sqlite3` under the platform data directory. Only
 one daemon may use a given database. Browser command request IDs prevent duplicate
 delivery when checking a lost response.
 
@@ -856,8 +856,8 @@ prompts to oh-my-prompt. See [SINKS.md](SINKS.md).
 
 ## Pane host selection
 
-`MUXA_HOST=tmux|cmux|rmux|herdr|zellij` pins a single host. `MUXA_HOSTS` accepts an
-ordered comma-separated set, for example `MUXA_HOSTS=rmux,tmux`. rmux's native
+`TEND_HOST=tmux|cmux|rmux|herdr|zellij` pins a single host. `TEND_HOSTS` accepts an
+ordered comma-separated set, for example `TEND_HOSTS=rmux,tmux`. rmux's native
 `RMUX` variables take precedence over the `TMUX` compatibility variables it
 also exports. See [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md), and
 [ZELLIJ.md](proposals/ZELLIJ.md).

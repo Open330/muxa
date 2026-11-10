@@ -1,10 +1,10 @@
 # Versioned collaboration task contracts
 
-Muxa's optional `collaboration_task_contract_v1` extension binds a task to an
+Tend's optional `collaboration_task_contract_v1` extension binds a task to an
 immutable contract, execution-attempt identity and recipient-reported evidence.
 Legacy requests and replies keep their existing behavior. A contract adds no
 execution permission: `work_mode` and `paths` remain the existing declared scope.
-References are data; Muxa does not open artifacts, execute test commands, contact
+References are data; Tend does not open artifacts, execute test commands, contact
 URLs, or infer authorization from them.
 
 ## Request and report
@@ -68,7 +68,7 @@ a command ran or that its result is correct. Output labels evidence as
 `report_basis_matched` is emitted only with an actual matching structured reply,
 not with a queued request or a blocker without a report. It describes equality
 to the requested commit, not freshness against the working tree's current HEAD.
-Muxa does not probe Git or independently run tests as part of this extension.
+Tend does not probe Git or independently run tests as part of this extension.
 
 Limits: 1–32 unique acceptance criteria, 16 references per list, 128-byte task ID,
 8 KiB objective, 1 KiB per criterion, and 2 KiB per evidence locator. A serialized
@@ -111,18 +111,18 @@ returns historical evidence. Recovery escalations close when their parent ends.
 ## CLI and MCP
 
 ```sh
-muxa msg send role:reviewer 'Review the submitted change' --kind review \
+tend msg send role:reviewer 'Review the submitted change' --kind review \
   --task-contract contract.json --json
-muxa msg accept REQUEST_ID --json
-muxa msg reply REQUEST_ID 'Findings and evidence' --report report.json --json
+tend msg accept REQUEST_ID --json
+tend msg reply REQUEST_ID 'Findings and evidence' --report report.json --json
 
 # New revision; use a fresh dispatch and the actual old request ID.
-muxa msg send role:reviewer 'Review the updated change' --kind review \
+tend msg send role:reviewer 'Review the updated change' --kind review \
   --task-contract updated-contract.json --supersedes OLD_REQUEST_ID --json
 ```
 
-MCP `muxa_send_message`, `muxa_call_peer` and `muxa_fleet_call_peer` accept
-`task_contract` and `supersedes_request_id` objects/IDs. `muxa_reply` accepts
+MCP `tend_send_message`, `tend_call_peer` and `tend_fleet_call_peer` accept
+`task_contract` and `supersedes_request_id` objects/IDs. `tend_reply` accepts
 `report`. Inbox and direct-delivery prompts include the complete contract and
 attempt; metadata/progress views omit instruction and evidence bodies. Outcome
 reads include the new report and any historical late reports.

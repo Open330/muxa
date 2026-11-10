@@ -15,23 +15,23 @@ enabled = true
 # coordinator omitted means this node owns placement and Global Ask.
 
 [orchestration.paths]
-root = "~/workspace-muxa"
+root = "~/workspace-tend"
 repo = "repos/{repo}"
 run = "runs/{workspace}/{work}/{attempt}"
 artifacts = "artifacts/{workspace}/{work}/{attempt}"
 
-[orchestration.workspaces.muxa]
-repo = "open330-muxa"
-url = "git@github.com:Open330/muxa.git"
+[orchestration.workspaces.tend]
+repo = "open330-tend"
+url = "git@github.com:Open330/tend.git"
 pipeline = "solo"
 selector = "organization=personal"
 
-[orchestration.workspaces.muxa.paths]
-root = "~/projects/muxa-execution"
+[orchestration.workspaces.tend.paths]
+root = "~/projects/tend-execution"
 
 # Prefer a stable NodeId; a coordinator-local Fleet alias also works.
-[orchestration.workspaces.muxa.nodes.devbox]
-root = "/srv/workspace-muxa"
+[orchestration.workspaces.tend.nodes.devbox]
+root = "/srv/workspace-tend"
 ```
 
 On entry hosts:
@@ -43,7 +43,7 @@ coordinator = "laptop"
 ```
 
 The coordinator alias must be a configured control-mode Fleet host, reachable
-from that entry host. Muxa does not establish a VPN or synthesize SSH routes.
+from that entry host. Tend does not establish a VPN or synthesize SSH routes.
 Configure ProxyJump/HostName in OpenSSH when required. The coordinator itself
 must omit `coordinator` (or set it to `local`); forwarding loops are rejected.
 `local` always means the daemon handling the request, never a particular laptop.
@@ -51,7 +51,7 @@ must omit `coordinator` (or set it to `local`); forwarding loops are rejected.
 Workers must enable orchestration and install the named pipeline and provider.
 The coordinator stores repository, selector and path policy; worker-local paths
 are resolved using the worker's home directory. No credentials or whole home
-folders are synchronized. Install matching Muxa CLI and daemon versions; the
+folders are synchronized. Install matching Tend CLI and daemon versions; the
 new `orchestration_v1` / `collaboration_dispatch_v1` capabilities prevent silent
 use of older execution contracts.
 
@@ -72,7 +72,7 @@ Git object ID available from the configured repository):
 ```json
 {
   "dispatch_id": "d4ee3ec5-8a79-4ef2-9b26-50c9c975e5a1",
-  "workspace": "muxa",
+  "workspace": "tend",
   "work": "linux-validation",
   "commit": "0123456789abcdef0123456789abcdef01234567",
   "body": "Run the Linux checks. Report commands, outcomes, and artifacts.",
@@ -81,13 +81,13 @@ Git object ID available from the configured repository):
 ```
 
 ```sh
-muxa work dispatch --from-json request.json --plan
-muxa work dispatch --from-json request.json
-muxa work dispatch-status d4ee3ec5-8a79-4ef2-9b26-50c9c975e5a1
+tend work dispatch --from-json request.json --plan
+tend work dispatch --from-json request.json
+tend work dispatch-status d4ee3ec5-8a79-4ef2-9b26-50c9c975e5a1
 ```
 
-MCP exposes `muxa_dispatch_work` (same JSON, optional `plan: true`) and
-`muxa_dispatch_status` (`dispatch_id`). A plan makes no filesystem changes and
+MCP exposes `tend_dispatch_work` (same JSON, optional `plan: true`) and
+`tend_dispatch_status` (`dispatch_id`). A plan makes no filesystem changes and
 spends no provider turn. The workspace selector and request selector intersect;
 `host` can further restrict to an alias or NodeId. Eligible nodes must be online,
 control-authorized and support orchestration. Selection prefers fewer active
@@ -120,10 +120,10 @@ copied back or merged. Agents should report deliverables and resulting commits.
 * A damaged/incomplete journal blocks execution. An operator must establish what
   ran before repairing it. Initial implementation deliberately has no automatic
   reservation expiry, destructive cleanup or rerun command.
-* Journals live under the Muxa data directory, `dispatches/{coordinator,worker}`.
+* Journals live under the Tend data directory, `dispatches/{coordinator,worker}`.
   Peer sends also write `dispatches/peer-outbox` before the remote effect.
 
-`muxa_fleet_call_peer` accepts optional UUID `dispatch_id` and a
+`tend_fleet_call_peer` accepts optional UUID `dispatch_id` and a
 `delegation_parent: {node_id, request_id}` across nodes. The source node is stamped
 by the sender. These causal fields do not grant authorization or replace local
 `parent_request_id` participant checks. The sender receipt pins the target NodeId as well as its Fleet alias.
@@ -144,12 +144,12 @@ retain their existing tool/permission limitations.
 
 Keep AGENTS.md small, for example:
 
-> Delegate authorized Fleet work through muxa_dispatch_work. Muxa owns placement
+> Delegate authorized Fleet work through tend_dispatch_work. Tend owns placement
 > and paths. Use a stable dispatch ID, exact commit, bounded task and acceptance
 > criteria. Reuse the ID after uncertain delivery. Report completion/artifacts
 > or a real blocker; avoid repeated prompts and terminal polling.
 
-Full policy belongs in Muxa configuration, not copied inventories in prompts.
+Full policy belongs in Tend configuration, not copied inventories in prompts.
 Attachability is implemented through tmux. An explicit operator takeover state
 that pauses dependency reconciliation, optional headless execution, hardware
 capacity reservations, queues, artifact transfer and multi-node DAG dispatch are

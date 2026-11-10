@@ -1,0 +1,16 @@
+---
+source: crates/tend-cli/src/watch.rs
+expression: "snapshot_helpers::buffer_string(&terminal)"
+---
+ tend watch   0 agents  + 0 panes   sort PANE ID   <clock>
+j/k move  ·  / filter  ·  : commands  ·  ? help
+────────────────────────────────────────────────────────────────────────────────────────────────────
+┌ Agents ──────────────────────────────────────────────────────────────────────────────────────────┐
+│                                                                                                  │
+│                                   Start your first coding agent                                  │
+│                          Enter / n: start an agent in the current folder                         │
+│                  Already running one? r: refresh · tend doctor: check detection                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  jump   o  preview   m  message   Alt-M  move

@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """The sandbox server must not read the caller's `~/.tmux.conf`.
 
-Their bindings and options would be surprising; their *hooks* are worse. muxa's
+Their bindings and options would be surprising; their *hooks* are worse. tend's
 own `tmux-auto-view`, on by default since v0.8.36, binds `client-attached` and
 `client-session-changed` to hand an arriving client its own session-group view
 — which fires inside the sandbox the instant the learner attaches and moves
 them straight back out, ending the tour at step 6 with
-`[detached (from session muxa-onboarding)]`.
+`[detached (from session tend-onboarding)]`.
 """
 import argparse
 import pathlib
@@ -22,7 +22,7 @@ def main() -> int:
     ap.add_argument("--name", default="cfgiso")
     args = ap.parse_args()
 
-    sandbox = HERE / "muxa-sandbox.sh"
+    sandbox = HERE / "tend-sandbox.sh"
     # A config a sandbox server would visibly obey if it read one at all.
     with tempfile.NamedTemporaryFile("w", suffix=".conf", delete=False) as f:
         f.write("set -g @caller-config-was-read yes\n")

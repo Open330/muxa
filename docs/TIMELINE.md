@@ -1,21 +1,21 @@
 # Timeline
 
-`muxa timeline` shows how agent sessions moved through work, waiting,
+`tend timeline` shows how agent sessions moved through work, waiting,
 errors, human interaction, and tmux foreground time. It is the visual view of
-the same duration data used by `muxa stats` and `muxa stats report`.
+the same duration data used by `tend stats` and `tend stats report`.
 
 ## Quick Start
 
 ```bash
-muxa timeline --since today
-muxa timeline --since today --session main
-muxa timeline --since today --exclude-session 'monitor*'
-muxa timeline --since 24h --agent codex
-muxa timeline --since today --group-by kind
-muxa timeline --since today --sort waiting
-muxa timeline --view heatmap --since 12w
-muxa timeline --day 2026-06-06
-muxa timeline --since today --format json
+tend timeline --since today
+tend timeline --since today --session main
+tend timeline --since today --exclude-session 'monitor*'
+tend timeline --since 24h --agent codex
+tend timeline --since today --group-by kind
+tend timeline --since today --sort waiting
+tend timeline --view heatmap --since 12w
+tend timeline --day 2026-06-06
+tend timeline --since today --format json
 ```
 
 The default overview is grouped by tmux session. Each session group can show:
@@ -23,7 +23,7 @@ The default overview is grouped by tmux session. Each session group can show:
 | Lane | Meaning |
 | --- | --- |
 | Agent | Agent state spans: working, waiting, error, starting, idle. |
-| Human | Human interaction spans recorded by muxa, such as prompt input or tmux attach. |
+| Human | Human interaction spans recorded by tend, such as prompt input or tmux attach. |
 | tmux | Time the tmux session was foregrounded by an interactive client. |
 
 ## Options
@@ -40,15 +40,15 @@ The default overview is grouped by tmux session. Each session group can show:
 | `--group-by` | `session` default, `kind`, or `flat`. TUI only. |
 | `--sort` | `latest` default, `name`, `duration`, `working`, `waiting`, `error`, `human`, or `foreground`. Also accepts aliases like `dur`, `work`, `wait`, `err`, and `tmux`. |
 | `--format` | `tui` default or `json`. |
-| `--theme` | Same one-shot theme override style as other muxa TUIs. |
+| `--theme` | Same one-shot theme override style as other tend TUIs. |
 
 ## Heatmap View
 
-`muxa timeline --view heatmap --since 12w` prints a compact daily activity
+`tend timeline --view heatmap --since 12w` prints a compact daily activity
 map in the terminal. Each cell is a local calendar day; intensity is based on
 agent work, waiting, errors, human interaction, and tmux foreground time.
 Week rows are ISO-style Monday-first, matching `--since last-week`.
-Below the grid, muxa lists the busiest days and, for a single-day view, the
+Below the grid, tend lists the busiest days and, for a single-day view, the
 top sessions for that day.
 
 ## TUI Keys
@@ -82,7 +82,7 @@ from `session-activity.json` when session activity tracking is enabled.
 Agent transition rows render the state they left. For example, a ledger row
 `working -> waiting_input` draws a `working` span from `state_entered_at` to
 the transition timestamp. This keeps duration accounting consistent with
-`muxa stats`.
+`tend stats`.
 
 ## Dashboard
 
@@ -90,5 +90,5 @@ The dashboard timeline uses the same `/api/timeline` document and groups
 lanes by session by default. It also renders a daily contribution-map style
 heatmap above the lane graph; click a day to drill into that calendar day.
 Use the dashboard when you want a persistent browser view; use
-`muxa timeline` when you want keyboard navigation, focus view, terminal
+`tend timeline` when you want keyboard navigation, focus view, terminal
 heatmaps, terminal-native JSON export, and scope exclusions.

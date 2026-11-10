@@ -1,8 +1,8 @@
 # Agent collaboration
 
-`muxa`는 tmux window를 협업 room으로 보고, 그 안의 top-level agent가 durable
+`tend`는 tmux window를 협업 room으로 보고, 그 안의 top-level agent가 durable
 request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 범위를 표현하고,
-실제 메시지는 `muxad`의 owner-only Unix socket과 local mailbox를 통과합니다.
+실제 메시지는 `tendd`의 owner-only Unix socket과 local mailbox를 통과합니다.
 
 ## 사람의 작업 우선 처리
 
@@ -11,7 +11,7 @@ request/reply 메시지를 주고받게 할 수 있습니다. tmux는 위치와 
 않습니다. 사람이 console에서 보낸 요청과 자신이 보낸 요청의 최종 응답 알림은
 계속 전달합니다.
 
-자동·provider·role 선택은 `worker`만 대상으로 합니다. `muxa_call_peer`는 기존
+자동·provider·role 선택은 `worker`만 대상으로 합니다. `tend_call_peer`는 기존
 worker를 재사용하고 없으면 기본적으로 생성합니다. provider 권한 설정을 그대로
 사용하며 bypass 플래그를 추가하지 않습니다. `collaboration.auto_spawn_workers=false`로
 자동 생성을 끄거나 호출별 `spawn_if_missing`으로 덮어쓸 수 있습니다.
@@ -20,12 +20,12 @@ worker를 재사용하고 없으면 기본적으로 생성합니다. provider �
 지정합니다. 일반 start와 role 없는 pipeline 에이전트는 primary이며 별도 worker pool은
 만들지 않습니다.
 
-전용 worker는 `muxa start --agent claude --purpose worker`로 실행하거나 해당 세션에서
-`muxa identity purpose worker`로 지정합니다. `primary`로 다시 변경할 수 있습니다.
+전용 worker는 `tend start --agent claude --purpose worker`로 실행하거나 해당 세션에서
+`tend identity purpose worker`로 지정합니다. `primary`로 다시 변경할 수 있습니다.
 목적은 정확한 provider 세션에 저장하며 pane, role, alias나 새 세션으로 상속하지
 않습니다. 새 worker의 첫 세션만 실제 CLI 프로세스에 한 번 결합합니다.
 
-`muxa identity purpose worker --session ID`로 살아 있는 특정 에이전트 세션을 지정할 수
+`tend identity purpose worker --session ID`로 살아 있는 특정 에이전트 세션을 지정할 수
 있습니다. purpose 도입 전에 띄운 worker의 요청이 대기열에 묶여 있을 때 씁니다. 직접 실행하거나
 에이전트에게 지시해 실행시킬 수 있고, 변경은 호출자와 함께 audit에 남습니다. 승격된 세션의
 대기 요청은 다시 보내지 않아도 다음 idle 때 전달됩니다.
@@ -33,13 +33,13 @@ worker를 재사용하고 없으면 기본적으로 생성합니다. provider �
 고수준 호출에서 primary를 지정해도 일반 작업은 같은 provider의 worker로 보냅니다.
 기존 대화가 꼭 필요할 때만 `context_bound=true`를 지정합니다. 이 요청과 저수준
 pane·alias 직접 지정 메시지는 primary에서 대기합니다. 작업을 받아도 될 때
-`muxa msg accept REQUEST --json` 또는 `muxa_inbox(request_id=REQUEST)`로 하나만
+`tend msg accept REQUEST --json` 또는 `tend_inbox(request_id=REQUEST)`로 하나만
 명시적으로 수락합니다. 이미 수락한 작업의 소유권은 유지합니다.
 
-사용자가 에이전트에게 primary로 보내라고 지시했다면, 에이전트는 `muxa msg send`나
-`muxa peer`에 `--user-authorized`를 붙입니다(MCP는 `user_authorized=true`). 그러면
+사용자가 에이전트에게 primary로 보내라고 지시했다면, 에이전트는 `tend msg send`나
+`tend peer`에 `--user-authorized`를 붙입니다(MCP는 `user_authorized=true`). 그러면
 primary는 수락 단계 없이 요청을 받고, 지정한 primary가 worker로 바뀌지도 않습니다.
-muxad는 이 요청을 사람의 터미널에 입력하지 않습니다. 보내지 않은 입력이 남아 있으면
+tendd는 이 요청을 사람의 터미널에 입력하지 않습니다. 보내지 않은 입력이 남아 있으면
 요청과 섞여 함께 제출될 수 있기 때문입니다. 대신 그 세션의 provider hook이 다음 턴
 경계에서 *제안*합니다. 진행 중인 턴이 끝날 때 이어서 처리하거나(Claude Code·Codex
 `Stop` hook), 사용자의 다음 프롬프트에 함께 붙습니다(`UserPromptSubmit`). 제안만으로는
@@ -60,7 +60,7 @@ daemon은 요청을 조용히 대기시키지 않고 이 옵션을 거부합니�
 provider 설정의 기본값을 사용하며 기존 대화·정확한 모델·계정을 복제하지 않습니다.
 
 
-`prefix + q` (`muxa peek`)는 등록된 역할과 primary/worker 목적, 실제 요청의
+`prefix + q` (`tend peek`)는 등록된 역할과 primary/worker 목적, 실제 요청의
 송수신 상대와 전달·응답 상태를 프롬프트·응답 카드 아래 별도 `Links` 구역에
 최대 3건 표시합니다. 카드에는 `rmux:%37` 같은 전체 pane ID를 표시하고, 실제 pane
 위치에 맞춰 연결선을 그립니다. 연결선은 텍스트 카드를 지나지 않으며 공간이 부족하거나
@@ -72,9 +72,9 @@ provider 설정의 기본값을 사용하며 기존 대화·정확한 모델·�
 생성자는 정확한 agent 세션과 서버로 고정하므로 같은 pane의 새 세션에는 연결하지
 않습니다. 이 정보는 pane 생성 이력이며 현재 작업의 관리자를 뜻하지 않습니다.
 `primary`는 사람 작업 우선 목적이고, 관리 역할은 명시적으로 등록된 역할을 따릅니다.
-Muxa가 생성자를 확인할 수 있는 새 실행부터 기록하며 기존 pane의 생성자는 추정하지
+Tend가 생성자를 확인할 수 있는 새 실행부터 기록하며 기존 pane의 생성자는 추정하지
 않습니다. pane 메타데이터는 daemon 재시작 후에도 남고, 닫힌 pane의 이력은
-데이터 디렉터리의 `muxa/spawns/<launch-id>.json`에 보관합니다. 요청 본문은 저장하지
+데이터 디렉터리의 `tend/spawns/<launch-id>.json`에 보관합니다. 요청 본문은 저장하지
 않으며 overlay는 이력 디렉터리를 순회하지 않습니다.
 pane ID에는 서버와 pane을 기준으로 정해지는 고정 색상을 적용합니다. 카드 제목·
 생성자·통신 상대에서 같은 ID는 같은 색이며, 관계선의 색과 plain 출력은 유지합니다.
@@ -94,11 +94,11 @@ Codex worker는 `--no-daemon`으로 분리하며 자신의 pane을 보고하는 
 
 ## 이것만 기억하세요
 
-- tmux window 하나가 협업 room 하나입니다. Muxa managed model에서 이 window는
+- tmux window 하나가 협업 room 하나입니다. Tend managed model에서 이 window는
   현재 Run의 협업 경계이며, 지속되는 Work나 외부 이슈의 identity는 아닙니다.
-- MCP나 `muxa msg`로 말하는 **agent**는 자기 pane을 대행하는 발신자입니다. 응답은
+- MCP나 `tend msg`로 말하는 **agent**는 자기 pane을 대행하는 발신자입니다. 응답은
   그 pane으로 돌아가 agent를 깨웁니다.
-- `muxa watch`는 agent가 아니라 **operator console**입니다. watch를 연 pane에 무엇이
+- `tend watch`는 agent가 아니라 **operator console**입니다. watch를 연 pane에 무엇이
   들어 있든, 발신자는 키보드 앞의 사람입니다.
 - agent를 선택하고 `m`으로 보내며 `M`으로 mailbox를 엽니다.
 
@@ -108,7 +108,7 @@ Codex worker는 `--no-daemon`으로 분리하며 자신의 pane을 보고하는 
 
 ### console
 
-`muxa watch`는 고정된 identity를 가지며 자기 pane이 없는 `console`로 보냅니다.
+`tend watch`는 고정된 identity를 가지며 자기 pane이 없는 `console`로 보냅니다.
 알아둘 결과가 셋 있습니다.
 
 - **watch를 띄운 그 pane을 포함해 모든 행이 대상입니다.** 발신자는 그 pane의
@@ -132,25 +132,25 @@ identity입니다. watch에서 사람이 보낸 요청도 예전에는 이 agent
 확인한 PID/UID, process environment 또는 ancestry로 관찰한 pane과 evidence 종류,
 주장한 origin과의 일치 여부를 따로 표시합니다. console 요청도 사람이 어느 pane에서
 걸었는지를 함께 남기므로 audit은 그대로 유지되고, 수신자는 wake 문구에서
-`from console via muxa watch (caller %N, pid …)`를 봅니다.
+`from console via tend watch (caller %N, pid …)`를 봅니다.
 
 ## 활성화
 
 `standard` preset은 Codex와 Claude Code에 전역 진입 지침, 공통
-`muxa-collaboration` 스킬, MCP 등록도 설치합니다. 기존 설치에는
-`muxa init --component agent-instructions,agent-skills,agent-mcp`로 추가합니다.
+`tend-collaboration` 스킬, MCP 등록도 설치합니다. 기존 설치에는
+`tend init --component agent-instructions,agent-skills,agent-mcp`로 추가합니다.
 자세한 내용은 [전역 에이전트 연동](AGENT_INTEGRATION.ko.md)을 참고하세요.
 아래 수동 MCP 등록은 해당 컴포넌트를 선택하지 않았을 때 사용할 수 있습니다.
 
 협업은 명시적으로 켜야 합니다. 요청이 도착하면 상대 pane에 짧은 prompt를 넣어
-깨우기 때문입니다. `muxa init`이 다른 항목과 함께 이 권한을 묻고, `standard`
+깨우기 때문입니다. `tend init`이 다른 항목과 함께 이 권한을 묻고, `standard`
 preset에 포함돼 있습니다.
 
 ```bash
-muxa init --component collaboration
+tend init --component collaboration
 ```
 
-아래 블록을 `config.toml`에 씁니다. 해제는 `muxa init --component collaboration
+아래 블록을 `config.toml`에 씁니다. 해제는 `tend init --component collaboration
 --uninstall`입니다. 직접 편집해도 동일합니다.
 
 ```toml
@@ -164,32 +164,32 @@ wake_payload = "operator_full"
 ```
 
 이미 있는 `wake` 값은 덮어쓰지 않습니다. `never`는 "mailbox는 쓰되 내 pane은
-건드리지 말라"는 의도적 선택이므로 `muxa init`을 다시 실행해도 유지됩니다.
+건드리지 말라"는 의도적 선택이므로 `tend init`을 다시 실행해도 유지됩니다.
 
 설정 후 daemon을 재시작합니다.
 
-각 agent에 `muxa mcp`가 등록돼 있어야 합니다. Claude Code와 Codex에는 다음처럼
+각 agent에 `tend mcp`가 등록돼 있어야 합니다. Claude Code와 Codex에는 다음처럼
 등록합니다.
 
 ```bash
-claude mcp add --scope user muxa -- muxa mcp
-codex mcp add muxa -- muxa mcp
+claude mcp add --scope user tend -- tend mcp
+codex mcp add tend -- tend mcp
 ```
 
 Codex는 허용 목록에 지정한 환경 변수만 stdio MCP process로 전달합니다.
-`~/.codex/config.toml`에 생성된 `[mcp_servers.muxa]` table 아래에 다음 줄을
+`~/.codex/config.toml`에 생성된 `[mcp_servers.tend]` table 아래에 다음 줄을
 추가하세요.
 
 ```toml
-env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "TEND_SOCKET"]
 ```
 
 이미 실행 중인 agent는 등록된 MCP 목록을 다시 읽도록 종료 후 재실행합니다.
-MCP가 연결되면 muxa는 초기 지침에서 같은 window의 agent를 reviewer나 좁은 범위의
+MCP가 연결되면 tend는 초기 지침에서 같은 window의 agent를 reviewer나 좁은 범위의
 subagent로 활용할 수 있음을 알립니다. agent는 필요할 때
-`muxa_collaboration_guide`로 같은 지침을 다시 조회할 수 있습니다.
+`tend_collaboration_guide`로 같은 지침을 다시 조회할 수 있습니다.
 
-`muxa doctor`가 pane을 synthetic agent로 표시하면 그 agent는 아직 안정적인 session
+`tend doctor`가 pane을 synthetic agent로 표시하면 그 agent는 아직 안정적인 session
 identity가 없으므로 room participant나 요청 대상에 포함되지 않습니다. agent에서 새
 prompt를 한 번 제출해 hook event를 발생시키고, 계속 synthetic이면 agent를 재시작한
 뒤 다시 확인하세요. 이는 synthetic session에 요청이 고정된 채 실제 session으로
@@ -199,7 +199,7 @@ prompt를 한 번 제출해 hook event를 발생시키고, 계속 synthetic이�
 
 Claude MCP process는 agent와 같은 pane host의 native 환경 변수를 상속하고,
 Codex는 위 `env_vars` 허용 목록을 통해 전달합니다. 기존 default-endpoint Codex
-등록에는 muxa가 active backend의 process ancestry를 따라 pane을 복구하는 fallback도 적용합니다.
+등록에는 tend가 active backend의 process ancestry를 따라 pane을 복구하는 fallback도 적용합니다.
 해석된 값과 daemon의 live agent/pane registry를 대조해 발신자를 결정하므로 tool
 argument로 발신 pane을 임의 지정하지 않습니다.
 
@@ -211,7 +211,7 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 - identity를 등록한 agent는 `@reviewer` 또는 `role:rust`처럼 지정할 수 있습니다.
 - `scope = "window"`에서는 다른 window의 pane을 거부합니다. `scope = "host"`는
   명시적 pane 대상(`pane:rmux:%12`, `pane:%12` 등)을 다른 window/session까지 넓힙니다.
-  Muxa가 반환한 backend 접두사를 유지해야 합니다. `peer`, `@alias`, `role:`은
+  Tend가 반환한 backend 접두사를 유지해야 합니다. `peer`, `@alias`, `role:`은
   같은 room 안에서만 찾으며, 다른 서버에 같은 pane ID가 있으면 모호한 대상으로 거부합니다.
 - 요청은 pane뿐 아니라 현재 agent session에도 고정됩니다. pane을 새 agent가
   재사용해도 이전 요청을 받지 않습니다.
@@ -223,7 +223,7 @@ argument로 발신 pane을 임의 지정하지 않습니다.
   이를 요구합니다.
 - pane이 아니라 "이 작업의 이 역할"에게 보내려면 경로를 씁니다:
   `workspace/work/role`, `workspace/work/role@alias`, `workspace/work/@alias`
-  (예: `muxa msg send webapp/ENG-8111/implementer "진행 상황?"`). 살아 있는 agent
+  (예: `tend msg send webapp/ENG-8111/implementer "진행 상황?"`). 살아 있는 agent
   하나와 정확히 일치해야 하며 pane 대상과 같은 scope 규칙을 따릅니다.
 - 경로·`@alias`·`role:`로 보낸 요청은 슬롯을 기억합니다. 아직 전달되기 전(미수신, 알림
   전)이라면 같은 세션이 다른 pane으로 옮겼을 때 그 세션을, 원래 세션이 사라졌을 때는
@@ -234,16 +234,16 @@ argument로 발신 pane을 임의 지정하지 않습니다.
 확인:
 
 ```bash
-muxa peers
-muxa peers --json
+tend peers
+tend peers --json
 ```
 
 ## 기본 handle
 
 agent pane은 아무도 이름을 붙이지 않아도 handle을 하나 받습니다. room에서 그
 런타임의 첫 agent가 `@claude`, `@codex`, `@gemini`, `@agy`, `@opencode`가 되고
-같은 종류의 두 번째가 `@claude2`가 됩니다. session의 첫 hook 이벤트에서 부여되며, pane 옵션 `@muxa_agent_alias`에
-저장되어 muxad·CLI·agent 재시작보다 오래 남습니다.
+같은 종류의 두 번째가 `@claude2`가 됩니다. session의 첫 hook 이벤트에서 부여되며, pane 옵션 `@tend_agent_alias`에
+저장되어 tendd·CLI·agent 재시작보다 오래 남습니다.
 
 handle 발급은 전부 daemon이 합니다. pane 옵션·등록된 identity·아직 기록되지
 않은 예약까지 room 전체를 보는 유일한 지점이고, 그보다 좁은 시야에서 할당하면
@@ -251,7 +251,7 @@ handle 발급은 전부 daemon이 합니다. pane 옵션·등록된 identity·�
 등록합니다. daemon에 닿지 못하면 이름을 붙이지 않고 `%1242`로 남깁니다.
 
 이미 이름이 있는 pane은 건드리지 않으므로 pipeline alias나 직접 지정한 이름이
-우선합니다. `muxa peek`은 각 pane 헤더에 pane id와 함께 handle을 표시합니다.
+우선합니다. `tend peek`은 각 pane 헤더에 pane id와 함께 handle을 표시합니다.
 
 ## Agent identity
 
@@ -260,13 +260,13 @@ pane이 셋 이상인 room에서는 각 agent가 의미 있는 alias와 role을 
 agent가 재사용해도 이전 이름이나 역할을 상속하지 않습니다.
 
 ```bash
-muxa identity set --alias reviewer --role review --role rust
-muxa identity show
+tend identity set --alias reviewer --role review --role rust
+tend identity show
 
-muxa msg send @reviewer "auth 변경을 검토해 주세요" --kind review
-muxa msg send role:rust "이 lifetime 오류의 원인을 찾아 주세요"
+tend msg send @reviewer "auth 변경을 검토해 주세요" --kind review
+tend msg send role:rust "이 lifetime 오류의 원인을 찾아 주세요"
 
-muxa identity clear
+tend identity clear
 ```
 
 alias는 live peer 사이에서 room-local unique이며 32자 이하 slug입니다. role은
@@ -277,52 +277,52 @@ alias는 live peer 사이에서 room-local unique이며 32자 이하 slug입니�
 
 ```bash
 # 질문/리뷰는 read-only가 기본
-muxa msg send peer "auth 변경의 race 가능성을 검토해 주세요" --kind review
+tend msg send peer "auth 변경의 race 가능성을 검토해 주세요" --kind review
 
 # 원인 request와 Work/Run을 연결한 후속 검증
-muxa msg send peer "수정 결과를 검증해 주세요" --kind review \
+tend msg send peer "수정 결과를 검증해 주세요" --kind review \
   --parent req_... --workspace webapp --work ENG-7345 --run resolve-2 \
   --artifact commit:d4bf2aa --link https://example.test/review
 
 # 수정 권한과 advisory path scope를 명시한 작업
-muxa msg send pane:%18 "테스트를 보강해 주세요" \
+tend msg send pane:%18 "테스트를 보강해 주세요" \
   --kind task --execute --path 'crates/auth/**'
 
 # 검증된 AIR plan을 작업 입력으로 함께 전달
-muxa msg send peer "이 계획의 위험을 검토해 주세요" --kind review \
+tend msg send peer "이 계획의 위험을 검토해 주세요" --kind review \
   --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"ENG-6924 plan","locator":{"display":".air/eng-6924-plan.air.json","disclosure":"local-only"}}'
 
 # 수신 agent
-muxa msg inbox
-muxa msg reply req_... "검토 완료: ..." --status completed
+tend msg inbox
+tend msg reply req_... "검토 완료: ..." --status completed
 
 # 발신 agent
-muxa msg wait req_... --timeout-secs 300 --body
+tend msg wait req_... --timeout-secs 300 --body
 
 # claim하지 않고 request/reply lifecycle 확인
-muxa msg list --mailbox sent
-muxa msg list --mailbox incoming --json
+tend msg list --mailbox sent
+tend msg list --mailbox incoming --json
 
 # 이 window 전체 / 이 daemon이 가진 모든 room (operator console 전용)
-muxa msg list --scope room
-muxa msg list --scope all
+tend msg list --scope room
+tend msg list --scope all
 
 # 모든 조건은 AND이며 필터 뒤 offset/limit 적용
-muxa msg list --scope all --since 7d --work ENG-7345 --kind review \
+tend msg list --scope all --since 7d --work ENG-7345 --kind review \
   --status completed --limit 50 --offset 0
 
 # 아직 상대가 claim하지 않은 요청 취소
-muxa msg cancel req_...
+tend msg cancel req_...
 
 # 포기했거나 다시 보낸 요청: 늦게 온 답장이 더는 깨우지 않음(작업·답장은 그대로)
-muxa msg send peer "쓰기 권한으로 다시 요청" --withdraw req_...
-muxa msg withdraw req_...
+tend msg send peer "쓰기 권한으로 다시 요청" --withdraw req_...
+tend msg withdraw req_...
 ```
 
 에이전트 간 알림은 요청 본문을 대화에 붙여넣지 않고 요청 ID를 전달합니다.
-`muxa_inbox(request_id="REQUEST")` 또는 `muxa msg accept REQUEST --json`으로
+`tend_inbox(request_id="REQUEST")` 또는 `tend msg accept REQUEST --json`으로
 해당 요청 하나만 읽고, 같은 ID로 진행 상황과 최종 답변을 연결하세요.
-`muxa msg inbox --json`은 MCP와 같은 간결한 형식으로 본문·허용 경로·첨부·작업 계약을
+`tend msg inbox --json`은 MCP와 같은 간결한 형식으로 본문·허용 경로·첨부·작업 계약을
 빠짐없이 반환합니다. 기존 전체 감사 기록은 `--json --full`로 조회합니다.
 수신 전용 형식은 송신자·추가 지시 작성자의 이름과 세션 ID를 보존하며, 운영자이면
 `console: true`도 표시합니다. 수신자 자신의 위치, 전송 상태, 반복 경로·revision,
@@ -330,12 +330,12 @@ muxa msg withdraw req_...
 역할 문맥·출처 이상 신호는 유지합니다. 30분 이상 지난 요청에는
 `request_age_minutes`도 표시합니다. 요청한 기준 revision은 `attempt`에 있습니다.
 일반 목록·전송 확인에는 경로 정보가, 전체 기록에는 감사 정보가 남습니다.
-이후 진행 상황은 `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`으로
+이후 진행 상황은 `tend msg list --request-id REQUEST --after-update SEQUENCE --json`으로
 새 항목만 읽을 수 있습니다.
 
-`muxa msg inbox`의 텍스트 출력에는 작업 본문과 함께 답변 의무, 허용 경로, 첨부 자료가 표시됩니다. `muxa msg wait --timeout SECONDS`는 `--timeout-secs SECONDS`의 별칭입니다.
+`tend msg inbox`의 텍스트 출력에는 작업 본문과 함께 답변 의무, 허용 경로, 첨부 자료가 표시됩니다. `tend msg wait --timeout SECONDS`는 `--timeout-secs SECONDS`의 별칭입니다.
 
-`muxa msg wait` 기본 출력은 전달 상태와 최종 답장 수신 여부를 나타내는
+`tend msg wait` 기본 출력은 전달 상태와 최종 답장 수신 여부를 나타내는
 간결한 JSON입니다. 작업 성공을 판정하지 않습니다. 대기 시간 초과는
 `reason: timeout` JSON과 종료 코드 2로 구분하며, 작업 결과를 판정하지 않습니다.
 `--full`도 시간 초과에는 비정상 종료하고, 전달 오류는 별도로 비정상 종료합니다.
@@ -363,12 +363,12 @@ root request에는 `thread_id`가 생깁니다. 기본값은 request id이며 `-
 명시할 수도 있습니다. `--parent <request-id>`는 causal edge를 만들고 parent의
 canonical thread를 상속합니다. parent가 없거나 room/participant pair가 다르거나
 명시한 thread가 충돌하면 거부합니다. `workspace_id`, `work_id`, `run_id`는 durable
-Work와 한 번의 실행을 구분합니다. Muxa는 관리 중인 pane/window metadata에서 빠진
+Work와 한 번의 실행을 구분합니다. Tend는 관리 중인 pane/window metadata에서 빠진
 Work 필드를 채우고 가능하면 execution binding으로 run id를 만들며, CLI/MCP에서
 명시한 값이 우선합니다. 일반 `artifacts`와 `links`는 metadata일 뿐 파일·URL 접근
 권한이 아닙니다.
 
-`muxa msg list`의 `--since`, `--workspace`, `--work`, `--thread`, `--kind`,
+`tend msg list`의 `--since`, `--workspace`, `--work`, `--thread`, `--kind`,
 `--status`, `--window`(`--room` alias)는 AND로 결합되고 최신순 snapshot에
 `--offset`, `--limit`가 적용됩니다. 새 CLI가 구형 daemon과 연결돼도 필터 없는 결과를
 조용히 반환하지 않도록 CLI가 전체 결과를 받아 필터링합니다. 따라서 offset은 동시
@@ -377,7 +377,7 @@ Work 필드를 채우고 가능하면 execution binding으로 run id를 만들�
 `2h`/`7d` 같은 duration, local date, RFC 3339 timestamp, timeline과 같은 calendar
 keyword를 받습니다.
 
-tracked agent pane에서 `prefix+s`로 `muxa watch`를 열면 같은 lifecycle을 TUI로
+tracked agent pane에서 `prefix+s`로 `tend watch`를 열면 같은 lifecycle을 TUI로
 사용할 수 있습니다. `m`은 선택한 room peer에게 요청을 보내고, `M`은 claim
 없는 mailbox 이력을 열며, `i`는 inbox를 claim하고 `e`는 응답합니다. window 행의
 `M`은 room 전체를, session 행에서는 모든 room을 window별로 모아 보여주며 두
@@ -395,31 +395,31 @@ durable request에 실리는 계약이고, `just send`는 본문을 키스트로
 
 watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 다른
 색상으로 표시합니다. `○ READ-ONLY`는 조사·답변만 위임하고 `● EXECUTE`는 명령과
-파일 변경을 허용합니다. 두 mode는 수신 agent에게 전달되는 계약이며 muxa가 직접
+파일 변경을 허용합니다. 두 mode는 수신 agent에게 전달되는 계약이며 tend가 직접
 작업을 실행하는 스위치가 아닙니다.
 
 ## MCP tools
 
 | Tool | 역할 |
 | --- | --- |
-| `muxa_collaboration_guide` | reviewer/question/subagent/AIR 전달의 권장 계약 조회 |
-| `muxa_room_context` | self, same-window peers, unread count 조회 |
-| `muxa_call_peer` | 등록 스킬 확장, peer 선택, durable 요청, 선택적 응답 대기, 확인 후 agent 생성 |
-| `muxa_peer_report` | 이전 peer 요청의 최신 완료 보고 또는 정확한 request id 조회 |
-| `muxa_set_identity` | 현재 agent session의 room-local alias/roles 교체 |
-| `muxa_send_message` | durable request 생성 |
-| `muxa_inbox` | 현재 agent session의 요청 claim/read |
-| `muxa_list_messages` | incoming/sent/all request 상태 조회(미claim) |
-| `muxa_reply` | completed/blocked/declined/failed 구조화 응답 |
-| `muxa_wait_reply` | event-driven 방식으로 요청의 terminal reply 대기 |
-| `muxa_withdraw_reply_wake` | 포기했거나 대체한 내 요청의 답장 wake 철회(작업·답장은 유지) |
-| `muxa_cancel_message` | 아직 queued인 발신 요청 취소 |
+| `tend_collaboration_guide` | reviewer/question/subagent/AIR 전달의 권장 계약 조회 |
+| `tend_room_context` | self, same-window peers, unread count 조회 |
+| `tend_call_peer` | 등록 스킬 확장, peer 선택, durable 요청, 선택적 응답 대기, 확인 후 agent 생성 |
+| `tend_peer_report` | 이전 peer 요청의 최신 완료 보고 또는 정확한 request id 조회 |
+| `tend_set_identity` | 현재 agent session의 room-local alias/roles 교체 |
+| `tend_send_message` | durable request 생성 |
+| `tend_inbox` | 현재 agent session의 요청 claim/read |
+| `tend_list_messages` | incoming/sent/all request 상태 조회(미claim) |
+| `tend_reply` | completed/blocked/declined/failed 구조화 응답 |
+| `tend_wait_reply` | event-driven 방식으로 요청의 terminal reply 대기 |
+| `tend_withdraw_reply_wake` | 포기했거나 대체한 내 요청의 답장 wake 철회(작업·답장은 유지) |
+| `tend_cancel_message` | 아직 queued인 발신 요청 취소 |
 
 ## Agent 대화에서 자연스럽게 호출하기
 
-`muxa mcp`에 연결된 Claude나 Codex agent는 `@peer`와 `@muxa-peer`를 Muxa 협업
+`tend mcp`에 연결된 Claude나 Codex agent는 `@peer`와 `@tend-peer`를 Tend 협업
 전용 표현으로 취급합니다. `@codex` 같은 provider, 고유한 `@alias`, `role:name`,
-또는 자연어로 동료에게 새 작업을 요청하는 표현은 `muxa_call_peer`로 변환합니다.
+또는 자연어로 동료에게 새 작업을 요청하는 표현은 `tend_call_peer`로 변환합니다.
 `/name`으로 등록 스킬을 함께 지정할 수 있습니다.
 
 ```text
@@ -428,10 +428,10 @@ watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 �
 ```
 
 “`@peer`의 보고”, “peer 응답”, “peer 지적을 해결해”처럼 기존 결과를 가리키는
-표현은 먼저 `muxa_peer_report`로 실제 구조화된 mailbox 응답을 읽습니다. 사용자가
+표현은 먼저 `tend_peer_report`로 실제 구조화된 mailbox 응답을 읽습니다. 사용자가
 제공했거나 이미 확인된 context에 명시적인 PR 번호나 GitHub PR URL이 없다면
 GitHub PR/review 도구를 호출하거나 PR을 추측해서는 안 됩니다. repository나 cwd만
-알고 있는 것은 충분한 근거가 아닙니다. Muxa 도구가 보이지 않을 때의 복구 방법은
+알고 있는 것은 충분한 근거가 아닙니다. Tend 도구가 보이지 않을 때의 복구 방법은
 agent 재시작이며 GitHub를 대체 transport로 사용하지 않습니다.
 
 이 고수준 도구는 아래 mailbox 의미를 유지하면서 model이 여러 저수준 호출을 직접
@@ -447,58 +447,58 @@ agent 재시작이며 GitHub를 대체 transport로 사용하지 않습니다.
 아니라 **pane**을 수신자로 큐에 들어갑니다. 이 fallback이 없으면 세션을 지연 생성하는
 agent는 아예 동작하지 않습니다. codex는 TUI가 뜰 때가 아니라 첫 프롬프트가 제출될 때
 `SessionStart`를 발생시키므로, 보내기 전에 등록을 기다리면 지금 보내려는 그 request와
-교착합니다. muxad는 pane이 idle로 읽히는 즉시 배달하고, 그 pane에 처음 등록한 agent
+교착합니다. tendd는 pane이 idle로 읽히는 즉시 배달하고, 그 pane에 처음 등록한 agent
 session이 request를 인계받습니다(같은 room·pane·endpoint일 때만). 그 뒤부터는 다른
-request와 똑같이 session에 고정됩니다. 준비 여부는 muxa가 그 pane에서 agent
+request와 똑같이 session에 고정됩니다. 준비 여부는 tend가 그 pane에서 agent
 프로세스를 볼 수 있어야 판단되므로, 이 fallback은 discovery가 분류하거나 screen
 manifest가 있는 provider에만 적용됩니다. `opencode` pane spawn은 큐잉 대신 종전처럼
 빠르게 실패합니다.
-결과에는 `peer_pending: true`와 `request_id`가 실리며, 대기는 `muxa_wait_reply`로 합니다.
+결과에는 `peer_pending: true`와 `request_id`가 실리며, 대기는 `tend_wait_reply`로 합니다.
 `tmux capture-pane` polling으로 대체하지 마세요.
 
 대기는 model이 주도하는 polling loop가 아니라 MCP tool call 하나를 blocking하는
-방식입니다. muxad는 durable mailbox의 단조 증가 revision을 구독하고, revision이
+방식입니다. tendd는 durable mailbox의 단조 증가 revision을 구독하고, revision이
 바뀌거나 최종 timeout 경계에 도달했을 때만 해당 request를 다시 읽습니다.
 새 client가 `collaboration_wait`를 거부하는 구형 daemon에 연결된 경우에는 같은 tool
 call 내부에서만 bounded `collaboration_get` 호환 polling을 사용하므로 model turn은
 추가되지 않습니다. 최신 daemon은 항상 event-driven 경로를 사용합니다.
-`wait=false`로 보냈다면 발신 agent는 독립 작업을 계속할 수 있고, muxad가 reply
+`wait=false`로 보냈다면 발신 agent는 독립 작업을 계속할 수 있고, tendd가 reply
 revision과 발신 pane의 Idle 전환에 반응해 짧은 알림 prompt를 한 번 전달합니다.
-Muxa가 관리하는 peer를 `sleep`, raw `tmux capture-pane`, 반복 status/capture 호출로
+Tend가 관리하는 peer를 `sleep`, raw `tmux capture-pane`, 반복 status/capture 호출로
 모니터링하지 마세요.
 
 Codex에서는 blocking call이 host의 30초 실행 경계를 넘으면 background cell로
-돌아올 수 있습니다. 같은 작업에 새 Muxa wait를 시작하지 말고 host wait 함수의
+돌아올 수 있습니다. 같은 작업에 새 Tend wait를 시작하지 말고 host wait 함수의
 `yield_time_ms=60000`으로 그 cell 자체를 이어서 기다립니다.
 
 일반적인 흐름:
 
 ```text
-Agent A: muxa_room_context
-Agent A: muxa_set_identity(alias="implementer", roles=["rust"])
-Agent A: muxa_send_message(target="peer", kind="review", ...)
-Agent A: muxa_wait_reply(request_id="req_...", timeout_secs=300)
+Agent A: tend_room_context
+Agent A: tend_set_identity(alias="implementer", roles=["rust"])
+Agent A: tend_send_message(target="peer", kind="review", ...)
+Agent A: tend_wait_reply(request_id="req_...", timeout_secs=300)
 
 Agent B: idle 상태에서 짧은 mailbox wake prompt 수신
-Agent B: muxa_inbox
-Agent B: muxa_reply(request_id="req_...", status="completed", ...)
+Agent B: tend_inbox
+Agent B: tend_reply(request_id="req_...", status="completed", ...)
 
 Agent A: wait 중이 아니고 Idle이면 짧은 reply wake prompt 수신
-Agent A: muxa_wait_reply(request_id="req_...")
+Agent A: tend_wait_reply(request_id="req_...")
 ```
 
 `wake_payload = "full"`이면 Agent B의 두 단계는 다음처럼 바뀝니다.
 
 ```text
 Agent B: idle 상태에서 metadata와 원문이 포함된 claimed request prompt 수신
-Agent B: inbox 호출 없이 작업 후 muxa_reply(request_id="req_...", ...)
+Agent B: inbox 호출 없이 작업 후 tend_reply(request_id="req_...", ...)
 ```
 
 ## Reviewer와 subagent로 활용하기
 
 agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니다.
 
-1. `muxa_collaboration_guide`, `muxa_room_context`로 같은 room의 peer와 계약을
+1. `tend_collaboration_guide`, `tend_room_context`로 같은 room의 peer와 계약을
    확인합니다.
 2. reviewer에는 `kind=review`, `work_mode=read_only`와 검토 범위를 보냅니다.
 3. 구현을 위임할 subagent에는 `kind=task`, `work_mode=execute`와 겹치지 않는 좁은
@@ -507,10 +507,10 @@ agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니�
    통합합니다.
 
 수신 agent는 inbox를 빠르게 claim하고 kind/work mode/path를 지키며, 성공 여부와
-관계없이 `muxa_reply`로 terminal 상태를 남겨야 합니다. 두 agent가 같은 파일을
+관계없이 `tend_reply`로 terminal 상태를 남겨야 합니다. 두 agent가 같은 파일을
 동시에 수정해야 한다면 별도 worktree를 사용하세요.
 
-`muxa_send_message`와 `muxa_call_peer`는 동일한 causal/Work metadata인
+`tend_send_message`와 `tend_call_peer`는 동일한 causal/Work metadata인
 `thread_id`, `parent_request_id`, `workspace_id`, `work_id`, `run_id`와
 `artifacts`, `links`를 optional 입력으로 받습니다. Mutation receipt는 model이 방금
 보낸 body를 되돌려 주지 않고 correlation field만 반환하며, mailbox/report 조회는
@@ -520,7 +520,7 @@ request id를 다음 호출의 parent로 넘길 수 있습니다.
 ## AIR artifact 전달과 시각화
 
 request와 reply의 `air_artifacts`에는 AIR 1.0 artifact의 타입이 지정된 참조를 최대
-8개까지 첨부할 수 있습니다. `muxa watch`와 `muxa dashboard` mailbox는 첫 참조를
+8개까지 첨부할 수 있습니다. `tend watch`와 `tend dashboard` mailbox는 첫 참조를
 색상 배지로 표시하고, 상세 영역에서 input/output, 짧은 digest, label, 표시용
 locator를 보여줍니다.
 
@@ -533,15 +533,15 @@ locator를 보여줍니다.
 
 artifact ID는 `urn:air:sha256:` 뒤에 소문자 64자리 SHA-256 digest가 와야 합니다.
 locator는 `local-only` 또는 `redacted` disclosure를 가진 표시용 힌트일 뿐이며 파일
-접근 권한이나 실행 권한이 아닙니다. muxa는 참조 형식만 검사하고 artifact의 AIR
+접근 권한이나 실행 권한이 아닙니다. tend는 참조 형식만 검사하고 artifact의 AIR
 conformance를 주장하지 않습니다. 검증·편집·그래프 탐색은 AIR Workbench에서
-수행하세요. muxa 협업 내용을 위해 새 trace profile을 만들거나 session snapshot에
+수행하세요. tend 협업 내용을 위해 새 trace profile을 만들거나 session snapshot에
 prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
 
 ## Indexed history, migration, retention
 
 mailbox는 전달 전에 owner-only SQLite DB에 저장됩니다. 과거 기본 config path인
-`$XDG_DATA_HOME/muxa/collaboration.json`은 그대로지만, Muxa는 이를 authoritative
+`$XDG_DATA_HOME/tend/collaboration.json`은 그대로지만, Tend는 이를 authoritative
 `collaboration.sqlite3`로 매핑합니다. 첫 시작 때 기존 JSON snapshot을 transaction으로
 한 번 import하고 완료 marker를 남기며, 예전 request의 `thread_id`는 자기 request id로
 채웁니다. 설정한 path의 확장자가 `.sqlite`, `.sqlite3`, `.db`이면 그 파일을 직접
@@ -551,10 +551,10 @@ mailbox는 전달 전에 owner-only SQLite DB에 저장됩니다. 과거 기본 
 
 이후 mutation은 전체 이력을 다시 쓰지 않고 indexed row만 갱신합니다. SQLite 본체,
 WAL, shared-memory 파일은 `0600`입니다. `retention_days`를 생략하면 영구 보존합니다.
-값을 설정하면 muxad 시작 시 newest activity가 cutoff보다 오래되고 모든 request가
+값을 설정하면 tendd 시작 시 newest activity가 cutoff보다 오래되고 모든 request가
 terminal·전달 완료된 thread만 통째로 정리합니다. parent chain을 나누거나 pending
 delivery/wake 또는 아직 읽지 않은 reply 상태를 지우지 않습니다. 본문을 담지 않는
-별도 audit ledger는 그대로 유지됩니다. migration 뒤 구형 muxad를 남겨 둔 JSON에
+별도 audit ledger는 그대로 유지됩니다. migration 뒤 구형 tendd를 남겨 둔 JSON에
 대해 실행하는 downgrade는 안전하지 않습니다. 구형 daemon이 stale fork를 써도 import
 완료된 SQLite가 다시 가져오지 않으므로 downgrade 전 두 파일을 모두 백업하세요.
 
@@ -570,11 +570,11 @@ delivery/wake 또는 아직 읽지 않은 reply 상태를 지우지 않습니다
 
 `Working`, `WaitingInput`, `WaitingChoice`, `Error` 상태에는 입력하지 않습니다.
 화면 감지로 생성된 synthetic agent는 안정적인 session identity가 없어 room
-participant가 아니며 자동 선택 대상도 아닙니다. 예외는 하나입니다. muxa가 띄웠지만
+participant가 아니며 자동 선택 대상도 아닙니다. 예외는 하나입니다. tend가 띄웠지만
 아직 agent가 등록하지 않은 pane을 **명시적으로 pane 지정**해 보낸 request는 pending
 pane 수신자를 갖고, 그 pane의 synthetic 행은 오직 배달 시점을 정하는 idle 게이트로만
 쓰입니다. 안전장치는 그대로입니다. 시작 승인 게이트는 번들 screen manifest가
-`WaitingInput`/`WaitingChoice`로 분류하므로 배달이 보류되고, muxa launch mark도 없고
+`WaitingInput`/`WaitingChoice`로 분류하므로 배달이 보류되고, tend launch mark도 없고
 agent 프로세스로 분류되지도 않은 pane은 이 경로로 주소가 지정되지 않으므로 사람의
 shell에 request가 들어갈 일은 없습니다. `wake = "never"`로 설정하면 mailbox는
 유지하면서 모든 입력 주입을 끌 수 있습니다.
@@ -591,7 +591,7 @@ envelope를 줄입니다. idle generation 하나에는 원문 하나만 제출�
 transition이 온 뒤 다음 요청을 전달합니다. reply 본문은 모든 모드에서 항상
 mailbox에만 둡니다.
 
-`operator_full`은 전달 정책이지 사람의 승인을 증명하는 장치가 아닙니다. muxad가
+`operator_full`은 전달 정책이지 사람의 승인을 증명하는 장치가 아닙니다. tendd가
 resolve한 sender identity를 기준으로 하며, `work_mode = "execute"`만으로 agent 발신
 요청을 operator 요청으로 승격하거나 payload 정책을 바꾸지 않습니다. 직접 전달된
 envelope의 source 줄에는 operator surface와 caller provenance가 계속 표시됩니다.
@@ -599,17 +599,17 @@ envelope의 source 줄에는 operator surface와 caller provenance가 계속 표
 직접 전달은 요청 본문을 terminal과 agent prompt history에도 남기므로 민감한 본문을
 항상 mailbox에만 두려면 `notice`를 사용하세요. `operator_full`은 agent 발신 본문만
 mailbox에 유지합니다. terminal 제어문자가 포함된 본문은
-변형하거나 위험하게 paste하지 않고 자동으로 `notice` 경로를 사용합니다. muxad는
+변형하거나 위험하게 paste하지 않고 자동으로 `notice` 경로를 사용합니다. tendd는
 prompt text 기록과 별도 Enter 제출 단계를 durable state로 구분합니다. 중단 후
 text가 이미 기록된 것이 확실하면 Enter만 재시도하고, 기록 여부가 불확실하면 원문을
 다시 넣는 대신 짧은 inbox 복구 알림을 보냅니다. agent가 먼저 inbox를 읽으면 이
 자동 복구는 취소됩니다.
 
 모든 collaboration IPC 호출(context, identity, send, inbox, list, reply, get, wait,
-cancel)은 `$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`에도 append-only로
+cancel)은 `$XDG_DATA_HOME/tend/collaboration-audit.ndjson`에도 append-only로
 기록됩니다. 이 로그는 `0600`이며 message/reply 본문을 중복 저장하지 않고 operation,
 request id, 대상, 결과, represented origin/session과 OS-observed caller만 담습니다.
-`muxa msg list --json`과 `muxa_list_messages`에서는 각 request의 생성 provenance를 바로
+`tend msg list --json`과 `tend_list_messages`에서는 각 request의 생성 provenance를 바로
 볼 수 있습니다. 업그레이드 전 요청은 `provenance`가 없을 수 있습니다.
 
 origin과 observed caller pane이 다르더라도 기존의 자유로운 대행 권한을 유지하기 위해
@@ -617,13 +617,13 @@ origin과 observed caller pane이 다르더라도 기존의 자유로운 대행 
 실패가 아닙니다. 같은 UID의 다른 로컬 프로세스가 IPC를 호출할 수 있다는 기존
 owner-only socket 모델도 그대로입니다.
 
-발신자가 `muxa_wait_reply`/`muxa msg wait`로 terminal 응답을 읽으면 이를 확인한
+발신자가 `tend_wait_reply`/`tend msg wait`로 terminal 응답을 읽으면 이를 확인한
 것으로 기록해 이후 reply wake를 생략합니다. 먼저 reply wake가 전달된 경우에도
 본문은 mailbox에 그대로 남아 있어 `wait` 또는 `list`로 조회할 수 있습니다.
 
 ## Request lifecycle
 
-`muxa msg list`와 `muxa_list_messages`는 메시지를 claim하지 않고 현재 agent
+`tend msg list`와 `tend_list_messages`는 메시지를 claim하지 않고 현재 agent
 session의 incoming/sent/all 이력을 보여줍니다. `room_context`는 새 incoming
 request 수와 아직 확인하지 않은 reply 수를 각각 반환합니다.
 
@@ -647,11 +647,11 @@ CLI 목록의 기본 `--scope auto`는 추적된 agent에서는 자신의 우편
 `--scope caller`는 agent 신원을 요구하며, `--scope all`은 모든 room을 조회합니다.
 명시된 agent session의 신원 오류는 조회 범위를 자동으로 넓히지 않습니다.
 
-CLI `muxa msg list`는 기본 20건의 메타데이터를 출력합니다. 본문·답변·진행 기록·
+CLI `tend msg list`는 기본 20건의 메타데이터를 출력합니다. 본문·답변·진행 기록·
 provenance는 `--full`로 명시할 때 포함합니다. JSON 배열의 `id`와 저장된 `status`는
 유지하며, `--limit`·`--offset`으로 페이지를 지정합니다.
-`muxa msg list --request-id REQUEST --full --json`은 해당 요청 하나를 직접 조회합니다.
-최종 답변만 필요하면 `muxa msg wait REQUEST --body --output FILE`을 사용합니다.
+`tend msg list --request-id REQUEST --full --json`은 해당 요청 하나를 직접 조회합니다.
+최종 답변만 필요하면 `tend msg wait REQUEST --body --output FILE`을 사용합니다.
 짧은 timeout을 반복 조회하지 말고 완료 알림이나 실질적인 작업 체크포인트에서 읽습니다.
 
 `--limit 0`은 일치하는 전체 기록을 요청합니다. 페이지가 잘리면 CLI가 전체 건수와
@@ -660,22 +660,22 @@ provenance를 읽던 기존 진단 스크립트에는 `--full`을 추가해야 �
 
 ### 기존 요청 갱신과 호출 절약
 
-`muxa msg update REQUEST "추가 안내 또는 진행 상황" [--json]`으로 열린 요청에
+`tend msg update REQUEST "추가 안내 또는 진행 상황" [--json]`으로 열린 요청에
 안내를 추가할 수 있습니다. 원래 권한·경로 범위를 유지하며, 새 요청을 만들거나
 수신자를 깨우지 않습니다. 양쪽 참여자가 사용할 수 있고 종료된 요청은 거절합니다.
 같은 참여자가 마지막 안내를 그대로 재전송하면 중복 추가하지 않습니다.
 JSON 확인 응답에는 요청 ID와 `next_after_update`가 포함됩니다.
 
-`muxa msg send ... --notify`는 `--notify true`와 같습니다. `--notify false`도
+`tend msg send ... --notify`는 `--notify true`와 같습니다. `--notify false`도
 유지됩니다. 오류와 종료 코드를 보존하세요. `grep`으로 출력을 거르면 옵션 오류가
 빈 응답처럼 보일 수 있습니다. 답변 본문은 JSON 필드를 추측하는 대신
-`muxa msg wait REQUEST --body [--output FILE]`로 읽습니다.
+`tend msg wait REQUEST --body [--output FILE]`로 읽습니다.
 완료 알림이나 의미 있는 작업 체크포인트에서 결과를 읽고, 1초 확인을 반복하지
 않습니다. 전면 MCP 대기는 30~60초를 권장하며 Fleet 기본값은 30초입니다.
 이미 확인한 도구 스키마는 버전·기능 변경이나 실제 도구/인자 오류가 생길 때까지
 재사용합니다.
 
-CLI에서 추가 안내는 `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`으로
+CLI에서 추가 안내는 `tend msg list --request-id REQUEST --after-update SEQUENCE --json`으로
 읽고 `next_after_update`부터 이어갑니다. 원래 작업·최종 답변 본문은 반복하지 않습니다.
 
 ### 원문 기준 부가량 측정
@@ -702,11 +702,11 @@ UTF-8 기준 `추가 바이트 = 수신 바이트 - body 원문 바이트`,
 ### 짧은 확인과 조용한 전달
 
 별도로 진행할 일이 없는 짧은 질문·검토는 기본값인
-`muxa_call_peer(wait=true)`를 사용하면 전송 접수 결과를 받은 뒤 다시 기다리는
+`tend_call_peer(wait=true)`를 사용하면 전송 접수 결과를 받은 뒤 다시 기다리는
 호출을 줄일 수 있습니다. 독립 작업이 있으면 `wait=false`를 사용합니다.
 단순 전달은 `kind=notice`, `expects_reply=false`와 기본 조용한 알림을 사용하고,
 `notify=true`는 차단·결정·충돌·자원 인계에 한정합니다. 진행 중인 요청의
-보충 내용은 새 작업 대신 `muxa_update_request`로 전달합니다. 권한과 경로는
+보충 내용은 새 작업 대신 `tend_update_request`로 전달합니다. 권한과 경로는
 원래 요청을 유지하며 갱신 자체로 상대를 깨우지 않습니다.
 
 `[collaboration]`의 `wake_payload = "adaptive"`는 선택 기능입니다. 운영자
@@ -727,13 +727,13 @@ UTF-8 본문 768바이트 이하, 전체 지시 JSON 1024바이트 이하인 요
 한글 최대 256자에 해당하지만, 추가 문맥이나 JSON escaping 때문에 전체 지시
 1024바이트 제한에 먼저 도달할 수 있습니다.
 
-재현 가능한 측정은 `muxad`의 `adaptive_delivery_cost_matrix` 테스트를 변경
-전후에 실행하고 `MUXA_DELIVERY_MATRIX_REPORT`로 각각 JSON을 저장합니다.
-`muxa-cli`의 `adaptive_reply_cost_matrix`는 `MUXA_REPLY_MATRIX_REPORT`로
+재현 가능한 측정은 `tendd`의 `adaptive_delivery_cost_matrix` 테스트를 변경
+전후에 실행하고 `TEND_DELIVERY_MATRIX_REPORT`로 각각 JSON을 저장합니다.
+`tend-cli`의 `adaptive_reply_cost_matrix`는 `TEND_REPLY_MATRIX_REPORT`로
 저장한 뒤 `python scripts/short-delivery-cost-report.py BEFORE AFTER REPLIES`로
 합산합니다. 최초 전달·발신 결과·응답 접수 결과의 수신 바이트와 원문 대비
 추가량을 측정하며, 모델 지연·과금 토큰·반복 컨텍스트 비용은 측정하지 않습니다.
-현재 전달 테스트에서 `MUXA_DELIVERY_BASELINE_REPORT`도 지정하면 `5470a27`의
+현재 전달 테스트에서 `TEND_DELIVERY_BASELINE_REPORT`도 지정하면 `5470a27`의
 이전 안내 문구와 512바이트 제한을 적용한 비교 기준을 같은 입력으로 저장합니다.
 
 효율은 직전 대비 감소율뿐 아니라 `extra = 수신량 - 본문 원문 바이트`로
@@ -753,16 +753,16 @@ socket에 걸쳐 모호하면 환경 변수만으로 위치를 확정하지 않�
 
 ### CLI에서 peer 요청 보내기
 
-MCP를 사용할 수 없으면 `muxa peer codex "변경 사항을 읽기 전용으로 리뷰하세요"`를
-사용합니다. `muxa_call_peer`와 같은 전용 worker 선택·생성 및 권한 정책을 적용하며,
+MCP를 사용할 수 없으면 `tend peer codex "변경 사항을 읽기 전용으로 리뷰하세요"`를
+사용합니다. `tend_call_peer`와 같은 전용 worker 선택·생성 및 권한 정책을 적용하며,
 기본값은 대기 없이 요청 ID를 반환합니다. `--wait --timeout-secs 60`으로 기다리거나
-같은 요청 ID로 `muxa msg wait REQUEST_ID`를 사용하세요. 편집은
+같은 요청 ID로 `tend msg wait REQUEST_ID`를 사용하세요. 편집은
 `--intent task --execute`가 필요합니다. `--context-bound`는 정확한 대화를 지정하며
-primary 세션의 명시적 수락을 유지합니다. `muxa msg send %N`은 정확한 세션의
+primary 세션의 명시적 수락을 유지합니다. `tend msg send %N`은 정확한 세션의
 메일함에 보내는 명령이므로 primary에 보낸 일반 요청은 먼저 취소한 뒤
-`muxa peer`로 전용 worker에 보내세요.
+`tend peer`로 전용 worker에 보내세요.
 
-macOS에서 `muxa init --component muxad-launchd --yes`는 설치 셸의 PATH를
+macOS에서 `tend init --component tendd-launchd --yes`는 설치 셸의 PATH를
 LaunchAgent에 기록합니다. 평소 에이전트를 실행하는 셸에서 설치하면 headless
 실행도 사용자 CLI와 계정 shim을 찾을 수 있습니다.
 
@@ -775,7 +775,7 @@ LaunchAgent에 기록합니다. 평소 에이전트를 실행하는 셸에서 �
 나뉜 알려진 폴더 신뢰 확인창도 처리합니다. pane의 launch ID·프로세스 시작 시점·
 작업 디렉터리를 키 입력 전에 검사하고, 준비 완료 응답에 `input_readiness`를 담습니다.
 
-초기화는 모델을 호출하지 않으며 Muxa가 전역 설정 파일을 직접 편집하지 않습니다.
+초기화는 모델을 호출하지 않으며 Tend가 전역 설정 파일을 직접 편집하지 않습니다.
 다만 폴더 신뢰를 수락하면 provider가 해당 cwd의 신뢰를 저장하고 프로젝트 설정
 (hook·MCP 등)을 활성화할 수 있습니다. 폴더 설정,
 도구 실행 승인, 로그인, 알 수 없는 질문, 입력 중인 초안은 임의로 승인하거나 지우지
@@ -793,15 +793,15 @@ LaunchAgent에 기록합니다. 평소 에이전트를 실행하는 셸에서 �
 유지합니다. 정확한 기존 worker만 다시 준비하려면 다음처럼 실행합니다.
 
 ```sh
-muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux-socket default
+tend agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux-socket default
 ```
 
 이 명령은 JSON 결과를 출력하며 실제 입력 준비가 검증되지 않으면 0 이외로 종료합니다.
 
-Claude worker에는 기존 Muxa 관리 `agent-integration` bootstrap·skill 디렉터리도 입력 경로로 제공합니다. 다른 사용자 설정 디렉터리는 추가하지 않습니다.
+Claude worker에는 기존 Tend 관리 `agent-integration` bootstrap·skill 디렉터리도 입력 경로로 제공합니다. 다른 사용자 설정 디렉터리는 추가하지 않습니다.
 
 Codex 폴더 신뢰 확인창은 sandbox 영향 검증 전까지 자동 수락하지 않습니다.
 입력 준비가 pending·blocked인 worker에는 새 고수준 peer 요청을 보내지 않습니다.
 
-확인창을 수동 해결한 후에도 `muxa agent prepare`를 다시 실행해 준비 상태를 갱신해야 합니다.
+확인창을 수동 해결한 후에도 `tend agent prepare`를 다시 실행해 준비 상태를 갱신해야 합니다.
 Codex 자동 준비는 폴더 신뢰 확인이 필요 없는 cwd에서 지원됩니다.

@@ -1,0 +1,466 @@
+//! Which session a workspace resolves to, and what tend says when the two
+//! sources of that answer disagree.
+//!
+//! A workspace's identity is a tmux session option (`@tend_workspace_id`), and
+//! the session *name* is the fallback used when nothing claims the workspace.
+//! The mark outranks the name deliberately: that is what lets a renamed or
+//! adopted session keep working. The cost is that a stale mark sends a launch
+//! somewhere the operator did not name, and until now nothing said so.
+//!
+//! The tests drive the real `tend` binary against a private tmux server, with
+//! a stand-in `claude` on `PATH`. They skip when tmux is not installed.
+
+#![cfg(unix)]
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+fn tend() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_tend"))
+}
+
+fn tmux_installed() -> bool {
+    tend::tmux::tmux_command()
+        .arg("-V")
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
+/// A tmux server of our own: private socket, and `-f /dev/null` so the
+/// operator's `~/.tmux.conf` stays out of the test.
+struct Server {
+    socket: PathBuf,
+    dir: tempfile::TempDir,
+}
+
+impl Server {
+    fn start() -> Self {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let socket = dir.path().join("tmux.sock");
+        Self { socket, dir }
+    }
+
+    fn session(&self, name: &str) {
+        self.tmux(&[
+            "new-session",
+            "-d",
+            "-s",
+            name,
+            "-x",
+            "80",
+            "-y",
+            "24",
+            "-c",
+            "/tmp",
+        ])
+        .unwrap_or_else(|error| panic!("start session {name}: {error}"));
+    }
+
+    fn tmux(&self, args: &[&str]) -> Result<String, String> {
+        let out = tend::tmux::tmux_command()
+            .arg("-f")
+            .arg("/dev/null")
+            .arg("-S")
+            .arg(&self.socket)
+            .args(args)
+            .output()
+            .expect("run tmux");
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if out.status.success() {
+            Ok(stdout)
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    fn query(&self, args: &[&str]) -> String {
+        self.tmux(args).expect("tmux query")
+    }
+
+    /// Session name → workspace mark, for every session on the server.
+    fn marks(&self) -> String {
+        self.query(&[
+            "list-sessions",
+            "-F",
+            "#{session_name} #{@tend_workspace_id}",
+        ])
+    }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.tmux(&["kill-server"]);
+    }
+}
+
+/// A `claude` that stays in its pane and needs nothing installed.
+fn stub_agent_dir(root: &Path) -> PathBuf {
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).expect("create stub bin dir");
+    let claude = bin.join("claude");
+    std::fs::write(&claude, "#!/bin/sh\nexec sleep 600\n").expect("write stub claude");
+    std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod stub claude");
+    bin
+}
+
+fn run_tend(server: &Server, stub_bin: &Path, args: &[&str]) -> std::process::Output {
+    let path = format!(
+        "{}:{}",
+        stub_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    Command::new(tend())
+        .args(args)
+        .env("PATH", path)
+        .env("TEND_TMUX_SOCKET", &server.socket)
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
+        // A socket no daemon answers: these paths mark tmux and report, and
+        // must not reach the operator's running tendd.
+        .env("TEND_SOCKET", server.dir.path().join("tendd.sock"))
+        .env_remove("RMUX")
+        .env_remove("RMUX_PANE")
+        .env_remove("TMUX")
+        .env_remove("TMUX_PANE")
+        .output()
+        .expect("run tend")
+}
+
+/// The shape that sent four agents to `webapp-set`: a stale mark on one
+/// session while another carries the workspace's own name.
+///
+/// The mark winning is the intended order — this locks it so a later change
+/// has to be deliberate — but it is also why the launch went somewhere nobody
+/// asked for, which is what the doctor check below exists to say out loud.
+#[test]
+fn a_workspace_mark_outranks_a_session_named_after_the_workspace() {
+    if !tmux_installed() {
+        eprintln!("skipping: tmux is not installed");
+        return;
+    }
+    let server = Server::start();
+    server.session("wsmark");
+    server.session("wsmark-set");
+    let claimant = server.query(&["display-message", "-p", "-t", "wsmark-set", "#{session_id}"]);
+    server
+        .tmux(&[
+            "set-option",
+            "-t",
+            &claimant,
+            "@tend_workspace_id",
+            "wsmark",
+        ])
+        .expect("plant the stale mark");
+    let stub = stub_agent_dir(server.dir.path());
+
+    let out = run_tend(
+        &server,
+        &stub,
+        &[
+            "work",
+            "start",
+            "probe",
+            "--agent",
+            "claude",
+            "--workspace",
+            "wsmark",
+            "--cwd",
+            "/tmp",
+        ],
+    );
+    assert!(
+        out.status.success(),
+        "work start failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let windows = server.query(&[
+        "list-windows",
+        "-a",
+        "-F",
+        "#{session_name} #{@tend_work_id}",
+    ]);
+    let owner = windows
+        .lines()
+        .find(|line| line.split_whitespace().nth(1) == Some("PROBE"))
+        .and_then(|line| line.split_whitespace().next())
+        .unwrap_or_else(|| panic!("no PROBE window anywhere; windows:\n{windows}"));
+    assert_eq!(
+        owner, "wsmark-set",
+        "the mark decides, not the name; windows:\n{windows}"
+    );
+}
+
+/// The reporting half. tend still goes where the mark says; `doctor` is where
+/// the disagreement stops being invisible.
+#[test]
+fn doctor_reports_a_workspace_claimed_by_another_session() {
+    if !tmux_installed() {
+        eprintln!("skipping: tmux is not installed");
+        return;
+    }
+    let server = Server::start();
+    server.session("wsmark");
+    server.session("wsmark-set");
+    let claimant = server.query(&["display-message", "-p", "-t", "wsmark-set", "#{session_id}"]);
+    server
+        .tmux(&[
+            "set-option",
+            "-t",
+            &claimant,
+            "@tend_workspace_id",
+            "wsmark",
+        ])
+        .expect("plant the stale mark");
+    let stub = stub_agent_dir(server.dir.path());
+
+    let out = run_tend(&server, &stub, &["doctor"]);
+    let report = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        report.contains("claimed by session wsmark-set"),
+        "doctor should name the claiming session; report:\n{report}"
+    );
+    assert!(
+        report.contains("named wsmark"),
+        "doctor should name the session the workspace would otherwise resolve to; report:\n{report}"
+    );
+}
+
+/// Why every write tend makes to a session is addressed by id.
+///
+/// tmux resolves a bare name by exact match, then as a pattern, then as a
+/// *unique prefix* — and the last of those is silent. So a name that named one
+/// session when tend looked it up can name a different one by the time the
+/// write goes out. `=name` is not an escape: tmux 3.4 refuses that spelling
+/// for `set-option`, even though `kill-session` accepts it.
+#[test]
+fn a_bare_session_name_can_resolve_to_a_neighbour() {
+    if !tmux_installed() {
+        eprintln!("skipping: tmux is not installed");
+        return;
+    }
+    let server = Server::start();
+    server.session("wsmark-set");
+
+    // No session is named `wsmark`, and `wsmark-set` is the only one starting
+    // with it, so tmux takes the neighbour and reports success.
+    server
+        .tmux(&["set-option", "-t", "wsmark", "@tend_workspace_id", "wsmark"])
+        .expect("tmux resolves the bare name to the only prefix match");
+    assert_eq!(
+        server.marks(),
+        "wsmark-set wsmark",
+        "a bare name landed on the neighbour"
+    );
+
+    // A second candidate makes it ambiguous, which tmux refuses — so this is
+    // a hazard that shows up only sometimes, which is the worst kind.
+    server.session("wsmark-other");
+    let refused = server
+        .tmux(&["set-option", "-t", "wsmark", "@tend_probe", "x"])
+        .expect_err("two prefix candidates are ambiguous");
+    assert!(
+        refused.contains("no such session"),
+        "expected an ambiguity refusal, got {refused:?}"
+    );
+}
+
+/// Exercise the real launcher with a CLI that never emits a hook or receives
+/// an initial prompt. Its process name stays codex/claude for discovery.
+#[test]
+fn no_prompt_launch_registers_the_observed_provider_immediately() {
+    if !tmux_installed() || Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: tmux and cc are required");
+        return;
+    }
+    for program in ["codex", "claude"] {
+        launch_registers(program, false);
+    }
+}
+
+/// A CLI that shows up in its pane only after a moment (its shell still
+/// starting it, a loaded machine) is registered all the same: the launcher
+/// looks for it rather than reading the pane once.
+#[test]
+fn a_launch_whose_agent_starts_late_is_still_registered() {
+    if !tmux_installed() || Command::new("cc").arg("--version").output().is_err() {
+        eprintln!("skipping: tmux and cc are required");
+        return;
+    }
+    launch_registers("codex", true);
+}
+
+/// Launch `program` with `tend agent start` and expect its registration;
+/// `late` puts a second's wait in front of the agent.
+#[allow(
+    clippy::too_many_lines,
+    reason = "one real launch, start to registration"
+)]
+fn launch_registers(program: &str, late: bool) {
+    use std::time::Duration;
+    {
+        let server = Server::start();
+        server.session("no-prompt");
+        server
+            .tmux(&["set-option", "-g", "default-shell", "/bin/sh"])
+            .unwrap();
+        let config = server.dir.path().join("config.toml");
+        std::fs::write(&config, "").unwrap();
+        let stub_bin = server.dir.path().join("bin");
+        std::fs::create_dir(&stub_bin).unwrap();
+        let source = server.dir.path().join("agent.c");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { for (;;) pause(); }\n",
+        )
+        .unwrap();
+        let binary = if late {
+            let real_bin = stub_bin.join("real");
+            std::fs::create_dir(&real_bin).unwrap();
+            real_bin.join(program)
+        } else {
+            stub_bin.join(program)
+        };
+        assert!(Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .status()
+            .unwrap()
+            .success());
+        if late {
+            // macOS tmux reports the executable basename, not exec -a's
+            // argv[0]. Give the delayed executable the real provider name.
+            let script = stub_bin.join(program);
+            std::fs::write(
+                &script,
+                format!(
+                    "#!/bin/sh\nsleep 1\nexec {}\n",
+                    tend::shell::Dialect::Posix.quote(&binary.to_string_lossy())
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                &script,
+                <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+            )
+            .unwrap();
+        }
+        // tmux starts the child's shell with its server-side PATH.
+        server
+            .tmux(&[
+                "set-environment",
+                "-g",
+                "PATH",
+                &format!(
+                    "{}:{}",
+                    stub_bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            ])
+            .unwrap();
+        let (recv, reader) = registration_listener(&server.dir.path().join("tendd.sock"));
+        let output = run_tend(
+            &server,
+            &stub_bin,
+            &[
+                "--config",
+                config.to_str().unwrap(),
+                "agent",
+                "start",
+                "--host",
+                "tmux",
+                "--agent",
+                program,
+                "--placement",
+                "window",
+                "--target",
+                "no-prompt",
+                "--name",
+                "worker",
+                "--json",
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(result["prompt_supplied"], false);
+        let registered = recv
+            .recv_timeout(Duration::from_secs(LISTEN_WINDOW_SECS + 1))
+            .unwrap_or_else(|error| {
+                panic!(
+                    "launcher must register without waiting for a hook: {error}; panes: {}",
+                    server.query(&[
+                        "list-panes",
+                        "-a",
+                        "-F",
+                        "#{pane_id} #{pane_current_command} #{@tend_agent} #{pane_pid}"
+                    ])
+                )
+            });
+        let event: tend::event::AgentEvent =
+            serde_json::from_value(registered["event"].clone()).unwrap();
+        let tend::event::AgentEvent::Started { id, .. } = event else {
+            panic!("expected Started")
+        };
+        assert_eq!(id.kind, tend::discovery::classify_command(program).unwrap());
+        assert_eq!(id.pane.as_deref(), result["pane"].as_str());
+        assert!(id
+            .session_id
+            .starts_with(tend::state::SYNTHETIC_SESSION_PREFIX));
+        reader.join().unwrap();
+    }
+}
+
+/// How long the stand-in daemon listens for the launcher's registration.
+const LISTEN_WINDOW_SECS: u64 = 30;
+
+fn registration_listener(
+    socket: &Path,
+) -> (
+    std::sync::mpsc::Receiver<serde_json::Value>,
+    std::thread::JoinHandle<()>,
+) {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::time::{Duration, Instant};
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        // Counted from before the CLI starts: a loaded CI runner can take
+        // seconds to launch the pane before the registration arrives.
+        let deadline = Instant::now() + Duration::from_secs(LISTEN_WINDOW_SECS);
+        while Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            let mut line = String::new();
+            if BufReader::new(&stream).read_line(&mut line).is_err() {
+                continue;
+            }
+            let Ok(request) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            writeln!(stream, "{{\"protocol\":6,\"ok\":true}}").unwrap();
+            if request["kind"] == "ingest" {
+                send.send(request).unwrap();
+                return;
+            }
+        }
+    });
+    (recv, reader)
+}

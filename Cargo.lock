@@ -2679,7 +2679,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dce6dd36094cac388f119d2e9dc82dc730ef91c32a6222170d630e5414b956e6"
 
 [[package]]
-name = "muxa"
+name = "tend"
 version = "0.9.10"
 dependencies = [
  "axum",
@@ -2718,7 +2718,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "muxa-cli"
+name = "tend-cli"
 version = "0.9.10"
 dependencies = [
  "ansi-to-tui",
@@ -2731,7 +2731,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "insta",
- "muxa",
+ "tend",
  "nix 0.29.0",
  "owo-colors 4.3.0",
  "rand 0.8.6",
@@ -2755,7 +2755,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "muxa-zellij-plugin"
+name = "tend-zellij-plugin"
 version = "0.9.10"
 dependencies = [
  "serde",
@@ -2764,12 +2764,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "muxad"
+name = "tendd"
 version = "0.9.10"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
- "muxa",
+ "tend",
  "serde_json",
  "tempfile",
  "time",

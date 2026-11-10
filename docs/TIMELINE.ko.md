@@ -1,21 +1,21 @@
 # Timeline
 
-`muxa timeline`은 agent session이 work, waiting, error, human interaction,
-tmux foreground 사이를 어떻게 오갔는지 보여주는 시각화입니다. `muxa stats`,
-`muxa stats report`와 같은 duration 데이터를 사용합니다.
+`tend timeline`은 agent session이 work, waiting, error, human interaction,
+tmux foreground 사이를 어떻게 오갔는지 보여주는 시각화입니다. `tend stats`,
+`tend stats report`와 같은 duration 데이터를 사용합니다.
 
 ## 빠른 시작
 
 ```bash
-muxa timeline --since today
-muxa timeline --since today --session main
-muxa timeline --since today --exclude-session 'monitor*'
-muxa timeline --since 24h --agent codex
-muxa timeline --since today --group-by kind
-muxa timeline --since today --sort waiting
-muxa timeline --view heatmap --since 12w
-muxa timeline --day 2026-06-06
-muxa timeline --since today --format json
+tend timeline --since today
+tend timeline --since today --session main
+tend timeline --since today --exclude-session 'monitor*'
+tend timeline --since 24h --agent codex
+tend timeline --since today --group-by kind
+tend timeline --since today --sort waiting
+tend timeline --view heatmap --since 12w
+tend timeline --day 2026-06-06
+tend timeline --since today --format json
 ```
 
 기본 overview는 tmux session별로 묶입니다. 각 session group 안에는 다음 lane이
@@ -24,7 +24,7 @@ muxa timeline --since today --format json
 | Lane | 의미 |
 | --- | --- |
 | Agent | working, waiting, error, starting, idle 같은 agent 상태 구간. |
-| Human | muxa가 기록한 prompt input, tmux attach 같은 human interaction 구간. |
+| Human | tend가 기록한 prompt input, tmux attach 같은 human interaction 구간. |
 | tmux | interactive tmux client에서 해당 session이 foreground였던 시간. |
 
 ## 옵션
@@ -41,11 +41,11 @@ muxa timeline --since today --format json
 | `--group-by` | 기본값 `session`, 또는 `kind`, `flat`. TUI 전용. |
 | `--sort` | 기본값 `latest`, 또는 `name`, `duration`, `working`, `waiting`, `error`, `human`, `foreground`. `dur`, `work`, `wait`, `err`, `tmux` alias도 지원. |
 | `--format` | 기본값 `tui`, 또는 `json`. |
-| `--theme` | 다른 muxa TUI와 같은 일회성 theme override. |
+| `--theme` | 다른 tend TUI와 같은 일회성 theme override. |
 
 ## Heatmap View
 
-`muxa timeline --view heatmap --since 12w`는 terminal에 compact daily
+`tend timeline --view heatmap --since 12w`는 terminal에 compact daily
 activity map을 출력합니다. 각 cell은 local calendar day이고, intensity는 agent
 work, waiting, error, human interaction, tmux foreground 시간을 기준으로 합니다.
 요일 행은 `--since last-week`와 맞게 ISO 스타일 Monday-first 순서를 씁니다.
@@ -81,7 +81,7 @@ tracking이 켜져 있을 때 `session-activity.json`에서 옵니다.
 
 Agent transition row는 진입한 상태(`to`)가 아니라 떠난 상태(`from`)를 그립니다.
 예를 들어 `working -> waiting_input` row는 `state_entered_at`부터 transition
-timestamp까지의 `working` span입니다. 이렇게 해야 `muxa stats`의 duration 계산과
+timestamp까지의 `working` span입니다. 이렇게 해야 `tend stats`의 duration 계산과
 일관됩니다.
 
 ## Dashboard
@@ -91,4 +91,4 @@ lane을 묶습니다. lane graph 위에는 daily contribution-map style heatmap�
 표시되고, 날짜를 클릭하면 해당 calendar day로 drilldown됩니다. 브라우저에서 계속
 켜둘 화면이 필요하면 dashboard를 쓰고, keyboard navigation, focus view, terminal
 heatmap, terminal-native JSON export, scope exclusion이 필요하면
-`muxa timeline`을 쓰는 것이 좋습니다.
+`tend timeline`을 쓰는 것이 좋습니다.

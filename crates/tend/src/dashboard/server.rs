@@ -1,0 +1,6036 @@
+//! axum HTTP server for the dashboard.
+//!
+//! Read routes can be private, public-read, or fully public depending on
+//! [`DashboardAuthMode`](crate::config::DashboardAuthMode). Control routes
+//! are separate and always require the configured bearer token; `auth =
+//! "none"` disables them rather than making them public. Bearer tokens are
+//! sent in `Authorization`, never cookies, so cross-site forms cannot trigger
+//! a control action and browser clients can treat the token like a PAT.
+//!
+//! The one cookie that authorizes operator APIs is the optional OIDC operator
+//! session (`[dashboard.login]`, see [`super::operator`]). Because a browser
+//! attaches it ambiently, a cookie-authorized request that changes state must
+//! also carry `Origin: <public_url>` and `X-Tend-Operator: 1`; reads and SSE
+//! need no extra proof. Bearer-authorized requests are unaffected.
+//!
+//! [`serve`] composes the router with the lifecycle plumbing the daemon
+//! needs: TCP bind, graceful shutdown wired to the daemon's existing
+//! shutdown channel, structured logging on bind failure.
+
+use axum::{
+    body::Body,
+    extract::{DefaultBodyLimit, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, Request, StatusCode},
+    middleware::{self, Next},
+    response::{
+        sse::{Event as SseEvent, KeepAlive, Sse},
+        IntoResponse, Json, Response,
+    },
+    routing::{get, post, put},
+    Router,
+};
+use futures::stream::{self, Stream, StreamExt};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use std::collections::{BTreeMap, HashMap};
+use std::convert::Infallible;
+use std::net::{IpAddr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use time::{OffsetDateTime, UtcOffset};
+use tokio::net::TcpListener;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::{errors::BroadcastStreamRecvError, BroadcastStream};
+use tower_http::trace::TraceLayer;
+
+use crate::backend::{HostKind, SharedBackend};
+use crate::collaboration::{
+    CollaborationCursor, CollaborationError, CollaborationOptions, CollaborationQuery,
+    CollaborationStore, MailboxScope, Participant, RequestKind, RequestMailbox, RequestStatus,
+    RoomId,
+};
+use crate::config::{DashboardAuthMode, StatsConfig};
+use crate::dashboard::work_store::WorkStore;
+use crate::dashboard::{assets, DashboardConfig};
+use crate::event::{AgentKind, AgentState, PROTOCOL_VERSION};
+use crate::fleet::{FleetOperation, FleetRuntime, LabelSelector};
+use crate::metrics::Metrics;
+use crate::scope_filter::ScopeExclusions;
+use crate::session::{SessionBackend, SharedSessionBackend};
+use crate::state::{Agent, SharedStore, Transition};
+use crate::timeline::{
+    self, TimelineBuildInput, TimelineDocument, TimelineFilters, TimelineLane, TimelineLaneKind,
+    TimelineRange, TimelineTotals,
+};
+use crate::tmux::scanner::{self, PaneCache, PaneSummary, ScanError, TendPaneMetadata};
+use crate::work::{
+    self, ExecutionIdentity, WorkIdentity, WorkMetadataPatch, WorkRecord, WorkSnapshot,
+};
+use crate::work_control::{self, WorkUpError, WorkUpRequest};
+
+/// SSE keep-alive ping interval. Picked long enough to be invisible
+/// (15s is well under any sane proxy idle-timeout) but short enough
+/// that a stale connection drops within ~30s.
+const SSE_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// TTL for the cached `agents_by_state` histogram on `/api/metrics`.
+/// Recomputing the histogram requires a `store.snapshot().await` plus a
+/// full iteration of the registry, which contends with writers under
+/// load. One second is short enough that operators scraping at 1 Hz
+/// always see fresh-ish data and long enough to absorb burst scrapes.
+///
+/// TODO(perf): when we hit real perf issues, replace this with a
+/// per-state `AtomicU64` counter that's bumped/decremented in
+/// `Store::apply` on every state transition. A scrape then becomes
+/// `O(num_states)` atomic loads and the cache + mutex go away.
+const AGENTS_BY_STATE_CACHE_TTL: Duration = Duration::from_secs(1);
+
+const TIMELINE_SUMMARY_CACHE_TTL: Duration = Duration::from_secs(15);
+const TIMELINE_SUMMARY_CACHE_CAPACITY: usize = 16;
+const CONTROL_BODY_LIMIT_BYTES: usize = 64 * 1024;
+
+/// Cached `agents_by_state` histogram with the wall-clock instant it
+/// was computed. Lives inside [`AppState`] behind a `tokio::sync::Mutex`
+/// so concurrent scrapes coalesce on a single recompute when the cache
+/// is stale, instead of every request taking the store snapshot lock.
+#[derive(Debug, Default)]
+struct AgentsByStateCache {
+    /// `None` until the first scrape populates it; subsequent scrapes
+    /// refresh in place. We don't pre-populate at construction because
+    /// it would force `AppState::new` to be `async`.
+    value: Option<(Instant, BTreeMap<String, u64>, u64)>,
+}
+
+#[derive(Debug, Default)]
+struct TimelineSummaryCache {
+    values: HashMap<TimelineSummaryCacheKey, (Instant, TimelineSummaryResponse)>,
+}
+
+/// Application state shared by every handler. Cheap to clone (all
+/// fields are `Arc`-flavoured) so axum's `State` extractor copies
+/// freely.
+#[derive(Clone)]
+pub struct AppState {
+    pub store: SharedStore,
+    /// Durable request/reply history shared with tendd's collaboration IPC
+    /// handlers. Dashboard reads use this same store so the web graph never
+    /// races or diverges from the CLI mailbox.
+    pub collaboration: Arc<CollaborationStore>,
+    pub config: Arc<DashboardConfig>,
+    pub pane_cache: Arc<PaneCache>,
+    pub sessions: SharedSessionBackend,
+    pub(super) sharing: Arc<super::sharing::Sharing>,
+    /// OIDC operator sessions. Separate from `sharing` so a recipient
+    /// session can never be mistaken for operator access.
+    pub(super) operator: Arc<super::operator::OperatorLogin>,
+    /// Primary pane backend retained for compatibility with callers that
+    /// inspect it directly. Pane scans use `backends` below so every active
+    /// host contributes to one dashboard inventory.
+    pub backend: Option<SharedBackend>,
+    /// Every active backend, used both for pane scans and to route PAT-gated
+    /// control actions by pane-id namespace.
+    pub backends: Arc<Vec<SharedBackend>>,
+    /// Lock-free runtime counters surfaced via `/api/metrics`. Cloned
+    /// from the [`Store`](crate::state::Store)'s metrics so SSE
+    /// connect/disconnect bumps live alongside event-apply bumps.
+    pub metrics: Metrics,
+    /// Activity ledger path used by `/api/timeline`. `None` means the
+    /// endpoint still returns a well-formed empty timeline with a note.
+    pub activity_path: Option<PathBuf>,
+    /// Session activity file used only for currently-open tmux foreground
+    /// intervals. Closed foreground intervals come from `activity_path`.
+    pub session_activity_path: Option<PathBuf>,
+    /// ACTIVE estimate tuning shared with `tend stats`.
+    pub stats_config: StatsConfig,
+    /// Optional SSH fleet runtime. Fleet reads reuse tendd's per-host cache;
+    /// dashboard requests never launch their own SSH processes.
+    pub fleet: Option<FleetRuntime>,
+    /// Durable operator-authored work metadata. Execution topology remains in
+    /// the backend; only workflow annotations are stored here.
+    work_store: Arc<tokio::sync::Mutex<WorkStore>>,
+    /// 1-second cache for the `agents_by_state` histogram. See the
+    /// [`AGENTS_BY_STATE_CACHE_TTL`] doc-comment for the perf rationale
+    /// and the eventual plan to replace this with per-state atomics.
+    agents_by_state_cache: Arc<tokio::sync::Mutex<AgentsByStateCache>>,
+    /// Short-lived parsed ledger cache shared by summary and detail timeline
+    /// requests. Entries are immutable behind an `Arc`, so handlers do not
+    /// clone the full retained activity set.
+    activity_ledger_cache: Arc<tokio::sync::Mutex<crate::activity::ActivityCache>>,
+    /// Compact final response cache. This protects the daemon from multiple
+    /// dashboard tabs rebuilding the same retained-history projection at once.
+    timeline_summary_cache: Arc<tokio::sync::Mutex<TimelineSummaryCache>>,
+    /// `[message.skills]`, so a dashboard prompt can expand the same `/name`
+    /// templates the CLI and `tend_call_peer` expand. One composer, three
+    /// front doors.
+    message_skills: Arc<BTreeMap<String, String>>,
+    /// Shared capture loops behind `/api/panes/{pane}/output/stream`.
+    pane_streams: Arc<super::pane_stream::PaneStreamHub>,
+}
+
+#[derive(Clone, Default)]
+pub struct DashboardRuntimeConfig {
+    /// The daemon's durable collaboration store. Optional to preserve the
+    /// embedding API for callers that serve a dashboard without tendd.
+    pub collaboration: Option<Arc<CollaborationStore>>,
+    pub message_skills: BTreeMap<String, String>,
+    pub activity_path: Option<PathBuf>,
+    pub session_activity_path: Option<PathBuf>,
+    pub work_store_path: Option<PathBuf>,
+    pub stats_config: StatsConfig,
+    pub fleet: Option<FleetRuntime>,
+}
+
+impl AppState {
+    #[must_use]
+    pub fn new(
+        store: SharedStore,
+        config: Arc<DashboardConfig>,
+        pane_cache: Arc<PaneCache>,
+        sessions: SharedSessionBackend,
+    ) -> Self {
+        let metrics = store.metrics();
+        Self {
+            store,
+            collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
+            sharing: super::sharing::Sharing::new(config.sharing.clone()),
+            operator: super::operator::OperatorLogin::new(config.login.clone()),
+            config,
+            pane_cache,
+            sessions,
+            backend: None,
+            backends: Arc::new(Vec::new()),
+            metrics,
+            activity_path: None,
+            session_activity_path: None,
+            stats_config: StatsConfig::default(),
+            fleet: None,
+            work_store: Arc::new(tokio::sync::Mutex::new(WorkStore::memory())),
+            agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
+            activity_ledger_cache: Arc::new(tokio::sync::Mutex::new(
+                crate::activity::ActivityCache::default(),
+            )),
+            timeline_summary_cache: Arc::new(tokio::sync::Mutex::new(
+                TimelineSummaryCache::default(),
+            )),
+            message_skills: Arc::new(BTreeMap::new()),
+            pane_streams: Arc::new(super::pane_stream::PaneStreamHub::new(
+                super::pane_stream::PaneStreamLimits::default(),
+            )),
+        }
+    }
+
+    /// Replace the live-output limits (tests shorten the capture interval).
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_pane_stream_limits(
+        mut self,
+        limits: super::pane_stream::PaneStreamLimits,
+    ) -> Self {
+        self.pane_streams = Arc::new(super::pane_stream::PaneStreamHub::new(limits));
+        self
+    }
+
+    #[must_use]
+    pub fn with_collaboration(mut self, collaboration: Arc<CollaborationStore>) -> Self {
+        self.collaboration = collaboration;
+        self
+    }
+
+    #[must_use]
+    pub fn with_message_skills(mut self, skills: BTreeMap<String, String>) -> Self {
+        self.message_skills = Arc::new(skills);
+        self
+    }
+
+    #[must_use]
+    pub fn with_activity_paths(
+        mut self,
+        activity_path: Option<PathBuf>,
+        session_activity_path: Option<PathBuf>,
+    ) -> Self {
+        self.activity_path = activity_path;
+        self.session_activity_path = session_activity_path;
+        self
+    }
+
+    #[must_use]
+    pub fn with_stats_config(mut self, stats_config: StatsConfig) -> Self {
+        self.stats_config = stats_config;
+        self
+    }
+
+    #[must_use]
+    pub fn with_fleet(mut self, fleet: Option<FleetRuntime>) -> Self {
+        self.fleet = fleet;
+        self
+    }
+
+    #[must_use]
+    pub fn with_work_store_path(mut self, path: Option<PathBuf>) -> Self {
+        self.work_store = Arc::new(tokio::sync::Mutex::new(WorkStore::load(path)));
+        self
+    }
+
+    #[must_use]
+    pub fn with_backend(mut self, backend: SharedBackend) -> Self {
+        self.backend = Some(backend.clone());
+        self.backends = Arc::new(vec![backend]);
+        self
+    }
+
+    #[must_use]
+    pub fn with_backends(mut self, backends: Vec<SharedBackend>) -> Self {
+        self.backend = backends.first().cloned();
+        self.backends = Arc::new(backends);
+        self
+    }
+
+    /// Refresh the pane inventory through the pane cache. tmux keeps its
+    /// multi-socket scanner; every active non-tmux backend contributes its
+    /// own pane inventory. `/api/panes`, control routing, and the timeline's
+    /// pane→session map therefore see the same multi-host set.
+    async fn refresh_pane_scan(&self) -> scanner::ScanResult {
+        let backends = self.backends.clone();
+        self.pane_cache
+            .get_or_refresh(|| multi_host_pane_scan(backends))
+            .await
+    }
+}
+
+/// Pull one multi-host inventory: the tmux scanner plus every other active
+/// backend (rmux, zellij, …), which a tmux scan alone never sees. The two run
+/// concurrently; each backend is sync-blocking, so those calls stay on
+/// Tokio's blocking pool. Work projections must be built from this, or a
+/// host whose panes live on rmux shows no Work at all.
+pub async fn multi_host_pane_scan(backends: Arc<Vec<SharedBackend>>) -> scanner::ScanResult {
+    let non_tmux = backends
+        .iter()
+        .filter(|backend| backend.kind() != HostKind::Tmux)
+        .cloned()
+        .collect::<Vec<_>>();
+    let backend_scan = tokio::task::spawn_blocking(move || {
+        non_tmux
+            .into_iter()
+            .map(|backend| {
+                let panes = backend.work_panes().unwrap_or_else(|| {
+                    backend
+                        .list_panes()
+                        .into_iter()
+                        .map(|pane| (pane, TendPaneMetadata::default()))
+                        .collect()
+                });
+                (backend.kind(), panes)
+            })
+            .collect::<Vec<_>>()
+    });
+    let (mut scan, backend_rows) = tokio::join!(scanner::scan(), backend_scan);
+    if let Ok(backend_rows) = backend_rows {
+        for (kind, panes) in backend_rows {
+            let additional = if kind == HostKind::Herdr {
+                scanner::herdr_scan_result(panes.into_iter().map(|(pane, _)| pane).collect())
+            } else {
+                backend_scan_result(kind, panes)
+            };
+            scan = merge_pane_scans(scan, additional);
+        }
+    }
+    scan
+}
+
+/// Convert a non-tmux backend's common `PaneInfo` rows to the dashboard wire
+/// shape. rmux retains its full socket path; hosts without endpoint paths use
+/// a stable host label. Bare-terminal attach commands remain tmux-only.
+fn backend_scan_result(
+    kind: HostKind,
+    panes: Vec<(crate::tmux::PaneInfo, TendPaneMetadata)>,
+) -> scanner::ScanResult {
+    let panes = panes
+        .into_iter()
+        .map(|(pane, tend)| {
+            let socket = match kind {
+                HostKind::Rmux | HostKind::Cmux => pane
+                    .socket
+                    .as_deref()
+                    .map_or_else(|| PathBuf::from(kind.to_string()), PathBuf::from),
+                HostKind::Herdr => PathBuf::from("herdr"),
+                HostKind::Zellij => PathBuf::from("zellij"),
+                HostKind::Tmux => pane
+                    .socket
+                    .as_deref()
+                    .map_or_else(|| PathBuf::from("tmux"), PathBuf::from),
+            };
+            PaneSummary {
+                host: kind,
+                pane_id: pane.pane_id,
+                session_id: pane.session_id,
+                session: pane.session,
+                window_id: pane.window_id,
+                window_name: pane.window_name,
+                window_index: pane.window_index,
+                pane_index: pane.pane_index,
+                tty: pane.tty,
+                current_command: pane.current_command,
+                title: pane.title,
+                current_path: pane.current_path,
+                socket,
+                tend,
+                attach_command: String::new(),
+            }
+        })
+        .collect();
+    scanner::ScanResult {
+        panes,
+        errors: Vec::new(),
+        fetched_at: OffsetDateTime::now_utc(),
+    }
+}
+
+/// Append one backend inventory while preserving earlier scan errors and the
+/// original fetch timestamp.
+fn merge_pane_scans(
+    mut base: scanner::ScanResult,
+    additional: scanner::ScanResult,
+) -> scanner::ScanResult {
+    base.panes.extend(additional.panes);
+    base.errors.extend(additional.errors);
+    base
+}
+
+/// Build the dashboard router. Public so `tendd`'s integration tests
+/// can mount it on an in-process listener and so that future PRs (e.g.
+/// the oh-my-prompt sink) can `.merge()` additional routes without
+/// touching this file.
+pub fn router(state: AppState) -> Router {
+    let host_layer = middleware::from_fn_with_state(state.clone(), host_guard_middleware);
+    let read_auth_layer = middleware::from_fn_with_state(state.clone(), read_auth_middleware);
+    let write_auth_layer = middleware::from_fn_with_state(state.clone(), write_auth_middleware);
+    let read_api = Router::new()
+        .route("/api/health", get(health_handler))
+        .route("/api/access", get(access_handler))
+        .route("/api/agents", get(agents_handler))
+        .route("/api/fleet", get(fleet_handler))
+        .route("/api/panes", get(panes_handler))
+        .route("/api/windows/{window}/layout", get(window_layout_handler))
+        .route("/api/works", get(works_handler))
+        .route("/api/work-metadata", get(work_metadata_handler))
+        .route("/api/terminal-sessions", get(terminal_sessions_handler))
+        .route("/api/collaboration", get(collaboration_handler))
+        .route(
+            "/api/terminal-sessions/{id}/capture",
+            get(terminal_capture_handler),
+        )
+        .route("/api/timeline", get(timeline_handler))
+        .route("/api/events", get(events_handler))
+        .route("/api/metrics", get(metrics_handler));
+    let read_api = if matches!(state.config.auth, DashboardAuthMode::Token) {
+        read_api.layer(read_auth_layer)
+    } else {
+        read_api
+    };
+    let write_api = super::sharing::admin_routes()
+        .merge(super::operator::admin_routes())
+        .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
+        .route("/api/fleet/{host}/command", post(fleet_command_handler))
+        .route("/api/panes/{pane}/abort", post(pane_abort_handler))
+        .route("/api/work-metadata", put(work_metadata_put_handler))
+        .route("/api/work-control/prompt", post(work_prompt_handler))
+        .route("/api/work-control/up", post(work_up_handler))
+        .route("/api/work-control/abort", post(work_abort_handler))
+        .route(
+            "/api/terminal-sessions/{id}/input",
+            post(terminal_input_handler),
+        )
+        .route(
+            "/api/terminal-sessions/{id}/terminate",
+            post(terminal_terminate_handler),
+        )
+        .layer(DefaultBodyLimit::max(CONTROL_BODY_LIMIT_BYTES))
+        .layer(write_auth_layer);
+    // Operator-only reads. Pane output can hold secrets the redacted read
+    // views never expose, so it sits behind the control gate even though it
+    // is a GET: a viewer session gets 403, and in `public_read` an anonymous
+    // visitor needs the token (401). Being a GET it needs no CSRF proof.
+    let operator_read_api = Router::new()
+        .route("/api/panes/{pane}/output", get(pane_output_handler))
+        .route(
+            "/api/panes/{pane}/output/stream",
+            get(pane_output_stream_handler),
+        )
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            write_auth_middleware,
+        ))
+        .layer(middleware::map_response(no_store));
+    let api = read_api
+        .merge(write_api)
+        .merge(operator_read_api)
+        .merge(super::sharing::recipient_routes(state.clone()))
+        .merge(super::operator::routes())
+        .with_state(state.clone());
+    // Static assets sit OUTSIDE the auth layer — see assets.rs for the
+    // rationale (token bootstrap in the browser). The DNS-rebinding host
+    // guard, by contrast, wraps *everything* (API + assets). The
+    // `TraceLayer` sits outermost so even rejected requests are traced —
+    // with a token-scrubbed URI (see `make_request_span`).
+    api.merge(assets::router::<()>())
+        .layer(host_layer)
+        .layer(TraceLayer::new_for_http().make_span_with(make_request_span::<Body>))
+}
+
+/// Build the tracing span for one request with the `token` query
+/// parameter value redacted. The bootstrap token now travels in the URL
+/// *fragment* (never sent to the server), but this is defense-in-depth:
+/// a hand-typed or legacy `?token=…` URL must never be recorded verbatim
+/// in a span/log where the secret would outlive the client-side scrub.
+fn make_request_span<B>(req: &Request<B>) -> tracing::Span {
+    tracing::info_span!(
+        "http.request",
+        method = %req.method(),
+        uri = %scrub_token_from_uri(req.uri()),
+        version = ?req.version(),
+    )
+}
+
+/// Render `uri` with operator tokens and OIDC code/state query values
+/// replaced by `REDACTED`. Other parameters are preserved verbatim.
+fn scrub_token_from_uri(uri: &axum::http::Uri) -> String {
+    let path = uri.path();
+    match uri.query() {
+        None => path.to_string(),
+        Some(query) => {
+            let scrubbed = query
+                .split('&')
+                .map(|pair| match pair.split_once('=') {
+                    Some((k, _))
+                        if ["token", "code", "state"].iter().any(|sensitive| {
+                            url::form_urlencoded::parse(pair.as_bytes())
+                                .next()
+                                .is_some_and(|(key, _)| key.eq_ignore_ascii_case(sensitive))
+                        }) =>
+                    {
+                        format!("{k}=REDACTED")
+                    }
+                    _ => pair.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("&");
+            format!("{path}?{scrubbed}")
+        }
+    }
+}
+
+/// Bind and serve the router until `shutdown` fires or the listener
+/// closes. Returns `Ok(())` on graceful shutdown.
+pub async fn serve(
+    config: Arc<DashboardConfig>,
+    store: SharedStore,
+    pane_cache: Arc<PaneCache>,
+    sessions: SharedSessionBackend,
+    backends: Vec<SharedBackend>,
+    runtime: DashboardRuntimeConfig,
+    mut shutdown: broadcast::Receiver<()>,
+) -> std::io::Result<()> {
+    let collaboration = runtime.collaboration.unwrap_or_else(|| {
+        CollaborationStore::in_memory(CollaborationOptions {
+            enabled: false,
+            ..CollaborationOptions::default()
+        })
+    });
+    let sharing = super::sharing::Sharing::open(config.sharing.clone()).await?;
+    let operator = super::operator::OperatorLogin::open(config.login.clone(), None).await?;
+    let mut state = AppState::new(store, config.clone(), pane_cache, sessions)
+        .with_collaboration(collaboration)
+        .with_backends(backends)
+        .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
+        .with_work_store_path(runtime.work_store_path)
+        .with_stats_config(runtime.stats_config)
+        .with_message_skills(runtime.message_skills)
+        .with_fleet(runtime.fleet);
+    state.sharing = sharing;
+    state.operator = operator;
+    let app = router(state);
+    let listener = TcpListener::bind(config.bind).await?;
+    let local = listener.local_addr()?;
+    tracing::info!(addr = %local, "dashboard listening");
+    log_access_url(&config, local);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.recv().await;
+        })
+        .await
+}
+
+/// DNS-rebinding guard. A page on an attacker-controlled domain can,
+/// after re-resolving that domain to `127.0.0.1`, issue requests to this
+/// loopback server from the victim's browser — but the browser still
+/// sends the attacker's domain in the `Host` header. Rejecting any
+/// non-loopback `Host` closes that hole while leaving genuine
+/// `localhost` / `127.0.0.1` access untouched.
+///
+/// Only enforced for loopback binds: an operator who deliberately binds
+/// a public address (`allow_public`) is reached via a real hostname and
+/// rebinding is moot there, so we let those requests through.
+///
+/// An *absent* `Host` header is allowed: the DNS-rebinding vector is a
+/// browser, and browsers always send `Host`. Non-browser local clients
+/// (the tend CLI, tests) that omit it are not the threat this guards.
+async fn host_guard_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if state.config.bind.ip().is_loopback() {
+        let host = req
+            .headers()
+            .get(header::HOST)
+            .and_then(|h| h.to_str().ok());
+        if !host_is_loopback(host, state.config.bind.ip())
+            && !host.is_some_and(|host| public_host(&state.config, host))
+        {
+            return Err(StatusCode::FORBIDDEN);
+        }
+    }
+    Ok(next.run(req).await)
+}
+
+/// Does `host` name a configured public origin? A reverse proxy or tunnel
+/// that forwards the browser's `Host` reaches a loopback bind with it.
+fn public_host(config: &DashboardConfig, host: &str) -> bool {
+    config
+        .sharing
+        .as_ref()
+        .is_some_and(|sharing| sharing.matches_host(host))
+        || config
+            .login
+            .as_ref()
+            .is_some_and(|login| login.matches_host(host))
+}
+
+/// Is `host` (a raw `Host` header value, optionally `host:port` or
+/// `[ipv6]:port`) a loopback name/literal, or the configured loopback
+/// bind IP? Returns `true` for `None` — see [`host_guard_middleware`] for
+/// why an absent header is not an attack vector.
+fn host_is_loopback(host: Option<&str>, bind_ip: IpAddr) -> bool {
+    let Some(raw) = host else {
+        return true;
+    };
+    let host_only = strip_host_port(raw);
+    if host_only.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match host_only.parse::<IpAddr>() {
+        Ok(ip) => ip.is_loopback() || ip == bind_ip,
+        Err(_) => false,
+    }
+}
+
+/// Split the host component out of a `Host` header value, dropping any
+/// `:port` suffix and surrounding IPv6 brackets. `127.0.0.1:7878` →
+/// `127.0.0.1`, `[::1]:7878` → `::1`, `localhost` → `localhost`.
+fn strip_host_port(raw: &str) -> &str {
+    let raw = raw.trim();
+    if let Some(rest) = raw.strip_prefix('[') {
+        // IPv6 literal: `[::1]` or `[::1]:port`.
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    // IPv4 or hostname: strip a single trailing `:port` if present.
+    match raw.rsplit_once(':') {
+        Some((h, _port)) => h,
+        None => raw,
+    }
+}
+
+/// Return the non-sensitive URL and whether authentication is enabled for the
+/// startup log. The bearer token must never enter tracing fields: launchd
+/// redirects info logs to a persistent file, turning a convenience URL into a
+/// long-lived credential leak. `tend init` persists and prints the one-time
+/// fragment URL at setup time; daemon logs intentionally show only the base.
+fn access_log_details(config: &DashboardConfig, local: SocketAddr) -> (String, bool) {
+    let host = match local.ip() {
+        IpAddr::V6(ip) => format!("[{ip}]"),
+        IpAddr::V4(ip) => ip.to_string(),
+    };
+    let base = format!("http://{host}:{}/", local.port());
+    (base, config.token.is_some())
+}
+
+fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
+    let (base, auth_enabled) = access_log_details(config, local);
+    if auth_enabled {
+        tracing::info!(
+            url = %base,
+            "dashboard ready (authentication enabled; token omitted from logs)"
+        );
+    } else {
+        tracing::info!(url = %base, "dashboard ready (auth disabled via auth = \"none\")");
+    }
+}
+
+/// Authenticate an operator request: the bearer token, or else an OIDC
+/// operator session. Every operator gate goes through this one function so
+/// reads, writes, `/api/access` and detail redaction cannot disagree.
+fn operator_auth(state: &AppState, headers: &HeaderMap) -> Option<super::operator::OperatorAuth> {
+    super::operator::authenticate(state.config.token.as_deref(), &state.operator, headers)
+}
+
+/// Is this request authorized to act as the operator? Session-authorized
+/// state changes additionally need the CSRF proof described at the top of
+/// this module.
+fn operator_authorized(state: &AppState, req: &Request<Body>) -> Result<(), StatusCode> {
+    match operator_auth(state, req.headers()) {
+        Some(super::operator::OperatorAuth::Bearer) => Ok(()),
+        Some(super::operator::OperatorAuth::Session) => {
+            if state.operator.csrf_ok(req.method(), req.headers()) {
+                Ok(())
+            } else {
+                Err(StatusCode::FORBIDDEN)
+            }
+        }
+        None => Err(StatusCode::UNAUTHORIZED),
+    }
+}
+
+/// Read authentication for `auth = "token"`. Public-read and none modes do
+/// not install this layer on their GET/SSE router.
+async fn read_auth_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if state.config.token.is_none() {
+        return Ok(next.run(req).await);
+    }
+    match operator_authorized(&state, &req) {
+        // A signed-in viewer reads what a `public_read` visitor would; the
+        // handlers redact details for anyone who is not an operator.
+        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {}
+        result => result?,
+    }
+    Ok(next.run(req).await)
+}
+
+/// Control authentication. This layer always wraps mutation routes. A
+/// missing configured token means control is intentionally unavailable
+/// (`auth = "none"`), never anonymously writable.
+async fn write_auth_middleware(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    if state.config.token.is_none() {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    match operator_authorized(&state, &req) {
+        // Signed in, but only as a viewer: authenticated, not allowed.
+        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        result => result?,
+    }
+    Ok(next.run(req).await)
+}
+
+#[derive(Debug, Serialize)]
+struct HealthResponse {
+    ok: bool,
+    version: &'static str,
+    protocol: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct AccessResponse {
+    mode: &'static str,
+    read_requires_token: bool,
+    write_available: bool,
+    write_authorized: bool,
+    capabilities: AccessCapabilities,
+    login: LoginStatus,
+}
+
+/// Operator sign-in state, also served unauthenticated at `/auth/session` so
+/// a signed-out browser can offer "Sign in" instead of a token prompt.
+#[derive(Debug, Serialize)]
+pub(super) struct LoginStatus {
+    available: bool,
+    signed_in: bool,
+    email: Option<String>,
+    /// What this request may do: `none`, `viewer` or `operator` (the
+    /// bearer token counts as `operator`).
+    role: super::operator::Role,
+    /// Why the signed-in account has its role: `group`, `enrollment`,
+    /// `viewer_group` or `viewer_rule`.
+    via: Option<super::operator::Via>,
+    /// Whether a token holder may enroll accounts outside `required_group`.
+    enrollment: bool,
+    /// Absolute, so a browser on another origin (e.g. `localhost`) starts
+    /// the flow on the public origin its callback and cookie belong to.
+    login_url: Option<String>,
+}
+
+pub(super) fn login_status(state: &AppState, headers: &HeaderMap) -> LoginStatus {
+    let config = state.operator.config();
+    let (signed_in, email, via) = state
+        .operator
+        .signed_in(headers)
+        .map_or((false, None, None), |(email, via)| (true, email, Some(via)));
+    let role = if operator_auth(state, headers).is_some() {
+        super::operator::Role::Operator
+    } else {
+        via.map_or(super::operator::Role::None, super::operator::Via::role)
+    };
+    LoginStatus {
+        available: config.is_some(),
+        signed_in,
+        role,
+        email,
+        via,
+        enrollment: config.is_some_and(super::operator::LoginConfig::enrollment_enabled),
+        login_url: config.map(|config| format!("{}/auth/login", config.origin())),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AccessCapabilities {
+    work_start: bool,
+    pane_sharing: bool,
+}
+
+async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    let write_authorized = operator_auth(&state, &headers).is_some();
+    let mode = match state.config.auth {
+        DashboardAuthMode::Token => "token",
+        DashboardAuthMode::PublicRead => "public_read",
+        DashboardAuthMode::None => "read_only",
+    };
+    Json(AccessResponse {
+        mode,
+        read_requires_token: matches!(state.config.auth, DashboardAuthMode::Token),
+        write_available: state.config.token.is_some(),
+        write_authorized,
+        capabilities: AccessCapabilities {
+            work_start: state.config.allow_work_start,
+            pane_sharing: state.config.sharing.is_some(),
+        },
+        login: login_status(&state, &headers),
+    })
+}
+
+async fn health_handler() -> impl IntoResponse {
+    Json(HealthResponse {
+        ok: true,
+        version: env!("CARGO_PKG_VERSION"),
+        protocol: PROTOCOL_VERSION,
+    })
+}
+
+const COLLABORATION_PAGE_DEFAULT: usize = 100;
+const COLLABORATION_PAGE_MAX: usize = 500;
+const COLLABORATION_FILTER_MAX_BYTES: usize = 512;
+const COLLABORATION_CURSOR_ID_MAX_BYTES: usize = 128;
+
+/// HTTP-shaped collaboration filters. The durable store owns filtering and
+/// keyset pagination; this type only translates ergonomic query strings into
+/// its typed contract.
+#[derive(Debug, Default, Deserialize)]
+struct CollaborationHttpQuery {
+    until: Option<String>,
+    id: Option<String>,
+    q: Option<String>,
+    /// Same grammar as the CLI timeline (`24h`, `7d`, RFC3339, `all`, ...).
+    since: Option<String>,
+    #[serde(alias = "work_id")]
+    work: Option<String>,
+    #[serde(alias = "workspace_id")]
+    workspace: Option<String>,
+    #[serde(alias = "thread_id")]
+    thread: Option<String>,
+    #[serde(alias = "parent_request_id")]
+    parent: Option<String>,
+    kind: Option<String>,
+    status: Option<String>,
+    /// URL-encoded JSON `RoomId`, e.g. `{"host":"tmux","window_id":"@1"}`.
+    room: Option<String>,
+    session: Option<String>,
+    socket: Option<String>,
+    limit: Option<String>,
+    /// Opaque keyset token returned as `pagination.next_cursor`.
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CollaborationPagination {
+    total: usize,
+    limit: usize,
+    has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CollaborationHttpResponse {
+    #[serde(with = "time::serde::rfc3339")]
+    generated_at: OffsetDateTime,
+    /// False without operator authentication. Topology and status
+    /// remain useful for the graph, but message bodies and attached details
+    /// are omitted.
+    details_included: bool,
+    requests: Vec<serde_json::Value>,
+    pagination: CollaborationPagination,
+}
+
+async fn collaboration_handler(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(http): Query<CollaborationHttpQuery>,
+) -> Response {
+    let (mut query, limit) = match collaboration_query_from_http(http) {
+        Ok(query) => query,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+    query.search_bodies = dashboard_details_authorized(&state, &headers);
+    // All-scope reads are explicitly operator-only in CollaborationStore.
+    // The dashboard is the operator surface; the room value is immaterial at
+    // this scope but keeps the authority marker a normal console participant.
+    let console = Participant::console(RoomId {
+        host: "dashboard".to_string(),
+        socket: None,
+        window_id: "dashboard".to_string(),
+    });
+    let page = match state
+        .collaboration
+        .query_for(&console, RequestMailbox::All, MailboxScope::All, &query)
+        .await
+    {
+        Ok(page) => page,
+        Err(CollaborationError::Disabled) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({
+                    "ok": false,
+                    "error": "agent collaboration is disabled"
+                })),
+            )
+                .into_response();
+        }
+        Err(error) => {
+            tracing::warn!(%error, "dashboard collaboration history query failed");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": "collaboration history query failed" })),
+            )
+                .into_response();
+        }
+    };
+
+    let details_included = dashboard_details_authorized(&state, &headers);
+    let requests = page
+        .requests
+        .into_iter()
+        .map(|request| {
+            let mut value =
+                serde_json::to_value(request).expect("collaboration request serializes");
+            if !details_included {
+                redact_collaboration_details(&mut value);
+            }
+            value
+        })
+        .collect();
+    let mut response = Json(CollaborationHttpResponse {
+        generated_at: OffsetDateTime::now_utc(),
+        details_included,
+        requests,
+        pagination: CollaborationPagination {
+            total: page.total,
+            limit,
+            has_more: page.has_more,
+            next_cursor: page.next_cursor.as_ref().map(encode_collaboration_cursor),
+        },
+    })
+    .into_response();
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("private, no-store"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        HeaderValue::from_static("Authorization, Cookie"),
+    );
+    response
+}
+
+fn collaboration_query_from_http(
+    http: CollaborationHttpQuery,
+) -> Result<(CollaborationQuery, usize), String> {
+    let now = OffsetDateTime::now_utc();
+    let since = http
+        .since
+        .as_deref()
+        .map(|raw| timeline::parse_since(raw, now, "all collaboration history"))
+        .transpose()?
+        .and_then(|range| range.since_at);
+    let until = http
+        .until
+        .as_deref()
+        .map(|raw| {
+            OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .map_err(|_| "until must be an RFC3339 timestamp".to_string())
+        })
+        .transpose()?;
+    if since.zip(until).is_some_and(|(start, end)| start > end) {
+        return Err("since must not be later than until".to_string());
+    }
+    let limit = http
+        .limit
+        .as_deref()
+        .map(str::parse::<usize>)
+        .transpose()
+        .map_err(|_| "limit must be an integer from 1 to 500".to_string())?
+        .unwrap_or(COLLABORATION_PAGE_DEFAULT);
+    if !(1..=COLLABORATION_PAGE_MAX).contains(&limit) {
+        return Err("limit must be an integer from 1 to 500".to_string());
+    }
+    let room = http
+        .room
+        .as_deref()
+        .map(serde_json::from_str::<RoomId>)
+        .transpose()
+        .map_err(|error| format!("invalid room; expected a JSON RoomId: {error}"))?;
+    Ok((
+        CollaborationQuery {
+            human_only: false,
+            max_bytes: None,
+            until_exclusive: false,
+            window: None,
+            until,
+            request_id: non_empty_collaboration_filter("id", http.id)?,
+            search: non_empty_collaboration_filter("q", http.q)?,
+            search_bodies: false,
+            since,
+            work_id: non_empty_collaboration_filter("work", http.work)?,
+            workspace_id: non_empty_collaboration_filter("workspace", http.workspace)?,
+            thread_id: non_empty_collaboration_filter("thread", http.thread)?,
+            parent_request_id: non_empty_collaboration_filter("parent", http.parent)?,
+            kind: http.kind.as_deref().map(parse_request_kind).transpose()?,
+            status: http
+                .status
+                .as_deref()
+                .map(parse_request_status)
+                .transpose()?,
+            room,
+            tmux_session_id: None,
+            tmux_session_name: non_empty_collaboration_filter("session", http.session)?,
+            tmux_socket: non_empty_collaboration_filter("socket", http.socket)?,
+            limit: Some(limit),
+            cursor: http
+                .cursor
+                .as_deref()
+                .map(parse_collaboration_cursor)
+                .transpose()?,
+        },
+        limit,
+    ))
+}
+
+fn non_empty_collaboration_filter(
+    name: &str,
+    value: Option<String>,
+) -> Result<Option<String>, String> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Err(format!("{name} must not be empty"))
+            } else if value.len() > COLLABORATION_FILTER_MAX_BYTES {
+                Err(format!(
+                    "{name} must not exceed {COLLABORATION_FILTER_MAX_BYTES} bytes"
+                ))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .transpose()
+}
+
+fn parse_request_kind(raw: &str) -> Result<RequestKind, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "question" => Ok(RequestKind::Question),
+        "review" => Ok(RequestKind::Review),
+        "task" => Ok(RequestKind::Task),
+        "notice" => Ok(RequestKind::Notice),
+        _ => Err(format!(
+            "invalid collaboration kind {raw:?}; expected question, review, task, or notice"
+        )),
+    }
+}
+
+fn parse_request_status(raw: &str) -> Result<RequestStatus, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "queued" => Ok(RequestStatus::Queued),
+        "claimed" => Ok(RequestStatus::Claimed),
+        "completed" => Ok(RequestStatus::Completed),
+        "blocked" => Ok(RequestStatus::Blocked),
+        "declined" => Ok(RequestStatus::Declined),
+        "failed" => Ok(RequestStatus::Failed),
+        "expired" => Ok(RequestStatus::Expired),
+        "cancelled" | "canceled" => Ok(RequestStatus::Cancelled),
+        _ => Err(format!(
+            "invalid collaboration status {raw:?}; expected queued, claimed, completed, blocked, declined, failed, expired, or cancelled"
+        )),
+    }
+}
+
+fn encode_collaboration_cursor(cursor: &CollaborationCursor) -> String {
+    format!("{}:{}", cursor.created_at.unix_timestamp_nanos(), cursor.id)
+}
+
+fn parse_collaboration_cursor(raw: &str) -> Result<CollaborationCursor, String> {
+    let (nanos, id) = raw
+        .split_once(':')
+        .ok_or_else(|| "invalid collaboration cursor".to_string())?;
+    if id.is_empty()
+        || id.len() > COLLABORATION_CURSOR_ID_MAX_BYTES
+        || !id.starts_with("req_")
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        return Err("invalid collaboration cursor".to_string());
+    }
+    let nanos = nanos
+        .parse::<i128>()
+        .map_err(|_| "invalid collaboration cursor".to_string())?;
+    let created_at = OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .map_err(|_| "invalid collaboration cursor".to_string())?;
+    Ok(CollaborationCursor {
+        created_at,
+        id: id.to_string(),
+    })
+}
+
+fn dashboard_details_authorized(state: &AppState, headers: &HeaderMap) -> bool {
+    matches!(
+        state.config.auth,
+        DashboardAuthMode::Token | DashboardAuthMode::PublicRead
+    ) && operator_auth(state, headers).is_some()
+}
+
+fn redact_collaboration_details(request: &mut serde_json::Value) {
+    let Some(request) = request.as_object_mut() else {
+        return;
+    };
+    for field in [
+        "body",
+        "provenance",
+        "paths",
+        "artifacts",
+        "links",
+        "air_artifacts",
+    ] {
+        request.remove(field);
+    }
+    if let Some(updates) = request
+        .get_mut("updates")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for update in updates {
+            if let Some(update) = update.as_object_mut() {
+                update.remove("body");
+            }
+        }
+    }
+    if let Some(info) = request
+        .get_mut("interruption")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        info.remove("decision");
+    }
+    // Progress bodies are also private message content.
+    if let Some(reply) = request
+        .get_mut("reply")
+        .and_then(serde_json::Value::as_object_mut)
+    {
+        for field in ["body", "artifacts", "air_artifacts"] {
+            reply.remove(field);
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct AgentsResponse {
+    agents: Vec<Agent>,
+}
+
+async fn agents_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(AgentsResponse {
+        agents: state.store.snapshot().await,
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FleetQuery {
+    selector: Option<String>,
+}
+
+async fn fleet_handler(State(state): State<AppState>, Query(query): Query<FleetQuery>) -> Response {
+    let Some(fleet) = &state.fleet else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "fleet manager is not enabled" })),
+        )
+            .into_response();
+    };
+    let selector = match query
+        .selector
+        .as_deref()
+        .map(str::parse::<LabelSelector>)
+        .transpose()
+    {
+        Ok(selector) => selector,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": error }))).into_response();
+        }
+    };
+    Json(fleet.store.snapshot_selected(selector.as_ref()).await).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct FleetCommandRequest {
+    operation: FleetOperation,
+}
+
+async fn fleet_command_handler(
+    State(state): State<AppState>,
+    Path(host): Path<String>,
+    Json(request): Json<FleetCommandRequest>,
+) -> Response {
+    let Some(fleet) = &state.fleet else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "fleet manager is not enabled" })),
+        )
+            .into_response();
+    };
+    match fleet
+        .execute(host, request.operation, Duration::from_secs(20))
+        .await
+    {
+        Ok(result) => Json(result).into_response(),
+        Err(error) => (StatusCode::CONFLICT, Json(json!({ "error": error }))).into_response(),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PanesResponse {
+    panes: Vec<PaneSummary>,
+    errors: Vec<ScanError>,
+    #[serde(with = "time::serde::rfc3339")]
+    fetched_at: OffsetDateTime,
+}
+
+async fn panes_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let result = state.refresh_pane_scan().await;
+    Json(PanesResponse {
+        panes: crate::tmux::canonical_panes(&result.panes)
+            .into_iter()
+            .map(|mut pane| {
+                pane.session = crate::tmux::base_session_name(&pane.session).to_string();
+                pane
+            })
+            .collect(),
+        errors: result.errors,
+        fetched_at: result.fetched_at,
+    })
+}
+
+async fn works_handler(State(state): State<AppState>) -> Json<WorkSnapshot> {
+    let scan = state.refresh_pane_scan().await;
+    let agents = state.store.snapshot().await;
+    let mut work_store = state.work_store.lock().await;
+    // Once per pane, not once per `~view~` listing of it: each upsert writes.
+    for pane in &crate::tmux::canonical_panes(&scan.panes) {
+        if let Some((identity, item)) = work::external_item_for_pane(pane, scan.fetched_at) {
+            if let Err(error) = work_store.upsert_external_item(identity, item).await {
+                tracing::warn!(%error, "failed to persist discovered external work item");
+            }
+        }
+    }
+    let records = work_store.records();
+    drop(work_store);
+    Json(work::build_snapshot(
+        &scan.panes,
+        &agents,
+        &records,
+        scan.fetched_at,
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct WorkMetadataResponse {
+    works: Vec<WorkRecord>,
+}
+
+async fn work_metadata_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(WorkMetadataResponse {
+        works: state.work_store.lock().await.records(),
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkMetadataPutRequest {
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
+    metadata: WorkMetadataPatch,
+}
+
+async fn work_metadata_put_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkMetadataPutRequest>,
+) -> Response {
+    if let Err(error) = validate_work_selector(input.identity.as_ref(), input.key.as_ref()) {
+        return control_error(StatusCode::BAD_REQUEST, error);
+    }
+    let metadata = match input.metadata.validate() {
+        Ok(metadata) => metadata,
+        Err(error) => return control_error(StatusCode::BAD_REQUEST, error),
+    };
+    let scan = state.refresh_pane_scan().await;
+    let records = state.work_store.lock().await.records();
+    let identity_exists = input.identity.as_ref().is_some_and(|identity| {
+        records.iter().any(|record| &record.identity == identity)
+            || scan
+                .panes
+                .iter()
+                .any(|pane| work::work_identity_for_pane(pane).as_ref() == Some(identity))
+    });
+    let key_exists = input.key.as_ref().is_some_and(|key| {
+        scan.panes
+            .iter()
+            .any(|pane| pane_matches_execution(pane, key))
+    });
+    if !identity_exists && !key_exists {
+        return control_error(StatusCode::NOT_FOUND, "work item is no longer present");
+    }
+    let result = if let Some(identity) = input.identity {
+        state
+            .work_store
+            .lock()
+            .await
+            .upsert_metadata(identity, metadata)
+            .await
+    } else if let Some(key) = input.key {
+        state
+            .work_store
+            .lock()
+            .await
+            .upsert_legacy_metadata(key, metadata)
+            .await
+    } else {
+        unreachable!("validated selector")
+    };
+    match result {
+        Ok(record) => Json(json!({ "ok": true, "work": record })).into_response(),
+        Err(error) => control_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist work metadata: {error}"),
+        ),
+    }
+}
+
+fn pane_socket_identity(pane: &PaneSummary) -> String {
+    work::pane_socket_identity(pane)
+}
+
+fn pane_matches_execution(pane: &PaneSummary, key: &ExecutionIdentity) -> bool {
+    pane.host == key.host
+        && pane_socket_identity(pane) == key.socket
+        && pane.session_id == key.session_id
+        && pane.window_id == key.window_id
+}
+
+fn validate_work_selector(
+    identity: Option<&WorkIdentity>,
+    key: Option<&ExecutionIdentity>,
+) -> Result<(), &'static str> {
+    match (identity, key) {
+        (None, None) => Err("work selector is missing"),
+        (Some(_), Some(_)) => Err("provide exactly one work selector: identity or key"),
+        _ => Ok(()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkPromptRequest {
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
+    /// Literal text, kept for callers that compose their own prompt.
+    #[serde(default)]
+    text: String,
+    /// Registered `[message.skills]` name, expanded ahead of `body` exactly
+    /// as `tend_call_peer` and `tend work up` expand it.
+    #[serde(default)]
+    skill: Option<String>,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+    #[serde(default = "default_true")]
+    submit: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct WorkAbortRequest {
+    #[serde(default)]
+    identity: Option<WorkIdentity>,
+    #[serde(default)]
+    key: Option<ExecutionIdentity>,
+}
+
+#[derive(Debug, Serialize)]
+struct WorkControlResult {
+    pane: String,
+    sent: bool,
+    submitted: bool,
+}
+
+/// Stand a work item's pipeline up from the dashboard.
+///
+/// This delegates to the `tend` binary rather than reimplementing the
+/// pipeline here. The launcher and the managed-tmux registry live in the
+/// CLI crate, which depends on this one — so calling them in-process would
+/// mean either inverting that dependency or keeping a second implementation
+/// alive. One implementation behind a subprocess beats two behind none.
+///
+/// Gated on `[dashboard] allow_work_start` on top of the control token:
+/// every other write route steers a process the operator already started,
+/// while this one starts new ones with permissions bypassed.
+async fn work_up_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkUpRequest>,
+) -> Response {
+    if !state.config.allow_work_start {
+        // Not FORBIDDEN: the browser treats 401/403 as "your token is bad"
+        // and drops into read-only. This deployment simply does not offer
+        // the capability, which is what 501 says — and what the backend
+        // capability checks above already use.
+        return control_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "starting work is disabled; set [dashboard] allow_work_start = true to enable it",
+        );
+    }
+    let result = match work_control::execute_work_up(&input, None).await {
+        Ok(result) => result,
+        Err(error) => return control_error(work_up_error_status(&error), error.to_string()),
+    };
+    let linked_external_item = if input.dry_run {
+        false
+    } else {
+        persist_started_external_item(&state, &result).await
+    };
+    Json(json!({
+        "ok": true,
+        // Retained for clients of the first control-plane draft. Provider
+        // titles now remain external references instead of becoming local
+        // operator-authored Work metadata.
+        "seeded_metadata": false,
+        "linked_external_item": linked_external_item,
+        "result": result
+    }))
+    .into_response()
+}
+
+fn work_up_error_status(error: &WorkUpError) -> StatusCode {
+    match error {
+        WorkUpError::Invalid(_) | WorkUpError::Failed(_) => StatusCode::BAD_REQUEST,
+        WorkUpError::Timeout => StatusCode::GATEWAY_TIMEOUT,
+        WorkUpError::Spawn(_) | WorkUpError::OutputTooLarge | WorkUpError::InvalidJson(_) => {
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
+    }
+}
+
+/// Persist the external reference recorded on the newly created Run without
+/// copying its title or provider status into the local Work definition.
+async fn persist_started_external_item(state: &AppState, result: &serde_json::Value) -> bool {
+    let (Some(workspace_id), Some(work_id)) = (
+        result.get("workspace").and_then(serde_json::Value::as_str),
+        result.get("work").and_then(serde_json::Value::as_str),
+    ) else {
+        return false;
+    };
+    let identity = WorkIdentity::new(workspace_id, work_id);
+    let scan = state.refresh_pane_scan().await;
+    let item = scan.panes.iter().find_map(|pane| {
+        let (candidate, item) = work::external_item_for_pane(pane, scan.fetched_at)?;
+        (candidate == identity).then_some(item)
+    });
+    let Some(item) = item else {
+        return false;
+    };
+    state
+        .work_store
+        .lock()
+        .await
+        .upsert_external_item(identity, item)
+        .await
+        .is_ok()
+}
+
+async fn work_prompt_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkPromptRequest>,
+) -> Response {
+    // `text` stays the escape hatch; skill/body/context go through the one
+    // composer so a template registered once works from every front door.
+    let composed = match crate::request::compose(
+        crate::request::RequestParts {
+            skill: input.skill.as_deref(),
+            body: input.body.as_deref(),
+            context: input.context.as_deref(),
+        },
+        &state.message_skills,
+    ) {
+        Ok(composed) => composed,
+        Err(error) => return control_error(StatusCode::BAD_REQUEST, error.to_string()),
+    };
+    let text = match (composed, input.text.trim()) {
+        (Some(composed), "") => composed.text,
+        (Some(composed), literal) => format!("{}\n\n{literal}", composed.text),
+        (None, "") => {
+            return control_error(
+                StatusCode::BAD_REQUEST,
+                "prompt requires text, body, skill, or context",
+            )
+        }
+        (None, literal) => literal.to_string(),
+    };
+    run_work_control(
+        &state,
+        input.identity,
+        input.key,
+        text,
+        input.submit,
+        "prompt",
+    )
+    .await
+}
+
+async fn work_abort_handler(
+    State(state): State<AppState>,
+    Json(input): Json<WorkAbortRequest>,
+) -> Response {
+    run_work_control(
+        &state,
+        input.identity,
+        input.key,
+        "\u{3}".to_string(),
+        false,
+        "abort",
+    )
+    .await
+}
+
+async fn run_work_control(
+    state: &AppState,
+    identity: Option<WorkIdentity>,
+    key: Option<ExecutionIdentity>,
+    text: String,
+    submit: bool,
+    action: &'static str,
+) -> Response {
+    if let Err(error) = validate_work_selector(identity.as_ref(), key.as_ref()) {
+        return control_error(StatusCode::BAD_REQUEST, error);
+    }
+    let scan = state.refresh_pane_scan().await;
+    let agents = state.store.snapshot().await;
+    let records = state.work_store.lock().await.records();
+    let legacy_binding = identity.as_ref().and_then(|identity| {
+        records
+            .iter()
+            .find(|record| &record.identity == identity)
+            .and_then(|record| record.legacy_binding.clone())
+    });
+    // A grouped session lists each pane once per `~view~` member; typing
+    // into every listing would submit the prompt (or Ctrl-C) more than once.
+    let panes = crate::tmux::canonical_panes(&scan.panes);
+    let candidates = panes
+        .iter()
+        .filter(|pane| {
+            identity.as_ref().is_some_and(|identity| {
+                work::work_identity_for_pane(pane).as_ref() == Some(identity)
+                    || legacy_binding
+                        .as_ref()
+                        .is_some_and(|binding| pane_matches_execution(pane, binding))
+            }) || key
+                .as_ref()
+                .is_some_and(|key| pane_matches_execution(pane, key))
+        })
+        .filter(|pane| pane.tend.managed_agent || pane_has_live_agent(pane, &panes, &agents))
+        .filter_map(|pane| {
+            let backend = state
+                .backends
+                .iter()
+                .find(|backend| backend.kind() == pane.host)
+                .filter(|backend| backend.caps().send_text)
+                .cloned()?;
+            Some((backend, pane_socket_identity(pane), pane.pane_id.clone()))
+        })
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return control_error(
+            StatusCode::NOT_FOUND,
+            "work item has no live or managed agent panes",
+        );
+    }
+
+    let results = tokio::task::spawn_blocking(move || {
+        candidates
+            .into_iter()
+            .map(|(backend, socket, pane)| {
+                let sent = backend.send_prompt_text_on(Some(&socket), &pane, &text);
+                let submitted = if sent && submit {
+                    std::thread::sleep(crate::backend::prompt_submit_grace(&pane));
+                    backend.send_text_on(Some(&socket), &pane, "\r")
+                } else {
+                    false
+                };
+                WorkControlResult {
+                    pane,
+                    sent,
+                    submitted,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    let succeeded = results.iter().filter(|result| result.sent).count();
+    if succeeded == 0 {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            format!("{action} failed for every agent pane"),
+        );
+    }
+    Json(json!({
+        "ok": succeeded == results.len(),
+        "action": action,
+        "attempted": results.len(),
+        "succeeded": succeeded,
+        "results": results,
+    }))
+    .into_response()
+}
+
+fn pane_has_live_agent(pane: &PaneSummary, panes: &[PaneSummary], agents: &[Agent]) -> bool {
+    let duplicates = panes
+        .iter()
+        .filter(|candidate| candidate.host == pane.host && candidate.pane_id == pane.pane_id)
+        .count();
+    agents.iter().any(|agent| {
+        agent.state != AgentState::Stopped
+            && agent.pane.as_deref() == Some(&pane.pane_id)
+            && crate::backend::pane_id_host_kind(&pane.pane_id).is_none_or(|host| host == pane.host)
+            && match agent.tmux_socket.as_deref() {
+                Some(socket) => {
+                    crate::backend::pane_endpoint_identity(Some(&pane.pane_id), socket)
+                        == pane_socket_identity(pane)
+                }
+                None => duplicates == 1,
+            }
+    })
+}
+
+#[derive(Debug, Serialize)]
+struct TerminalSessionsResponse {
+    sessions: Vec<crate::session::SessionRef>,
+}
+
+async fn terminal_sessions_handler(State(state): State<AppState>) -> impl IntoResponse {
+    Json(TerminalSessionsResponse {
+        sessions: state.sessions.list_sessions(),
+    })
+}
+
+async fn terminal_capture_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.sessions.capture(&id) {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "ok": false, "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PaneControlTarget {
+    /// Optional tmux socket name/path. Required only when the same `%N` pane
+    /// id exists on more than one tmux server.
+    socket: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PanePromptRequest {
+    text: String,
+    #[serde(default = "default_true")]
+    submit: bool,
+    socket: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+struct TerminalInputRequest {
+    data: String,
+}
+
+fn control_error(status: StatusCode, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(json!({ "ok": false, "error": message.into() })),
+    )
+        .into_response()
+}
+
+struct ControlFailure {
+    status: StatusCode,
+    message: String,
+}
+
+impl ControlFailure {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn into_response(self) -> Response {
+        control_error(self.status, self.message)
+    }
+}
+
+fn control_backend(state: &AppState, pane: &str) -> Result<SharedBackend, ControlFailure> {
+    let Some(primary) = state.backends.first() else {
+        return Err(ControlFailure::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no pane backend is available",
+        ));
+    };
+    match crate::backend::pane_id_host_kind(pane) {
+        Some(kind) => state
+            .backends
+            .iter()
+            .find(|backend| backend.kind() == kind)
+            .cloned()
+            .ok_or_else(|| {
+                ControlFailure::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("no active {kind} backend for pane {pane}"),
+                )
+            }),
+        None => Ok(primary.clone()),
+    }
+}
+
+fn socket_basename(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    std::path::Path::new(trimmed)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+}
+
+async fn control_socket(
+    state: &AppState,
+    backend: &SharedBackend,
+    pane: &str,
+    requested: Option<&str>,
+) -> Result<Option<String>, ControlFailure> {
+    if backend.kind() == HostKind::Rmux {
+        let mut candidates = state
+            .store
+            .by_pane(pane)
+            .await
+            .into_iter()
+            .filter_map(|agent| agent.tmux_socket)
+            .map(|endpoint| crate::backend::pane_endpoint_identity(Some(pane), &endpoint))
+            .collect::<Vec<_>>();
+        let scan = state.refresh_pane_scan().await;
+        candidates.extend(
+            scan.panes
+                .into_iter()
+                .filter(|candidate| candidate.pane_id == pane)
+                .filter_map(|candidate| candidate.socket.to_str().map(str::to_string)),
+        );
+        candidates.sort();
+        candidates.dedup();
+
+        if let Some(requested) = requested {
+            let requested = crate::backend::pane_endpoint_identity(Some(pane), requested);
+            if candidates.iter().any(|candidate| candidate == &requested) {
+                return Ok(Some(requested));
+            }
+            return Err(ControlFailure::new(
+                StatusCode::BAD_REQUEST,
+                format!("pane {pane} is not present on rmux endpoint {requested}"),
+            ));
+        }
+        return match candidates.as_slice() {
+            [] => Ok(None),
+            [endpoint] => Ok(Some(endpoint.clone())),
+            _ => Err(ControlFailure::new(
+                StatusCode::CONFLICT,
+                format!("pane {pane} exists on multiple rmux endpoints; specify socket"),
+            )),
+        };
+    }
+    if backend.kind() != HostKind::Tmux {
+        return Ok(None);
+    }
+
+    let mut candidates = state
+        .store
+        .by_pane(pane)
+        .await
+        .into_iter()
+        .filter_map(|agent| agent.tmux_socket)
+        .filter_map(|socket| socket_basename(&socket))
+        .collect::<Vec<_>>();
+    let scan = state.refresh_pane_scan().await;
+    candidates.extend(
+        scan.panes
+            .into_iter()
+            .filter(|candidate| candidate.pane_id == pane)
+            .filter_map(|candidate| {
+                candidate
+                    .socket
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            }),
+    );
+    candidates.sort();
+    candidates.dedup();
+
+    if let Some(requested) = requested.and_then(socket_basename) {
+        if candidates.iter().any(|candidate| candidate == &requested) {
+            return Ok(Some(requested));
+        }
+        return Err(ControlFailure::new(
+            StatusCode::BAD_REQUEST,
+            format!("pane {pane} is not present on tmux socket {requested}"),
+        ));
+    }
+
+    match candidates.as_slice() {
+        [] => Ok(None),
+        [only] => Ok(Some(only.clone())),
+        _ => Err(ControlFailure::new(
+            StatusCode::CONFLICT,
+            format!("pane {pane} exists on multiple tmux sockets; specify socket"),
+        )),
+    }
+}
+
+async fn pane_prompt_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Json(input): Json<PanePromptRequest>,
+) -> Response {
+    if input.text.trim().is_empty() {
+        return control_error(StatusCode::BAD_REQUEST, "prompt text is empty");
+    }
+    let backend = match control_backend(&state, &pane) {
+        Ok(backend) if backend.caps().send_text => backend,
+        Ok(backend) => {
+            return control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane input", backend.kind()),
+            );
+        }
+        Err(failure) => return failure.into_response(),
+    };
+    let socket = match control_socket(&state, &backend, &pane, input.socket.as_deref()).await {
+        Ok(socket) => socket,
+        Err(failure) => return failure.into_response(),
+    };
+    let text = input.text;
+    let submit = input.submit;
+    let pane_for_send = pane.clone();
+    let (sent, submitted) = tokio::task::spawn_blocking(move || {
+        let socket = socket.as_deref();
+        let sent = backend.send_prompt_text_on(socket, &pane_for_send, &text);
+        let submitted = if sent && submit {
+            std::thread::sleep(crate::backend::prompt_submit_grace(&pane_for_send));
+            backend.send_text_on(socket, &pane_for_send, "\r")
+        } else {
+            false
+        };
+        (sent, submitted)
+    })
+    .await
+    .unwrap_or((false, false));
+
+    if !sent {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            "pane input failed: pane gone or backend unreachable",
+        );
+    }
+    Json(json!({
+        "ok": true,
+        "pane": pane,
+        "sent": sent,
+        "submitted": submitted,
+    }))
+    .into_response()
+}
+
+async fn pane_abort_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Json(input): Json<PaneControlTarget>,
+) -> Response {
+    let backend = match control_backend(&state, &pane) {
+        Ok(backend) if backend.caps().send_text => backend,
+        Ok(backend) => {
+            return control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane input", backend.kind()),
+            );
+        }
+        Err(failure) => return failure.into_response(),
+    };
+    let socket = match control_socket(&state, &backend, &pane, input.socket.as_deref()).await {
+        Ok(socket) => socket,
+        Err(failure) => return failure.into_response(),
+    };
+    let pane_for_send = pane.clone();
+    let sent = tokio::task::spawn_blocking(move || {
+        backend.send_text_on(socket.as_deref(), &pane_for_send, "\u{3}")
+    })
+    .await
+    .unwrap_or(false);
+    if !sent {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            "abort failed: pane gone or backend unreachable",
+        );
+    }
+    Json(json!({ "ok": true, "pane": pane, "aborted": true })).into_response()
+}
+
+#[derive(Debug, Deserialize)]
+struct WindowLayoutQuery {
+    socket: Option<String>,
+}
+
+/// A tmux window id taken from a URL: `@` followed by digits.
+fn valid_window_id(window: &str) -> bool {
+    window.strip_prefix('@').is_some_and(|digits| {
+        !digits.is_empty() && digits.len() <= 12 && digits.bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
+/// Pick the tmux server a window lives on from the scanned inventory. A
+/// socket the request names is only ever matched against scanned sockets, so
+/// this read route never points tmux at a caller-chosen path.
+fn resolve_window_socket(
+    panes: &[PaneSummary],
+    window: &str,
+    requested: Option<&str>,
+) -> Result<String, (StatusCode, &'static str)> {
+    let mut sockets = panes
+        .iter()
+        .filter(|pane| pane.host == HostKind::Tmux && pane.window_id == window)
+        .map(|pane| pane.socket.to_string_lossy().into_owned())
+        .filter(|socket| {
+            requested.is_none_or(|requested| {
+                socket == requested
+                    || crate::tmux::socket_short_name(socket)
+                        == crate::tmux::socket_short_name(requested)
+            })
+        })
+        .collect::<Vec<_>>();
+    sockets.sort();
+    sockets.dedup();
+    match sockets.as_slice() {
+        [] => Err((StatusCode::NOT_FOUND, "window not found")),
+        [socket] => Ok(socket.clone()),
+        _ => Err((
+            StatusCode::CONFLICT,
+            "window exists on multiple tmux sockets; specify socket",
+        )),
+    }
+}
+
+/// Pane geometry for one tmux window, so the dashboard can lay its panes out
+/// the way tmux does. Metadata only (no output), hence a normal read route.
+async fn window_layout_handler(
+    State(state): State<AppState>,
+    Path(window): Path<String>,
+    Query(query): Query<WindowLayoutQuery>,
+) -> Response {
+    if !valid_window_id(&window) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid window id");
+    }
+    let requested = query.socket.as_deref().filter(|s| !s.is_empty());
+    if requested.is_some_and(|socket| !valid_pane_socket(socket)) {
+        return control_error(StatusCode::BAD_REQUEST, "invalid socket");
+    }
+    let scan = state.refresh_pane_scan().await;
+    let socket = match resolve_window_socket(&scan.panes, &window, requested) {
+        Ok(socket) => socket,
+        Err((status, message)) => return control_error(status, message),
+    };
+    let target = window.clone();
+    let socket_for_query = socket.clone();
+    let (panes, zoomed) = tokio::task::spawn_blocking(move || {
+        crate::tmux::layout::window_panes_on(Some(&socket_for_query), &target)
+    })
+    .await
+    .unwrap_or_default();
+    let panes = panes
+        .into_iter()
+        .map(|pane| {
+            json!({
+                "pane_id": pane.pane_id,
+                "pane_index": pane.pane_index,
+                "left": pane.left,
+                "top": pane.top,
+                "width": pane.width,
+                "height": pane.height,
+                "active": pane.active,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "window": window,
+        "socket": socket,
+        "zoomed": zoomed,
+        "panes": panes,
+    }))
+    .into_response()
+}
+
+/// Default and maximum number of lines `/api/panes/{pane}/output` returns.
+const PANE_OUTPUT_DEFAULT_LINES: usize = 200;
+const PANE_OUTPUT_MAX_LINES: usize = 1000;
+/// Byte bound on the returned text; the newest output is kept.
+const PANE_OUTPUT_MAX_BYTES: usize = 64 * 1024;
+const PANE_ID_MAX_LEN: usize = 128;
+const PANE_SOCKET_MAX_LEN: usize = 1024;
+
+#[derive(Debug, Deserialize)]
+struct PaneOutputQuery {
+    socket: Option<String>,
+    lines: Option<usize>,
+}
+
+async fn no_store(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    response
+}
+
+/// Shape check for a pane id taken from a URL: a tmux `%N`, or a known
+/// host-prefixed id (`rmux:…`, `herdr:…`, …). Anything else never reaches a
+/// backend command line.
+fn valid_pane_id(pane: &str) -> bool {
+    if pane.is_empty()
+        || pane.len() > PANE_ID_MAX_LEN
+        || !pane.chars().all(|c| c.is_ascii_graphic())
+    {
+        return false;
+    }
+    if let Some(digits) = pane.strip_prefix('%') {
+        return !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit());
+    }
+    crate::backend::pane_id_host_kind(pane).is_some()
+        && pane
+            .split_once(':')
+            .is_some_and(|(_, rest)| !rest.is_empty())
+}
+
+fn valid_pane_socket(socket: &str) -> bool {
+    !socket.trim().is_empty()
+        && socket.len() <= PANE_SOCKET_MAX_LEN
+        && !socket.chars().any(char::is_control)
+}
+
+/// Turn a raw capture into what the drawer shows: escapes and control bytes
+/// stripped (the same sanitizer the share view and fleet captures use), the
+/// screen's trailing blank rows dropped, the newest `lines` lines, and at
+/// most [`PANE_OUTPUT_MAX_BYTES`] bytes cut on a character boundary.
+fn pane_output_text(raw: &str, lines: usize) -> String {
+    pane_output_tail(&super::pane_stream::clean_capture(raw), lines)
+}
+
+/// The newest `lines` lines of already-sanitized output, byte-bounded.
+fn pane_output_tail(clean: &str, lines: usize) -> String {
+    let rows = clean.trim_end().lines().collect::<Vec<_>>();
+    let start = rows.len().saturating_sub(lines);
+    let mut text = rows[start..].join("\n");
+    if text.len() > PANE_OUTPUT_MAX_BYTES {
+        let mut cut = text.len() - PANE_OUTPUT_MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text.drain(..cut);
+    }
+    text
+}
+
+/// A validated capture request: which backend, which socket, how deep.
+struct PaneCaptureTarget {
+    backend: SharedBackend,
+    socket: Option<String>,
+    lines: usize,
+}
+
+/// Shared validation for the output and output-stream routes. The pane id
+/// and socket are shape-checked before any backend sees them, and the
+/// socket is resolved against the scanned inventory. The error response is
+/// boxed because `Response` is large enough to trip `result_large_err`.
+async fn resolve_pane_capture(
+    state: &AppState,
+    pane: &str,
+    query: &PaneOutputQuery,
+) -> Result<PaneCaptureTarget, Box<Response>> {
+    if !valid_pane_id(pane) {
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid pane id",
+        )));
+    }
+    let requested_socket = query.socket.as_deref().filter(|s| !s.is_empty());
+    if requested_socket.is_some_and(|socket| !valid_pane_socket(socket)) {
+        return Err(Box::new(control_error(
+            StatusCode::BAD_REQUEST,
+            "invalid socket",
+        )));
+    }
+    let lines = query
+        .lines
+        .unwrap_or(PANE_OUTPUT_DEFAULT_LINES)
+        .clamp(1, PANE_OUTPUT_MAX_LINES);
+    let backend = match control_backend(state, pane) {
+        Ok(backend) if backend.caps().capture_pane => backend,
+        Ok(backend) => {
+            return Err(Box::new(control_error(
+                StatusCode::NOT_IMPLEMENTED,
+                format!("{} backend does not support pane capture", backend.kind()),
+            )));
+        }
+        Err(failure) => return Err(Box::new(failure.into_response())),
+    };
+    let socket = control_socket(state, &backend, pane, requested_socket)
+        .await
+        .map_err(|failure| Box::new(failure.into_response()))?;
+    Ok(PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    })
+}
+
+async fn pane_output_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Query(query): Query<PaneOutputQuery>,
+) -> Response {
+    let PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    } = match resolve_pane_capture(&state, &pane, &query).await {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let pane_for_capture = pane.clone();
+    let captured = tokio::task::spawn_blocking(move || {
+        backend.capture_pane_history_on(socket.as_deref(), &pane_for_capture, lines)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(raw) = captured else {
+        return control_error(
+            StatusCode::BAD_GATEWAY,
+            "pane output unavailable: pane gone or backend unreachable",
+        );
+    };
+    Json(json!({
+        "pane": pane,
+        "text": pane_output_text(&raw, lines),
+        "captured_at": super::pane_stream::now_rfc3339(),
+    }))
+    .into_response()
+}
+
+/// Live pane output over SSE, for the drawer and window tiles. Same gate
+/// and validation as [`pane_output_handler`]. The first `output` event is
+/// the current snapshot; later ones are sent only when the text changed,
+/// each carrying the full (bounded) text. `gone` means the pane closed and
+/// is the last event. The stream ends after the configured lifetime and the
+/// client reconnects.
+async fn pane_output_stream_handler(
+    State(state): State<AppState>,
+    Path(pane): Path<String>,
+    Query(query): Query<PaneOutputQuery>,
+) -> Response {
+    let PaneCaptureTarget {
+        backend,
+        socket,
+        lines,
+    } = match resolve_pane_capture(&state, &pane, &query).await {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let rx = match state
+        .pane_streams
+        .subscribe(backend, socket, pane.clone(), lines)
+    {
+        Ok(rx) => rx,
+        Err(error) => return control_error(StatusCode::TOO_MANY_REQUESTS, error.message()),
+    };
+    let lifetime = tokio::time::sleep(state.pane_streams.limits().lifetime);
+    let events = pane_output_events(rx, pane, lines)
+        .take_until(lifetime)
+        .map(Ok::<_, Infallible>);
+    Sse::new(events)
+        .keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+        .into_response()
+}
+
+/// One subscriber's view of a pane channel: its own tail of each capture,
+/// deduplicated so an unchanged tail sends nothing.
+struct PaneOutputSubscriber {
+    rx: tokio::sync::watch::Receiver<super::pane_stream::PaneFrame>,
+    pane: String,
+    lines: usize,
+    last: Option<String>,
+    done: bool,
+}
+
+impl PaneOutputSubscriber {
+    fn event_for(&mut self, frame: super::pane_stream::PaneFrame) -> Option<SseEvent> {
+        use super::pane_stream::PaneFrame;
+        match frame {
+            PaneFrame::Pending => None,
+            PaneFrame::Output { text, captured_at } => {
+                let text = pane_output_tail(&text, self.lines);
+                if self.last.as_deref() == Some(text.as_str()) {
+                    return None;
+                }
+                let event = SseEvent::default()
+                    .event("output")
+                    .json_data(json!({
+                        "pane": self.pane,
+                        "text": text,
+                        "captured_at": &*captured_at,
+                    }))
+                    .ok()?;
+                self.last = Some(text);
+                Some(event)
+            }
+            PaneFrame::Gone => {
+                self.done = true;
+                Some(
+                    SseEvent::default()
+                        .event("gone")
+                        .json_data(json!({ "pane": self.pane }))
+                        .unwrap_or_else(|_| SseEvent::default().event("gone").data("{}")),
+                )
+            }
+        }
+    }
+}
+
+fn pane_output_events(
+    rx: tokio::sync::watch::Receiver<super::pane_stream::PaneFrame>,
+    pane: String,
+    lines: usize,
+) -> impl Stream<Item = SseEvent> + Send {
+    let subscriber = PaneOutputSubscriber {
+        rx,
+        pane,
+        lines,
+        last: None,
+        done: false,
+    };
+    stream::unfold(subscriber, |mut sub| async move {
+        if sub.done {
+            return None;
+        }
+        loop {
+            let frame = sub.rx.borrow_and_update().clone();
+            if let Some(event) = sub.event_for(frame) {
+                return Some((event, sub));
+            }
+            if sub.rx.changed().await.is_err() {
+                // The capture loop ended; report a final `gone` not yet seen.
+                let frame = sub.rx.borrow().clone();
+                return match frame {
+                    super::pane_stream::PaneFrame::Gone => {
+                        sub.event_for(frame).map(|event| (event, sub))
+                    }
+                    _ => None,
+                };
+            }
+        }
+    })
+}
+
+async fn terminal_input_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(input): Json<TerminalInputRequest>,
+) -> Response {
+    match state.sessions.send_input(&id, input.data.as_bytes()) {
+        Ok(()) => Json(json!({ "ok": true, "session_id": id })).into_response(),
+        Err(crate::session::SessionError::NotFound(_)) => {
+            control_error(StatusCode::NOT_FOUND, format!("session not found: {id}"))
+        }
+        Err(crate::session::SessionError::Exited(_)) => control_error(
+            StatusCode::CONFLICT,
+            format!("session already exited: {id}"),
+        ),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+async fn terminal_terminate_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    match state.sessions.terminate(&id) {
+        Ok(()) => Json(json!({ "ok": true, "session_id": id })).into_response(),
+        Err(crate::session::SessionError::NotFound(_)) => {
+            control_error(StatusCode::NOT_FOUND, format!("session not found: {id}"))
+        }
+        Err(crate::session::SessionError::Exited(_)) => control_error(
+            StatusCode::CONFLICT,
+            format!("session already exited: {id}"),
+        ),
+        Err(error) => control_error(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct TimelineQuery {
+    /// Same grammar as the CLI: today, yesterday, week, month, last-week, last-month, 24h, 7d, RFC3339, all.
+    since: Option<String>,
+    /// tmux session name, tmux session id, or pane id.
+    session: Option<String>,
+    /// Comma-separated pane id glob exclusions. `exclude-pane` is accepted too.
+    #[serde(alias = "exclude-pane")]
+    exclude_pane: Option<String>,
+    /// Comma-separated tmux session name/id glob exclusions. `exclude-session` is accepted too.
+    #[serde(alias = "exclude-session")]
+    exclude_session: Option<String>,
+    /// Agent kind in `snake_case`.
+    agent: Option<String>,
+    /// `detail` preserves the original response. `summary` omits raw intervals
+    /// and returns compact all-session aggregates for the dashboard.
+    view: Option<TimelineView>,
+    /// Browser-local UTC offset used to group summary days. For example, Seoul
+    /// sends `540` and New York standard time sends `-300`.
+    timezone_offset_minutes: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TimelineView {
+    Detail,
+    Summary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct TimelineSummaryCacheKey {
+    since: String,
+    session: Option<String>,
+    exclude_pane: Option<String>,
+    exclude_session: Option<String>,
+    agent: Option<String>,
+    timezone_offset_minutes: i32,
+}
+
+impl TimelineSummaryCacheKey {
+    fn from_query(query: &TimelineQuery) -> Self {
+        Self {
+            since: query.since.clone().unwrap_or_else(|| "24h".to_string()),
+            session: query.session.clone(),
+            exclude_pane: query.exclude_pane.clone(),
+            exclude_session: query.exclude_session.clone(),
+            agent: query.agent.clone(),
+            timezone_offset_minutes: query.timezone_offset_minutes.unwrap_or(0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSummaryResponse {
+    #[serde(with = "time::serde::rfc3339")]
+    generated_at: OffsetDateTime,
+    range: TimelineRange,
+    #[serde(with = "time::serde::rfc3339")]
+    window_started_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    window_ended_at: OffsetDateTime,
+    lanes: Vec<TimelineLane>,
+    totals: TimelineTotals,
+    active_sessions: Vec<timeline::TimelineActiveSession>,
+    notes: Vec<String>,
+    summary: TimelineSummary,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSummary {
+    version: u8,
+    sessions: Vec<TimelineSessionSummary>,
+    days: Vec<TimelineDaySummary>,
+    sources: Vec<TimelineSourceSummary>,
+    human_presence_secs: u64,
+    overview: Vec<timeline::TimelineOverviewLane>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSessionSummary {
+    label: String,
+    lanes: usize,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    latest_at: Option<OffsetDateTime>,
+    totals: TimelineTotals,
+    human_presence_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineDaySummary {
+    date: String,
+    totals: TimelineTotals,
+    top_sessions: Vec<timeline::TimelineActiveSession>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct TimelineSourceSummary {
+    kind: TimelineLaneKind,
+    lanes: usize,
+    sessions: usize,
+    totals: TimelineTotals,
+}
+
+enum BuiltTimeline {
+    Detail(TimelineDocument),
+    Summary(TimelineSummaryResponse),
+}
+
+struct TimelineProjectionInput {
+    now: OffsetDateTime,
+    range: TimelineRange,
+    prompt_entries: Vec<crate::history::HistoryEntry>,
+    activity_entries: Arc<Vec<crate::activity::ActivityEntry>>,
+    agents: Vec<Agent>,
+    session_activities: Vec<crate::session_activity::SessionActivity>,
+    pane_sessions: HashMap<String, String>,
+    stats_config: StatsConfig,
+    filters: TimelineFilters,
+    notes: Vec<String>,
+    wants_summary: bool,
+    timezone_offset: UtcOffset,
+}
+
+async fn timeline_handler(
+    State(state): State<AppState>,
+    Query(query): Query<TimelineQuery>,
+) -> Response {
+    let summary_cache_key = (query.view == Some(TimelineView::Summary))
+        .then(|| TimelineSummaryCacheKey::from_query(&query));
+    if let Some(cache_key) = summary_cache_key.as_ref() {
+        if let Some(response) = cached_timeline_summary(&state, cache_key).await {
+            return Json(response).into_response();
+        }
+    }
+
+    let now = OffsetDateTime::now_utc();
+    let since = query.since.as_deref().unwrap_or("24h");
+    let range = match timeline::parse_since(since, now, "all retained activity") {
+        Ok(range) => range,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+    let agent_kind = match query.agent.as_deref().map(parse_agent_kind).transpose() {
+        Ok(kind) => kind,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+
+    let timezone_offset = match timeline_timezone_offset(query.timezone_offset_minutes) {
+        Ok(offset) => offset,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": error })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut notes = Vec::new();
+    let activity_entries = load_cached_activity_entries(&state, &mut notes).await;
+    let session_activities = match state.session_activity_path.as_ref() {
+        Some(path) => crate::session_activity::load(path).await,
+        None => Vec::new(),
+    };
+    let agents = state.store.snapshot().await;
+    let prompt_entries = state.store.recent_prompts(None, 0).await;
+    let pane_scan = state.refresh_pane_scan().await;
+    let pane_sessions = crate::tmux::canonical_panes(&pane_scan.panes)
+        .into_iter()
+        .map(|pane| (pane.pane_id, pane.session))
+        .collect::<HashMap<_, _>>();
+
+    let built = match build_timeline_projection(TimelineProjectionInput {
+        now,
+        range,
+        prompt_entries,
+        activity_entries,
+        agents,
+        session_activities,
+        pane_sessions,
+        stats_config: state.stats_config.clone(),
+        filters: TimelineFilters {
+            session: query.session,
+            agent_kind,
+            exclusions: ScopeExclusions::new(
+                split_query_patterns(query.exclude_pane),
+                split_query_patterns(query.exclude_session),
+            ),
+        },
+        notes,
+        wants_summary: summary_cache_key.is_some(),
+        timezone_offset,
+    })
+    .await
+    {
+        Ok(built) => built,
+        Err(error) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(
+                    json!({ "ok": false, "error": format!("timeline projection failed: {error}") }),
+                ),
+            )
+                .into_response();
+        }
+    };
+
+    match built {
+        BuiltTimeline::Summary(response) => {
+            if let Some(cache_key) = summary_cache_key {
+                store_timeline_summary(&state, cache_key, response.clone()).await;
+            }
+            Json(response).into_response()
+        }
+        BuiltTimeline::Detail(document) => Json(document).into_response(),
+    }
+}
+
+async fn build_timeline_projection(
+    projection: TimelineProjectionInput,
+) -> Result<BuiltTimeline, tokio::task::JoinError> {
+    tokio::task::spawn_blocking(move || {
+        let input = TimelineBuildInput {
+            now: projection.now,
+            range: projection.range,
+            prompt_entries: &projection.prompt_entries,
+            activity_entries: projection.activity_entries.as_slice(),
+            agents: &projection.agents,
+            session_activities: &projection.session_activities,
+            pane_sessions: &projection.pane_sessions,
+            active_lookback_secs: projection.stats_config.active_lookback_secs,
+            active_timeout_secs: projection.stats_config.active_timeout_secs,
+            active_tick_timeout_secs: projection.stats_config.active_tick_timeout_secs,
+            count_tmux_input: projection.stats_config.count_tmux_input,
+            filters: projection.filters,
+            notes: projection.notes,
+        };
+        if projection.wants_summary {
+            BuiltTimeline::Summary(build_timeline_summary_response(timeline::build_summary(
+                input,
+                projection.timezone_offset,
+            )))
+        } else {
+            BuiltTimeline::Detail(timeline::build_document(input))
+        }
+    })
+    .await
+}
+
+async fn cached_timeline_summary(
+    state: &AppState,
+    cache_key: &TimelineSummaryCacheKey,
+) -> Option<TimelineSummaryResponse> {
+    let mut cache = state.timeline_summary_cache.lock().await;
+    cache
+        .values
+        .retain(|_, (cached_at, _)| cached_at.elapsed() < TIMELINE_SUMMARY_CACHE_TTL);
+    cache
+        .values
+        .get(cache_key)
+        .map(|(_, response)| response.clone())
+}
+
+async fn store_timeline_summary(
+    state: &AppState,
+    cache_key: TimelineSummaryCacheKey,
+    response: TimelineSummaryResponse,
+) {
+    let mut cache = state.timeline_summary_cache.lock().await;
+    cache
+        .values
+        .retain(|_, (cached_at, _)| cached_at.elapsed() < TIMELINE_SUMMARY_CACHE_TTL);
+    if cache.values.len() >= TIMELINE_SUMMARY_CACHE_CAPACITY
+        && !cache.values.contains_key(&cache_key)
+    {
+        let oldest = cache
+            .values
+            .iter()
+            .min_by_key(|(_, (cached_at, _))| *cached_at)
+            .map(|(key, _)| key.clone());
+        if let Some(oldest) = oldest {
+            cache.values.remove(&oldest);
+        }
+    }
+    cache.values.insert(cache_key, (Instant::now(), response));
+}
+
+async fn load_cached_activity_entries(
+    state: &AppState,
+    notes: &mut Vec<String>,
+) -> Arc<Vec<crate::activity::ActivityEntry>> {
+    let Some(path) = state.activity_path.as_ref() else {
+        notes.push("activity ledger is not available to the dashboard".to_string());
+        return Arc::new(Vec::new());
+    };
+
+    let mut cache = state.activity_ledger_cache.lock().await;
+    match cache.refresh(path).await {
+        Ok(entries) => entries,
+        Err(error) => {
+            notes.push(format!(
+                "could not refresh activity ledger; using cached data: {error}"
+            ));
+            cache.snapshot()
+        }
+    }
+}
+
+fn timeline_timezone_offset(minutes: Option<i32>) -> Result<UtcOffset, String> {
+    let minutes = minutes.unwrap_or(0);
+    let seconds = minutes
+        .checked_mul(60)
+        .ok_or_else(|| format!("invalid timezone offset {minutes}"))?;
+    UtcOffset::from_whole_seconds(seconds)
+        .map_err(|_| format!("invalid timezone offset {minutes}; expected minutes from UTC"))
+}
+
+fn build_timeline_summary_response(
+    projection: timeline::TimelineSummaryProjection,
+) -> TimelineSummaryResponse {
+    let summary = TimelineSummary {
+        version: 1,
+        sessions: projection
+            .sessions
+            .into_iter()
+            .map(|session| TimelineSessionSummary {
+                label: session.label,
+                lanes: session.lanes,
+                latest_at: session.latest_at,
+                totals: session.totals,
+                human_presence_secs: session.human_presence_secs,
+            })
+            .collect(),
+        days: projection
+            .days
+            .into_iter()
+            .map(|day| TimelineDaySummary {
+                date: day.date,
+                totals: day.totals,
+                top_sessions: day.top_sessions,
+            })
+            .collect(),
+        sources: projection
+            .sources
+            .into_iter()
+            .map(|source| TimelineSourceSummary {
+                kind: source.kind,
+                lanes: source.lanes,
+                sessions: source.sessions,
+                totals: source.totals,
+            })
+            .collect(),
+        human_presence_secs: projection.human_presence_secs,
+        overview: projection.overview,
+    };
+    TimelineSummaryResponse {
+        generated_at: projection.generated_at,
+        range: projection.range,
+        window_started_at: projection.window_started_at,
+        window_ended_at: projection.window_ended_at,
+        lanes: Vec::new(),
+        totals: projection.totals,
+        active_sessions: projection.active_sessions,
+        notes: projection.notes,
+        summary,
+    }
+}
+
+fn split_query_patterns(raw: Option<String>) -> Vec<String> {
+    raw.into_iter()
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
+    match raw {
+        "claude_code" => Ok(AgentKind::ClaudeCode),
+        "codex" => Ok(AgentKind::Codex),
+        "gemini_cli" => Ok(AgentKind::GeminiCli),
+        "antigravity" => Ok(AgentKind::Antigravity),
+        "opencode" => Ok(AgentKind::Opencode),
+        "unknown" => Ok(AgentKind::Unknown),
+        _ => Err(format!("unknown agent kind {raw:?}")),
+    }
+}
+
+/// Wire shape for `/api/metrics`. Mirrors [`crate::metrics::MetricsSnapshot`]
+/// 1:1, plus aggregates derived from the live `Store` (agent counts).
+///
+/// **Stability:** unstable until the 1.0 release. Field names are
+/// stable within a 0.x patch series; we may add or rename fields in
+/// minor releases. Operators scraping this should be tolerant of
+/// extra keys.
+///
+/// `events_received_per_sec_1m` is intentionally omitted from v1: an
+/// accurate 1-minute rate needs a small ring buffer that we'd have to
+/// update on every event, and we'd rather ship a correct counter than
+/// a racy gauge. Operators can compute the rate from successive scrapes.
+#[derive(Debug, Serialize)]
+struct MetricsResponse {
+    /// Daemon `CARGO_PKG_VERSION` — same value as `/api/health`.
+    version: &'static str,
+    /// Seconds since the metrics handle (and therefore the daemon's
+    /// store) was constructed. Not strictly the daemon's PID-1
+    /// uptime, but close enough that the difference is invisible to
+    /// operators.
+    uptime_secs: u64,
+    /// Total agents currently in the registry (every state, including
+    /// `Stopped` rows that haven't been GC'd yet).
+    agents_total: u64,
+    /// Histogram of agents by [`crate::event::AgentState`]. Keys are
+    /// the `snake_case` `Display` form of the variant; missing keys mean
+    /// zero. `BTreeMap` so the JSON output is deterministically
+    /// ordered for tests and human inspection.
+    agents_by_state: BTreeMap<String, u64>,
+    /// Lifetime count of events the store has processed via
+    /// [`Store::apply`](crate::state::Store::apply).
+    events_received_total: u64,
+    /// Lifetime count of successful snapshot writes (failures are not
+    /// counted — the goal is "writes that hit disk").
+    snapshot_writes_total: u64,
+    /// Wall-clock duration of the most recent snapshot write, in
+    /// milliseconds. Zero before the first write.
+    snapshot_last_write_elapsed_ms: u64,
+    /// Lifetime count of reconciliation passes (every pass, including
+    /// no-ops — operators want to see the loop is alive).
+    reconcile_passes_total: u64,
+    /// Live count of SSE subscribers connected to `/api/events`.
+    sse_subscribers_current: u64,
+}
+
+#[tracing::instrument(level = "debug", skip(state))]
+async fn metrics_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let snap = state.metrics.snapshot();
+    let (agents_by_state, agents_total) = agents_by_state_cached(&state).await;
+
+    Json(MetricsResponse {
+        version: env!("CARGO_PKG_VERSION"),
+        uptime_secs: snap.uptime_secs,
+        agents_total,
+        agents_by_state,
+        events_received_total: snap.events_received_total,
+        snapshot_writes_total: snap.snapshot_writes_total,
+        snapshot_last_write_elapsed_ms: snap.snapshot_last_write_elapsed_ms,
+        reconcile_passes_total: snap.reconcile_passes_total,
+        sse_subscribers_current: snap.sse_subscribers_current,
+    })
+}
+
+/// Read the cached `agents_by_state` histogram, recomputing if the
+/// entry is missing or older than [`AGENTS_BY_STATE_CACHE_TTL`].
+/// Returns the histogram and the agent total it was derived from so
+/// both numbers come from the same `store.snapshot()` call (avoids the
+/// histogram-and-total drifting against each other across a race).
+async fn agents_by_state_cached(state: &AppState) -> (BTreeMap<String, u64>, u64) {
+    let mut guard = state.agents_by_state_cache.lock().await;
+    if let Some((at, hist, total)) = guard.value.as_ref() {
+        if at.elapsed() < AGENTS_BY_STATE_CACHE_TTL {
+            return (hist.clone(), *total);
+        }
+    }
+    // Cache miss or stale — recompute from the store. The registry is
+    // bounded (tens to low hundreds of entries) so the iteration is
+    // cheap; the cache exists to keep the `store.snapshot().await`
+    // read lock from being taken on every scrape.
+    let agents = state.store.snapshot().await;
+    let agents_total = u64::try_from(agents.len()).unwrap_or(u64::MAX);
+    let mut agents_by_state: BTreeMap<String, u64> = BTreeMap::new();
+    for a in &agents {
+        let key = a.state.to_string();
+        *agents_by_state.entry(key).or_insert(0) += 1;
+    }
+    // Ensure every known state appears as an explicit zero so consumers
+    // never have to special-case "missing key means zero". Cheap; the
+    // enum has seven variants.
+    for s in [
+        AgentState::Starting,
+        AgentState::Working,
+        AgentState::Idle,
+        AgentState::WaitingInput,
+        AgentState::WaitingChoice,
+        AgentState::Error,
+        AgentState::Stopped,
+    ] {
+        agents_by_state.entry(s.to_string()).or_insert(0);
+    }
+    guard.value = Some((Instant::now(), agents_by_state.clone(), agents_total));
+    (agents_by_state, agents_total)
+}
+
+/// Live SSE stream of state transitions.
+///
+/// Emits three event types on the wire:
+///
+/// - `snapshot` — sent first, exactly once. Payload: `{ agents: [...] }`.
+///   Lets a freshly-loaded client paint the table without a separate
+///   `/api/agents` round-trip.
+/// - `transition` — every `Store::subscribe()` broadcast. Payload: a
+///   serialized [`Transition`](crate::state::Transition).
+/// - `lagged` — emitted when the broadcast receiver falls behind the
+///   sender's ring buffer. Payload: the count of dropped messages.
+///   Clients should treat this as a hint to refetch `/api/agents` for
+///   a clean baseline.
+///
+/// Subscribe-then-snapshot ordering means a transition that lands
+/// between the subscribe and the snapshot is delivered twice (once in
+/// the snapshot, again as a transition); applying the transition is
+/// idempotent so this is harmless. The reverse ordering — snapshot
+/// then subscribe — would *miss* such a transition entirely.
+async fn events_handler(
+    State(state): State<AppState>,
+) -> Sse<impl Stream<Item = Result<SseEvent, Infallible>>> {
+    let rx = state.store.subscribe();
+    let snapshot = state.store.snapshot().await;
+
+    // Construct the `SubscriberGuard` *first* so the connect bump and
+    // matching disconnect bump are owned by the same RAII handle —
+    // `SubscriberGuard::new` increments, `Drop` decrements, and there's
+    // no third call site to drift out of sync with a future refactor.
+    let guard = SubscriberGuard::new(state.metrics.clone());
+
+    let snapshot_event = SseEvent::default()
+        .event("snapshot")
+        .json_data(json!({ "agents": snapshot }))
+        .unwrap_or_else(|_| SseEvent::default().event("snapshot").data("{}"));
+
+    // Each broadcasted transition increments the subscriber-count
+    // trace, gated at `trace!` so it stays cheap and off by default.
+    // We capture the metrics handle so the `move`-d closure can read
+    // the current count without needing to hop back to `state`.
+    let metrics_for_stream = state.metrics.clone();
+    let live = BroadcastStream::new(rx).map(move |res| {
+        if res.is_ok() {
+            tracing::trace!(
+                subscribers = metrics_for_stream.sse_subscribers(),
+                "sse.transition_broadcast",
+            );
+        }
+        map_transition_recv_to_sse(res)
+    });
+
+    // `SubscriberGuard` decrements on stream drop — handles browser
+    // refresh, network drop, and clean unsubscribe alike. Wrapping the
+    // whole stream in a `_guard` field makes the destructor's lifetime
+    // tied to the connection's lifetime: when axum drops the SSE body
+    // (the only stable handle to the connection), the guard runs.
+    let combined = stream::once(async move { snapshot_event })
+        .chain(live)
+        .map(Ok::<_, Infallible>);
+    // Box-pin the combinator chain so the wrapper's `S: Unpin` bound
+    // is satisfied without pulling in `pin-project` for one struct.
+    // The double indirection costs an extra heap allocation per
+    // connection — invisible at SSE rates.
+    let combined: std::pin::Pin<Box<dyn Stream<Item = Result<SseEvent, Infallible>> + Send>> =
+        Box::pin(combined);
+    let combined = GuardedStream {
+        inner: combined,
+        _guard: guard,
+    };
+
+    Sse::new(combined).keep_alive(KeepAlive::new().interval(SSE_KEEPALIVE_INTERVAL))
+}
+
+/// Map a single `BroadcastStream` poll result into the SSE event emitted on
+/// the wire. Extracted from [`events_handler`] so tests can drive both
+/// branches — `Ok(Transition)` and `Err(Lagged)` — without spinning up a
+/// full HTTP roundtrip and without duplicating the encoding rules.
+pub(crate) fn map_transition_recv_to_sse(
+    res: Result<Transition, BroadcastStreamRecvError>,
+) -> SseEvent {
+    match res {
+        Ok(t) => SseEvent::default()
+            .event("transition")
+            .json_data(&t)
+            .unwrap_or_else(|_| SseEvent::default().event("transition").data("{}")),
+        Err(BroadcastStreamRecvError::Lagged(n)) => {
+            SseEvent::default().event("lagged").data(n.to_string())
+        }
+    }
+}
+
+/// Drop guard that decrements the SSE subscriber gauge when the stream
+/// it's embedded in is dropped (client disconnects, server shuts down,
+/// connection drops). Pairing the bump in `sse_connect` with a guarded
+/// decrement keeps the gauge accurate across every disconnect path
+/// without having to instrument each one explicitly.
+struct SubscriberGuard {
+    metrics: Metrics,
+}
+
+impl SubscriberGuard {
+    /// Single source of truth for "is this subscriber accounted for?":
+    /// constructing the guard bumps the gauge, dropping it decrements.
+    /// SSE connects are rare-ish (once per dashboard tab open) and
+    /// operators want to see them even at the default log level — the
+    /// `info!` here is symmetric with the `info!` in `Drop`.
+    fn new(metrics: Metrics) -> Self {
+        let after = metrics.sse_connect();
+        tracing::info!(subscribers = after, "sse.connect");
+        Self { metrics }
+    }
+}
+
+impl Drop for SubscriberGuard {
+    fn drop(&mut self) {
+        let after = self.metrics.sse_disconnect();
+        tracing::info!(subscribers = after, "sse.disconnect");
+    }
+}
+
+/// Newtype that owns a [`SubscriberGuard`] for the lifetime of the
+/// inner stream. Pinned via a `pin-project`-style hand-rolled impl —
+/// we don't pull in `pin-project` for this single use and the inner
+/// stream is `Unpin` (combinator-built from `BroadcastStream` +
+/// `stream::once` + `chain` + `map`).
+struct GuardedStream<S> {
+    inner: S,
+    _guard: SubscriberGuard,
+}
+
+impl<S> Stream for GuardedStream<S>
+where
+    S: Stream + Unpin,
+{
+    type Item = S::Item;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn recovery_decisions_and_progress_are_redacted() {
+        let mut value = serde_json::json!({"interruption":{"reason":"error","decision":{"body":"private choice"}},"updates":[{"sequence":1,"body":"private progress"}]});
+        super::redact_collaboration_details(&mut value);
+        assert!(value["interruption"].get("decision").is_none());
+        assert!(value["updates"][0].get("body").is_none());
+        assert_eq!(value["updates"][0]["sequence"], 1);
+        assert_eq!(value["interruption"]["reason"], "error");
+    }
+
+    use super::*;
+    use crate::backend::{BackendCaps, PaneBackend};
+    use crate::event::{AgentEvent, AgentId, AgentKind};
+    use crate::state::Store;
+    use crate::tmux::PaneInfo;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use http_body_util::BodyExt;
+    use serde_json::Value;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Mutex;
+    use tower::ServiceExt;
+
+    struct RecordingControlBackend {
+        sent: Arc<Mutex<Vec<(String, String)>>>,
+        panes: Vec<PaneInfo>,
+    }
+
+    struct InventoryBackend {
+        kind: HostKind,
+        panes: Vec<PaneInfo>,
+    }
+
+    impl PaneBackend for InventoryBackend {
+        fn kind(&self) -> HostKind {
+            self.kind
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, _pane_id: &str, _text: &str) -> bool {
+            false
+        }
+    }
+
+    impl PaneBackend for RecordingControlBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Herdr
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            self.panes.clone()
+        }
+
+        fn resolve_pane(&self, pane_id: &str) -> Option<PaneInfo> {
+            self.panes
+                .iter()
+                .find(|pane| pane.pane_id == pane_id)
+                .cloned()
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            None
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, pane_id: &str, text: &str) -> bool {
+            self.sent
+                .lock()
+                .unwrap()
+                .push((pane_id.to_string(), text.to_string()));
+            true
+        }
+
+        fn caps(&self) -> BackendCaps {
+            BackendCaps::default()
+        }
+    }
+
+    fn fresh_state() -> AppState {
+        AppState::new(
+            Store::shared(),
+            Arc::new(DashboardConfig::loopback_default()),
+            Arc::new(PaneCache::new(Duration::from_secs(60))),
+            crate::session::PtySessionBackend::shared(),
+        )
+    }
+
+    fn state_with_token(token: &str) -> AppState {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.token = Some(token.to_string());
+        AppState::new(
+            Store::shared(),
+            Arc::new(cfg),
+            Arc::new(PaneCache::new(Duration::from_secs(60))),
+            crate::session::PtySessionBackend::shared(),
+        )
+    }
+
+    fn public_read_state(token: &str) -> AppState {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::PublicRead;
+        cfg.token = Some(token.to_string());
+        state_from(cfg)
+    }
+
+    fn test_pane(
+        pane_id: &str,
+        session_id: &str,
+        session: &str,
+        window_id: &str,
+        window_name: &str,
+    ) -> PaneInfo {
+        PaneInfo {
+            session_group: None,
+            agent_program: None,
+            worker_launch_id: None,
+            agent_role: None,
+            agent_alias: None,
+            workspace_id: None,
+            work_id: None,
+            socket: None,
+            pane_id: pane_id.into(),
+            session_id: session_id.into(),
+            session: session.into(),
+            window_id: window_id.into(),
+            window_name: window_name.into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "codex".into(),
+            title: String::new(),
+            pane_pid: 0,
+            current_path: "/work/tend".into(),
+        }
+    }
+
+    fn collaboration_participant(
+        pane: &str,
+        agent_session_id: &str,
+        window_id: &str,
+    ) -> Participant {
+        Participant {
+            launch_purpose: crate::collaboration::LaunchPurpose::Primary,
+            draining: false,
+            agent_kind: AgentKind::Codex,
+            agent_session_id: agent_session_id.to_string(),
+            pane: pane.to_string(),
+            socket: Some("default".to_string()),
+            room: RoomId {
+                host: "tmux".to_string(),
+                socket: Some("default".to_string()),
+                window_id: window_id.to_string(),
+            },
+            tmux_session_id: Some("$1".to_string()),
+            tmux_session_name: Some("webapp".to_string()),
+            window_name: Some("ENG-7345".to_string()),
+            state: AgentState::Idle,
+            cwd: Some("/work/tend".to_string()),
+            alias: None,
+            roles: Vec::new(),
+            console: false,
+        }
+    }
+
+    async fn seed_collaboration_requests(
+        collaboration: &Arc<CollaborationStore>,
+    ) -> Vec<crate::collaboration::CollaborationRequest> {
+        use crate::collaboration::{NewRequest, WorkMode};
+
+        let from = collaboration_participant("%1", "implementer-session", "@7");
+        let to = collaboration_participant("%2", "reviewer-session", "@7");
+        let mut requests = Vec::new();
+        for body in ["review round one", "review round two"] {
+            requests.push(
+                collaboration
+                    .create(
+                        from.clone(),
+                        to.clone(),
+                        NewRequest {
+                            user_authorized: false,
+                            task_contract: None,
+                            supersedes_request_id: None,
+                            dispatch_id: None,
+                            source_node_id: None,
+                            delegation_parent: None,
+                            human_action: None,
+                            initiator: None,
+                            kind: RequestKind::Review,
+                            body: body.to_string(),
+                            expects_reply: true,
+                            notify: None,
+                            work_mode: WorkMode::ReadOnly,
+                            thread_id: Some("thread-eng-7345".to_string()),
+                            parent_request_id: None,
+                            workspace_id: Some("webapp".to_string()),
+                            work_id: Some("ENG-7345".to_string()),
+                            run_id: Some("run-1".to_string()),
+                            paths: vec!["/private/review.patch".to_string()],
+                            artifacts: vec!["artifact-request-secret".to_string()],
+                            links: vec!["https://private.invalid/review".to_string()],
+                            air_artifacts: Vec::new(),
+                            withdraw_reply_wakes: Vec::new(),
+                            recipient_slot: None,
+                        },
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        requests.push(
+            collaboration
+                .create(
+                    from,
+                    to,
+                    NewRequest {
+                        user_authorized: false,
+                        task_contract: None,
+                        supersedes_request_id: None,
+                        dispatch_id: None,
+                        source_node_id: None,
+                        delegation_parent: None,
+                        human_action: None,
+                        initiator: None,
+                        kind: RequestKind::Notice,
+                        body: "finalize".to_string(),
+                        expects_reply: false,
+                        notify: None,
+                        work_mode: WorkMode::ReadOnly,
+                        thread_id: Some("thread-eng-7345".to_string()),
+                        parent_request_id: None,
+                        workspace_id: Some("webapp".to_string()),
+                        work_id: Some("ENG-7345".to_string()),
+                        run_id: Some("run-1".to_string()),
+                        paths: Vec::new(),
+                        artifacts: Vec::new(),
+                        links: Vec::new(),
+                        air_artifacts: Vec::new(),
+                        withdraw_reply_wakes: Vec::new(),
+                        recipient_slot: None,
+                    },
+                )
+                .await
+                .unwrap(),
+        );
+        requests
+    }
+
+    async fn seed_agent(state: &AppState, session_id: &str, pane: &str) {
+        state
+            .store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::Codex,
+                    session_id: session_id.into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+    }
+
+    fn state_from(cfg: DashboardConfig) -> AppState {
+        AppState::new(
+            Store::shared(),
+            Arc::new(cfg),
+            Arc::new(PaneCache::new(Duration::from_secs(60))),
+            crate::session::PtySessionBackend::shared(),
+        )
+    }
+
+    /// Resolve a config the way the daemon does and return the `(state,
+    /// token)` pair so tests exercise the real config path.
+    fn resolved_state(toml: crate::config::DashboardTomlConfig) -> (AppState, Option<String>) {
+        let cfg = DashboardConfig::resolve(&toml, &crate::dashboard::DashboardOverrides::default())
+            .unwrap();
+        let token = cfg.token.clone();
+        (state_from(cfg), token)
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    #[tokio::test]
+    async fn health_endpoint_returns_ok_json() {
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["protocol"], i64::from(PROTOCOL_VERSION));
+        assert!(v["version"].is_string());
+    }
+
+    fn fleet_host(alias: &str, environment: &str) -> crate::fleet::FleetHostSnapshot {
+        crate::fleet::FleetHostSnapshot {
+            alias: alias.into(),
+            local: false,
+            ssh_target: alias.into(),
+            labels: BTreeMap::from([("environment".into(), environment.into())]),
+            annotations: BTreeMap::new(),
+            mode: crate::fleet::HostAccessMode::Observe,
+            state: crate::fleet::FleetHostState::Online,
+            node_id: None,
+            hostname: None,
+            os: None,
+            arch: None,
+            tend_version: None,
+            protocol: None,
+            capabilities: Vec::new(),
+            daemon_generation: None,
+            boot_id: None,
+            latency_ms: None,
+            last_seen_at: None,
+            received_at: None,
+            error: None,
+            remote: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn fleet_endpoint_reads_cache_and_applies_label_selector() {
+        let store = Arc::new(crate::fleet::FleetStore::new());
+        store.upsert_host(fleet_host("dev", "development")).await;
+        store.upsert_host(fleet_host("prod", "production")).await;
+        let (runtime, _commands) = FleetRuntime::new(store);
+        let app = router(fresh_state().with_fleet(Some(runtime)));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet?selector=environment%3Dproduction")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["hosts"].as_array().unwrap().len(), 1);
+        assert_eq!(body["hosts"][0]["alias"], "prod");
+    }
+
+    #[tokio::test]
+    async fn fleet_command_endpoint_is_pat_gated_and_dispatches() {
+        let (runtime, mut commands) = FleetRuntime::new(Arc::new(crate::fleet::FleetStore::new()));
+        let app = router(state_with_token("secret").with_fleet(Some(runtime)));
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/dev/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"operation":{"kind":"refresh"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let responder = tokio::spawn(async move {
+            let command = commands.recv().await.unwrap();
+            assert_eq!(command.host, "dev");
+            assert!(matches!(command.operation, FleetOperation::Refresh));
+            command
+                .reply
+                .send(Ok(crate::fleet::FleetCommandResult::accepted("refreshed")))
+                .unwrap();
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/fleet/dev/command")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer secret")
+                    .body(Body::from(r#"{"operation":{"kind":"refresh"}}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["message"], "refreshed");
+        responder.await.unwrap();
+    }
+
+    #[test]
+    fn dashboard_access_log_never_contains_bearer_token() {
+        let secret = "do-not-log-this-token";
+        let mut config = DashboardConfig::loopback_default();
+        config.token = Some(secret.into());
+        let local: SocketAddr = "127.0.0.1:7878".parse().unwrap();
+
+        let (url, auth_enabled) = access_log_details(&config, local);
+
+        assert!(auth_enabled);
+        assert_eq!(url, "http://127.0.0.1:7878/");
+        assert!(!url.contains(secret));
+        assert!(!url.contains("#token="));
+    }
+
+    #[tokio::test]
+    async fn agents_endpoint_returns_store_snapshot() {
+        let state = fresh_state();
+        // Seed the store with two agents.
+        for (kind, sid, pane) in [
+            (AgentKind::ClaudeCode, "s1", "%1"),
+            (AgentKind::Codex, "s2", "%2"),
+        ] {
+            state
+                .store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        tmux_socket: None,
+                        kind,
+                        session_id: sid.into(),
+                        surface: None,
+                        pane: Some(pane.into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let agents = v["agents"].as_array().expect("agents array");
+        assert_eq!(agents.len(), 2);
+        let kinds: Vec<&str> = agents.iter().map(|a| a["kind"].as_str().unwrap()).collect();
+        assert!(kinds.contains(&"claude_code"));
+        assert!(kinds.contains(&"codex"));
+    }
+
+    #[tokio::test]
+    async fn panes_endpoint_returns_well_formed_json_shape() {
+        // We don't necessarily have tmux running in the test env; the
+        // contract is that we always return a well-formed JSON object
+        // with `panes`, `errors`, and `fetched_at` keys regardless.
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/panes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v["panes"].is_array());
+        assert!(v["errors"].is_array());
+        assert!(v["fetched_at"].is_string());
+    }
+
+    /// On a herdr host `/api/panes` must source rows from the herdr backend,
+    /// not the (empty-on-herdr) tmux scanner. We stand up a minimal herdr
+    /// mock socket, point a real `HerdrBackend` at it, and assert the pane
+    /// surfaces with the herdr synthetic socket identity.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn panes_endpoint_sources_from_herdr_backend_when_host_is_herdr() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        // Answer pane.list (+ per-pane pane.process_info) on a detached
+        // accept loop; the same newline-JSON shape herdr.rs tests use.
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.is_empty() {
+                    continue;
+                }
+                let req: Value = serde_json::from_str(&line).unwrap();
+                let id = req.get("id").and_then(Value::as_str).unwrap_or("");
+                let method = req.get("method").and_then(Value::as_str).unwrap_or("");
+                let result = match method {
+                    "pane.list" => json!({
+                        "type": "pane_list",
+                        "panes": [{
+                            "pane_id": "p1", "terminal_id": "t1",
+                            "workspace_id": "ws1", "tab_id": "tab1",
+                            "focused": true, "agent_status": "idle", "revision": 1,
+                            "cwd": "/home/u/proj", "title": "editor",
+                            "terminal_title": "raw",
+                        }],
+                    }),
+                    "pane.process_info" => json!({
+                        "type": "pane_process_info",
+                        "process_info": {
+                            "pane_id": "p1", "shell_pid": 4242, "tty": "/dev/pts/3",
+                            "foreground_processes": [
+                                { "pid": 4242, "name": "zsh" },
+                                { "pid": 5001, "name": "vim" },
+                            ],
+                        },
+                    }),
+                    _ => json!({ "type": "ok" }),
+                };
+                let mut out =
+                    serde_json::to_string(&json!({ "id": id, "result": result })).unwrap();
+                out.push('\n');
+                let _ = stream.write_all(out.as_bytes());
+            }
+        });
+
+        let backend: SharedBackend = Arc::new(
+            crate::backend::herdr::HerdrBackend::with_socket_path(socket_path),
+        );
+        let state = fresh_state().with_backend(backend);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/panes")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        let panes = v["panes"].as_array().expect("panes array");
+        // The herdr branch now merges the tmux scan too, so any stray tmux
+        // server on the test host may add panes — find the herdr pane rather
+        // than asserting an exact count.
+        let herdr = panes
+            .iter()
+            .find(|p| p["pane_id"] == "herdr:p1")
+            .unwrap_or_else(|| panic!("herdr pane must surface: {v:?}"));
+        assert_eq!(herdr["session"], "ws1");
+        assert_eq!(herdr["window_index"], "tab1");
+        assert_eq!(herdr["socket"], "herdr");
+        assert_eq!(herdr["current_command"], "vim");
+    }
+
+    /// The herdr pane-scan path merges rather than replaces: a herdr backend's
+    /// panes are appended onto whatever the tmux scan returned, and the tmux
+    /// side's per-socket errors survive. Exercised on the pure merge helper so
+    /// the tmux side can be fabricated (a real tmux server isn't needed).
+    #[test]
+    fn merge_pane_scans_appends_herdr_onto_tmux_and_keeps_errors() {
+        use crate::tmux::scanner::{PaneSummary, ScanError, ScanResult};
+        use std::path::PathBuf;
+
+        let tmux_pane = PaneSummary {
+            host: HostKind::Tmux,
+            pane_id: "%1".into(),
+            session_id: "$1".into(),
+            session: "main".into(),
+            window_id: "@1".into(),
+            window_name: "main".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "zsh".into(),
+            title: String::new(),
+            current_path: "/tmp/project".into(),
+            socket: PathBuf::from("default"),
+            tend: TendPaneMetadata::default(),
+            attach_command: "tmux attach".into(),
+        };
+        let tmux = ScanResult {
+            panes: vec![tmux_pane],
+            errors: vec![ScanError {
+                socket: PathBuf::from("wedged"),
+                message: "timed out".into(),
+            }],
+            fetched_at: OffsetDateTime::now_utc(),
+        };
+        let herdr = scanner::herdr_scan_result(vec![crate::tmux::PaneInfo {
+            session_group: None,
+            agent_program: None,
+            worker_launch_id: None,
+            agent_role: None,
+            agent_alias: None,
+            workspace_id: None,
+            work_id: None,
+            socket: None,
+            pane_id: "herdr:p1".into(),
+            session_id: "ws1".into(),
+            session: "ws1".into(),
+            window_id: "tab1".into(),
+            window_name: "tab1".into(),
+            window_index: "tab1".into(),
+            pane_index: "p1".into(),
+            tty: String::new(),
+            current_command: "vim".into(),
+            title: String::new(),
+            pane_pid: 0,
+            current_path: String::new(),
+        }]);
+
+        let merged = merge_pane_scans(tmux, herdr);
+        let ids: Vec<&str> = merged.panes.iter().map(|p| p.pane_id.as_str()).collect();
+        assert_eq!(ids, ["%1", "herdr:p1"], "tmux first, herdr appended");
+        assert_eq!(merged.errors.len(), 1, "tmux scan errors preserved");
+        assert_eq!(merged.errors[0].socket, PathBuf::from("wedged"));
+    }
+
+    #[test]
+    fn rmux_dashboard_rows_preserve_full_endpoint() {
+        let scan = backend_scan_result(
+            HostKind::Rmux,
+            vec![(
+                crate::tmux::PaneInfo {
+                    session_group: None,
+                    agent_program: None,
+                    worker_launch_id: None,
+                    agent_role: None,
+                    agent_alias: None,
+                    workspace_id: None,
+                    work_id: None,
+                    socket: Some("/tmp/rmux-user/default".into()),
+                    pane_id: "rmux:%4".into(),
+                    session_id: "$1".into(),
+                    session: "work".into(),
+                    window_id: "@2".into(),
+                    window_name: "editor".into(),
+                    window_index: "0".into(),
+                    pane_index: "0".into(),
+                    tty: "/dev/pts/4".into(),
+                    current_command: "zsh".into(),
+                    title: "work".into(),
+                    pane_pid: 42,
+                    current_path: "/tmp/project".into(),
+                },
+                TendPaneMetadata::default(),
+            )],
+        );
+        assert_eq!(scan.panes.len(), 1);
+        assert_eq!(scan.panes[0].pane_id, "rmux:%4");
+        assert_eq!(
+            scan.panes[0].socket,
+            PathBuf::from("/tmp/rmux-user/default")
+        );
+        assert!(scan.panes[0].attach_command.is_empty());
+    }
+
+    #[test]
+    fn non_tmux_rows_become_a_work_only_by_their_managed_work_mark() {
+        let pane = |id: &str, window: &str| crate::tmux::PaneInfo {
+            session_group: None,
+            agent_program: Some("codex".into()),
+            worker_launch_id: None,
+            agent_role: Some("reviewer".into()),
+            agent_alias: None,
+            // An agent stamped for ENG-1: the ids alone must not make its
+            // window a Work.
+            workspace_id: Some("webapp".into()),
+            work_id: Some("ENG-1".into()),
+            socket: Some("/tmp/rmux-user/default".into()),
+            pane_id: id.into(),
+            session_id: "$1".into(),
+            session: "webapp".into(),
+            window_id: window.into(),
+            window_name: "ENG-1".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: "/dev/pts/4".into(),
+            current_command: "codex".into(),
+            title: "codex".into(),
+            pane_pid: 42,
+            current_path: "/tmp/project".into(),
+        };
+        let marked = TendPaneMetadata {
+            managed_work: true,
+            workspace_id: Some("webapp".into()),
+            work_id: Some("ENG-1".into()),
+            external_source: Some("linear".into()),
+            external_key: Some("ENG-1".into()),
+            ..TendPaneMetadata::default()
+        };
+        let unmarked = TendPaneMetadata {
+            workspace_id: Some("webapp".into()),
+            work_id: Some("ENG-1".into()),
+            ..TendPaneMetadata::default()
+        };
+        let scan = backend_scan_result(
+            HostKind::Rmux,
+            vec![
+                (pane("rmux:%4", "@2"), marked),
+                (pane("rmux:%5", "@3"), unmarked),
+            ],
+        );
+        let snapshot = work::build_snapshot(&scan.panes, &[], &[], OffsetDateTime::now_utc());
+        let works: Vec<_> = snapshot
+            .works
+            .iter()
+            .map(|work| (work.identity.work_id.as_str(), work.runs.len()))
+            .collect();
+        assert_eq!(
+            works,
+            [("ENG-1", 1)],
+            "only the marked window is the Work's Run"
+        );
+        // The issue mark travels too; the daemon persists it from here.
+        assert!(scan
+            .panes
+            .iter()
+            .any(|pane| work::external_item_for_pane(pane, scan.fetched_at).is_some()));
+        assert_eq!(snapshot.unlinked_executions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dashboard_scan_includes_non_primary_rmux_backend() {
+        let rmux: SharedBackend = Arc::new(InventoryBackend {
+            kind: HostKind::Rmux,
+            panes: vec![crate::tmux::PaneInfo {
+                session_group: None,
+                agent_program: None,
+                worker_launch_id: None,
+                agent_role: None,
+                agent_alias: None,
+                workspace_id: None,
+                work_id: None,
+                socket: Some("/tmp/rmux-secondary/default".into()),
+                pane_id: "rmux:%8".into(),
+                session_id: "$2".into(),
+                session: "secondary".into(),
+                window_id: "@3".into(),
+                window_name: "shell".into(),
+                window_index: "0".into(),
+                pane_index: "0".into(),
+                tty: "/dev/pts/8".into(),
+                current_command: "zsh".into(),
+                title: "secondary".into(),
+                pane_pid: 88,
+                current_path: "/tmp/project".into(),
+            }],
+        });
+
+        let scan = multi_host_pane_scan(Arc::new(vec![rmux.clone()])).await;
+        let pane = scan
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == "rmux:%8")
+            .expect("secondary rmux backend should contribute to dashboard scan");
+        assert_eq!(pane.socket, PathBuf::from("/tmp/rmux-secondary/default"));
+
+        let state = fresh_state().with_backend(rmux.clone());
+        let endpoint = match control_socket(&state, &rmux, "rmux:%8", None).await {
+            Ok(endpoint) => endpoint,
+            Err(failure) => panic!(
+                "untracked pane should resolve from the dashboard scan: {}",
+                failure.message
+            ),
+        };
+        assert_eq!(endpoint.as_deref(), Some("/tmp/rmux-secondary/default"));
+    }
+
+    #[tokio::test]
+    async fn timeline_endpoint_returns_well_formed_json_shape() {
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?since=24h")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert!(v["generated_at"].is_string());
+        assert!(v["window_started_at"].is_string());
+        assert!(v["window_ended_at"].is_string());
+        assert!(v["lanes"].is_array());
+        assert!(v["active_sessions"].is_array());
+        assert!(v["totals"]["active_secs"].is_number());
+        assert!(v["notes"].is_array());
+    }
+
+    #[tokio::test]
+    async fn timeline_summary_endpoint_omits_raw_lanes_and_returns_aggregates() {
+        let app = router(fresh_state());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?since=24h&view=summary&timezone_offset_minutes=540")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["lanes"].as_array().map(Vec::len), Some(0));
+        assert_eq!(v["summary"]["version"], 1);
+        assert!(v["summary"]["sessions"].is_array());
+        assert!(v["summary"]["days"].is_array());
+        assert_eq!(v["summary"]["sources"].as_array().map(Vec::len), Some(3));
+        assert!(v["summary"]["human_presence_secs"].is_number());
+
+        let other_range = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?since=7d&view=summary&timezone_offset_minutes=540")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(other_range.status(), StatusCode::OK);
+
+        let cached = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?since=24h&view=summary&timezone_offset_minutes=540")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cached.status(), StatusCode::OK);
+        let cached = body_json(cached).await;
+        assert_eq!(cached["generated_at"], v["generated_at"]);
+    }
+
+    #[tokio::test]
+    async fn timeline_summary_rejects_invalid_timezone_offset() {
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/timeline?view=summary&timezone_offset_minutes=99999")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_filters_and_uses_keyset_pagination() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        seed_collaboration_requests(&collaboration).await;
+        let app = router(state_with_token("s3cret").with_collaboration(Arc::clone(&collaboration)));
+        let first = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/api/collaboration?workspace=webapp&work=ENG-7345&thread=thread-eng-7345&kind=review&status=queued&limit=1",
+                    )
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = body_json(first).await;
+        assert_eq!(first["details_included"], true);
+        assert_eq!(first["pagination"]["total"], 2);
+        assert_eq!(first["pagination"]["limit"], 1);
+        assert_eq!(first["pagination"]["has_more"], true);
+        assert_eq!(first["requests"].as_array().map(Vec::len), Some(1));
+        assert!(first["requests"][0]["body"].is_string());
+        assert!(first["requests"][0]["paths"].is_array());
+        let cursor = first["pagination"]["next_cursor"]
+            .as_str()
+            .expect("first page should return a cursor");
+
+        let second = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/collaboration?work=ENG-7345&kind=review&limit=1&cursor={cursor}"
+                    ))
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(second.status(), StatusCode::OK);
+        let second = body_json(second).await;
+        assert_eq!(second["pagination"]["total"], 2);
+        assert_eq!(second["pagination"]["has_more"], false);
+        assert_eq!(second["requests"].as_array().map(Vec::len), Some(1));
+        assert_ne!(second["requests"][0]["id"], first["requests"][0]["id"]);
+
+        let future = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?since=2099-01-01T00%3A00%3A00Z")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(future.status(), StatusCode::OK);
+        let future = body_json(future).await;
+        assert_eq!(future["pagination"]["total"], 0);
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_accepts_exact_json_room_filter() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        seed_collaboration_requests(&collaboration).await;
+        let room = serde_json::to_string(&RoomId {
+            host: "tmux".to_string(),
+            socket: Some("default".to_string()),
+            window_id: "@7".to_string(),
+        })
+        .unwrap();
+        let query = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("room", &room)
+            .append_pair("limit", "10")
+            .finish();
+        let app = router(state_with_token("s3cret").with_collaboration(Arc::clone(&collaboration)));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/collaboration?{query}"))
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = body_json(response).await;
+        assert_eq!(response["pagination"]["total"], 3);
+    }
+
+    #[tokio::test]
+    async fn history_search_never_exposes_private_body_matches_to_public_readers() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        let requests = seed_collaboration_requests(&collaboration).await;
+        let app = router(public_read_state("secret").with_collaboration(collaboration));
+        for (token, total) in [(None, 0), (Some("invalid"), 0), (Some("secret"), 1)] {
+            let mut builder = Request::builder().uri("/api/collaboration?q=round%20one&limit=1");
+            if let Some(token) = token {
+                builder = builder.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            let response = app
+                .clone()
+                .oneshot(builder.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(body_json(response).await["pagination"]["total"], total);
+        }
+        let exact = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/collaboration?id={}", requests[0].id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(body_json(exact).await["pagination"]["total"], 1);
+        let reversed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?since=2026-10-14T00:00:00Z&until=2026-10-13T00:00:00Z")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reversed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn public_collaboration_history_redacts_message_details_without_pat() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        let requests = seed_collaboration_requests(&collaboration).await;
+        let recipient = collaboration_participant("%2", "reviewer-session", "@7");
+        collaboration
+            .update_request(
+                &requests[0].from,
+                &requests[0].id,
+                "progress-secret".to_string(),
+            )
+            .await
+            .unwrap();
+        collaboration
+            .reply(
+                &recipient,
+                &requests[0].id,
+                RequestStatus::Completed,
+                "approved".to_string(),
+                vec!["artifact-secret".to_string()],
+                Vec::new(),
+            )
+            .await
+            .unwrap();
+        let app =
+            router(public_read_state("s3cret").with_collaboration(Arc::clone(&collaboration)));
+
+        let public = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public.status(), StatusCode::OK);
+        let public = body_json(public).await;
+        assert_eq!(public["details_included"], false);
+        let request = &public["requests"][0];
+        assert!(request.get("body").is_none());
+        assert!(request.get("paths").is_none());
+        assert!(request["updates"][0].get("body").is_none());
+        assert_eq!(request["updates"][0]["sequence"], 1);
+        assert!(request["reply"].get("body").is_none());
+        assert!(request["reply"].get("artifacts").is_none());
+
+        let public_with_pat = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(public_with_pat.status(), StatusCode::OK);
+        assert_eq!(
+            public_with_pat.headers()[header::CACHE_CONTROL],
+            "private, no-store"
+        );
+        assert_eq!(
+            public_with_pat.headers()[header::VARY],
+            "Authorization, Cookie"
+        );
+        let public_with_pat = body_json(public_with_pat).await;
+        assert_eq!(public_with_pat["details_included"], true);
+        assert_eq!(
+            public_with_pat["requests"][0]["updates"][0]["body"],
+            "progress-secret"
+        );
+        assert!(public_with_pat["requests"][0]["body"].is_string());
+        assert_eq!(public_with_pat["requests"][0]["reply"]["body"], "approved");
+        assert_eq!(
+            public_with_pat["requests"][0]["reply"]["artifacts"][0],
+            "artifact-secret"
+        );
+
+        let invalid_pat = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?status=completed")
+                    .header(header::AUTHORIZATION, "Bearer invalid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let invalid_pat = body_json(invalid_pat).await;
+        assert_eq!(invalid_pat["details_included"], false);
+        assert!(invalid_pat["requests"][0].get("body").is_none());
+        assert!(invalid_pat["requests"][0]["updates"][0]
+            .get("body")
+            .is_none());
+        assert!(invalid_pat["requests"][0]["reply"].get("body").is_none());
+    }
+
+    #[tokio::test]
+    async fn collaboration_details_require_operator_enabled_auth_mode() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions::default());
+        seed_collaboration_requests(&collaboration).await;
+
+        let token_app =
+            router(state_with_token("s3cret").with_collaboration(Arc::clone(&collaboration)));
+        let unauthorized = token_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let mut config = DashboardConfig::loopback_default();
+        config.auth = DashboardAuthMode::None;
+        config.token = None;
+        let none_app = router(state_from(config).with_collaboration(collaboration));
+        let summary = none_app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration?limit=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(summary.status(), StatusCode::OK);
+        let summary = body_json(summary).await;
+        assert_eq!(summary["details_included"], false);
+        assert!(summary["requests"][0].get("body").is_none());
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_reports_disabled_store() {
+        let collaboration = CollaborationStore::in_memory(CollaborationOptions {
+            enabled: false,
+            ..CollaborationOptions::default()
+        });
+        let app = router(fresh_state().with_collaboration(collaboration));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/collaboration")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn collaboration_endpoint_rejects_invalid_filters() {
+        let app = router(fresh_state());
+        for uri in [
+            "/api/collaboration?limit=0",
+            "/api/collaboration?limit=501",
+            "/api/collaboration?kind=unknown",
+            "/api/collaboration?status=unknown",
+            "/api/collaboration?room=not-json",
+            "/api/collaboration?cursor=not-a-cursor",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_passes_with_correct_bearer() {
+        let app = router(state_with_token("s3cret"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_missing_header_when_token_set() {
+        let app = router(state_with_token("s3cret"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_rejects_wrong_bearer() {
+        let app = router(state_with_token("s3cret"));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::AUTHORIZATION, "Bearer nope")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn auth_middleware_passes_through_when_no_token_configured() {
+        // Only auth = "none" leaves the token unset; such a state passes.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = crate::config::DashboardAuthMode::None;
+        cfg.token = None;
+        let app = router(state_from(cfg));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn public_read_allows_anonymous_reads_and_reports_locked_control() {
+        let app = router(public_read_state("edit-pat"));
+        let agents = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(agents.status(), StatusCode::OK);
+
+        let access = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/access")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(access.status(), StatusCode::OK);
+        let access = body_json(access).await;
+        assert_eq!(access["mode"], "public_read");
+        assert_eq!(access["read_requires_token"], false);
+        assert_eq!(access["write_available"], true);
+        assert_eq!(access["write_authorized"], false);
+
+        let unlocked = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/access")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let unlocked = body_json(unlocked).await;
+        assert_eq!(unlocked["write_authorized"], true);
+    }
+
+    #[tokio::test]
+    async fn public_read_mutations_require_the_control_pat() {
+        let app = router(public_read_state("edit-pat"));
+        let locked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminal-sessions/missing/terminate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+
+        let unlocked = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminal-sessions/missing/terminate")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unlocked.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn public_read_pat_can_send_and_submit_a_pane_prompt() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes: Vec::new(),
+        });
+        let app = router(public_read_state("edit-pat").with_backend(backend));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/panes/herdr%3Ap1/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"text":"review this","submit":true}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                ("herdr:p1".to_string(), "review this".to_string()),
+                ("herdr:p1".to_string(), "\r".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn work_metadata_requires_pat_and_persists_for_the_exact_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("dashboard-work.json");
+        let backend: SharedBackend = Arc::new(InventoryBackend {
+            kind: HostKind::Herdr,
+            panes: vec![test_pane(
+                "herdr:p1",
+                "session-1",
+                "tend",
+                "window-1",
+                "ENG-101",
+            )],
+        });
+        let state = public_read_state("edit-pat")
+            .with_backend(backend)
+            .with_work_store_path(Some(path.clone()));
+        let app = router(state);
+        let body = r#"{
+            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+            "metadata":{"title":"Repair auth","goal":"No stale tokens","next_action":"Run tests","stage":"review"}
+        }"#;
+
+        let locked = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/work-metadata")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(locked.status(), StatusCode::UNAUTHORIZED);
+
+        let saved = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/work-metadata")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(saved.status(), StatusCode::OK);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/work-metadata")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let response = body_json(response).await;
+        assert_eq!(response["works"][0]["metadata"]["title"], "Repair auth");
+        assert_eq!(response["works"][0]["metadata"]["stage"], "review");
+
+        let snapshot = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/works")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let snapshot = body_json(snapshot).await;
+        assert_eq!(snapshot["schema_version"], work::WORK_SCHEMA_VERSION);
+        // Select the work this test created rather than asserting a global
+        // count. The pane scan always includes the host's own tmux server,
+        // so a machine with any tend-managed work of its own would fail an
+        // assertion about how many works exist — a real failure this test
+        // hit once the developer's box had one.
+        let mine = snapshot["works"]
+            .as_array()
+            .expect("works array")
+            .iter()
+            .find(|work| work["title"] == "Repair auth")
+            .expect("the work this test annotated is present");
+        assert_eq!(mine["stage"], "review");
+        assert_eq!(mine["runs"].as_array().unwrap().len(), 1);
+
+        // Reload from disk and look for this test's own record. Counting is
+        // not safe here: `GET /api/works` upserts an external item for every
+        // pane it discovers, and the scan includes the host's real tmux — so
+        // the file legitimately holds a row per work running on the machine.
+        let reloaded = WorkStore::load(Some(path));
+        assert!(
+            reloaded
+                .records()
+                .iter()
+                .any(|record| record.metadata.title.as_deref() == Some("Repair auth")),
+            "the annotated work survived the round trip"
+        );
+    }
+
+    #[tokio::test]
+    async fn work_mutations_refuse_ambiguous_logical_and_execution_selectors() {
+        let app = router(public_read_state("edit-pat"));
+        let metadata = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/api/work-metadata")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "identity":{"workspace_id":"tend","work_id":"ENG-101"},
+                            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+                            "metadata":{"stage":"review"}
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(metadata.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(metadata).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exactly one"));
+
+        let prompt = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "identity":{"workspace_id":"tend","work_id":"ENG-101"},
+                            "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},
+                            "text":"report status"
+                        }"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(prompt.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(prompt).await["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("exactly one"));
+    }
+
+    #[tokio::test]
+    async fn starting_work_needs_its_own_grant_beyond_the_control_token() {
+        // A valid control token is not enough: every other write route steers
+        // a process the operator already started, while this one starts new
+        // ones with permissions bypassed.
+        let state = public_read_state("edit-pat");
+        assert!(!state.config.allow_work_start, "default must be off");
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/up")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"work":"eng-1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Not 403: the browser reads 401/403 as a bad token and flips the
+        // whole dashboard to read-only, which would be a lie here.
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = body_json(response).await;
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("allow_work_start"),
+            "the refusal should name the switch that enables it: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn starting_work_still_refuses_without_the_control_token() {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::PublicRead;
+        cfg.token = Some("edit-pat".into());
+        cfg.allow_work_start = true;
+        let response = router(state_from(cfg))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/up")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"work":"eng-1234"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_prompt_expands_the_same_registered_skill_the_cli_does() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let panes = vec![test_pane(
+            "herdr:p1",
+            "session-1",
+            "tend",
+            "window-1",
+            "ENG-101",
+        )];
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes,
+        });
+        let state = public_read_state("edit-pat")
+            .with_backend(backend)
+            .with_message_skills(BTreeMap::from([(
+                "review-plan".to_string(),
+                "Run the peer review workflow.".to_string(),
+            )]));
+        seed_agent(&state, "agent-1", "herdr:p1").await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"skill":"/review-plan","body":"check ENG-101","context":"tests pass","submit":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            sent.lock().unwrap()[0].1,
+            "Run the peer review workflow.\n\ncheck ENG-101\n\nInvocation context:\ntests pass"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_prompt_with_nothing_to_say_is_refused() {
+        let response = router(public_read_state("edit-pat"))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"s","window_id":"w"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn work_prompt_targets_only_live_agents_in_the_selected_work() {
+        let sent = Arc::new(Mutex::new(Vec::new()));
+        let panes = vec![
+            test_pane("herdr:p1", "session-1", "tend", "window-1", "ENG-101"),
+            test_pane("herdr:p2", "session-1", "tend", "window-1", "ENG-101"),
+            test_pane("herdr:p3", "session-1", "tend", "window-2", "ENG-102"),
+            test_pane("herdr:shell", "session-1", "tend", "window-1", "ENG-101"),
+        ];
+        let backend: SharedBackend = Arc::new(RecordingControlBackend {
+            sent: sent.clone(),
+            panes,
+        });
+        let state = public_read_state("edit-pat").with_backend(backend);
+        seed_agent(&state, "agent-1", "herdr:p1").await;
+        seed_agent(&state, "agent-2", "herdr:p2").await;
+        seed_agent(&state, "agent-3", "herdr:p3").await;
+
+        let response = router(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/work-control/prompt")
+                    .header(header::AUTHORIZATION, "Bearer edit-pat")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{"key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},"text":"report status","submit":false}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = body_json(response).await;
+        assert_eq!(response["attempted"], 2);
+        assert_eq!(response["succeeded"], 2);
+        assert_eq!(
+            *sent.lock().unwrap(),
+            vec![
+                ("herdr:p1".to_string(), "report status".to_string()),
+                ("herdr:p2".to_string(), "report status".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_none_is_read_only_not_anonymously_writable() {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        cfg.token = None;
+        let app = router(state_from(cfg));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/terminal-sessions/missing/terminate")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// A persisted explicit token (the path used by `tend init`) gates the API.
+    #[tokio::test]
+    async fn enabled_dashboard_with_explicit_token_requires_it() {
+        let (state, token) = resolved_state(crate::config::DashboardTomlConfig {
+            enabled: Some(true),
+            token: Some("persisted-token".into()),
+            ..Default::default()
+        });
+        let token = token.expect("explicit token must be preserved");
+        let app = router(state);
+
+        // No credentials → rejected.
+        let unauthed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthed.status(), StatusCode::UNAUTHORIZED);
+
+        // Correct configured token → allowed.
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+    }
+
+    /// Explicit opt-out: `auth = "none"` runs the API unauthenticated
+    /// even when enabled.
+    #[tokio::test]
+    async fn enabled_dashboard_auth_none_opts_out() {
+        let (state, token) = resolved_state(crate::config::DashboardTomlConfig {
+            enabled: Some(true),
+            auth: Some(crate::config::DashboardAuthMode::None),
+            ..Default::default()
+        });
+        assert!(token.is_none(), "auth = none must leave the token unset");
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/agents")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// DNS-rebinding guard: a non-loopback `Host` header is rejected with
+    /// 403 on a loopback bind, before any handler runs.
+    #[tokio::test]
+    async fn host_guard_rejects_non_loopback_host() {
+        let app = router(fresh_state());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::HOST, "attacker.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Loopback `Host` values (with and without port, IPv4 and IPv6) are
+    /// allowed through the guard.
+    #[tokio::test]
+    async fn host_guard_allows_loopback_hosts() {
+        for host in ["127.0.0.1:7878", "localhost", "[::1]:7878", "127.0.0.1"] {
+            let app = router(fresh_state());
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/health")
+                        .header(header::HOST, host)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK, "host {host:?} must pass");
+        }
+    }
+
+    /// The guard is a no-op for a deliberately public bind — an operator
+    /// who set `allow_public` is reached via a real hostname.
+    #[tokio::test]
+    async fn host_guard_skipped_for_public_bind() {
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.bind = "0.0.0.0:7878".parse().unwrap();
+        cfg.auth = crate::config::DashboardAuthMode::None;
+        cfg.token = None;
+        let app = router(state_from(cfg));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/health")
+                    .header(header::HOST, "dash.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn host_is_loopback_classifies_correctly() {
+        let v4 = "127.0.0.1".parse().unwrap();
+        // Absent header is allowed (non-browser clients).
+        assert!(host_is_loopback(None, v4));
+        assert!(host_is_loopback(Some("localhost"), v4));
+        assert!(host_is_loopback(Some("LocalHost:7878"), v4));
+        assert!(host_is_loopback(Some("127.0.0.1:7878"), v4));
+        assert!(host_is_loopback(Some("127.0.0.5"), v4));
+        assert!(host_is_loopback(Some("[::1]:7878"), v4));
+        assert!(!host_is_loopback(Some("attacker.example.com"), v4));
+        assert!(!host_is_loopback(Some("10.0.0.1:7878"), v4));
+        // A non-loopback bind IP is honoured as an allowed Host literal.
+        let public: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(host_is_loopback(Some("203.0.113.7:7878"), public));
+    }
+
+    #[test]
+    fn strip_host_port_variants() {
+        assert_eq!(strip_host_port("127.0.0.1:7878"), "127.0.0.1");
+        assert_eq!(strip_host_port("localhost"), "localhost");
+        assert_eq!(strip_host_port("[::1]:7878"), "::1");
+        assert_eq!(strip_host_port("[::1]"), "::1");
+    }
+
+    /// Defense-in-depth: the traced request URI must never carry the
+    /// token, even if a legacy `?token=` slips through.
+    #[test]
+    fn scrub_token_from_uri_redacts_token_param() {
+        let uri: axum::http::Uri = "/api/agents?token=s3cret&since=24h".parse().unwrap();
+        let scrubbed = scrub_token_from_uri(&uri);
+        assert!(!scrubbed.contains("s3cret"), "scrubbed: {scrubbed}");
+        assert!(scrubbed.contains("token=REDACTED"), "scrubbed: {scrubbed}");
+        assert!(scrubbed.contains("since=24h"), "scrubbed: {scrubbed}");
+
+        // No query → untouched path.
+        let encoded: axum::http::Uri =
+            "/share/auth/callback?co%64e=secret&sta%74e=secret&to%6ben=secret"
+                .parse()
+                .unwrap();
+        assert!(!scrub_token_from_uri(&encoded).contains("secret"));
+        let plain: axum::http::Uri = "/api/health".parse().unwrap();
+        assert_eq!(scrub_token_from_uri(&plain), "/api/health");
+    }
+
+    /// Read up to `limit_bytes` of SSE body or until `dur` elapses,
+    /// whichever comes first. SSE streams never EOF on their own under
+    /// normal operation; we use the timeout as the read budget.
+    async fn collect_sse(resp: Response, dur: Duration, limit_bytes: usize) -> String {
+        let mut body = resp.into_body();
+        let mut bytes = Vec::new();
+        let deadline = tokio::time::sleep(dur);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                () = &mut deadline => break,
+                frame = body.frame() => {
+                    match frame {
+                        Some(Ok(f)) => {
+                            if let Ok(data) = f.into_data() {
+                                bytes.extend_from_slice(&data);
+                                if bytes.len() >= limit_bytes { break; }
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_emits_initial_snapshot() {
+        let state = fresh_state();
+        state
+            .store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "s1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+        assert!(body.contains("event: snapshot"), "body: {body:?}");
+        assert!(body.contains("\"agents\""), "body: {body:?}");
+        assert!(body.contains("claude_code"), "body: {body:?}");
+    }
+
+    /// End-to-end: hit `/api/events` via `Router::oneshot` and verify the
+    /// FIRST SSE event emitted is `event: snapshot` with a JSON payload that
+    /// matches `Store::snapshot()` at the time of subscription. Complements
+    /// `sse_endpoint_emits_initial_snapshot` (substring match) by parsing
+    /// the `data:` line and round-tripping the agents through
+    /// `serde_json` — pins the wire contract clients depend on.
+    #[tokio::test]
+    async fn events_handler_emits_initial_snapshot_event() {
+        let state = fresh_state();
+        // Seed the store so the snapshot event has a non-empty payload to
+        // round-trip — empty arrays would pass even a broken serializer.
+        state
+            .store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "snap-1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let expected = state.store.snapshot().await;
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+
+        // Locate the first SSE event block — events are separated by `\n\n`.
+        let first_block = body
+            .split("\n\n")
+            .find(|b| !b.trim().is_empty())
+            .expect("SSE body should contain at least one event block");
+        assert!(
+            first_block.contains("event: snapshot"),
+            "first SSE event must be `snapshot`, got: {first_block:?}",
+        );
+
+        // Concatenate the `data:` lines (SSE allows multi-line data) and
+        // confirm the payload deserializes to the live `Store::snapshot()`.
+        let data_payload: String = first_block
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+            .collect::<Vec<_>>()
+            .join("");
+        let v: Value = serde_json::from_str(&data_payload)
+            .unwrap_or_else(|e| panic!("snapshot data must be JSON: {e} (raw: {data_payload})"));
+        let agents = v["agents"]
+            .as_array()
+            .expect("snapshot payload must carry `agents` array");
+        assert_eq!(
+            agents.len(),
+            expected.len(),
+            "snapshot agents count must match Store::snapshot()",
+        );
+        let parsed: Vec<Agent> = serde_json::from_value(v["agents"].clone())
+            .expect("snapshot agents must round-trip into Vec<Agent>");
+        assert_eq!(parsed.len(), expected.len());
+        assert_eq!(parsed[0].session_id, expected[0].session_id);
+        assert_eq!(parsed[0].kind, expected[0].kind);
+    }
+
+    #[tokio::test]
+    async fn sse_endpoint_streams_transitions_after_snapshot() {
+        use crate::event::{AgentState, NotificationLevel};
+
+        let state = fresh_state();
+        let store = state.store.clone();
+        // Pre-create an agent so the transition has something to mutate.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "s1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Drive a state transition concurrently with reading the body.
+        let store_for_task = store.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            store_for_task
+                .apply(&AgentEvent::NotificationFired {
+                    id: AgentId {
+                        tmux_socket: None,
+                        kind: AgentKind::ClaudeCode,
+                        session_id: "s1".into(),
+                        surface: None,
+                        pane: Some("%1".into()),
+                        cwd: None,
+                    },
+                    level: NotificationLevel::NeedsInput,
+                    message: "approve?".into(),
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+            // sanity: state should now be WaitingInput
+            let snap = store_for_task.snapshot().await;
+            assert_eq!(snap[0].state, AgentState::WaitingInput);
+        });
+
+        let body = collect_sse(resp, Duration::from_millis(300), 1 << 16).await;
+        assert!(body.contains("event: snapshot"), "body: {body:?}");
+        assert!(body.contains("event: transition"), "body: {body:?}");
+        assert!(body.contains("waiting_input"), "body: {body:?}");
+    }
+
+    /// Drive `map_transition_recv_to_sse` end-to-end on its happy path: a
+    /// real `Transition` arrives from a `broadcast::Receiver`, the function
+    /// must encode it as `event: transition` with a JSON payload that
+    /// matches the `Transition` wire shape (`from`, `to`, `agent`).
+    ///
+    /// This is the analogous "happy path" companion to
+    /// [`map_transition_recv_emits_lagged_event_on_overflow`], covering the
+    /// `Ok(_)` arm of the same `pub(crate)` test seam. Going through the
+    /// seam (rather than just `Store::subscribe`) is what makes this a
+    /// dashboard-layer test rather than a state-layer one — it asserts the
+    /// SSE encoding rules (`event:` tag + JSON payload shape), not just
+    /// the broadcast plumbing.
+    #[tokio::test]
+    async fn map_transition_recv_emits_transition_event_for_active_subscriber() {
+        use crate::event::AgentState;
+        use tokio_stream::StreamExt as _TokioStreamExt;
+
+        let (tx, rx) = broadcast::channel::<Transition>(8);
+        let mut stream = BroadcastStream::new(rx);
+
+        let agent = Agent {
+            ask_origin: None,
+            tmux_socket: None,
+            tmux_session: None,
+            kind: AgentKind::ClaudeCode,
+            session_id: "s1".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            cwd: None,
+            pid: None,
+            workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
+            state: AgentState::Idle,
+            last_prompt: None,
+            last_prompt_at: None,
+            last_response: None,
+            recap: None,
+            ai_title: None,
+            pending_command: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: OffsetDateTime::now_utc(),
+            last_activity_at: OffsetDateTime::now_utc(),
+            state_entered_at: OffsetDateTime::now_utc(),
+        };
+        tx.send(Transition {
+            from: AgentState::Starting,
+            to: AgentState::Idle,
+            agent: Arc::new(agent.clone()),
+        })
+        .expect("subscriber alive, send must succeed");
+
+        let next = _TokioStreamExt::next(&mut stream)
+            .await
+            .expect("stream should yield the buffered Transition")
+            .expect("Ok(Transition), not Lagged");
+        let sse = map_transition_recv_to_sse(Ok(next));
+
+        // To assert the on-the-wire shape (event-type tag + JSON payload),
+        // hand the encoded `SseEvent` to `Sse::new` and consume the resulting
+        // HTTP response body. That's the same path the production handler
+        // takes from `map_transition_recv_to_sse` to bytes — round-tripping
+        // through it is what makes this a real "wire shape" assertion.
+        let app = Router::new().route(
+            "/once",
+            get(|| async move { Sse::new(stream::once(async move { Ok::<_, Infallible>(sse) })) }),
+        );
+        let resp = app
+            .oneshot(Request::builder().uri("/once").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = collect_sse(resp, Duration::from_millis(200), 1 << 16).await;
+
+        assert!(
+            body.contains("event: transition"),
+            "transition SSE must carry the `transition` event-type tag: {body:?}",
+        );
+        assert!(
+            !body.contains("event: lagged"),
+            "happy-path event must not be tagged `lagged`: {body:?}",
+        );
+
+        // Peel the `data:` line(s) out of the rendered SSE block and confirm
+        // they deserialize to the `Transition` wire shape (`from`, `to`,
+        // `agent.agent_session_id`). `Transition` itself isn't `Deserialize` (it's
+        // an outbound-only type), so we verify shape via `serde_json::Value`.
+        let data_payload: String = body
+            .lines()
+            .filter_map(|l| l.strip_prefix("data:").map(str::trim))
+            .collect::<Vec<_>>()
+            .join("");
+        assert!(
+            !data_payload.is_empty(),
+            "rendered SSE should contain at least one `data:` line: {body:?}",
+        );
+        let v: Value = serde_json::from_str(&data_payload)
+            .unwrap_or_else(|e| panic!("data payload must be JSON: {e} (raw: {data_payload})"));
+        assert_eq!(v["from"], "starting");
+        assert_eq!(v["to"], "idle");
+        assert_eq!(v["agent"]["agent_session_id"], "s1");
+        assert_eq!(v["agent"]["kind"], "claude_code");
+    }
+
+    /// When a subscriber falls behind the broadcast ring buffer, the SSE
+    /// handler must surface that as `event: lagged` so clients know to
+    /// resync via `/api/agents`. We drive the same map function the
+    /// handler uses with a real `BroadcastStreamRecvError::Lagged` to
+    /// avoid timing-dependent backpressure choreography over HTTP.
+    #[tokio::test]
+    async fn map_transition_recv_emits_lagged_event_on_overflow() {
+        use crate::event::AgentState;
+        // Disambiguate `next` — both `futures::StreamExt` and
+        // `tokio_stream::StreamExt` are imported by this module.
+        use tokio_stream::StreamExt as _TokioStreamExt;
+
+        // Tiny channel so we can lag the receiver deterministically.
+        let (tx, rx) = broadcast::channel::<Transition>(2);
+        // Build the stream BEFORE sending, but never poll until after we
+        // overflow — that's what the BroadcastStream impl requires to
+        // produce a Lagged error on the next poll.
+        let mut stream = BroadcastStream::new(rx);
+
+        // Fill + overflow the buffer. Capacity is 2; we send 5 so the
+        // receiver is now 3 messages behind.
+        let agent = Agent {
+            ask_origin: None,
+            tmux_socket: None,
+            tmux_session: None,
+            kind: AgentKind::ClaudeCode,
+            session_id: "lag".into(),
+            surface: None,
+            pane: Some("%1".into()),
+            cwd: None,
+            pid: None,
+            workload: crate::WorkloadSummary::default(),
+            subagents: Vec::new(),
+            state: AgentState::Idle,
+            last_prompt: None,
+            last_prompt_at: None,
+            last_response: None,
+            recap: None,
+            ai_title: None,
+            pending_command: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: OffsetDateTime::now_utc(),
+            last_activity_at: OffsetDateTime::now_utc(),
+            state_entered_at: OffsetDateTime::now_utc(),
+        };
+        for _ in 0..5 {
+            tx.send(Transition {
+                from: AgentState::Starting,
+                to: AgentState::Idle,
+                agent: Arc::new(agent.clone()),
+            })
+            .expect("subscriber alive, send must succeed");
+        }
+
+        // First poll yields Lagged, which the handler maps to `event: lagged`.
+        let next = _TokioStreamExt::next(&mut stream)
+            .await
+            .expect("stream should yield the Lagged error");
+        assert!(
+            matches!(next, Err(BroadcastStreamRecvError::Lagged(_))),
+            "expected Lagged after overflowing capacity-2 channel with 5 sends, got {next:?}",
+        );
+        let lagged_sse = map_transition_recv_to_sse(next);
+        // axum's `Event` Debug renders the on-the-wire SSE bytes
+        // (e.g. `event: lagged\ndata: 3\n\n`), so a substring match on the
+        // formatted Debug output asserts the encoded event-type tag.
+        let lagged_dbg = format!("{lagged_sse:?}");
+        assert!(
+            lagged_dbg.contains("lagged"),
+            "lagged SSE event must render its event-type tag: {lagged_dbg}",
+        );
+        assert!(
+            !lagged_dbg.contains("transition"),
+            "lagged event must not be tagged as a transition: {lagged_dbg}",
+        );
+
+        // Drain the rest of the buffered messages — they're real
+        // `Transition`s, so the map function should emit `event: transition`.
+        // Confirms the handler keeps producing well-formed events after a lag.
+        let recovered = _TokioStreamExt::next(&mut stream)
+            .await
+            .expect("stream should keep yielding after the lag is reported");
+        assert!(
+            recovered.is_ok(),
+            "post-lag poll should yield a regular Transition: {recovered:?}",
+        );
+        let ok_sse = map_transition_recv_to_sse(recovered);
+        let ok_dbg = format!("{ok_sse:?}");
+        assert!(
+            ok_dbg.contains("transition"),
+            "post-lag SSE event must be tagged `transition`: {ok_dbg}",
+        );
+    }
+
+    /// `/api/metrics` returns the wire shape promised in the README:
+    /// every documented field present, counters reflect events
+    /// already applied, agent histogram totals match the registry.
+    #[tokio::test]
+    async fn metrics_endpoint_reflects_events_and_agents() {
+        let state = fresh_state();
+        // Seed the store with two agents — `Store::apply` bumps the
+        // events counter twice, which the metrics endpoint must show.
+        for (kind, sid, pane) in [
+            (AgentKind::ClaudeCode, "s1", "%1"),
+            (AgentKind::Codex, "s2", "%2"),
+        ] {
+            state
+                .store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        tmux_socket: None,
+                        kind,
+                        session_id: sid.into(),
+                        surface: None,
+                        pane: Some(pane.into()),
+                        cwd: None,
+                    },
+                    at: OffsetDateTime::now_utc(),
+                })
+                .await;
+        }
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+
+        // Every field documented in the README must be present and
+        // typed correctly. We don't assert on `uptime_secs` value —
+        // the test runs fast enough that asserting any numeric range
+        // would be flaky.
+        assert!(v["version"].is_string());
+        assert!(v["uptime_secs"].is_u64());
+        assert_eq!(v["agents_total"], 2);
+        assert_eq!(v["events_received_total"], 2);
+        assert_eq!(v["snapshot_writes_total"], 0);
+        assert_eq!(v["snapshot_last_write_elapsed_ms"], 0);
+        assert_eq!(v["reconcile_passes_total"], 0);
+        assert_eq!(v["sse_subscribers_current"], 0);
+
+        let by_state = &v["agents_by_state"];
+        assert!(by_state.is_object(), "agents_by_state must be an object");
+        // Both freshly-started agents land in `Starting` until a follow-up
+        // event moves them. Either way, the histogram total must equal
+        // `agents_total`.
+        let histogram_sum: u64 = by_state
+            .as_object()
+            .unwrap()
+            .values()
+            .map(|n| n.as_u64().unwrap_or(0))
+            .sum();
+        assert_eq!(histogram_sum, 2);
+        // Every `AgentState` variant must appear as an explicit key
+        // (zero-filled), so consumers don't have to special-case
+        // missing keys.
+        for s in [
+            "starting",
+            "working",
+            "idle",
+            "waiting_input",
+            "error",
+            "stopped",
+        ] {
+            assert!(by_state.get(s).is_some(), "missing state key: {s}");
+        }
+    }
+
+    /// The metrics endpoint is gated by the same auth middleware as
+    /// `/api/agents` — without a bearer token it returns 401 when one
+    /// is configured.
+    #[tokio::test]
+    async fn metrics_endpoint_requires_bearer_when_token_set() {
+        let app = router(state_with_token("s3cret"));
+        let unauthed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unauthed.status(), StatusCode::UNAUTHORIZED);
+
+        let authed = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .header(header::AUTHORIZATION, "Bearer s3cret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(authed.status(), StatusCode::OK);
+    }
+
+    /// SSE connect/disconnect bumps the live-subscriber gauge — the
+    /// metrics endpoint reads from the same `Metrics` instance so a
+    /// concurrent SSE handle should be visible.
+    #[tokio::test]
+    async fn metrics_sse_subscriber_count_tracks_live_connections() {
+        let state = fresh_state();
+        let metrics = state.metrics.clone();
+        // Pre-test: gauge is zero.
+        assert_eq!(metrics.snapshot().sse_subscribers_current, 0);
+
+        // Open an SSE connection and hold it long enough to read at
+        // least the snapshot frame; while the handle is live, the
+        // gauge must reflect one subscriber.
+        let app = router(state);
+        let sse_resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/events")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let body = collect_sse(sse_resp, Duration::from_millis(50), 1 << 16).await;
+        assert!(body.contains("event: snapshot"), "body: {body:?}");
+        // The `collect_sse` helper drops the body after the read
+        // budget elapses, which fires `SubscriberGuard::drop`. By the
+        // time we reach this assertion the gauge is already back to
+        // zero — that's the desired post-condition: connect bumped,
+        // disconnect decremented, no leak.
+        // Give the runtime a yield so the drop-side decrement settles.
+        tokio::task::yield_now().await;
+        assert_eq!(metrics.snapshot().sse_subscribers_current, 0);
+    }
+
+    /// A herdr-kind backend whose capture is canned, recording the history
+    /// depth each capture asked for. Tests can change the canned text (or
+    /// set it to `None`, a closed pane) while streams are open.
+    struct CaptureBackend {
+        output: Arc<Mutex<Option<String>>>,
+        history: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl PaneBackend for CaptureBackend {
+        fn kind(&self) -> HostKind {
+            HostKind::Herdr
+        }
+
+        fn list_panes(&self) -> Vec<PaneInfo> {
+            Vec::new()
+        }
+
+        fn resolve_pane(&self, _pane_id: &str) -> Option<PaneInfo> {
+            None
+        }
+
+        fn capture_pane(&self, _pane_id: &str) -> Option<String> {
+            self.output.lock().unwrap().clone()
+        }
+
+        fn capture_pane_history_on(
+            &self,
+            _socket: Option<&str>,
+            pane_id: &str,
+            history: usize,
+        ) -> Option<String> {
+            self.history.lock().unwrap().push(history);
+            self.capture_pane(pane_id)
+        }
+
+        fn pane_pid_map(&self) -> HashMap<u32, String> {
+            HashMap::new()
+        }
+
+        fn current_pane(&self) -> Option<String> {
+            None
+        }
+
+        fn focus_pane(&self, _pane_id: &str) -> bool {
+            false
+        }
+
+        fn send_text(&self, _pane_id: &str, _text: &str) -> bool {
+            false
+        }
+    }
+
+    fn capture_state(state: AppState, output: &str) -> (AppState, Arc<Mutex<Vec<usize>>>) {
+        let (state, live) = live_capture_state(state, output);
+        (state, live.history)
+    }
+
+    /// Handles onto a [`CaptureBackend`]'s canned text and capture log.
+    struct LiveCapture {
+        output: Arc<Mutex<Option<String>>>,
+        history: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl LiveCapture {
+        fn set(&self, text: Option<&str>) {
+            *self.output.lock().unwrap() = text.map(str::to_string);
+        }
+
+        fn captures(&self) -> usize {
+            self.history.lock().unwrap().len()
+        }
+    }
+
+    fn live_capture_state(state: AppState, output: &str) -> (AppState, LiveCapture) {
+        let live = LiveCapture {
+            output: Arc::new(Mutex::new(Some(output.to_string()))),
+            history: Arc::new(Mutex::new(Vec::new())),
+        };
+        let backend: SharedBackend = Arc::new(CaptureBackend {
+            output: live.output.clone(),
+            history: live.history.clone(),
+        });
+        (state.with_backend(backend), live)
+    }
+
+    async fn get_output(state: &AppState, uri: &str, bearer: Option<&str>) -> Response {
+        let mut request = Request::builder().uri(uri);
+        if let Some(token) = bearer {
+            request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        router(state.clone())
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn pane_output_returns_sanitized_text_to_the_operator() {
+        let raw = "\u{1b}[1;32mready\u{1b}[0m\r\n\u{1b}]0;title\u{7}> \u{1b}[2Kprompt\u{8}\n\n\n";
+        let (state, history) = capture_state(state_with_token("op"), raw);
+        let response = get_output(&state, "/api/panes/herdr%3Ap1/output", Some("op")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+        let body = body_json(response).await;
+        assert_eq!(body["pane"], "herdr:p1");
+        assert_eq!(body["text"], "ready\n> prompt");
+        assert!(OffsetDateTime::parse(
+            body["captured_at"].as_str().unwrap(),
+            &time::format_description::well_known::Rfc3339
+        )
+        .is_ok());
+        assert_eq!(*history.lock().unwrap(), vec![PANE_OUTPUT_DEFAULT_LINES]);
+    }
+
+    #[tokio::test]
+    async fn pane_output_clamps_the_requested_line_count() {
+        let (state, history) = capture_state(state_with_token("op"), "a\nb\nc\nd");
+        let body =
+            body_json(get_output(&state, "/api/panes/herdr%3Ap1/output?lines=2", Some("op")).await)
+                .await;
+        assert_eq!(body["text"], "c\nd");
+        get_output(
+            &state,
+            "/api/panes/herdr%3Ap1/output?lines=50000",
+            Some("op"),
+        )
+        .await;
+        get_output(&state, "/api/panes/herdr%3Ap1/output?lines=0", Some("op")).await;
+        assert_eq!(*history.lock().unwrap(), vec![2, PANE_OUTPUT_MAX_LINES, 1]);
+        let response = get_output(
+            &state,
+            "/api/panes/herdr%3Ap1/output?lines=lots",
+            Some("op"),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn pane_output_needs_the_token_in_every_auth_mode() {
+        // Private dashboard: no credentials is 401, a wrong token too.
+        let (state, _) = capture_state(state_with_token("op"), "secret");
+        let uri = "/api/panes/herdr%3Ap1/output";
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, uri, Some("nope")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // public_read: reads are anonymous, pane output is not.
+        let (state, _) = capture_state(public_read_state("op"), "secret");
+        let anonymous = get_output(&state, uri, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            get_output(&state, uri, Some("op")).await.status(),
+            StatusCode::OK
+        );
+
+        // auth = "none": nobody is an operator, so nobody reads output.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        let (state, _) = capture_state(state_from(cfg), "secret");
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn pane_output_rejects_malformed_pane_ids_and_sockets() {
+        let (state, history) = capture_state(state_with_token("op"), "x");
+        for uri in [
+            "/api/panes/abc/output",
+            "/api/panes/%25/output",
+            "/api/panes/%251x/output",
+            "/api/panes/%251%3Bkill/output",
+            "/api/panes/herdr%3A/output",
+            "/api/panes/herdr%3Ap%201/output",
+            "/api/panes/herdr%3Ap1/output?socket=a%0Ab",
+        ] {
+            let response = get_output(&state, uri, Some("op")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert!(history.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn pane_output_text_keeps_the_newest_bounded_tail() {
+        assert_eq!(pane_output_text("one\ntwo\nthree\n\n", 2), "two\nthree");
+        assert_eq!(pane_output_text("", 10), "");
+        // Byte bound: the newest bytes survive, cut on a char boundary.
+        let line = "é".repeat(100);
+        let raw = vec![line.as_str(); 1000].join("\n");
+        let text = pane_output_text(&raw, PANE_OUTPUT_MAX_LINES);
+        assert!(text.len() <= PANE_OUTPUT_MAX_BYTES);
+        assert!(text.len() > PANE_OUTPUT_MAX_BYTES - 4);
+        assert!(text.ends_with(&line));
+    }
+
+    fn window_pane(pane_id: &str, window_id: &str, socket: &str, host: HostKind) -> PaneSummary {
+        PaneSummary {
+            host,
+            pane_id: pane_id.into(),
+            session_id: "$1".into(),
+            session: "main".into(),
+            window_id: window_id.into(),
+            window_name: "main".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "zsh".into(),
+            title: String::new(),
+            current_path: "/tmp".into(),
+            socket: std::path::PathBuf::from(socket),
+            tend: TendPaneMetadata::default(),
+            attach_command: String::new(),
+        }
+    }
+
+    #[test]
+    fn window_layout_resolves_only_scanned_tmux_sockets() {
+        let panes = vec![
+            window_pane("%1", "@1", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%2", "@1", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%3", "@2", "/tmp/tmux-501/default", HostKind::Tmux),
+            window_pane("%3", "@2", "/tmp/tmux-501/work", HostKind::Tmux),
+            window_pane("rmux:%1", "@9", "/tmp/rmux.sock", HostKind::Rmux),
+        ];
+        assert_eq!(
+            resolve_window_socket(&panes, "@1", None).unwrap(),
+            "/tmp/tmux-501/default"
+        );
+        // Short names and full paths both select a scanned socket …
+        assert_eq!(
+            resolve_window_socket(&panes, "@2", Some("work")).unwrap(),
+            "/tmp/tmux-501/work"
+        );
+        // … an ambiguous window needs one, and an unscanned path is never used.
+        assert_eq!(
+            resolve_window_socket(&panes, "@2", None).unwrap_err().0,
+            StatusCode::CONFLICT
+        );
+        assert_eq!(
+            resolve_window_socket(&panes, "@1", Some("/etc/evil"))
+                .unwrap_err()
+                .0,
+            StatusCode::NOT_FOUND
+        );
+        // Geometry comes from tmux only.
+        assert_eq!(
+            resolve_window_socket(&panes, "@9", None).unwrap_err().0,
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[test]
+    fn window_ids_are_shape_checked() {
+        assert!(valid_window_id("@0"));
+        assert!(valid_window_id("@123"));
+        for bad in ["", "@", "1", "@1x", "@-1", "@1;kill", "@1234567890123"] {
+            assert!(!valid_window_id(bad), "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn window_layout_is_a_read_route() {
+        // Private: reads need the token.
+        let state = state_with_token("op");
+        let uri = "/api/windows/%40x/layout";
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, uri, Some("op")).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        // public_read: layout metadata is readable anonymously, like /api/panes.
+        let state = public_read_state("op");
+        assert_eq!(
+            get_output(&state, uri, None).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let response = get_output(
+            &state,
+            "/api/windows/%40987654321/layout?socket=a%0Ab",
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── Live pane output (SSE) ─────────────────────────────────────────
+
+    use crate::dashboard::pane_stream::PaneStreamLimits;
+
+    const STREAM_URI: &str = "/api/panes/herdr%3Ap1/output/stream";
+
+    fn fast_limits() -> PaneStreamLimits {
+        PaneStreamLimits {
+            interval: Duration::from_millis(15),
+            max_tasks: 2,
+            max_subscribers_per_pane: 2,
+            lifetime: Duration::from_secs(60),
+            gone_after_failures: 2,
+        }
+    }
+
+    fn stream_state(output: &str) -> (AppState, LiveCapture) {
+        live_capture_state(
+            state_with_token("op").with_pane_stream_limits(fast_limits()),
+            output,
+        )
+    }
+
+    /// Reads SSE events off a streaming response body one at a time.
+    struct SseReader {
+        body: Body,
+        buf: String,
+    }
+
+    impl SseReader {
+        fn new(response: Response) -> Self {
+            Self {
+                body: response.into_body(),
+                buf: String::new(),
+            }
+        }
+
+        /// The next named event and its JSON data, skipping keep-alive
+        /// comments; `None` if nothing arrives within `wait` or the stream
+        /// ended.
+        async fn next(&mut self, wait: Duration) -> Option<(String, Value)> {
+            let deadline = tokio::time::Instant::now() + wait;
+            loop {
+                if let Some(end) = self.buf.find("\n\n") {
+                    let block = self.buf[..end].to_string();
+                    self.buf.drain(..end + 2);
+                    let mut event = String::new();
+                    let mut data = String::new();
+                    for line in block.lines() {
+                        if let Some(value) = line.strip_prefix("event:") {
+                            event = value.trim_start().to_string();
+                        } else if let Some(value) = line.strip_prefix("data:") {
+                            data.push_str(value.trim_start());
+                        }
+                    }
+                    if event.is_empty() {
+                        continue;
+                    }
+                    return Some((event, serde_json::from_str(&data).unwrap()));
+                }
+                match tokio::time::timeout_at(deadline, self.body.frame()).await {
+                    Ok(Some(Ok(frame))) => {
+                        if let Ok(bytes) = frame.into_data() {
+                            self.buf.push_str(&String::from_utf8_lossy(&bytes));
+                        }
+                    }
+                    _ => return None,
+                }
+            }
+        }
+    }
+
+    /// Poll `check` until it holds or two seconds pass.
+    async fn eventually(mut check: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if check() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        check()
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_needs_the_token_in_every_auth_mode() {
+        let (state, live) = live_capture_state(state_with_token("op"), "secret");
+        assert_eq!(
+            get_output(&state, STREAM_URI, None).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            get_output(&state, STREAM_URI, Some("nope")).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let ok = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(ok.status(), StatusCode::OK);
+        assert_eq!(ok.headers()[header::CONTENT_TYPE], "text/event-stream");
+        assert_eq!(ok.headers()[header::CACHE_CONTROL], "no-store");
+        drop(ok);
+
+        // public_read: reads are anonymous, pane output is not.
+        let (state, _) = live_capture_state(public_read_state("op"), "secret");
+        let anonymous = get_output(&state, STREAM_URI, None).await;
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.headers()[header::CACHE_CONTROL], "no-store");
+        assert_eq!(
+            get_output(&state, STREAM_URI, Some("op")).await.status(),
+            StatusCode::OK
+        );
+
+        // auth = "none": nobody is an operator, so nobody streams output.
+        let mut cfg = DashboardConfig::loopback_default();
+        cfg.auth = DashboardAuthMode::None;
+        let (state, none_live) = live_capture_state(state_from(cfg), "secret");
+        assert_eq!(
+            get_output(&state, STREAM_URI, None).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        // A refused request never starts a capture loop.
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+        assert_eq!(none_live.captures(), 0);
+        let _ = live;
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_validates_like_the_output_route() {
+        let (state, live) = stream_state("x");
+        for uri in [
+            "/api/panes/abc/output/stream",
+            "/api/panes/%251%3Bkill/output/stream",
+            "/api/panes/herdr%3Ap1/output/stream?socket=a%0Ab",
+        ] {
+            let response = get_output(&state, uri, Some("op")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+        assert_eq!(live.captures(), 0);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_sends_a_snapshot_then_only_changes() {
+        let (state, live) = stream_state("\u{1b}[1;32mready\u{1b}[0m\nline two\n\n\n");
+        let response = get_output(&state, &format!("{STREAM_URI}?lines=5"), Some("op")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut events = SseReader::new(response);
+
+        // First event: the current (sanitized, trimmed) snapshot.
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "output");
+        assert_eq!(data["pane"], "herdr:p1");
+        assert_eq!(data["text"], "ready\nline two");
+        assert!(data["captured_at"]
+            .as_str()
+            .is_some_and(|at| !at.is_empty()));
+
+        // Unchanged output: the loop keeps capturing but sends nothing.
+        let seen = live.captures();
+        assert!(eventually(|| live.captures() >= seen + 3).await);
+        assert!(events.next(Duration::from_millis(60)).await.is_none());
+
+        // A change produces one new full snapshot.
+        live.set(Some("ready\nline two\nline three"));
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "output");
+        assert_eq!(data["text"], "ready\nline two\nline three");
+        assert!(events.next(Duration::from_millis(60)).await.is_none());
+        // Every capture asked for the subscriber's depth.
+        assert!(live.history.lock().unwrap().iter().all(|lines| *lines == 5));
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_subscribers_share_one_loop_with_their_own_tail() {
+        let (state, live) = stream_state("a\nb\nc");
+        let mut short =
+            SseReader::new(get_output(&state, &format!("{STREAM_URI}?lines=1"), Some("op")).await);
+        let (_, data) = short.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "c");
+        let mut long =
+            SseReader::new(get_output(&state, &format!("{STREAM_URI}?lines=3"), Some("op")).await);
+        let (_, data) = long.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "a\nb\nc");
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+        // The shared loop now captures the deepest history anyone asked for.
+        assert!(eventually(|| live.history.lock().unwrap().last() == Some(&3)).await);
+
+        // A change outside the short tail's window is not news to it.
+        live.set(Some("z\nb\nc"));
+        let (_, data) = long.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "z\nb\nc");
+        assert!(short.next(Duration::from_millis(60)).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_loop_stops_after_the_last_subscriber() {
+        let (state, live) = stream_state("hello");
+        let mut first = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        let mut second = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert!(first.next(Duration::from_secs(2)).await.is_some());
+        assert!(second.next(Duration::from_secs(2)).await.is_some());
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+
+        drop(first);
+        // One subscriber left: the loop keeps running.
+        let seen = live.captures();
+        assert!(eventually(|| live.captures() >= seen + 2).await);
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+
+        drop(second);
+        assert!(eventually(|| state.pane_streams.active_tasks() == 0).await);
+        let stopped_at = live.captures();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(live.captures() <= stopped_at + 1, "loop kept capturing");
+
+        // A new subscriber starts a fresh loop.
+        let mut again = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        let (_, data) = again.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(data["text"], "hello");
+        assert_eq!(state.pane_streams.active_tasks(), 1);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_limits_answer_429() {
+        let (state, _live) = stream_state("x");
+        // Two subscribers per pane.
+        let a = get_output(&state, STREAM_URI, Some("op")).await;
+        let b = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(a.status(), StatusCode::OK);
+        assert_eq!(b.status(), StatusCode::OK);
+        let refused = get_output(&state, STREAM_URI, Some("op")).await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(refused.headers()[header::CACHE_CONTROL], "no-store");
+        assert!(body_json(refused).await["error"]
+            .as_str()
+            .unwrap()
+            .contains("too many"));
+
+        // Two panes streaming at once.
+        let other = get_output(&state, "/api/panes/herdr%3Ap2/output/stream", Some("op")).await;
+        assert_eq!(other.status(), StatusCode::OK);
+        assert_eq!(state.pane_streams.active_tasks(), 2);
+        let third_pane =
+            get_output(&state, "/api/panes/herdr%3Ap3/output/stream", Some("op")).await;
+        assert_eq!(third_pane.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // Capacity comes back when subscribers leave.
+        drop((a, b));
+        assert!(eventually(|| state.pane_streams.active_tasks() == 1).await);
+        let retry = get_output(&state, "/api/panes/herdr%3Ap3/output/stream", Some("op")).await;
+        assert_eq!(retry.status(), StatusCode::OK);
+        drop(other);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_reports_a_closed_pane_and_ends() {
+        let (state, live) = stream_state("still here");
+        let mut events = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert_eq!(
+            events.next(Duration::from_secs(2)).await.unwrap().0,
+            "output"
+        );
+        live.set(None);
+        let (event, data) = events.next(Duration::from_secs(2)).await.unwrap();
+        assert_eq!(event, "gone");
+        assert_eq!(data["pane"], "herdr:p1");
+        // `gone` is the last event: the stream closes and the loop is gone.
+        assert!(events.next(Duration::from_millis(200)).await.is_none());
+        assert_eq!(state.pane_streams.active_tasks(), 0);
+    }
+
+    #[tokio::test]
+    async fn pane_output_stream_ends_after_its_lifetime() {
+        let limits = PaneStreamLimits {
+            lifetime: Duration::from_millis(100),
+            ..fast_limits()
+        };
+        let (state, _live) =
+            live_capture_state(state_with_token("op").with_pane_stream_limits(limits), "x");
+        let started = std::time::Instant::now();
+        let mut events = SseReader::new(get_output(&state, STREAM_URI, Some("op")).await);
+        assert!(events.next(Duration::from_secs(2)).await.is_some());
+        assert!(events.next(Duration::from_secs(2)).await.is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        // The server drops a finished body, releasing the subscription.
+        drop(events);
+        assert!(eventually(|| state.pane_streams.active_tasks() == 0).await);
+    }
+}

@@ -6,7 +6,7 @@
 #   agent   claude | codex | gemini
 #   state   working | approval | choice | error | rate-limit | done
 #
-# Why this exists: `muxa watch`'s inspector and preview show the selected
+# Why this exists: `tend watch`'s inspector and preview show the selected
 # pane's *live screen*. With the demo panes parked on bare `cat`, every one
 # of those surfaces renders an empty box — the recording ends up
 # advertising the feature by showing nothing. Painting each pane fixes

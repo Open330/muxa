@@ -1,6 +1,6 @@
 # rmux backend
 
-Status: **CLI backend and terminal controls implemented.** Muxa can discover rmux panes,
+Status: **CLI backend and terminal controls implemented.** Tend can discover rmux panes,
 correlate agent hooks, capture screens, focus panes, and send targeted literal
 input through rmux's public command-line surface.
 
@@ -11,7 +11,7 @@ rmux deliberately sets both its native environment variables (`RMUX`,
 as tmux would make a native rmux pane such as `%3` collide with a real tmux
 pane `%3`, and tmux socket discovery would target the wrong server.
 
-Muxa therefore:
+Tend therefore:
 
 - detects `RMUX` / `RMUX_PANE` before the compatibility `TMUX` variables;
 - stores rmux pane ids as `rmux:%N` internally;
@@ -20,12 +20,12 @@ Muxa therefore:
 - skips rmux compatibility shims when resolving the native tmux executable,
   so the same rmux panes do not appear a second time as tmux panes.
 
-`MUXA_HOST=rmux` forces a single rmux backend. `MUXA_HOSTS=rmux,tmux` observes
+`TEND_HOST=rmux` forces a single rmux backend. `TEND_HOSTS=rmux,tmux` observes
 both explicitly. With the rmux CLI installed, a login-launched daemon keeps an
 endpoint-less rmux backend ready even before the first server starts. Inside a
 native rmux pane, rmux becomes primary while tmux remains in the multi-host set.
 
-Muxa resolves the binary through `PATH`, the official installer's
+Tend resolves the binary through `PATH`, the official installer's
 `~/.local/bin/rmux`, Cargo's `~/.cargo/bin/rmux`, and the common Homebrew
 prefixes. This also covers systemd/launchd environments with a restricted
 `PATH`.
@@ -40,15 +40,15 @@ prefixes. This also covers systemd/launchd environments with a restricted
 | Focus | Client-scoped session/window/pane jump with private grouped views |
 | Rename | Session, window, and pane title; CLI buffer-based window naming |
 | Lifecycle | Workspace/work and agent launch, window creation, pane splitting, close |
-| Interaction | Prompt submission, interrupt, capture, window inspector, `muxa peek` |
-| Auto view | `muxa workspace view` attach/session-change hooks; view reuse and cleanup |
+| Interaction | Prompt submission, interrupt, capture, window inspector, `tend peek` |
+| Auto view | `tend workspace view` attach/session-change hooks; view reuse and cleanup |
 | Targeted input | literal `send-keys`; bracketed paste for multiline text |
 | Hook identity | `RMUX_PANE` → `rmux:%N` |
 | Session activity duration | Not yet sampled |
 | Watch jump / bare-terminal attach | Switch the invoking client to the target session/window/pane; attach from a bare terminal |
 
 The CLI transport is intentional for the first slice because it matches
-Muxa's synchronous `PaneBackend` contract and keeps rmux out of the dependency
+Tend's synchronous `PaneBackend` contract and keeps rmux out of the dependency
 graph. The backend boundary permits a later move to `rmux-sdk` for streaming
 events and fewer process launches without changing callers.
 
@@ -60,7 +60,7 @@ events and fewer process launches without changing callers.
   endpoint for capture and input and are not reaped by another endpoint's scan.
 - Session/client activity sampling is absent, so rmux rows report no DUR/ACT
   time instead of borrowing tmux's same-shaped `$N` session ids.
-- `muxa watch` switches the invoking rmux client to the selected session,
+- `tend watch` switches the invoking rmux client to the selected session,
   window, and pane. Busy sessions get a grouped view per terminal, and jumps
   preserve an existing view. Window creation is detached until the invoking
   client jumps, so it does not move another terminal's selected window.
@@ -73,7 +73,7 @@ events and fewer process launches without changing callers.
   rmux 0.10.x.
 - On Windows the endpoint is a named pipe whose name ends in a nonce drawn
   each time the server starts. An endpoint recorded before a restart (in a
-  snapshot, an agent row, or across `muxa reload`) is followed to the one
+  snapshot, an agent row, or across `tend reload`) is followed to the one
   live pipe that differs only in that nonce. See
   [WINDOWS.md](WINDOWS.md) for the rest of the Windows specifics.
 
@@ -83,7 +83,7 @@ The generated watch/Fleet bindings use full width, 99% height, and top-left
 placement. This leaves at least one bottom row for the host status bar:
 rmux continues writing that bar while a popup is open, so a 100%-height
 popup and its footer otherwise share the same terminal row. Existing users
-can re-run the popup component of `muxa init`, or change only the watch
+can re-run the popup component of `tend init`, or change only the watch
 bindings from `-h 100%` to `-h 99%` while keeping `-x 0 -y 0`.
 
 This mitigates the bottom-row collision, **not all popup flicker**. rmux
@@ -96,7 +96,7 @@ The renderer fix is in [Open330/rmux](https://github.com/Open330/rmux)'s
 changed rows; `aa777483` diffs bordered popups cell by cell; `58a679bd`
 defers status ticks a popup covers). Until a release carries it, build rmux
 from that branch. Measured through a real client on Windows, an idle watch
-popup went from 2–4 KB/s on 0.10.0 to 25–40 B/s. Running `muxa watch`
+popup went from 2–4 KB/s on 0.10.0 to 25–40 B/s. Running `tend watch`
 directly in a pane avoids the popup redraw path on any version.
 
 ## Validation
@@ -108,23 +108,23 @@ same-basename endpoint disambiguation. A live smoke test requires an installed
 an existing rmux server:
 
 ```sh
-muxa_rmux_smoke_dir=$(mktemp -d)
-muxa_rmux_smoke_socket="$muxa_rmux_smoke_dir/rmux.sock"
-cleanup_muxa_rmux_smoke() {
-  rmux -S "$muxa_rmux_smoke_socket" kill-server >/dev/null 2>&1 || true
-  rmdir "$muxa_rmux_smoke_dir" >/dev/null 2>&1 || true
+tend_rmux_smoke_dir=$(mktemp -d)
+tend_rmux_smoke_socket="$tend_rmux_smoke_dir/rmux.sock"
+cleanup_tend_rmux_smoke() {
+  rmux -S "$tend_rmux_smoke_socket" kill-server >/dev/null 2>&1 || true
+  rmdir "$tend_rmux_smoke_dir" >/dev/null 2>&1 || true
 }
-trap cleanup_muxa_rmux_smoke EXIT INT TERM
+trap cleanup_tend_rmux_smoke EXIT INT TERM
 
-rmux -S "$muxa_rmux_smoke_socket" new-session -d -s muxa-rmux-smoke
-muxa_rmux_smoke_pane=$(
-  rmux -S "$muxa_rmux_smoke_socket" \
-    list-panes -t muxa-rmux-smoke -F '#{pane_id}'
+rmux -S "$tend_rmux_smoke_socket" new-session -d -s tend-rmux-smoke
+tend_rmux_smoke_pane=$(
+  rmux -S "$tend_rmux_smoke_socket" \
+    list-panes -t tend-rmux-smoke -F '#{pane_id}'
 )
 
-MUXA_RMUX_TEST_ENDPOINT="$muxa_rmux_smoke_socket" \
-MUXA_RMUX_TEST_PANE="$muxa_rmux_smoke_pane" \
-  cargo test -p muxa \
+TEND_RMUX_TEST_ENDPOINT="$tend_rmux_smoke_socket" \
+TEND_RMUX_TEST_PANE="$tend_rmux_smoke_pane" \
+  cargo test -p tend \
     backend::rmux::tests::live_backend_smoke_against_explicit_endpoint \
     -- --ignored --exact
 ```
@@ -158,7 +158,7 @@ interrupt/close, capture, CLI buffer naming, and peek against a disposable serve
 
 Grouped windows also need session-qualified targets for commands such as
 `set-option`: a bare `@N` can be ambiguous even though every link represents
-the same window. Muxa resolves those ids within the selected endpoint before
+the same window. Tend resolves those ids within the selected endpoint before
 sending control commands. Window rename reads link identities from enumeration
 to avoid empty `display-message` context fields on rmux 0.10.
 
@@ -166,12 +166,12 @@ Auto-view hooks use `#{hook_client}`, which names the client that triggered
 the event on both tmux and rmux. rmux can leave `#{client_name}` empty in that
 hook context; popup key bindings continue to use `#{client_name}` at keypress.
 
-Watch popup bindings use `muxa watch --popup` to select the native host and
+Watch popup bindings use `tend watch --popup` to select the native host and
 socket directly. A long-running rmux server can have a `run-shell` PATH where
 `tmux` resolves to `/usr/bin/tmux`, so invoking `tmux display-popup` from that
 shell sends the request to the wrong host. Re-run
-`muxa init --component tmux-popup --yes --start-daemon=false` after upgrading.
-The popup reuses the current muxa executable and preserves watch arguments.
+`tend init --component tmux-popup --yes --start-daemon=false` after upgrading.
+The popup reuses the current tend executable and preserves watch arguments.
 
 Run `python3 scripts/rmux-popup-check.py` after building the CLI to drive
 prefix+s and prefix+S through a real PTY, with native tmux first in PATH.
@@ -179,4 +179,4 @@ The check reproduces the old binding failure before verifying both new bindings.
 
 Init checks server availability with `list-sessions`, not `info`: rmux's
 `info` alias needs an unambiguous client and otherwise skips configuration
-reloads. Both reload and `MUXA_SOCKET` propagation use the current native host.
+reloads. Both reload and `TEND_SOCKET` propagation use the current native host.

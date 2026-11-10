@@ -7,15 +7,15 @@ as decisions change.
 
 ## Why
 
-muxa is structurally a daemon + CLI that observes per-pane agent state. tmux
+tend is structurally a daemon + CLI that observes per-pane agent state. tmux
 is one possible host; nothing in the event ingest, state machine, sinks, or
-watch UI is tmux-specific. A zellij backend brings muxa to users who prefer
+watch UI is tmux-specific. A zellij backend brings tend to users who prefer
 zellij's layout model and plugin system without forking the project.
 
 ## Current tmux coupling
 
-The tmux surface muxa actually uses is small (~600 LOC, all under
-`crates/muxa/src/tmux/`):
+The tmux surface tend actually uses is small (~600 LOC, all under
+`crates/tend/src/tmux/`):
 
 | Concern                   | Today                                                                 |
 | ------------------------- | --------------------------------------------------------------------- |
@@ -50,7 +50,7 @@ without a hook installed are invisible. That's a regression we should not ship.
 
 ### Step 1 — Extract `PaneBackend` trait
 
-Refactor `crates/muxa/src/tmux/` into `crates/muxa/src/backend/` with a trait
+Refactor `crates/tend/src/tmux/` into `crates/tend/src/backend/` with a trait
 roughly shaped as:
 
 ```rust
@@ -67,13 +67,13 @@ current command, title). The tmux impl moves under `backend/tmux.rs` mostly
 unchanged. This is a non-feature refactor that's worth doing on its own merits
 — it also unblocks a future control-mode (`-C`) tmux backend.
 
-### Step 2 — `muxa-zellij-plugin`
+### Step 2 — `tend-zellij-plugin`
 
 A small Rust → WASM plugin (target `wasm32-wasip1`) that:
 
 1. Subscribes to `PaneUpdate` and `TabUpdate` via the zellij plugin API.
 2. On every update, serializes the relevant `PaneInfo` fields and pushes them
-   to `$XDG_RUNTIME_DIR/muxa.sock` over a new daemon command (e.g.
+   to `$XDG_RUNTIME_DIR/tend.sock` over a new daemon command (e.g.
    `BackendPaneSnapshot { panes: Vec<PaneSnapshot> }`).
 3. Holds no state — the daemon is the source of truth. Plugin is a pure
    adapter.
@@ -96,10 +96,10 @@ no-op for this backend.
 
 ### Step 4 — CLI wiring
 
-`muxa status`, `muxa watch`, `muxa hook <agent>` pick the backend through
+`tend status`, `tend watch`, `tend hook <agent>` pick the backend through
 [`backend::detect_host_env`]. The resolution order is:
 
-1. `MUXA_HOST=tmux|zellij` — explicit operator override; wins regardless
+1. `TEND_HOST=tmux|zellij` — explicit operator override; wins regardless
    of which host env vars are present. Useful for nested-multiplexer
    setups where `tmux new-session` from inside zellij leaves `ZELLIJ`
    set in the new shell's env even though the actual host is tmux.
@@ -110,7 +110,7 @@ no-op for this backend.
 
 When both `$TMUX` and `$ZELLIJ` are present, zellij wins by default —
 this is a pragmatic pick rather than a principled one (the env doesn't
-carry "set last" ordering). `MUXA_HOST` is the escape hatch.
+carry "set last" ordering). `TEND_HOST` is the escape hatch.
 
 ## Capability story (CLI-only zellij)
 
@@ -133,7 +133,7 @@ install the WASM plugin. It's intentionally degraded — agent
 auto-discovery falls back to "trust whatever pane the stdin hook
 self-reports" because there's no way to classify panes by foreground
 command. The plugin is what closes that gap; the CLI-only mode exists
-mainly so an operator who installs the muxa binary on a zellij host
+mainly so an operator who installs the tend binary on a zellij host
 gets *something* working immediately, even if it's not full parity.
 
 Hook ancestry (`adapters/hook.rs`), discovery (`discovery.rs`), and
@@ -200,5 +200,5 @@ to stderr before committing to the rest.
   `terminal_command` from the plugin API, agent auto-discovery is too weak to
   ship.
 - Replacing the tmux backend. Both coexist; the trait is the seam.
-- Zellij-specific features (layouts, floating panes as first-class muxa
+- Zellij-specific features (layouts, floating panes as first-class tend
   concepts). Out of scope for the initial port.

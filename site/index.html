@@ -4,20 +4,20 @@
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <meta name="color-scheme" content="light dark" />
-<title>Muxa — know which coding agent is waiting on you</title>
-<meta name="description" content="Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you which one needs you, and takes you there. No wrapper, no new terminal." />
-<meta property="og:title" content="Muxa — know which coding agent is waiting on you" />
+<title>Tend — know which coding agent is waiting on you</title>
+<meta name="description" content="Tend watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you which one needs you, and takes you there. No wrapper, no new terminal." />
+<meta property="og:title" content="Tend — know which coding agent is waiting on you" />
 <meta property="og:description" content="Know which tmux coding agent is waiting on you — and jump to it. Works with Claude Code, Codex, and Gemini CLI." />
 <meta property="og:type" content="website" />
-<meta property="og:url" content="https://open330.github.io/muxa/" />
-<meta property="og:image" content="https://open330.github.io/muxa/landing/board-light.webp" />
+<meta property="og:url" content="https://open330.github.io/tend/" />
+<meta property="og:image" content="https://open330.github.io/tend/landing/board-light.webp" />
 <link rel="icon" href="icon.svg" type="image/svg+xml" />
 <!--
   The page is the dashboard's landing view in "site" mode, so the project
   page and the page a daemon shows to visitors without access share one
   design and one copy. The pages workflow copies landing.mjs,
   the shared landing/onboarding modules, landing.css and the screens from
-  crates/muxa/src/dashboard/web at deploy time.
+  crates/tend/src/dashboard/web at deploy time.
 -->
 <style>
   html { background: #f7f7f5; color: #1a1d21; color-scheme: light dark; }
@@ -35,12 +35,12 @@
 <body data-view="landing">
 <div class="landing" id="landing">
   <div class="fallback" data-page-fallback>
-    <h1>Muxa</h1>
-    <p>Know which coding agent is waiting on you — and jump to it. Muxa watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.</p>
-    <pre>brew install open330/tap/muxa
-muxa init
-muxa attend</pre>
-    <p><a href="learn/?track=attention">Try muxa</a> · <a href="https://github.com/Open330/muxa">github.com/Open330/muxa</a></p>
+    <h1>Tend</h1>
+    <p>Know which coding agent is waiting on you — and jump to it. Tend watches the Claude Code, Codex, and Gemini CLI sessions you already run in tmux, tells you the moment one stops for input, a choice, or an error, and takes you straight to its pane. No wrapper, no new terminal.</p>
+    <pre>brew install open330/tap/tend
+tend init
+tend attend</pre>
+    <p><a href="learn/?track=attention">Try tend</a> · <a href="https://github.com/Open330/tend">github.com/Open330/tend</a></p>
   </div>
 </div>
 <script type="module">
@@ -50,7 +50,7 @@ muxa attend</pre>
     renderLanding(root, { mode: "site", assetBase: "./" });
   } catch (error) {
     root.innerHTML = fallback;
-    console.error("Muxa landing could not load", error);
+    console.error("Tend landing could not load", error);
   } finally {
     document.documentElement.removeAttribute("data-page-loading");
   }

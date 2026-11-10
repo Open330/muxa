@@ -4,7 +4,7 @@ An *automation* is a rule that watches an agent's state and acts on it.
 
 The case it was built for: you are running Claude and Codex all day, one
 of them hits `You've hit your limit · resets 2:40pm`, and the session sits
-there red until you happen to look. muxa already knows the cap happened
+there red until you happen to look. tend already knows the cap happened
 and, usually, when it lifts. A rule turns that knowledge into a `continue`
 typed at the right moment.
 
@@ -12,8 +12,8 @@ The cap is only the first rule anyone wants, so the mechanism is general —
 an **event**, some **filters**, a **delay**, and an **action** — and the
 first rule is just one instance of it.
 
-**Automation ships with five disabled rules.** `muxa init` installs them;
-`muxad` also adds missing rules on startup for binary-only upgrades. Existing
+**Automation ships with five disabled rules.** `tend init` installs them;
+`tendd` also adds missing rules on startup for binary-only upgrades. Existing
 rules with the same names keep every setting, including their enabled state.
 The engine is enabled by default, but new rules do nothing until you enable them.
 
@@ -30,10 +30,10 @@ send an OS notification. The existing cooldown, hourly ceilings, live condition
 check and one-firing-per-episode guards apply to every rule.
 
 ```console
-muxa automation list
-muxa automation enable resume-codex-capacity
-muxa automation test resume-codex-capacity
-muxa automation disable resume-codex-capacity
+tend automation list
+tend automation enable resume-codex-capacity
+tend automation test resume-codex-capacity
+tend automation disable resume-codex-capacity
 ```
 
 New installs and upgrades add only missing names. Your custom rules, comments,
@@ -45,7 +45,7 @@ rules as operator configuration.
 To add the rules to an existing installation explicitly:
 
 ```console
-muxa init --component automation --yes
+tend init --component automation --yes
 ```
 
 When the daemon is already running, restart it after init to load file edits.
@@ -54,15 +54,15 @@ CLI `automation enable/disable/add` changes the live engine immediately.
 ## Confirm selected Yes / Proceed
 
 `confirm-selected-yes` is installed disabled. It watches Claude/Codex input
-waits and uses `action = "press_enter"`. Before Enter, muxad captures the
+waits and uses `action = "press_enter"`. Before Enter, tendd captures the
 current pane and requires exactly one highlighted `Yes` or `Proceed` row and
 an Enter/confirmation footer. A selected `No`, plain text input, an ambiguous
 screen or a failed capture receives no key. The live waiting state and episode
 are checked again after capture. The rule does not move the selection.
 
 ```console
-muxa automation enable confirm-selected-yes
-muxa automation disable confirm-selected-yes
+tend automation enable confirm-selected-yes
+tend automation disable confirm-selected-yes
 ```
 
 Enabling this rule authorizes confirmation of the selected affirmative option,
@@ -79,7 +79,7 @@ label that wraps onto the next line, receives no key.
 ### Approve only commands you name
 
 Give a `press_enter` rule a `screen` regex and it confirms only a shell
-command that the pattern matches in full. muxad reads the command from the
+command that the pattern matches in full. tendd reads the command from the
 capture taken right before Enter, and only from a dialog it recognizes:
 
 - Codex: exactly one `Would you like to run the following command?`
@@ -107,7 +107,7 @@ description are never part of the command.
 
 The capture and the key press are not atomic: if someone moves the
 selection by hand in the moment between them, Enter confirms what is then
-selected. muxad rechecks the agent's waiting state and episode after the
+selected. tendd rechecks the agent's waiting state and episode after the
 capture, but cannot see a selection change inside the same wait.
 
 ```toml
@@ -124,7 +124,7 @@ max_per_hour = 10
 
 ## Quick start
 
-Put this in `$XDG_CONFIG_HOME/muxa/config.toml` and restart `muxad`:
+Put this in `$XDG_CONFIG_HOME/tend/config.toml` and restart `tendd`:
 
 ```toml
 [[automation.rule]]
@@ -139,7 +139,7 @@ fallback = "20m"
 Then check it against what is running right now, without firing anything:
 
 ```console
-$ muxa automation test resume-after-limit
+$ tend automation test resume-after-limit
 resume-after-limit: rule enabled, engine on
 %42	claude_code	error	fire	at 2026-09-03T14:42:00Z	"continue"
 nothing was fired; this was a dry run
@@ -151,7 +151,7 @@ and needs no restart:
 ```console
 $ echo '{"name":"resume-after-limit","on":"rate_limited","action":"send_prompt",
          "text":"continue","wait":"{{reset}}+2m","fallback":"20m"}' |
-    muxa automation add --from-json -
+    tend automation add --from-json -
 wrote resume-after-limit
 ```
 
@@ -193,19 +193,19 @@ on = "rate_limited"
 action = "swap_account"
 ```
 
-`muxa swap` does the same by hand. See [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md).
+`tend swap` does the same by hand. See [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md).
 
 ## Commands
 
 | Command | What it does |
 | ------- | ------------ |
-| `muxa automation list [--json]` | Every rule with its effective timing, guards, and recent activity. |
-| `muxa automation log [--limit N] [--json]` | What the engine did: fired, skipped, and why. |
-| `muxa automation enable <name>` / `disable <name>` | Turn one rule on or off, live and in `config.toml`. |
-| `muxa automation pause [--for 1h]` / `resume` | Hold every rule. A pause expires on its own; `resume` lifts it early. |
-| `muxa automation add --from-json <path\|->` | Write or replace one rule from JSON. |
-| `muxa automation remove <name>` | Delete one rule. |
-| `muxa automation test <name> [--json]` | Evaluate the rule against the live registry and print what it *would* do. |
+| `tend automation list [--json]` | Every rule with its effective timing, guards, and recent activity. |
+| `tend automation log [--limit N] [--json]` | What the engine did: fired, skipped, and why. |
+| `tend automation enable <name>` / `disable <name>` | Turn one rule on or off, live and in `config.toml`. |
+| `tend automation pause [--for 1h]` / `resume` | Hold every rule. A pause expires on its own; `resume` lifts it early. |
+| `tend automation add --from-json <path\|->` | Write or replace one rule from JSON. |
+| `tend automation remove <name>` | Delete one rule. |
+| `tend automation test <name> [--json]` | Evaluate the rule against the live registry and print what it *would* do. |
 
 Every subcommand goes through the daemon rather than editing
 `config.toml` behind its back. The daemon reads config once at startup and
@@ -219,7 +219,7 @@ file would not load.
 ```toml
 [automation]
 enabled = true            # master switch, default true
-# paused_until = "..."    # RFC3339; written by `muxa automation pause`
+# paused_until = "..."    # RFC3339; written by `tend automation pause`
 
 [[automation.rule]]
 name = "resume-after-limit"      # unique, TOML-safe, required
@@ -308,8 +308,8 @@ difference between those two is a runaway.
 ### Filters
 
 All present filters must match. `workspace` and `work` read the tmux user
-options a muxa-managed launch stamps on the pane, so they never match a
-pane muxa did not launch. `host = "local"` matches every pane this daemon
+options a tend-managed launch stamps on the pane, so they never match a
+pane tend did not launch. `host = "local"` matches every pane this daemon
 governs — it only ever sees its own node — while a backend name (`tmux`,
 `herdr`, …) narrows to one pane-id namespace.
 
@@ -348,7 +348,7 @@ max_per_hour = 6
 ### Provider and privacy boundary
 
 Requires `[ask] enabled = true` and a configured API key available to
-`muxad`. Only the `openai` and `anthropic` API engines are allowed, including
+`tendd`. Only the `openai` and `anthropic` API engines are allowed, including
 named API instances backed by either engine. CLI providers (including Claude
 and Codex) are not supported because the judge requires a strict no-tools
 turn, not a general-purpose agent session. The app's test request does not
@@ -396,7 +396,7 @@ potentially paid, read-only test that records a judgment but **never executes
 an action**, even with observe-only off. It can test the editor's draft; it
 does not save that draft as a rule.
 
-The ordinary `muxa automation test` and app rule test remain **free,
+The ordinary `tend automation test` and app rule test remain **free,
 deterministic dry runs**: no Ask call, no action, and no ledger entry. An
 otherwise eligible candidate with an Ask condition reports `ask_required`,
 not an inferred match.
@@ -409,7 +409,7 @@ this, and each layer is independent:
 1. **`[automation] enabled`** — the master switch. `false` stops every
    rule without editing any of them.
 2. **`paused_until`** — a time-boxed hold over everything. It expires on
-   its own; `muxa automation pause --for 2h` is safe to use and forget.
+   its own; `tend automation pause --for 2h` is safe to use and forget.
 3. **The rule's own `enabled`** — one rule off, the rest running.
 4. **`cooldown`** (default 2m) — minimum gap between firings of one rule
    against one pane.
@@ -431,8 +431,8 @@ this, and each layer is independent:
    its episode: retrying would re-send keystrokes into a pane that may
    have taken the first ones.
 9. **The ledger** — every decision, including every fire-time skip and its
-   reason, is appended to `$XDG_DATA_HOME/muxa/automation.json` (last 500
-   entries) and readable with `muxa automation log`.
+   reason, is appended to `$XDG_DATA_HOME/tend/automation.json` (last 500
+   entries) and readable with `tend automation log`.
 
 A rule is also skipped, silently, when the row has no pane — there is
 nothing to type into.
@@ -461,7 +461,7 @@ cached for ten seconds.
 The decision logic itself is pure: given a rule, an agent snapshot, the
 guard state, an injected `now`, and an injected jitter ratio, it answers
 "fire, and when" or "skip, because". That is what makes the guards
-testable to the second — see `crates/muxa/src/automation.rs`.
+testable to the second — see `crates/tend/src/automation.rs`.
 
 ## IPC
 

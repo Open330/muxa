@@ -1,15 +1,15 @@
 # Agent sidebar
 
-`muxa sidebar show` opens a compact agent explorer as a full-height native pane
+`tend sidebar show` opens a compact agent explorer as a full-height native pane
 on the left. It shares watch's topology, event subscription, state merge and pane
 ID colors. It never sends agent messages or starts an LLM.
 
 ```sh
-muxa sidebar show
-muxa sidebar show --side right --width 40
-muxa sidebar toggle
-muxa sidebar status
-muxa sidebar hide
+tend sidebar show
+tend sidebar show --side right --width 40
+tend sidebar toggle
+tend sidebar status
+tend sidebar hide
 ```
 
 Width defaults to 36 columns (24–80). At least 20 columns must remain for work.
@@ -17,7 +17,7 @@ Existing content panes and their nested split structure are retained. Repeating
 show does not create duplicates; changing side/width replaces only the sidebar.
 
 `prefix + e` toggles the explorer and remembers its side/width. An existing
-custom `e` binding is preserved when enabling the sidebar. `muxa init` also
+custom `e` binding is preserved when enabling the sidebar. `tend init` also
 installs this shortcut with the watch bindings.
 
 `prefix + s` opens the normal full watch over the tree; closing watch reveals
@@ -46,7 +46,7 @@ sidebar panes; the last sidebar-only window becomes a shell rather than closing.
 ## Keep it visible during zoom
 
 ```sh
-muxa sidebar zoom
+tend sidebar zoom
 ```
 
 When the existing `prefix + z` is tmux's stock zoom binding, show connects it to
@@ -67,16 +67,16 @@ policy/zoom state and do not run a sidebar CLI in disabled sessions. The ordinar
 zoom binding still behaves normally in windows without a sidebar.
 
 Pin an endpoint for scripts or key bindings; `--mux-socket` is the tmux/rmux
-server, whereas Muxa's root `--socket` is the daemon:
+server, whereas Tend's root `--socket` is the daemon:
 
 ```sh
-muxa sidebar show --host rmux --mux-socket /tmp/rmux-1044/default --pane rmux:%47
+tend sidebar show --host rmux --mux-socket /tmp/rmux-1044/default --pane rmux:%47
 ```
 
 Real-host regression tests create only shell panes on a private rmux socket:
 
 ```sh
-cargo test -p muxa-cli --test sidebar -- --ignored
+cargo test -p tend-cli --test sidebar -- --ignored
 ```
 
 Watch’s live layout excludes the marked sidebar before capturing terminals and

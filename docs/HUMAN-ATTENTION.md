@@ -1,8 +1,8 @@
 # Human attention in collaboration mailboxes
 
-Agent instructions ship through MCP initialization, `muxa_collaboration_guide`,
-and the managed `muxa-collaboration` skill. Install/update the file-based entry
-points with `muxa init --component agent-instructions,agent-skills --yes
+Agent instructions ship through MCP initialization, `tend_collaboration_guide`,
+and the managed `tend-collaboration` skill. Install/update the file-based entry
+points with `tend init --component agent-instructions,agent-skills --yes
 --start-daemon=false`. Existing agents must reread the skill or reconnect MCP
 to acquire updated guidance; changing a file does not replace their context.
 
@@ -13,11 +13,11 @@ do not make that request an operator notification.
 When an operator decision is required, send a separate request to `human`:
 
 ```sh
-muxa msg send human 'Choose A or B. Recommend A because it preserves compatibility.' \
+tend msg send human 'Choose A or B. Recommend A because it preserves compatibility.' \
   --human-action choice --parent req_parent --json
 ```
 
-The equivalent MCP `muxa_send_message` arguments are `target: "human"`,
+The equivalent MCP `tend_send_message` arguments are `target: "human"`,
 `human_action: "choice"`, `body`, and optionally `parent_request_id`.
 Actions are `approval`, `choice`, and `information`. Explain the decision,
 why it blocks progress, the options, and your recommendation in the body.
@@ -27,16 +27,16 @@ Only a participant in the parent request may escalate it to the operator.
 The parent thread is retained. Human replies return to the requesting agent's
 normal reply mailbox. No pane is woken to deliver a request to a human.
 
-`muxa watch` opens its mailbox on **Need you**. `Tab` switches to agent
+`tend watch` opens its mailbox on **Need you**. `Tab` switches to agent
 traffic/history and sent messages. `e` answers a human request as the operator;
-claiming an agent inbox is unnecessary. Muxa.app uses the same default tab.
+claiming an agent inbox is unnecessary. Tend.app uses the same default tab.
 Completed, cancelled, expired, failed, declined, or blocked requests no longer
 count as awaiting a response. Legacy console-targeted requests are classified
 by recipient, `expects_reply`, kind and status; no message text is scanned.
 
 The dashboard graph preserves request/reply directions and shows **need you**
 counts on edges. Counts apply to loaded history (which may be paginated).
-Muxa.app also shows a chronological participant graph for the latest 20 loaded
+Tend.app also shows a chronological participant graph for the latest 20 loaded
 requests: solid request arrows, dashed return arrows and orange human waits.
 
 With the existing `[notifier] enabled = true, backend = "libnotify"` setting,
@@ -50,7 +50,7 @@ existing policy: a pending peer request alone does not prove an input prompt
 is safe to suppress.
 
 Linux builds validate the Rust and dashboard changes. SwiftUI rendering must
-be built and visually verified on macOS before publishing a Muxa.app bundle.
+be built and visually verified on macOS before publishing a Tend.app bundle.
 
 ## Interrupted peers and usage caps
 
@@ -78,7 +78,7 @@ updated daemon; old hosts continue to use bounded policy checks.
 If the coordinator is unavailable, or does not acknowledge via a request update
 within two minutes, one human choice request is persisted in the same transaction
 as its link on the original request. Restarts do not duplicate it. Existing linked
-human questions are reused. The service is explicitly identified as Muxa recovery;
+human questions are reused. The service is explicitly identified as Tend recovery;
 it does not impersonate a peer. Human answers are copied to interruption.decision
 for the coordinator; they do not execute any action or complete the original work.
 Original participants have read/wait access to the daemon action ID, so they can
@@ -89,7 +89,7 @@ metadata follows the parent recovery state.
 Healthy working/idle state or an actual terminal reply clears the interruption and
 withdraws an unanswered daemon-generated action. A reset time alone never clears it.
 
-muxa.app shows reason/reset/original request/action identity and decision, with
+tend.app shows reason/reset/original request/action identity and decision, with
 editable reply drafts for wait/recheck, safe handoff and stopping an attempt. Its
 Reply button records only the decision. Dashboard detail shows the same structured
 recovery metadata; decision and progress bodies stay redacted without detail auth.
@@ -104,8 +104,8 @@ report. For a withdrawn review, verified handoff, or result produced outside the
 old attempt, an operator can record its retirement without impersonating the peer:
 
 ```sh
-muxa msg retire REQUEST --reason "review explicitly withdrawn" --evidence "REQUEST#update-2"
-muxa msg retire REQUEST --reason "review explicitly withdrawn" --evidence "REQUEST#update-2" --execute
+tend msg retire REQUEST --reason "review explicitly withdrawn" --evidence "REQUEST#update-2"
+tend msg retire REQUEST --reason "review explicitly withdrawn" --evidence "REQUEST#update-2" --execute
 ```
 
 This is an operator-initiated, audited operation under the existing same-UID local

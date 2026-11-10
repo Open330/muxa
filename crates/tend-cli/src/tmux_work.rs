@@ -1,0 +1,3222 @@
+//! Managed tmux workspace/session, work/window, and agent/pane lifecycle.
+//!
+//! Tend's tmux policy is deliberately narrow:
+//! - one managed session represents one workspace or project;
+//! - one managed window binds the current run of a tend Work;
+//! - one managed pane represents one coding agent;
+//!
+//! Identity is stored in tmux user options so it survives tendd and MCP
+//! process restarts without adding another database.
+
+use crate::mux_control::Control;
+
+use crate::theme::TableTone;
+use anyhow::{bail, Context, Result};
+use clap::ValueEnum;
+use serde::Serialize;
+use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
+use tend::ipc::Client;
+use tend::work::{WorkRecord, WorkStage};
+
+const WORKSPACE_ID_OPTION: &str = "@tend_workspace_id";
+const WORKSPACE_CWD_OPTION: &str = "@tend_workspace_cwd";
+const MANAGED_WORKSPACE_OPTION: &str = "@tend_managed_workspace";
+const WORK_ID_OPTION: &str = "@tend_work_id";
+const WORK_CWD_OPTION: &str = "@tend_work_cwd";
+const MANAGED_WORK_OPTION: &str = "@tend_managed_work";
+const MANAGED_AGENT_OPTION: &str = "@tend_managed_agent";
+const AGENT_OPTION: &str = "@tend_agent";
+const AGENT_ROLE_OPTION: &str = "@tend_agent_role";
+const AGENT_TASK_OPTION: &str = "@tend_agent_task";
+/// Stable per-window name for one pipeline agent. This is the key
+/// `tend work up` diffs on, which is why it lives on the pane rather
+/// than in the daemon: it has to outlive tendd, the CLI process, and
+/// the agent restarting inside the pane.
+const AGENT_ALIAS_OPTION: &str = "@tend_agent_alias";
+const AGENT_GENERATION_OPTION: &str = "@tend_pipeline_generation";
+const PANE_WORKSPACE_OPTION: &str = "@tend_agent_workspace_id";
+const PANE_WORK_OPTION: &str = "@tend_agent_work_id";
+const EXTERNAL_SOURCE_OPTION: &str = "@tend_external_source";
+const EXTERNAL_SCOPE_OPTION: &str = "@tend_external_scope";
+const EXTERNAL_STABLE_ID_OPTION: &str = "@tend_external_stable_id";
+/// Comma-separated pipeline aliases that have reported finishing.
+///
+/// On the window rather than the pane: an agent that has finished may well
+/// have exited, and the fact that it finished has to outlive it. This is
+/// the only completion signal tend has — agent state cannot supply one,
+/// because `idle` means both "done" and "paused mid-thought".
+const EXTERNAL_KEY_OPTION: &str = "@tend_external_key";
+const EXTERNAL_TITLE_OPTION: &str = "@tend_external_title";
+const EXTERNAL_URL_OPTION: &str = "@tend_external_url";
+const EXTERNAL_STATUS_OPTION: &str = "@tend_external_status";
+
+const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@tend_workspace_id}\t#{@tend_workspace_cwd}\t#{@tend_managed_workspace}\t#{session_attached}\t#{session_windows}\t#{session_group}";
+const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@tend_work_id}\t#{@tend_work_cwd}\t#{@tend_managed_work}\t#{@tend_external_source}\t#{@tend_external_scope}\t#{@tend_external_stable_id}\t#{@tend_external_key}\t#{@tend_external_title}\t#{@tend_external_url}\t#{@tend_external_status}";
+const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@tend_agent}\t#{@tend_agent_role}\t#{@tend_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@tend_managed_agent}\t#{@tend_agent_workspace_id}\t#{@tend_agent_work_id}\t#{@tend_agent_alias}";
+const WINDOW_IDENTITY_FORMAT: &str =
+    "#{window_id}\t#{session_id}\t#{session_name}\t#{window_name}\t#{automatic-rename}";
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ManagedAgentPane {
+    pub pane: String,
+    pub agent: String,
+    /// Pipeline alias, when this pane was created by `tend work up`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    pub command: String,
+    pub cwd: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkInfo {
+    pub work: String,
+    pub workspace: String,
+    pub session: String,
+    /// tmux's stable `$N`, retained as this Run's physical coordinate.
+    pub session_id: String,
+    pub window: String,
+    pub window_index: u32,
+    pub window_name: String,
+    pub cwd: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub external_item: Option<Box<ExternalItemInfo>>,
+    pub agents: Vec<ManagedAgentPane>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ExternalItemInfo {
+    pub source: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stable_id: Option<String>,
+    pub display_key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WorkspaceInfo {
+    pub workspace: String,
+    pub session: String,
+    /// The session's tmux id. Anything that acts on the session — placing a
+    /// window in it, writing its marks — uses this rather than `session`,
+    /// because tmux resolves a bare name by unique prefix as well as by
+    /// exact match, and picks the neighbour silently when the exact one is
+    /// gone. `session` is for display.
+    ///
+    /// Kept out of `--json`: this is plumbing for addressing the session
+    /// correctly, and putting a new key in a published payload is a decision
+    /// to make on its own rather than a side effect of fixing the addressing.
+    #[serde(skip)]
+    pub session_id: String,
+    /// Whether tend created this session, as opposed to adopting one the
+    /// operator already had.
+    ///
+    /// Identity and ownership are different facts. A session tend adopted
+    /// carries a workspace id so its work windows are findable, but tend
+    /// must never close it: it is full of windows tend did not open.
+    pub managed: bool,
+    pub cwd: PathBuf,
+    pub attached_clients: u32,
+    pub windows: u32,
+    pub works: Vec<WorkInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct WindowRenameResult {
+    pub window_id: String,
+    pub session_id: String,
+    pub session_name: String,
+    pub previous_name: String,
+    pub name: String,
+    pub automatic: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentControlAction {
+    Interrupt,
+    Terminate,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManageAction {
+    ListWorkspace,
+    ShowWorkspace,
+    ListWork,
+    ShowWork,
+    InterruptAgent,
+    TerminateAgent,
+    CloseWork,
+    CloseWorkspace,
+}
+
+impl ManageAction {
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "list_workspace" | "list_workspaces" => Ok(Self::ListWorkspace),
+            "show_workspace" => Ok(Self::ShowWorkspace),
+            "list_work" | "list" => Ok(Self::ListWork),
+            "show_work" | "show" => Ok(Self::ShowWork),
+            "interrupt_agent" | "interrupt" | "abort" => Ok(Self::InterruptAgent),
+            "terminate_agent" | "terminate" | "kill" => Ok(Self::TerminateAgent),
+            "close_work" | "close" => Ok(Self::CloseWork),
+            "close_workspace" => Ok(Self::CloseWorkspace),
+            other => Err(format!(
+                "unknown tmux action {other:?}; expected list_workspace, show_workspace, \
+                 list_work, show_work, interrupt_agent, terminate_agent, close_work, \
+                 or close_workspace"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ManageRequest {
+    pub action: ManageAction,
+    pub pane: Option<String>,
+    pub workspace: Option<String>,
+    pub work: Option<String>,
+    pub confirm: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum ManageResult {
+    Workspaces {
+        workspaces: Vec<WorkspaceInfo>,
+    },
+    Workspace {
+        workspace: WorkspaceInfo,
+    },
+    Works {
+        works: Vec<WorkInfo>,
+    },
+    Work {
+        work: WorkInfo,
+    },
+    AgentControl {
+        action: AgentControlAction,
+        pane: String,
+    },
+    SessionControl {
+        action: AgentControlAction,
+        session: String,
+    },
+    WorkClosed {
+        work: String,
+        workspace: String,
+        session: String,
+        window: String,
+    },
+    WorkspaceClosed {
+        workspace: String,
+        session: String,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AgentControlArgs {
+    /// Exact managed tmux pane id, for example %42. Conflicts with --session.
+    #[arg(long, required_unless_present = "session", conflicts_with = "session")]
+    pub pane: Option<String>,
+    /// Tend-owned native PTY session id or display name. Conflicts with --pane.
+    #[arg(long, required_unless_present = "pane", conflicts_with = "pane")]
+    pub session: Option<String>,
+    /// Interrupt the current turn or terminate the whole pane/session.
+    #[arg(long, value_enum)]
+    pub action: AgentControlAction,
+    /// Confirm the destructive terminate action.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WindowRenameArgs {
+    /// New stable display name. Whitespace is normalized to `-`.
+    #[arg(
+        value_name = "NAME",
+        required_unless_present_any = ["auto", "buffer"],
+        conflicts_with_all = ["auto", "buffer"]
+    )]
+    pub name: Option<String>,
+    /// Read the name from a tmux paste buffer and delete it. Used by the
+    /// generated `prefix + ,` binding so prompt text never enters a shell.
+    #[arg(
+        long,
+        value_name = "BUFFER",
+        hide = true,
+        conflicts_with_all = ["name", "auto"]
+    )]
+    pub buffer: Option<String>,
+    /// Exact window target such as @42. Defaults to the current tmux pane's window.
+    #[arg(long, value_name = "TARGET")]
+    pub window: Option<String>,
+    /// Restore tmux's dynamic process-based automatic window name.
+    #[arg(long, conflicts_with = "buffer")]
+    pub auto: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkDoneArgs {
+    /// Pipeline alias reporting done. Defaults to the alias recorded on
+    /// the calling pane, so an agent can just run `tend work done`.
+    #[arg(long)]
+    pub alias: Option<String>,
+    /// tmux pane to read the alias and work from. Defaults to `TMUX_PANE`.
+    #[arg(long)]
+    pub pane: Option<String>,
+    /// Run generation being completed. Defaults to the generation stamped on
+    /// the calling pane. Useful when automation supplies an explicit pane.
+    #[arg(long)]
+    pub generation: Option<u64>,
+    /// Restart this alias's completion generation and hold/reconcile its
+    /// downstream aliases again.
+    #[arg(long)]
+    pub undo: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkListArgs {
+    /// Limit work windows to one managed workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkShowArgs {
+    /// Tend Work id, for example TEST-0001.
+    pub work: String,
+    /// Workspace id when the same work id exists in more than one workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkCloseArgs {
+    /// Tend Work id, for example TEST-0001.
+    pub work: String,
+    /// Workspace id when the same work id exists in more than one workspace.
+    #[arg(long)]
+    pub workspace: Option<String>,
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceListArgs {
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceShowArgs {
+    /// Managed workspace/project id.
+    pub workspace: String,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceCloseArgs {
+    /// Managed workspace/project id.
+    pub workspace: String,
+    /// Skip the confirmation prompt.
+    #[arg(long, short = 'y')]
+    pub yes: bool,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct WorkspaceViewArgs {
+    /// Session to view. Defaults to the session the calling client is in.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// tmux client to move, e.g. `/dev/pts/71`. Defaults to the calling one.
+    #[arg(long)]
+    pub client: Option<String>,
+    /// Suffix that names the view. Defaults to the client's pid, which keeps
+    /// one terminal to one view instead of a new session per jump.
+    #[arg(long = "client-pid")]
+    pub client_pid: Option<String>,
+    /// Emit JSON.
+    #[arg(long)]
+    pub json: bool,
+}
+
+/// Name for a client's private view of `session`.
+///
+/// `<session>~view~<suffix>` sorts next to the session it mirrors and reads as
+/// what it is. Safe despite tmux matching session names by prefix, because an
+/// exact match wins over prefix candidates — measured on tmux 3.4 with
+/// `acme`, `acme-set` and `acme~view~1734560` all present, `-t
+/// acme` resolves to `acme`.
+fn view_session_name(session: &str, suffix: &str) -> String {
+    format!("{session}~view~{suffix}")
+}
+
+const VIEW_SESSION_FORMAT: &str =
+    "#{session_id}\t#{session_name}\t#{session_attached}\t#{session_group}\t#{destroy-unattached}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ViewSession {
+    id: String,
+    name: String,
+    attached: u32,
+    group: Option<String>,
+    destroy_unattached: bool,
+}
+
+fn parse_view_session(line: &str) -> Result<ViewSession> {
+    let mut fields = line.trim_end_matches(['\r', '\n']).splitn(5, '\t');
+    let id = fields.next().unwrap_or_default().to_string();
+    let name = fields.next().unwrap_or_default().to_string();
+    let attached = fields
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("tmux did not report session_attached"))?
+        .parse::<u32>()
+        .context("tmux reported an invalid session_attached value")?;
+    let group = fields
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let destroy_unattached = match fields.next().unwrap_or_default().trim() {
+        "1" | "on" => true,
+        "0" | "off" => false,
+        value => bail!("tmux reported an invalid destroy-unattached value {value:?}"),
+    };
+    if id.is_empty() || name.is_empty() {
+        bail!("tmux did not report a session id and name");
+    }
+    Ok(ViewSession {
+        id,
+        name,
+        attached,
+        group,
+        destroy_unattached,
+    })
+}
+
+fn list_view_sessions(control: &Control) -> Result<Vec<ViewSession>> {
+    control
+        .output(&["list-sessions", "-F", VIEW_SESSION_FORMAT])?
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(parse_view_session)
+        .collect()
+}
+
+fn resolve_view_session(control: &Control, target: &str) -> Result<ViewSession> {
+    let clients = control.output(&["list-clients", "-F", "#{client_name}\t#{session_id}"])?;
+    let session = clients
+        .lines()
+        .find_map(|line| {
+            let (name, id) = line.split_once('\t')?;
+            (name == target).then_some(id)
+        })
+        .unwrap_or(target);
+    parse_view_session(&control.output(&[
+        "display-message",
+        "-p",
+        "-t",
+        session,
+        VIEW_SESSION_FORMAT,
+    ])?)
+}
+
+fn tmux_session_id_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let sequence = |id: &str| id.strip_prefix('$').and_then(|raw| raw.parse::<u64>().ok());
+    match (sequence(left), sequence(right)) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => left.cmp(right),
+    }
+}
+
+/// Pick the same representative as topology folding. `session_group` keeps
+/// the original name after `rename-session`, so the only durable ordering is
+/// tmux's monotonically allocated numeric session id.
+fn canonical_view_source(target: &ViewSession, sessions: &[ViewSession]) -> ViewSession {
+    let Some(group) = target.group.as_deref() else {
+        return target.clone();
+    };
+    sessions
+        .iter()
+        .filter(|session| session.group.as_deref() == Some(group))
+        .min_by(|left, right| tmux_session_id_cmp(&left.id, &right.id))
+        .cloned()
+        .unwrap_or_else(|| target.clone())
+}
+
+fn expected_view_group(source: &ViewSession) -> &str {
+    source.group.as_deref().unwrap_or(&source.name)
+}
+
+/// A renamed original session should lend its new name to future views. If
+/// that original is gone and the oldest survivor is itself a generated view,
+/// remove its final view suffix instead of producing
+/// `base~view~1~view~2` on every regroup. The session-group name cannot be
+/// used as the base because tmux does not update it after `rename-session`.
+fn view_name_base(source: &ViewSession) -> &str {
+    let differs_from_group = source
+        .group
+        .as_deref()
+        .is_some_and(|group| group != source.name);
+    if source.destroy_unattached || differs_from_group {
+        if let Some((base, suffix)) = source.name.rsplit_once("~view~") {
+            if !base.is_empty() && !suffix.is_empty() {
+                return base;
+            }
+        }
+    }
+    &source.name
+}
+
+/// Reuse only a view created but not yet occupied by a racing invocation, or
+/// the view the same client has already entered. An attached session owned by
+/// another client is a name collision, not this terminal's private view.
+fn reusable_view<'a>(
+    sessions: &'a [ViewSession],
+    name: &str,
+    source: &ViewSession,
+    client_session_id: &str,
+) -> Option<&'a ViewSession> {
+    sessions.iter().find(|session| {
+        session.name == name
+            && session.group.as_deref() == Some(expected_view_group(source))
+            && (session.attached == 0 || session.id == client_session_id)
+    })
+}
+
+struct PreparedView {
+    id: String,
+    name: String,
+    created: bool,
+}
+
+fn prepare_view(
+    control: &Control,
+    client: &str,
+    source: &ViewSession,
+    suffix: &str,
+    sessions: &[ViewSession],
+) -> Result<PreparedView> {
+    let base_name = view_session_name(view_name_base(source), suffix);
+    let current_id = resolve_view_session(control, client)?.id;
+    let existing = reusable_view(sessions, &base_name, source, &current_id);
+    let mut name = base_name;
+    if existing.is_none() && sessions.iter().any(|session| session.name == name) {
+        name = unique_name(name, |candidate| {
+            sessions.iter().any(|session| session.name == candidate)
+        });
+    }
+    if let Some(existing) = existing {
+        return Ok(PreparedView {
+            id: existing.id.clone(),
+            name,
+            created: false,
+        });
+    }
+
+    let create = control.output(&[
+        "new-session",
+        "-dP",
+        "-F",
+        "#{session_id}",
+        "-t",
+        // rmux 0.10 treats -t as a group/session NAME, not a target
+        // expression: passing $N silently creates an unrelated group.
+        if control.is_rmux() {
+            &source.name
+        } else {
+            &source.id
+        },
+        "-s",
+        &name,
+    ]);
+    match create {
+        Ok(id) => Ok(PreparedView {
+            id: id.trim().to_string(),
+            name,
+            created: true,
+        }),
+        Err(create_error) => {
+            // Another hook invocation may have won the create between our
+            // listing and `new-session`. Reuse only its unattached view or the
+            // session this same client already entered.
+            let refreshed = list_view_sessions(control)?;
+            let refreshed_client_id = resolve_view_session(control, client)?.id;
+            let Some(existing) = reusable_view(&refreshed, &name, source, &refreshed_client_id)
+            else {
+                return Err(create_error);
+            };
+            Ok(PreparedView {
+                id: existing.id.clone(),
+                name,
+                created: false,
+            })
+        }
+    }
+}
+
+fn activate_view(
+    control: &Control,
+    client: &str,
+    original_session_id: &str,
+    view: &PreparedView,
+) -> Result<()> {
+    // Move the client in BEFORE `destroy-unattached`. Setting that option on a
+    // session that still has no client makes tmux reap it on the spot.
+    if let Err(error) = control.run(&["switch-client", "-c", client, "-t", &view.id]) {
+        if view.created {
+            let _ = control.run(&["kill-session", "-t", &view.id]);
+        }
+        return Err(error);
+    }
+    if let Err(error) = control.run(&["set-option", "-t", &view.id, "destroy-unattached", "on"]) {
+        if let Err(rollback) =
+            control.run(&["switch-client", "-c", client, "-t", original_session_id])
+        {
+            bail!("{error}; could not return client to {original_session_id}: {rollback}");
+        }
+        if view.created {
+            let _ = control.run(&["kill-session", "-t", &view.id]);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Give one tmux client its own view of a session, so two terminals on one
+/// workspace stop following each other's window switches.
+///
+/// A tmux session has a single current window shared by every client attached
+/// to it. A *session group* is the only thing that separates them: the window
+/// list stays shared, but each session in the group keeps its own current
+/// window. This puts the client into one.
+///
+/// A no-op when the client is the session's only one — a lone terminal needs
+/// no view, and creating one anyway would leave a second session in every
+/// listing for nothing.
+pub fn run_workspace_view(args: WorkspaceViewArgs) -> Result<()> {
+    let control = &Control::Ambient;
+    let client = match args.client.clone() {
+        Some(client) => client,
+        None => control
+            .output(&["display-message", "-p", "#{client_name}"])?
+            .trim()
+            .to_string(),
+    };
+    if client.is_empty() {
+        bail!("no tmux client to move; pass --client");
+    }
+    let client_session = resolve_view_session(control, &client)
+        .with_context(|| format!("resolve the current session for client {client:?}"))?;
+    let target = match args.session.as_deref() {
+        Some(session) => resolve_view_session(control, session)
+            .with_context(|| format!("resolve requested session {session:?}"))?,
+        None => client_session.clone(),
+    };
+    let other_clients = target
+        .attached
+        .saturating_sub(u32::from(target.id == client_session.id));
+    if other_clients == 0 {
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "client": client,
+                    "session": target.name,
+                    "view": serde_json::Value::Null,
+                    "reason": "sole client",
+                }))?
+            );
+        }
+        return Ok(());
+    }
+
+    let suffix = match args.client_pid.clone() {
+        Some(suffix) => suffix,
+        None => client_suffix(control, &client)?,
+    };
+    let suffix = if suffix.is_empty() {
+        std::process::id().to_string()
+    } else {
+        suffix
+    };
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&target, &sessions);
+    let window = control.output(&["display-message", "-p", "-t", &target.id, "#{window_id}"])?;
+    let view = prepare_view(control, &client, &source, &suffix, &sessions)?;
+    activate_view(control, &client, &client_session.id, &view)?;
+    control.run(&[
+        "select-window",
+        "-t",
+        &format!("{}:{}", view.id, window.trim()),
+    ])?;
+
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "client": client,
+                "session": source.name,
+                "view": view.name,
+                "view_id": view.id,
+            }))?
+        );
+    } else {
+        println!("client {client} now views {} as {}", source.name, view.name);
+    }
+    Ok(())
+}
+
+/// Focus a moved agent for one client. Reuse its grouped view when possible;
+/// otherwise create a private destination view if another client is there.
+pub(crate) fn focus_moved_pane(
+    control: &Control,
+    client: &str,
+    session: &str,
+    window: &str,
+    pane: &str,
+) -> Result<()> {
+    let current = resolve_view_session(control, client)?;
+    let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
+    let target = if linked.lines().any(|id| id == window) {
+        current.clone()
+    } else {
+        resolve_view_session(control, session)?
+    };
+    let others = target
+        .attached
+        .saturating_sub(u32::from(target.id == current.id));
+    let session = if others > 0 {
+        let sessions = list_view_sessions(control)?;
+        let source = canonical_view_source(&target, &sessions);
+        let suffix = client_suffix(control, client)?;
+        let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+        activate_view(control, client, &current.id, &view)?;
+        view.id
+    } else {
+        target.id
+    };
+    let target = format!("{session}:{window}");
+    control.run(&["switch-client", "-c", client, "-t", &target])?;
+    control.run(&["select-window", "-t", &target])?;
+    control.run(&[
+        "select-pane",
+        "-t",
+        &format!("{target}.{}", pane.strip_prefix("rmux:").unwrap_or(pane)),
+    ])
+}
+
+pub(crate) struct MoveFollowView {
+    pub session: String,
+    pub private: bool,
+    pub created: bool,
+}
+
+/// Prepare a destination view without switching away from the popup. Whole
+/// window moves can close that popup, so its switch must join the move queue.
+pub(crate) fn prepare_window_move_follow(
+    control: &Control,
+    client: &str,
+    session: &str,
+) -> Result<MoveFollowView> {
+    let current = resolve_view_session(control, client)?;
+    let target = resolve_view_session(control, session)?;
+    let others = target
+        .attached
+        .saturating_sub(u32::from(target.id == current.id));
+    if others == 0 {
+        return Ok(MoveFollowView {
+            session: target.id,
+            private: false,
+            created: false,
+        });
+    }
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&target, &sessions);
+    let suffix = client_suffix(control, client)?;
+    let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+    Ok(MoveFollowView {
+        session: view.id,
+        private: true,
+        created: view.created,
+    })
+}
+
+fn client_suffix(control: &Control, client: &str) -> Result<String> {
+    let listing = control.output(&["list-clients", "-F", "#{client_name}\t#{client_pid}"])?;
+    listing
+        .lines()
+        .find_map(|line| {
+            let (name, pid) = line.split_once('\t')?;
+            (name == client && !pid.is_empty()).then(|| pid.to_string())
+        })
+        .ok_or_else(|| anyhow::anyhow!("client {client:?} is no longer attached"))
+}
+
+/// Choose a private destination before changing the selected window. This
+/// avoids even a transient window switch in another terminal's session.
+pub(crate) fn prepare_jump_view(
+    control: &Control,
+    client: &str,
+    session: &str,
+    window: &str,
+) -> Result<AttachView> {
+    let current = resolve_view_session(control, client)?;
+    let linked = control.output(&["list-windows", "-t", &current.id, "-F", "#{window_id}"])?;
+    let target = if linked.lines().any(|id| id == window) {
+        current.clone()
+    } else {
+        resolve_view_session(control, session)?
+    };
+    let others = target
+        .attached
+        .saturating_sub(u32::from(current.id == target.id));
+    if others == 0 {
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
+    }
+    let opted_out = control
+        .output(&["show-options", "-v", "-t", &target.id, "@no_auto_view"])
+        .unwrap_or_default();
+    if !opted_out.trim().is_empty() {
+        return Ok(AttachView {
+            id: target.id,
+            control: control.clone(),
+            created: false,
+        });
+    }
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&target, &sessions);
+    let suffix = client_suffix(control, client)?;
+    let view = prepare_view(control, client, &source, &suffix, &sessions)?;
+    let view = AttachView {
+        id: view.id,
+        control: control.clone(),
+        created: view.created,
+    };
+    // A popup's process is terminated by switch-client. Arm cleanup on the
+    // server before switching, and keep preparation free of client moves.
+    arm_view_cleanup(control, &view.id, "client-session-changed[9001]")?;
+    Ok(view)
+}
+
+/// Keep a bare-terminal attach private as well. The guard cleans up failed
+/// attaches; a server-side client-attached hook arms destroy-unattached only
+/// after the first client arrives, so abrupt client/parent exits are covered
+/// without reaping the view before it can be attached.
+pub(crate) struct AttachView {
+    pub id: String,
+    control: Control,
+    created: bool,
+}
+
+impl Drop for AttachView {
+    fn drop(&mut self) {
+        if self.created
+            && resolve_view_session(&self.control, &self.id)
+                .is_ok_and(|session| session.attached == 0)
+        {
+            let _ = self.control.run(&["kill-session", "-t", &self.id]);
+        }
+    }
+}
+
+pub(crate) fn prepare_attach_view(control: &Control, target: &str) -> Result<AttachView> {
+    let session = resolve_view_session(control, target)?;
+    let opted_out = control
+        .output(&["show-options", "-v", "-t", &session.id, "@no_auto_view"])
+        .unwrap_or_default();
+    if session.attached == 0 || !opted_out.trim().is_empty() {
+        return Ok(AttachView {
+            id: session.id,
+            control: control.clone(),
+            created: false,
+        });
+    }
+    let sessions = list_view_sessions(control)?;
+    let source = canonical_view_source(&session, &sessions);
+    let name = unique_name(
+        view_session_name(view_name_base(&source), &std::process::id().to_string()),
+        |name| sessions.iter().any(|session| session.name == name),
+    );
+    let id = control.output(&[
+        "new-session",
+        "-dP",
+        "-F",
+        "#{session_id}",
+        "-t",
+        if control.is_rmux() {
+            &source.name
+        } else {
+            &source.id
+        },
+        "-s",
+        &name,
+    ])?;
+    let view = AttachView {
+        id: id.trim().to_string(),
+        control: control.clone(),
+        created: true,
+    };
+    // Stable server-generated session ids are quoted to keep tmux from
+    // interpreting the leading '$' as an environment expansion in the hook.
+    // Retain the guard before installing the hook so an installation failure
+    // also removes this newly created, unattached view.
+    arm_view_cleanup(control, &view.id, "client-attached[9001]")?;
+    Ok(view)
+}
+
+fn arm_view_cleanup(control: &Control, session: &str, hook: &str) -> Result<()> {
+    control.run(&[
+        "set-hook",
+        "-t",
+        session,
+        hook,
+        &format!("set-option -t '{session}' destroy-unattached on"),
+    ])
+}
+
+pub async fn run_agent_control(args: AgentControlArgs, client: &Client) -> Result<()> {
+    let result = if let Some(session) = args.session.as_deref() {
+        let sessions = client
+            .list_sessions()
+            .await
+            .context("listing native tend sessions")?;
+        let session_id = sessions
+            .iter()
+            .find(|candidate| {
+                candidate.id == session || candidate.display_name.as_deref() == Some(session)
+            })
+            .map_or_else(|| session.to_string(), |candidate| candidate.id.clone());
+        if args.action == AgentControlAction::Terminate
+            && !confirm_destructive(
+                args.yes,
+                &format!("Terminate native agent session {session_id}?"),
+            )?
+        {
+            println!("cancelled");
+            return Ok(());
+        }
+        match args.action {
+            AgentControlAction::Interrupt => client
+                .write_session(&session_id, "\u{3}")
+                .await
+                .context("interrupting native agent session")?,
+            AgentControlAction::Terminate => client
+                .terminate_session(&session_id)
+                .await
+                .context("terminating native agent session")?,
+        }
+        ManageResult::SessionControl {
+            action: args.action,
+            session: session_id,
+        }
+    } else {
+        let pane = args.pane.as_deref().expect("clap requires pane or session");
+        if args.action == AgentControlAction::Terminate
+            && !confirm_destructive(args.yes, &format!("Terminate managed agent pane {pane}?"))?
+        {
+            println!("cancelled");
+            return Ok(());
+        }
+        control_agent(pane, args.action, args.yes)?
+    };
+    print_result(&result, args.json)
+}
+
+pub fn run_window_rename(args: WindowRenameArgs) -> Result<()> {
+    let name = match args.buffer.as_deref() {
+        Some(buffer) => Some(take_window_name_buffer(buffer)?),
+        None => args.name.clone(),
+    };
+    let result = rename_window(args.window.as_deref(), name.as_deref(), args.auto)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    } else if result.automatic {
+        println!(
+            "window {} ({}) now uses automatic name {:?}",
+            result.window_id, result.session_name, result.name
+        );
+    } else {
+        println!(
+            "renamed window {} ({}) from {:?} to {:?}",
+            result.window_id, result.session_name, result.previous_name, result.name
+        );
+    }
+    Ok(())
+}
+
+/// Move one command-prompt response across the tmux boundary without ever
+/// interpolating it into a shell command. The binding stores the response in
+/// a per-client named buffer; this reads and immediately deletes that buffer.
+fn take_window_name_buffer(buffer: &str) -> Result<String> {
+    if buffer.trim().is_empty() {
+        bail!("tmux buffer name cannot be empty");
+    }
+    let value = tmux_output(&["show-buffer", "-b", buffer])?;
+    tmux_status(&["delete-buffer", "-b", buffer])
+        .with_context(|| format!("delete consumed tmux buffer {buffer:?}"))?;
+    Ok(value.trim_end_matches(['\r', '\n']).to_string())
+}
+
+/// Report that this agent has finished its part, which is what opens an
+/// `after` edge for whatever waits on it.
+///
+/// tend cannot observe "done" any other way: agent state says `idle` both
+/// when an agent has finished and when it is between thoughts, and a pane
+/// stays open either way. So the agent says so, and tend records the claim
+/// rather than inferring one.
+pub async fn run_work_done(
+    args: WorkDoneArgs,
+    client: &tend::ipc::Client,
+    config: &tend::config::Config,
+) -> Result<()> {
+    let pane = args
+        .pane
+        .clone()
+        .or_else(crate::mcp::own_tmux_pane)
+        .filter(|pane| !pane.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("no pane to read; pass --pane (outside tmux, or under a shared Codex app-server whose TMUX_PANE names another pane)"))?;
+    validate_pane_id(&pane)?;
+    let alias = match args.alias.clone() {
+        Some(alias) => alias,
+        None => pane_option(&pane, AGENT_ALIAS_OPTION)?
+            .ok_or_else(|| anyhow::anyhow!("pane {pane} has no pipeline alias; pass --alias"))?,
+    }
+    .trim()
+    .to_ascii_lowercase();
+    let workspace = pane_option(&pane, PANE_WORKSPACE_OPTION)?.ok_or_else(|| {
+        anyhow::anyhow!("pane {pane} has no pipeline workspace; run `tend work up` first")
+    })?;
+    let work = pane_option(&pane, PANE_WORK_OPTION)?.ok_or_else(|| {
+        anyhow::anyhow!("pane {pane} has no pipeline Work; run `tend work up` first")
+    })?;
+    let generation = match args.generation {
+        Some(generation) => generation,
+        None => pane_option(&pane, AGENT_GENERATION_OPTION)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pane {pane} has no pipeline generation; run `tend work up` to adopt it"
+                )
+            })?
+            .parse::<u64>()
+            .with_context(|| format!("pane {pane} has an invalid pipeline generation"))?,
+    };
+    let identity = tend::work::WorkIdentity::new(workspace, work);
+    let run = if args.undo {
+        client
+            .pipeline_invalidate(&identity, &alias, generation)
+            .await
+            .with_context(|| format!("invalidate pipeline alias {alias:?}"))?
+    } else {
+        client
+            .pipeline_done(&identity, &alias, generation)
+            .await
+            .with_context(|| format!("atomically complete pipeline alias {alias:?}"))?
+    };
+    // Completion is the event that drives reconciliation; callers never need
+    // to remember a second `work up`. The daemon also subscribes to this same
+    // durable revision as a crash/restart safety net.
+    crate::work_up::reconcile_run(client, config, &identity, run.generation).await?;
+    let done = run
+        .aliases
+        .values()
+        .filter(|state| state.status == tend::pipeline_run::PipelineAliasStatus::Done)
+        .map(|state| state.alias.clone())
+        .collect::<Vec<_>>();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "work": identity,
+                "alias": alias,
+                "generation": run.generation,
+                "done": done,
+            }))?
+        );
+    } else if args.undo {
+        println!("{alias} is no longer reported done");
+    } else {
+        println!("{alias} reported done ({})", done.join(", "));
+    }
+    Ok(())
+}
+
+/// Give `pane` a room-local handle if nothing has named it yet. Returns the
+/// alias the pane now answers to, or `None` when it already had one or the
+/// room has no free name left.
+///
+/// The addressing vocabulary was never what was missing — `resolve_target`
+/// has understood `@alias` for as long as collaboration has existed. What
+/// was missing is that nothing *minted* one: an alias appeared only if
+/// `tend work up` stamped a pipeline name or the agent called
+/// `tend identity set` on itself, which an agent started by hand never
+/// does. So in practice every peer call fell back to `%1242` — unique,
+/// correct, and unreadable. You cannot tell which pane it is without
+/// asking tmux, and you certainly cannot remember it between two calls.
+///
+/// The name goes on the pane rather than into the daemon, for the same
+/// reason the pipeline alias does: it has to outlive tendd, this CLI
+/// process, and the agent restarting in place, so the *slot* keeps its
+/// name across all three. It dies with the pane, which is exactly right —
+/// a handle is worth keeping only while the thing it addresses exists.
+/// Budget for registering an explicit alias. A launch must not stall on a
+/// wedged daemon; past this the name is written unrefereed.
+const RESERVE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Whether anything has already named `pane`.
+///
+/// One tmux call, and the answer for every session start after the first —
+/// which is why it comes before asking the daemon for anything.
+pub fn pane_is_named(pane: &str) -> Result<bool> {
+    validate_pane_id(pane)?;
+    Ok(pane_option(pane, AGENT_ALIAS_OPTION)?.is_some())
+}
+
+/// Write a handle the room's arbiter issued onto `pane`, but only if nothing
+/// has named it. Returns the name the pane ends up answering to, or `None`
+/// when somebody else got there first.
+///
+/// The daemon decides *which* name; this only writes it, and the write stays
+/// conditional because the daemon is not the only writer of a pane option.
+/// `agent_launch::start` launches the agent — which fires its session-start
+/// hook immediately — and only then stamps a pipeline's explicit alias, so a
+/// hook that read "unnamed" before that stamp landed would overwrite a
+/// `review` with a `claude`.
+///
+/// `set-option -o` refuses an option that is already set, which settles both
+/// orders in the pipeline's favour without either side coordinating: an
+/// explicit alias landing first makes this a no-op, and one landing second
+/// overwrites it with a plain set. `-q` keeps tmux's "already set" message
+/// off the agent's stderr, which also makes the exit status the same either
+/// way — so the pane option itself is the verdict, read back rather than
+/// inferred from a status whose shape is tmux's business.
+pub fn claim_alias(pane: &str, alias: &str) -> Result<Option<String>> {
+    validate_pane_id(pane)?;
+    tmux_status(&[
+        "set-option",
+        "-p",
+        "-o",
+        "-q",
+        "-t",
+        pane,
+        AGENT_ALIAS_OPTION,
+        alias,
+    ])?;
+    Ok(pane_option(pane, AGENT_ALIAS_OPTION)?.filter(|held| held == alias))
+}
+
+fn pane_option(pane: &str, key: &str) -> Result<Option<String>> {
+    let raw = tmux_output(&["display-message", "-p", "-t", pane, &format!("#{{{key}}}")])?;
+    Ok(option(raw.trim()))
+}
+
+pub async fn run_work_list(args: WorkListArgs, client: &tend::ipc::Client) -> Result<()> {
+    let works = match args.workspace.as_deref() {
+        Some(workspace) => find_workspace(workspace)?
+            .map(|workspace| workspace.works)
+            .unwrap_or_default(),
+        None => list_works()?,
+    };
+    let visible_runs = client
+        .pipeline_runs()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|run| {
+            args.workspace
+                .as_deref()
+                .is_none_or(|workspace| run.identity.workspace_id == workspace)
+        })
+        .collect::<Vec<_>>();
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "works": works,
+                "pipeline_runs": visible_runs,
+            }))?
+        );
+    } else if works.is_empty() && visible_runs.is_empty() {
+        println!("no tend-managed work or durable pipeline Runs");
+    } else {
+        let theme = crate::theme::for_theme(
+            tend::config::Config::load_or_default(None)
+                .map(|cfg| cfg.ui.theme)
+                .unwrap_or_default(),
+            crate::use_colors(),
+        );
+        print!(
+            "{}",
+            work_list_table(&works, &work_annotations(), &visible_runs, theme)
+        );
+    }
+    Ok(())
+}
+
+/// Render the work table.
+///
+/// Pure on its inputs so the layout is testable without a tmux server; the
+/// caller supplies the works, their annotations, and the theme.
+fn work_list_table(
+    works: &[WorkInfo],
+    records: &[WorkRecord],
+    runs: &[tend::pipeline_run::PipelineRun],
+    theme: crate::theme::CliTheme,
+) -> String {
+    use comfy_table::{ContentArrangement, Table};
+
+    let staged: Vec<Option<String>> = works
+        .iter()
+        .map(|work| {
+            stage_for(work, records)
+                .filter(|stage| *stage != WorkStage::Auto)
+                .map(|stage| stage.label().to_string())
+        })
+        .collect();
+    let run_stages = runs
+        .iter()
+        .map(|run| {
+            stage_for_identity(&run.identity, records)
+                .filter(|stage| *stage != WorkStage::Auto)
+                .map(|stage| stage.label().to_string())
+        })
+        .collect::<Vec<_>>();
+    // The column only earns its width when something is actually staged.
+    let show_stage = staged.iter().chain(&run_stages).any(Option::is_some);
+
+    let mut header = vec!["WORK", "WORKSPACE", "GEN", "ALIASES", "DONE"];
+    if show_stage {
+        header.push("STAGE");
+    }
+    header.push("CWD");
+
+    let mut table = Table::new();
+    table
+        .load_preset(comfy_table::presets::UTF8_BORDERS_ONLY)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(
+            header
+                .into_iter()
+                .map(|label| theme.cell(label, TableTone::Header))
+                .collect::<Vec<_>>(),
+        );
+
+    for (work, stage) in works.iter().zip(&staged) {
+        let run = runs.iter().find(|run| {
+            run.identity.workspace_id == work.workspace && run.identity.work_id == work.work
+        });
+        let completion = run.map(tend::pipeline_run::PipelineRun::completion);
+        let mut row = vec![
+            theme.cell(&work.work, TableTone::Accent),
+            theme.cell(&work.workspace, TableTone::Dim),
+            run.map_or_else(
+                || theme.right_cell("-", TableTone::Dim),
+                |run| theme.right_cell(run.generation, TableTone::Dim),
+            ),
+            theme.cell(
+                run.map_or_else(|| agent_summary(work), pipeline_alias_summary),
+                TableTone::Tmux,
+            ),
+            match completion {
+                // No Run, or a Run that named no agents: nothing here was ever
+                // asked to report, and `0/N` would say the opposite.
+                None | Some((_, 0)) => theme.right_cell("-", TableTone::Dim),
+                Some((done, total)) if done == total => {
+                    theme.right_cell(format!("{done}/{total}"), TableTone::Good)
+                }
+                Some((done, total)) => theme.right_cell(format!("{done}/{total}"), TableTone::Warn),
+            },
+        ];
+        if show_stage {
+            row.push(theme.cell(stage.as_deref().unwrap_or("-"), TableTone::Dim));
+        }
+        row.push(theme.cell(shorten_home(&work.cwd), TableTone::Dim));
+        table.add_row(row);
+    }
+    for (run, stage) in runs.iter().zip(&run_stages).filter(|(run, _)| {
+        !works.iter().any(|work| {
+            run.identity.workspace_id == work.workspace && run.identity.work_id == work.work
+        })
+    }) {
+        let (done, total) = run.completion();
+        let mut row = vec![
+            theme.cell(&run.identity.work_id, TableTone::Accent),
+            theme.cell(&run.identity.workspace_id, TableTone::Dim),
+            theme.right_cell(run.generation, TableTone::Dim),
+            theme.cell(pipeline_alias_summary(run), TableTone::Tmux),
+            if done == total {
+                theme.right_cell(format!("{done}/{total}"), TableTone::Good)
+            } else {
+                theme.right_cell(format!("{done}/{total}"), TableTone::Warn)
+            },
+        ];
+        if show_stage {
+            row.push(theme.cell(stage.as_deref().unwrap_or("-"), TableTone::Dim));
+        }
+        row.push(theme.cell(shorten_home(&run.cwd), TableTone::Dim));
+        table.add_row(row);
+    }
+    format!("{table}\n")
+}
+
+fn pipeline_alias_summary(run: &tend::pipeline_run::PipelineRun) -> String {
+    run.desired
+        .iter()
+        .filter_map(|agent| {
+            run.aliases
+                .get(&agent.alias)
+                .map(|state| format!("{}:{}", agent.alias, state.status))
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
+/// Who is in the window: pipeline aliases when it has them, otherwise the
+/// agent programs, collapsed so three claudes read as `claude x3` rather than
+/// as a list.
+fn agent_summary(work: &WorkInfo) -> String {
+    let aliases: Vec<&str> = work
+        .agents
+        .iter()
+        .filter_map(|agent| agent.alias.as_deref())
+        .collect();
+    if !aliases.is_empty() {
+        return aliases.join(" \u{b7} ");
+    }
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for agent in &work.agents {
+        match counts.iter_mut().find(|(name, _)| *name == agent.agent) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((agent.agent.as_str(), 1)),
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(name, count)| {
+            if count > 1 {
+                format!("{name} x{count}")
+            } else {
+                name.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" \u{b7} ")
+}
+
+/// `/home/june/x` -> `~/x`, so the column spends its width on the part that
+/// differs between rows.
+fn shorten_home(path: &Path) -> String {
+    let Some(home) = dirs::home_dir() else {
+        return path.display().to_string();
+    };
+    path.strip_prefix(&home).map_or_else(
+        |_| path.display().to_string(),
+        |rest| {
+            if rest.as_os_str().is_empty() {
+                "~".to_string()
+            } else {
+                format!("~/{}", rest.display())
+            }
+        },
+    )
+}
+
+pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
+    let work = find_work_in(&args.work, args.workspace.as_deref())?
+        .ok_or_else(|| anyhow::anyhow!("managed work {:?} not found", args.work))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&work)?);
+    } else {
+        let records = work_annotations();
+        println!(
+            "{}  workspace={}  session={}  window={}  cwd={}{}",
+            work.work,
+            work.workspace,
+            work.session,
+            work.window,
+            work.cwd.display(),
+            stage_suffix(&work, &records)
+        );
+        for agent in &work.agents {
+            println!(
+                "  {}  {}{}{}{}",
+                agent.pane,
+                agent.agent,
+                agent
+                    .alias
+                    .as_deref()
+                    .map_or_else(String::new, |alias| format!(" alias={alias}")),
+                agent
+                    .role
+                    .as_deref()
+                    .map_or_else(String::new, |role| format!(" role={role}")),
+                agent
+                    .task
+                    .as_deref()
+                    .map_or_else(String::new, |task| format!(" task={task}"))
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn run_work_close(args: WorkCloseArgs) -> Result<()> {
+    if !confirm_destructive(
+        args.yes,
+        &format!("Close work {} and all agent panes?", args.work),
+    )? {
+        println!("cancelled");
+        return Ok(());
+    }
+    let result = close_work(&args.work, args.workspace.as_deref(), args.yes)?;
+    print_result(&result, args.json)
+}
+
+pub fn run_workspace_list(args: WorkspaceListArgs) -> Result<()> {
+    let workspaces = list_workspaces()?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json_workspaces(&workspaces))?
+        );
+    } else if workspaces.is_empty() {
+        println!("no tend-managed workspaces");
+    } else {
+        for workspace in workspaces {
+            println!(
+                "{}  session={}  works={}  cwd={}",
+                workspace.workspace,
+                workspace.session,
+                workspace.works.len(),
+                workspace.cwd.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn run_workspace_show(args: WorkspaceShowArgs) -> Result<()> {
+    let workspace = find_workspace(&args.workspace)?
+        .ok_or_else(|| anyhow::anyhow!("managed workspace {:?} not found", args.workspace))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&workspace)?);
+    } else {
+        println!(
+            "{}  session={}  works={}  cwd={}",
+            workspace.workspace,
+            workspace.session,
+            workspace.works.len(),
+            workspace.cwd.display()
+        );
+        for work in &workspace.works {
+            println!(
+                "  {}  window={}  agents={}  cwd={}",
+                work.work,
+                work.window,
+                work.agents.len(),
+                work.cwd.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+pub fn run_workspace_close(args: WorkspaceCloseArgs) -> Result<()> {
+    if !confirm_destructive(
+        args.yes,
+        &format!(
+            "Close workspace {} and every work window and agent pane?",
+            args.workspace
+        ),
+    )? {
+        println!("cancelled");
+        return Ok(());
+    }
+    let result = close_workspace(&args.workspace, args.yes)?;
+    print_result(&result, args.json)
+}
+
+pub fn manage(request: ManageRequest) -> Result<ManageResult> {
+    match request.action {
+        ManageAction::ListWorkspace => Ok(ManageResult::Workspaces {
+            workspaces: list_workspaces()?,
+        }),
+        ManageAction::ShowWorkspace => {
+            let raw = required(
+                request.workspace.as_deref(),
+                "show_workspace requires workspace",
+            )?;
+            let workspace = find_workspace(raw)?
+                .ok_or_else(|| anyhow::anyhow!("managed workspace {raw:?} not found"))?;
+            Ok(ManageResult::Workspace { workspace })
+        }
+        ManageAction::ListWork => Ok(ManageResult::Works {
+            works: match request.workspace.as_deref() {
+                Some(workspace) => find_workspace(workspace)?
+                    .map(|workspace| workspace.works)
+                    .unwrap_or_default(),
+                None => list_works()?,
+            },
+        }),
+        ManageAction::ShowWork => {
+            let raw = required(request.work.as_deref(), "show_work requires work")?;
+            let work = find_work_in(raw, request.workspace.as_deref())?
+                .ok_or_else(|| anyhow::anyhow!("managed work {raw:?} not found"))?;
+            Ok(ManageResult::Work { work })
+        }
+        ManageAction::InterruptAgent => {
+            let pane = required(request.pane.as_deref(), "interrupt_agent requires pane")?;
+            control_agent(pane, AgentControlAction::Interrupt, true)
+        }
+        ManageAction::TerminateAgent => {
+            let pane = required(request.pane.as_deref(), "terminate_agent requires pane")?;
+            control_agent(pane, AgentControlAction::Terminate, request.confirm)
+        }
+        ManageAction::CloseWork => {
+            let work = required(request.work.as_deref(), "close_work requires work")?;
+            close_work(work, request.workspace.as_deref(), request.confirm)
+        }
+        ManageAction::CloseWorkspace => {
+            let workspace = required(
+                request.workspace.as_deref(),
+                "close_workspace requires workspace",
+            )?;
+            close_workspace(workspace, request.confirm)
+        }
+    }
+}
+
+pub fn normalize_work_id(raw: &str) -> Result<String> {
+    let work = raw.trim().to_ascii_uppercase();
+    if work.is_empty() {
+        bail!("work id cannot be empty");
+    }
+    if work.len() > 128 {
+        bail!("work id is too long (max 128 bytes)");
+    }
+    if work
+        .chars()
+        .any(|ch| ch == '\t' || ch == '\n' || ch == '\r')
+    {
+        bail!("work id cannot contain tabs or newlines");
+    }
+    Ok(work)
+}
+
+pub fn normalize_workspace_id(raw: &str) -> Result<String> {
+    let workspace = raw.trim().to_ascii_lowercase();
+    if workspace.is_empty() {
+        bail!("workspace id cannot be empty");
+    }
+    if workspace.len() > 128 {
+        bail!("workspace id is too long (max 128 bytes)");
+    }
+    if workspace
+        .chars()
+        .any(|ch| ch == '\t' || ch == '\n' || ch == '\r')
+    {
+        bail!("workspace id cannot contain tabs or newlines");
+    }
+    Ok(workspace)
+}
+
+pub fn workspace_id_for_cwd(cwd: &Path) -> Result<String> {
+    let name = cwd
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("workspace");
+    normalize_workspace_id(name)
+}
+
+pub fn find_work_in(raw: &str, workspace: Option<&str>) -> Result<Option<WorkInfo>> {
+    let wanted = normalize_work_id(raw)?;
+    let workspace = workspace.map(normalize_workspace_id).transpose()?;
+    let mut matches = list_works()?
+        .into_iter()
+        .filter(|work| {
+            work.work == wanted
+                && workspace
+                    .as_deref()
+                    .is_none_or(|workspace| work.workspace == workspace)
+        })
+        .collect::<Vec<_>>();
+    if matches.len() > 1 {
+        bail!("work {wanted} exists in multiple workspaces; specify --workspace");
+    }
+    Ok(matches.pop())
+}
+
+pub fn find_workspace(raw: &str) -> Result<Option<WorkspaceInfo>> {
+    let wanted = normalize_workspace_id(raw)?;
+    Ok(list_workspaces()?
+        .into_iter()
+        .find(|workspace| workspace.workspace == wanted))
+}
+
+/// A workspace mark that does not agree with the session names around it.
+///
+/// Neither shape is treated as an error. tend resolves a workspace through
+/// its mark and falls back to the session name, and that order is right: the
+/// mark is the explicit identity, and it is what lets a renamed or adopted
+/// session keep working. These are the states where the two sources disagree
+/// and a human would want to know before wondering why a launch landed
+/// somewhere unexpected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarkAnomaly {
+    /// The workspace is claimed by one session while a *different* session
+    /// carries the name the workspace would otherwise resolve to. The mark
+    /// wins, so `--workspace acme` goes to the claiming session even
+    /// though a session named `acme` is sitting right there.
+    Shadowed {
+        workspace: String,
+        claimed_by: String,
+        named: String,
+    },
+    /// Two or more sessions claim the same workspace. One session is one
+    /// workspace, so this is a state tend should not be able to reach —
+    /// lookups take the first tmux happens to list.
+    Duplicated {
+        workspace: String,
+        sessions: Vec<String>,
+    },
+}
+
+impl std::fmt::Display for MarkAnomaly {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shadowed {
+                workspace,
+                claimed_by,
+                named,
+            } => write!(
+                f,
+                "workspace {workspace} is claimed by session {claimed_by}, \
+                 but a different session is named {named} — launches into \
+                 {workspace} go to {claimed_by}"
+            ),
+            Self::Duplicated {
+                workspace,
+                sessions,
+            } => write!(
+                f,
+                "workspace {workspace} is claimed by {} sessions ({}) — \
+                 lookups take whichever tmux lists first",
+                sessions.len(),
+                sessions.join(", ")
+            ),
+        }
+    }
+}
+
+/// Disagreements between the workspace marks and the session names, read from
+/// the live tmux server.
+pub fn workspace_mark_anomalies() -> Result<Vec<MarkAnomaly>> {
+    Ok(mark_anomalies(&list_workspaces()?, &all_session_names()?))
+}
+
+/// The pure half of [`workspace_mark_anomalies`], so the shapes can be tested
+/// without a tmux server.
+pub fn mark_anomalies(workspaces: &[WorkspaceInfo], session_names: &[String]) -> Vec<MarkAnomaly> {
+    let mut anomalies = Vec::new();
+    let mut claimants: Vec<(&str, Vec<&str>)> = Vec::new();
+    for workspace in workspaces {
+        match claimants
+            .iter_mut()
+            .find(|(id, _)| *id == workspace.workspace)
+        {
+            Some((_, sessions)) => sessions.push(&workspace.session),
+            None => claimants.push((&workspace.workspace, vec![&workspace.session])),
+        }
+    }
+    for (workspace, sessions) in &claimants {
+        if sessions.len() > 1 {
+            anomalies.push(MarkAnomaly::Duplicated {
+                workspace: (*workspace).to_string(),
+                sessions: sessions.iter().map(|s| (*s).to_string()).collect(),
+            });
+            continue;
+        }
+        // The name a workspace resolves to when nothing claims it, which is
+        // what `adoptable_session` matches on.
+        let named = sanitize_session_name(&workspace.to_ascii_lowercase());
+        let claimed_by = sessions[0];
+        if claimed_by != named && session_names.iter().any(|name| name == &named) {
+            anomalies.push(MarkAnomaly::Shadowed {
+                workspace: (*workspace).to_string(),
+                claimed_by: claimed_by.to_string(),
+                named,
+            });
+        }
+    }
+    anomalies
+}
+
+pub fn list_works() -> Result<Vec<WorkInfo>> {
+    Ok(list_workspaces()?
+        .into_iter()
+        .flat_map(|workspace| workspace.works)
+        .collect())
+}
+
+pub fn list_workspaces() -> Result<Vec<WorkspaceInfo>> {
+    let sessions = tmux_output_allow_no_server(&["list-sessions", "-F", SESSION_FORMAT])?;
+    let windows = tmux_output_allow_no_server(&["list-windows", "-a", "-F", WINDOW_FORMAT])?;
+    let panes = tmux_output_allow_no_server(&["list-panes", "-a", "-F", PANE_FORMAT])?;
+    Ok(parse_workspaces(&sessions, &windows, &panes))
+}
+
+/// A session tend may put this workspace's work windows into without
+/// having created it: one already named after the workspace. Returns its
+/// tmux *session id*, not its name.
+///
+/// Refusing to adopt splits a workspace across `acme` and `acme-2`,
+/// which contradicts the whole model — one session is one workspace. The
+/// safety that mattered was never "do not touch it"; it is that
+/// `close_workspace` refuses a session tend did not create.
+///
+/// The id comes out of the same listing that matched the name, so nothing
+/// between here and the write has to look the session up again: see
+/// [`adopt_workspace`] for why a name handed back to tmux is not the same
+/// session it came from.
+pub fn adoptable_session(workspace: &str) -> Result<Option<String>> {
+    let normalized = normalize_workspace_id(workspace)?;
+    let wanted = sanitize_session_name(&normalized.to_ascii_lowercase());
+    Ok(all_sessions()?
+        .into_iter()
+        .find(|(name, _)| name == &wanted)
+        .map(|(_, id)| id))
+}
+
+pub fn session_name_for_workspace(workspace: &str) -> Result<String> {
+    let normalized = normalize_workspace_id(workspace)?;
+    let base = sanitize_session_name(&normalized.to_ascii_lowercase());
+    let existing = all_session_names()?;
+    Ok(unique_name(base, |candidate| {
+        existing.iter().any(|name| name == candidate)
+    }))
+}
+
+pub fn window_name_for_work(work: &str) -> Result<String> {
+    Ok(sanitize_window_name(&normalize_work_id(work)?))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowIdentity {
+    window_id: String,
+    session_id: String,
+    session_name: String,
+    name: String,
+}
+
+fn rename_window(
+    target: Option<&str>,
+    name: Option<&str>,
+    automatic: bool,
+) -> Result<WindowRenameResult> {
+    let before = resolve_window_identity(target)?;
+    if automatic {
+        set_window_automatic_rename(&before.window_id, true)?;
+    } else {
+        let name = normalize_window_name(required(name, "window rename requires NAME or --auto")?)?;
+        ensure_window_name_available(&before, &name)?;
+        // Pin the mode explicitly. `rename-window` currently disables automatic
+        // rename itself, but relying on that side effect makes the policy
+        // sensitive to tmux behavior changes.
+        set_window_automatic_rename(&before.window_id, false)?;
+        tmux_status(&["rename-window", "-t", &before.window_id, &name])?;
+    }
+    let after = resolve_window_identity(Some(&before.window_id))?;
+    Ok(WindowRenameResult {
+        window_id: after.window_id,
+        session_id: after.session_id,
+        session_name: after.session_name,
+        previous_name: before.name,
+        name: after.name,
+        automatic,
+    })
+}
+
+fn resolve_window_identity(target: Option<&str>) -> Result<WindowIdentity> {
+    let target = target
+        .filter(|target| !target.trim().is_empty())
+        .map(str::to_string)
+        .or_else(crate::mcp::own_tmux_pane)
+        .ok_or_else(|| {
+            anyhow::anyhow!("window target is required outside tmux; pass --window @N")
+        })?;
+    if crate::mux_control::ambient_rmux().is_some() {
+        // A grouped @window may be linked into a different session from the
+        // caller. rmux 0.10's display-message can then report empty identity
+        // fields; enumeration gives each link its explicit session context.
+        let native = target.strip_prefix("rmux:").unwrap_or(&target);
+        let rows = if native.starts_with('@') {
+            tmux_output(&["list-windows", "-a", "-F", WINDOW_IDENTITY_FORMAT])?
+        } else if native.starts_with('%') {
+            let format = format!("#{{pane_id}}\t{WINDOW_IDENTITY_FORMAT}");
+            tmux_output(&["list-panes", "-a", "-F", &format])?
+                .lines()
+                .filter_map(|line| line.split_once('\t'))
+                .filter(|(pane, _)| *pane == native)
+                .map(|(_, identity)| identity.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            String::new()
+        };
+        let mut matches: Vec<_> = rows
+            .lines()
+            .filter_map(parse_window_identity)
+            .filter(|identity| !native.starts_with('@') || identity.window_id == native)
+            .collect();
+        matches.sort_by(|a, b| tmux_session_id_cmp(&a.session_id, &b.session_id));
+        if let Some(identity) = matches.into_iter().next() {
+            return Ok(identity);
+        }
+    }
+    let output = tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        &target,
+        WINDOW_IDENTITY_FORMAT,
+    ])?;
+    parse_window_identity(output.trim_end_matches(['\r', '\n'])).ok_or_else(|| {
+        anyhow::anyhow!("tmux target {target:?} did not resolve to a complete window identity")
+    })
+}
+
+fn parse_window_identity(line: &str) -> Option<WindowIdentity> {
+    let mut fields = line.splitn(5, '\t');
+    let window_id = fields.next()?.trim();
+    let session_id = fields.next()?.trim();
+    let session_name = fields.next()?;
+    let name = fields.next()?;
+    // Consume the mode field as part of validating the complete format even
+    // though the caller already knows which mode it requested.
+    fields.next()?;
+    if !window_id.starts_with('@') || !session_id.starts_with('$') || session_name.is_empty() {
+        return None;
+    }
+    Some(WindowIdentity {
+        window_id: window_id.into(),
+        session_id: session_id.into(),
+        session_name: session_name.into(),
+        name: name.into(),
+    })
+}
+
+fn ensure_window_name_available(window: &WindowIdentity, name: &str) -> Result<()> {
+    let rows = tmux_output(&[
+        "list-windows",
+        "-t",
+        &window.session_id,
+        "-F",
+        "#{window_id}\t#{window_name}",
+    ])?;
+    if rows.lines().any(|line| {
+        line.split_once('\t')
+            .is_some_and(|(window_id, current)| window_id != window.window_id && current == name)
+    }) {
+        bail!(
+            "window name {name:?} already exists in session {} ({})",
+            window.session_name,
+            window.session_id
+        );
+    }
+    Ok(())
+}
+
+fn set_window_automatic_rename(window: &str, enabled: bool) -> Result<()> {
+    set_option(
+        OptionScope::Window,
+        window,
+        "automatic-rename",
+        if enabled { "on" } else { "off" },
+    )
+}
+
+/// Give an adopted session a workspace identity without claiming it.
+///
+/// Deliberately does not set `@tend_managed_workspace`: that flag is what
+/// `close_workspace` reads, and tend must not offer to kill a session full
+/// of windows somebody else opened.
+/// Takes a tmux session *id* (`$5`), never a name.
+///
+/// tmux resolves a bare name by exact match, then as a pattern, then as a
+/// unique prefix — and that last step is silent. So a name that named one
+/// session when tend looked it up can name a *different* one by the time the
+/// write goes out: with `acme` gone and `acme-set` the only session
+/// left starting with those letters, `set-option -t acme` succeeds against
+/// `acme-set`, exit 0. The `=name` spelling does not close this, because
+/// tmux 3.4 refuses it for `set-option` (it accepts it for `kill-session`,
+/// which is why `close_workspace` is already safe). An id is the only
+/// spelling that means one session and nothing else.
+pub fn adopt_workspace(session_id: &str, workspace: &str) -> Result<()> {
+    validate_session_id(session_id)?;
+    let workspace = normalize_workspace_id(workspace)?;
+    set_option(
+        OptionScope::Session,
+        session_id,
+        WORKSPACE_ID_OPTION,
+        &workspace,
+    )
+}
+
+/// Takes a tmux session *id* — see [`adopt_workspace`].
+pub fn mark_workspace(session_id: &str, workspace: &str, cwd: &Path) -> Result<()> {
+    validate_session_id(session_id)?;
+    let workspace = normalize_workspace_id(workspace)?;
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("workspace cwd is not valid UTF-8: {}", cwd.display()))?;
+    set_option(
+        OptionScope::Session,
+        session_id,
+        WORKSPACE_ID_OPTION,
+        &workspace,
+    )?;
+    set_option(OptionScope::Session, session_id, WORKSPACE_CWD_OPTION, cwd)?;
+    set_option(
+        OptionScope::Session,
+        session_id,
+        MANAGED_WORKSPACE_OPTION,
+        "1",
+    )?;
+    Ok(())
+}
+
+pub fn mark_work(window: &str, workspace: &str, work: &str, cwd: &Path) -> Result<()> {
+    let workspace = normalize_workspace_id(workspace)?;
+    let work = normalize_work_id(work)?;
+    let cwd = cwd
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("work cwd is not valid UTF-8: {}", cwd.display()))?;
+    set_option(OptionScope::Window, window, WORK_ID_OPTION, &work)?;
+    set_option(OptionScope::Window, window, WORK_CWD_OPTION, cwd)?;
+    set_option(OptionScope::Window, window, MANAGED_WORK_OPTION, "1")?;
+    set_option(OptionScope::Window, window, WORKSPACE_ID_OPTION, &workspace)?;
+    set_window_automatic_rename(window, false)?;
+    Ok(())
+}
+
+/// Attach a provider-neutral external issue snapshot to a managed work
+/// window. These options let tendd discover the association and persist it in
+/// the durable work store without teaching tendd a Linear/GitHub/Jira client.
+pub fn mark_work_external(window: &str, ticket: &tend::pipeline::Ticket) -> Result<()> {
+    let Some(source) = ticket.source.as_deref() else {
+        return Ok(());
+    };
+    set_option(
+        OptionScope::Window,
+        window,
+        EXTERNAL_SOURCE_OPTION,
+        &metadata(source, 64)?,
+    )?;
+    set_option(
+        OptionScope::Window,
+        window,
+        EXTERNAL_KEY_OPTION,
+        &metadata(&ticket.id, 128)?,
+    )?;
+    for (key, value, max) in [
+        (EXTERNAL_SCOPE_OPTION, ticket.scope.as_deref(), 256),
+        (EXTERNAL_STABLE_ID_OPTION, ticket.stable_id.as_deref(), 256),
+        (EXTERNAL_TITLE_OPTION, ticket.title.as_deref(), 512),
+        (EXTERNAL_URL_OPTION, ticket.url.as_deref(), 2_048),
+        (EXTERNAL_STATUS_OPTION, ticket.state.as_deref(), 128),
+    ] {
+        // Write every field, including empty ones. Otherwise changing the
+        // linked issue could combine its key with the previous issue's URL,
+        // title, or provider status left behind on this Run window.
+        set_option(
+            OptionScope::Window,
+            window,
+            key,
+            &external_option_value(value, max),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // pane metadata is an explicit flat tmux option contract
+pub fn mark_agent(
+    pane: &str,
+    agent: &str,
+    workspace: Option<&str>,
+    work: Option<&str>,
+    role: Option<&str>,
+    task: Option<&str>,
+    alias: Option<&str>,
+    generation: Option<u64>,
+    socket: &Path,
+) -> Result<()> {
+    validate_pane_id(pane)?;
+    set_option(OptionScope::Pane, pane, AGENT_OPTION, &metadata(agent, 64)?)?;
+    set_option(OptionScope::Pane, pane, MANAGED_AGENT_OPTION, "1")?;
+    if let Some(workspace) = workspace {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            PANE_WORKSPACE_OPTION,
+            &normalize_workspace_id(workspace)?,
+        )?;
+    }
+    if let Some(work) = work {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            PANE_WORK_OPTION,
+            &normalize_work_id(work)?,
+        )?;
+    }
+    if let Some(role) = role.filter(|value| !value.trim().is_empty()) {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            AGENT_ROLE_OPTION,
+            &metadata(role, 64)?,
+        )?;
+    }
+    if let Some(task) = task.filter(|value| !value.trim().is_empty()) {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            AGENT_TASK_OPTION,
+            &metadata(task, 256)?,
+        )?;
+    }
+    if let Some(alias) = alias.filter(|value| !value.trim().is_empty()) {
+        let alias = metadata(alias, 64)?;
+        // Register it with the room's arbiter before writing, so a handle
+        // being minted for another pane at this moment cannot be handed the
+        // same name. The write itself stays unconditional: an explicit alias
+        // comes from the user's configuration and outranks anything tend
+        // minted for the slot.
+        // The caller's daemon, not whichever one `default_socket` names: a
+        // launch against any other socket reserved the name in the wrong
+        // room, and against a host with no default daemon it failed outright
+        // and took the launch down with it.
+        tend::ipc::blocking_reserve_handle(
+            socket,
+            &if crate::mux_control::ambient_rmux().is_some() {
+                format!("rmux:{pane}")
+            } else {
+                pane.to_string()
+            },
+            None,
+            &alias,
+            RESERVE_TIMEOUT,
+        )
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+        set_option(OptionScope::Pane, pane, AGENT_ALIAS_OPTION, &alias)?;
+    }
+    if let Some(generation) = generation {
+        set_option(
+            OptionScope::Pane,
+            pane,
+            AGENT_GENERATION_OPTION,
+            &generation.to_string(),
+        )?;
+    }
+    Ok(())
+}
+
+pub fn mark_agent_generation(pane: &str, generation: u64) -> Result<()> {
+    validate_pane_id(pane)?;
+    set_option(
+        OptionScope::Pane,
+        pane,
+        AGENT_GENERATION_OPTION,
+        &generation.to_string(),
+    )
+}
+
+/// The stage a human (or the dashboard) recorded for this logical Work.
+/// A new Run in another tmux window retains the same stage because execution
+/// coordinates are deliberately not part of Work identity.
+fn stage_for(work: &WorkInfo, records: &[WorkRecord]) -> Option<WorkStage> {
+    stage_for_identity(
+        &tend::work::WorkIdentity::new(&work.workspace, &work.work),
+        records,
+    )
+}
+
+fn stage_for_identity(
+    identity: &tend::work::WorkIdentity,
+    records: &[WorkRecord],
+) -> Option<WorkStage> {
+    records
+        .iter()
+        .find(|record| &record.identity == identity)
+        .map(|record| record.metadata.stage)
+}
+
+/// Load the dashboard's annotations for display. Read-only on purpose:
+/// `WorkStore` rewrites the whole file on save, so a second writer outside
+/// tendd's mutex would drop records the dashboard holds in memory.
+fn work_annotations() -> Vec<WorkRecord> {
+    tend::dashboard::load_work_records(tend::paths::default_dashboard_work_file())
+}
+
+fn stage_suffix(work: &WorkInfo, records: &[WorkRecord]) -> String {
+    stage_for(work, records)
+        .filter(|stage| *stage != WorkStage::Auto)
+        .map_or_else(String::new, |stage| format!("  stage={}", stage.label()))
+}
+
+#[cfg(test)]
+mod work_list_view_tests {
+    use super::*;
+
+    fn agent(pane: &str, program: &str, alias: Option<&str>) -> ManagedAgentPane {
+        ManagedAgentPane {
+            pane: pane.into(),
+            agent: program.into(),
+            alias: alias.map(Into::into),
+            role: None,
+            task: None,
+            command: program.into(),
+            cwd: PathBuf::from("/repo"),
+        }
+    }
+
+    fn run(work: &str, aliases: &[(&str, bool)]) -> tend::pipeline_run::PipelineRun {
+        use tend::pipeline_run::{PipelineAliasState, PipelineAliasStatus};
+        tend::pipeline_run::PipelineRun {
+            identity: tend::work::WorkIdentity::new("webapp", work),
+            pipeline: "pair".into(),
+            desired: aliases
+                .iter()
+                .map(|(alias, _)| tend::pipeline::DesiredAgent {
+                    alias: (*alias).to_string(),
+                    program: "claude".into(),
+                    role: None,
+                    task: None,
+                    prompt: None,
+                    options: Vec::new(),
+                    direction: None,
+                    after: Vec::new(),
+                    purpose: tend::collaboration::LaunchPurpose::Primary,
+                })
+                .collect(),
+            cwd: PathBuf::from("/repo"),
+            generation: 1,
+            window_id: None,
+            aliases: aliases
+                .iter()
+                .map(|(alias, done)| {
+                    (
+                        (*alias).to_string(),
+                        PipelineAliasState {
+                            alias: (*alias).to_string(),
+                            status: if *done {
+                                PipelineAliasStatus::Done
+                            } else {
+                                PipelineAliasStatus::Pending
+                            },
+                            generation: 1,
+                            completion_generation: None,
+                            pane: None,
+                            error: None,
+                            reconcile_pending: false,
+                            claim_started_at: None,
+                            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+                        },
+                    )
+                })
+                .collect(),
+            updated_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    fn work(name: &str, agents: Vec<ManagedAgentPane>) -> WorkInfo {
+        WorkInfo {
+            work: name.into(),
+            workspace: "webapp".into(),
+            session: "webapp".into(),
+            session_id: "$1".into(),
+            window: "@1".into(),
+            window_index: 0,
+            window_name: name.into(),
+            cwd: PathBuf::from("/repo"),
+            external_item: None,
+            agents,
+        }
+    }
+
+    fn durable_run() -> tend::pipeline_run::PipelineRun {
+        use tend::pipeline_run::{PipelineAliasState, PipelineAliasStatus, PipelineRun};
+        let now = time::OffsetDateTime::UNIX_EPOCH;
+        let desired = [("impl", Vec::new()), ("review", vec!["impl".to_string()])]
+            .into_iter()
+            .map(|(alias, after)| tend::pipeline::DesiredAgent {
+                alias: alias.to_string(),
+                program: "codex".to_string(),
+                role: None,
+                task: None,
+                prompt: None,
+                options: Vec::new(),
+                direction: None,
+                after,
+                purpose: tend::collaboration::LaunchPurpose::Primary,
+            })
+            .collect();
+        let state = |alias: &str, status, completion_generation| PipelineAliasState {
+            alias: alias.to_string(),
+            status,
+            generation: 1,
+            completion_generation,
+            pane: (alias == "impl").then(|| "%1".to_string()),
+            error: None,
+            reconcile_pending: false,
+            claim_started_at: None,
+            updated_at: now,
+        };
+        PipelineRun {
+            identity: tend::work::WorkIdentity::new("webapp", "ENG-1"),
+            pipeline: "delivery".to_string(),
+            desired,
+            cwd: PathBuf::from("/repo"),
+            generation: 1,
+            window_id: Some("@1".to_string()),
+            aliases: std::collections::BTreeMap::from([
+                (
+                    "impl".to_string(),
+                    state("impl", PipelineAliasStatus::Done, Some(1)),
+                ),
+                (
+                    "review".to_string(),
+                    state("review", PipelineAliasStatus::Pending, None),
+                ),
+            ]),
+            updated_at: now,
+        }
+    }
+
+    /// `done` records aliases, so only aliased panes can ever be in it. A pane
+    /// the operator split by hand must not inflate the denominator and make a
+    #[test]
+    fn agents_read_as_aliases_or_collapsed_programs() {
+        let piped = work(
+            "ENG-1",
+            vec![
+                agent("%1", "claude", Some("impl")),
+                agent("%2", "codex", Some("review")),
+            ],
+        );
+        assert_eq!(agent_summary(&piped), "impl \u{b7} review");
+
+        let manual = work(
+            "RELEASE-1",
+            vec![
+                agent("%1", "claude", None),
+                agent("%2", "claude", None),
+                agent("%3", "codex", None),
+            ],
+        );
+        assert_eq!(agent_summary(&manual), "claude x2 \u{b7} codex");
+    }
+
+    /// A converged pipeline and a stalled one differ by one cell, so that cell
+    /// has to be present and correct.
+    #[test]
+    fn table_shows_the_completion_ratio() {
+        let works = vec![
+            work(
+                "ENG-1",
+                vec![
+                    agent("%1", "claude", Some("impl")),
+                    agent("%2", "codex", Some("review")),
+                ],
+            ),
+            work("RELEASE-1", vec![agent("%3", "claude", None)]),
+        ];
+        let runs = vec![run("ENG-1", &[("impl", true), ("review", true)])];
+        let out = work_list_table(&works, &[], &runs, crate::theme::CliTheme::plain());
+        assert!(out.contains("ENG-1"), "{out}");
+        assert!(out.contains("2/2"), "{out}");
+        // The stage column stays out of the way when nothing is staged.
+        assert!(!out.contains("STAGE"), "{out}");
+    }
+
+    /// The denominator is what the pipeline *asked for*, not what has been
+    /// launched — otherwise a pair whose reviewer has not started yet reads
+    /// `1/1`, which is indistinguishable from converged.
+    #[test]
+    fn an_unlaunched_agent_still_counts_against_the_total() {
+        let works = vec![work("ENG-1", vec![agent("%1", "claude", Some("impl"))])];
+        let runs = vec![run("ENG-1", &[("impl", true), ("review", false)])];
+        let out = work_list_table(&works, &[], &runs, crate::theme::CliTheme::plain());
+        assert!(out.contains("1/2"), "{out}");
+    }
+
+    /// A window with no Run has no completion record at all. `0/N` would say
+    /// nothing finished; the truth is that nothing here was ever asked to.
+    #[test]
+    fn a_work_without_a_run_reports_no_ratio() {
+        let works = vec![work("ENG-1", vec![agent("%1", "claude", Some("impl"))])];
+        let out = work_list_table(&works, &[], &[], crate::theme::CliTheme::plain());
+        assert!(!out.contains("0/1"), "{out}");
+        assert!(out.contains("ENG-1"), "{out}");
+    }
+
+    #[test]
+    fn table_uses_durable_desired_aliases_before_downstream_has_a_pane() {
+        let works = vec![work("ENG-1", vec![agent("%1", "codex", Some("impl"))])];
+        let out = work_list_table(
+            &works,
+            &[],
+            &[durable_run()],
+            crate::theme::CliTheme::plain(),
+        );
+        assert!(out.contains("1/2"), "{out}");
+        assert!(out.contains("impl:done"), "{out}");
+        assert!(out.contains("review:pending"), "{out}");
+        assert!(!out.contains("1/1"), "{out}");
+    }
+
+    #[test]
+    fn table_keeps_a_durable_run_visible_without_a_tmux_window() {
+        let out = work_list_table(&[], &[], &[durable_run()], crate::theme::CliTheme::plain());
+        assert!(out.contains("ENG-1"), "{out}");
+        assert!(out.contains("webapp"), "{out}");
+        assert!(out.contains("impl:done"), "{out}");
+        assert!(out.contains("review:pending"), "{out}");
+        assert!(out.contains("1/2"), "{out}");
+    }
+}
+
+pub fn window_id_for_pane(pane: &str) -> Result<String> {
+    validate_pane_id(pane)?;
+    let window = tmux_output(&["display-message", "-p", "-t", pane, "#{window_id}"])?;
+    let window = window.trim();
+    if !window.starts_with('@') {
+        bail!("pane {pane} resolved to an invalid window id {window:?}");
+    }
+    Ok(window.to_string())
+}
+
+/// The session id owning `pane`. A pane id is exact, so this resolves one
+/// session with no room for tmux's prefix matching — which is what makes it
+/// the right input to [`mark_workspace`].
+pub fn session_id_for_pane(pane: &str) -> Result<String> {
+    validate_pane_id(pane)?;
+    let session = tmux_output(&["display-message", "-p", "-t", pane, "#{session_id}"])?;
+    let session = session.trim();
+    if session.is_empty() {
+        bail!("pane {pane} resolved to an empty session id");
+    }
+    validate_session_id(session)?;
+    Ok(session.to_string())
+}
+
+pub fn session_name_for_pane(pane: &str) -> Result<String> {
+    validate_pane_id(pane)?;
+    let session = tmux_output(&["display-message", "-p", "-t", pane, "#{session_name}"])?;
+    let session = session.trim();
+    if session.is_empty() {
+        bail!("pane {pane} resolved to an empty session name");
+    }
+    Ok(session.to_string())
+}
+
+pub fn cleanup_pane(pane: &str) {
+    if validate_pane_id(pane).is_ok() {
+        let _ = tmux_status(&["kill-pane", "-t", pane]);
+    }
+}
+
+fn control_agent(pane: &str, action: AgentControlAction, confirm: bool) -> Result<ManageResult> {
+    validate_pane_id(pane)?;
+    if action == AgentControlAction::Terminate && !confirm {
+        bail!("terminate_agent requires confirm=true");
+    }
+    ensure_managed_agent(pane)?;
+    let args = match action {
+        AgentControlAction::Interrupt => vec!["send-keys", "-t", pane, "C-c"],
+        AgentControlAction::Terminate => vec!["kill-pane", "-t", pane],
+    };
+    tmux_status(&args)?;
+    Ok(ManageResult::AgentControl {
+        action,
+        pane: pane.to_string(),
+    })
+}
+
+fn close_work(raw: &str, workspace: Option<&str>, confirm: bool) -> Result<ManageResult> {
+    if !confirm {
+        bail!("close_work requires confirm=true");
+    }
+    let work = find_work_in(raw, workspace)?
+        .ok_or_else(|| anyhow::anyhow!("managed work {raw:?} not found"))?;
+    tmux_status(&["kill-window", "-t", &work.window])?;
+    Ok(ManageResult::WorkClosed {
+        work: work.work,
+        workspace: work.workspace,
+        session: work.session,
+        window: work.window,
+    })
+}
+
+fn close_workspace(raw: &str, confirm: bool) -> Result<ManageResult> {
+    if !confirm {
+        bail!("close_workspace requires confirm=true");
+    }
+    let workspace = find_workspace(raw)?
+        .ok_or_else(|| anyhow::anyhow!("managed workspace {raw:?} not found"))?;
+    if !workspace.managed {
+        bail!(
+            "workspace {raw:?} lives in session {:?}, which tend adopted rather than created; \
+             close its work windows instead, or kill the session yourself",
+            workspace.session
+        );
+    }
+    tmux_status(&["kill-session", "-t", &format!("={}", workspace.session)])?;
+    Ok(ManageResult::WorkspaceClosed {
+        workspace: workspace.workspace,
+        session: workspace.session,
+    })
+}
+
+fn ensure_managed_agent(pane: &str) -> Result<()> {
+    let output = tmux_output(&[
+        "display-message",
+        "-p",
+        "-t",
+        pane,
+        "#{@tend_managed_agent}\t#{@tend_agent}",
+    ])?;
+    let mut fields = output.trim().split('\t');
+    if fields.next() != Some("1") || fields.next().is_none_or(str::is_empty) {
+        bail!("pane {pane} is not a tend-managed agent pane");
+    }
+    Ok(())
+}
+
+fn validate_session_id(session: &str) -> Result<()> {
+    if session
+        .strip_prefix('$')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        Ok(())
+    } else {
+        bail!("session must be an exact tmux session id such as $5, not {session:?}")
+    }
+}
+
+fn validate_pane_id(pane: &str) -> Result<()> {
+    if pane
+        .strip_prefix('%')
+        .is_some_and(|digits| !digits.is_empty() && digits.chars().all(|ch| ch.is_ascii_digit()))
+    {
+        Ok(())
+    } else {
+        bail!("pane must be an exact tmux pane id such as %42")
+    }
+}
+
+fn metadata(raw: &str, max: usize) -> Result<String> {
+    let value = raw.trim();
+    if value.is_empty() {
+        bail!("metadata value cannot be empty");
+    }
+    if value.len() > max {
+        bail!("metadata value is too long (max {max} bytes)");
+    }
+    if value
+        .chars()
+        .any(|ch| ch == '\t' || ch == '\n' || ch == '\r')
+    {
+        bail!("metadata value cannot contain tabs or newlines");
+    }
+    Ok(value.to_string())
+}
+
+fn external_metadata(raw: &str, max: usize) -> String {
+    let normalized = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = normalized.len().min(max);
+    while !normalized.is_char_boundary(end) {
+        end = end.saturating_sub(1);
+    }
+    normalized[..end].to_string()
+}
+
+fn external_option_value(raw: Option<&str>, max: usize) -> String {
+    raw.filter(|value| !value.trim().is_empty())
+        .map_or_else(String::new, |value| external_metadata(value, max))
+}
+
+fn parse_workspaces(sessions: &str, windows: &str, panes: &str) -> Vec<WorkspaceInfo> {
+    let mut workspaces = Vec::new();
+    let rows: Vec<Vec<&str>> = sessions
+        .lines()
+        .map(|line| line.split('\t').collect())
+        .collect();
+    let mut canonical = std::collections::HashMap::<&str, &str>::new();
+    for fields in &rows {
+        if fields.len() >= 8 && !fields[2].trim().is_empty() && !fields[7].is_empty() {
+            canonical
+                .entry(fields[7])
+                .and_modify(|id| {
+                    if tmux_session_id_cmp(fields[1], id).is_lt() {
+                        *id = fields[1];
+                    }
+                })
+                .or_insert(fields[1]);
+        }
+    }
+    for fields in &rows {
+        // A workspace id is enough to be findable; `managed` decides what
+        // tend may do to the session, not whether it can see it.
+        if fields.len() < 7 || fields[2].trim().is_empty() {
+            continue;
+        }
+        let group = fields.get(7).copied().filter(|group| !group.is_empty());
+        if group.is_some_and(|group| canonical.get(group).is_some_and(|id| *id != fields[1])) {
+            continue;
+        }
+        let session = fields[0].to_string();
+        let session_id = fields[1];
+        let workspace = fields[2].trim().to_ascii_lowercase();
+        let session_id_owned = session_id.to_string();
+        let mut works = windows
+            .lines()
+            .filter_map(|line| parse_work_window(line, session_id, &workspace, panes))
+            .collect::<Vec<_>>();
+        works.sort_by(|left, right| left.work.cmp(&right.work));
+        workspaces.push(WorkspaceInfo {
+            workspace,
+            session,
+            session_id: session_id_owned,
+            managed: fields[4] == "1",
+            cwd: PathBuf::from(fields[3]),
+            attached_clients: group.map_or_else(
+                || fields[5].parse().unwrap_or(0),
+                |group| {
+                    rows.iter()
+                        .filter(|row| row.get(7) == Some(&group))
+                        .map(|row| row[5].parse::<u32>().unwrap_or(0))
+                        .fold(0_u32, u32::saturating_add)
+                },
+            ),
+            windows: fields[6].parse().unwrap_or(0),
+            works,
+        });
+    }
+    workspaces.sort_by(|left, right| left.workspace.cmp(&right.workspace));
+    workspaces
+}
+
+fn parse_work_window(
+    line: &str,
+    session_id: &str,
+    workspace: &str,
+    panes: &str,
+) -> Option<WorkInfo> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() < 8
+        || fields[1] != session_id
+        || fields[5].trim().is_empty()
+        || fields[7] != "1"
+    {
+        return None;
+    }
+    let work = fields[5].trim().to_ascii_uppercase();
+    let window = fields[2].to_string();
+    let mut seen = std::collections::HashSet::new();
+    let agents = panes
+        .lines()
+        .filter_map(|line| parse_agent_pane(line, &window, workspace, &work))
+        .filter(|agent| seen.insert(agent.pane.clone()))
+        .collect();
+    Some(WorkInfo {
+        work,
+        workspace: workspace.to_string(),
+        session: fields[0].to_string(),
+        session_id: session_id.to_string(),
+        window,
+        window_index: fields[3].parse().unwrap_or(0),
+        window_name: fields[4].to_string(),
+        cwd: PathBuf::from(fields[6]),
+        external_item: parse_external_item(&fields),
+        agents,
+    })
+}
+
+fn parse_external_item(fields: &[&str]) -> Option<Box<ExternalItemInfo>> {
+    let source = fields.get(8)?.trim();
+    let display_key = fields.get(11).map_or("", |value| value.trim());
+    if source.is_empty() || display_key.is_empty() {
+        return None;
+    }
+    Some(Box::new(ExternalItemInfo {
+        source: source.into(),
+        scope: optional_field(fields, 9),
+        stable_id: optional_field(fields, 10),
+        display_key: display_key.into(),
+        title: optional_field(fields, 12),
+        url: optional_field(fields, 13),
+        status: optional_field(fields, 14),
+    }))
+}
+
+fn optional_field(fields: &[&str], index: usize) -> Option<String> {
+    fields
+        .get(index)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn parse_agent_pane(
+    line: &str,
+    window: &str,
+    workspace: &str,
+    work: &str,
+) -> Option<ManagedAgentPane> {
+    let fields: Vec<&str> = line.split('\t').collect();
+    if fields.len() < 12
+        || fields[1] != window
+        || fields[3].trim().is_empty()
+        || fields[8] != "1"
+        || !fields[9].eq_ignore_ascii_case(workspace)
+        || !fields[10].eq_ignore_ascii_case(work)
+    {
+        return None;
+    }
+    Some(ManagedAgentPane {
+        pane: fields[2].to_string(),
+        agent: fields[3].to_string(),
+        alias: option(fields[11]),
+        role: option(fields[4]),
+        task: option(fields[5]),
+        command: fields[6].to_string(),
+        cwd: PathBuf::from(fields[7]),
+    })
+}
+
+fn option(value: &str) -> Option<String> {
+    (!value.trim().is_empty()).then(|| value.to_string())
+}
+
+/// Every session's name paired with its id, read in one listing so a caller
+/// that matches on the name can act on the id.
+fn all_sessions() -> Result<Vec<(String, String)>> {
+    Ok(
+        tmux_output_allow_no_server(&["list-sessions", "-F", "#{session_name}\t#{session_id}"])?
+            .lines()
+            .filter_map(|line| {
+                let (name, id) = line.split_once('\t')?;
+                Some((name.to_string(), id.to_string()))
+            })
+            .collect(),
+    )
+}
+
+fn all_session_names() -> Result<Vec<String>> {
+    Ok(
+        tmux_output_allow_no_server(&["list-sessions", "-F", "#{session_name}"])?
+            .lines()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn sanitize_session_name(name: &str) -> String {
+    let mut cleaned = String::new();
+    for ch in name.trim().chars() {
+        let ch = if ch == '.' || ch == ':' || ch.is_whitespace() {
+            '-'
+        } else {
+            ch
+        };
+        if ch != '-' || !cleaned.ends_with('-') {
+            cleaned.push(ch);
+        }
+    }
+    let cleaned = cleaned.trim_matches('-').to_string();
+    if cleaned.is_empty() {
+        "workspace".into()
+    } else {
+        cleaned
+    }
+}
+
+fn sanitize_window_name(name: &str) -> String {
+    sanitize_session_name(name)
+}
+
+/// Normalize a user-supplied name: whitespace to `-`, no control characters,
+/// bounded length. Shared with `watch`'s rename form so both entry points
+/// produce the same name for the same keystrokes.
+pub(crate) fn normalize_window_name(raw: &str) -> Result<String> {
+    let value = metadata(raw, 64)?;
+    if value.chars().any(char::is_control) {
+        bail!("window name cannot contain control characters");
+    }
+    if value.contains("#{") || value.contains("#(") {
+        bail!("window name cannot contain tmux format expansions");
+    }
+    let mut normalized = String::new();
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if !normalized.ends_with('-') {
+                normalized.push('-');
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+    let normalized = normalized.trim_matches('-').to_string();
+    if normalized.is_empty() {
+        bail!("window name cannot be empty");
+    }
+    if normalized.len() > 64 {
+        bail!("window name is too long after normalization (max 64 bytes)");
+    }
+    Ok(normalized)
+}
+
+fn unique_name(base: String, exists: impl Fn(&str) -> bool) -> String {
+    if !exists(&base) {
+        return base;
+    }
+    (2..10_000)
+        .map(|suffix| format!("{base}-{suffix}"))
+        .find(|candidate| !exists(candidate))
+        .unwrap_or_else(|| format!("{base}-overflow"))
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OptionScope {
+    Session,
+    Window,
+    Pane,
+}
+
+fn set_option(scope: OptionScope, target: &str, key: &str, value: &str) -> Result<()> {
+    let mut args = vec!["set-option"];
+    match scope {
+        OptionScope::Session => {}
+        OptionScope::Window => args.push("-w"),
+        OptionScope::Pane => args.push("-p"),
+    }
+    args.extend(["-t", target, key, value]);
+    tmux_status(&args)
+}
+
+fn tmux_status(args: &[&str]) -> Result<()> {
+    Control::Ambient.run(args)
+}
+
+fn tmux_output(args: &[&str]) -> Result<String> {
+    Control::Ambient.output(args)
+}
+
+fn tmux_output_allow_no_server(args: &[&str]) -> Result<String> {
+    match tmux_output(args) {
+        Ok(output) => Ok(output),
+        Err(error)
+            if error.to_string().contains("no server running")
+                || error.to_string().contains("no sessions")
+                || (error.to_string().contains("error connecting to ")
+                    && error.to_string().contains("(No such file or directory)")) =>
+        {
+            Ok(String::new())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn confirm_destructive(yes: bool, prompt: &str) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!("confirmation requires an interactive terminal; pass --yes");
+    }
+    Ok(cliclack::confirm(prompt).initial_value(false).interact()?)
+}
+
+fn required<'a>(value: Option<&'a str>, message: &str) -> Result<&'a str> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!(message.to_string()))
+}
+
+fn json_workspaces(workspaces: &[WorkspaceInfo]) -> serde_json::Value {
+    serde_json::json!({ "workspaces": workspaces })
+}
+
+fn print_result(result: &ManageResult, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(result)?);
+    } else {
+        match result {
+            ManageResult::AgentControl { action, pane } => {
+                println!("{action:?} agent pane {pane}");
+            }
+            ManageResult::SessionControl { action, session } => {
+                println!("{action:?} native agent session {session}");
+            }
+            ManageResult::WorkClosed {
+                work,
+                workspace,
+                session,
+                window,
+            } => {
+                println!(
+                    "closed work {work} (workspace {workspace}, session {session}, window {window})"
+                );
+            }
+            ManageResult::WorkspaceClosed { workspace, session } => {
+                println!("closed workspace {workspace} (session {session})");
+            }
+            ManageResult::Workspaces { .. }
+            | ManageResult::Workspace { .. }
+            | ManageResult::Works { .. }
+            | ManageResult::Work { .. } => {
+                println!("{}", serde_json::to_string_pretty(result)?);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn view_session(
+        id: &str,
+        name: &str,
+        attached: u32,
+        group: Option<&str>,
+        destroy_unattached: bool,
+    ) -> ViewSession {
+        ViewSession {
+            id: id.into(),
+            name: name.into(),
+            attached,
+            group: group.map(str::to_string),
+            destroy_unattached,
+        }
+    }
+
+    #[test]
+    fn view_session_name_sorts_beside_the_session_it_mirrors() {
+        // `<session>~view~<pid>` rather than `view~<pid>~<session>`: the view
+        // lands next to its session in `list-sessions` and in watch's tree.
+        // Safe despite tmux's prefix matching because an exact name match wins
+        // — `-t webapp` resolves to `webapp`, not to this.
+        assert_eq!(
+            view_session_name("webapp", "1734560"),
+            "webapp~view~1734560"
+        );
+    }
+
+    #[test]
+    fn view_session_name_keeps_one_terminal_to_one_view() {
+        // The suffix is the client's pid, so the same terminal regrouping
+        // twice asks for the same name instead of leaving a trail of sessions
+        // behind every jump.
+        assert_eq!(
+            view_session_name("tend", "42"),
+            view_session_name("tend", "42")
+        );
+        assert_ne!(
+            view_session_name("tend", "42"),
+            view_session_name("tend", "43")
+        );
+    }
+
+    #[test]
+    fn canonical_view_source_survives_base_session_rename() {
+        let renamed = view_session("$99", "renamed", 2, Some("base"), false);
+        let later_view = view_session("$107", "base~view~42", 1, Some("base"), true);
+        let sessions = vec![later_view.clone(), renamed.clone()];
+
+        assert_eq!(canonical_view_source(&later_view, &sessions), renamed);
+    }
+
+    #[test]
+    fn orphaned_view_strips_one_view_suffix_without_nesting() {
+        let orphan = view_session("$107", "base~view~42", 2, Some("base"), true);
+        assert_eq!(view_name_base(&orphan), "base");
+        assert_eq!(
+            view_session_name(view_name_base(&orphan), "43"),
+            "base~view~43"
+        );
+
+        let leaked_orphan = view_session("$108", "base~view~44", 2, Some("base"), false);
+        assert_eq!(view_name_base(&leaked_orphan), "base");
+
+        let renamed_orphan = view_session("$109", "renamed~view~45", 2, Some("base"), false);
+        assert_eq!(view_name_base(&renamed_orphan), "renamed");
+        assert_eq!(
+            view_session_name(view_name_base(&renamed_orphan), "46"),
+            "renamed~view~46"
+        );
+
+        let renamed_base = view_session("$99", "renamed", 2, Some("base"), false);
+        assert_eq!(view_name_base(&renamed_base), "renamed");
+
+        let deliberate_name = view_session(
+            "$100",
+            "project~view~draft",
+            2,
+            Some("project~view~draft"),
+            false,
+        );
+        assert_eq!(view_name_base(&deliberate_name), "project~view~draft");
+    }
+
+    #[test]
+    fn reusable_view_does_not_take_over_another_clients_session() {
+        let source = view_session("$1", "base", 2, Some("base"), false);
+        let occupied = view_session("$2", "base~view~42", 1, Some("base"), true);
+        let sessions = vec![source.clone(), occupied.clone()];
+
+        assert!(reusable_view(&sessions, &occupied.name, &source, "$1").is_none());
+        assert_eq!(
+            reusable_view(&sessions, &occupied.name, &source, "$2"),
+            Some(&occupied)
+        );
+
+        let available = view_session("$3", "base~view~43", 0, Some("base"), false);
+        let sessions = vec![source.clone(), available.clone()];
+        assert_eq!(
+            reusable_view(&sessions, &available.name, &source, "$1"),
+            Some(&available)
+        );
+    }
+
+    #[test]
+    fn parse_view_session_refuses_a_malformed_attached_count() {
+        assert!(parse_view_session("$1\tbase\tnot-a-number\t\toff").is_err());
+    }
+
+    fn workspace_at(workspace: &str, session: &str, session_id: &str) -> WorkspaceInfo {
+        WorkspaceInfo {
+            workspace: workspace.to_string(),
+            session: session.to_string(),
+            session_id: session_id.to_string(),
+            managed: false,
+            cwd: PathBuf::new(),
+            attached_clients: 0,
+            windows: 1,
+            works: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_mark_on_a_differently_named_session_is_only_reported_when_the_name_is_taken() {
+        // Adoption and renames both leave a mark whose session is named
+        // something else. On its own that is the feature working.
+        let renamed = [workspace_at("webapp", "webapp-set", "$5")];
+        assert!(mark_anomalies(&renamed, &["webapp-set".to_string()]).is_empty());
+
+        // A session carrying the workspace's own name is what makes it
+        // ambiguous: `--workspace webapp` passes it by without a word.
+        let shadowed = mark_anomalies(&renamed, &["webapp-set".to_string(), "webapp".to_string()]);
+        assert_eq!(
+            shadowed,
+            vec![MarkAnomaly::Shadowed {
+                workspace: "webapp".to_string(),
+                claimed_by: "webapp-set".to_string(),
+                named: "webapp".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn two_sessions_claiming_one_workspace_are_reported_together() {
+        let both = [
+            workspace_at("webapp", "webapp", "$2"),
+            workspace_at("webapp", "webapp-set", "$5"),
+        ];
+        // Reported as the duplicate, not as a shadow: which session a lookup
+        // returns is down to tmux's listing order, and naming one of them as
+        // the claimant would imply tend had chosen.
+        assert_eq!(
+            mark_anomalies(&both, &["webapp".to_string(), "webapp-set".to_string()]),
+            vec![MarkAnomaly::Duplicated {
+                workspace: "webapp".to_string(),
+                sessions: vec!["webapp".to_string(), "webapp-set".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn the_mark_writers_refuse_a_session_name() {
+        // The whole point of the id: a name is what tmux may resolve to a
+        // neighbour, so it must not reach `set-option` at all.
+        let error = adopt_workspace("webapp", "webapp").unwrap_err().to_string();
+        assert!(error.contains("session id"), "unexpected error: {error}");
+        let error = mark_workspace("webapp", "webapp", Path::new("/tmp"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("session id"), "unexpected error: {error}");
+        // And the spellings tmux itself uses are accepted.
+        assert!(validate_session_id("$5").is_ok());
+        assert!(validate_session_id("$").is_err());
+        assert!(validate_session_id("$x").is_err());
+    }
+
+    #[test]
+    fn workspace_and_work_ids_are_normalized_and_tmux_safe() {
+        assert_eq!(normalize_workspace_id(" Tend ").unwrap(), "tend");
+        assert_eq!(normalize_work_id(" test-0001 ").unwrap(), "TEST-0001");
+        assert!(normalize_work_id("bad\nid").is_err());
+        assert_eq!(
+            window_name_for_work("TEST.0001: Review").unwrap(),
+            "TEST-0001-REVIEW"
+        );
+    }
+
+    #[test]
+    fn explicit_window_names_preserve_case_and_normalize_whitespace() {
+        assert_eq!(
+            normalize_window_name("  ENG-7175  auth refactor  ").unwrap(),
+            "ENG-7175-auth-refactor"
+        );
+        assert_eq!(
+            normalize_window_name("topology-watch").unwrap(),
+            "topology-watch"
+        );
+        assert!(normalize_window_name("\n").is_err());
+        assert!(normalize_window_name("#(printf hidden)").is_err());
+        assert!(normalize_window_name("#{session_name}").is_err());
+    }
+
+    #[test]
+    fn window_identity_parser_requires_stable_native_ids() {
+        assert_eq!(
+            parse_window_identity("@42\t$7\ttend\tENG-7175\t0"),
+            Some(WindowIdentity {
+                window_id: "@42".into(),
+                session_id: "$7".into(),
+                session_name: "tend".into(),
+                name: "ENG-7175".into(),
+            })
+        );
+        assert!(parse_window_identity("ENG-7175\t$7\ttend\tname\t0").is_none());
+        assert!(parse_window_identity("@42\ttend\ttend\tname\t0").is_none());
+    }
+
+    #[test]
+    fn parser_keeps_only_managed_workspace_work_and_agent_hierarchy() {
+        let sessions = "tend\t$1\ttend\t/repo\t1\t1\t2\n\
+                        legacy\t$2\t\t/tmp\t\t0\t1\n";
+        let windows = "tend\t$1\t@1\t0\ttest-0001\tTEST-0001\t/repo/wt\t1\tlinear\tENG\tstable-1\tENG-7093\tDashboard work\thttps://linear.app/ENG-7093\tstarted\n\
+                       tend\t$1\t@2\t1\tplain\t\t/repo\t\n\
+                       legacy\t$2\t@3\t0\tlegacy\tOLD-1\t/tmp\t1\n";
+        // Trailing column is the pipeline alias: set on %1, empty on the
+        // hand-started %4 that `tend work up` would report as unclaimed.
+        let panes = "tend\t@1\t%1\tcodex\timplementer\tmain\tcodex\t/repo/wt\t1\ttend\tTEST-0001\timpl\n\
+                     tend\t@1\t%2\tcodex\treviewer\twrong\tcodex\t/repo/wt\t1\ttend\tTEST-9999\t\n\
+                     tend\t@1\t%3\tcodex\treviewer\tunmanaged\tcodex\t/repo/wt\t\ttend\tTEST-0001\t\n\
+                     tend\t@1\t%4\tclaude\t\t\tclaude\t/repo/wt\t1\ttend\tTEST-0001\t\n";
+        let workspaces = parse_workspaces(sessions, windows, panes);
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].workspace, "tend");
+        assert_eq!(workspaces[0].works.len(), 1);
+        assert_eq!(workspaces[0].works[0].work, "TEST-0001");
+        assert_eq!(workspaces[0].works[0].window, "@1");
+        assert_eq!(
+            workspaces[0].works[0]
+                .external_item
+                .as_ref()
+                .map(|item| (item.source.as_str(), item.display_key.as_str())),
+            Some(("linear", "ENG-7093"))
+        );
+        assert_eq!(workspaces[0].works[0].agents.len(), 2);
+        assert_eq!(workspaces[0].works[0].agents[0].pane, "%1");
+        assert_eq!(
+            workspaces[0].works[0].agents[0].alias.as_deref(),
+            Some("impl")
+        );
+        // A managed pane nobody aliased still parses; it simply has no key
+        // for the pipeline diff to claim it by.
+        assert_eq!(workspaces[0].works[0].agents[1].pane, "%4");
+        assert!(workspaces[0].works[0].agents[1].alias.is_none());
+    }
+
+    #[test]
+    fn grouped_workspaces_use_the_oldest_session_and_deduplicate_agents() {
+        let sessions="base~view~test\t$107\tproject\t/repo\t1\t1\t1\tbase\nrenamed\t$99\tproject\t/repo\t1\t1\t1\tbase\n";
+        let windows="base~view~test\t$107\t@7\t0\tTASK\tTASK\t/repo\t1\nrenamed\t$99\t@7\t0\tTASK\tTASK\t/repo\t1\n";
+        let panes="renamed\t@7\t%1\tcodex\tfixture\tcheck\tcodex\t/repo\t1\tproject\tTASK\ta\nbase~view~test\t@7\t%1\tcodex\tfixture\tcheck\tcodex\t/repo\t1\tproject\tTASK\ta\n";
+        let workspaces = parse_workspaces(sessions, windows, panes);
+        assert_eq!(workspaces.len(), 1);
+        assert_eq!(workspaces[0].session_id, "$99");
+        assert_eq!(workspaces[0].session, "renamed");
+        assert_eq!(workspaces[0].attached_clients, 2);
+        assert_eq!(workspaces[0].works.len(), 1);
+        assert_eq!(workspaces[0].works[0].agents.len(), 1);
+        let distinct = parse_workspaces(
+            "a\t$1\tproject\t/repo\t1\t0\t1\t\nb\t$2\tproject\t/repo\t1\t0\t1\t\n",
+            "",
+            "",
+        );
+        assert_eq!(
+            distinct.len(),
+            2,
+            "independent claims remain visible for anomaly detection"
+        );
+    }
+
+    fn work_at(workspace: &str, work: &str) -> WorkInfo {
+        WorkInfo {
+            work: work.into(),
+            workspace: workspace.into(),
+            session: "webapp".into(),
+            session_id: "$1".into(),
+            window: "@7".into(),
+            window_index: 0,
+            window_name: work.into(),
+            cwd: PathBuf::from("/work"),
+            external_item: None,
+            agents: Vec::new(),
+        }
+    }
+
+    fn record_at(workspace: &str, work: &str, stage: WorkStage) -> WorkRecord {
+        WorkRecord {
+            identity: tend::work::WorkIdentity::new(workspace, work),
+            metadata: tend::work::WorkMetadata {
+                title: None,
+                goal: None,
+                next_action: None,
+                stage,
+                updated_at: time::OffsetDateTime::UNIX_EPOCH,
+            },
+            external_items: Vec::new(),
+            legacy_binding: None,
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn a_stage_follows_the_logical_work_across_runs() {
+        let work = work_at("webapp", "ENG-1234");
+        let records = vec![
+            record_at("webapp", "ENG-1234", WorkStage::Review),
+            record_at("webapp", "OTHER", WorkStage::Done),
+            record_at("other", "ENG-1234", WorkStage::Blocked),
+        ];
+        assert_eq!(stage_for(&work, &records), Some(WorkStage::Review));
+        assert_eq!(stage_for(&work_at("webapp", "MISSING"), &records), None);
+        assert_eq!(stage_for(&work, &[]), None);
+    }
+
+    #[test]
+    fn the_default_stage_adds_no_column() {
+        let work = work_at("webapp", "ENG-1234");
+        let records = vec![record_at("webapp", "ENG-1234", WorkStage::Auto)];
+        // `auto` means "nobody has said anything"; printing it would be noise.
+        assert_eq!(stage_suffix(&work, &records), "");
+        let staged = vec![record_at("webapp", "ENG-1234", WorkStage::InProgress)];
+        assert_eq!(stage_suffix(&work, &staged), "  stage=in_progress");
+    }
+
+    #[test]
+    fn an_external_issue_refresh_clears_absent_fields_and_normalizes_present_ones() {
+        assert_eq!(external_option_value(None, 32), "");
+        assert_eq!(external_option_value(Some("   "), 32), "");
+        assert_eq!(
+            external_option_value(Some("  Needs\n review  "), 32),
+            "Needs review"
+        );
+    }
+
+    #[test]
+    fn an_adopted_session_is_findable_but_not_closable() {
+        // Identity and ownership are separate facts. tend must be able to
+        // find work in a session it adopted, and must never offer to kill
+        // it — it is full of windows tend did not open.
+        let sessions = "webapp\t$1\twebapp\t/repo\t\t1\t3\n\
+                        owned\t$2\towned\t/repo\t1\t1\t1\n";
+        let workspaces = parse_workspaces(sessions, "", "");
+        let adopted = workspaces
+            .iter()
+            .find(|w| w.workspace == "webapp")
+            .expect("an adopted session is still visible");
+        assert!(!adopted.managed, "adoption must not claim ownership");
+        let owned = workspaces
+            .iter()
+            .find(|w| w.workspace == "owned")
+            .expect("a created session is visible too");
+        assert!(owned.managed);
+    }
+
+    #[test]
+    fn destructive_management_requires_explicit_confirmation() {
+        let request = ManageRequest {
+            action: ManageAction::TerminateAgent,
+            pane: Some("%42".into()),
+            workspace: None,
+            work: None,
+            confirm: false,
+        };
+        assert!(manage(request)
+            .unwrap_err()
+            .to_string()
+            .contains("confirm=true"));
+        assert_eq!(
+            ManageAction::parse("close_work").unwrap(),
+            ManageAction::CloseWork
+        );
+    }
+
+    #[test]
+    fn exact_pane_ids_are_required() {
+        assert!(validate_pane_id("%42").is_ok());
+        assert!(validate_pane_id("42").is_err());
+        assert!(validate_pane_id("%4x").is_err());
+    }
+}

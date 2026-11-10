@@ -1,8 +1,8 @@
 name: pages
 
-# The landing page at https://open330.github.io/muxa/. `site/index.html`
+# The landing page at https://open330.github.io/tend/. `site/index.html`
 # renders the dashboard's landing view in "site" mode, so its code, styles
-# and screens come from crates/muxa/src/dashboard/web; the TUI recording is
+# and screens come from crates/tend/src/dashboard/web; the TUI recording is
 # the one the README uses. All of it is copied in at deploy time so nothing
 # is kept twice in the repo.
 
@@ -11,10 +11,10 @@ on:
     branches: [main]
     paths:
       - "site/**"
-      - "crates/muxa/src/dashboard/web/landing*"
-      - "crates/muxa/src/dashboard/web/landing/**"
-      - "crates/muxa/src/dashboard/web/landing-terminal/**"
-      - "crates/muxa/src/dashboard/web/icon.svg"
+      - "crates/tend/src/dashboard/web/landing*"
+      - "crates/tend/src/dashboard/web/landing/**"
+      - "crates/tend/src/dashboard/web/landing-terminal/**"
+      - "crates/tend/src/dashboard/web/icon.svg"
       - "docs/demo.gif"
       - ".github/workflows/pages.yml"
   workflow_dispatch:
@@ -40,7 +40,7 @@ jobs:
         run: |
           mkdir -p _site
           cp -r site/. _site/
-          web=crates/muxa/src/dashboard/web
+          web=crates/tend/src/dashboard/web
           cp "$web"/landing.mjs "$web"/landing-film.mjs "$web"/landing-frames.mjs "$web"/landing-learn.mjs "$web"/landing-onboarding.mjs "$web"/landing-shared.mjs "$web"/landing-shell.mjs "$web"/landing-watch.mjs "$web"/landing-practice.mjs "$web"/landing.css "$web"/icon.svg _site/
           cp -r "$web"/landing-terminal _site/landing-terminal
           cp -r "$web"/landing _site/landing

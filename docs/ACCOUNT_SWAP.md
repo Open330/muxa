@@ -2,14 +2,14 @@
 
 When one account's usage cap is spent, the conversation is still fine. As
 long as the accounts share `projects/` (Claude) and `sessions/` (Codex), the
-same provider session id resumes under any account. `muxa swap` moves agents
+same provider session id resumes under any account. `tend swap` moves agents
 onto another account and resumes each one in its own pane.
 
 Accounts come from an *account provider*, chosen per provider (Claude,
 Codex) in this order:
 
 1. **`[[accounts.<provider>]]` in `config.toml`** — no external tool. Each
-   account is a name and the environment that selects it. muxa launches with
+   account is a name and the environment that selects it. tend launches with
    that environment and recognises a running agent's account from its own
    environment however it was started. The accounts are used in the listed
    order (see below).
@@ -22,7 +22,7 @@ Codex) in this order:
    nothing. A capped agent can still be recovered: the `resume-after-limit`
    rule (see [Automation](AUTOMATION.md)) waits for its reset and resumes it,
    and needs no accounts at all. It is installed disabled; turn it on with
-   `muxa automation enable resume-after-limit`.
+   `tend automation enable resume-after-limit`.
 
 ```toml
 [[accounts.claude]]
@@ -45,7 +45,7 @@ copies it.
 
 `auto` over configured accounts follows a fixed rule: a new agent starts on
 the first listed account, and a swap moves an agent to the first eligible
-listed account other than its own, skipping the one it was capped on. muxa does not
+listed account other than its own, skipping the one it was capped on. tend does not
 yet rank configured accounts by the usage it observes on other agents: it
 cannot yet tell deterministically which account a running agent's limit
 reports belong to. Ranking by observed usage is coming in a follow-up (#367).
@@ -58,13 +58,13 @@ is relaunched with the account's environment like any other. An `env_file`
 must be an absolute or `~/` path.
 
 ```console
-$ muxa swap --dry-run
+$ tend swap --dry-run
 planned  %1         claude_code work -> personal
          $ sh -c 'set -a; . "$0"; set +a; exec "$@"' ~/.secrets/claude-personal.env claude --dangerously-skip-permissions --resume 090b45a6-…
          then send "continue"
 ```
 
-For each agent, muxa:
+For each agent, tend:
 
 1. reads how the agent was started from its pane's process tree (a bare
    `claude` / `codex`, `env … claude`, or `aas e <account> …`) and which
@@ -99,10 +99,10 @@ For each agent, muxa:
 
 | Command | Agents |
 | ------- | ------ |
-| `muxa swap` / `muxa swap --limited` | Every agent stopped by a usage cap. |
-| `muxa swap %5 herdr:p9 <session-id>` | Exactly these panes or provider session ids. |
-| `muxa swap --all` | Every idle Claude / Codex agent. Mid-turn agents are skipped. |
-| `muxa swap --all --force` | Also stops mid-turn agents. |
+| `tend swap` / `tend swap --limited` | Every agent stopped by a usage cap. |
+| `tend swap %5 herdr:p9 <session-id>` | Exactly these panes or provider session ids. |
+| `tend swap --all` | Every idle Claude / Codex agent. Mid-turn agents are skipped. |
+| `tend swap --all --force` | Also stops mid-turn agents. |
 
 `--provider claude|codex` narrows any of these to one provider.
 
@@ -110,10 +110,10 @@ A named target is resolved to exactly one live pane first. A bare `%81`
 means `rmux:%81` when that is the only pane it can mean. A name that matches
 no live pane, or several (the same `%N` on two servers), is reported and
 swaps nothing. `--exclude` is resolved the same way, and an ambiguous
-exclude protects every pane it may mean. A live pane muxa has no agent row
+exclude protects every pane it may mean. A live pane tend has no agent row
 for is reported too, instead of silently missing.
 
-A row muxa only saw on screen, never from the agent's own hooks
+A row tend only saw on screen, never from the agent's own hooks
 (`"registered": false`), has no trustworthy state. `--all` and `--limited`
 list it without touching it. Naming it swaps it only with `--force`, and it
 gets a follow-up only under `--continue-when always`.
@@ -121,7 +121,7 @@ gets a follow-up only under `--continue-when always`.
 Before stopping an agent, the swap checks which conversation the running
 process is actually on. For Claude on Linux that is
 `<config dir>/sessions/<pid>.json`, matched on the pid and the process's
-start time (`conversation_verified: true`). A conversation muxa can verify
+start time (`conversation_verified: true`). A conversation tend can verify
 this way can be swapped even without a hook-registered id. One that
 disagrees with the registry or the command line is reported as an identity
 conflict and left alone. The process is checked again right before it is
@@ -181,7 +181,7 @@ is only resumed — nothing is typed into it. Naming the wording with
 to send the text to every swapped agent, idle ones included; it now keeps the
 `continue_when` policy and prints a notice. The MCP tool takes
 `continue_text` and `continue_when`, with `continue` kept as the same alias.
-A Fleet host running an older `muxa` refuses the new options rather than
+A Fleet host running an older `tend` refuses the new options rather than
 reading the old meaning. A blank `--continue-text ""` sends nothing, here and
 on a host alike.
 
@@ -215,14 +215,14 @@ not that the prompt was delivered or acted on.
 
 ## Daemon jobs
 
-When the daemon runs swaps as jobs, `muxa swap` hands it the request: the
+When the daemon runs swaps as jobs, `tend swap` hands it the request: the
 daemon plans it, records every step in its job journal before taking it, and
 keeps any other writer (its own automation included) off a pane while the
 swap acts on it. The CLI prints the request key first, then follows the job:
 
 ```console
-$ muxa swap %5 --to work@claude
-muxa swap: request cli-3f… (see it with `muxa swap --status cli-3f…`)
+$ tend swap %5 --to work@claude
+tend swap: request cli-3f… (see it with `tend swap --status cli-3f…`)
 ```
 
 Ctrl-C only stops waiting; the job runs on, and `--status` shows it. The CLI
@@ -236,7 +236,7 @@ exact agents the daemon planned: a pane that changed in the meantime is
 skipped, never swapped as whatever runs there now. Those panes are not in the
 job's record, and get no exclusion against the daemon's automation.
 
-`muxa swap --retry <key>` retries a daemon job that has ended. A target is
+`tend swap --retry <key>` retries a daemon job that has ended. A target is
 swapped again only if it failed before anything at or past its relaunch was
 even attempted, nothing about it is uncertain, and the very agent the job
 planned (same process) still runs on the same pane: it moves to the account
@@ -261,8 +261,8 @@ waiting for the whole swap a cancelled job is a failure (not everything was
 swapped); for `--cancel` itself a job that ended cleanly is a success.
 
 On a Fleet host the key is minted here and printed before the swap is sent,
-so if the answer is lost `muxa swap --host <alias> --status <key>` still finds
-it. The swap is never sent again under another key: a host whose `muxa` is too
+so if the answer is lost `tend swap --host <alias> --status <key>` still finds
+it. The swap is never sent again under another key: a host whose `tend` is too
 old for relayed keys fails the request, and the hint to check the key stays.
 
 A daemon from before swap jobs means the whole swap runs here, as before. A
@@ -277,16 +277,16 @@ reconcile) is pruned 30 days after it ended, at most once a day: `--status`
 then says the detail was pruned, and such a job can no longer be retried,
 since how far each target got is no longer known. A job with any uncertain
 effect, or one needing reconciliation, keeps all of it. A failed pruning run
-is shown by `muxa doctor` and retried the next day. The journal is at schema
-v3 from this version on; an older muxa refuses it rather than misread it.
+is shown by `tend doctor` and retried the next day. The journal is at schema
+v3 from this version on; an older tend refuses it rather than misread it.
 
 ## On a Fleet host
 
-`muxa swap --host <alias>` runs the same swap on a control-mode
+`tend swap --host <alias>` runs the same swap on a control-mode
 `[fleet.hosts]` host: that host's daemon, agents and `[accounts]`, through
 the Fleet work-command transport, with the report printed here. Agents use
-the same thing through the `muxa_swap_account` MCP tool (`host` omitted for
-this host). The host's own `muxa` must be new enough to know `swap`.
+the same thing through the `tend_swap_account` MCP tool (`host` omitted for
+this host). The host's own `tend` must be new enough to know `swap`.
 
 The swap executes on the remote host through Fleet's work-command transport.
 Ctrl-C here only stops waiting for its report; it does not reliably cancel
@@ -294,7 +294,7 @@ the swap there, which may still be stopping and relaunching agents. Check
 the host before running it again.
 
 ```console
-$ muxa swap --host build --to work --dry-run
+$ tend swap --host build --to work --dry-run
 ```
 
 ## Automatic swap
@@ -329,9 +329,9 @@ swap it finds unfinished to its job's end; it never starts one again.
 
 ## New agents
 
-`muxa swap` moves agents that are already running. To start new ones on a
+`tend swap` moves agents that are already running. To start new ones on a
 chosen account, set `[agent.<program>].account = "auto"`
-(see [Configuration](CONFIGURATION.md#starting-on-an-account)): every muxa
+(see [Configuration](CONFIGURATION.md#starting-on-an-account)): every tend
 launch then starts on the first configured account's environment, or, with
 the `aas` backend, on `aas e <best eligible account>` instead of the bare
 CLI. Only the `aas` backend skips a capped account at launch; configured
@@ -342,7 +342,7 @@ says why.
 
 Account routing adds no configuration keys: existing `[agent.*].account`,
 `[[accounts.*]]` and `[swap]` settings keep their meaning, and a config that
-uses them loads in older muxa builds unchanged. `aas` users need to change
+uses them loads in older tend builds unchanged. `aas` users need to change
 nothing; it is still used for any provider that lists no accounts.
 
 ## Before the agent is stopped
@@ -365,7 +365,7 @@ any of it is not there:
   script among them.
 
 A program found through the pane's own `PATH` (`aas`, a bare `claude`) is
-resolved by that shell, in a context muxa does not reproduce: it is recorded
+resolved by that shell, in a context tend does not reproduce: it is recorded
 as `unknown`, not certified, and the swap goes on as before. Passing these
 checks is not a promise the launch works.
 
@@ -381,9 +381,9 @@ checks is not a promise the launch works.
   the cap.
 - What was half-typed into the agent's prompt is typed back after the
   resume (after the follow-up, so the two are not sent as one prompt).
-- After the follow-up, muxa waits up to 20 seconds for the agent to show a
+- After the follow-up, tend waits up to 20 seconds for the agent to show a
   turn in progress and says in the report whether it did.
-- muxa needs the provider session id. A hook-fed row has it; a
+- tend needs the provider session id. A hook-fed row has it; a
   screen-detected row is resumed only when the agent's own command line names
   it (`--resume <id>` / `resume <id>`).
 - On macOS, `ps` reports a command line joined, so a flag value containing a
@@ -391,5 +391,5 @@ checks is not a promise the launch works.
 - Codex keeps its thread index per account (`CODEX_HOME`), but `codex resume <id>`
   finds the thread's rollout in the shared `sessions/`, so it resumes under an
   account that never ran it. If the pane's shell is no longer in the thread's
-  directory, Codex first asks which directory to use; muxa keeps the
+  directory, Codex first asks which directory to use; tend keeps the
   session's directory.

@@ -1,6 +1,6 @@
 # Doctor collaboration diagnostics — 2026-10-29
 
-`muxa doctor` now reads a bounded, body-free `collaboration_health_v1` summary.
+`tend doctor` now reads a bounded, body-free `collaboration_health_v1` summary.
 It no longer downloads agent snapshots or stale request bodies for these checks.
 The daemon borrows its existing request and agent projections and reuses the
 published topology inventory; a doctor run does not discover backends again,
@@ -37,8 +37,8 @@ freshness budget and invalidation state. Sample locations are bounded in size.
 ## Selective cleanup and protected decisions
 
 ```sh
-muxa msg expire --older-than 24h --quiet-only --request-id REQUEST --dry-run
-muxa msg expire --older-than 24h --quiet-only --request-id REQUEST
+tend msg expire --older-than 24h --quiet-only --request-id REQUEST --dry-run
+tend msg expire --older-than 24h --quiet-only --request-id REQUEST
 ```
 
 Selective expiry requires `collaboration_expire_filtered_v2`; a client refuses
@@ -67,4 +67,4 @@ inventory, selective expiry races, legacy-server mutation refusal, protection of
 human decisions, and one-time restoration of accidentally expired questions.
 
 Local evidence, actual doctor output, cleanup previews and final results are in
-`~/.local/share/muxa/validation/doctor-followup-20261029/`.
+`~/.local/share/tend/validation/doctor-followup-20261029/`.

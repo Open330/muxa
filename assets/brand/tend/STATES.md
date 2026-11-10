@@ -1,0 +1,24 @@
+# Tend mark — state rule A (a fixed state per room)
+
+The four rooms of the F2 mark each stand for one kind of agent state.
+A room lights when at least one agent is in that state; otherwise it is dimmed.
+
+| Room | Position | State | Lit colour |
+| --- | --- | --- | --- |
+| `room-waiting` | top right (small) | waiting on you (input, choice) | amber `#FFAA2B` |
+| `room-error` | top left | error or blocked | coral `#FF5A3C` |
+| `room-working` | bottom right (large) | working | ink `#16181D` on light, paper `#F2F3F5` on dark |
+| `room-done` | bottom left | finished | green `#3FBF84` |
+
+Dimmed rooms keep the theme ink/paper colour at 22% (light) or 26% (dark) opacity.
+With no agents at all every room is dimmed.
+
+## Files
+
+- `assets/brand/tend/mark-rooms.svg`: master with `id`/`class` per room and `fill="currentColor"`; colour the rooms in code.
+- `assets/brand/tend/states/menubar-WERD-THEME[-16|-32].{svg,png}`: all 16 combinations, pre-rendered.
+  The four digits are waiting, error, working, done (1 = lit). Example: `menubar-1010-dark-32.png`
+  means "someone is waiting and others are working" on a dark menu bar.
+
+On macOS, the calm state (no waiting, no error) can use `menubar-template.svg` as a template image so
+the system tints it; any state that shows colour must use a non-template image from `states/`.

@@ -1,27 +1,27 @@
 # Live TUI
 
-`muxa watch` is the main interactive surface. It shows tracked agents and
+`tend watch` is the main interactive surface. It shows tracked agents and
 plain tmux panes, lets you jump to panes, composes prompts, and exchanges
 durable collaboration requests between agents in the same tmux window.
 
 For the workspace-card console that keeps you inside the TUI while sending
 prompts, aborting turns, and inspecting live captures, use
-[`muxa dashboard`](DASHBOARD_CLI.md).
+[`tend dashboard`](DASHBOARD_CLI.md).
 
 ## Open
 
 ```bash
-muxa watch
-muxa watch --layout work
-muxa watch --view pane
-muxa watch --include-paneless
+tend watch
+tend watch --layout work
+tend watch --view pane
+tend watch --include-paneless
 ```
 
 The default `view = "window"` groups tmux panes by window and labels each
 parent as `workspace › work`. This is an execution topology view: a session binds a
 Workspace, a window binds the current Run, and each child pane binds an agent
 session. `view = "pane"` shows one row per pane. Durable Work and external issue
-state belong to `muxa dashboard`, not this topology tree.
+state belong to `tend dashboard`, not this topology tree.
 
 The default tree is an accordion: selecting a session reveals its windows and
 folds the previously selected session. In pane view, selecting a window also
@@ -64,7 +64,7 @@ children keep their aggregate state markers.
 | `Enter` | Attach to the selected pane. |
 | `C` | Open a plain shell window in the selected row's session and jump into it — `prefix + c` without attaching first. |
 | `n` | Create/reuse a workspace session and work window, then add an agent pane. |
-| `w` | Run a pipeline: type a work id and hand off to a window running `muxa work up`. |
+| `w` | Run a pipeline: type a work id and hand off to a window running `tend work up`. |
 | `R` / `:rename` | Rename the selected tmux session or window, or set the selected pane title. |
 | `\|` | Cycle the list/inspector split: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | Continue Ask / open the selected conversation. In the composer, `Ctrl-E` switches to a new conversation; in the panel, `n` drafts one. |
@@ -111,7 +111,7 @@ configuration.
 
 ### Move a running agent
 
-Press `prefix+M` from the agent pane, or select it in local `muxa watch` and
+Press `prefix+M` from the agent pane, or select it in local `tend watch` and
 press `Alt-M` (`:move` also works). Both open the same searchable session → window tree:
 new window in the current session, new session, or another session/window.
 Choose a destination and press Enter; a new session asks only for its name.
@@ -133,9 +133,9 @@ old pipeline generation is cleared when the workspace changes. Undo restores
 the previous session, window name, and pane metadata. A final source window
 leaves a shell window behind to keep its clients connected.
 
-For scripts: `muxa window move --source-window @13 --session dev --stay`,
-`muxa window move --source-window @13 --new-session review`, or
-`muxa window move --source-window @13 --undo`.
+For scripts: `tend window move --source-window @13 --session dev --stay`,
+`tend window move --source-window @13 --new-session review`, or
+`tend window move --source-window @13 --undo`.
 
 The pane, process, working directory, conversation, and terminal history remain
 alive. Moving the final pane leaves a shell in the original session so its
@@ -151,11 +151,11 @@ session was closed, choose a destination manually. Following uses a private
 grouped session view when another client is already attached. Mailbox history
 keeps its existing `M` binding (`b` remains an alias), including in Fleet watch.
 
-Install or refresh the binding with `muxa init --component tmux-popup --yes`.
-For scripts, use `muxa agent move --pane %42 --new-session review --stay`, or
+Install or refresh the binding with `tend init --component tmux-popup --yes`.
+For scripts, use `tend agent move --pane %42 --new-session review --stay`, or
 `--session NAME --new-window NAME`, `--window @ID`, or `--undo`.
 `--server-socket` and `--host tmux|rmux` pin the terminal server; the global
-`--socket` continues to name the Muxa daemon.
+`--socket` continues to name the Tend daemon.
 
 ## Filter, Inspector, and Events
 
@@ -213,7 +213,7 @@ roster. Selecting an individual pane still opens its denser metadata and full
 single-pane capture.
 
 `Alt-I` toggles the inspector, and `|` cycles 50/50, 70/30, and 30/70
-list/inspector splits. That 120 is the width `muxa watch` itself receives, not
+list/inspector splits. That 120 is the width `tend watch` itself receives, not
 your terminal's: an inset `display-popup` subtracts its own inset *and* its
 border, so a 134-column terminal hands a `-w 90%` popup only 118. This is why
 the bundled `prefix + s` binding is borderless and full-client
@@ -237,7 +237,7 @@ for subsequent refreshes in the current watch process.
 ## The work layout
 
 `W` swaps the tree for a flat table of Works — one row each, mirroring
-`muxa work list` column for column (WORK, WORKSPACE, GEN, ALIASES, DONE, CWD)
+`tend work list` column for column (WORK, WORKSPACE, GEN, ALIASES, DONE, CWD)
 and adding the live state gauge a CLI table cannot show. `W` again returns to
 whatever layout it interrupted, so a swarm is not silently discarded; the
 palette's `layout work` and `--layout work` reach it too, as does
@@ -252,7 +252,7 @@ since a flat table shows no ancestry to move within.
 
 ## Screens
 
-`muxa watch` shows one of three lists, chosen with `Alt-1` / `Alt-2` /
+`tend watch` shows one of three lists, chosen with `Alt-1` / `Alt-2` /
 `Alt-3`, the `screen topology|collab|board` palette command, `--screen`, or
 `[watch] screen`.
 
@@ -270,7 +270,7 @@ kind, and the status. `Enter` attaches to the peer's pane — requests outlive
 panes, so a request whose peer is gone says so rather than doing nothing.
 
 `board` lists Works: persisted Work records joined with the windows scanned for
-them — the same projection `muxa dashboard` and the web dashboard read. A Work
+them — the same projection `tend dashboard` and the web dashboard read. A Work
 keeps its row while it has no live Run, and one Work can have several Runs,
 which is why this is a screen and not `layout work` (whose rows are windows).
 Works that need you — a signal on the Work, or an agent in it waiting for input,
@@ -327,9 +327,9 @@ open collaboration — unfinished requests to its agents and from them, across
 every Run, each request once — from a history listing refreshed every fifteen
 seconds while the board shows (it never claims anything), and says
 `unavailable` rather than zero when the listing fails. A `workers` line counts
-the Work's agents that muxa launched for peer work, matched by agent session,
+the Work's agents that tend launched for peer work, matched by agent session,
 and how many are long idle (over 24h), in error, or possibly overlapping; it is
-read-only and points at `muxa workers prune`, which plans host-wide, dry-runs
+read-only and points at `tend workers prune`, which plans host-wide, dry-runs
 by default, skips workers with open work, and takes errored ones only with
 `--error`. `b` (or `M`) opens that agent's
 mailbox, read-only until you act; `i` claims its queued requests and `e`
@@ -373,7 +373,7 @@ conversation and its first question are committed together, so cancelling a
 draft never leaves an empty conversation. A conversation accepts one running
 question at a time; mark an independent draft as new to let it run alongside
 the current one.
-muxad runs the agent in print mode and captures the answer, so nothing is
+tendd runs the agent in print mode and captures the answer, so nothing is
 typed into a pane and no session has to be managed. `Esc` cancels; Backspace
 also cancels when the input is already empty.
 
@@ -387,7 +387,7 @@ also restores that provider for the next turn.
 
 The daemon owns execution: an answer lands in the history whether or not
 the popup is still open, and the history outlives restarts in
-`$XDG_DATA_HOME/muxa/ask.json`. Requires `[ask] enabled = true` — see
+`$XDG_DATA_HOME/tend/ask.json`. Requires `[ask] enabled = true` — see
 [CONFIGURATION.md](CONFIGURATION.md).
 
 The detail pane under the list only ever shows an answer's first screenful.
@@ -433,7 +433,7 @@ Typing filters names and prompt text, arrows or `Tab` move the selection, and
 existing text. Adjacent content is separated as paragraphs, and more skills
 can be inserted into the same draft. Insertion never sends: edit or verify the
 expanded body, then press `Enter` again. Register templates with
-`muxa skill add <name> <prompt>` or `[message.skills]` in config. Inside either
+`tend skill add <name> <prompt>` or `[message.skills]` in config. Inside either
 watch palette, `F2` opens the add/update form and `Delete` confirms removal of
 the selected skill. `Ctrl-A` and `Ctrl-D` remain compatibility aliases.
 
@@ -474,7 +474,7 @@ plain prompt now that `Enter` attaches directly.
 `○ READ-ONLY` (green) authorizes investigation and an answer, not changes.
 `Ctrl-E` switches to `● EXECUTE` (red), explicitly authorizing commands and
 file changes. This is a contract delivered to the receiving agent, not a
-command that muxa executes immediately. Watch has no separate path-scope
+command that tend executes immediately. Watch has no separate path-scope
 field, so include the intended edit scope in an execute request's body.
 
 Press `M` for history. In a pane mailbox, `m` opens a
@@ -499,8 +499,8 @@ the current position, such as `2/3`, when more than one agent is available.
 ## tmux Popup Binding
 
 ```tmux
-bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
-bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
+bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "tend watch"
+bind-key D display-popup -E -w 95% -h 90% "tend dashboard"
 ```
 
 `prefix+e` toggles the persistent [agent sidebar](SIDEBAR.md). Its sort order
@@ -513,27 +513,27 @@ optional shortcut to the richer Dashboard.
 
 ## Stable tmux Names
 
-`muxa init` enables the `tmux-window-names` component by default. It turns off
+`tend init` enables the `tmux-window-names` component by default. It turns off
 tmux's process-based `automatic-rename`, so a Work window keeps its useful name
 instead of becoming `node` or `claude`, and routes the familiar `prefix + ,`
-prompt through `muxa window rename`. Window whitespace is normalized to `-`
+prompt through `tend window rename`. Window whitespace is normalized to `-`
 and duplicate names in one session are refused. Restore dynamic naming for one
-window with `muxa window rename --auto`.
+window with `tend window rename --auto`.
 
 ## Two Terminals on One Workspace
 
 One tmux session has one current window, and every client attached to it shows
 that window. Two terminals attached to the same session therefore cannot sit on
 two different Work windows — switching one switches the other. That is tmux's
-model, not a muxa limitation, and a *session group* is the only thing that
+model, not a tend limitation, and a *session group* is the only thing that
 changes it: the window list stays shared, but each session in the group keeps
 its own current window.
 
-`muxa init` installs this as the `tmux-auto-view` component, on by default. It
+`tend init` installs this as the `tmux-auto-view` component, on by default. It
 sets two hooks that hand an arriving client its own view:
 
 ```tmux
-set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"tend workspace view --client #{client_name}\"'"
 set-hook -g 'client-session-changed[9000]' "…same…"
 ```
 
@@ -547,7 +547,7 @@ component was installed goes through. Measured on tmux 3.4: with only the
 attach hook, jumping from watch put both terminals back into one session and
 they followed each other from there.
 
-Nothing runs for a lone terminal. `muxa workspace view` is a no-op when its
+Nothing runs for a lone terminal. `tend workspace view` is a no-op when its
 client is the session's only one, so a single-terminal workspace never grows a
 second session, and a terminal that regroups reuses its own view rather than
 leaving a trail of sessions behind every jump.
@@ -556,7 +556,7 @@ You can also run it by hand — on a terminal that was already attached, for
 instance:
 
 ```sh
-muxa workspace view
+tend workspace view
 ```
 
 The view is named `<session>~view~<pid>`, so it sorts beside the session it
@@ -603,7 +603,7 @@ tmux set-option -t <session> @no_auto_view 1
 
 ## macOS Menu Bar with BarShelf
 
-The bundled [BarShelf](https://github.com/Open330/barshelf) `muxa Watch`
+The bundled [BarShelf](https://github.com/Open330/barshelf) `tend Watch`
 widget provides a compact menu-bar popover view of the same agent state. It
 shows the five most recently active agents in the familiar `NAME / ST / ACT /
 LAST PROMPT` layout. The widget refreshes every five seconds while the popover
@@ -612,15 +612,15 @@ is open and does not poll in the background.
 Install it from the BarShelf gallery, or directly with:
 
 ```bash
-barshelf install https://github.com/Open330/barshelf/tree/master/widgets/muxa-watch
+barshelf install https://github.com/Open330/barshelf/tree/master/widgets/tend-watch
 ```
 
-The widget requires Deno and a `muxa` version that supports the versioned
-snapshot command below. Set `MUXA_BIN` or the widget's custom socket setting
+The widget requires Deno and a `tend` version that supports the versioned
+snapshot command below. Set `TEND_BIN` or the widget's custom socket setting
 when the defaults do not match your installation.
 
 ```bash
-muxa status --json
+tend status --json
 ```
 
 ## Columns

@@ -50,7 +50,7 @@ jobs:
       # `window_placement` drives a private tmux server; without tmux the test
       # skips itself and the regression it guards goes unwatched here.
       - run: sudo apt-get update && sudo apt-get install -y tmux
-      # e2e tests shell out to `muxad` / `muxa` — those bins live in other
+      # e2e tests shell out to `tendd` / `tend` — those bins live in other
       # workspace packages and cargo test won't build them otherwise.
       - run: cargo build --workspace --bins
       - run: cargo test --workspace
@@ -67,7 +67,7 @@ jobs:
       # topology, work and collaboration models) are plain ES modules tested
       # with node's built-in runner. `node --test <directory>` does not find
       # these files, so name them with a glob; the job fails if any test does.
-      - run: node --test crates/muxa/tests-js/*.test.mjs
+      - run: node --test crates/tend/tests-js/*.test.mjs
 
   onboarding-script:
     name: onboarding script
@@ -87,12 +87,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y tmux
       - run: cargo build --workspace --bins
-      - run: shellcheck scripts/muxa-sandbox.sh scripts/sandbox-smoke.sh
+      - run: shellcheck scripts/tend-sandbox.sh scripts/sandbox-smoke.sh
       # A sandbox that leaks a daemon or a tmux server is worse than no
       # sandbox, so the suite asserts teardown is total from every state.
       - run: scripts/sandbox-smoke.sh
       # A sandbox that reads the caller's ~/.tmux.conf is not a sandbox: their
-      # hooks run inside it, and muxa's own `tmux-auto-view` detaches the
+      # hooks run inside it, and tend's own `tmux-auto-view` detaches the
       # learner the moment they attach.
       - run: python3 scripts/config-isolation-check.py
 
@@ -109,14 +109,14 @@ jobs:
       - run: cargo build --workspace --bins
       # The tour claims it never intercepts a keystroke, so every step has to be
       # reachable by typing the command the narration asks for. This types them.
-      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa
-      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --lang ko
+      - run: scripts/live-tour-smoke.py --tend target/debug/tend
+      - run: scripts/live-tour-smoke.py --tend target/debug/tend --lang ko
       # Issue #76 was a gate with no way around it; this is the check that
       # the live tour cannot repeat that.
-      - run: scripts/live-tour-smoke.py --muxa target/debug/muxa --mode skip
+      - run: scripts/live-tour-smoke.py --tend target/debug/tend --mode skip
       # `exit` closes the last pane, and with it the sandbox server the tour is
       # polling. That is a way out, not a crash.
-      - run: python3 scripts/exit-check.py --muxa target/debug/muxa
+      - run: python3 scripts/exit-check.py --tend target/debug/tend
 
   msrv:
     name: MSRV (1.89)

@@ -1,0 +1,313 @@
+//! Pre-flight environment probing.
+//!
+//! Used for two things:
+//!
+//! 1. **Hard gates.** Cargo missing or no tmux + zellij anywhere on
+//!    PATH means the wizard exits early with a friendly message —
+//!    there's nothing to wire.
+//! 2. **Smart defaults.** When a user runs `tend init` interactively,
+//!    components are pre-checked based on what we found: Claude config
+//!    file present → `claude-hooks` ✓; macOS → `tendd-systemd` greyed
+//!    out; etc. The user can still toggle.
+
+use crate::init::components::Component;
+use std::path::PathBuf;
+use std::process::Command;
+
+#[derive(Debug, Default)]
+pub struct Detection {
+    pub tmux: Option<String>,
+    pub zellij: Option<String>,
+    pub cargo: Option<String>,
+    pub claude_settings: Option<PathBuf>,
+    pub codex_config: Option<PathBuf>,
+    pub gemini_settings: Option<PathBuf>,
+    /// Marker that the Antigravity CLI has run here. Separate from
+    /// `gemini_settings`: agy shares the `~/.gemini` tree with the CLI it
+    /// replaced, so the presence of `settings.json` says nothing about
+    /// whether `agy` is installed (and vice versa).
+    pub antigravity_home: Option<PathBuf>,
+    pub opencode_config: Option<PathBuf>,
+    pub tendd_running: bool,
+    pub systemd_user_available: bool,
+    pub launchctl_available: bool,
+}
+
+/// The tmux-compatible host `tend init` writes bindings for. Windows has no
+/// tmux; native rmux speaks the same command surface and is what the bindings
+/// target there (see `files::tmux::default_path`).
+fn tmux_compatible_version() -> Option<String> {
+    #[cfg(windows)]
+    {
+        tool_version("tmux", &["-V"]).or_else(|| tool_version("rmux", &["-V"]))
+    }
+    #[cfg(not(windows))]
+    {
+        tool_version("tmux", &["-V"])
+    }
+}
+
+impl Detection {
+    pub fn run() -> Detection {
+        Detection {
+            tmux: tmux_compatible_version(),
+            zellij: tool_version("zellij", &["--version"]),
+            cargo: tool_version("cargo", &["--version"]),
+            claude_settings: agent_config(super::files::claude::default_path(), "claude"),
+            codex_config: agent_config(super::files::codex::default_path(), "codex"),
+            gemini_settings: existing_file(home_join(".gemini/settings.json")),
+            antigravity_home: detect_antigravity(),
+            opencode_config: existing_dir(opencode_config_dir()),
+            tendd_running: tendd_is_running(),
+            systemd_user_available: super::files::systemd::systemd_available(),
+            launchctl_available: super::files::launchd::launchctl_available(),
+        }
+    }
+
+    /// Components that should be pre-checked by default given this
+    /// detection result.
+    pub fn default_selection(&self) -> Vec<Component> {
+        let mut out = vec![Component::Automation];
+        if self.tmux.is_some() {
+            out.push(Component::TmuxPopup);
+            out.push(Component::TmuxStatusLine);
+            out.push(Component::TmuxPeek);
+            // Pre-checked because the default it replaces is actively wrong
+            // for tend's model: `automatic-rename` renames a Work window
+            // after whatever process is running in it, so every window ends
+            // up called `node` or `claude` and the Work it stands for is
+            // invisible in tmux's own status line and window list.
+            out.push(Component::TmuxWindowNames);
+            // Pre-checked for the same reason: the tmux default is wrong for
+            // how tend is used. One session has one current window, so a
+            // second terminal on a workspace cannot sit on a second Work —
+            // and there is no way to discover that the fix is a session group.
+            out.push(Component::TmuxAutoView);
+            // A collaboration room *is* a tmux window, so tmux is the only
+            // prerequisite. Pre-checked rather than opt-in: leaving it dark
+            // is what made `m`/`b` answer "collaboration is disabled" on
+            // every fresh install with nothing pointing at the fix. The
+            // grant stays informed — the picker shows what it does, and the
+            // plan is confirmed before anything is written.
+            out.push(Component::Collaboration);
+            // Same reasoning as collaboration: watch is where `a`/`A`
+            // live, so tmux is the only prerequisite worth gating on.
+            // Pre-checked so the feature is not invisible; the picker
+            // states the cost before anything is written.
+            out.push(Component::Ask);
+        }
+        if self.claude_settings.is_some() {
+            out.push(Component::ClaudeHooks);
+        }
+        if self.codex_config.is_some() {
+            out.push(Component::CodexHooks);
+        }
+        if self.claude_settings.is_some() || self.codex_config.is_some() {
+            out.extend([
+                Component::AgentInstructions,
+                Component::AgentSkills,
+                Component::AgentMcp,
+            ]);
+        }
+        if self.gemini_settings.is_some() {
+            out.push(Component::GeminiHooks);
+        }
+        if self.antigravity_home.is_some() {
+            out.push(Component::AntigravityHooks);
+        }
+        // Pre-check the daemon-manager that fits this host so the
+        // wizard's default produces a working install. The picker
+        // hides the others (filtered via `Component::applicable_here`).
+        out.push(self.recommended_daemon_manager());
+        // Dashboard stays opt-in — costs a port and a token.
+        out
+    }
+
+    /// Whether an agent-hook component's config is present on disk.
+    ///
+    /// Returns `Some(true)`/`Some(false)` for the five agent hooks
+    /// (Claude/Codex/Gemini/agy/opencode) and `None` for every other
+    /// component — the caller reads `None` as "not an agent hook, always
+    /// keep". This is what lets the non-interactive/preset path skip
+    /// wiring up an agent the user doesn't actually have installed,
+    /// mirroring the pre-check logic in `default_selection`.
+    pub fn agent_config_present(&self, c: Component) -> Option<bool> {
+        match c {
+            Component::ClaudeHooks => Some(self.claude_settings.is_some()),
+            Component::CodexHooks => Some(self.codex_config.is_some()),
+            Component::GeminiHooks => Some(self.gemini_settings.is_some()),
+            Component::AntigravityHooks => Some(self.antigravity_home.is_some()),
+            Component::OpencodeHooks => Some(self.opencode_config.is_some()),
+            _ => None,
+        }
+    }
+
+    /// The OS-appropriate auto-start manager for this host. Defers to
+    /// the static `Component::recommended_daemon_manager()` but degrades
+    /// to `TenddShellrc` when systemctl/launchctl is missing on a host
+    /// that would normally support them (containers, CI sandboxes).
+    pub fn recommended_daemon_manager(&self) -> Component {
+        match Component::recommended_daemon_manager() {
+            Component::TenddSystemd if !self.systemd_user_available => Component::TenddShellrc,
+            Component::TenddLaunchd if !self.launchctl_available => Component::TenddShellrc,
+            other => other,
+        }
+    }
+
+    /// Hard-gate the wizard. Empty Vec means "go ahead".
+    pub fn blockers(&self) -> Vec<&'static str> {
+        let mut blockers = Vec::new();
+        if self.cargo.is_none() {
+            blockers.push("`cargo` not found on PATH (we need it to install tend)");
+        }
+        if self.tmux.is_none() && self.zellij.is_none() {
+            blockers.push("neither tmux nor zellij found on PATH — install one first");
+        }
+        blockers
+    }
+
+    /// Soft warnings — render but don't block.
+    pub fn warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+        // Only nag about a missing daemon-manager *if it's the one we
+        // would have recommended for this host*. Linux without
+        // systemctl is interesting; macOS without systemctl is normal.
+        let dm = self.recommended_daemon_manager();
+        if dm == Component::TenddShellrc
+            && Component::recommended_daemon_manager() != Component::TenddShellrc
+        {
+            warnings.push(
+                "no service manager available — falling back to shellrc autostart for tendd".into(),
+            );
+        }
+        if self.tmux.is_none() && self.zellij.is_some() {
+            warnings.push("tmux not found — only zellij components will be considered".into());
+        }
+        warnings
+    }
+}
+
+fn tool_version(name: &str, args: &[&str]) -> Option<String> {
+    if which::which(name).is_err() {
+        return None;
+    }
+    let out = Command::new(name).args(args).output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    Some(if s.is_empty() { name.to_string() } else { s })
+}
+
+fn existing_file(p: PathBuf) -> Option<PathBuf> {
+    if p.is_file() {
+        Some(p)
+    } else {
+        None
+    }
+}
+
+fn agent_config(path: Option<PathBuf>, program: &str) -> Option<PathBuf> {
+    path.filter(|p| p.is_file() || which::which(program).is_ok())
+}
+
+fn existing_dir(p: Option<PathBuf>) -> Option<PathBuf> {
+    p.filter(|p| p.is_dir())
+}
+
+/// Is the Antigravity CLI installed, and where does it keep state?
+///
+/// Prefers its state directory — `agy` creates `~/.gemini/antigravity-cli/`
+/// on first run, and that survives a shell whose PATH the wizard didn't
+/// inherit. Falls back to `agy` on PATH so a fresh install that has never
+/// been run still pre-checks.
+pub fn detect_antigravity() -> Option<PathBuf> {
+    let home = home_join(".gemini/antigravity-cli");
+    if home.is_dir() {
+        return Some(home);
+    }
+    which::which("agy").ok()
+}
+
+/// Presence-only form of [`detect_antigravity`], for callers (like `doctor`)
+/// that have no `Detection` in hand.
+pub fn antigravity_installed() -> bool {
+    detect_antigravity().is_some()
+}
+
+/// opencode has no single well-known settings file the way the other
+/// agents do — it keeps state under `~/.config/opencode/` (that's also
+/// where its `plugins/` dir lives). Presence of that directory is our
+/// "opencode is installed" signal.
+fn opencode_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("opencode"))
+}
+
+fn home_join(rel: &str) -> PathBuf {
+    dirs::home_dir().unwrap_or_default().join(rel)
+}
+
+/// Is tendd actually serving requests? We probe its IPC socket
+/// directly rather than asking `pgrep` whether *some* process named
+/// `tendd` exists. The pgrep approach was misleading after a v0.4.0
+/// incident: a stale tendd pid lingered with its socket gone, pgrep
+/// said "running", IPC clients then couldn't connect. Socket-connect
+/// is a strict superset of "the daemon you actually want to talk to
+/// is up".
+fn tendd_is_running() -> bool {
+    super::util::tendd_responsive(&super::util::default_tendd_socket())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detection_runs_without_panicking() {
+        // Just confirm the call shape — environment-dependent assertions
+        // would be flaky in CI. We require `cargo` because cargo built us.
+        let d = Detection::run();
+        assert!(d.cargo.is_some());
+    }
+
+    #[test]
+    fn default_selection_with_no_tools_picks_disabled_rules_and_daemon_manager() {
+        // `Detection::default()` represents a host with no tmux,
+        // no agents, no service managers. We still pre-check the
+        // OS-fallback daemon-manager (`TenddShellrc`) so a default
+        // install still produces a working tendd — that's the whole
+        // point of the post-v0.4.1 wizard.
+        let d = Detection::default();
+        let sel = d.default_selection();
+        assert_eq!(sel, vec![Component::Automation, Component::TenddShellrc]);
+    }
+
+    #[test]
+    fn ask_is_pre_checked_whenever_tmux_exists() {
+        // Same trap as collaboration: shipping it unticked leaves `a`/`A`
+        // answering "ask is disabled" with nothing pointing at the fix.
+        let mut d = Detection::default();
+        assert!(!d.default_selection().contains(&Component::Ask));
+        d.tmux = Some("tmux 3.4".into());
+        assert!(d.default_selection().contains(&Component::Ask));
+    }
+
+    #[test]
+    fn collaboration_is_pre_checked_whenever_tmux_exists() {
+        // The wizard's ticks come from here, not from `Component::preset`,
+        // so a component missing from this list ships dark even when its
+        // preset includes it.
+        let mut d = Detection::default();
+        assert!(!d.default_selection().contains(&Component::Collaboration));
+        d.tmux = Some("tmux 3.4".into());
+        assert!(d.default_selection().contains(&Component::Collaboration));
+    }
+
+    #[test]
+    fn blockers_fire_when_no_multiplexer() {
+        let d = Detection::default();
+        let blockers = d.blockers();
+        assert!(blockers.iter().any(|m| m.contains("cargo")));
+        assert!(blockers.iter().any(|m| m.contains("tmux")));
+    }
+}

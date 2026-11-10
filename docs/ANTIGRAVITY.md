@@ -1,17 +1,17 @@
 # Antigravity CLI (`agy`)
 
 Google's Antigravity CLI succeeded the Gemini CLI. It keeps the `~/.gemini`
-directory and it still runs Gemini models, which makes it easy to assume muxa's
+directory and it still runs Gemini models, which makes it easy to assume tend's
 existing Gemini support carries over. It does not — **none** of the three things
-muxa needs is the same.
+tend needs is the same.
 
 | | Gemini CLI (`gemini`) | Antigravity CLI (`agy`) |
 | --- | --- | --- |
 | Hook config | `hooks` key inside `~/.gemini/settings.json` | its own `~/.gemini/config/hooks.json` |
 | Events | `SessionStart`, `BeforeAgent`, `AfterAgent`, `BeforeTool`, `AfterTool`, `Notification`, `SessionEnd` | `SessionStart`, `PreInvocation`, `PostInvocation`, `PreToolUse`, `PostToolUse`, `Stop` |
 | Payload | snake_case, `session_id` | camelCase protojson, `conversationId` |
-| muxa kind | `gemini_cli` | `antigravity` |
-| muxa hook | `muxa hook gemini` | `muxa hook agy` |
+| tend kind | `gemini_cli` | `antigravity` |
+| tend hook | `tend hook gemini` | `tend hook agy` |
 
 The failure mode is silent in both directions: hooks written into
 `settings.json` make agy log `loaded 0 named hooks from 0 hooks.json file(s)`
@@ -23,32 +23,32 @@ side.
 ## Install
 
 ```sh
-muxa init --component agy-hooks
-muxa doctor          # → "Hooks · Antigravity — hook installed in …"
+tend init --component agy-hooks
+tend doctor          # → "Hooks · Antigravity — hook installed in …"
 ```
 
-That writes a single `muxa` key into `~/.gemini/config/hooks.json`:
+That writes a single `tend` key into `~/.gemini/config/hooks.json`:
 
 ```json
 {
-  "muxa": {
-    "SessionStart":   [{ "type": "command", "command": "muxa hook agy --event session_start",   "timeout": 10 }],
-    "PreInvocation":  [{ "type": "command", "command": "muxa hook agy --event pre_invocation",  "timeout": 10 }],
-    "PostInvocation": [{ "type": "command", "command": "muxa hook agy --event post_invocation", "timeout": 10 }],
-    "Stop":           [{ "type": "command", "command": "muxa hook agy --event stop",            "timeout": 10 }],
-    "PreToolUse":  [{ "matcher": "*", "hooks": [{ "type": "command", "command": "muxa hook agy --event pre_tool_use",  "timeout": 10 }] }],
-    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "muxa hook agy --event post_tool_use", "timeout": 10 }] }]
+  "tend": {
+    "SessionStart":   [{ "type": "command", "command": "tend hook agy --event session_start",   "timeout": 10 }],
+    "PreInvocation":  [{ "type": "command", "command": "tend hook agy --event pre_invocation",  "timeout": 10 }],
+    "PostInvocation": [{ "type": "command", "command": "tend hook agy --event post_invocation", "timeout": 10 }],
+    "Stop":           [{ "type": "command", "command": "tend hook agy --event stop",            "timeout": 10 }],
+    "PreToolUse":  [{ "matcher": "*", "hooks": [{ "type": "command", "command": "tend hook agy --event pre_tool_use",  "timeout": 10 }] }],
+    "PostToolUse": [{ "matcher": "*", "hooks": [{ "type": "command", "command": "tend hook agy --event post_tool_use", "timeout": 10 }] }]
   }
 }
 ```
 
-`hooks.json` is keyed by hook **name**, so muxa owns exactly one top-level key.
+`hooks.json` is keyed by hook **name**, so tend owns exactly one top-level key.
 Entries written by agy's own `/hooks` command, by plugins, or by hand are never
-touched, and `muxa init --uninstall --component agy-hooks` drops only the `muxa`
+touched, and `tend init --uninstall --component agy-hooks` drops only the `tend`
 key.
 
-`muxa doctor` reports this line only when agy is actually installed, and it
-requires **all six** events to be wired — a block left over from an older muxa
+`tend doctor` reports this line only when agy is actually installed, and it
+requires **all six** events to be wired — a block left over from an older tend
 reports as broken rather than healthy, because a partial block yields a row
 that never shows a prompt or a tool.
 
@@ -63,7 +63,7 @@ error.
 
 ## Event mapping
 
-| agy event | muxa event | Row effect |
+| agy event | tend event | Row effect |
 | --- | --- | --- |
 | `SessionStart` | `Started` | `Idle`. Fires on a new session only — `agy -c` resumes without it. |
 | `PreInvocation`, `invocationNum == 0` | `PromptSubmitted` | `Working`, prompt read from the transcript |
@@ -85,7 +85,7 @@ would restate the prompt once per model call.
 ### Prompts and responses come from the transcript
 
 No agy payload carries prompt or response text — they carry a `transcriptPath`.
-muxa reads the tail of that JSONL: the last `USER_INPUT`/`USER_EXPLICIT` step
+tend reads the tail of that JSONL: the last `USER_INPUT`/`USER_EXPLICIT` step
 (unwrapped from agy's `<USER_REQUEST>` envelope) for the prompt, and the last
 `PLANNER_RESPONSE` step with string `content` for the response. Both fail
 silently — a hook runs synchronously inside agy's loop, so a missing or
@@ -95,9 +95,9 @@ malformed transcript must cost a blank cell, never a stall.
 
 agy fires no hook when it puts an approval prompt up, so nothing in the event
 stream can say "this agent is waiting on you" — the single most important thing
-muxa exists to report.
+tend exists to report.
 
-Normally hooks are absolute: `muxad` skips screen inference entirely on any
+Normally hooks are absolute: `tendd` skips screen inference entirely on any
 pane a live hook row owns. agy is the one documented exception. Its rows are
 classified **attention-blind** (`AgentKind::hooks_report_attention` is `false`),
 and for those the screen detector keeps running and contributes exactly one
@@ -130,30 +130,30 @@ Verified against a live agy 1.1.17 pane, on both prompt shapes agy renders
 `working` → `waiting_input` → approve → `idle`, with the hook-supplied model
 and response intact throughout.
 
-## `muxa hook agy` is fail-open and silent
+## `tend hook agy` is fail-open and silent
 
 agy reads a hook's **stdout as a verdict**. An empty stdout means "no opinion";
 a `PreToolUse` reply that is JSON but carries no valid `decision` blocks the
 call outright (`tool call denied by pre-tool hook`), and so does a non-zero
-exit. `muxa hook agy` therefore:
+exit. `tend hook agy` therefore:
 
 - writes **zero bytes** to stdout on every event, and
 - exits `0` even when the payload is unparseable, the event flag is unknown, or
-  muxad is down.
+  tendd is down.
 
-`muxa hook` as a whole also stops aborting on an unreadable `config.toml` — it
+`tend hook` as a whole also stops aborting on an unreadable `config.toml` — it
 degrades to defaults and reports the parse error on stderr — because that check
 runs before the handler and would otherwise defeat the guarantee above from
 outside it. Every non-hook subcommand still fails loudly on a bad config.
 
 Observation must never be able to block the agent. This is the one hook handler
-in muxa that swallows its own errors for that reason.
+in tend that swallows its own errors for that reason.
 
 ## What agy does not expose
 
 - **No permission/notification hook.** No agy hook fires when it puts an
   approval prompt up, so `WaitingInput` is unreachable from the hook stream.
-  muxa fills the gap from the screen instead — see
+  tend fills the gap from the screen instead — see
   [Attention comes from the screen](#attention-comes-from-the-screen).
 - **No session-end hook.** `Stop` is a turn boundary, not a session boundary, so
   agy rows are reaped by pane liveness like Codex's.
@@ -164,14 +164,14 @@ in muxa that swallows its own errors for that reason.
 - **No rate-limit or cost signal.** `modelName` rides on every payload (more
   than Codex or the Gemini CLI give), but the usage fields stay `None`.
 
-## Elsewhere in muxa
+## Elsewhere in tend
 
 | Surface | Value |
 | --- | --- |
 | Discovery (`pane_current_command`) | `agy`, `antigravity` |
-| `muxa agent start --agent` | `agy` (alias `antigravity`) → `agy --dangerously-skip-permissions [-i <prompt>]` |
-| `muxa watch` spawn form | `agy` |
-| `muxa timeline --agent` | `antigravity` (alias `agy`) |
-| MCP `muxa_start_agent` / `muxa_call_peer` | `"agy"` |
+| `tend agent start --agent` | `agy` (alias `antigravity`) → `agy --dangerously-skip-permissions [-i <prompt>]` |
+| `tend watch` spawn form | `agy` |
+| `tend timeline --agent` | `antigravity` (alias `agy`) |
+| MCP `tend_start_agent` / `tend_call_peer` | `"agy"` |
 | Wire / dashboard kind | `antigravity` |
 | omp sink | `source: antigravity`, `cli_name: agy` |

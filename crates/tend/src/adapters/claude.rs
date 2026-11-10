@@ -1,0 +1,940 @@
+//! Claude Code adapter — reads hook JSON on stdin, emits `AgentEvent`.
+//!
+//! Wire up in `~/.claude/settings.json`:
+//!
+//! ```json
+//! "hooks": {
+//!   "SessionStart":     [{ "hooks": [{ "type":"command", "command":"tend hook claude --event session_start"      }]}],
+//!   "UserPromptSubmit": [{ "hooks": [{ "type":"command", "command":"tend hook claude --event user_prompt_submit" }]}],
+//!   "PreToolUse":       [{ "hooks": [{ "type":"command", "command":"tend hook claude --event pre_tool_use"       }]}],
+//!   "PostToolUse":      [{ "hooks": [{ "type":"command", "command":"tend hook claude --event post_tool_use"      }]}],
+//!   "Notification":     [{ "hooks": [{ "type":"command", "command":"tend hook claude --event notification"       }]}],
+//!   "Stop":             [{ "hooks": [{ "type":"command", "command":"tend hook claude --event stop"               }]}],
+//!   "StopFailure":      [{ "hooks": [{ "type":"command", "command":"tend hook claude --event stop_failure"       }]}],
+//!   "SessionEnd":       [{ "hooks": [{ "type":"command", "command":"tend hook claude --event session_end"        }]}]
+//! }
+//! ```
+
+use super::hook::{truncate, AdapterError, HookAdapter};
+use super::transcript;
+use crate::event::{
+    AgentEvent, AgentId, AgentKind, NotificationLevel, RateLimitScope, RateLimitSource,
+    SubagentSpec,
+};
+use serde::Deserialize;
+use std::path::PathBuf;
+use time::OffsetDateTime;
+
+/// Positive evidence that a resolved built-in dialog returned to the normal
+/// composer. History alone and a bare prompt without the normal footer do not
+/// qualify; active/permission overlays retain hook authority.
+pub fn idle_composer_from_capture(raw: &str) -> bool {
+    let text = crate::screen::prepare_capture(raw, 20);
+    let lines: Vec<_> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let Some(prompt) = lines.iter().rposition(|line| *line == "❯") else {
+        return false;
+    };
+    let separator = |line: &str| line.chars().count() >= 8 && line.chars().all(|c| c == '─');
+    if prompt == 0
+        || prompt + 1 >= lines.len()
+        || !separator(lines[prompt - 1])
+        || !separator(lines[prompt + 1])
+    {
+        return false;
+    }
+    let footer = lines.last().copied().unwrap_or_default().to_lowercase();
+    if lines[prompt + 2..].iter().any(|line| {
+        let trimmed = line.trim_start_matches(['❯', '›', '>']).trim_start();
+        trimmed.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && (line.starts_with('❯') || line.starts_with('›') || line.starts_with('>'))
+    }) {
+        return false;
+    }
+    let lower = text.to_lowercase();
+    if [
+        "esc to interrupt",
+        "esc to cancel",
+        "esc to exit",
+        "enter to choose",
+        "enter to confirm",
+        "enter to select",
+        "tab to amend",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        return false;
+    }
+    [
+        "auto mode on",
+        "bypass permissions on",
+        "accept edits on",
+        "plan mode on",
+        "? for shortcuts",
+    ]
+    .iter()
+    .any(|mode| footer.contains(mode))
+}
+
+pub struct ClaudeAdapter;
+
+pub const APPROVAL_NOTIFICATION_PREFIX: &str = "Claude approval required: ";
+
+#[derive(Debug, Deserialize)]
+pub struct Input {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub notification_type: Option<String>,
+    #[serde(default)]
+    pub message: Option<String>,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Path to the JSONL session transcript. Provided by Claude Code on
+    /// every hook event; we use it on `Stop` to extract the assistant's
+    /// last response since the hook payload itself doesn't carry one.
+    #[serde(default)]
+    pub transcript_path: Option<PathBuf>,
+    /// `StopFailure` hook only: which API error class triggered the
+    /// failure. Documented values include `rate_limit`,
+    /// `authentication_failed`, `billing_error`, `invalid_request`,
+    /// `server_error`, `max_output_tokens`, `unknown`.
+    #[serde(default)]
+    pub error: Option<String>,
+    /// `StopFailure` hook only: free-form details from the upstream
+    /// API response (e.g., `"429 Too Many Requests"`).
+    #[serde(default)]
+    pub error_details: Option<String>,
+    /// `StopFailure` hook only: assistant text rendered in-TUI just
+    /// before the failure (e.g., `"You've hit your limit · resets …"`).
+    /// Echoes content the transcript also captures, but is cheaper to
+    /// read here and avoids racing the JSONL flush.
+    #[serde(default)]
+    pub last_assistant_message: Option<String>,
+    /// `PreToolUse` only: the tool's input object. We read only the `Task`
+    /// fields (`subagent_type`, `description`) to surface subagents; every
+    /// other tool's input is ignored.
+    #[serde(default)]
+    pub tool_input: Option<ToolInput>,
+}
+
+/// Narrow view of a tool's input — just the `Task` fields tend needs to
+/// identify a spawned subagent. Deserialization ignores all other keys.
+#[derive(Debug, Deserialize)]
+pub struct ToolInput {
+    #[serde(default)]
+    pub subagent_type: Option<String>,
+    #[serde(default)]
+    pub description: Option<String>,
+    /// `Bash` only: the shell command about to run. Approval rules compare
+    /// it with the command shown in the permission dialog.
+    #[serde(default)]
+    pub command: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Event {
+    SessionStart,
+    UserPromptSubmit,
+    PreToolUse,
+    PostToolUse,
+    Notification,
+    Stop,
+    StopFailure,
+    SessionEnd,
+}
+
+impl HookAdapter for ClaudeAdapter {
+    type Event = Event;
+    type Input = Input;
+    const KIND: AgentKind = AgentKind::ClaudeCode;
+
+    fn parse_event(flag: &str) -> Result<Event, AdapterError> {
+        Ok(match flag {
+            "session_start" => Event::SessionStart,
+            "user_prompt_submit" => Event::UserPromptSubmit,
+            "pre_tool_use" => Event::PreToolUse,
+            "post_tool_use" => Event::PostToolUse,
+            "notification" => Event::Notification,
+            "stop" => Event::Stop,
+            "stop_failure" => Event::StopFailure,
+            "session_end" => Event::SessionEnd,
+            other => return Err(AdapterError::UnknownEvent(other.into())),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)] // per-hook-event dispatch; splitting the match only scatters it
+    fn normalize(event: Event, input: Input, pane: Option<String>) -> AgentEvent {
+        let id = AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: input.session_id,
+            surface: None,
+            pane,
+            tmux_socket: None,
+            cwd: input.cwd,
+        };
+        let at = OffsetDateTime::now_utc();
+
+        match event {
+            Event::SessionStart => AgentEvent::Started { id, at },
+            Event::UserPromptSubmit => AgentEvent::PromptSubmitted {
+                id,
+                prompt: truncate(input.prompt.unwrap_or_default(), 4_000),
+                at,
+            },
+            Event::PreToolUse => pre_tool_event(id, input.tool_name, input.tool_input, at),
+            Event::PostToolUse => AgentEvent::ToolCompleted {
+                id,
+                tool: input.tool_name.unwrap_or_else(|| "unknown".into()),
+                success: true,
+                at,
+            },
+            Event::Notification => {
+                let kind = input.notification_type.unwrap_or_default();
+                let level = match kind.as_str() {
+                    "permission_prompt" | "cross_session_message_held" => {
+                        NotificationLevel::NeedsChoice
+                    }
+                    "elicitation_dialog" => NotificationLevel::NeedsInput,
+                    _ => NotificationLevel::Info,
+                };
+                let message = input.message.unwrap_or(kind);
+                let message = if level == NotificationLevel::NeedsChoice {
+                    format!("{APPROVAL_NOTIFICATION_PREFIX}{message}")
+                } else {
+                    message
+                };
+                AgentEvent::NotificationFired {
+                    id,
+                    level,
+                    message,
+                    at,
+                }
+            }
+            Event::Stop => {
+                // Walk the transcript tail. If the last recognizable
+                // entry is a rate-limit synthetic, treat the Stop hook
+                // as a rate-limit signal (fallback for installs that
+                // don't have the StopFailure hook wired). Otherwise
+                // emit a normal `TurnStopped` with the assistant text.
+                // The same transcript also carries the session recap
+                // (`※ recap: …`, a `system`/`away_summary` record) and the
+                // rolling `ai-title`. Neither is in any hook payload or the
+                // statusline JSON, so this scan is the only stable read
+                // path — do it once here and ride along on `TurnStopped`.
+                let summary = input
+                    .transcript_path
+                    .as_deref()
+                    .map(transcript::last_session_summary)
+                    .unwrap_or_default();
+                let recap = summary.recap.map(|r| truncate(r, 2_000));
+                let ai_title = summary.ai_title.map(|t| truncate(t, 200));
+                match input
+                    .transcript_path
+                    .as_deref()
+                    .and_then(transcript::last_turn_outcome)
+                {
+                    Some(transcript::TurnOutcome::RateLimited(text)) => AgentEvent::RateLimited {
+                        id,
+                        scope: RateLimitScope::Unknown,
+                        source: RateLimitSource::Transcript,
+                        // No reset timestamp: parsing "resets 2:40pm
+                        // (Asia/Seoul)" reliably is fragile (locale,
+                        // 12-hour ambiguity, whitespace). The watch UI
+                        // renders the message verbatim until a richer
+                        // signal lands.
+                        resets_at: None,
+                        message: Some(truncate(text, 4_000)),
+                        at,
+                    },
+                    Some(transcript::TurnOutcome::Response(text)) => AgentEvent::TurnStopped {
+                        id,
+                        response: Some(truncate(text, 4_000)),
+                        recap,
+                        ai_title,
+                        idle_confirmed: false,
+                        at,
+                    },
+                    None => AgentEvent::TurnStopped {
+                        id,
+                        response: None,
+                        recap,
+                        ai_title,
+                        idle_confirmed: false,
+                        at,
+                    },
+                }
+            }
+            Event::StopFailure => {
+                let error_kind = input.error.as_deref().unwrap_or("unknown");
+                if error_kind == "rate_limit" {
+                    AgentEvent::RateLimited {
+                        id,
+                        // The hook payload doesn't tell us which window
+                        // tripped — that's only on the statusline / per-
+                        // request response headers.
+                        scope: RateLimitScope::Unknown,
+                        source: RateLimitSource::StopFailure,
+                        // Same reason — no reset timestamp from this
+                        // signal alone. The store keeps any prior
+                        // `rate_limited_until` it learned from a richer
+                        // source.
+                        resets_at: None,
+                        message: input
+                            .last_assistant_message
+                            .or(input.error_details)
+                            .map(|m| truncate(m, 4_000)),
+                        at,
+                    }
+                } else {
+                    // Non-rate-limit StopFailures (auth, billing, server
+                    // error, …) flip the row to Error so the user can't
+                    // miss the dead session. Surface the human-readable
+                    // message when one is provided.
+                    let message = input
+                        .last_assistant_message
+                        .or(input.error_details)
+                        .unwrap_or_else(|| format!("StopFailure: {error_kind}"));
+                    AgentEvent::NotificationFired {
+                        id,
+                        level: NotificationLevel::Error,
+                        message: truncate(message, 4_000),
+                        at,
+                    }
+                }
+            }
+            Event::SessionEnd => AgentEvent::SessionEnded { id, at },
+        }
+    }
+}
+
+/// Map a `PreToolUse` hook to the right `AgentEvent`. Most tools
+/// emit `ToolStarted` (state → Working); a small closed-set of
+/// user-blocking tools route through `NotificationFired { NeedsChoice }`
+/// so the row reads `WaitingChoice` while the menu is up — both
+/// `AskUserQuestion` and `ExitPlanMode` present numbered/menu UIs,
+/// distinct from a free-text `Notification` prompt. The matching
+/// `PostToolUse` → `ToolCompleted` recovers the row back to Working
+/// via `state::mutate_for_event`.
+fn pre_tool_event(
+    id: AgentId,
+    tool_name: Option<String>,
+    tool_input: Option<ToolInput>,
+    at: OffsetDateTime,
+) -> AgentEvent {
+    let tool_name = tool_name.unwrap_or_else(|| "unknown".into());
+    if is_user_blocking_tool(&tool_name) {
+        AgentEvent::NotificationFired {
+            id,
+            level: NotificationLevel::NeedsChoice,
+            message: format!("waiting on {tool_name}"),
+            at,
+        }
+    } else {
+        // Claude's `Task` tool spawns a subagent; carry its identity so the
+        // store can track it as an in-flight subagent (retired on the
+        // matching `PostToolUse`). Every other tool carries `None`.
+        let (kind, description, command) = tool_input.map_or((None, None, None), |ti| {
+            (ti.subagent_type, ti.description, ti.command)
+        });
+        let subagent = (tool_name == "Task").then(|| SubagentSpec {
+            kind: kind.unwrap_or_else(|| "subagent".into()),
+            description,
+        });
+        let command = if tool_name == "Bash" { command } else { None };
+        AgentEvent::ToolStarted {
+            id,
+            tool: tool_name,
+            subagent,
+            command,
+            at,
+        }
+    }
+}
+
+/// Tools whose `PreToolUse` semantically means "block on the user
+/// for input" rather than "agent is doing work". Routing them
+/// through `NotificationFired { NeedsInput }` flips the row to
+/// `WaitingInput` while the menu is up, so the operator's mental
+/// model ("yellow = needs me") matches reality.
+///
+/// Add new entries here when Claude Code (or upstreams that share
+/// this hook surface) ship more user-blocking tools. The list is
+/// closed-set on purpose: an unknown tool default-routes to the
+/// "agent is working" path so we don't accidentally over-flip.
+fn is_user_blocking_tool(name: &str) -> bool {
+    matches!(name, "AskUserQuestion" | "ExitPlanMode")
+}
+
+// ---------------------------------------------------------------------------
+// Status line (not a HookAdapter — it reads a different payload and emits a
+// Heartbeat rather than a hook-triggered event).
+
+#[derive(Debug, Deserialize)]
+pub struct StatusLineInput {
+    pub session_id: String,
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub model: Option<StatusModel>,
+    #[serde(default)]
+    pub context_window: Option<StatusContext>,
+    #[serde(default)]
+    pub cost: Option<StatusCost>,
+    /// Pro/Max usage windows. Documented schema (CC 2.1.80+):
+    /// `rate_limits.{five_hour,seven_day}.{used_percentage,resets_at}`.
+    /// Always optional — API-key sessions don't populate it.
+    #[serde(default)]
+    pub rate_limits: Option<StatusRateLimits>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StatusModel {
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StatusContext {
+    pub used_percentage: Option<f32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StatusCost {
+    pub total_cost_usd: Option<f64>,
+}
+
+/// `rate_limits` object emitted by Claude Code's statusline JSON.
+#[derive(Debug, Deserialize, Default)]
+pub struct StatusRateLimits {
+    #[serde(default)]
+    pub five_hour: Option<StatusRateLimitWindow>,
+    #[serde(default)]
+    pub seven_day: Option<StatusRateLimitWindow>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct StatusRateLimitWindow {
+    /// 0..100 — Claude Code documents this as a percentage.
+    #[serde(default)]
+    pub used_percentage: Option<f32>,
+    /// Unix epoch *seconds*. Optional even when `used_percentage` is
+    /// known — the documented schema lets the two fields move
+    /// independently.
+    #[serde(default)]
+    pub resets_at: Option<i64>,
+}
+
+/// Parse the Claude Code status-line JSON from stdin and build a Heartbeat.
+pub fn parse_statusline<R: std::io::Read>(r: &mut R) -> Result<StatusLineInput, AdapterError> {
+    let mut buf = String::new();
+    r.read_to_string(&mut buf)?;
+    Ok(serde_json::from_str(&buf)?)
+}
+
+pub fn statusline_heartbeat(input: StatusLineInput, pane: Option<String>) -> AgentEvent {
+    fn extract(window: Option<&StatusRateLimitWindow>) -> (Option<f32>, Option<OffsetDateTime>) {
+        let pct = window.and_then(|w| w.used_percentage);
+        let reset = window
+            .and_then(|w| w.resets_at)
+            .and_then(|s| OffsetDateTime::from_unix_timestamp(s).ok());
+        (pct, reset)
+    }
+    let (five_hour_pct, five_hour_reset) = extract(
+        input
+            .rate_limits
+            .as_ref()
+            .and_then(|rl| rl.five_hour.as_ref()),
+    );
+    let (seven_day_pct, seven_day_reset) = extract(
+        input
+            .rate_limits
+            .as_ref()
+            .and_then(|rl| rl.seven_day.as_ref()),
+    );
+    AgentEvent::Heartbeat {
+        id: AgentId {
+            kind: AgentKind::ClaudeCode,
+            session_id: input.session_id,
+            surface: None,
+            pane,
+            tmux_socket: None,
+            cwd: input.cwd,
+        },
+        model: input.model.and_then(|m| m.display_name),
+        context_used_pct: input.context_window.and_then(|c| c.used_percentage),
+        cost_usd: input.cost.and_then(|c| c.total_cost_usd),
+        rate_limit_5h_pct: five_hour_pct,
+        rate_limit_5h_resets_at: five_hour_reset,
+        rate_limit_7d_pct: seven_day_pct,
+        rate_limit_7d_resets_at: seven_day_reset,
+        at: OffsetDateTime::now_utc(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::NamedTempFile;
+
+    #[test]
+    fn bash_pre_tool_use_carries_its_command() {
+        let mut input = pretool_input("Bash");
+        input.tool_input = Some(ToolInput {
+            subagent_type: None,
+            description: Some("Run tests".into()),
+            command: Some("npm test".into()),
+        });
+        match ClaudeAdapter::normalize(Event::PreToolUse, input, None) {
+            AgentEvent::ToolStarted { command, .. } => {
+                assert_eq!(command.as_deref(), Some("npm test"));
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+        let mut edit = pretool_input("Edit");
+        edit.tool_input = Some(ToolInput {
+            subagent_type: None,
+            description: None,
+            command: Some("not a shell".into()),
+        });
+        match ClaudeAdapter::normalize(Event::PreToolUse, edit, None) {
+            AgentEvent::ToolStarted { command, .. } => assert_eq!(command, None),
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    fn pretool_input(tool_name: &str) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: Some(tool_name.into()),
+            notification_type: None,
+            message: None,
+            prompt: None,
+            transcript_path: None,
+            error: None,
+            error_details: None,
+            last_assistant_message: None,
+            tool_input: None,
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_ask_user_question_emits_needs_choice_notification() {
+        // The numbered-menu case: AskUserQuestion presents a menu, so
+        // the row should land in WaitingChoice (via NeedsChoice), not
+        // free-text WaitingInput.
+        let ev =
+            ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("AskUserQuestion"), None);
+        match ev {
+            AgentEvent::NotificationFired { level, .. } => {
+                assert!(matches!(level, NotificationLevel::NeedsChoice));
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_exit_plan_mode_also_blocks() {
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("ExitPlanMode"), None);
+        assert!(matches!(
+            ev,
+            AgentEvent::NotificationFired {
+                level: NotificationLevel::NeedsChoice,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn pre_tool_use_for_regular_tool_emits_tool_started() {
+        // Sanity: non-blocking tools must still go through the
+        // ToolStarted path — we don't want every pre-tool hook to
+        // read as WaitingInput.
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("Bash"), None);
+        match ev {
+            AgentEvent::ToolStarted { tool, subagent, .. } => {
+                assert_eq!(tool, "Bash");
+                assert!(subagent.is_none(), "non-Task tools carry no subagent");
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_task_carries_subagent_identity() {
+        // The `Task` tool spawns a subagent; the adapter lifts its
+        // `subagent_type` + `description` onto ToolStarted so the store can
+        // track it as an in-flight subagent.
+        let mut input = pretool_input("Task");
+        input.tool_input = Some(ToolInput {
+            subagent_type: Some("Explore".into()),
+            description: Some("map the codebase".into()),
+            command: None,
+        });
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, input, None);
+        match ev {
+            AgentEvent::ToolStarted { tool, subagent, .. } => {
+                assert_eq!(tool, "Task");
+                let s = subagent.expect("Task must carry a subagent spec");
+                assert_eq!(s.kind, "Explore");
+                assert_eq!(s.description.as_deref(), Some("map the codebase"));
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_tool_use_for_task_without_subagent_type_defaults() {
+        // A `Task` call whose input we couldn't parse still registers a
+        // subagent, just with a generic kind.
+        let ev = ClaudeAdapter::normalize(Event::PreToolUse, pretool_input("Task"), None);
+        match ev {
+            AgentEvent::ToolStarted { subagent, .. } => {
+                assert_eq!(subagent.expect("Task carries a subagent").kind, "subagent");
+            }
+            other => panic!("expected ToolStarted, got {other:?}"),
+        }
+    }
+
+    fn notification_input(notification_type: &str) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: None,
+            notification_type: Some(notification_type.into()),
+            message: Some(format!("notification: {notification_type}")),
+            prompt: None,
+            transcript_path: None,
+            error: None,
+            error_details: None,
+            last_assistant_message: None,
+            tool_input: None,
+        }
+    }
+
+    #[test]
+    fn idle_prompt_notification_stays_informational() {
+        let ev =
+            ClaudeAdapter::normalize(Event::Notification, notification_input("idle_prompt"), None);
+        match ev {
+            AgentEvent::NotificationFired { level, message, .. } => {
+                assert_eq!(level, NotificationLevel::Info);
+                assert_eq!(message, "notification: idle_prompt");
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn user_blocking_notifications_distinguish_approval_from_free_text() {
+        for (notification_type, expected) in [
+            ("permission_prompt", NotificationLevel::NeedsChoice),
+            ("cross_session_message_held", NotificationLevel::NeedsChoice),
+            ("elicitation_dialog", NotificationLevel::NeedsInput),
+        ] {
+            let ev = ClaudeAdapter::normalize(
+                Event::Notification,
+                notification_input(notification_type),
+                None,
+            );
+            match ev {
+                AgentEvent::NotificationFired { level, .. } => {
+                    assert_eq!(level, expected);
+                }
+                other => panic!("expected NotificationFired, got {other:?}"),
+            }
+        }
+    }
+
+    fn stop_input(transcript_path: Option<PathBuf>) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: None,
+            notification_type: None,
+            message: None,
+            prompt: None,
+            transcript_path,
+            error: None,
+            error_details: None,
+            last_assistant_message: None,
+            tool_input: None,
+        }
+    }
+
+    fn stop_failure_input(error: &str, last_assistant_message: Option<&str>) -> Input {
+        Input {
+            session_id: "s".into(),
+            cwd: None,
+            tool_name: None,
+            notification_type: None,
+            message: None,
+            prompt: None,
+            transcript_path: None,
+            error: Some(error.into()),
+            error_details: Some(format!("{error} details")),
+            last_assistant_message: last_assistant_message.map(Into::into),
+            tool_input: None,
+        }
+    }
+
+    #[test]
+    fn stop_failure_rate_limit_emits_rate_limited_event() {
+        let ev = ClaudeAdapter::normalize(
+            Event::StopFailure,
+            stop_failure_input(
+                "rate_limit",
+                Some("You've hit your limit · resets 9:30pm (Asia/Seoul)"),
+            ),
+            None,
+        );
+        match ev {
+            AgentEvent::RateLimited {
+                scope,
+                source,
+                resets_at,
+                message,
+                ..
+            } => {
+                assert_eq!(scope, RateLimitScope::Unknown);
+                assert_eq!(source, RateLimitSource::StopFailure);
+                // StopFailure carries no reset timestamp by design.
+                assert!(resets_at.is_none());
+                assert_eq!(
+                    message.as_deref(),
+                    Some("You've hit your limit · resets 9:30pm (Asia/Seoul)")
+                );
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_failure_non_rate_limit_emits_error_notification() {
+        let ev = ClaudeAdapter::normalize(
+            Event::StopFailure,
+            stop_failure_input("server_error", Some("upstream 502")),
+            None,
+        );
+        match ev {
+            AgentEvent::NotificationFired { level, message, .. } => {
+                assert_eq!(level, NotificationLevel::Error);
+                assert_eq!(message, "upstream 502");
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_failure_unknown_error_falls_back_to_kind_label() {
+        // No `last_assistant_message` and no `error_details` — the
+        // adapter should still surface a meaningful notification.
+        let mut input = stop_failure_input("billing_error", None);
+        input.error_details = None;
+        let ev = ClaudeAdapter::normalize(Event::StopFailure, input, None);
+        match ev {
+            AgentEvent::NotificationFired { level, message, .. } => {
+                assert_eq!(level, NotificationLevel::Error);
+                assert!(
+                    message.contains("billing_error"),
+                    "fallback message should name the error kind, got {message:?}",
+                );
+            }
+            other => panic!("expected NotificationFired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn statusline_passes_through_rate_limits() {
+        let json = r#"{
+            "session_id": "s1",
+            "rate_limits": {
+                "five_hour":  { "used_percentage": 84.0, "resets_at": 1745948400 },
+                "seven_day":  { "used_percentage": 31.5, "resets_at": 1746466800 }
+            }
+        }"#;
+        let mut cur = std::io::Cursor::new(json);
+        let parsed = parse_statusline(&mut cur).unwrap();
+        let ev = statusline_heartbeat(parsed, None);
+        match ev {
+            AgentEvent::Heartbeat {
+                rate_limit_5h_pct,
+                rate_limit_5h_resets_at,
+                rate_limit_7d_pct,
+                rate_limit_7d_resets_at,
+                ..
+            } => {
+                assert!((rate_limit_5h_pct.unwrap() - 84.0).abs() < f32::EPSILON);
+                assert!((rate_limit_7d_pct.unwrap() - 31.5).abs() < f32::EPSILON);
+                assert_eq!(
+                    rate_limit_5h_resets_at.unwrap().unix_timestamp(),
+                    1_745_948_400
+                );
+                assert_eq!(
+                    rate_limit_7d_resets_at.unwrap().unix_timestamp(),
+                    1_746_466_800
+                );
+            }
+            _ => panic!("expected Heartbeat"),
+        }
+    }
+
+    #[test]
+    fn statusline_without_rate_limits_emits_none() {
+        let json = r#"{ "session_id": "s1" }"#;
+        let mut cur = std::io::Cursor::new(json);
+        let parsed = parse_statusline(&mut cur).unwrap();
+        let ev = statusline_heartbeat(parsed, None);
+        match ev {
+            AgentEvent::Heartbeat {
+                rate_limit_5h_pct,
+                rate_limit_5h_resets_at,
+                rate_limit_7d_pct,
+                rate_limit_7d_resets_at,
+                ..
+            } => {
+                assert!(rate_limit_5h_pct.is_none());
+                assert!(rate_limit_5h_resets_at.is_none());
+                assert!(rate_limit_7d_pct.is_none());
+                assert!(rate_limit_7d_resets_at.is_none());
+            }
+            _ => panic!("expected Heartbeat"),
+        }
+    }
+
+    #[test]
+    fn statusline_partial_rate_limits_each_field_independent() {
+        // 5h has only the percentage, 7d has only the timestamp — both
+        // legal per the documented schema.
+        let json = r#"{
+            "session_id": "s1",
+            "rate_limits": {
+                "five_hour":  { "used_percentage": 12.0 },
+                "seven_day":  { "resets_at": 1746466800 }
+            }
+        }"#;
+        let mut cur = std::io::Cursor::new(json);
+        let parsed = parse_statusline(&mut cur).unwrap();
+        let ev = statusline_heartbeat(parsed, None);
+        match ev {
+            AgentEvent::Heartbeat {
+                rate_limit_5h_pct,
+                rate_limit_5h_resets_at,
+                rate_limit_7d_pct,
+                rate_limit_7d_resets_at,
+                ..
+            } => {
+                assert!(rate_limit_5h_pct.is_some());
+                assert!(rate_limit_5h_resets_at.is_none());
+                assert!(rate_limit_7d_pct.is_none());
+                assert!(rate_limit_7d_resets_at.is_some());
+            }
+            _ => panic!("expected Heartbeat"),
+        }
+    }
+
+    #[test]
+    fn stop_without_transcript_path_emits_none_response() {
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(None), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => assert!(response.is_none()),
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn stop_with_transcript_path_pulls_last_assistant_text() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"hello from the model"}}]}}}}"#
+        )
+        .unwrap();
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(f.path().into())), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => {
+                assert_eq!(response.as_deref(), Some("hello from the model"));
+            }
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn stop_with_long_response_truncates_to_4kb() {
+        let mut f = NamedTempFile::new().unwrap();
+        let huge = "x".repeat(10_000);
+        // Embed the long string in a JSON-safe way.
+        let line = format!(
+            r#"{{"type":"assistant","message":{{"role":"assistant","content":[{{"type":"text","text":"{huge}"}}]}}}}"#
+        );
+        writeln!(f, "{line}").unwrap();
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(f.path().into())), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => {
+                let text = response.expect("response present");
+                // truncate() bound is 4_000 bytes + a single ellipsis (3
+                // bytes in UTF-8) — anything larger means the truncation
+                // hook isn't running.
+                assert!(text.len() <= 4_000 + 3, "got {} bytes", text.len());
+                assert!(text.ends_with('…'));
+            }
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+
+    #[test]
+    fn stop_with_transcript_rate_limit_emits_rate_limited_event() {
+        let mut f = NamedTempFile::new().unwrap();
+        writeln!(
+            f,
+            r#"{{"type":"assistant","message":{{"model":"<synthetic>","role":"assistant","content":[{{"type":"text","text":"You've hit your limit · resets 2:40pm (Asia/Seoul)"}}]}},"error":"rate_limit","isApiErrorMessage":true,"apiErrorStatus":429}}"#
+        )
+        .unwrap();
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(f.path().into())), None);
+        match ev {
+            AgentEvent::RateLimited {
+                source, message, ..
+            } => {
+                assert_eq!(source, RateLimitSource::Transcript);
+                assert!(message.unwrap().contains("You've hit your limit"));
+            }
+            other => panic!("expected RateLimited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stop_with_unreadable_path_emits_none_response() {
+        let path = PathBuf::from("/tmp/no-such-transcript-zzz.jsonl");
+        let ev = ClaudeAdapter::normalize(Event::Stop, stop_input(Some(path)), None);
+        match ev {
+            AgentEvent::TurnStopped { response, .. } => assert!(response.is_none()),
+            _ => panic!("expected TurnStopped"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod idle_composer_tests {
+    use super::*;
+    #[test]
+    fn resolved_auto_mode_dialog_is_idle_but_modals_running_and_unknown_screens_are_not() {
+        let idle="❯ /auto-mode-setup\n● Saved to settings.json (environment).\n────────────────────\n❯ \n────────────────────\n ~/w/project Opus 5.5\n ⏵⏵ auto mode on (shift+tab to cycle)\n";
+        assert!(idle_composer_from_capture(idle));
+        for screen in [
+            idle.replace("❯ \n", "❯ continue\n"),
+            idle.replace("auto mode on", "Enter to confirm · Esc to cancel"),
+            format!("✻ Thinking (esc to interrupt)\n{idle}"),
+            "Permission request\n❯ 1. Yes\n  2. No\nEnter to select".into(),
+            "❯\n auto mode on".into(),
+            "ordinary shell prompt".into(),
+        ] {
+            assert!(!idle_composer_from_capture(&screen), "{screen}");
+        }
+    }
+}

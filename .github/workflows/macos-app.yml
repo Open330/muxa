@@ -1,6 +1,6 @@
 name: macOS app
 
-# The release builds Muxa for Mac with the runner's Xcode, which can be older
+# The release builds Tend for Mac with the runner's Xcode, which can be older
 # than the one on a developer's Mac and stricter about Sendable. Build and test
 # the app on every pull request that touches it, so a release is never the
 # first place it compiles.
@@ -8,12 +8,12 @@ on:
   push:
     branches: [main]
     paths:
-      - "apps/muxa-macos/**"
+      - "apps/tend-macos/**"
       - ".github/workflows/macos-app.yml"
   pull_request:
     branches: [main]
     paths:
-      - "apps/muxa-macos/**"
+      - "apps/tend-macos/**"
       - ".github/workflows/macos-app.yml"
 
 concurrency:
@@ -39,27 +39,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            apps/muxa-macos/.build/dependencies
-            apps/muxa-macos/.build/toolchains
-            apps/muxa-macos/.build/libghostty.stamp
-          key: libghostty-${{ runner.os }}-${{ hashFiles('apps/muxa-macos/Dependencies.lock', 'apps/muxa-macos/Patches/libghostty-spm/*.patch') }}
+            apps/tend-macos/.build/dependencies
+            apps/tend-macos/.build/toolchains
+            apps/tend-macos/.build/libghostty.stamp
+          key: libghostty-${{ runner.os }}-${{ hashFiles('apps/tend-macos/Dependencies.lock', 'apps/tend-macos/Patches/libghostty-spm/*.patch') }}
 
       - name: Build libghostty and generate the project
-        working-directory: apps/muxa-macos
+        working-directory: apps/tend-macos
         run: |
           Scripts/build-libghostty.sh
           xcodegen generate
 
       - name: Test AFM workspace grounding
-        run: bash apps/muxa-macos/Scripts/test-ask-helper.sh
+        run: bash apps/tend-macos/Scripts/test-ask-helper.sh
 
-      - name: Build and run MuxaTests
-        working-directory: apps/muxa-macos
+      - name: Build and run TendTests
+        working-directory: apps/tend-macos
         run: |
           set -o pipefail
           xcodebuild \
-            -project Muxa.xcodeproj \
-            -scheme Muxa \
+            -project Tend.xcodeproj \
+            -scheme Tend \
             -configuration Debug \
             -derivedDataPath .build/DerivedData \
             -destination 'platform=macOS' \
@@ -73,12 +73,12 @@ jobs:
       # actor-isolation checking is stricter than Debug's: v0.8.57 passed
       # this job and still failed the release. Compile it here too.
       - name: Build the Release configuration
-        working-directory: apps/muxa-macos
+        working-directory: apps/tend-macos
         run: |
           set -o pipefail
           xcodebuild \
-            -project Muxa.xcodeproj \
-            -scheme Muxa \
+            -project Tend.xcodeproj \
+            -scheme Tend \
             -configuration Release \
             -derivedDataPath .build/DerivedDataRelease \
             -destination 'platform=macOS' \
@@ -89,7 +89,7 @@ jobs:
       # The build extracts every new string into the catalog; one without a
       # Korean value means a translation was forgotten.
       - name: Check translations
-        working-directory: apps/muxa-macos
+        working-directory: apps/tend-macos
         run: python3 Scripts/l10n-sync.py --check
 
       - name: Upload the build log

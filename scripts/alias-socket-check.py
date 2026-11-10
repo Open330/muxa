@@ -2,7 +2,7 @@
 """`--alias` must reserve the handle on the daemon the launch is talking to.
 
 `mark_agent` registered the name against `paths::default_socket()` regardless
-of `--socket` or `MUXA_SOCKET`. Against any other daemon the name is taken in a
+of `--socket` or `TEND_SOCKET`. Against any other daemon the name is taken in a
 room that knows nothing about the pane, while the room that owns it never
 hears — so that room's next minted handle can hand the same name to a second
 pane, and two panes answer to one alias.
@@ -37,15 +37,15 @@ HERE = pathlib.Path(__file__).resolve().parent
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--name", default="aliassock")
-    ap.add_argument("--muxa", help="defaults to whichever of target/{debug,release} exists")
-    ap.add_argument("--muxad", help="likewise")
+    ap.add_argument("--tend", help="defaults to whichever of target/{debug,release} exists")
+    ap.add_argument("--tendd", help="likewise")
     args = ap.parse_args()
 
     def built(name: str, given: str | None) -> str:
         """The binary to use: what was asked for, else whichever is built.
 
         Defaulting to `target/debug` alone meant a release-only checkout failed
-        with `muxad not found` from inside the sandbox script, which reads as a
+        with `tendd not found` from inside the sandbox script, which reads as a
         sandbox problem rather than a missing flag.
         """
         if given:
@@ -56,10 +56,10 @@ def main() -> int:
                 return str(candidate.resolve())
         sys.exit(f"no {name} built: run `cargo build --workspace --bins` or pass --{name}")
 
-    muxa = built("muxa", args.muxa)
-    muxad = built("muxad", args.muxad)
+    tend = built("tend", args.tend)
+    tendd = built("tendd", args.tendd)
     sock = f"/tmp/{args.name}-sandbox/tmux.sock"
-    script = str(HERE / "muxa-sandbox.sh")
+    script = str(HERE / "tend-sandbox.sh")
 
     env = {k: v for k, v in os.environ.items() if k not in ("TMUX", "TMUX_PANE")}
 
@@ -80,7 +80,7 @@ def main() -> int:
 
     failures = 0
     try:
-        up = sandbox("up", "--muxa", muxa, "--muxad", muxad,
+        up = sandbox("up", "--tend", tend, "--tendd", tendd,
                      "--extra-path", str(fake_bin))
         if up.returncode != 0:
             print(f"  FAIL  sandbox did not come up\n{up.stdout}\n{up.stderr}")
@@ -94,7 +94,7 @@ def main() -> int:
             if line.startswith("export ") and "=" in line:
                 key, _, value = line[len("export "):].partition("=")
                 senv[key] = value.split(':"$PATH"')[0].strip("'")
-        senv["TMUX"] = senv.get("MUXA_SANDBOX_TMUX_ENV", "")
+        senv["TMUX"] = senv.get("TEND_SANDBOX_TMUX_ENV", "")
 
         # The launch resolves `codex` inside a pane, from the tmux server's
         # environment rather than this process's. `--extra-path` only prepends
@@ -117,7 +117,7 @@ def main() -> int:
         held, other = panes[0], panes[1]
 
         started = subprocess.run(
-            [muxa, "agent", "start", "--agent", "codex", "--alias", "codex",
+            [tend, "agent", "start", "--agent", "codex", "--alias", "codex",
              "--placement", "pane", "--target", held, "--json"],
             capture_output=True, text=True, env=senv,
         )
@@ -126,14 +126,14 @@ def main() -> int:
             return 1
         print("  ok    `agent start --alias codex` succeeded")
 
-        subprocess.run([muxa, "hook", "codex", "--event", "session_start"],
+        subprocess.run([tend, "hook", "codex", "--event", "session_start"],
                        input='{"session_id":"alias-socket-check"}',
                        capture_output=True, text=True,
                        env=dict(senv, TMUX_PANE=other))
         minted = ""
         for _ in range(40):
             time.sleep(0.4)
-            minted = tmux("show", "-p", "-t", other, "-v", "@muxa_agent_alias", tenv=senv).strip()
+            minted = tmux("show", "-p", "-t", other, "-v", "@tend_agent_alias", tenv=senv).strip()
             if minted:
                 break
 

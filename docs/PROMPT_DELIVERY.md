@@ -1,6 +1,6 @@
 # Prompt delivery and submission
 
-Muxa sends prompt text and the submit key as separate operations. Native tmux
+Tend sends prompt text and the submit key as separate operations. Native tmux
 and rmux use `load-buffer` followed by `paste-buffer -p -r` for every nonempty
 prompt, including a one-line `continue`. The terminal supplies bracketed-paste
 start/end markers when the application enables that mode. Enter follows the end
@@ -16,14 +16,14 @@ explicit paste clears that state. See the upstream
 Raw control keys still use `send_text_on`, without a paste wrapper. Empty prompt
 text is a no-op before an Enter-only operation. Hosts without an explicit paste
 transport retain a 250ms best-effort fallback; that delay cannot prove submission.
-The fallback and host selection live in `crates/muxa/src/backend/mod.rs`, rather
+The fallback and host selection live in `crates/tend/src/backend/mod.rs`, rather
 than an automation rule or a user-editable timing setting.
 
 The IPC `send_prompt` response distinguishes:
 
 - `sent`: the host accepted prompt text; do not resend it.
 - `submitted`: the host accepted the separate Enter key.
-- `submission_confirmed: true`: Muxa observed a new `PromptSubmitted` event
+- `submission_confirmed: true`: Tend observed a new `PromptSubmitted` event
   matching the original agent session, socket, and exact prompt. The observer
   subscribes before injection and waits at most 750ms after Enter. Absent evidence
   leaves this field omitted; it does not mean submission failed.
@@ -34,7 +34,7 @@ record the same acknowledgement in daemon debug logs without blocking mailbox
 bookkeeping or subsequent peer wakes. Other send interfaces
 continue to report transport outcomes.
 
-Muxa does not resend the body or repeat Enter merely because an acknowledgement
+Tend does not resend the body or repeat Enter merely because an acknowledgement
 is missing. Hooks can arrive late or be unavailable, and a retry could submit a
 different user draft. Inspect the pane before an explicit Enter-only recovery.
 The `confirm-selected-yes` automation remains limited to affirmative choice
@@ -43,9 +43,9 @@ menus; it does not submit arbitrary pending drafts.
 Protocol regression tests:
 
 ```sh
-cargo test -p muxa --lib prompt_delivery
-cargo test -p muxa --lib send_prompt_
-cargo test -p muxa --test prompt_paste_boundary -- --ignored
+cargo test -p tend --lib prompt_delivery
+cargo test -p tend --lib send_prompt_
+cargo test -p tend --test prompt_paste_boundary -- --ignored
 ```
 
 The last command requires native tmux, rmux, and Python 3. It creates temporary

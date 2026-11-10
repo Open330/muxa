@@ -1,0 +1,3354 @@
+//! `tend peek` — tmux's `display-panes`, carrying tend's per-pane context.
+//!
+//! `display-panes` answers "which pane is which number". This answers
+//! "which pane is doing what": over each pane's own screen sits a box with
+//! its tmux pane id, its agent's state glyph, session summary, latest
+//! prompt, and latest response. Typing the pane's digit jumps there, so it
+//! takes over
+//! `prefix + q` outright rather than asking for a modifier to reach the
+//! better version of a reflex you already have.
+//!
+//! ## Faking transparency
+//!
+//! tmux allows exactly one popup per client, offers no per-pane overlay
+//! primitive, and its popups are opaque. So "a translucent card floating
+//! over each pane" is not expressible — but it can be *reconstructed*: one
+//! borderless popup covers the whole client, and inside it we repaint the
+//! window's pane layout from `#{pane_left}`/`#{pane_top}` (see
+//! [`tend::tmux::layout`]), fill each rectangle with that pane's captured
+//! screen dimmed to a backdrop, and lay the info box on top.
+//!
+//! Two rules keep the illusion honest. The box takes only the rows its
+//! content needs, never more than two thirds of the pane, so the terminal
+//! underneath stays readable — a box that filled its pane would be an
+//! opaque overlay again. And the box's own rectangle is cleared before
+//! drawing, because backdrop text bleeding through the box's interior
+//! reads as corruption rather than depth.
+//!
+//! ## Reading the focused pane
+//!
+//! Inside a popup `$TMUX_PANE` names the *popup's own* pane, so
+//! [`tend::tmux::current_pane`] cannot answer "which pane is the user on".
+//! Focus comes from tmux's `#{pane_active}` instead, carried on
+//! [`PaneGeometry::active`].
+
+use std::fmt::Write as _;
+use std::io::{self, Stdout};
+use std::time::{Duration, Instant};
+
+use anyhow::Result;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::{Frame, Terminal};
+use tend::config::IconSet;
+use tend::ipc::Client;
+use tend::state::Agent;
+use tend::tmux::layout::{ClientSurface, PaneGeometry, WindowFrame, WindowTarget};
+use tend::AgentState;
+use time::OffsetDateTime;
+use unicode_width::UnicodeWidthChar;
+
+use crate::attend;
+use crate::watch::agent_kind_short;
+
+mod identity;
+#[cfg(test)]
+mod layout_tests;
+mod relations;
+
+/// Budget for the one snapshot round-trip. The overlay is a
+/// press-and-glance affair, so a wedged daemon must degrade to "boxes
+/// with no agent detail" fast rather than leaving the user staring at a
+/// blank popup. Looser than the status-line's 250 ms because this fires
+/// once per keypress, not twice per second.
+const PEEK_IPC_TIMEOUT: Duration = Duration::from_millis(400);
+
+/// How often the overlay re-reads agents and pane geometry while open.
+/// Peek stays up until dismissed (unlike `display-panes`, whose content
+/// is static enough to time out), so a state flip or a layout change made
+/// from another client should show up without a manual refresh. Pane
+/// backdrops are deliberately *not* on this tick — see the refresh arm in
+/// [`drive`].
+const REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Input poll slice. Short enough that a digit feels instant, long enough
+/// that idling costs nothing.
+const INPUT_POLL: Duration = Duration::from_millis(100);
+
+/// How far back to look in a pane's prompt history for an entry
+/// belonging to the current agent session. History is newest-first, so
+/// the match is normally the first entry; the small slack covers a pane
+/// whose previous occupant's prompts have not aged out yet.
+const PROMPT_HISTORY_LOOKBACK: usize = 8;
+
+/// Smallest box that can carry a border plus one row of content. Below
+/// this, [`render_cell`] drops the border and prints a bare badge.
+const MIN_BORDERED_HEIGHT: u16 = 3;
+
+#[derive(Debug, Clone, clap::Args)]
+pub(crate) struct Args {
+    /// Open the overlay on the client that invoked the key binding.
+    #[arg(long, conflicts_with = "plain")]
+    pub(crate) popup: bool,
+    #[arg(long, hide = true)]
+    pub(crate) caller_client: Option<String>,
+    #[arg(long, hide = true, requires = "caller_window")]
+    caller_session: Option<String>,
+    #[arg(long, hide = true, requires = "caller_session")]
+    caller_window: Option<String>,
+    /// Print the overlay's per-pane lines as plain text and exit, instead
+    /// of drawing the TUI. Intended for `tend doctor`-style debugging from
+    /// a normal shell, where there's no popup to draw into.
+    #[arg(long)]
+    plain: bool,
+    /// Open the active pane in a fullscreen, scrollable reader.
+    #[arg(long)]
+    expanded: bool,
+}
+
+impl Args {
+    fn target(&self) -> Result<WindowTarget> {
+        match (&self.caller_session, &self.caller_window) {
+            (None, None) => Ok(WindowTarget::resolve()),
+            (Some(session), Some(window)) if native_id(session, '$') && native_id(window, '@') => {
+                Ok(WindowTarget {
+                    session: Some(session.clone()),
+                    window: Some(window.clone()),
+                })
+            }
+            _ => anyhow::bail!("peek needs valid caller session ($N) and window (@N) IDs"),
+        }
+    }
+}
+fn native_id(value: &str, prefix: char) -> bool {
+    value
+        .strip_prefix(prefix)
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PeekCollaboration {
+    roles: Vec<String>,
+    purpose: Option<tend::collaboration::LaunchPurpose>,
+    links: Vec<String>,
+    connections: Vec<tend::collaboration::CollaborationLink>,
+}
+
+/// One pane's worth of overlay: where to draw, and what to say.
+#[derive(Debug, Clone)]
+pub(crate) struct PeekCell {
+    pub collaboration: PeekCollaboration,
+    pub geo: PaneGeometry,
+    /// The agent whose story this box tells. `None` for a pane running a
+    /// plain shell, which gets a bare digit badge instead of a box —
+    /// nothing to narrate, and its output stays fully visible.
+    pub agent: Option<Agent>,
+    /// Agents sharing this pane beyond `agent` (a restarted session that
+    /// hasn't been reaped yet, or a `tend register`ed task). Surfaced as a
+    /// `+N` badge rather than silently dropped.
+    pub extra: usize,
+    /// When the human last sent this agent a prompt, from the daemon's
+    /// prompt history. `None` when history holds nothing for this
+    /// agent's session — a fresh session, or history switched off — in
+    /// which case the box simply carries no age.
+    pub last_prompt_at: Option<OffsetDateTime>,
+    /// The pane's visible screen, one entry per row, painted dim behind
+    /// the info box. Taken once when the overlay opens and re-taken only
+    /// on `r`/resize, so it is a snapshot rather than a live mirror.
+    /// Empty when the capture failed or wasn't requested (`--plain`,
+    /// tests) — the box then renders over blank space.
+    pub capture: Vec<String>,
+}
+
+pub(crate) async fn run(client: &Client, args: Args) -> Result<()> {
+    // Pin the window before anything else: every later query is scoped to
+    // it, so a keystroke in another terminal can't reroute the overlay
+    // onto a different session mid-read.
+    let target = args.target()?;
+    // Before any work: is there a viewer a popup could be drawn on? When
+    // there isn't, peek reports in text rather than painting a full-client
+    // overlay into a pane-sized hole (or into a popup nobody renders).
+    let surface = tend::tmux::layout::client_surface(&target);
+    let plain = args.plain || !surface.draws_overlays();
+    if plain && !args.plain {
+        eprintln!("{}", undrawable_note(surface));
+    }
+    let (panes, zoomed) = tend::tmux::layout::current_window_panes(&target);
+    if panes.is_empty() {
+        anyhow::bail!(
+            "no tmux panes visible — `tend peek` reads the current window, so run it inside tmux \
+             (normally via `prefix + q`)"
+        );
+    }
+    let frame = tend::tmux::layout::current_window_frame(&target);
+    let agents = client
+        .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
+        .await
+        .unwrap_or_default();
+    let mut cells = build_cells_on(
+        panes,
+        &agents,
+        tend::backend::rmux::endpoint_from_env().as_deref(),
+    );
+    attach_prompt_times(client, &mut cells).await;
+    attach_collaboration(client, &mut cells).await;
+
+    if plain {
+        for line in plain_lines(&cells) {
+            println!("{line}");
+        }
+        return Ok(());
+    }
+    attach_captures(&mut cells, zoomed);
+
+    // The guard restores the terminal on the way out of every path,
+    // including a panic mid-draw. Outside a popup (`tend peek` run bare in
+    // a shell) nothing else would put the terminal back.
+    let mut guard = TerminalGuard::new(setup_terminal()?);
+    let detail = args.expanded.then(|| Detail::active(&cells)).flatten();
+    let outcome = drive(
+        guard.terminal_mut(),
+        client,
+        cells,
+        frame,
+        zoomed,
+        &target,
+        detail,
+    )
+    .await;
+    drop(guard);
+    // Jump only after the popup's screen is torn down: `select-pane`
+    // repaints the window underneath, and doing it while we still own the
+    // alternate screen leaves the user looking at our leftovers.
+    if let Outcome::Jump(pane_id) = outcome? {
+        let pane_target = match (&target.session, &target.window) {
+            (Some(session), Some(window)) => format!("{session}:{window}.{pane_id}"),
+            _ => pane_id,
+        };
+        crate::mux_control::Control::Ambient.run(&["select-pane", "-t", &pane_target])?;
+    }
+    Ok(())
+}
+
+/// The one line explaining why this run printed text instead of drawing.
+///
+/// peek falls back rather than failing because the fallback is the same
+/// report: `--plain` answers "which pane is doing what" in full, and on
+/// these front-ends it is the only form of the answer that can reach the
+/// user. Erroring out would make them retype the command to get output
+/// tend could simply have produced.
+///
+/// The note goes to stderr so the report itself stays pipeable, and it is
+/// printed only when peek chose the fallback — an explicit `--plain` needs
+/// no explanation.
+///
+/// # Panics
+///
+/// Only if called for a surface that draws overlays, which has no note to
+/// give; callers gate on [`ClientSurface::draws_overlays`].
+fn undrawable_note(surface: ClientSurface) -> String {
+    let cause = match surface {
+        // cmux: panes driven by `capture-pane`/`send-keys` with nothing
+        // attached. `display-popup` fails with "no current client" here,
+        // and no client means no key-binding resolution either — which is
+        // why `prefix + q` does nothing on such a server.
+        ClientSurface::Detached => {
+            "no tmux client is attached to this session, so there is no screen to draw a popup on"
+        }
+        // amux, iTerm2: a client exists but is sent pane content only.
+        ClientSurface::ControlMode => {
+            "this tmux client runs in control mode (`tmux -CC`), which is sent pane content but \
+             never popup content"
+        }
+        ClientSurface::Terminal | ClientSurface::Unknown => {
+            unreachable!("only an undrawable surface has a note")
+        }
+    };
+    format!("tend peek: {cause} — printing the per-pane report instead of the overlay.")
+}
+
+enum Outcome {
+    Jump(String),
+    Dismissed,
+}
+
+/// A stable reading snapshot; background refreshes must not move the text
+/// underneath the reader. `r` explicitly captures a newer snapshot.
+struct Detail {
+    cell: PeekCell,
+    history: String,
+    terminal: bool,
+    offset: usize,
+    page: usize,
+    width: u16,
+    lines: Vec<String>,
+}
+
+impl Detail {
+    fn active(cells: &[PeekCell]) -> Option<Self> {
+        cells
+            .iter()
+            .find(|cell| cell.geo.active)
+            .or(cells.first())
+            .cloned()
+            .map(Self::new)
+    }
+
+    fn new(cell: PeekCell) -> Self {
+        let history = tend::tmux::layout::capture_pane_history_plain(&cell.geo.pane_id)
+            .unwrap_or_else(|| "Pane history unavailable (the pane may have closed).".into());
+        Self {
+            cell,
+            history,
+            terminal: false,
+            offset: 0,
+            page: 1,
+            width: 0,
+            lines: Vec::new(),
+        }
+    }
+
+    fn text(&self) -> String {
+        if self.terminal {
+            return self.history.clone();
+        }
+        let mut text = String::from(
+            "Saved agent text — Tab opens terminal history for the original output.\n",
+        );
+        if let Some(agent) = &self.cell.agent {
+            for (title, body) in [
+                ("Latest response", agent.last_response.as_deref()),
+                ("Latest prompt", agent.last_prompt.as_deref()),
+                ("Conversation recap", agent.recap.as_deref()),
+                ("Notification", agent.last_notification.as_deref()),
+            ] {
+                if let Some(body) = body.filter(|body| !body.trim().is_empty()) {
+                    let _ = write!(text, "\n{title}\n{body}\n");
+                }
+            }
+        } else {
+            text.push_str("\nNo tracked agent. Press Tab to read this pane's terminal history.");
+        }
+        text
+    }
+
+    fn toggle_source(&mut self) {
+        self.terminal = !self.terminal;
+        self.offset = if self.terminal { usize::MAX } else { 0 };
+        self.width = 0;
+    }
+
+    fn scroll(&mut self, key: KeyCode) {
+        let max = self.lines.len().saturating_sub(self.page);
+        self.offset = match key {
+            KeyCode::Up | KeyCode::Char('k') => self.offset.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => self.offset.saturating_add(1),
+            KeyCode::PageUp => self.offset.saturating_sub(self.page),
+            KeyCode::PageDown | KeyCode::Char(' ') => self.offset.saturating_add(self.page),
+            KeyCode::Home | KeyCode::Char('g') => 0,
+            KeyCode::End | KeyCode::Char('G') => max,
+            _ => self.offset,
+        }
+        .min(max);
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let source = if self.terminal {
+            "Terminal history"
+        } else {
+            "Saved agent text"
+        };
+        let block = Block::bordered().title(identity::address_line(
+            format!(
+                " {} {} · {source} ",
+                self.cell.geo.pane_index,
+                pane_address(&self.cell)
+            ),
+            pane_address(&self.cell),
+            self.cell
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.tmux_socket.as_deref()),
+        ));
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        let body = Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        if self.width != body.width || self.lines.is_empty() {
+            self.lines = wrap_full(&self.text(), usize::from(body.width));
+            self.width = body.width;
+        }
+        self.page = usize::from(body.height).max(1);
+        self.offset = self.offset.min(self.lines.len().saturating_sub(self.page));
+        let visible: Vec<Line<'static>> = self
+            .lines
+            .iter()
+            .skip(self.offset)
+            .take(self.page)
+            .cloned()
+            .map(Line::raw)
+            .collect();
+        frame.render_widget(Paragraph::new(visible), body);
+        if inner.height > 0 {
+            let footer = format!(" {}/{} · j/k ↑↓ PgUp/Dn g/G · Tab source · n/p pane · r refresh · |/Esc back · Enter jump · q close",
+                self.offset + 1, self.lines.len().max(1));
+            frame.render_widget(
+                Paragraph::new(footer).style(Style::default().fg(Color::DarkGray)),
+                Rect {
+                    y: inner.bottom() - 1,
+                    height: 1,
+                    ..inner
+                },
+            );
+        }
+    }
+}
+
+/// Wrap without ellipsizing or collapsing line breaks/indentation. Unlike the
+/// glance cards, this reader must make every retained character reachable.
+fn wrap_full(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut result = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for ch in line.chars().filter(|ch| !ch.is_control() || *ch == '\t') {
+            let chars = if ch == '\t' {
+                "    ".to_owned()
+            } else {
+                ch.to_string()
+            };
+            for ch in chars.chars() {
+                let cells = ch.width().unwrap_or(0);
+                if used + cells > width && !row.is_empty() {
+                    result.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                row.push(ch);
+                used += cells;
+            }
+        }
+        result.push(row);
+    }
+    result
+}
+
+fn handle_detail_key(
+    detail: &mut Option<Detail>,
+    key: KeyEvent,
+    cells: &[PeekCell],
+) -> Option<Outcome> {
+    let reader = detail.as_mut().expect("detail is open");
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Some(Outcome::Dismissed)
+        }
+        KeyCode::Char('q' | 'Q') => return Some(Outcome::Dismissed),
+        KeyCode::Esc | KeyCode::Char('|') => *detail = None,
+        KeyCode::Enter => return Some(Outcome::Jump(reader.cell.geo.pane_id.clone())),
+        KeyCode::Tab => reader.toggle_source(),
+        KeyCode::Char('r') => {
+            let cell = cells
+                .iter()
+                .find(|cell| cell.geo.pane_id == reader.cell.geo.pane_id)
+                .unwrap_or(&reader.cell)
+                .clone();
+            let terminal = reader.terminal;
+            let offset = reader.offset;
+            *reader = Detail::new(cell);
+            reader.terminal = terminal;
+            reader.offset = offset;
+        }
+        KeyCode::Char('n' | 'p') => {
+            let index = cells
+                .iter()
+                .position(|cell| cell.geo.pane_id == reader.cell.geo.pane_id)
+                .unwrap_or(0);
+            if !cells.is_empty() {
+                let next = if key.code == KeyCode::Char('n') {
+                    (index + 1) % cells.len()
+                } else {
+                    (index + cells.len() - 1) % cells.len()
+                };
+                *reader = Detail::new(cells[next].clone());
+            }
+        }
+        code => reader.scroll(code),
+    }
+    None
+}
+
+async fn drive(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    client: &Client,
+    mut cells: Vec<PeekCell>,
+    frame: Option<WindowFrame>,
+    mut zoomed: bool,
+    target: &WindowTarget,
+    mut detail: Option<Detail>,
+) -> Result<Outcome> {
+    let placement = Placement::from(frame);
+    let mut typed = String::new();
+    let mut last_refresh = Instant::now();
+    // Set when something invalidated the current frame (an explicit `r`, a
+    // resize) so the next pass re-reads immediately instead of waiting out
+    // the interval.
+    let mut stale = false;
+    loop {
+        terminal.draw(|f| {
+            if let Some(detail) = detail.as_mut() {
+                detail.draw(f);
+            } else {
+                draw(f, &cells, placement, zoomed, &typed);
+            }
+        })?;
+
+        if event::poll(INPUT_POLL)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press && detail.is_some() => {
+                    if let Some(outcome) = handle_detail_key(&mut detail, key, &cells) {
+                        return Ok(outcome);
+                    }
+                }
+                Event::Key(key) if key.kind == KeyEventKind::Press => match classify(key) {
+                    Action::Dismiss => return Ok(Outcome::Dismissed),
+                    Action::Refresh => {
+                        typed.clear();
+                        stale = true;
+                    }
+                    Action::Digit(d) => {
+                        typed.push(d);
+                        match resolve_typed(&typed, &cells) {
+                            Selection::Hit(pane_id) => return Ok(Outcome::Jump(pane_id)),
+                            Selection::Prefix => {}
+                            Selection::Miss => typed.clear(),
+                        }
+                    }
+                    Action::Commit => {
+                        if let Some(pane_id) = exact_match(&typed, &cells) {
+                            return Ok(Outcome::Jump(pane_id));
+                        }
+                        typed.clear();
+                    }
+                    Action::Ignore => {}
+                    Action::Expand => {
+                        detail = exact_match(&typed, &cells)
+                            .and_then(|id| cells.iter().find(|cell| cell.geo.pane_id == id))
+                            .cloned()
+                            .map(Detail::new)
+                            .or_else(|| Detail::active(&cells));
+                        typed.clear();
+                    }
+                },
+                // A resize invalidates every rectangle we hold; re-read
+                // geometry rather than repainting a stale layout.
+                Event::Resize(_, _) => stale = true,
+                _ => {}
+            }
+        }
+
+        if stale || last_refresh.elapsed() >= REFRESH_INTERVAL {
+            let (panes, now_zoomed) = tend::tmux::layout::current_window_panes(target);
+            if !panes.is_empty() {
+                let agents = client
+                    .snapshot_with_timeout(PEEK_IPC_TIMEOUT)
+                    .await
+                    .unwrap_or_default();
+                let mut next = build_cells_on(
+                    panes,
+                    &agents,
+                    tend::backend::rmux::endpoint_from_env().as_deref(),
+                );
+                attach_prompt_times(client, &mut next).await;
+                attach_collaboration(client, &mut next).await;
+                // Agent state is cheap to re-read and worth keeping live.
+                // Backdrops are neither: one `capture-pane` per pane per
+                // second buys a flicker of scrollback nobody is reading
+                // while the overlay is up. They refresh when the user asks
+                // (`r`) or when a resize reflows them.
+                if stale {
+                    attach_captures(&mut next, now_zoomed);
+                } else {
+                    carry_captures(&cells, &mut next);
+                }
+                cells = next;
+                zoomed = now_zoomed;
+            }
+            last_refresh = Instant::now();
+            stale = false;
+        }
+    }
+}
+
+enum Action {
+    Expand,
+    Digit(char),
+    /// Commit whatever digits are pending, ambiguity be damned.
+    Commit,
+    Refresh,
+    Dismiss,
+    Ignore,
+}
+
+/// What the digits typed so far mean.
+enum Selection {
+    Hit(String),
+    /// Still ambiguous — `1` when both pane 1 and pane 10 exist. Waiting
+    /// for another digit is the only way to tell them apart.
+    Prefix,
+    Miss,
+}
+
+/// Resolve typed digits against the visible pane indexes.
+///
+/// Single-digit windows (nearly all of them) jump on the first keypress.
+/// A window with ten or more panes makes `1` a prefix of `10`, so those
+/// wait for a second digit rather than leaving panes 10+ unreachable.
+///
+/// The wait is why `Enter` exists: with panes 1, 10 and 11 on screen,
+/// every continuation of `1` names a *different* pane, so pane 1 could
+/// never be reached by typing alone. `Enter` commits what's pending —
+/// see [`exact_match`].
+fn resolve_typed(typed: &str, cells: &[PeekCell]) -> Selection {
+    let exact = cells.iter().find(|c| c.geo.pane_index == typed);
+    let ambiguous = cells
+        .iter()
+        .any(|c| c.geo.pane_index.len() > typed.len() && c.geo.pane_index.starts_with(typed));
+    match (exact, ambiguous) {
+        (Some(cell), false) => Selection::Hit(cell.geo.pane_id.clone()),
+        (_, true) => Selection::Prefix,
+        (None, false) => Selection::Miss,
+    }
+}
+
+/// The pane whose index is exactly `typed`, ignoring the ambiguity that
+/// makes [`resolve_typed`] wait. This is what `Enter` commits.
+fn exact_match(typed: &str, cells: &[PeekCell]) -> Option<String> {
+    cells
+        .iter()
+        .find(|c| c.geo.pane_index == typed)
+        .map(|c| c.geo.pane_id.clone())
+}
+
+fn classify(key: KeyEvent) -> Action {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c' | 'C') => Action::Dismiss,
+            _ => Action::Ignore,
+        };
+    }
+    match key.code {
+        // `q` mirrors tmux's own `display-panes` dismissal; Esc is the
+        // reflex for anything popup-shaped.
+        // `Q` too: the key that opened the overlay should close it.
+        KeyCode::Char('q' | 'Q') | KeyCode::Esc => Action::Dismiss,
+        KeyCode::Char('r') => Action::Refresh,
+        KeyCode::Char('|') => Action::Expand,
+        KeyCode::Enter => Action::Commit,
+        KeyCode::Char(c) if c.is_ascii_digit() => Action::Digit(c),
+        _ => Action::Ignore,
+    }
+}
+
+/// Pair pane geometry with the agent rows the daemon holds for it.
+///
+/// Every visible pane gets a cell, including the ones a zoomed pane is
+/// currently covering: the attention count in the footer must still see
+/// them, and `--plain` lists them. Hiding the covered ones is a *drawing*
+/// concern, handled in [`draw`].
+#[cfg(test)]
+fn build_cells(panes: Vec<PaneGeometry>, agents: &[Agent]) -> Vec<PeekCell> {
+    build_cells_on(panes, agents, None)
+}
+
+fn build_cells_on(panes: Vec<PaneGeometry>, agents: &[Agent], rmux: Option<&str>) -> Vec<PeekCell> {
+    let here = rmux
+        .map(str::to_string)
+        .or_else(tend::tmux::layout::current_socket_name);
+    panes
+        .into_iter()
+        .map(|geo| {
+            let mut mine: Vec<&Agent> = agents
+                .iter()
+                .filter(|a| {
+                    let id = if rmux.is_some() {
+                        format!("rmux:{}", geo.pane_id)
+                    } else {
+                        geo.pane_id.clone()
+                    };
+                    a.pane.as_deref() == Some(id.as_str())
+                })
+                .filter(|a| on_this_server(a, here.as_deref()))
+                .collect();
+            // Most interesting first: a pane holding both a live agent and
+            // the husk of a previous one should read as the live one.
+            mine.sort_by(|a, b| {
+                interest_rank(a)
+                    .cmp(&interest_rank(b))
+                    .then(b.last_activity_at.cmp(&a.last_activity_at))
+            });
+            let extra = mine.len().saturating_sub(1);
+            PeekCell {
+                collaboration: PeekCollaboration::default(),
+                agent: mine.first().map(|a| (*a).clone()),
+                extra,
+                last_prompt_at: None,
+                capture: Vec::new(),
+                geo,
+            }
+        })
+        .collect()
+}
+
+/// One bounded metadata read for the entire window; never claims requests or reads bodies.
+async fn attach_collaboration(client: &Client, cells: &mut [PeekCell]) {
+    let Some(agent) = cells.iter().find_map(|cell| cell.agent.as_ref()) else {
+        return;
+    };
+    let Some(pane) = agent.pane.clone() else {
+        return;
+    };
+    let origin = tend::collaboration::CollaborationOrigin {
+        exact_session: false,
+        pane,
+        socket: agent.tmux_socket.clone(),
+        console: true,
+        agent_session_id: None,
+    };
+    if let Ok(Ok(overview)) =
+        tokio::time::timeout(PEEK_IPC_TIMEOUT, client.collaboration_overview(&origin)).await
+    {
+        apply_collaboration(cells, &overview);
+    }
+}
+
+fn apply_collaboration(
+    cells: &mut [PeekCell],
+    overview: &tend::collaboration::CollaborationOverview,
+) {
+    use tend::collaboration::{is_pending_session, RequestStatus};
+    for cell in cells {
+        cell.collaboration = PeekCollaboration::default();
+        let Some(agent) = cell.agent.as_ref() else {
+            continue;
+        };
+        let Some(participant) = overview.participants.iter().find(|participant| {
+            Some(&participant.pane) == agent.pane.as_ref()
+                && match (agent.tmux_socket.as_deref(), participant.socket.as_deref()) {
+                    (Some(actual), Some(expected)) => {
+                        tend::backend::pane_endpoints_match(agent.pane.as_deref(), actual, expected)
+                    }
+                    (None, _) => true,
+                    (Some(_), None) => false,
+                }
+                && (participant.agent_session_id == agent.session_id
+                    || agent
+                        .session_id
+                        .starts_with(tend::state::SYNTHETIC_SESSION_PREFIX)
+                        && is_pending_session(&participant.agent_session_id))
+        }) else {
+            continue;
+        };
+        cell.collaboration.roles.clone_from(&participant.roles);
+        cell.collaboration.purpose = Some(participant.launch_purpose);
+        if participant.alias.is_some() {
+            cell.geo.alias.clone_from(&participant.alias);
+        }
+        for link in &overview.links {
+            let outbound = link.from.agent_session_id == participant.agent_session_id
+                && link.from.socket == participant.socket;
+            let inbound = link.to.agent_session_id == participant.agent_session_id
+                && link.to.socket == participant.socket;
+            if !outbound && !inbound {
+                continue;
+            }
+            let other = if outbound { &link.to } else { &link.from };
+            let live_peer = overview.participants.iter().find(|peer| {
+                peer.agent_session_id == other.agent_session_id && peer.socket == other.socket
+            });
+            let label = live_peer.map_or_else(
+                || {
+                    if overview.participants.iter().any(|peer| {
+                        peer.pane == other.pane
+                            && peer.socket == other.socket
+                            && peer.agent_session_id != other.agent_session_id
+                    }) {
+                        format!("{} [previous session]", other.label)
+                    } else {
+                        other.label.clone()
+                    }
+                },
+                tend::collaboration::Participant::label,
+            );
+            let state = if link.reply_received {
+                format!("reply received / {:?}", link.status).to_ascii_lowercase()
+            } else if link.status == RequestStatus::Completed {
+                "delivered".into()
+            } else {
+                format!("{:?}", link.status).to_ascii_lowercase()
+            };
+            cell.collaboration.connections.push(link.clone());
+            cell.collaboration.links.push(format!(
+                "{} {}{} · {:?} · {}",
+                if outbound { "to" } else { "from" },
+                label,
+                connection_location(participant, other, live_peer),
+                link.kind,
+                state
+            ));
+            if cell.collaboration.links.len() == 3 {
+                break;
+            }
+        }
+    }
+}
+
+/// Add only the location components that differ from this card's pane.
+fn connection_location(
+    current: &tend::collaboration::Participant,
+    other: &tend::collaboration::CollaborationEndpoint,
+    live: Option<&tend::collaboration::Participant>,
+) -> String {
+    let endpoint = live.map(tend::collaboration::CollaborationEndpoint::from);
+    let other = endpoint.as_ref().unwrap_or(other);
+    let Some(location) = &other.location else {
+        return String::new();
+    };
+    let same_server = tend::backend::pane_id_host_kind(&current.pane)
+        == tend::backend::pane_id_host_kind(&other.pane)
+        && match (current.socket.as_deref(), other.socket.as_deref()) {
+            (Some(a), Some(b)) => tend::backend::pane_endpoints_match(Some(&current.pane), a, b),
+            (None, None) => true,
+            _ => false,
+        };
+    let same_session = same_server
+        && match (&current.tmux_session_id, &location.session_id) {
+            (Some(a), Some(b)) => a == b,
+            _ => {
+                matches!((&current.tmux_session_name, &location.session_name), (Some(a), Some(b)) if a == b)
+            }
+        };
+    let session = location
+        .session_name
+        .as_deref()
+        .or(location.session_id.as_deref());
+    let window = location
+        .window_name
+        .as_deref()
+        .unwrap_or(&location.window_id);
+    if !same_session {
+        if let Some(session) = session {
+            return format!(" [{session}/{window}]");
+        }
+    }
+    if !same_server || current.room.window_id != location.window_id {
+        return format!(" [{window}]");
+    }
+    String::new()
+}
+
+fn collaboration_lines(cell: &PeekCell) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(purpose) = cell.collaboration.purpose {
+        let roles = if cell.collaboration.roles.is_empty() {
+            "agent".into()
+        } else {
+            cell.collaboration.roles.join(", ")
+        };
+        lines.push(format!(
+            "{} · {}",
+            roles,
+            match purpose {
+                tend::collaboration::LaunchPurpose::Primary => "primary",
+                tend::collaboration::LaunchPurpose::Worker => "worker",
+            }
+        ));
+    }
+    if let Some(spawn) = &cell.geo.spawn {
+        lines.push(format!(
+            "Pane spawned by {} · {}",
+            spawn.creator.pane, spawn.creator.label
+        ));
+    }
+    lines.extend(cell.collaboration.links.iter().cloned());
+    lines
+}
+
+/// Read each visible pane's screen into its cell.
+///
+/// One `capture-pane` shell-out per pane per refresh. Panes a zoomed pane
+/// covers are skipped — they are not drawn, so capturing them would spend
+/// a subprocess on pixels nobody sees. A failed capture leaves the cell's
+/// backdrop empty rather than failing the frame.
+fn attach_captures(cells: &mut [PeekCell], zoomed: bool) {
+    for cell in cells.iter_mut() {
+        if zoomed && !cell.geo.active {
+            cell.capture.clear();
+            continue;
+        }
+        let Some(raw) = tend::tmux::layout::capture_pane_plain(&cell.geo.pane_id) else {
+            cell.capture.clear();
+            continue;
+        };
+        observe_codex_recap(cell, &raw);
+        cell.capture = raw.lines().map(str::to_string).collect();
+    }
+}
+
+/// Fill the overlay's cloned agent row from the same fresh capture it already
+/// took for the backdrop. The daemon normally persists this observation on its
+/// three-second screen-detection tick; doing it here as well closes the small
+/// race where peek opens immediately after Codex prints a recap (and keeps peek
+/// useful when screen detection was explicitly disabled).
+fn observe_codex_recap(cell: &mut PeekCell, raw: &str) {
+    let Some(agent) = cell
+        .agent
+        .as_mut()
+        .filter(|agent| agent.kind == tend::AgentKind::Codex)
+    else {
+        return;
+    };
+    if let Some(recap) = tend::adapters::codex::conversation_recap_from_capture(raw) {
+        agent.recap = Some(recap);
+    }
+}
+
+/// Stamp each cell with when its agent last received a prompt.
+///
+/// One in-memory history read per pane, matched on `session_id`: a pane
+/// that has been reused by a *new* agent session must not inherit the
+/// previous occupant's timestamp, and a `tend register`ed task whose
+/// `last_prompt` is really its command line has no history of its own to
+/// borrow from.
+async fn attach_prompt_times(client: &Client, cells: &mut [PeekCell]) {
+    // One deadline for the whole pass, not per pane: a wedged daemon
+    // would otherwise freeze the redraw for `panes × timeout`, which on a
+    // ten-pane window is four seconds of dead overlay.
+    let started = Instant::now();
+    for cell in cells.iter_mut() {
+        if started.elapsed() >= PEEK_IPC_TIMEOUT {
+            break;
+        }
+        let Some(session_id) = cell.agent.as_ref().map(|a| a.session_id.clone()) else {
+            continue;
+        };
+        let history = client
+            .recent_prompts_with_timeout(
+                Some(&cell.geo.pane_id),
+                Some(PROMPT_HISTORY_LOOKBACK),
+                PEEK_IPC_TIMEOUT.saturating_sub(started.elapsed()),
+            )
+            .await
+            .unwrap_or_default();
+        cell.last_prompt_at = history
+            .into_iter()
+            .find(|e| e.session_id == session_id)
+            .map(|e| e.at);
+    }
+}
+
+/// Move backdrops from the previous cells onto freshly built ones,
+/// matched by pane id. A pane that appeared since the last capture simply
+/// has no backdrop until the next `r`.
+fn carry_captures(previous: &[PeekCell], next: &mut [PeekCell]) {
+    for cell in next.iter_mut() {
+        if let Some(old) = previous
+            .iter()
+            .find(|c| c.geo.pane_id == cell.geo.pane_id)
+            .filter(|c| !c.capture.is_empty())
+        {
+            cell.capture.clone_from(&old.capture);
+        }
+    }
+}
+
+/// Whether an agent row can belong to the tmux server peek is running on.
+///
+/// Pane ids are only unique *per server*, so with two tmux servers up, a
+/// `%5` recorded against one can collide with `%5` on the other and put a
+/// stranger's prompt in your box. Only reject when both sides actually
+/// name a socket: the field is backfilled best-effort by the reconciler
+/// and is routinely `None`, where dropping the row would be worse than the
+/// collision it guards against.
+fn on_this_server(agent: &Agent, here: Option<&str>) -> bool {
+    match (agent.tmux_socket.as_deref(), here) {
+        (Some(theirs), Some(ours)) => theirs == ours,
+        _ => true,
+    }
+}
+
+/// Sort key for "which agent speaks for this pane" — lower wins. Blocked
+/// agents outrank busy ones because they're the reason you opened the
+/// overlay; stopped rows sink below everything.
+fn interest_rank(a: &Agent) -> u8 {
+    match a.state {
+        AgentState::WaitingChoice | AgentState::WaitingInput => 0,
+        AgentState::Error => 1,
+        AgentState::Working => 2,
+        AgentState::Starting => 3,
+        AgentState::Idle => 4,
+        AgentState::Stopped => 5,
+    }
+}
+
+/// Colour for a state glyph and the box border that carries it.
+///
+/// Peek deliberately doesn't take a `[watch] theme`: it's a momentary
+/// overlay answering "which pane needs me", so it stays on the same fixed
+/// semantic palette as the status line rather than inheriting a theme.
+/// (`crate::state_style` is the `owo_colors` one used by the table
+/// printers — this is its ratatui counterpart.)
+fn state_style(state: AgentState) -> Style {
+    let color = match state {
+        AgentState::Working => Color::Green,
+        AgentState::WaitingInput => Color::Yellow,
+        AgentState::WaitingChoice => Color::LightYellow,
+        AgentState::Error => Color::Red,
+        AgentState::Starting => Color::Cyan,
+        AgentState::Idle => Color::Gray,
+        AgentState::Stopped => Color::DarkGray,
+    };
+    Style::default().fg(color)
+}
+
+/// Where the overlay's own chrome goes relative to the client.
+///
+/// Both fields come from the same fact — which end of the client tmux's
+/// status line occupies. Panes start below it, and the hint bar goes back
+/// on top of it, so the overlay never has to steal a row from a pane.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Placement {
+    /// Client row where window row 0 lands.
+    pub origin_y: u16,
+    /// Draw the hint bar on the first client row rather than the last.
+    pub hint_at_top: bool,
+}
+
+impl From<Option<WindowFrame>> for Placement {
+    fn from(frame: Option<WindowFrame>) -> Self {
+        // No frame reading means no known status line; the popup then owns
+        // the whole client, and the bottom row is the conventional home for
+        // a hint bar.
+        frame.map_or(Placement::default(), |f| Placement {
+            origin_y: f.pane_origin_y(),
+            hint_at_top: f.status_top,
+        })
+    }
+}
+
+fn draw(f: &mut Frame, cells: &[PeekCell], placement: Placement, zoomed: bool, pending: &str) {
+    let area = f.area();
+    // Relative ages deliberately collapse into coarse buckets (`1h ago`,
+    // `2h ago`, ...). Keep the exact timestamp for ranking so two panes
+    // that display the same age still reveal which one the human touched
+    // last.
+    let latest_prompt_at = latest_prompt_at(cells);
+    f.render_widget(Clear, area);
+    for cell in cells {
+        // A zoomed window still reports the *unzoomed* rectangles for the
+        // covered panes; drawing those would stamp boxes over screen the
+        // zoomed pane now owns.
+        if zoomed && !cell.geo.active {
+            continue;
+        }
+        if let Some(rect) = cell_rect(&cell.geo, placement.origin_y, area) {
+            render_cell(
+                f,
+                cell,
+                rect,
+                cell.last_prompt_at == latest_prompt_at && latest_prompt_at.is_some(),
+            );
+        }
+    }
+    relations::draw(f, cells, placement, zoomed);
+    if area.height > 0 {
+        // Land on the row tmux's status line occupies — the one row of the
+        // client that never belongs to a pane. Guessing wrong here paints
+        // the hint over a pane's content.
+        let y = if placement.hint_at_top {
+            area.y
+        } else {
+            area.y + area.height - 1
+        };
+        let hint = Rect {
+            x: area.x,
+            y,
+            width: area.width,
+            height: 1,
+        };
+        f.render_widget(Paragraph::new(hint_line(cells, pending)), hint);
+    }
+}
+
+/// Translate one pane's window-relative rectangle into client-relative
+/// screen space, clipped to what the popup actually owns.
+///
+/// Returns `None` when the pane falls entirely outside the popup — which
+/// happens legitimately when the layout changed between the geometry read
+/// and the draw, so it's a skip rather than an error.
+pub(crate) fn cell_rect(geo: &PaneGeometry, origin_y: u16, area: Rect) -> Option<Rect> {
+    let x = area.x.checked_add(geo.left)?;
+    let y = area.y.checked_add(geo.top)?.checked_add(origin_y)?;
+    if x >= area.right() || y >= area.bottom() {
+        return None;
+    }
+    let width = geo.width.min(area.right() - x);
+    let height = geo.height.min(area.bottom() - y);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    Some(Rect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+fn render_cell(f: &mut Frame, cell: &PeekCell, rect: Rect, is_latest_prompt: bool) {
+    // The pane's own screen goes down first, dimmed, so the overlay reads
+    // as something laid *over* your terminal rather than instead of it.
+    // tmux popups have no transparency, so this redraw is the only way to
+    // keep the context that tells you which pane you're looking at.
+    render_backdrop(f, cell, rect);
+
+    let one_line = Rect { height: 1, ..rect };
+    // A bare badge owns the whole row; a title has to fit between the
+    // border's two corners. `header_spans` drops the pane id rather than
+    // overrun either, so it needs the difference.
+    if rect.height < MIN_BORDERED_HEIGHT || rect.width < 4 {
+        // Too small to frame — spend every cell on the label itself.
+        f.render_widget(Clear, one_line);
+        f.render_widget(
+            Paragraph::new(Line::from(header_spans(cell, rect.width))),
+            one_line,
+        );
+        return;
+    }
+    if cell.agent.is_none() {
+        // No agent, nothing to narrate. A bare badge keeps the pane
+        // jumpable without framing an empty box over its output.
+        f.render_widget(Clear, one_line);
+        f.render_widget(
+            Paragraph::new(Line::from(header_spans(cell, rect.width))),
+            one_line,
+        );
+        return;
+    }
+    // The box covers only what it needs, so the pane's content stays
+    // readable below it.
+    let rect = info_rect(cell, rect);
+    let header = header_spans(cell, rect.width.saturating_sub(2));
+    // Wipe the backdrop out from under the box: the dim capture showing
+    // through the box's own interior reads as corruption, not as depth.
+    f.render_widget(Clear, rect);
+
+    let accent = cell.agent.as_ref().map_or_else(
+        || Style::default().fg(Color::DarkGray),
+        |a| state_style(a.state),
+    );
+    let block = Block::bordered()
+        .border_type(if cell.geo.active {
+            BorderType::Double
+        } else {
+            BorderType::Rounded
+        })
+        .border_style(if cell.geo.active {
+            accent.add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        })
+        .title(Line::from(header.clone()));
+    // Right-aligned on the same border row as the header. A box too
+    // narrow to hold both would render them overlapping, so the stamp
+    // yields to the identity that makes the pane jumpable.
+    //
+    // Ordinary ages use plain `Gray`: the box has a legibility ladder —
+    // summary (Cyan+BOLD) → prompt (White) → response (Gray+DIM) →
+    // backdrop (DarkGray+DIM, the tier that means "ignore me"). The
+    // stamp used to carry that last style, so the one number telling you
+    // whether a prompt landed a minute or a day ago read as noise. It
+    // belongs a notch under the prompt it annotates, not under the
+    // dimmed capture. The exact newest stamp is Cyan+BOLD because its
+    // purpose is to break otherwise indistinguishable relative-age ties.
+    let block = match age_stamp(cell, is_latest_prompt) {
+        Some(stamp) if fits_alongside_header(&header, &stamp, rect.width) => block.title_top(
+            Line::from(Span::styled(
+                stamp,
+                if is_latest_prompt {
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::Gray)
+                },
+            ))
+            .right_aligned(),
+        ),
+        _ => block,
+    };
+    let inner = block.inner(rect);
+    f.render_widget(block, rect);
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
+
+    // Reserve the bottom row for the meta strip once there's a row to
+    // spare above it; below that, body text is the better use of space.
+    let (body, meta) = if inner.height >= 3 && meta_line(cell, inner.width).is_some() {
+        (
+            Rect {
+                height: inner.height - 1,
+                ..inner
+            },
+            Some(Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            }),
+        )
+    } else {
+        (inner, None)
+    };
+
+    f.render_widget(
+        Paragraph::new(body_text(cell, body.width, body.height)),
+        body,
+    );
+    if let Some(meta) = meta {
+        if let Some(line) = meta_line(cell, meta.width) {
+            f.render_widget(Paragraph::new(line), meta);
+        }
+    }
+}
+
+/// Paint the pane's captured screen as a dim backdrop.
+fn render_backdrop(f: &mut Frame, cell: &PeekCell, rect: Rect) {
+    if cell.capture.is_empty() {
+        return;
+    }
+    let lines: Vec<Line> = cell
+        .capture
+        .iter()
+        .take(rect.height as usize)
+        .map(|raw| {
+            Line::from(Span::styled(
+                raw.clone(),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(Text::from(lines)), rect);
+}
+
+/// How many rows the info box claims out of a pane's rectangle.
+///
+/// Only as many as the content needs, and never more than two thirds of
+/// the pane — a box that swallowed the whole pane would put us back to an
+/// opaque overlay, which is the thing the backdrop exists to avoid.
+pub(crate) fn box_height(cell: &PeekCell, rect: Rect) -> u16 {
+    let ceiling = (rect.height.saturating_mul(2) / 3).max(MIN_BORDERED_HEIGHT);
+    let ceiling = ceiling.min(rect.height);
+    let inner_width = rect.width.saturating_sub(2);
+    // Ask for the content the box *would* render at full allowance, then
+    // shrink to it. `body_text` is already budget-aware, so passing the
+    // ceiling keeps the two in agreement about what fits.
+    let content = body_text(cell, inner_width, ceiling.saturating_sub(2));
+    // `body_text` is bounded by the row budget we just handed it, so the
+    // count always fits — clamp rather than cast so a future change to
+    // that contract can't silently wrap.
+    let mut needed = u16::try_from(content.lines.len()).unwrap_or(u16::MAX);
+    if meta_line(cell, inner_width).is_some() {
+        needed += 1;
+    }
+    (needed + 2).clamp(MIN_BORDERED_HEIGHT, ceiling)
+}
+
+/// Leave a routing lane beside cards that have a separate collaboration panel.
+fn info_rect(cell: &PeekCell, mut pane: Rect) -> Rect {
+    if pane.height < MIN_BORDERED_HEIGHT || pane.width < 4 {
+        return Rect {
+            height: pane.height.min(1),
+            ..pane
+        };
+    }
+    if cell.collaboration.purpose.is_some() && pane.width >= 12 {
+        pane.x += 1;
+        pane.width -= 2;
+    }
+    Rect {
+        height: box_height(cell, pane),
+        ..pane
+    }
+}
+
+fn pane_address(cell: &PeekCell) -> &str {
+    cell.agent
+        .as_ref()
+        .and_then(|agent| agent.pane.as_deref())
+        .unwrap_or(&cell.geo.pane_id)
+}
+
+/// Whether the header and the age stamp can share the top border without
+/// colliding. Both are drawn on the same row from opposite ends, and
+/// ratatui will happily overlap them; the two corners plus a gap between
+/// is the floor.
+fn fits_alongside_header(header: &[Span<'static>], stamp: &str, width: u16) -> bool {
+    spans_width(header) + display_width(stamp) + 3 <= width as usize
+}
+
+/// Display columns a run of spans will occupy.
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans.iter().map(|s| display_width(&s.content)).sum()
+}
+
+/// `1 ● @claude %1242 +2` — the box title, and the whole box when it's
+/// one row.
+///
+/// Three facts compete for one border row, and they are not equally
+/// droppable:
+///
+/// - the **digit** is how you jump inside peek, and is never dropped;
+/// - the **handle** (`@claude`, `@reviewer`) is how you address the pane
+///   from anywhere else — a peer call, `tend send` — which is the reason
+///   most people open this overlay at all;
+/// - the **pane id** is the same address spelled the way tmux spells it:
+///   always correct, never memorable.
+///
+/// A narrow box keeps the complete pane address before the handle or kind.
+/// When the address itself cannot fit, it is omitted in full. Everything
+/// except the bare kind is width-gated
+/// rather than left to ratatui's title clipping, because a clipped
+/// `%1242` or `@claude2` is still a well-formed address — it just points
+/// somewhere else, and would be copied without a second thought. Clipping
+/// `claude` down to `clau` misleads nobody.
+fn header_spans(cell: &PeekCell, width: u16) -> Vec<Span<'static>> {
+    let extra = (cell.extra > 0).then(|| {
+        Span::styled(
+            format!(" +{}", cell.extra),
+            Style::default().fg(Color::DarkGray),
+        )
+    });
+    let pane_id = Span::styled(
+        format!(" {}", pane_address(cell)),
+        Style::default()
+            .fg(identity::cell_color(cell))
+            .add_modifier(Modifier::BOLD),
+    );
+
+    let mut narrowest = Vec::new();
+    for with_pane_id in [true, false] {
+        for identity in identity_spans(cell) {
+            let mut spans = badge_spans(cell);
+            spans.extend(identity.iter().cloned());
+            if with_pane_id {
+                spans.push(pane_id.clone());
+            }
+            spans.extend(extra.iter().cloned());
+            spans.push(Span::raw(" "));
+            if spans_width(&spans) <= width as usize {
+                return spans;
+            }
+            narrowest = spans;
+        }
+        if with_pane_id {
+            let mut address = badge_spans(cell);
+            address.push(pane_id.clone());
+            address.push(Span::raw(" "));
+            if spans_width(&address) <= width as usize {
+                return address;
+            }
+        }
+    }
+    narrowest
+}
+
+/// The part of the header that is never negotiable: the jump digit, and
+/// the state glyph when there's an agent to have one.
+fn badge_spans(cell: &PeekCell) -> Vec<Span<'static>> {
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", cell.geo.pane_index),
+            Style::default()
+                .fg(Color::Black)
+                .bg(if cell.geo.active {
+                    Color::Cyan
+                } else {
+                    Color::Gray
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(" "),
+    ];
+    if let Some(a) = &cell.agent {
+        spans.push(Span::styled(
+            crate::state_icon(a.state),
+            state_style(a.state),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+/// How the pane names itself, richest first. Later entries give up a fact
+/// so the header can fit a narrower box.
+fn identity_spans(cell: &PeekCell) -> Vec<Vec<Span<'static>>> {
+    let Some(a) = &cell.agent else {
+        // No agent: name the process so the box still identifies the pane
+        // rather than reading as an empty slot.
+        let label = if cell.geo.command.is_empty() {
+            "-".to_string()
+        } else {
+            cell.geo.command.clone()
+        };
+        return vec![vec![Span::styled(
+            label,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        )]];
+    };
+    let kind = agent_kind_short(a.kind);
+    let kind_span = Span::styled(kind, Style::default().fg(Color::White));
+    let Some(alias) = cell.geo.alias.as_deref() else {
+        return vec![vec![kind_span]];
+    };
+    let handle = Span::styled(format!("@{alias}"), Style::default().fg(Color::Cyan));
+    // A handle tend minted from the kind (`claude`, `claude2`) already says
+    // which runtime this is, so printing `claude @claude` spends a third of
+    // the header restating it. A handle that names something else — a
+    // pipeline role, an alias the agent chose — does not, and keeps both
+    // until the box gets too narrow to afford it.
+    if alias.to_ascii_lowercase().starts_with(kind) {
+        return vec![vec![handle], vec![kind_span]];
+    }
+    vec![
+        vec![kind_span.clone(), Span::raw(" "), handle.clone()],
+        // The kind goes before the handle does: `@reviewer` still addresses
+        // the pane, `codex` addresses nothing.
+        vec![handle],
+        vec![kind_span],
+    ]
+}
+
+/// Body text, allocated by priority into whatever rows the pane has.
+///
+/// Every tier degrades rather than truncating the tier below it: a 4-row
+/// pane shows summary + prompt, a 10-row pane shows summary + prompt +
+/// response. The order is deliberate — the summary answers "what is this
+/// agent doing", which is the question the overlay exists for; the prompt
+/// and response are the supporting evidence.
+pub(crate) fn body_text(cell: &PeekCell, width: u16, height: u16) -> Text<'static> {
+    let width = width as usize;
+    let mut budget = height as usize;
+    if width == 0 || budget == 0 {
+        return Text::default();
+    }
+    let Some(agent) = cell.agent.as_ref() else {
+        return Text::default();
+    };
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(summary) = summary_source(agent) {
+        // A tall pane can afford a second line of summary; a short one
+        // must leave room for the prompt.
+        let allowance = if budget >= 6 { 2 } else { 1 };
+        push_tier(
+            &mut lines,
+            &mut budget,
+            summary,
+            "",
+            allowance,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+            width,
+        );
+    }
+    if let Some(prompt) = agent.last_prompt.as_deref() {
+        push_tier(
+            &mut lines,
+            &mut budget,
+            prompt,
+            glyph_prompt(),
+            2,
+            Style::default().fg(Color::White),
+            width,
+        );
+    }
+    if let Some(response) = agent.last_response.as_deref() {
+        push_tier(
+            &mut lines,
+            &mut budget,
+            response,
+            glyph_response(),
+            3,
+            Style::default().fg(Color::Gray).add_modifier(Modifier::DIM),
+            width,
+        );
+    }
+    Text::from(lines)
+}
+
+/// Wrap one tier into at most `max_lines` rows (further capped by what's
+/// left of the box), prefixing the first row with `glyph`.
+fn push_tier(
+    lines: &mut Vec<Line<'static>>,
+    budget: &mut usize,
+    raw: &str,
+    glyph: &str,
+    max_lines: usize,
+    style: Style,
+    width: usize,
+) {
+    let allowed = max_lines.min(*budget);
+    if allowed == 0 {
+        return;
+    }
+    let indent = display_width(glyph);
+    let body_width = width.saturating_sub(indent);
+    if body_width == 0 {
+        return;
+    }
+    for (i, chunk) in wrap_clamped(raw, body_width, allowed)
+        .into_iter()
+        .enumerate()
+    {
+        let prefix = if i == 0 {
+            glyph.to_string()
+        } else {
+            " ".repeat(indent)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(prefix, style),
+            Span::styled(chunk, style),
+        ]));
+        *budget -= 1;
+    }
+}
+
+/// Exact newest prompt timestamp across the current window.
+///
+/// More than one cell may carry this value when the history source cannot
+/// distinguish prompts that landed at the same instant. Callers should mark
+/// all of them rather than inventing an ordering.
+fn latest_prompt_at(cells: &[PeekCell]) -> Option<OffsetDateTime> {
+    cells.iter().filter_map(|cell| cell.last_prompt_at).max()
+}
+
+/// ` 5m ago `, or ` last · 5m ` for the newest prompt in the window.
+/// This sits in the box's top-right corner.
+///
+/// It lives on the border rather than inline with the prompt text, where
+/// it broke the reading flow of the very line it was annotating. The
+/// border is chrome; a timestamp is chrome.
+pub(crate) fn age_stamp(cell: &PeekCell, is_latest_prompt: bool) -> Option<String> {
+    let at = cell.last_prompt_at?;
+    let age = crate::relative_time(OffsetDateTime::now_utc(), at);
+    Some(if is_latest_prompt {
+        // `last` already supplies the temporal context, so dropping `ago`
+        // keeps the distinguishing label usable in narrower pane titles.
+        format!(" last · {} ", age.strip_suffix(" ago").unwrap_or(&age))
+    } else {
+        format!(" {age} ")
+    })
+}
+
+fn glyph_prompt() -> &'static str {
+    match crate::icon_set() {
+        IconSet::Unicode => "▸ ",
+        IconSet::Ascii => "> ",
+    }
+}
+
+fn glyph_response() -> &'static str {
+    match crate::icon_set() {
+        IconSet::Unicode => "◂ ",
+        IconSet::Ascii => "< ",
+    }
+}
+
+/// Summary source, degrading the same way `tend watch` does: response → recap →
+/// session title → nothing. `last_prompt` is deliberately *not* in this
+/// chain — unlike watch's single summary column, peek renders the prompt
+/// on its own line, and falling back to it here would print it twice.
+fn summary_source(a: &Agent) -> Option<&str> {
+    a.summary_text()
+}
+
+/// `opus · ctx 62% · 5h 41%` — the bottom strip, dropped entirely when
+/// none of its parts are known.
+fn meta_line(cell: &PeekCell, width: u16) -> Option<Line<'static>> {
+    let agent = cell.agent.as_ref()?;
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(model) = agent.model.as_deref() {
+        parts.push(model.to_ascii_lowercase());
+    }
+    if let Some(ctx) = agent.context_used_pct {
+        parts.push(format!("ctx {ctx:.0}%"));
+    }
+    if let Some(five) = agent.rate_limit_5h_pct {
+        parts.push(format!("5h {five:.0}%"));
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    let text = clip_to_width(&parts.join(" · "), width as usize);
+    Some(Line::from(Span::styled(
+        text,
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    )))
+}
+
+/// Footer strip drawn over the row tmux's status line occupies. Leads
+/// with the attention count when anything is blocked, because that is the
+/// one fact worth stealing focus for.
+pub(crate) fn hint_line(cells: &[PeekCell], pending: &str) -> Line<'static> {
+    let blocked = cells
+        .iter()
+        .filter(|c| {
+            c.agent
+                .as_ref()
+                .is_some_and(|a| attend::needs_attention(a.state))
+        })
+        .count();
+    let mut spans = Vec::new();
+    if blocked > 0 {
+        let verb = if blocked == 1 { "needs" } else { "need" };
+        spans.push(Span::styled(
+            format!(" {blocked} {verb} you "),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Red)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::raw(" "));
+    }
+    if pending.is_empty() {
+        spans.push(Span::styled(
+            " 0-9 jump · | expand · r refresh · q/Esc close",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    } else {
+        // Digits only pend when the window has enough panes to make them
+        // ambiguous. Showing them is the difference between "waiting for
+        // your second digit" and "the overlay ignored my keypress".
+        spans.push(Span::styled(
+            format!(" {pending}"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        spans.push(Span::styled(
+            "… more digits, or Enter to take it",
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// Plain-text rendering used by `--plain`, one line per pane.
+pub(crate) fn plain_lines(cells: &[PeekCell]) -> Vec<String> {
+    let latest_prompt_at = latest_prompt_at(cells);
+    cells
+        .iter()
+        .map(|cell| {
+            let (glyph, kind) = match &cell.agent {
+                Some(a) => (crate::state_icon(a.state), agent_kind_short(a.kind)),
+                None => ("·", "-"),
+            };
+            // The handle over the kind: `--plain` exists to be read from a
+            // shell, where the next thing you type is the address.
+            let label = cell
+                .geo
+                .alias
+                .as_deref()
+                .map_or_else(|| kind.to_string(), |alias| format!("@{alias}"));
+            let summary = cell
+                .agent
+                .as_ref()
+                .and_then(|a| summary_source(a).or(a.last_prompt.as_deref()))
+                .map_or_else(|| "-".to_string(), collapse);
+            let age = cell.last_prompt_at.map_or_else(
+                || "-".to_string(),
+                |at| {
+                    let age = crate::relative_time(OffsetDateTime::now_utc(), at);
+                    if Some(at) == latest_prompt_at {
+                        format!("last · {}", age.strip_suffix(" ago").unwrap_or(&age))
+                    } else {
+                        age
+                    }
+                },
+            );
+            format!(
+                "{} {} {} {:<12} {:>15}  {}",
+                cell.geo.pane_index,
+                cell.geo.pane_id,
+                glyph,
+                label,
+                age,
+                if collaboration_lines(cell).is_empty() {
+                    summary
+                } else {
+                    format!(
+                        "{}\n  Links · {}\n    {}",
+                        summary,
+                        pane_address(cell),
+                        collaboration_lines(cell).join("\n    ")
+                    )
+                }
+            )
+        })
+        .collect()
+}
+
+/// Greedy word wrap into at most `max_lines` rows of `width` display
+/// columns, ellipsizing what doesn't fit.
+///
+/// Width is measured in terminal columns, not `char`s: prompts and recaps
+/// here are routinely CJK, where a `chars().take(n)` budget overflows the
+/// box by up to 2×. Words longer than the line (paths, URLs, hashes) are
+/// broken mid-word rather than pushed out of view.
+pub(crate) fn wrap_clamped(raw: &str, width: usize, max_lines: usize) -> Vec<String> {
+    if width == 0 || max_lines == 0 {
+        return Vec::new();
+    }
+    let text = collapse(raw);
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+    let mut overflowed = false;
+
+    for word in text.split(' ').filter(|w| !w.is_empty()) {
+        let word_width = display_width(word);
+        let sep = usize::from(!current.is_empty());
+        if current_width + sep + word_width <= width {
+            if sep == 1 {
+                current.push(' ');
+            }
+            current.push_str(word);
+            current_width += sep + word_width;
+            continue;
+        }
+        if !current.is_empty() {
+            lines.push(std::mem::take(&mut current));
+            current_width = 0;
+            if lines.len() == max_lines {
+                overflowed = true;
+                break;
+            }
+        }
+        // A word wider than the whole line can never be placed by
+        // wrapping; chop it across as many lines as we're allowed.
+        if word_width > width {
+            let mut rest = word;
+            loop {
+                let (head, tail) = split_at_width(rest, width);
+                if head.is_empty() {
+                    break;
+                }
+                if lines.len() == max_lines {
+                    overflowed = true;
+                    break;
+                }
+                if tail.is_empty() {
+                    current = head.to_string();
+                    current_width = display_width(head);
+                    break;
+                }
+                lines.push(head.to_string());
+                rest = tail;
+            }
+            if overflowed {
+                break;
+            }
+        } else {
+            current = word.to_string();
+            current_width = word_width;
+        }
+    }
+    if !overflowed && !current.is_empty() && lines.len() < max_lines {
+        lines.push(current);
+    } else if !current.is_empty() {
+        overflowed = true;
+    }
+    if lines.len() > max_lines {
+        lines.truncate(max_lines);
+        overflowed = true;
+    }
+    if overflowed {
+        if let Some(last) = lines.last_mut() {
+            *last = ellipsize(last, width);
+        }
+    }
+    lines
+}
+
+/// Collapse a multi-line, ragged value to a single spaced line. Prompts
+/// and recaps carry newlines and indentation that would otherwise eat the
+/// whole box.
+fn collapse(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut pending_space = false;
+    for c in raw.chars() {
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+            continue;
+        }
+        if pending_space {
+            out.push(' ');
+            pending_space = false;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(|c| c.width().unwrap_or(0)).sum()
+}
+
+/// Split `s` at the last boundary whose prefix fits in `width` columns.
+fn split_at_width(s: &str, width: usize) -> (&str, &str) {
+    let mut used = 0usize;
+    for (idx, c) in s.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width {
+            return s.split_at(idx);
+        }
+        used += w;
+    }
+    (s, "")
+}
+
+/// Clip to `width` columns, replacing the tail with `…` when it doesn't fit.
+fn clip_to_width(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    ellipsize(s, width)
+}
+
+/// Truncate to fit `width` columns *including* a trailing ellipsis.
+fn ellipsize(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if width == 1 {
+        return "…".into();
+    }
+    let (head, _) = split_at_width(s, width - 1);
+    format!("{head}…")
+}
+
+/// Puts the terminal back on every exit path — including a panic, which
+/// would otherwise strand a bare `tend peek` in raw mode on the alternate
+/// screen. (Inside a popup tmux tears the pty down for us; outside one,
+/// nothing does.)
+struct TerminalGuard {
+    terminal: Option<Terminal<CrosstermBackend<Stdout>>>,
+}
+
+impl TerminalGuard {
+    fn new(terminal: Terminal<CrosstermBackend<Stdout>>) -> Self {
+        Self {
+            terminal: Some(terminal),
+        }
+    }
+
+    fn terminal_mut(&mut self) -> &mut Terminal<CrosstermBackend<Stdout>> {
+        self.terminal.as_mut().expect("terminal present")
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if let Some(mut t) = self.terminal.take() {
+            let _ = disable_raw_mode();
+            let _ = execute!(t.backend_mut(), LeaveAlternateScreen);
+            let _ = t.show_cursor();
+        }
+    }
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    // The popup is its own screen already, but entering the alternate
+    // screen keeps the restore path identical to the rest of the TUIs —
+    // and matters for `tend peek` run bare in a shell.
+    execute!(stdout, EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use tend::state::Agent;
+    use tend::AgentKind;
+
+    #[test]
+    fn peer_locations_omit_shared_components_and_keep_remote_snapshot_names() {
+        use tend::collaboration::{CollaborationEndpoint, Participant};
+        let current: Participant = serde_json::from_value(serde_json::json!({
+            "agent_kind":"codex", "agent_session_id":"one", "pane":"rmux:%47",
+            "socket":"/tmp/server", "state":"idle",
+            "tmux_session_id":"$1", "tmux_session_name":"tend", "window_name":"main",
+            "room":{"host":"rmux", "socket":"/tmp/server", "window_id":"@1"}
+        }))
+        .unwrap();
+        let mut other = current.clone();
+        other.agent_session_id = "two".into();
+        other.pane = "rmux:%559".into();
+        assert_eq!(connection_location(&current, &(&other).into(), None), "");
+        // Renamed labels do not turn the same stable session/window into a
+        // different location.
+        other.tmux_session_name = Some("renamed".into());
+        other.window_name = Some("renamed-window".into());
+        assert_eq!(connection_location(&current, &(&other).into(), None), "");
+        other.room.window_id = "@2".into();
+        other.window_name = Some("review".into());
+        let remote = CollaborationEndpoint::from(&other);
+        assert_eq!(connection_location(&current, &remote, None), " [review]");
+        other.tmux_session_id = Some("$2".into());
+        other.tmux_session_name = Some("other-session".into());
+        assert_eq!(
+            connection_location(&current, &(&other).into(), None),
+            " [other-session/review]"
+        );
+        // Prefer a live identity's current location over an older snapshot.
+        assert_eq!(
+            connection_location(&current, &remote, Some(&other)),
+            " [other-session/review]"
+        );
+        other.tmux_session_id = Some("$1".into());
+        other.tmux_session_name = Some("tend".into());
+        other.socket = Some("/tmp/another-server".into());
+        assert_eq!(
+            connection_location(&current, &(&other).into(), None),
+            " [tend/review]"
+        );
+        other.tmux_session_name = None;
+        other.window_name = None;
+        assert_eq!(
+            connection_location(&current, &(&other).into(), None),
+            " [$1/@2]"
+        );
+        let legacy: CollaborationEndpoint = serde_json::from_value(serde_json::json!({
+            "agent_session_id":"old", "pane":"rmux:%5", "socket":"/tmp/server", "label":"old"
+        }))
+        .unwrap();
+        assert_eq!(connection_location(&current, &legacy, None), "");
+    }
+
+    #[test]
+    fn collaboration_cards_show_real_links_and_reject_recycled_sessions() {
+        use tend::collaboration::{
+            CollaborationEndpoint, CollaborationLink, CollaborationOverview, LaunchPurpose,
+            Participant, RequestKind, RequestStatus,
+        };
+        let mut first = agent("%0", AgentState::Idle);
+        first.tmux_socket = Some("default".into());
+        let mut second = agent("%1", AgentState::Idle);
+        second.tmux_socket = Some("default".into());
+        let participant = |a: &Agent, alias: &str, role: &str| -> Participant {
+            serde_json::from_value(serde_json::json!({
+                "agent_kind": "claude_code", "agent_session_id": a.session_id,
+                "pane": a.pane, "socket": "default", "state": "idle",
+                "room": {"host": "tmux", "socket": "default", "window_id": "@1"},
+                "alias": alias, "roles": [role], "launch_purpose": "worker"
+            }))
+            .unwrap()
+        };
+        let from = participant(&first, "builder", "implementer");
+        let to = participant(&second, "critic", "reviewer");
+        let mut overview = CollaborationOverview {
+            participants: vec![from.clone(), to.clone()],
+            links: vec![CollaborationLink {
+                request_id: "req-test".into(),
+                from: CollaborationEndpoint::from(&from),
+                to: CollaborationEndpoint::from(&to),
+                kind: RequestKind::Review,
+                status: RequestStatus::Blocked,
+                reply_received: true,
+            }],
+        };
+        let mut cells: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(i, a)| PeekCell {
+                geo: geo(&i.to_string(), 0, 0, 80, 24, true),
+                agent: Some(a),
+                extra: 0,
+                last_prompt_at: None,
+                capture: Vec::new(),
+                collaboration: PeekCollaboration::default(),
+            })
+            .collect();
+        apply_collaboration(&mut cells, &overview);
+        let rendered = plain_lines(&cells).join("\n");
+        assert!(rendered.contains("implementer · worker"));
+        assert!(rendered.contains("reviewer · worker"));
+        assert!(rendered.contains("to critic"));
+        assert!(rendered.contains("from builder"));
+        assert!(rendered.contains("reply received / blocked"));
+        assert_eq!(cells[0].collaboration.purpose, Some(LaunchPurpose::Worker));
+        let mut remote_overview = overview.clone();
+        remote_overview.participants.truncate(1);
+        remote_overview.links[0]
+            .to
+            .location
+            .as_mut()
+            .unwrap()
+            .window_id = "@9".into();
+        remote_overview.links[0]
+            .to
+            .location
+            .as_mut()
+            .unwrap()
+            .window_name = Some("remote-review".into());
+        apply_collaboration(&mut cells, &remote_overview);
+        assert!(cells[0].collaboration.links[0].contains(" [remote-review]"));
+        cells[1].agent.as_mut().unwrap().session_id = "replacement".into();
+        overview.participants[1].agent_session_id = "replacement".into();
+        apply_collaboration(&mut cells, &overview);
+        assert!(cells[1].collaboration.links.is_empty());
+        assert_eq!(cells[0].collaboration.links.len(), 1);
+        assert!(cells[0].collaboration.links[0].contains("[previous session]"));
+        overview.links.clear();
+        apply_collaboration(&mut cells, &overview);
+        assert!(cells.iter().all(|cell| cell.collaboration.links.is_empty()));
+    }
+
+    #[test]
+    fn prompt_card_excludes_collaboration_and_keeps_small_viewports_bounded() {
+        let cell = PeekCell {
+            geo: geo("0", 0, 0, 80, 24, true),
+            agent: Some(agent("%0", AgentState::Idle)),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+            collaboration: PeekCollaboration {
+                roles: vec!["reviewer".into()],
+                purpose: Some(tend::collaboration::LaunchPurpose::Worker),
+                links: vec!["← implementer · Review · claimed".into()],
+                ..PeekCollaboration::default()
+            },
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal
+            .draw(|f| render_cell(f, &cell, f.area(), false))
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(!rendered.contains("reviewer · worker"));
+        assert!(!rendered.contains("← implementer · Review · claimed"));
+        for width in [0, 1, 4, 12, 80] {
+            for height in [0, 1, 2, 3, 12] {
+                let body = body_text(&cell, width, height);
+                assert!(body.lines.len() <= usize::from(height));
+                assert!(body
+                    .lines
+                    .iter()
+                    .all(|line| line.width() <= usize::from(width)));
+            }
+        }
+    }
+
+    pub(super) fn linked_layout(vertical: bool) -> Vec<PeekCell> {
+        use tend::collaboration::{
+            CollaborationEndpoint, CollaborationLink, LaunchPurpose, RequestKind, RequestStatus,
+        };
+        let mut from = agent("rmux:%37", AgentState::Working);
+        from.last_prompt = Some("Implement the authentication change".into());
+        from.last_response = Some("Implementation ready for review".into());
+        let mut to = agent("rmux:%42", AgentState::Working);
+        to.last_prompt = Some("Review the authentication change".into());
+        to.last_response = Some("Checking behavior and regression risks".into());
+        let endpoint = |a: &Agent, alias: &str| CollaborationEndpoint {
+            location: None,
+            agent_session_id: a.session_id.clone(),
+            pane: a.pane.clone().unwrap(),
+            socket: a.tmux_socket.clone(),
+            label: format!("{}@{}", alias, a.pane.as_ref().unwrap()),
+        };
+        let link = CollaborationLink {
+            request_id: "req-layout".into(),
+            from: endpoint(&from, "builder"),
+            to: endpoint(&to, "reviewer"),
+            kind: RequestKind::Review,
+            status: RequestStatus::Claimed,
+            reply_received: false,
+        };
+        [from, to]
+            .into_iter()
+            .enumerate()
+            .map(|(i, agent)| {
+                let (left, top, width, height) = if vertical {
+                    (0, if i == 0 { 0 } else { 21 }, 60, 20)
+                } else {
+                    (if i == 0 { 0 } else { 45 }, 0, 44, 24)
+                };
+                PeekCell {
+                    geo: PaneGeometry {
+                        pane_id: if i == 0 { "%37" } else { "%42" }.into(),
+                        alias: Some(if i == 0 { "builder" } else { "reviewer" }.into()),
+                        ..geo(&i.to_string(), left, top, width, height, i == 0)
+                    },
+                    agent: Some(agent),
+                    extra: 0,
+                    last_prompt_at: None,
+                    capture: Vec::new(),
+                    collaboration: PeekCollaboration {
+                        roles: vec![if i == 0 { "implementer" } else { "reviewer" }.into()],
+                        purpose: Some(LaunchPurpose::Worker),
+                        links: vec![format!(
+                            "{} {} · Review · claimed",
+                            if i == 0 { "to" } else { "from" },
+                            if i == 0 {
+                                "reviewer@rmux:%42"
+                            } else {
+                                "builder@rmux:%37"
+                            }
+                        )],
+                        connections: vec![link.clone()],
+                    },
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collaboration_is_below_prompts_and_connects_actual_pane_positions() {
+        for vertical in [false, true] {
+            let cells = linked_layout(vertical);
+            let (width, height) = if vertical { (60, 42) } else { (90, 25) };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+                .unwrap();
+            let rendered = screen(&terminal);
+            assert!(rendered.contains("Links · rmux:%37"), "{rendered}");
+            assert!(rendered.contains("Links · rmux:%42"), "{rendered}");
+            assert!(rendered.contains("implementer · worker"), "{rendered}");
+            assert!(rendered.contains("reviewer · worker"), "{rendered}");
+            let rows: Vec<_> = rendered.lines().collect();
+            let response = rows
+                .iter()
+                .position(|row| row.contains("Implementation ready"))
+                .unwrap();
+            let relations = rows
+                .iter()
+                .position(|row| row.contains("Links · rmux:%37"))
+                .unwrap();
+            assert!(relations > response + 1, "{rendered}");
+            let arrows: Vec<_> = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .enumerate()
+                .filter(|(_, cell)| {
+                    cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol())
+                })
+                .collect();
+            assert!(!arrows.is_empty(), "no spatial arrows: {rendered}");
+            for (offset, _) in arrows {
+                let point = ratatui::layout::Position::new(
+                    u16::try_from(offset % usize::from(width)).unwrap(),
+                    u16::try_from(offset / usize::from(width)).unwrap(),
+                );
+                for cell in &cells {
+                    let rect = cell_rect(&cell.geo, 0, Rect::new(0, 0, width, height)).unwrap();
+                    assert!(
+                        !info_rect(cell, rect).contains(point),
+                        "arrow inside prompt card"
+                    );
+                }
+            }
+            if let Ok(directory) = std::env::var("TEND_PEEK_LAYOUT_PREVIEW") {
+                std::fs::create_dir_all(&directory).unwrap();
+                let preview:Vec<_>=terminal.backend().buffer().content().iter().map(|cell|
+                    serde_json::json!({"symbol":cell.symbol(),"fg":format!("{:?}",cell.fg),"bg":format!("{:?}",cell.bg)})).collect();
+                std::fs::write(
+                    std::path::Path::new(&directory).join(if vertical {
+                        "vertical.json"
+                    } else {
+                        "horizontal.json"
+                    }),
+                    serde_json::to_vec(
+                        &serde_json::json!({"width":width,"height":height,"cells":preview}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    std::path::Path::new(&directory).join(if vertical {
+                        "vertical.txt"
+                    } else {
+                        "horizontal.txt"
+                    }),
+                    rendered,
+                )
+                .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn spatial_links_skip_hidden_or_replaced_sessions_and_keep_prompts_intact() {
+        let mut cells = linked_layout(false);
+        cells[1].agent.as_mut().unwrap().session_id = "replacement".into();
+        let mut terminal = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        assert!(!terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol())));
+        let mut cells = linked_layout(false);
+        cells[0].geo.width = 90;
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), true, ""))
+            .unwrap();
+        assert!(!screen(&terminal).contains("Links · rmux:%42"));
+        assert!(!terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .any(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol())));
+    }
+
+    #[test]
+    fn replies_have_two_spatial_arrowheads_and_metadata_stays_separate_in_plain_output() {
+        let mut cells = linked_layout(false);
+        for cell in &mut cells {
+            for link in &mut cell.collaboration.connections {
+                link.reply_received = true;
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(90, 25)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let arrows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol()))
+            .count();
+        assert_eq!(arrows, 2, "{}", screen(&terminal));
+        let plain = plain_lines(&cells).join("\n");
+        assert!(plain.contains("\n  Links · rmux:%37\n    implementer · worker"));
+        assert!(!plain.lines().next().unwrap().contains("worker"));
+    }
+
+    #[test]
+    fn a_middle_pane_keeps_its_incoming_arrow_when_it_also_sends_work() {
+        let mut cells = linked_layout(true);
+        let mut third = cells[1].clone();
+        third.geo.top = 42;
+        third.geo.pane_id = "%53".into();
+        third.agent.as_mut().unwrap().pane = Some("rmux:%53".into());
+        third.agent.as_mut().unwrap().session_id = "third-session".into();
+        let mut link = cells[0].collaboration.connections[0].clone();
+        link.request_id = "req-chain".into();
+        link.from = link.to.clone();
+        link.to.pane = "rmux:%53".into();
+        link.to.agent_session_id = "third-session".into();
+        third.collaboration.connections = vec![link.clone()];
+        cells[1].collaboration.connections.push(link);
+        cells.push(third);
+        let mut terminal = Terminal::new(TestBackend::new(60, 64)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let arrows = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .filter(|cell| cell.fg == Color::Cyan && ["→", "←", "↑", "↓"].contains(&cell.symbol()))
+            .count();
+        assert_eq!(arrows, 2, "{}", screen(&terminal));
+    }
+
+    #[test]
+    fn expanded_wrap_preserves_indentation_newlines_and_unicode() {
+        let text = "  한글🙂abc\n\n    tail";
+        let rows = wrap_full(text, 8);
+        assert_eq!(rows, ["  한글🙂", "abc", "", "    tail"]);
+        assert!(rows.iter().all(|row| display_width(row) <= 8));
+        assert!(wrap_full(text, 0).is_empty());
+    }
+
+    #[test]
+    fn expanded_reader_reaches_response_tail_and_terminal_history() {
+        let mut a = agent("%0", AgentState::Idle);
+        a.last_response = Some(format!(
+            "{}\nFINAL RESPONSE LINE",
+            "long response\n".repeat(100)
+        ));
+        let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 80, 24, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+        let mut reader = Detail {
+            cell,
+            history: "original output\nFULL HISTORY END".into(),
+            terminal: false,
+            offset: 0,
+            page: 1,
+            width: 0,
+            lines: Vec::new(),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        assert!(reader.lines.len() > 100);
+        reader.scroll(KeyCode::End);
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("FINAL RESPONSE LINE"));
+        reader.scroll(KeyCode::Home);
+        assert_eq!(reader.offset, 0);
+        reader.scroll(KeyCode::PageDown);
+        assert_eq!(reader.offset, reader.page);
+        reader.toggle_source();
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        assert!(reader.lines.iter().any(|line| line == "FULL HISTORY END"));
+        assert!(!reader
+            .lines
+            .iter()
+            .any(|line| line == "FINAL RESPONSE LINE"));
+        // Resizing to a tiny viewport must clamp offsets without panicking.
+        terminal.resize(Rect::new(0, 0, 2, 2)).unwrap();
+        terminal.draw(|f| reader.draw(f)).unwrap();
+        let mut detail = Some(reader);
+        assert!(
+            matches!(handle_detail_key(&mut detail, KeyEvent::from(KeyCode::Enter), &[]), Some(Outcome::Jump(id)) if id == "%0")
+        );
+        assert!(handle_detail_key(&mut detail, KeyEvent::from(KeyCode::Esc), &[]).is_none());
+        assert!(detail.is_none());
+    }
+
+    #[test]
+    fn pipe_opens_reader_without_changing_digit_jump() {
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('|'))),
+            Action::Expand
+        ));
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('2'))),
+            Action::Digit('2')
+        ));
+    }
+
+    #[test]
+    fn the_fallback_names_its_own_cause() {
+        // cmux and amux fail for different reasons, and a user chasing
+        // either one needs the one that applies to them.
+        let detached = undrawable_note(ClientSurface::Detached);
+        assert!(
+            detached.contains("no tmux client is attached"),
+            "{detached}"
+        );
+
+        let control = undrawable_note(ClientSurface::ControlMode);
+        assert!(control.contains("-CC"), "{control}");
+
+        for note in [detached, control] {
+            assert!(
+                note.contains("per-pane report"),
+                "say what the user is getting instead: {note}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_undrawable_surfaces_fall_back() {
+        assert!(!ClientSurface::Detached.draws_overlays());
+        assert!(!ClientSurface::ControlMode.draws_overlays());
+        // The overlay is the whole point where it can be drawn, and an
+        // inconclusive probe must not cost anyone their overlay.
+        assert!(ClientSurface::Terminal.draws_overlays());
+        assert!(ClientSurface::Unknown.draws_overlays());
+    }
+
+    fn geo(
+        index: &str,
+        left: u16,
+        top: u16,
+        width: u16,
+        height: u16,
+        active: bool,
+    ) -> PaneGeometry {
+        PaneGeometry {
+            pane_id: format!("%{index}"),
+            pane_index: index.into(),
+            left,
+            top,
+            width,
+            height,
+            active,
+            command: "zsh".into(),
+            alias: None,
+            spawn: None,
+        }
+    }
+
+    /// A pane whose tmux id is unrelated to its window index — which is
+    /// the realistic case, and the whole reason the id is worth printing.
+    fn pane(index: &str, pane_id: &str, width: u16, height: u16) -> PaneGeometry {
+        PaneGeometry {
+            pane_id: pane_id.into(),
+            ..geo(index, 0, 0, width, height, true)
+        }
+    }
+
+    fn named(index: &str, pane_id: &str, alias: &str, width: u16, height: u16) -> PaneGeometry {
+        PaneGeometry {
+            alias: Some(alias.into()),
+            ..pane(index, pane_id, width, height)
+        }
+    }
+
+    fn agent(pane: &str, state: AgentState) -> Agent {
+        let now = time::OffsetDateTime::now_utc();
+        Agent {
+            ask_origin: None,
+            kind: AgentKind::ClaudeCode,
+            session_id: format!("sess-{pane}"),
+            surface: None,
+            pane: Some(pane.into()),
+            tmux_socket: None,
+            tmux_session: None,
+            cwd: None,
+            pid: None,
+            workload: tend::WorkloadSummary::default(),
+            subagents: Vec::new(),
+            state,
+            last_prompt: None,
+            last_prompt_at: None,
+            last_response: None,
+            recap: None,
+            ai_title: None,
+            pending_command: None,
+            last_notification: None,
+            model: None,
+            context_used_pct: None,
+            cost_usd: None,
+            rate_limit_5h_pct: None,
+            rate_limit_5h_resets_at: None,
+            rate_limit_7d_pct: None,
+            rate_limit_7d_resets_at: None,
+            rate_limited_until: None,
+            rate_limit_scope: None,
+            rate_limit_source: None,
+            started_at: now,
+            last_activity_at: now,
+            state_entered_at: now,
+        }
+    }
+
+    #[test]
+    fn caller_view_session_and_window_override_inherited_popup_context() {
+        let mut args = Args {
+            popup: false,
+            caller_client: Some("/dev/pts/1".into()),
+            caller_session: Some("$192".into()),
+            caller_window: Some("@11".into()),
+            plain: false,
+            expanded: false,
+        };
+        assert_eq!(
+            args.target().unwrap(),
+            WindowTarget {
+                session: Some("$192".into()),
+                window: Some("@11".into())
+            }
+        );
+        args.caller_session = Some("#{session_id}".into());
+        assert!(args.target().is_err());
+    }
+
+    fn screen(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        let area = buf.area();
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf.cell((x, y)).map_or("", ratatui::buffer::Cell::symbol))
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn cell_rect_offsets_by_status_line() {
+        let area = Rect::new(0, 0, 120, 40);
+        // Status at the top pushes window row 0 down to client row 1.
+        let rect = cell_rect(&geo("0", 0, 0, 120, 19, true), 1, area).unwrap();
+        assert_eq!((rect.x, rect.y), (0, 1));
+        assert_eq!((rect.width, rect.height), (120, 19));
+    }
+
+    #[test]
+    fn cell_rect_clips_instead_of_overflowing() {
+        let area = Rect::new(0, 0, 80, 24);
+        // A pane whose rectangle runs past the popup (layout changed
+        // under us) is clipped, not dropped and not drawn out of bounds.
+        let rect = cell_rect(&geo("1", 40, 20, 60, 20, false), 0, area).unwrap();
+        assert_eq!((rect.x, rect.y), (40, 20));
+        assert_eq!((rect.width, rect.height), (40, 4));
+        // Entirely off-screen is a skip.
+        assert!(cell_rect(&geo("2", 200, 0, 20, 5, false), 0, area).is_none());
+        assert!(cell_rect(&geo("3", 0, 30, 20, 5, false), 0, area).is_none());
+    }
+
+    #[test]
+    fn zoom_draws_only_the_active_pane_but_still_counts_the_rest() {
+        // tmux leaves stale rectangles on the covered siblings, so drawing
+        // them would paint boxes over the zoomed pane's screen. The hidden
+        // agent must still reach the footer count — a pane you cannot see
+        // is exactly the one you need told about.
+        let panes = vec![geo("0", 0, 0, 20, 5, false), geo("1", 0, 0, 20, 11, true)];
+        let cells = build_cells(
+            panes,
+            &[
+                agent("%0", AgentState::WaitingInput),
+                agent("%1", AgentState::Working),
+            ],
+        );
+        assert_eq!(cells.len(), 2, "both panes keep a cell");
+        assert!(line_text(&hint_line(&cells, "")).starts_with(" 1 needs you "));
+
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), true, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains(" 1 "), "{rendered}");
+        assert!(
+            !rendered.contains(" 0 "),
+            "the covered pane must not be painted over the zoomed one: {rendered}"
+        );
+
+        // Unzoomed, both are drawn — with the real (non-overlapping)
+        // rectangles tmux reports once the zoom is released.
+        let split = build_cells(
+            vec![geo("0", 0, 0, 20, 5, false), geo("1", 0, 6, 20, 5, true)],
+            &[],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(20, 12)).unwrap();
+        terminal
+            .draw(|f| draw(f, &split, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains(" 0 "), "{rendered}");
+        assert!(rendered.contains(" 1 "), "{rendered}");
+    }
+
+    #[test]
+    fn agent_from_another_tmux_server_is_not_borrowed() {
+        // Pane ids are unique per server, so `%0` on socket `amux` must not
+        // narrate `%0` here.
+        let mut theirs = agent("%0", AgentState::Working);
+        theirs.tmux_socket = Some("amux".into());
+        theirs.ai_title = Some("someone else's work".into());
+        assert!(!on_this_server(&theirs, Some("default")));
+        assert!(on_this_server(&theirs, Some("amux")));
+
+        // Unknown on either side means "can't tell" — keep the row rather
+        // than blanking a box, since the field is backfilled best-effort
+        // and is routinely absent.
+        let unknown = agent("%0", AgentState::Working);
+        assert!(on_this_server(&unknown, Some("default")));
+        assert!(on_this_server(&theirs, None));
+    }
+
+    #[test]
+    fn digits_resolve_and_wait_only_when_ambiguous() {
+        let few = build_cells(
+            vec![geo("0", 0, 0, 20, 5, true), geo("1", 0, 6, 20, 5, false)],
+            &[],
+        );
+        // Nine-or-fewer panes: the first keypress is the jump.
+        assert!(matches!(resolve_typed("1", &few), Selection::Hit(id) if id == "%1"));
+        assert!(matches!(resolve_typed("7", &few), Selection::Miss));
+
+        // With a pane 10, `1` is a prefix — jumping immediately would make
+        // pane 10 unreachable.
+        let many = build_cells(
+            vec![
+                geo("1", 0, 0, 20, 5, true),
+                geo("10", 0, 6, 20, 5, false),
+                geo("11", 0, 12, 20, 5, false),
+            ],
+            &[],
+        );
+        assert!(matches!(resolve_typed("1", &many), Selection::Prefix));
+        assert!(matches!(resolve_typed("10", &many), Selection::Hit(id) if id == "%10"));
+        assert!(matches!(resolve_typed("19", &many), Selection::Miss));
+
+        // Pane 1 is reachable only via Enter: every continuation of "1"
+        // names a different pane, so typing alone can never commit to it.
+        assert_eq!(exact_match("1", &many).as_deref(), Some("%1"));
+        assert_eq!(exact_match("19", &many), None);
+        assert_eq!(exact_match("", &many), None);
+    }
+
+    #[test]
+    fn pending_digits_are_shown_rather_than_swallowed() {
+        // A digit that pends looks identical to a dropped keypress unless
+        // the footer says otherwise.
+        let cells = build_cells(
+            vec![geo("1", 0, 0, 40, 5, true), geo("10", 0, 6, 40, 5, false)],
+            &[],
+        );
+        let idle = line_text(&hint_line(&cells, ""));
+        assert!(idle.contains("0-9 jump"), "{idle}");
+
+        let waiting = line_text(&hint_line(&cells, "1"));
+        assert!(waiting.contains(" 1"), "{waiting}");
+        assert!(waiting.contains("Enter"), "{waiting}");
+        assert!(!waiting.contains("0-9 jump"), "{waiting}");
+    }
+
+    #[test]
+    fn blocked_agent_speaks_for_a_shared_pane() {
+        // A restarted session leaves a stopped husk behind; the box must
+        // report the agent actually waiting on the human.
+        let agents = vec![
+            agent("%0", AgentState::Stopped),
+            agent("%0", AgentState::WaitingChoice),
+            agent("%0", AgentState::Working),
+        ];
+        let cells = build_cells(vec![geo("0", 0, 0, 80, 24, true)], &agents);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(
+            cells[0].agent.as_ref().unwrap().state,
+            AgentState::WaitingChoice
+        );
+        assert_eq!(cells[0].extra, 2, "the other two are badged, not dropped");
+    }
+
+    #[test]
+    fn pane_without_agent_still_gets_a_cell() {
+        let cells = build_cells(vec![geo("0", 0, 0, 80, 24, true)], &[]);
+        assert_eq!(cells.len(), 1);
+        assert!(cells[0].agent.is_none());
+        assert_eq!(cells[0].extra, 0);
+    }
+
+    #[test]
+    fn body_degrades_with_pane_height() {
+        let mut a = agent("%0", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        a.last_prompt = Some("fix the token check".into());
+        a.last_response = Some("added a JWT expiry guard".into());
+        let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 40, 10, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+
+        // One row: summary only — the question the overlay exists to answer.
+        let one = body_text(&cell, 38, 1);
+        assert_eq!(one.lines.len(), 1);
+        assert!(line_text(&one.lines[0]).contains("added a JWT expiry guard"));
+
+        // Two rows: summary + prompt.
+        let two = body_text(&cell, 38, 2);
+        assert_eq!(two.lines.len(), 2);
+        assert!(line_text(&two.lines[1]).contains("fix the token check"));
+
+        // Roomy: response earns its line too.
+        let full = body_text(&cell, 38, 8);
+        let joined: String = full
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(joined.contains("added a JWT expiry guard"), "{joined}");
+    }
+
+    #[test]
+    fn fresh_capture_supplies_codex_recap_before_daemon_poll() {
+        let mut a = agent("%0", AgentState::Idle);
+        a.kind = tend::AgentKind::Codex;
+        assert!(a.recap.is_none());
+        let mut cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 40, 10, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+
+        observe_codex_recap(
+            &mut cell,
+            "─ Conversation recap ───\n\n  Fixed the auth flow and verified it.\n\n› Ask Codex to do anything\n",
+        );
+
+        let agent = cell.agent.as_ref().unwrap();
+        assert_eq!(
+            agent.recap.as_deref(),
+            Some("Fixed the auth flow and verified it."),
+        );
+        assert_eq!(summary_source(agent), agent.recap.as_deref());
+    }
+
+    #[test]
+    fn body_never_exceeds_its_row_budget() {
+        let mut a = agent("%0", AgentState::Working);
+        a.recap = Some("word ".repeat(200));
+        a.last_prompt = Some("word ".repeat(200));
+        a.last_response = Some("word ".repeat(200));
+        let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 40, 10, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+        for height in 0..12u16 {
+            let text = body_text(&cell, 20, height);
+            assert!(
+                text.lines.len() <= height as usize,
+                "height {height} produced {} lines",
+                text.lines.len()
+            );
+        }
+    }
+
+    #[test]
+    fn summary_does_not_repeat_the_prompt() {
+        // watch's summary column falls back to last_prompt; peek must not,
+        // or a agent with no recap prints the same string twice.
+        let mut a = agent("%0", AgentState::Working);
+        a.last_prompt = Some("only a prompt".into());
+        let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 40, 10, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+        let text = body_text(&cell, 38, 6);
+        let hits = text
+            .lines
+            .iter()
+            .filter(|l| line_text(l).contains("only a prompt"))
+            .count();
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn wrap_measures_columns_not_chars() {
+        // Korean is two columns per char: a char-count budget would print
+        // 16 columns of text into an 8-column box.
+        let lines = wrap_clamped("토큰검증을고쳐줘", 8, 2);
+        for line in &lines {
+            assert!(
+                display_width(line) <= 8,
+                "{line:?} is {} columns",
+                display_width(line)
+            );
+        }
+        assert!(!lines.is_empty());
+    }
+
+    #[test]
+    fn wrap_breaks_words_longer_than_the_line() {
+        let lines = wrap_clamped("crates/tend-cli/src/peek.rs::render_cell", 10, 3);
+        assert_eq!(lines.len(), 3);
+        for line in &lines {
+            assert!(display_width(line) <= 10, "{line:?}");
+        }
+        assert!(lines.last().unwrap().ends_with('…'), "{lines:?}");
+    }
+
+    #[test]
+    fn wrap_collapses_newlines_and_marks_truncation() {
+        let lines = wrap_clamped("first line\n\n   second line   \nthird", 12, 1);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].ends_with('…'));
+        assert!(display_width(&lines[0]) <= 12);
+    }
+
+    #[test]
+    fn wrap_that_fits_is_not_ellipsized() {
+        let lines = wrap_clamped("short enough", 20, 2);
+        assert_eq!(lines, vec!["short enough".to_string()]);
+    }
+
+    #[test]
+    fn wrap_handles_degenerate_bounds() {
+        assert!(wrap_clamped("anything", 0, 3).is_empty());
+        assert!(wrap_clamped("anything", 10, 0).is_empty());
+        assert!(wrap_clamped("   \n  ", 10, 3).is_empty());
+    }
+
+    #[test]
+    fn meta_strip_drops_when_nothing_is_known() {
+        let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 40, 10, true),
+            agent: Some(agent("%0", AgentState::Working)),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+        assert!(meta_line(&cell, 30).is_none());
+
+        let mut a = agent("%0", AgentState::Working);
+        a.model = Some("Opus".into());
+        a.context_used_pct = Some(62.4);
+        a.rate_limit_5h_pct = Some(41.0);
+        let cell = PeekCell {
+            agent: Some(a),
+            ..cell
+        };
+        let line = meta_line(&cell, 30).unwrap();
+        assert_eq!(line_text(&line), "opus · ctx 62% · 5h 41%");
+    }
+
+    #[test]
+    fn hint_leads_with_the_attention_count() {
+        let quiet = build_cells(vec![geo("0", 0, 0, 80, 24, true)], &[]);
+        assert!(!line_text(&hint_line(&quiet, "")).contains("need"));
+
+        let cells = build_cells(
+            vec![geo("0", 0, 0, 80, 12, true), geo("1", 0, 13, 80, 11, false)],
+            &[
+                agent("%0", AgentState::WaitingInput),
+                agent("%1", AgentState::WaitingChoice),
+            ],
+        );
+        assert!(line_text(&hint_line(&cells, "")).starts_with(" 2 need you "));
+    }
+
+    #[test]
+    fn keys_map_to_actions() {
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('3'))),
+            Action::Digit('3')
+        ));
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Esc)),
+            Action::Dismiss
+        ));
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('q'))),
+            Action::Dismiss
+        ));
+        // The key that opened the overlay should also close it.
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('Q'))),
+            Action::Dismiss
+        ));
+        assert!(matches!(
+            classify(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            Action::Dismiss
+        ));
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Char('r'))),
+            Action::Refresh
+        ));
+        assert!(matches!(
+            classify(KeyEvent::from(KeyCode::Enter)),
+            Action::Commit
+        ));
+        // Ctrl-digit is a terminal chord, not a jump request.
+        assert!(matches!(
+            classify(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL)),
+            Action::Ignore
+        ));
+    }
+
+    #[test]
+    fn draws_every_pane_box_within_bounds() {
+        let mut a = agent("%1", AgentState::WaitingInput);
+        a.ai_title = Some("auth refactor".into());
+        a.last_prompt = Some("fix the token check".into());
+        let cells = build_cells(
+            vec![geo("0", 0, 0, 40, 11, false), geo("1", 0, 12, 40, 11, true)],
+            &[a],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(40, 24)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        // Pane digits are the jump affordance — both must be visible.
+        assert!(rendered.contains(" 0 "), "{rendered}");
+        assert!(rendered.contains(" 1 "), "{rendered}");
+        assert!(rendered.contains("auth refactor"), "{rendered}");
+        assert!(rendered.contains("fix the token check"), "{rendered}");
+        assert!(rendered.contains("0-9 jump"), "{rendered}");
+    }
+
+    #[test]
+    fn tiny_pane_drops_the_border_for_the_label() {
+        let cells = build_cells(
+            vec![geo("7", 0, 0, 20, 2, true)],
+            &[agent("%7", AgentState::Working)],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(20, 3)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains(" 7 "), "{rendered}");
+        assert!(
+            !rendered.contains('╔') && !rendered.contains('╭'),
+            "a 2-row pane has no room to spend on a frame: {rendered}"
+        );
+    }
+
+    #[test]
+    fn hint_bar_lands_on_the_status_row() {
+        // The status line is the only client row that belongs to no pane.
+        // With it at the top, a bottom-anchored hint would overwrite the
+        // last pane's content instead.
+        let frame = WindowFrame {
+            window_width: 20,
+            window_height: 5,
+            client_width: 20,
+            client_height: 6,
+            status_top: true,
+        };
+        let placement = Placement::from(Some(frame));
+        assert_eq!(placement.origin_y, 1);
+        assert!(placement.hint_at_top);
+
+        let cells = build_cells(vec![geo("0", 0, 0, 20, 5, true)], &[]);
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, placement, false, ""))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
+        assert!(rows[0].contains("0-9 jump"), "{rows:#?}");
+        // The pane's box is pushed down clear of the status row, and the
+        // pane's own last row stays its own — nothing is sacrificed to the
+        // hint at either end.
+        assert!(rows[1].contains(" 0 "), "{rows:#?}");
+        assert!(!rows[5].contains("0-9 jump"), "{rows:#?}");
+
+        // Status at the bottom (tmux's default) puts the hint back on the
+        // last row and starts panes at row 0.
+        let bottom = Placement::from(Some(WindowFrame {
+            status_top: false,
+            ..frame
+        }));
+        assert_eq!(bottom.origin_y, 0);
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, bottom, false, ""))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
+        assert!(rows[0].contains(" 0 "), "{rows:#?}");
+        assert!(rows[5].contains("0-9 jump"), "{rows:#?}");
+    }
+
+    #[test]
+    fn pane_content_stays_visible_under_the_box() {
+        // The whole point of the backdrop: you still see what the pane was
+        // showing, so the overlay reads as a layer over your terminal
+        // rather than a replacement for it.
+        let mut a = agent("%0", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        a.last_prompt = Some("fix the token check".into());
+        let mut cells = build_cells(vec![geo("0", 0, 0, 30, 12, true)], &[a]);
+        cells[0].capture = (0..12).map(|i| format!("output line {i}")).collect();
+
+        // The client is one row taller than the window — that row is the
+        // status line, and it's where the hint bar goes.
+        let mut terminal = Terminal::new(TestBackend::new(30, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("auth refactor"), "{rendered}");
+
+        let rows: Vec<String> = rendered.lines().map(str::to_string).collect();
+        let box_rows = box_height(&cells[0], Rect::new(0, 0, 30, 12)) as usize;
+        // Inside the box, the backdrop must be wiped: dim capture text
+        // showing through the box's own interior reads as corruption, not
+        // as depth. (Checked row-wise — "output line 1" is a substring of
+        // "output line 11", which legitimately appears further down.)
+        for (i, row) in rows.iter().take(box_rows).enumerate() {
+            assert!(
+                !row.contains("output line"),
+                "row {i} inside the box leaked the backdrop: {rows:#?}"
+            );
+        }
+        // Below it, the pane's own output survives to its last row.
+        assert!(rows[box_rows].contains("output line"), "{rows:#?}");
+        assert!(rendered.contains("output line 11"), "{rows:#?}");
+    }
+
+    #[test]
+    fn box_never_swallows_the_whole_pane() {
+        // A box that filled its pane would put us back to an opaque
+        // overlay, which is exactly what the backdrop exists to avoid.
+        let mut a = agent("%0", AgentState::Working);
+        a.recap = Some("word ".repeat(200));
+        a.last_prompt = Some("word ".repeat(200));
+        a.last_response = Some("word ".repeat(200));
+        a.model = Some("Opus".into());
+        let cell = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 40, 30, true),
+            agent: Some(a),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+        for height in MIN_BORDERED_HEIGHT..30 {
+            let rect = Rect::new(0, 0, 40, height);
+            let h = box_height(&cell, rect);
+            assert!(h >= MIN_BORDERED_HEIGHT, "height {height} gave {h}");
+            assert!(h <= height, "height {height} gave {h}");
+            // Two thirds is the ceiling, except where the minimum box is
+            // already taller than that.
+            let ceiling = (height * 2 / 3).max(MIN_BORDERED_HEIGHT);
+            assert!(h <= ceiling, "height {height} gave {h}, ceiling {ceiling}");
+        }
+    }
+
+    #[test]
+    fn box_shrinks_to_the_content_it_has() {
+        // A pane whose agent has nothing to say should not reserve rows it
+        // will only render blank.
+        let quiet = PeekCell {
+            collaboration: PeekCollaboration::default(),
+            geo: geo("0", 0, 0, 40, 24, true),
+            agent: Some(agent("%0", AgentState::Idle)),
+            extra: 0,
+            last_prompt_at: None,
+            capture: Vec::new(),
+        };
+        let rect = Rect::new(0, 0, 40, 24);
+        assert_eq!(box_height(&quiet, rect), MIN_BORDERED_HEIGHT);
+
+        let mut a = agent("%0", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        a.last_prompt = Some("fix the token check".into());
+        a.model = Some("Opus".into());
+        let talkative = PeekCell {
+            agent: Some(a),
+            ..quiet
+        };
+        assert!(box_height(&talkative, rect) > MIN_BORDERED_HEIGHT);
+    }
+
+    #[test]
+    fn latest_age_stamp_sits_on_the_border_not_in_the_prompt() {
+        let mut a = agent("%0", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        a.last_prompt = Some("fix the token check".into());
+        let mut cells = build_cells(vec![geo("0", 0, 0, 40, 12, true)], &[a]);
+        cells[0].last_prompt_at = Some(OffsetDateTime::now_utc() - time::Duration::minutes(5));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
+
+        // On the border, hugging the right corner.
+        assert!(rows[0].contains("last · 5m"), "{rows:#?}");
+        assert!(rows[0].trim_end().ends_with('╗'), "{rows:#?}");
+        // Not wedged into the prompt line, which broke the reading flow of
+        // the very text it annotated.
+        let prompt_row = rows
+            .iter()
+            .find(|r| r.contains("fix the token check"))
+            .expect("prompt line rendered");
+        assert!(!prompt_row.contains("ago"), "{prompt_row}");
+        // The glyph leads the text directly, with nothing wedged between.
+        assert!(prompt_row.contains("▸ fix the token check"), "{prompt_row}");
+    }
+
+    #[test]
+    fn unknown_prompt_time_leaves_the_border_bare() {
+        // An invented "0s ago" would be a lie about when the human last
+        // showed up — the question the stamp exists to answer.
+        let mut a = agent("%0", AgentState::Working);
+        a.last_prompt = Some("fix the token check".into());
+        let cells = build_cells(vec![geo("0", 0, 0, 40, 12, true)], &[a]);
+        assert!(cells[0].last_prompt_at.is_none());
+        assert!(age_stamp(&cells[0], false).is_none());
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        assert!(!screen(&terminal).contains("ago"));
+    }
+
+    #[test]
+    fn narrow_box_drops_the_stamp_rather_than_overlapping_the_header() {
+        // ratatui draws both titles on the same row from opposite ends and
+        // will happily let them collide; the digit is what makes the pane
+        // jumpable, so the stamp is what yields.
+        let mut a = agent("%0", AgentState::Working);
+        a.last_prompt = Some("fix it".into());
+        let mut cells = build_cells(vec![geo("0", 0, 0, 16, 8, true)], &[a]);
+        cells[0].last_prompt_at = Some(OffsetDateTime::now_utc() - time::Duration::minutes(5));
+
+        let header = header_spans(&cells[0], 16);
+        let stamp = age_stamp(&cells[0], true).unwrap();
+        assert!(!fits_alongside_header(&header, &stamp, 16));
+        assert!(fits_alongside_header(&header, &stamp, 40));
+
+        let mut terminal = Terminal::new(TestBackend::new(16, 9)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
+        assert!(!rows[0].contains("ago"), "{rows:#?}");
+        assert!(rows[0].contains(" 0 "), "the digit survives: {rows:#?}");
+    }
+
+    #[test]
+    fn box_header_carries_the_tmux_pane_id() {
+        // The digit jumps within peek; the pane id is what every other
+        // surface — peer calls, `tend send`, raw tmux — is addressed by.
+        let mut a = agent("%1242", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        let cells = build_cells(vec![pane("3", "%1242", 40, 10)], &[a]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("%1242"), "{rendered}");
+    }
+
+    #[test]
+    fn shell_pane_badge_carries_the_pane_id_too() {
+        // A pane running no agent still gets addressed — you send it a
+        // prompt to start one — so its bare badge names it as well.
+        let cells = build_cells(vec![pane("2", "%77", 40, 10)], &[]);
+        let mut terminal = Terminal::new(TestBackend::new(40, 11)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rendered = screen(&terminal);
+        assert!(rendered.contains("%77"), "{rendered}");
+    }
+
+    #[test]
+    fn minted_handle_replaces_the_kind_it_was_minted_from() {
+        // `claude @claude` spends a third of the header restating itself.
+        let cell = &build_cells(
+            vec![named("0", "%1242", "claude", 40, 10)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let header = line_text(&Line::from(header_spans(cell, 40)));
+        assert!(header.contains("@claude"), "{header:?}");
+        assert_eq!(header.matches("claude").count(), 1, "{header:?}");
+    }
+
+    #[test]
+    fn a_handle_naming_something_else_keeps_the_kind() {
+        // `@reviewer` says what the pane is for but not what runs in it.
+        let cell = &build_cells(
+            vec![named("0", "%1242", "reviewer", 40, 10)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let header = line_text(&Line::from(header_spans(cell, 40)));
+        assert!(header.contains("claude"), "{header:?}");
+        assert!(header.contains("@reviewer"), "{header:?}");
+    }
+
+    #[test]
+    fn a_narrow_header_keeps_the_pane_id_before_the_handle() {
+        // Keep the full address visible even when the alias must yield.
+        let cell = &build_cells(
+            vec![named("0", "%1242", "reviewer", 20, 10)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let header = line_text(&Line::from(header_spans(cell, 20)));
+        assert!(header.contains("%1242"), "{header:?}");
+        assert!(!header.contains("@reviewer"), "{header:?}");
+    }
+
+    #[test]
+    fn narrow_header_drops_the_pane_id_rather_than_clipping_it() {
+        // A clipped `%1242` is still a syntactically valid pane id, so it
+        // would be copied as one — pointing at somebody else's pane.
+        let cell = &build_cells(
+            vec![pane("3", "%1242", 14, 8)],
+            &[agent("%1242", AgentState::Working)],
+        )[0];
+        let wide = line_text(&Line::from(header_spans(cell, 40)));
+        let narrow = line_text(&Line::from(header_spans(cell, 12)));
+        assert!(wide.contains("%1242"), "{wide:?}");
+        assert!(
+            !narrow.contains('%') || narrow.contains("%1242"),
+            "no partial id survives: {narrow:?}"
+        );
+        assert!(narrow.contains(" 3 "), "the digit survives: {narrow:?}");
+    }
+
+    #[test]
+    fn latest_prompt_uses_exact_time_when_display_ages_tie() {
+        let mut left = agent("%0", AgentState::Working);
+        left.last_prompt = Some("older prompt".into());
+        let mut right = agent("%1", AgentState::Working);
+        right.last_prompt = Some("newer prompt".into());
+        let mut cells = build_cells(
+            vec![geo("0", 0, 0, 40, 6, true), geo("1", 0, 6, 40, 6, false)],
+            &[left, right],
+        );
+        let now = OffsetDateTime::now_utc();
+        cells[0].last_prompt_at = Some(now - time::Duration::minutes(70));
+        cells[1].last_prompt_at = Some(now - time::Duration::minutes(65));
+
+        // Both round down to the same human-facing bucket, but the exact
+        // timestamps still identify pane 1 as the most recently prompted.
+        assert_eq!(
+            crate::relative_time(now, cells[0].last_prompt_at.unwrap()),
+            "1h ago"
+        );
+        assert_eq!(
+            crate::relative_time(now, cells[1].last_prompt_at.unwrap()),
+            "1h ago"
+        );
+        let latest = latest_prompt_at(&cells);
+        assert_ne!(cells[0].last_prompt_at, latest);
+        assert_eq!(cells[1].last_prompt_at, latest);
+        assert!(!age_stamp(&cells[0], false).unwrap().contains("last"));
+        assert!(age_stamp(&cells[1], true).unwrap().contains("last · 1h"));
+
+        let mut terminal = Terminal::new(TestBackend::new(40, 13)).unwrap();
+        terminal
+            .draw(|f| draw(f, &cells, Placement::default(), false, ""))
+            .unwrap();
+        let rows: Vec<String> = screen(&terminal).lines().map(str::to_string).collect();
+        assert!(rows[0].contains("1h ago"), "{rows:#?}");
+        assert!(!rows[0].contains("last"), "{rows:#?}");
+        assert!(rows[6].contains("last · 1h"), "{rows:#?}");
+    }
+
+    #[test]
+    fn equally_recent_prompts_are_both_marked_last() {
+        let cells_at = OffsetDateTime::now_utc() - time::Duration::hours(2);
+        let mut cells = build_cells(
+            vec![geo("0", 0, 0, 40, 6, true), geo("1", 0, 6, 40, 6, false)],
+            &[
+                agent("%0", AgentState::Working),
+                agent("%1", AgentState::Working),
+            ],
+        );
+        cells[0].last_prompt_at = Some(cells_at);
+        cells[1].last_prompt_at = Some(cells_at);
+
+        let latest = latest_prompt_at(&cells);
+        assert_eq!(cells[0].last_prompt_at, latest);
+        assert_eq!(cells[1].last_prompt_at, latest);
+    }
+
+    #[test]
+    fn backdrops_survive_an_agent_refresh() {
+        // Agent state re-reads every second; backdrops must ride along
+        // rather than be re-shelled, or the "capture once" saving is lost
+        // the first time a state flips.
+        let mut before = build_cells(
+            vec![geo("0", 0, 0, 20, 5, true), geo("1", 0, 6, 20, 5, false)],
+            &[],
+        );
+        before[0].capture = vec!["pane zero output".into()];
+        before[1].capture = vec!["pane one output".into()];
+
+        let mut after = build_cells(
+            vec![
+                geo("0", 0, 0, 20, 5, true),
+                geo("1", 0, 6, 20, 5, false),
+                // A pane split into existence since the last capture.
+                geo("2", 0, 12, 20, 5, false),
+            ],
+            &[],
+        );
+        carry_captures(&before, &mut after);
+        assert_eq!(after[0].capture, vec!["pane zero output".to_string()]);
+        assert_eq!(after[1].capture, vec!["pane one output".to_string()]);
+        // No backdrop yet for the newcomer — it gets one on the next `r`,
+        // which beats inventing one from a pane we never read.
+        assert!(after[2].capture.is_empty());
+    }
+
+    #[test]
+    fn plain_mode_lists_one_line_per_pane() {
+        let mut a = agent("%1", AgentState::Working);
+        a.ai_title = Some("auth refactor".into());
+        let cells = build_cells(
+            vec![geo("0", 0, 0, 40, 11, false), geo("1", 0, 12, 40, 11, true)],
+            &[a],
+        );
+        let lines = plain_lines(&cells);
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("0 %0 "));
+        assert!(lines[1].contains("auth refactor"));
+    }
+
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+}

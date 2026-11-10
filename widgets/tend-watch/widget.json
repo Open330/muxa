@@ -1,0 +1,78 @@
+{
+  "$schema": "https://barshelf.dev/schema/widget-0.1.json",
+  "schemaVersion": 1,
+  "id": "dev.barshelf.tend-watch",
+  "name": "tend Watch",
+  "version": "0.5.0",
+  "icon": "rectangle.3.group.bubble.left.fill",
+  "bucket": { "group": "Agents", "order": 10, "size": "L", "pinned": true },
+
+  "entry": { "kind": "script", "runtime": "deno-ts@1" },
+  "source": {
+    "kind": "script",
+    "command": ["tend"],
+    "discover": ["$TEND_BIN", "/opt/homebrew/bin/tend", "/usr/local/bin/tend", "~/.cargo/bin/tend", "PATH"],
+    "timeoutMs": 8000,
+    "output": "viewtree"
+  },
+
+  "refresh": {
+    "onOpen": true,
+    "interval": 5,
+    "staleAfterSec": 5,
+    "runInBackground": false,
+    "triggers": ["url"]
+  },
+
+  "statusItem": { "mode": "none" },
+
+  "permissions": {
+    "exec": [
+      {
+        "command": "tend",
+        "allowedArgs": [
+          ["status", "--json"],
+          ["--socket", "*", "status", "--json"]
+        ],
+        "maxOutputBytes": 262144,
+        "sensitiveOutput": true
+      },
+      {
+        "command": "tend",
+        "allowedArgs": [
+          ["fleet", "status", "--json"],
+          ["--socket", "*", "fleet", "status", "--json"]
+        ],
+        "maxOutputBytes": 4194304,
+        "sensitiveOutput": true
+      },
+      {
+        "command": "ssh",
+        "allowedArgs": [
+          ["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "--", "*", "tend", "status", "--json"]
+        ],
+        "maxOutputBytes": 262144,
+        "sensitiveOutput": true
+      }
+    ],
+    "env": ["TEND_BIN"],
+    "keychain": false,
+    "notifications": false
+  },
+
+  "settings": [
+    { "key": "source", "title": "Source", "type": "enum", "options": ["Single host", "Fleet"], "default": "Single host" },
+    { "key": "sshHost", "title": "SSH host (Single host only; empty means this Mac)", "type": "string", "default": "" },
+    { "key": "maxAgents", "title": "Maximum rows per host", "type": "integer", "default": 5, "min": 1, "max": 10 },
+    { "key": "showPrompts", "title": "Show what each agent is working on", "type": "boolean", "default": true },
+    { "key": "showSubagents", "title": "Show subagents in flight", "type": "boolean", "default": true },
+    { "key": "includeStopped", "title": "Include stopped agents", "type": "boolean", "default": false },
+    { "key": "socket", "title": "Custom local tend socket", "type": "string", "default": "" }
+  ],
+
+  "appearance": {
+    "accent": "purple",
+    "density": "compact",
+    "showHeader": true
+  }
+}

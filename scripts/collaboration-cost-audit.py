@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize local Muxa traffic and recorded tool-output bytes, without bodies.
+"""Summarize local Tend traffic and recorded tool-output bytes, without bodies.
 
 Daemon audit counts are IPC operations, NOT model calls. Optional Codex/Claude
 session files measure recorded tool output, NOT billable model tokens. Nothing
@@ -40,20 +40,20 @@ def payload_bytes(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
-def muxa_call(name, arguments):
-    # Exact direct tools; arbitrary source paths or prose mentioning Muxa
-    # are not enough to classify an execution as a Muxa call.
-    if re.fullmatch(r"(?:mcp__muxa__|muxa[.:])?muxa_[a-z_]+", name):
+def tend_call(name, arguments):
+    # Exact direct tools; arbitrary source paths or prose mentioning Tend
+    # are not enough to classify an execution as a Tend call.
+    if re.fullmatch(r"(?:mcp__tend__|tend[.:])?tend_[a-z_]+", name):
         return name, arguments
     raw = arguments if isinstance(arguments, str) else json.dumps(arguments)
     if name in ("exec", "functions.exec"):
-        if re.search(r"tools\.mcp__muxa__muxa_\w+\s*\(", raw):
-            return "exec:muxa-tools (mixed output)", raw
-        if "ALL_TOOLS" in raw and "muxa" in raw:
-            return "exec:muxa-discovery (mixed output)", raw
+        if re.search(r"tools\.mcp__tend__tend_\w+\s*\(", raw):
+            return "exec:tend-tools (mixed output)", raw
+        if "ALL_TOOLS" in raw and "tend" in raw:
+            return "exec:tend-discovery (mixed output)", raw
     if name in ("exec", "functions.exec", "exec_command", "functions.exec_command", "Bash"):
-        if re.search(r"\bmuxa\s+(?:msg|peers|identity|reload|doctor|fleet)\b", raw):
-            return "shell:muxa (mixed output)", raw
+        if re.search(r"\btend\s+(?:msg|peers|identity|reload|doctor|fleet)\b", raw):
+            return "shell:tend (mixed output)", raw
     return None
 
 
@@ -148,7 +148,7 @@ def summarize(audit, sessions, since, repeat_seconds):
         seen_files.add(resolved)
         previous = {}
         for at, name, arguments, output in session_events(path):
-            call = muxa_call(name, arguments)
+            call = tend_call(name, arguments)
             if call is None:
                 continue
             if at is None:
@@ -225,7 +225,7 @@ def summarize(audit, sessions, since, repeat_seconds):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     data_home = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
-    parser.add_argument("--audit", type=Path, default=data_home / "muxa/collaboration-audit.ndjson")
+    parser.add_argument("--audit", type=Path, default=data_home / "tend/collaboration-audit.ndjson")
     parser.add_argument("--session", type=Path, action="append", default=[],
                         help="Codex or Claude JSONL; repeat for several sessions")
     parser.add_argument("--hours", type=float, default=24)

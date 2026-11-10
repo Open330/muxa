@@ -20,11 +20,11 @@ import time
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--rmux', default=shutil.which('rmux'))
-parser.add_argument('--muxa', type=Path, default=Path(__file__).resolve().parents[1] / 'target/debug/muxa')
+parser.add_argument('--tend', type=Path, default=Path(__file__).resolve().parents[1] / 'target/debug/tend')
 args = parser.parse_args()
-assert args.rmux and args.muxa.exists()
+assert args.rmux and args.tend.exists()
 
-with tempfile.TemporaryDirectory(prefix='muxa-popup-jump-') as tmp:
+with tempfile.TemporaryDirectory(prefix='tend-popup-jump-') as tmp:
     root = Path(tmp)
     env = dict(os.environ, TERM='xterm-256color')
     for key in ('RMUX', 'RMUX_PANE', 'TMUX', 'TMUX_PANE'):
@@ -72,15 +72,15 @@ with tempfile.TemporaryDirectory(prefix='muxa-popup-jump-') as tmp:
     def jump(client, fd, target):
         pane = target.split('.')[-1]
         command = shlex.join([
-            'env', 'MUXA_SOCKET=' + str(root / 'muxa.sock'),
-            'MUXA_CONFIG=' + str(root / 'config.toml'), str(args.muxa.resolve()),
+            'env', 'TEND_SOCKET=' + str(root / 'tend.sock'),
+            'TEND_CONFIG=' + str(root / 'config.toml'), str(args.tend.resolve()),
             'watch', '--popup', '--view', 'pane', '--caller-client', client,
             '--caller-pane', pane,
         ])
         run('bind-key', 's', 'run-shell', '-b', command)
         os.write(fd, b'\x02s')
         output = collect(3)
-        assert b'muxa watch' in output, 'prefix+s must open watch'
+        assert b'tend watch' in output, 'prefix+s must open watch'
         os.write(fd, b'\r')
         expected = target.split(':', 1)[1]
         for _ in range(50):
@@ -103,9 +103,9 @@ with tempfile.TemporaryDirectory(prefix='muxa-popup-jump-') as tmp:
         # Include the production auto-view hooks, which must not undo the
         # explicit destination or spawn a second view after the final switch.
         source = (Path(__file__).resolve().parents[1] /
-                  'crates/muxa-cli/src/init/files/tmux.rs').read_text()
+                  'crates/tend-cli/src/init/files/tmux.rs').read_text()
         hooks = source.split('pub const AUTO_VIEW_BODY: &str = r#"', 1)[1].split('"#;', 1)[0]
-        hooks = hooks.replace('muxa workspace view', str(args.muxa.resolve()) + ' workspace view')
+        hooks = hooks.replace('tend workspace view', str(args.tend.resolve()) + ' workspace view')
         (root / 'hooks.conf').write_text(hooks)
         run('source-file', str(root / 'hooks.conf'))
         client, fd = attach('origin')

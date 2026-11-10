@@ -1,0 +1,20 @@
+---
+source: crates/tend-cli/src/watch.rs
+expression: "snapshot_helpers::buffer_string(&terminal)"
+---
+ tend watch   ▶ ◆ ● ○  + 0 panes   sort PANE ID   <clock>
+j/k move  ·  / filter  ·  : commands  ·  ? help
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌ Agents ────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  NAME                   STATE        ACT    SUMMARY                                                        │
+│  alpha:0.0              ● WORK <rel> <rel> alpha response                                                 │
+│> alpha:1.0              ▶ WAIT <rel> <rel> beta response                                                  │
+│                                             ↳ beta response                                                │
+│  alpha:2.0              ◆ CHOICE <rel> <rel> gamma response                                                 │
+│  (no pane)              ○ IDLE <rel> <rel> -                                                              │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+│                                                                                                            │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  jump   o  preview   m  message   Alt-M  move   M  mailbo

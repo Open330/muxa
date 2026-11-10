@@ -1,24 +1,24 @@
-# Muxa for Mac
+# Tend for Mac
 
-Muxa for Mac is a native SwiftUI/AppKit client with a libghostty terminal. It
-does not make the app process the owner of shells or agents: `muxad` owns each
+Tend for Mac is a native SwiftUI/AppKit client with a libghostty terminal. It
+does not make the app process the owner of shells or agents: `tendd` owns each
 PTY and its retained output, while libghostty parses and renders the byte stream
 and encodes user input.
 
 ## Current product slice
 
-- launches the bundled `muxad` when no compatible daemon is reachable;
-- lists muxa-owned native PTY sessions;
+- launches the bundled `tendd` when no compatible daemon is reachable;
+- lists tend-owned native PTY sessions;
 - starts a shell without tmux;
-- starts or converges configured `muxa work up` pipelines from a native form;
+- starts or converges configured `tend work up` pipelines from a native form;
 - presents a native Live Watch hierarchy across registered hosts;
 - attaches a libghostty surface to an existing session;
 - sends input, resize, and attach state over the owner-only Unix socket;
 - reconnects terminal output by byte offset;
 - keeps the PTY alive when its native window closes;
 - saves and restores workspace snapshots (Explore "…" → Save Snapshot /
-  Restore Snapshot…) through muxad's `mux_snapshot_v1` requests, which run
-  `muxa snapshot` / `muxa restore --only-missing --json`; the restore
+  Restore Snapshot…) through tendd's `mux_snapshot_v1` requests, which run
+  `tend snapshot` / `tend restore --only-missing --json`; the restore
   preview compares the snapshot with what runs now, and with
   `mux_snapshot_plan_v1` "Only missing sessions" can be turned off to also
   fill in running sessions, and with `mux_snapshot_continue_v1` agents the
@@ -27,15 +27,15 @@ and encodes user input.
 
 External tmux, cmux, rmux, herdr, and zellij surfaces remain execution
 bindings. A sanitized screen capture is used only for read-only monitoring;
-keyboard input is enabled only after Muxa creates an exact interactive attach
-session backed by a muxad-owned PTY.
+keyboard input is enabled only after Tend creates an exact interactive attach
+session backed by a tendd-owned PTY.
 
 ## Workspace information architecture
 
 The native workspace follows two proven desktop navigation patterns:
 
 - VS Code's Activity Bar switches one contextual sidebar at a time while the
-  editor area remains stable. Muxa applies that to **Work**, **Explore**,
+  editor area remains stable. Tend applies that to **Work**, **Explore**,
   **Inbox**, **Ask**, **Shells**, and **Files**, with a filter scoped to the active
   context. Explore owns topology and host registration; Inbox owns the
   operator's sent commands, durable replies, and agents that require operator
@@ -43,14 +43,14 @@ The native workspace follows two proven desktop navigation patterns:
   provider rather than requests from an agent. Explore already uses hosts as its
   roots, so it does not duplicate them in a separate Hosts activity.
 - Lens separates resource navigation from contextual details and supports
-  drilling into a resource without flattening infrastructure identity. Muxa
+  drilling into a resource without flattening infrastructure identity. Tend
   keeps each host's agent sessions independent and treats host, tmux session,
   window, and pane as execution-location metadata rather than Work identity.
 
 The detail area is deliberately task-oriented:
 
 - **Work** exists for a pipeline run or for panes carrying an explicit complete
-  `workspace_id/work_id` stamp, including panes started by `muxa work` on
+  `workspace_id/work_id` stamp, including panes started by `tend work` on
   another host. Session and window names alone never create fake Work.
 - **Agent** opens on a Markdown summary and provides separate
   **Conversation** and read-only live **Shell** tabs. The Shell tab shows a
@@ -74,13 +74,13 @@ The detail area is deliberately task-oriented:
   activity first; picking one opens it in the editor, where each exchange and
   the whole conversation can be copied as Markdown or as a prompt, and a
   conversation saved as a Markdown file.
-- **Shell** is the interactive native Ghostty surface owned by a muxad PTY.
+- **Shell** is the interactive native Ghostty surface owned by a tendd PTY.
   It also has a read-only **Raw** mode for the bounded PTY output stream.
 
 The app now opens on a **Work Command Center**, not a terminal list. Its
-**Pipelines** section reads `muxa work options --json` through the bundled
+**Pipelines** section reads `tend work options --json` through the bundled
 CLI and draws every configured pipeline as a launchable card: the agents are
-laid out in the stages muxa will start them in (one column per `after`
+laid out in the stages tend will start them in (one column per `after`
 level), with the routes that select the pipeline underneath and a **Start…**
 button that opens the sheet with that pipeline preselected. The config file
 stays the source of truth; the app never keeps its own copy of routes or
@@ -93,8 +93,8 @@ workspace webapp → own git worktree`), the workspace field suggests the
 route's workspace and existing local sessions, the pipeline is a picker whose
 default is the route's choice, the selected pipeline's stage diagram is shown
 before launch, and message skills come from `[message.skills]`. The Start
-button is enabled only for combinations the CLI would accept. muxad then runs
-the canonical bundled `muxa work up` implementation as an asynchronous
+button is enabled only for combinations the CLI would accept. tendd then runs
+the canonical bundled `tend work up` implementation as an asynchronous
 operation, so ticket resolution cannot freeze refreshes or terminal I/O. The
 resulting Work opens as the same logical `{workspace_id, work_id}` used by
 CLI and dashboard surfaces.
@@ -102,7 +102,7 @@ CLI and dashboard surfaces.
 Work is not limited to this Mac. Pipelines are one **library**: this Mac's
 config is the source, and every fleet host in `control` mode shows a badge
 per pipeline (in sync, differs, missing, or unreadable) computed by reading
-that host's config through muxad's `work_command` operation. **Sync to
+that host's config through tendd's `work_command` operation. **Sync to
 hosts** writes the library definition to the hosts where it is missing or
 differs, and pipelines that exist only on a host can be pulled into the
 library. Pipelines are small, portable TOML; **routes** are not, because
@@ -110,7 +110,7 @@ they carry that host's folders and workspaces, so the Routes editor keeps a
 host switcher and edits each host's `[[route]]` table separately. The Start
 Work sheet has a host picker: the project folder is then a path on that
 host, workspace suggestions come from that host's sessions, and the launch
-itself runs `muxa work up` on the host through the daemon while the app
+itself runs `tend work up` on the host through the daemon while the app
 keeps the same asynchronous operation status. A daemon without
 `work_command_v1` still serves the local host through the bundled CLI and
 says so.
@@ -119,23 +119,23 @@ Pipelines are editable in place. **Edit…** on a card (or **New Pipeline…**
 and **Design your own…**) opens a visual editor: agents with alias, program,
 role, task, split direction, prompt, and `after` toggles, a shared prompt
 prefix, and the tmux layout, with the launch-stage picture redrawn as edges
-change. Saving goes through `muxa work pipeline set <name> --from-json -`,
+change. Saving goes through `tend work pipeline set <name> --from-json -`,
 so the same validation the CLI applies (allowlisted programs, unique
 aliases, acyclic `after` edges) runs before and after the round trip, and
-**Delete…** uses `muxa work pipeline remove`. The **Routes** list under the
+**Delete…** uses `tend work pipeline remove`. The **Routes** list under the
 cards edits `[[route]]` entries (match, pipeline, workspace, folder) through
-`muxa work route set` and `route remove`, keeping order and untouched
+`tend work route set` and `route remove`, keeping order and untouched
 `worktree`/`prepare` tables as written.
 
 When the config has no pipeline yet, both the Command Center and the sheet
-show muxa's built-in presets (`solo`, `pair`, `triad`) with their stage
-diagrams. **Install** writes the preset through `muxa work preset apply`
+show tend's built-in presets (`solo`, `pair`, `triad`) with their stage
+diagrams. **Install** writes the preset through `tend work preset apply`
 (adding a catch-all route only when no route exists), and **Describe with an
-agent…** opens the canonical interactive `muxa work init` wizard in a native
+agent…** opens the canonical interactive `tend work init` wizard in a native
 Shell tab for a custom setup. An older bundled CLI without `work options`
 falls back to the free-text fields.
 
-**Live Watch** is the native replacement for the common `muxa watch` operator
+**Live Watch** is the native replacement for the common `tend watch` operator
 loop. It nests **Host → Session → Window → Pane**, labels windows with their
 logical Work identity when one exists, orders the local host first, and keeps
 each host's stable laptop/server badge visible. A one-window session expands
@@ -152,7 +152,7 @@ Raw bytes are intentionally not exposed in Live Pane.
 
 Shells and monitored panes are workspace modules. They participate in
 preview/pin tabs and can be detached into independent macOS windows. Attaching
-from Live Watch runs the bundled `muxa fleet attach` inside a muxad-owned PTY
+from Live Watch runs the bundled `tend fleet attach` inside a tendd-owned PTY
 and reuses the bottom Live Pane instead of navigating away. **Open in Shell**
 remains available when a dedicated Shell tab is useful. A tmux detach returns
 the bottom panel to its read-only preview; in a dedicated Shell tab, the same
@@ -168,7 +168,7 @@ usable.
 Agent summaries, latest responses, collaboration bodies, and Ask answers are
 Markdown. Apple's Markdown parser records paragraphs, headings, lists, tables,
 and code blocks only as presentation intents that SwiftUI `Text` ignores, so
-Muxa rebuilds those block boundaries before display: `MuxaMarkdownText` keeps
+Tend rebuilds those block boundaries before display: `TendMarkdownText` keeps
 a single line-limited `Text` for cards and inspectors, and
 `ReadableMarkdownContent` renders full block layouts (including pipe tables)
 for the Inbox and Ask conversations. The user-facing vocabulary is **Hosts**;
@@ -179,7 +179,7 @@ the tab while another Work, Agent, Host, or Shell is inspected. `Command-Shift-P
 opens the workspace command palette, and each sidebar context supports text and
 status filters (`All`, `Attention`, `Active`); in Ask, Active is a
 conversation still being answered and Attention one whose last turn failed.
-Every attention count reads one summary (`MuxaAttentionSummary`). The Inbox
+Every attention count reads one summary (`TendAttentionSummary`). The Inbox
 badge, the menu bar and Command Center's "Need attention" show what needs the
 person — agents that need them, peers' requests for a decision, and unread
 replies — even when another context is selected; commands still waiting on an
@@ -203,7 +203,7 @@ and [Lens Navigator documentation](https://docs.k8slens.dev/k8slens/using-lens/n
 ## AAS accounts in the menu bar
 
 Enable **Settings → Modules → aas — Agent Account Switcher** with `aas` on
-the login shell's PATH. AAS joins the Muxa cluster as a hoverable gauge chip;
+the login shell's PATH. AAS joins the Tend cluster as a hoverable gauge chip;
 it does not create a separate status item. Hover to see the highest
 reported usage among active accounts. Click it to compare every stored
 account by provider, filter active accounts, or search by name/email. Each
@@ -231,7 +231,7 @@ acknowledging the entire group. Work identity includes host and workspace;
 unmanaged panes use their actual socket/session/window boundary. Opening an agent card acknowledges
 that session. Reviewed icons disappear after the card is closed and the
 pointer leaves; a new state change can show the agent again. With no unseen
-activity, only the Muxa launcher and any enabled extension chip remain.
+activity, only the Tend launcher and any enabled extension chip remain.
 
 Chips unfold on entry without an intent delay. Leaving schedules a 0.2-second
 fold, or 0.45 seconds toward an already-visible peek; returning cancels it.
@@ -262,11 +262,11 @@ Requirements:
 From the repository root:
 
 ```bash
-apps/muxa-macos/Scripts/build-app.sh --open
+apps/tend-macos/Scripts/build-app.sh --open
 ```
 
 The build reads the app version from the workspace `Cargo.toml` and rebuilds
-the bundled `muxa` and `muxad`. `MUXA_SKIP_EMBED=1` is only for local UI
+the bundled `tend` and `tendd`. `TEND_SKIP_EMBED=1` is only for local UI
 iteration: it keeps the existing helpers, so it can leave their versions and
 behavior behind the app. Rebuild without it when checking runtime changes.
 
@@ -277,29 +277,29 @@ required by the pinned Ghostty release and verifies its SHA-256 digest.
 The resulting development application is located at:
 
 ```text
-apps/muxa-macos/.build/DerivedData/Build/Products/Debug/Muxa.app
+apps/tend-macos/.build/DerivedData/Build/Products/Debug/Tend.app
 ```
 
 Build and smoke-test a universal Release app with:
 
 ```bash
-CONFIGURATION=Release apps/muxa-macos/Scripts/build-app.sh
-CONFIGURATION=Release apps/muxa-macos/Scripts/smoke-test.sh
+CONFIGURATION=Release apps/tend-macos/Scripts/build-app.sh
+CONFIGURATION=Release apps/tend-macos/Scripts/smoke-test.sh
 ```
 
 Run the launch/daemon/session/renderer smoke test with:
 
 ```bash
-apps/muxa-macos/Scripts/smoke-test.sh
+apps/tend-macos/Scripts/smoke-test.sh
 ```
 
-Set `MUXA_SOCKET` before opening from a shell to select a non-default daemon
-socket. Otherwise, the app uses `/tmp/muxa-<uid>.sock`, matching muxa's macOS
+Set `TEND_SOCKET` before opening from a shell to select a non-default daemon
+socket. Otherwise, the app uses `/tmp/tend-<uid>.sock`, matching tend's macOS
 fallback.
 
 ## Distribution
 
-Muxa for Mac ships as a **notarized DMG on the GitHub release**, not through
+Tend for Mac ships as a **notarized DMG on the GitHub release**, not through
 the Mac App Store. That is not a preference. The app runs the operator's own
 binaries (tmux, the agent CLIs, `ssh`), talks to a daemon that outlives it
 over a socket in `/tmp`, and reads whatever project directory the work is in.
@@ -310,13 +310,13 @@ tool.
 Users install it with:
 
 ```bash
-brew install --cask open330/tap/muxa-app
+brew install --cask open330/tap/tend-app
 ```
 
-The cask is named `muxa-app` rather than `muxa` because the tap already
-ships `Formula/muxa.rb`, and a formula and cask of one name make
-`brew install muxa` ambiguous. It matters more here than it does for a
-typical app: Muxa.app has no Sparkle and no updater of its own, so
+The cask is named `tend-app` rather than `tend` because the tap already
+ships `Formula/tend.rb`, and a formula and cask of one name make
+`brew install tend` ambiguous. It matters more here than it does for a
+typical app: Tend.app has no Sparkle and no updater of its own, so
 `brew upgrade` is the only way an installed copy ever moves forward.
 `tap-bump` rewrites the cask from the release's DMG checksum, and skips it
 when a release carries no DMG rather than pointing at a download that 404s.
@@ -324,10 +324,10 @@ when a release carries no DMG rather than pointing at a download that 404s.
 Build one locally:
 
 ```bash
-MUXA_SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
-MUXA_TEAM_ID=TEAMID \
-MUXA_NOTARY_PROFILE=muxa-notary \
-apps/muxa-macos/Scripts/package-dmg.sh
+TEND_SIGN_IDENTITY="Developer ID Application: NAME (TEAMID)" \
+TEND_TEAM_ID=TEAMID \
+TEND_NOTARY_PROFILE=tend-notary \
+apps/tend-macos/Scripts/package-dmg.sh
 ```
 
 The script builds Release, signs every nested executable before the bundle
@@ -335,15 +335,15 @@ that contains them, builds the DMG, submits it to Apple, staples the ticket,
 and finishes with the only check that matters:
 
 ```text
-spctl -a -vvv -t install dist/Muxa-<version>.dmg
+spctl -a -vvv -t install dist/Tend-<version>.dmg
   → accepted, source=Notarized Developer ID
 ```
 
 That is what a stranger's Mac decides about the file, and the script fails if
 the answer is anything else.
 
-Two escape hatches. `MUXA_SKIP_NOTARIZE=1` signs without submitting, for a
-fast local check. Omitting `MUXA_SIGN_IDENTITY` entirely produces a DMG named
+Two escape hatches. `TEND_SKIP_NOTARIZE=1` signs without submitting, for a
+fast local check. Omitting `TEND_SIGN_IDENTITY` entirely produces a DMG named
 `-unsigned`, which exercises the packaging path on a machine with no
 certificate and will not open anywhere else.
 
@@ -381,46 +381,46 @@ which release a user is running.
 
 Global Ask uses the installed `claude`, `codex`, and `gemini` CLIs in their
 structured non-interactive modes, the Anthropic and OpenAI APIs with a key, or
-Apple Intelligence through the bundled `muxa-afm` helper on macOS 26 or later
-(see [Configuration](CONFIGURATION.md)). The app augments a GUI-launched muxad PATH with
+Apple Intelligence through the bundled `tend-afm` helper on macOS 26 or later
+(see [Configuration](CONFIGURATION.md)). The app augments a GUI-launched tendd PATH with
 `~/.local/bin`, `~/.cargo/bin`, and Homebrew locations, while preserving
 normal Claude Code/Codex CLI sign-in.
 
 When `[ask].enabled` is absent or false, the Ask view shows an explicit
 **Enable & Reload** action instead of allowing the first question to fail.
-This writes the same opt-in grant as `muxa init --component ask` and reloads
-muxad; native PTY sessions require confirmation before replacement, while tmux
+This writes the same opt-in grant as `tend init --component ask` and reloads
+tendd; native PTY sessions require confirmation before replacement, while tmux
 sessions remain running. Submit from the composer with **Command-Return** or
 the provider-neutral **Send** button.
 
 The Providers sheet can optionally store `ANTHROPIC_API_KEY` or
 `CODEX_API_KEY` in the macOS login Keychain. A key is fetched only when its
-matching provider is selected and crosses the owner-only muxad socket as a
-one-turn credential. muxad puts it in only that child process environment; it
+matching provider is selected and crosses the owner-only tendd socket as a
+one-turn credential. tendd puts it in only that child process environment; it
 is redacted from debug output and never appears in config, Ask history, logs,
 or command arguments.
 
 ## Local QA helper
 
-`MuxaQAHelper.app` is an optional, separately signed development tool for
+`TendQAHelper.app` is an optional, separately signed development tool for
 testing the native UI. It is not embedded in or launched by the production
-Muxa app. Keeping it separate means Accessibility and Screen Recording access
-is granted to the QA tool rather than to Muxa or the terminal process running
+Tend app. Keeping it separate means Accessibility and Screen Recording access
+is granted to the QA tool rather than to Tend or the terminal process running
 the test client.
 
 Build, sign, install, and open the helper with:
 
 ```bash
-apps/muxa-macos/Scripts/install-qa-helper.sh
+apps/tend-macos/Scripts/install-qa-helper.sh
 ```
 
 The installer uses an available Apple Development identity so that the helper
 keeps a stable code identity across rebuilds. Override it when necessary with
-`MUXA_QA_CODESIGN_IDENTITY`, or install somewhere other than
-`~/Applications` with `MUXA_QA_INSTALL_DIR`. The helper requires macOS 14 or
+`TEND_QA_CODESIGN_IDENTITY`, or install somewhere other than
+`~/Applications` with `TEND_QA_INSTALL_DIR`. The helper requires macOS 14 or
 newer because window capture uses ScreenCaptureKit's screenshot API.
 
-In the helper window, choose **Request Permissions**, enable **Muxa QA Helper**
+In the helper window, choose **Request Permissions**, enable **Tend QA Helper**
 under Privacy & Security > Accessibility and Screen & System Audio Recording,
 then relaunch the helper. The permission status updates in the window.
 
@@ -428,19 +428,19 @@ The owner-only local client supports permission checks, window inspection,
 capture, and focused test input:
 
 ```bash
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py status
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py inspect
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py capture --output /tmp/muxa.png
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py type --text 'printf qa-ok' --return
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py click --x 600 --y 260
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py resize --width 920 --height 580
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py key --key , --mod command
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py key --key p --mod command --mod shift
-apps/muxa-macos/Scripts/muxa-qa-helper-client.py key --key escape
+apps/tend-macos/Scripts/tend-qa-helper-client.py status
+apps/tend-macos/Scripts/tend-qa-helper-client.py inspect
+apps/tend-macos/Scripts/tend-qa-helper-client.py capture --output /tmp/tend.png
+apps/tend-macos/Scripts/tend-qa-helper-client.py type --text 'printf qa-ok' --return
+apps/tend-macos/Scripts/tend-qa-helper-client.py click --x 600 --y 260
+apps/tend-macos/Scripts/tend-qa-helper-client.py resize --width 920 --height 580
+apps/tend-macos/Scripts/tend-qa-helper-client.py key --key , --mod command
+apps/tend-macos/Scripts/tend-qa-helper-client.py key --key p --mod command --mod shift
+apps/tend-macos/Scripts/tend-qa-helper-client.py key --key escape
 ```
 
-Click coordinates are relative to the captured Muxa window and are rejected if
-they fall outside that window. `resize` moves and resizes the largest Muxa
+Click coordinates are relative to the captured Tend window and are rejected if
+they fall outside that window. `resize` moves and resizes the largest Tend
 window through the Accessibility API, which makes minimum-size and responsive
 layouts reproducible; the window's own minimum size still applies and the
 resulting geometry is returned.
@@ -456,9 +456,9 @@ uses for menu shortcuts, so `⌘W` still works while an input method such as
 the last fallback; Shift is added when the layout needs it, and the resolved
 virtual key code is returned as `key_code`.
 
-The helper listens on `/tmp/muxa-qa-helper-<uid>.sock` with mode `0600`,
+The helper listens on `/tmp/tend-qa-helper-<uid>.sock` with mode `0600`,
 rejects peers owned by another user, caps request and text sizes, and always
-targets the fixed Muxa bundle identifier (`dev.muxa.mac`). It cannot capture or
+targets the fixed Tend bundle identifier (`dev.tend.mac`). It cannot capture or
 focus an arbitrary application. Because any process running as the same user
 can reach this QA bridge, quit the helper when UI automation is finished; it is
 intended for local development, not distribution.
@@ -505,7 +505,7 @@ is preserved when the earlier send completes.
 
 ## Reproducible libghostty supply chain
 
-[`apps/muxa-macos/Dependencies.lock`](../apps/muxa-macos/Dependencies.lock)
+[`apps/tend-macos/Dependencies.lock`](../apps/tend-macos/Dependencies.lock)
 pins all non-package-manager source inputs:
 
 - Ghostty release and full Git commit;
@@ -513,21 +513,21 @@ pins all non-package-manager source inputs:
   native Swift terminal surface;
 - Zig version and both macOS archive checksums.
 
-[`build-libghostty.sh`](../apps/muxa-macos/Scripts/build-libghostty.sh) checks
+[`build-libghostty.sh`](../apps/tend-macos/Scripts/build-libghostty.sh) checks
 out those exact commits, verifies that the patch set names the same Ghostty
 commit, applies it, builds arm64 and x86_64 static archives, combines them into
-Muxa's local `GhosttyKit.xcframework`, and points the local Swift package at
+Tend's local `GhosttyKit.xcframework`, and points the local Swift package at
 that artifact. The local compatibility patches are included in the cache key,
 and the build rejects archives that omit the required Ghostty C ABI. No
-release-hosted libghostty binary is linked into Muxa.
+release-hosted libghostty binary is linked into Tend.
 
-The Xcode embed phase builds `muxad` for every architecture in the app target
-and also builds the canonical `muxa` CLI used for Work control and Fleet
+The Xcode embed phase builds `tendd` for every architecture in the app target
+and also builds the canonical `tend` CLI used for Work control and Fleet
 attach. It combines both binaries when producing a universal app, so the
 renderer, process-owning daemon, and execution implementation cannot drift to
 incompatible architectures.
 
-Build outputs and source checkouts live under `apps/muxa-macos/.build` and are
+Build outputs and source checkouts live under `apps/tend-macos/.build` and are
 not committed.
 
 ## IPC contract
@@ -546,16 +546,16 @@ older clients. Native terminal clients require the additive
   responses suppressed, while a never-attached PTY performs normal first-time
   terminal negotiation;
 - `truncated: true` explicitly tells the UI that the requested offset fell
-  behind muxad's bounded retention window.
+  behind tendd's bounded retention window.
 
 `read_session_wait` blocks on the PTY output/exit signal for at most 15
-seconds, replacing the former 8–45 ms empty-read loop. MuxaIPCClient assigns
+seconds, replacing the former 8–45 ms empty-read loop. TendIPCClient assigns
 terminal reads their own serialized lane; keyboard input, attachment changes,
 and resize control remain responsive while that lane waits.
 
 ## Event-driven refresh and render budget
 
-Muxa.app opens compact `fleet_subscribe`, `pipeline_subscribe`, and
+Tend.app opens compact `fleet_subscribe`, `pipeline_subscribe`, and
 `ask_subscribe` streams after its initial coherent load. Host update bursts
 are coalesced for 75 ms and capped at four snapshot reads per second. A slow
 15-second full reconciliation repairs stream disconnects and lag gaps; it is
@@ -587,29 +587,29 @@ dashboard's separate network-facing `allow_work_start` gate remains unchanged.
 The app refuses to open a terminal against an older daemon that does not
 advertise this capability instead of silently corrupting terminal traffic. If
 an older daemon already owns the selected socket, the app presents **Use
-Bundled muxad**. After explicit confirmation it verifies that the socket and
+Bundled tendd**. After explicit confirmation it verifies that the socket and
 daemon belong to the current user, stops the existing service, and launches the
-version embedded in Muxa.app. The confirmation is required because native PTY
+version embedded in Tend.app. The confirmation is required because native PTY
 sessions owned by the old daemon end during replacement; external tmux sessions
 are not terminated.
 
 For a Homebrew-managed daemon, replacement also stops the persistent
-`open330/tap/muxa` background service and disables the legacy
-`dev.open330.muxad` LaunchAgent so neither can immediately reclaim the socket
+`open330/tap/tend` background service and disables the legacy
+`dev.open330.tendd` LaunchAgent so neither can immediately reclaim the socket
 with an older binary. Re-enable those services only after their installed
 version advertises `session_bytes_v1` (`launchctl enable
-gui/$(id -u)/dev.open330.muxad` for the legacy label).
+gui/$(id -u)/dev.open330.tendd` for the legacy label).
 
 ## Process ownership and lifecycle
 
 ```text
-Muxa.app
+Tend.app
 ├── Work/session UI
 ├── GhosttyTerminal (VT parser, Metal renderer, input encoder)
-└── MuxaIPCClient
+└── TendIPCClient
         │ byte-safe local IPC
         ▼
-muxad
+tendd
 ├── PTY child processes
 ├── retained output and offsets
 └── agent / Work / Run state
@@ -689,8 +689,8 @@ actions appear under the same names, the one its state calls for first:
   Account…**;
 - any other Claude Code or Codex agent: **Move to Another Account…**.
 
-The switch sheet runs `muxa swap … --json` on the agent's own host (local or
-Fleet) through muxad's `work_command`, so it uses the CLI's swap logic, daemon
+The switch sheet runs `tend swap … --json` on the agent's own host (local or
+Fleet) through tendd's `work_command`, so it uses the CLI's swap logic, daemon
 jobs and request keys unchanged. Before starting it shows the `--dry-run` plan
 per agent: from which `aas` account to which, and whether the interrupted turn
 is carried on. Running and finished switches appear in the status bar with
@@ -703,7 +703,7 @@ account and continue, wait for the reset and continue, or just tell me — in
 the rate-limit popover, the usage popover and Settings › Automations. It is
 written as ordinary automation rules (`swap-on-limit`, the
 `resume-after-limit` starter), so the CLI and `config.toml` see the same
-thing. The policy covers this Mac's agents (the rules run in its muxad); a
+thing. The policy covers this Mac's agents (the rules run in its tendd); a
 capped agent counts as needing the person, and notifies with a **Switch
 Account…** action, unless a rule of its own host's daemon will act on it — so
 a capped agent on a Fleet host always asks.
@@ -713,8 +713,8 @@ Restoring a snapshot can also tell the agents it caught mid-turn to
 
 ## Explicit requests for a person
 
-Agents use `muxa msg attention "..." --action approval` or the
-`muxa_request_attention` MCP tool for a required approval, choice, or missing
+Agents use `tend msg attention "..." --action approval` or the
+`tend_request_attention` MCP tool for a required approval, choice, or missing
 information. These requests do not fabricate a waiting agent state. The app
 reads the human incoming queue as well as operator-sent requests from every
 registered Fleet host, including hosts with no remaining terminal panes.
@@ -735,20 +735,20 @@ control retain their own ordered control path. A slow remote options request
 therefore does not hold up another host or terminal input. Workspace projection
 sorting/grouping runs off the main actor. At most one projection builds at a
 time; notifications arriving during it replace a single pending input. Only the
-latest result is published. Menu-bar cards activate Muxa before taking keyboard
+latest result is published. Menu-bar cards activate Tend before taking keyboard
 focus, switch directly between destinations, and close on a repeated click on
 the same destination. A transient close on mouse-down suppresses only the same
 destination on mouse-up.
 
 Settings → Runtime shows the daemon version/generation and, when the installed
-bundle has `Contents/Resources/muxa-build.json`, its app build commit. A matching
+bundle has `Contents/Resources/tend-build.json`, its app build commit. A matching
 version number alone does not establish matching code: several local main builds
-can report the same release version. The app's embedded `muxa` and `muxad` must
+can report the same release version. The app's embedded `tend` and `tendd` must
 also be refreshed when installing a newer main build. CLI-only commands do not
 automatically gain a native UI; Advanced settings exposes the daemon's complete
 configuration, while dedicated forms remain limited to their supported sections.
 
-Queued IPC work that is cancelled before it starts never reaches muxad. Cancelling
+Queued IPC work that is cancelled before it starts never reaches tendd. Cancelling
 an in-flight operation does not undo an already-sent command. Live pane preview
 ANSI parsing runs off the main actor and rejects superseded renders; inactive
 previews wake immediately on reactivation instead of waiting for the idle timer.

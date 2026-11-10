@@ -1,6 +1,6 @@
 import socket,json,datetime,time,pathlib,sys,subprocess
-ROOT=pathlib.Path('/tmp/muxa-quiet-e2e')
-SOCKET='/tmp/muxa-1044.sock'
+ROOT=pathlib.Path('/tmp/tend-quiet-e2e')
+SOCKET='/tmp/tend-1044.sock'
 ENDPOINT='/tmp/rmux-1044/default'
 ACTORS={name:'rmux:'+json.loads((ROOT/f'{name}-launch.json').read_text())['pane'] for name in ('sender','recipient')}
 def rpc(kind,**kwargs):
@@ -30,7 +30,7 @@ def wait_for(test,timeout=12):
         time.sleep(.15)
     raise AssertionError('timed out waiting for expected runtime state')
 def setup():
-    work=json.loads(subprocess.run(['/home/june/.cargo/bin/muxa','work','show',
+    work=json.loads(subprocess.run(['/home/june/.cargo/bin/tend','work','show',
         'QUIET-E2E-20260926','--workspace','quiet-validation-20260926','--json'],
         text=True,capture_output=True,check=True,timeout=15).stdout)
     assert work['cwd']==str(ROOT)
@@ -47,7 +47,7 @@ def baseline():
     wait_for(lambda:get(r).get('notified_at'))
     wait_for(lambda:r['id'] in (capture('recipient') or ''))
     screen=capture('recipient')
-    result={'version':'0.8.51','notices_sent':1,'notified':1,'request_id':r['id'],'actual_terminal_contains_request':r['id'] in screen,'before_terminal_contains_request':r['id'] in (before or ''),'reply_requested_by_prompt':'then respond with muxa_reply' in screen}
+    result={'version':'0.8.51','notices_sent':1,'notified':1,'request_id':r['id'],'actual_terminal_contains_request':r['id'] in screen,'before_terminal_contains_request':r['id'] in (before or ''),'reply_requested_by_prompt':'then respond with tend_reply' in screen}
     (ROOT/'baseline.json').write_text(json.dumps(result,indent=2));inbox('recipient');print(json.dumps(result,indent=2))
 def after():
     hello=rpc('hello')
@@ -76,7 +76,7 @@ def after():
     wait_for(lambda:get(urgent).get('notified_at'))
     wait_for(lambda:urgent['id'] in (capture('recipient') or ''))
     urgent_screen=capture('recipient')
-    assert ''.join(urgent_screen.split()).count('[muxa:'+urgent['id']+']')==1, 'handoff repeated in real terminal'
+    assert ''.join(urgent_screen.split()).count('[tend:'+urgent['id']+']')==1, 'handoff repeated in real terminal'
     assert 'Noreplyisexpected' in ''.join(urgent_screen.split())
     result.update(handoff_notified=True,handoff_terminal_occurrences=1,handoff_observed_seconds=round(time.monotonic()-t,2))
     inbox('recipient')
@@ -105,7 +105,7 @@ def after():
     wait_for(lambda:task['id'] in (capture('sender') or ''))
     sender_screen=capture('sender')
     assert task['id'] not in (sender_before or '')
-    assert ''.join(sender_screen.split()).count('[muxa:'+task['id']+']')==1
+    assert ''.join(sender_screen.split()).count('[tend:'+task['id']+']')==1
     assert 'transport fixture completed' not in sender_screen
     get(task) # consume the reply through the durable mailbox
     result['completion_reply_terminal_occurrences']=1

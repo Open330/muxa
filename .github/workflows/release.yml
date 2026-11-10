@@ -117,15 +117,15 @@ jobs:
         uses: taiki-e/upload-rust-binary-action@v1
         with:
           # Two binaries from the workspace.
-          bin: muxa,muxad
+          bin: tend,tendd
           target: ${{ matrix.target }}
-          # Archive filename pattern: muxa-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-          archive: muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}
+          # Archive filename pattern: tend-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+          archive: tend-${{ steps.ref.outputs.name }}-${{ matrix.target }}
           # Bundle license, README, and example wiring next to the binaries.
           # Note: the action also auto-includes top-level LICENSE* and
           # README.md, but listing them here keeps intent explicit.
           include: >-
-            LICENSE-MIT,LICENSE-APACHE,README.md,examples/muxad.service,examples/muxa.tmux.conf,examples/claude-settings.json
+            LICENSE-MIT,LICENSE-APACHE,README.md,examples/tendd.service,examples/tend.tmux.conf,examples/claude-settings.json
           # Files inside the archive sit under a directory named after
           # the archive (matches `tar tf` UX of common Rust releases).
           leading-dir: true
@@ -145,15 +145,15 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}
+          name: tend-${{ steps.ref.outputs.name }}-${{ matrix.target }}
           path: |
-            muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}.tar.gz
-            muxa-${{ steps.ref.outputs.name }}-${{ matrix.target }}.tar.gz.sha256
+            tend-${{ steps.ref.outputs.name }}-${{ matrix.target }}.tar.gz
+            tend-${{ steps.ref.outputs.name }}-${{ matrix.target }}.tar.gz.sha256
           if-no-files-found: error
           retention-days: 14
 
   # The Mac app ships as a notarized DMG rather than through the App Store:
-  # Muxa runs the operator's own binaries, talks to a daemon that outlives it
+  # Tend runs the operator's own binaries, talks to a daemon that outlives it
   # over a socket in /tmp, and reads whatever directory the work is in. The
   # App Sandbox forbids all three, so Developer ID is the only route.
   #
@@ -195,10 +195,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: |
-            apps/muxa-macos/.build/dependencies
-            apps/muxa-macos/.build/toolchains
-            apps/muxa-macos/.build/libghostty.stamp
-          key: libghostty-${{ runner.os }}-${{ hashFiles('apps/muxa-macos/Dependencies.lock', 'apps/muxa-macos/Patches/libghostty-spm/*.patch') }}
+            apps/tend-macos/.build/dependencies
+            apps/tend-macos/.build/toolchains
+            apps/tend-macos/.build/libghostty.stamp
+          key: libghostty-${{ runner.os }}-${{ hashFiles('apps/tend-macos/Dependencies.lock', 'apps/tend-macos/Patches/libghostty-spm/*.patch') }}
 
       # A keychain of its own, unlocked only for this job and deleted after it,
       # so the certificate never touches the runner's login keychain.
@@ -214,7 +214,7 @@ jobs:
             echo "signed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          keychain="$RUNNER_TEMP/muxa-signing.keychain-db"
+          keychain="$RUNNER_TEMP/tend-signing.keychain-db"
           password="$(openssl rand -base64 24)"
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 3600 "$keychain"
@@ -258,20 +258,20 @@ jobs:
 
       - name: Build, sign, notarize and package
         env:
-          MUXA_VERSION: ${{ steps.ref.outputs.version }}
-          MUXA_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
-          MUXA_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
-          MUXA_SKIP_NOTARIZE: ${{ steps.notary.outputs.enabled == 'true' && '0' || '1' }}
+          TEND_VERSION: ${{ steps.ref.outputs.version }}
+          TEND_SIGN_IDENTITY: ${{ steps.signing.outputs.identity }}
+          TEND_TEAM_ID: ${{ vars.MACOS_TEAM_ID }}
+          TEND_SKIP_NOTARIZE: ${{ steps.notary.outputs.enabled == 'true' && '0' || '1' }}
           NOTARY_KEY_PATH: ${{ steps.notary.outputs.path }}
           NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
           NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
-        run: apps/muxa-macos/Scripts/package-dmg.sh
+        run: apps/tend-macos/Scripts/package-dmg.sh
 
       - name: Checksum
         id: dmg
         run: |
           set -euo pipefail
-          dmg=$(/bin/ls apps/muxa-macos/dist/*.dmg | head -1)
+          dmg=$(/bin/ls apps/tend-macos/dist/*.dmg | head -1)
           name=$(basename "$dmg")
           # Same "<sha256>  <file>" shape the Rust archives publish, so the
           # tap bump can read every sidecar the same way.
@@ -292,8 +292,8 @@ jobs:
         if: github.event_name == 'workflow_dispatch' || steps.signing.outputs.signed != 'true'
         uses: actions/upload-artifact@v4
         with:
-          name: Muxa-${{ steps.ref.outputs.name }}-dmg
-          path: apps/muxa-macos/dist/*.dmg*
+          name: Tend-${{ steps.ref.outputs.name }}-dmg
+          path: apps/tend-macos/dist/*.dmg*
           if-no-files-found: error
           retention-days: 14
 
