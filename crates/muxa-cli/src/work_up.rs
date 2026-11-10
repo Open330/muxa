@@ -798,7 +798,7 @@ fn resolve_cwd(
             );
         }
         let plan = pipeline::worktree_plan(config, vars, &|value| expand_tilde(value));
-        let created = ensure_worktree(&plan)?;
+        let created = ensure_worktree(&plan, &format!("work:{}", args.work))?;
         let cwd = muxa::paths::canonicalize(&plan.path)
             .with_context(|| format!("resolve worktree {}", plan.path.display()))?;
         return Ok((cwd, Some(plan), created));
@@ -997,8 +997,9 @@ fn store_ticket(id: &str, ticket: &Ticket) {
 // -------------------------------------------------------------- worktree
 
 /// Create the work's git worktree, or confirm the one already there.
-/// Returns whether this call created it.
-fn ensure_worktree(plan: &WorktreePlan) -> Result<bool> {
+/// Returns whether this call created it. A worktree this call creates gets
+/// a receipt (see `muxa::worktree_receipt`); one already there does not.
+fn ensure_worktree(plan: &WorktreePlan, origin: &str) -> Result<bool> {
     if plan.path.exists() {
         if !plan.path.join(".git").exists() {
             bail!(
@@ -1037,7 +1038,31 @@ fn ensure_worktree(plan: &WorktreePlan) -> Result<bool> {
             base,
         ]
     };
-    git(&plan.repo, &args).with_context(|| format!("create worktree {}", plan.path.display()))?;
+    let (branch, base) = if args.iter().any(|arg| arg == "-b") {
+        (Some(plan.branch.clone()), args.last().cloned())
+    } else {
+        (Some(plan.branch.clone()), None)
+    };
+    // A receipt that cannot be written only costs cleanup its proof.
+    let receipt = muxa::worktree_receipt::WorktreeReceipt::begin(
+        &plan.repo, &plan.path, branch, base, origin,
+    )
+    .map_err(|error| tracing::warn!(%error, "worktree receipt not written"))
+    .ok();
+    if let Err(error) = git(&plan.repo, &args) {
+        if let Some(receipt) = receipt {
+            let _ = receipt.fail();
+        }
+        return Err(error).with_context(|| format!("create worktree {}", plan.path.display()));
+    }
+    if let Some(receipt) = receipt {
+        let head = git(&plan.path, &["rev-parse".into(), "HEAD".into()])
+            .ok()
+            .map(|out| out.trim().to_string());
+        if let Err(error) = receipt.finish(head) {
+            tracing::warn!(%error, "worktree receipt not completed");
+        }
+    }
     Ok(true)
 }
 
