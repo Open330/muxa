@@ -22,6 +22,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     private var hostIcons = MuxaHostIcons.all()
     private let registry = MuxaModuleRegistry.shared
     private var selectedChipID: String?
+    private var cardDestination: String?
     private var showAasChip = UserDefaults.standard.object(forKey: MuxaPreferences.menuBarAasChipKey) as? Bool ?? true
     private var focus: Int?
     private var pointerInside = false
@@ -399,6 +400,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         state.scope = nil
         state.showingUsage = false
         selectedChipID = nil
+        cardDestination = nil
         show(selected: nil)
     }
 
@@ -406,7 +408,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         let closing = closingClick
         closingClick = nil
         let action = MuxaMenuBarCardInteraction.action(
-            requested: destination, current: selectedChipID, shown: popover?.isShown == true,
+            requested: destination, current: cardDestination, shown: popover?.isShown == true,
             closed: closing?.destination, closedAt: closing?.at, now: .now)
         switch action {
         case .close: popover?.performClose(nil); return true
@@ -423,6 +425,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     func showChip(_ chip: MuxaMenuBarChip) {
         guard !toggleCard(destination: chip.id) else { return }
         selectedChipID = chip.id
+        cardDestination = chip.id
         switch chip.destination {
         case .agent(let id):
             state.scope = nil
@@ -478,7 +481,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         render()
     }
 
-    private func selectInCard(_ id: String?) {
+    func selectInCard(_ id: String?) {
         state.selectedID = id
         acknowledge(id)
         state.showingUsage = false
@@ -506,7 +509,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     }
 
     func popoverDidClose(_ notification: Notification) {
-        if NSApp.currentEvent?.type == .leftMouseDown || NSApp.currentEvent?.type == .rightMouseDown { closingClick = (selectedChipID, Date()) }
+        if NSApp.currentEvent?.type == .leftMouseDown || NSApp.currentEvent?.type == .rightMouseDown { closingClick = (cardDestination, Date()) }
         if let keyMonitor { NSEvent.removeMonitor(keyMonitor) }
         keyMonitor = nil
         popover?.contentViewController = nil
@@ -515,6 +518,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
         state.scope = nil
         state.showingUsage = false
         selectedChipID = nil
+        cardDestination = nil
         if !pointerInside { scheduleFold(grace: MuxaMenuBarHoverPolicy.exitGrace) }
         if animationStarted == nil { refresh() } else { render() }
     }

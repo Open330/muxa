@@ -48,6 +48,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Policy changes and periodic reconciliation keep time-based states fresh.
   Bursts keep one computation in flight and replace pending work with the latest
   input, rather than launching parallel calculations and discarding their results.
+  The Home sidebar badge reuses this projection instead of rebuilding every Work
+  during SwiftUI rendering.
 - Fresh Claude/Codex peer workers now prepare recognized startup gates and
   verify a stable empty input composer before dispatch. Narrow folder-trust
   dialogs are handled without a model turn; changed launch identities,

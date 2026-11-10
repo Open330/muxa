@@ -697,4 +697,9 @@ private struct MenuReplyError: LocalizedError {
     #expect(surface.isShown)
     controller.showOverview()
     #expect(!surface.isShown)
+    controller.showOverview()
+    let reopened = try #require(controller.presentedCard)
+    controller.selectInCard(snapshot.hostedAgents[0].id)
+    controller.showOverview()
+    #expect(!reopened.isShown, "Browsing an agent inside overview must not change its toggle destination")
 }

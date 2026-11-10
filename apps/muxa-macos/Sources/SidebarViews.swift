@@ -967,7 +967,7 @@ private struct SidebarActivityRail: View {
                 systemImage: "house",
                 title: String(localized: "Home"),
                 active: model.isSidebarListCollapsed,
-                badge: FleetBoard.works(groups: model.workGroups, agents: model.hostedAgents)
+                badge: model.homeWorks.lazy
                     .filter { $0.lane == .needsYou }.count,
                 select: { model.showHome() }
             )
