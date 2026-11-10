@@ -115,3 +115,15 @@ struct MuxaMenuBarFoldIntent {
         return true
     }
 }
+
+/// A transient card can close on mouse-down, before the status item's mouse-up.
+/// Suppress only that same destination; another chip must open immediately.
+enum MuxaMenuBarCardInteraction {
+    enum Action { case open, close, ignore }
+    static func action(requested: String?, current: String?, shown: Bool,
+                       closed: String?, closedAt: Date?, now: Date) -> Action {
+        if shown { return requested == current ? .close : .open }
+        if let closedAt, now.timeIntervalSince(closedAt) < 0.6, requested == closed { return .ignore }
+        return .open
+    }
+}

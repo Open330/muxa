@@ -733,7 +733,12 @@ Work commands use an ordered transport per host. Fleet snapshots and background
 state reads use separate transports, while terminal input, resize and attachment
 control retain their own ordered control path. A slow remote options request
 therefore does not hold up another host or terminal input. Workspace projection
-sorting/grouping runs off the main actor; only the latest result is published.
+sorting/grouping runs off the main actor. At most one projection builds at a
+time; notifications arriving during it replace a single pending input. Only the
+latest result is published. Menu-bar cards activate Muxa before taking keyboard
+focus, switch directly between destinations, and close on a repeated click on
+the same destination. A transient close on mouse-down suppresses only the same
+destination on mouse-up.
 
 Settings → Runtime shows the daemon version/generation and, when the installed
 bundle has `Contents/Resources/muxa-build.json`, its app build commit. A matching

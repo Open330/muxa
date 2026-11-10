@@ -647,3 +647,54 @@ private struct MenuReplyError: LocalizedError {
     #expect(model.homeWorks.first?.agents.first?.agent.agentSessionID == "second")
     #expect(model.homeWorks.first?.lane == .needsYou)
 }
+
+@Test func menuBarCardClicksToggleOnlyTheirOwnDestination() {
+    let now = Date()
+    #expect(MuxaMenuBarCardInteraction.action(requested: "b", current: "a", shown: true,
+        closed: nil, closedAt: nil, now: now) == .open)
+    #expect(MuxaMenuBarCardInteraction.action(requested: "a", current: "a", shown: true,
+        closed: nil, closedAt: nil, now: now) == .close)
+    for destination: String? in [nil, "a"] {
+        #expect(MuxaMenuBarCardInteraction.action(requested: destination, current: nil, shown: false,
+            closed: destination, closedAt: now.addingTimeInterval(-0.1), now: now) == .ignore)
+        #expect(MuxaMenuBarCardInteraction.action(requested: "b", current: nil, shown: false,
+            closed: destination, closedAt: now.addingTimeInterval(-0.1), now: now) == .open)
+        #expect(MuxaMenuBarCardInteraction.action(requested: destination, current: nil, shown: false,
+            closed: destination, closedAt: now.addingTimeInterval(-1), now: now) == .open)
+    }
+}
+
+@Test @MainActor func menuBarPopoverOpensSwitchesDestinationsAndAcceptsFocus() async throws {
+    let model = AppModel(client: MuxaIPCClient(socketPath: "/tmp/muxa-menubar-test-unused.sock"))
+    let snapshot = try menuBarSnapshot([("first", "waiting_input", "1"), ("second", "waiting_input", "1")])
+    model.ingestExecutionSnapshotForTesting(snapshot)
+    model.attention.ingest(snapshot)
+    let controller = MuxaMenuBarAgentController(model: model)
+    defer { controller.stop() }
+    // The menu-bar host registers a newly created status item asynchronously.
+    try await Task.sleep(for: .milliseconds(250))
+    controller.showOverview()
+    let surface = try #require(controller.presentedCard)
+    #expect(surface.isShown, Comment(rawValue: controller.presentationDiagnostics))
+    let window = try #require(surface.contentViewController?.view.window)
+    #expect(window.isKeyWindow)
+
+    let chips = snapshot.hostedAgents.map { MuxaMenuBarChip.agent(MuxaMenuBarAgent(hosted: $0, unread: true)) }
+    for chip in chips {
+        controller.showChip(chip)
+        #expect(controller.presentedCard === surface)
+        #expect(surface.isShown)
+        #expect(window.isKeyWindow)
+    }
+    let agents = snapshot.hostedAgents.map { MuxaMenuBarAgent(hosted: $0, unread: true) }
+    let group = try #require(MuxaMenuBarChip.activity(agents, grouping: .work).first)
+    controller.showChip(group)
+    #expect(controller.presentedCard === surface)
+    #expect(surface.isShown)
+    // Group and overview both have nil agent selection: destination still differs.
+    controller.showOverview()
+    #expect(controller.presentedCard === surface)
+    #expect(surface.isShown)
+    controller.showOverview()
+    #expect(!surface.isShown)
+}

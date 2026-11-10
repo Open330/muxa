@@ -236,7 +236,7 @@ final class AppModel: ObservableObject {
     private var askEventRefreshTask: Task<Void, Never>?
     private var pipelineEventRefreshTask: Task<Void, Never>?
     private var connectionGeneration: UInt64 = 0
-    private var projectionGeneration: UInt64 = 0
+    private let workspaceProjector = MuxaCoalescedProjection<MuxaWorkspaceProjection>()
     private var projectionBuiltAt = Date.distantPast
     private var coverageSubscription: AnyCancellable?
     private var refreshInFlight = false
@@ -776,30 +776,33 @@ final class AppModel: ObservableObject {
     }
 
     private func rebuildWorkspaceProjections() async {
-        projectionGeneration &+= 1
-        let token = projectionGeneration, connection = connectionGeneration
-        let snapshot = executionSnapshot, runs = pipelineRuns
-        let now = Date()
-        let result = await Task.detached(priority: .userInitiated) {
-            let agents = snapshot.hostedAgents
-                .filter { $0.agent.state != "stopped" }
-                .sorted { left, right in
-                    let leftPriority = left.agent.status.priority
-                    let rightPriority = right.agent.status.priority
-                    if leftPriority != rightPriority { return leftPriority < rightPriority }
-                    if left.host.local != right.host.local { return left.host.local }
-                    if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
-                    return left.agent.agentSessionID < right.agent.agentSessionID
-                }
-            let groups = snapshot.workGroups(pipelineRuns: runs)
-            return (agents, groups, FleetBoard.works(groups: groups, agents: agents, now: now))
-        }.value
-        // Another pipeline/Fleet event or reconnection may have overtaken us.
-        guard token == projectionGeneration, connection == connectionGeneration else { return }
-        hostedAgents = result.0
-        workGroups = result.1
-        homeWorks = result.2
-        projectionBuiltAt = now
+        await workspaceProjector.refresh(build: { [self] in
+            let connection = connectionGeneration
+            let snapshot = executionSnapshot, runs = pipelineRuns
+            let now = Date()
+            return await Task.detached(priority: .userInitiated) {
+                let agents = snapshot.hostedAgents
+                    .filter { $0.agent.state != "stopped" }
+                    .sorted { left, right in
+                        let leftPriority = left.agent.status.priority
+                        let rightPriority = right.agent.status.priority
+                        if leftPriority != rightPriority { return leftPriority < rightPriority }
+                        if left.host.local != right.host.local { return left.host.local }
+                        if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
+                        return left.agent.agentSessionID < right.agent.agentSessionID
+                    }
+                let groups = snapshot.workGroups(pipelineRuns: runs)
+                return MuxaWorkspaceProjection(agents: agents, groups: groups,
+                    works: FleetBoard.works(groups: groups, agents: agents, now: now),
+                    builtAt: now, connection: connection)
+            }.value
+        }, publish: { [weak self] result in
+            guard let self, result.connection == connectionGeneration else { return }
+            hostedAgents = result.agents
+            workGroups = result.groups
+            homeWorks = result.works
+            projectionBuiltAt = result.builtAt
+        })
     }
 
     func createShell() {
