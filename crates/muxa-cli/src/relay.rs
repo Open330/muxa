@@ -410,6 +410,37 @@ async fn handle_request(
                 result: FleetCommandResult::sent(outcome),
             })
         }
+        RelayRequest::SendKeys {
+            request_id,
+            pane,
+            keys,
+        } => {
+            if keys.is_empty() || keys.len() > muxa::fleet::FLEET_MAX_KEYS {
+                bail!("send_keys takes 1 to {} keys", muxa::fleet::FLEET_MAX_KEYS);
+            }
+            let backend = exact_backend(&backends, &pane).await?;
+            if !backend.caps().send_text {
+                bail!("{} backend does not support key input", backend.kind());
+            }
+            let socket = pane.window.session.endpoint.socket.clone();
+            let pane_id = pane.pane_id.clone();
+            let pressed = tokio::task::spawn_blocking(move || {
+                muxa::fleet::press_keys(backend.as_ref(), Some(&socket), &pane_id, &keys)
+            })
+            .await
+            .context("key task panicked")?;
+            if !pressed {
+                bail!("backend refused key input");
+            }
+            Ok(RelayFrame::Result {
+                request_id,
+                result: FleetCommandResult::sent(muxa::ipc::SendPromptOutcome {
+                    sent: true,
+                    submitted: false,
+                    submission_confirmed: None,
+                }),
+            })
+        }
         RelayRequest::WorkCommand {
             request_id,
             args,

@@ -290,7 +290,12 @@ private func menuBarSnapshot(_ agents: [(String, String, String)], host: String 
     let programs = ["codex", "claude_code", "gemini_cli", "antigravity", "opencode", "unknown"]
     let styles = programs.map { MuxaMenuBarAgentAppearance(identity: "host:session-1", kind: $0) }
     #expect(Set(styles.map(\.symbol)).count >= 5)
-    for style in styles { #expect(NSImage(systemSymbolName: style.symbol, accessibilityDescription: nil) != nil) }
+    for style in styles {
+        // Claude and Codex draw muxa's own marks; every other face is an SF Symbol.
+        if case .symbol(let name) = MuxaGlyph.kind(style.symbol) {
+            #expect(NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil)
+        }
+    }
     let palette = (0..<32).map { MuxaMenuBarAgentAppearance(identity: "agent-\($0)", kind: "codex") }
     #expect(Set(palette.map(\.paletteIndex)).count == 8)
 }

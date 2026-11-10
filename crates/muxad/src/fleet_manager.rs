@@ -17,7 +17,8 @@ use muxa::fleet::{
     FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
     FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
     RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
-    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
+    FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
 };
 use muxa::tmux::SessionInfo;
 use muxa::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
@@ -437,6 +438,16 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "send_prompt", text.len());
                 local_send_prompt(&self.backends, pane, text, submit).await
             }
+            FleetOperation::SendKeys { pane, keys } => {
+                if keys.is_empty() || keys.len() > muxa::fleet::FLEET_MAX_KEYS {
+                    return Err(format!(
+                        "send_keys takes 1 to {} keys",
+                        muxa::fleet::FLEET_MAX_KEYS
+                    ));
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "send_keys", keys.len());
+                local_send_keys(&self.backends, pane, keys).await
+            }
             FleetOperation::CollaborationSend { pane, request } => {
                 exact_local_backend(&self.backends, &pane).await?;
                 audit_operation(LOCAL_HOST_ALIAS, "collaboration_send", request.body.len());
@@ -563,6 +574,28 @@ async fn run_local_work_command(
     .await
     .map(FleetCommandResult::command)
     .map_err(|error| error.to_string())
+}
+
+/// Navigation keys reach only a relay that says it takes them; an older one
+/// would drop the request and leave the caller waiting.
+fn send_keys_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::SendKeys { .. }) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_SEND_KEYS_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot take navigation keys; upgrade muxa on that host"
+    ))
 }
 
 fn relay_supports_work_command(capabilities: &[String]) -> bool {
@@ -829,6 +862,35 @@ async fn local_send_prompt(
     .map_err(|error| format!("local send task panicked: {error}"))?
     .ok_or_else(|| "backend refused text injection".to_string())?;
     Ok(FleetCommandResult::sent(outcome))
+}
+
+async fn local_send_keys(
+    backends: &[SharedBackend],
+    pane: PaneKey,
+    keys: Vec<muxa::fleet::FleetKey>,
+) -> Result<FleetCommandResult, String> {
+    let backend = exact_local_backend(backends, &pane).await?;
+    if !backend.caps().send_text {
+        return Err(format!(
+            "{} backend does not support key input",
+            backend.kind()
+        ));
+    }
+    let socket = pane.window.session.endpoint.socket;
+    let pane_id = pane.pane_id;
+    let pressed = tokio::task::spawn_blocking(move || {
+        muxa::fleet::press_keys(backend.as_ref(), Some(&socket), &pane_id, &keys)
+    })
+    .await
+    .map_err(|error| format!("local key task panicked: {error}"))?;
+    if !pressed {
+        return Err("backend refused key input".to_string());
+    }
+    Ok(FleetCommandResult::sent(muxa::ipc::SendPromptOutcome {
+        sent: true,
+        submitted: false,
+        submission_confirmed: None,
+    }))
 }
 
 fn local_hostname() -> String {
@@ -1235,6 +1297,7 @@ impl HostTask {
                     if matches!(
                         command.operation,
                         FleetOperation::SendPrompt { .. }
+                            | FleetOperation::SendKeys { .. }
                             | FleetOperation::CollaborationSend { .. }
                             | FleetOperation::CollaborationGet { .. }
                             | FleetOperation::CollaborationClaim { .. }
@@ -1263,6 +1326,12 @@ impl HostTask {
                             "host '{}' does not support Fleet collaboration; upgrade muxa on that host",
                             self.alias
                         )));
+                        continue;
+                    }
+                    if let Some(refusal) =
+                        send_keys_refusal(&self.alias, &connected.hello, &command.operation)
+                    {
+                        let _ = command.reply.send(Err(refusal));
                         continue;
                     }
                     if let Some(refusal) =
@@ -1342,6 +1411,14 @@ impl HostTask {
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
                             RelayRequest::SendPrompt { request_id: id, pane, text, submit }
+                        }
+                        FleetOperation::SendKeys { pane, keys } => {
+                            audit_operation(&self.alias, "send_keys", keys.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::SendKeys { request_id: id, pane, keys }
                         }
                         FleetOperation::CollaborationSend { pane, request } => {
                             audit_operation(&self.alias, "collaboration_send", request.body.len());
@@ -1867,6 +1944,50 @@ mod tests {
         assert!(FLEET_CAPABILITIES.contains(&FLEET_BOUNDED_CLAIM_CAPABILITY));
         assert!(unbounded_claim_refusal("remote", &current, &claim).is_none());
         assert!(unbounded_claim_refusal("remote", &current, &list).is_none());
+    }
+
+    #[test]
+    fn navigation_keys_reach_only_relays_that_take_them() {
+        let pane = PaneKey {
+            window: WindowKey {
+                session: muxa::SessionKey {
+                    endpoint: muxa::BackendEndpoint {
+                        host: HostKind::Tmux,
+                        socket: "default".into(),
+                    },
+                    session_id: "$1".into(),
+                },
+                window_id: "@1".into(),
+            },
+            pane_id: "%1".into(),
+        };
+        let hello = |capabilities: &[&str]| RelayHello {
+            fleet_protocol: FLEET_PROTOCOL_VERSION,
+            min_fleet_protocol: FLEET_PROTOCOL_VERSION,
+            node_id: NodeId::generate(),
+            hostname: "remote".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            muxa_version: "0.0.0".into(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            daemon_generation: None,
+            boot_id: "boot".into(),
+            backends: Vec::new(),
+            server_time: OffsetDateTime::now_utc(),
+        };
+        let keys = FleetOperation::SendKeys {
+            pane: pane.clone(),
+            keys: vec![muxa::fleet::FleetKey::Down, muxa::fleet::FleetKey::Enter],
+        };
+        let capture = FleetOperation::Capture { pane };
+        // A relay from before navigation keys advertised send_prompt only.
+        let legacy = hello(&["capture", "send_prompt"]);
+        let refusal = send_keys_refusal("remote", &legacy, &keys).unwrap();
+        assert!(refusal.contains("host 'remote'"), "{refusal}");
+        assert!(refusal.contains("upgrade muxa"), "{refusal}");
+        assert!(send_keys_refusal("remote", &legacy, &capture).is_none());
+        let current = hello(FLEET_CAPABILITIES);
+        assert!(send_keys_refusal("remote", &current, &keys).is_none());
     }
 
     #[test]

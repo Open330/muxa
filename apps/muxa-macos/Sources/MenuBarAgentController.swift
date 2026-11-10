@@ -19,6 +19,7 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
     private var overflow = 0
     private var configuredAgentLimit = MuxaPreferences.menuBarAgentLimit()
     private var grouping = MuxaMenuBarGrouping(rawValue: UserDefaults.standard.string(forKey: MuxaPreferences.menuBarGroupingKey) ?? "") ?? .agent
+    private var hostIcons = MuxaHostIcons.all()
     private let registry = MuxaModuleRegistry.shared
     private var selectedChipID: String?
     private var showAasChip = UserDefaults.standard.object(forKey: MuxaPreferences.menuBarAasChipKey) as? Bool ?? true
@@ -90,7 +91,10 @@ final class MuxaMenuBarAgentController: NSObject, NSPopoverDelegate {
                 let limit = MuxaPreferences.menuBarAgentLimit()
                 let grouping = MuxaMenuBarGrouping(rawValue: UserDefaults.standard.string(forKey: MuxaPreferences.menuBarGroupingKey) ?? "") ?? .agent
                 let aas = UserDefaults.standard.object(forKey: MuxaPreferences.menuBarAasChipKey) as? Bool ?? true
-                guard limit != self.configuredAgentLimit || grouping != self.grouping || aas != self.showAasChip else { return }
+                let hostIcons = MuxaHostIcons.all()
+                guard limit != self.configuredAgentLimit || grouping != self.grouping || aas != self.showAasChip
+                        || hostIcons != self.hostIcons else { return }
+                self.hostIcons = hostIcons
                 self.configuredAgentLimit = limit
                 self.grouping = grouping
                 self.showAasChip = aas

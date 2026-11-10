@@ -43,6 +43,7 @@ enum MuxaSettingsTab: String, CaseIterable, Identifiable {
 enum MuxaPreferences {
     static let appearanceKey = "muxa.appearance"
     static let showWorkbenchOnLaunchKey = "muxa.showWorkbenchOnLaunch"
+    static let homeAnimatesMovesKey = "muxa.home.animatesMoves"
     static let settingsTabKey = "muxa.settings.selectedTab"
     static let workDirectoryKey = "nativeWorkDirectory"
     static let menuBarAgentLimitKey = "muxa.menuBar.maximumAgentIcons"
@@ -77,7 +78,7 @@ struct MuxaSettingsView: View {
                 .tabItem { Label("General", systemImage: "gearshape") }
                 .tag(MuxaSettingsTab.general.rawValue)
 
-            MuxaMenuBarSettingsView()
+            MuxaMenuBarSettingsView(model: model)
                 .tabItem { Label("Menu Bar", systemImage: "menubar.rectangle") }
                 .tag(MuxaSettingsTab.menuBar.rawValue)
 
@@ -136,6 +137,9 @@ struct MuxaSettingsShortcut: View {
 }
 
 private struct MuxaMenuBarSettingsView: View {
+    @ObservedObject var model: AppModel
+    @State private var hostIcons = MuxaHostIcons.all()
+    @State private var customText: [String: String] = [:]
     @AppStorage(MuxaPreferences.menuBarAgentLimitKey) private var menuBarAgentLimit = MuxaPreferences.defaultMenuBarAgentLimit
     @AppStorage(MuxaPreferences.menuBarGroupingKey) private var menuBarGrouping = MuxaMenuBarGrouping.agent.rawValue
     @AppStorage(MuxaPreferences.menuBarAasChipKey) private var showAasChip = true
@@ -159,6 +163,17 @@ private struct MuxaMenuBarSettingsView: View {
                     .font(MuxaType.detail).foregroundStyle(.secondary)
             }
 
+            Section("Fleet host icons") {
+                Text("Shown when activity is grouped by host. Agents show their provider: a spark for Claude, >_ for Codex.")
+                    .font(MuxaType.detail).foregroundStyle(.secondary)
+                if model.fleetHosts.isEmpty {
+                    Text("No fleet hosts yet.").font(MuxaType.detail).foregroundStyle(.secondary)
+                }
+                ForEach(model.fleetHosts) { host in
+                    hostIconRow(host)
+                }
+            }
+
             Section("Accounts and usage") {
                 Toggle("Show AAS usage chip", isOn: $showAasChip)
                 Text("Hover to see active account usage. Click to compare all accounts.")
@@ -174,11 +189,61 @@ private struct MuxaMenuBarSettingsView: View {
         .formStyle(.grouped)
         .padding(.top, 8)
     }
+
+    private func hostIconRow(_ host: MuxaFleetHost) -> some View {
+        let icon = MuxaHostIcons.icon(for: host.alias, local: host.local)
+        let isCustomText = MuxaGlyph.kind(icon) != .symbol(icon)
+        return HStack(spacing: 10) {
+            MuxaGlyphView(value: icon, size: 12)
+                .frame(width: 26, height: 26)
+                .background(MuxaMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+            Text(verbatim: host.alias)
+            Spacer()
+            Menu {
+                ForEach(MuxaHostIcons.choices, id: \.self) { symbol in
+                    Button {
+                        setIcon(symbol, for: host.alias)
+                    } label: {
+                        Label(symbol, systemImage: symbol)
+                    }
+                }
+            } label: {
+                Image(systemName: isCustomText ? "character.cursor.ibeam" : icon)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .help("Choose a symbol")
+            TextField("Text", text: Binding(
+                get: { customText[host.alias] ?? (isCustomText ? String(icon.dropFirst(MuxaGlyph.textPrefix.count)) : "") },
+                set: { value in
+                    let cleaned = MuxaGlyph.cleanedText(value)
+                    customText[host.alias] = cleaned
+                    setIcon(cleaned.isEmpty ? nil : MuxaGlyph.text(cleaned), for: host.alias)
+                }
+            ))
+            .frame(width: 54)
+            .help("Up to two characters or an emoji instead of a symbol")
+            if hostIcons[host.alias] != nil {
+                Button("Reset") {
+                    customText[host.alias] = ""
+                    setIcon(nil, for: host.alias)
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+
+    private func setIcon(_ icon: String?, for alias: String) {
+        if let icon, MuxaGlyph.kind(icon) == .symbol(icon) { customText[alias] = "" }
+        MuxaHostIcons.set(icon, for: alias)
+        hostIcons = MuxaHostIcons.all()
+    }
 }
 
 private struct MuxaGeneralSettingsView: View {
     @AppStorage(MuxaPreferences.appearanceKey) private var appearance = MuxaAppearance.system.rawValue
     @AppStorage(MuxaPreferences.showWorkbenchOnLaunchKey) private var showWorkbenchOnLaunch = true
+    @AppStorage(MuxaPreferences.homeAnimatesMovesKey) private var homeAnimatesMoves = true
     @AppStorage(MuxaPreferences.workDirectoryKey) private var workDirectory = ""
     @Environment(\.openWindow) private var openWindow
 
@@ -201,6 +266,13 @@ private struct MuxaGeneralSettingsView: View {
             }
 
             MuxaLanguageSettingsSection()
+
+            Section("Home") {
+                Toggle("Animate cards moving between lanes", isOn: $homeAnimatesMoves)
+                Text("A card glides to its new lane and shows where it came from for a few seconds.")
+                    .font(MuxaType.detail)
+                    .foregroundStyle(.secondary)
+            }
 
             Section("Startup") {
                 Toggle("Show the Workbench when Muxa launches", isOn: $showWorkbenchOnLaunch)

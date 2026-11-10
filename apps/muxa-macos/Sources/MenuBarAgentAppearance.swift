@@ -14,8 +14,8 @@ struct MuxaMenuBarAgentAppearance: Equatable {
         paletteIndex = Int(hash % UInt64(Self.palette.count))
         let program = MuxaAgentProgram(configValue: kind)
         switch program {
-        case .claude: symbol = "brain.head.profile"; provider = "Claude"
-        case .codex: symbol = "chevron.left.forwardslash.chevron.right"; provider = "Codex"
+        case .claude: symbol = MuxaGlyph.claude; provider = "Claude"
+        case .codex: symbol = MuxaGlyph.codex; provider = "Codex"
         case .gemini: symbol = "sparkles"; provider = "Gemini"
         case .agy: symbol = "arrow.up"; provider = "Antigravity"
         case .opencode: symbol = "terminal"; provider = "OpenCode"
@@ -72,9 +72,7 @@ struct MuxaMenuBarAvatar: View {
     var showsStatus = true
 
     var body: some View {
-        Image(systemName: item.appearance.symbol)
-            .font(.system(size: size * 0.45, weight: .semibold))
-            .foregroundStyle(.white)
+        MuxaGlyphView(value: item.appearance.symbol, size: size * 0.45)
             .frame(width: size, height: size)
             .background(item.appearance.gradient, in: Circle())
             .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5))
