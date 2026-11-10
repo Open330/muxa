@@ -1,0 +1,25 @@
+[Unit]
+Description=tend agent observability daemon
+Documentation=https://github.com/Open330/tend
+After=default.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/tendd
+Restart=on-failure
+RestartSec=2
+
+# Headroom above the default fd limit. The daemon caps concurrent IPC
+# handlers below this, so it's a safety margin rather than a hard reliance —
+# but a low ceiling is what let a burst of hung hook connections wedge accept().
+LimitNOFILE=4096
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+
+[Install]
+WantedBy=default.target

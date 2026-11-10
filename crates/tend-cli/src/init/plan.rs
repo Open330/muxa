@@ -1,0 +1,991 @@
+//! Build an `Plan` (`Vec<Action>`) from a set of components.
+//!
+//! The plan is computed eagerly: each `Action::EditFile` already
+//! carries the new file content. This means dry-run rendering and
+//! the apply step share exactly the same bytes, and the network of
+//! per-file editors is decoupled from the I/O layer.
+
+use crate::init::components::Component;
+use crate::init::detect::Detection;
+use crate::init::files;
+use crate::init::marker::Outcome;
+use anyhow::{Context, Result};
+use std::path::{Path, PathBuf};
+
+/// Direction of a plan: install (upsert) or uninstall (remove).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Install,
+    Uninstall,
+}
+
+#[derive(Debug)]
+pub enum Action {
+    /// Write `new_content` to `path`, backing up any existing file.
+    /// `outcome` is precomputed so apply.rs can short-circuit
+    /// `Outcome::Unchanged` without touching the disk.
+    EditFile {
+        component: Component,
+        path: PathBuf,
+        before: Option<String>,
+        after: String,
+        outcome: Outcome,
+    },
+    /// Delete a file (currently only the systemd unit on uninstall).
+    DeleteFile { component: Component, path: PathBuf },
+    /// Only change an absent link or remove the exact recorded link.
+    ManageSymlink {
+        path: PathBuf,
+        target: PathBuf,
+        remove: bool,
+    },
+    /// Remove a bundle asset only if it still contains the installed bytes.
+    RemoveOwnedFile { path: PathBuf, expected: String },
+    /// Run `systemctl --user enable --now tendd.service`.
+    EnableSystemdUnit,
+    /// Run `systemctl --user disable --now tendd.service`.
+    DisableSystemdUnit,
+    /// `launchctl bootstrap gui/<uid> <plist>` and kickstart.
+    EnableLaunchdUnit { plist_path: PathBuf },
+    /// `launchctl bootout gui/<uid>/<label>`.
+    DisableLaunchdUnit,
+    /// Register (`enable`) or unregister the login hook that runs
+    /// `tend restore --boot` with this host's scheduler.
+    ManageLoginRestore { enable: bool },
+    /// Start `tendd` in the background if it isn't already responding
+    /// on the IPC socket. Cross-platform — works regardless of which
+    /// (or no) daemon-manager component was selected. Honours
+    /// `--start-daemon=false`.
+    StartDaemonIfNeeded {
+        socket: PathBuf,
+        config_path: Option<PathBuf>,
+    },
+    /// Reload the user's tmux config in place if a tmux server is up.
+    /// No-op when not inside tmux + no live server.
+    SourceTmuxConf { path: PathBuf },
+    /// Print the dashboard URL + token at the end. Captured here so
+    /// apply.rs can render it as a final "info" line.
+    PrintDashboard { token: String, bind: String },
+}
+
+#[derive(Debug)]
+pub struct Plan {
+    pub direction: Direction,
+    pub components: Vec<Component>,
+    pub actions: Vec<Action>,
+    /// Plan-time warnings — surfaced to the user before they confirm
+    /// (e.g. "you have a custom Claude statusLine, leaving it alone").
+    pub warnings: Vec<String>,
+}
+
+impl Plan {
+    /// True if any action would actually mutate the disk.
+    pub fn has_changes(&self) -> bool {
+        self.actions.iter().any(|a| match a {
+            Action::EditFile { outcome, .. } => outcome.changed(),
+            Action::DeleteFile { .. }
+            | Action::ManageSymlink { .. }
+            | Action::RemoveOwnedFile { .. }
+            | Action::EnableSystemdUnit
+            | Action::DisableSystemdUnit
+            | Action::EnableLaunchdUnit { .. }
+            | Action::DisableLaunchdUnit
+            | Action::ManageLoginRestore { .. }
+            | Action::StartDaemonIfNeeded { .. } => true,
+            Action::SourceTmuxConf { .. } | Action::PrintDashboard { .. } => false,
+        })
+    }
+}
+
+pub fn build(
+    direction: Direction,
+    components: &[Component],
+    detect: &Detection,
+    socket: &Path,
+) -> Result<Plan> {
+    let mut actions = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    let comps = components.to_vec();
+
+    let tmux_path = files::tmux::default_path();
+    let mut tmux_selected = false;
+
+    for c in &comps {
+        match c {
+            // These share a manifest and are planned together after ordinary edits.
+            Component::AgentInstructions
+            | Component::AgentSkills
+            | Component::AgentMcp
+            | Component::Automation => {}
+            Component::TmuxPopup
+            | Component::TmuxStatusLine
+            | Component::TmuxPeek
+            | Component::TmuxWindowNames
+            | Component::TmuxAutoView => {
+                tmux_selected = true;
+                plan_tmux(direction, *c, tmux_path.as_ref(), &mut actions)?;
+            }
+            Component::ClaudeHooks => plan_claude(direction, *c, &mut actions, &mut warnings)?,
+            Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
+            Component::GeminiHooks => plan_gemini(direction, *c, &mut actions)?,
+            Component::AntigravityHooks => plan_antigravity(direction, *c, &mut actions)?,
+            Component::OpencodeHooks => plan_opencode(direction, *c, &mut actions)?,
+            Component::TenddSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
+            Component::TenddLaunchd => plan_launchd(direction, *c, detect, &mut actions)?,
+            Component::TenddShellrc => plan_shellrc(direction, *c, &mut actions)?,
+            Component::RestoreAtLogin => plan_login_restore(direction, *c, detect, &mut actions)?,
+            Component::Dashboard => {
+                let Some(path) = files::dashboard::default_path() else {
+                    continue;
+                };
+                let (before, original) = file_base(&actions, &path)?;
+                match direction {
+                    Direction::Install => {
+                        let (after, outcome, token) = files::dashboard::upsert(&original)
+                            .context("writing dashboard token to config.toml")?;
+                        actions.push(Action::EditFile {
+                            component: *c,
+                            path,
+                            before,
+                            after,
+                            outcome,
+                        });
+                        actions.push(Action::PrintDashboard {
+                            token,
+                            bind: "127.0.0.1:7878".into(),
+                        });
+                    }
+                    Direction::Uninstall => {
+                        let (after, outcome) = files::dashboard::remove(&original)
+                            .context("scrubbing dashboard config")?;
+                        actions.push(Action::EditFile {
+                            component: *c,
+                            path,
+                            before,
+                            after,
+                            outcome,
+                        });
+                    }
+                }
+            }
+            Component::Ask => plan_ask(direction, *c, &mut actions)?,
+            Component::Collaboration => {
+                let Some(path) = files::collaboration::default_path() else {
+                    continue;
+                };
+                let (before, original) = file_base(&actions, &path)?;
+                let (after, outcome) = match direction {
+                    Direction::Install => files::collaboration::upsert(&original)
+                        .context("enabling collaboration in config.toml")?,
+                    Direction::Uninstall => files::collaboration::remove(&original)
+                        .context("disabling collaboration in config.toml")?,
+                };
+                actions.push(Action::EditFile {
+                    component: *c,
+                    path,
+                    before,
+                    after,
+                    outcome,
+                });
+            }
+        }
+    }
+
+    // Whenever any tmux component is selected, reconcile the auto-managed
+    // `tmux-env` block that pins TEND_SOCKET. A *custom* socket needs the
+    // pin: it's the only path that survives `tmux kill-server`, and
+    // without it the runtime `set-environment` issued at init time is
+    // lost the next time the tmux server restarts. The default socket
+    // needs no pin at all — see `needs_socket_pin` — so this reconciles
+    // in both directions and will scrub a stale pin left by an earlier
+    // tend. We always include SourceTmuxConf here because the env block
+    // may be brand-new (or newly removed) even when popup/statusline are
+    // unchanged.
+    if tmux_selected {
+        if let Some(path) = tmux_path {
+            plan_tmux_env(direction, &path, socket, &mut actions)?;
+            actions.push(Action::SourceTmuxConf { path });
+        }
+    }
+
+    Ok(Plan {
+        direction,
+        components: comps,
+        actions,
+        warnings,
+    })
+}
+
+/// Install defaults into the selected config, folding onto other planned edits.
+/// Rules become operator configuration, so uninstall retains them.
+pub fn extend_automation(plan: &mut Plan, config_path: Option<&Path>) -> Result<()> {
+    if plan.direction != Direction::Install || !plan.components.contains(&Component::Automation) {
+        return Ok(());
+    }
+    let Some(path) = config_path
+        .map(Path::to_path_buf)
+        .or_else(tend::paths::default_config_file)
+    else {
+        return Ok(());
+    };
+    let (before, original) = file_base(&plan.actions, &path)?;
+    if let Some(after) = tend::automation_defaults::merge(&original).map_err(anyhow::Error::msg)? {
+        plan.actions.push(Action::EditFile {
+            component: Component::Automation,
+            path,
+            before,
+            after,
+            outcome: Outcome::Inserted,
+        });
+    }
+    Ok(())
+}
+
+fn plan_opencode(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::opencode::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => files::opencode::upsert(&original),
+        Direction::Uninstall => files::opencode::remove(&original),
+    };
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    Ok(())
+}
+
+/// Push an `EditFile`, but on **uninstall** demote it to a `DeleteFile`
+/// when stripping our block leaves the file empty. This keeps us from
+/// leaving a zero-byte orphan behind for files tend created from scratch
+/// (the opencode `tend.ts`, or a codex/gemini config that held nothing
+/// but our hooks). An empty remainder is itself proof there was no
+/// pre-existing user content to preserve, so this never deletes a file
+/// the user had populated by hand.
+fn push_edit_or_delete(
+    direction: Direction,
+    component: Component,
+    path: PathBuf,
+    before: Option<String>,
+    after: String,
+    outcome: Outcome,
+    actions: &mut Vec<Action>,
+) {
+    if direction == Direction::Uninstall
+        && before.is_some()
+        && outcome.changed()
+        && after.trim().is_empty()
+    {
+        actions.push(Action::DeleteFile { component, path });
+        return;
+    }
+    actions.push(Action::EditFile {
+        component,
+        path,
+        before,
+        after,
+        outcome,
+    });
+}
+
+/// Append an `EditFile` for the auto-managed `tmux-env` block. Uses the
+/// `TmuxStatusLine` component slot only as a label/grouping hint — it
+/// isn't user-selectable and doesn't appear in the components catalog.
+fn plan_tmux_env(
+    direction: Direction,
+    tmux_conf: &Path,
+    socket: &Path,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let path = tmux_conf.to_path_buf();
+    // Folds onto whatever popup/statusline planned for this file, rather than
+    // onto disk — see `file_base`.
+    let (_, latest) = file_base(actions, &path)?;
+    let (after, outcome) = match direction {
+        Direction::Install if !needs_socket_pin(socket, &tend::paths::default_socket()) => {
+            files::tmux::remove_env(&latest)
+        }
+        Direction::Install => files::tmux::upsert_env(&latest, socket),
+        Direction::Uninstall => files::tmux::remove_env(&latest),
+    };
+    actions.push(Action::EditFile {
+        // Group under TmuxStatusLine for the dry-run label — the env
+        // pin is conceptually a sibling of the status-right glyph.
+        component: Component::TmuxStatusLine,
+        path,
+        before: Some(latest),
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+/// Whether the resolved socket is worth writing into `~/.tmux.conf`.
+///
+/// Only a socket that differs from [`tend::paths::default_socket`] is.
+/// Every tend binary a pane runs calls that same function when
+/// `TEND_SOCKET` is unset, so pinning the default tells a pane something
+/// it was going to compute anyway — while baking this host's uid
+/// (`/tmp/tend-<uid>.sock`, `/run/user/<uid>/tend.sock`) into a file
+/// people commonly symlink out of a dotfiles repo and share across
+/// machines. On the next machine the pin is simply wrong, and it wins
+/// over the correct value the binary would have derived.
+///
+/// A custom socket — `tendd`'s `config.toml` pointing somewhere else —
+/// is unguessable, so it still gets pinned. That is the case the block
+/// was added for.
+///
+/// This does not regress the cold-start story the pin was meant to cover.
+/// `tendd` injects its own socket into a running tmux server's global
+/// environment at startup (`should_heal_tmux_socket_env` in tendd), which
+/// handles a tmux server whose environment diverges from the one `tend
+/// init` ran in. Between that heal and the pane's own `default_socket()`,
+/// a default-socket pin has no remaining job.
+fn needs_socket_pin(socket: &Path, default_socket: &Path) -> bool {
+    socket != default_socket
+}
+
+/// The content a file will hold once every edit planned before this point
+/// has been applied, and the `before` to record against the next one.
+///
+/// Planning a component reads its file from disk. That is right for the first
+/// component to touch a path and wrong for every one after it: `apply` writes
+/// each `after` in turn, so a second edit computed from the *original* text
+/// silently overwrites the first one's block. Several components share a file
+/// — `tmux-popup` and `tmux-statusline` both own part of `~/.tmux.conf`, and
+/// `ask`, `collaboration` and `dashboard` each own a table in the same
+/// `config.toml` — so this is the ordinary case, not a corner.
+///
+/// Returning the pending text as `before` also keeps the chain honest: the
+/// backup `apply` takes is the file as it stood a moment earlier, and the
+/// dry-run diff for each component shows only that component's change.
+pub(super) fn file_base(actions: &[Action], path: &Path) -> Result<(Option<String>, String)> {
+    let resolved = tend::paths::canonicalize(path).ok();
+    let pending = actions.iter().rev().find_map(|action| match action {
+        Action::EditFile {
+            path: planned,
+            after,
+            ..
+        } if planned == path
+            || resolved.as_ref().is_some_and(|target| {
+                tend::paths::canonicalize(planned).ok().as_ref() == Some(target)
+            }) =>
+        {
+            Some(after.clone())
+        }
+        _ => None,
+    });
+    if let Some(pending) = pending {
+        return Ok((Some(pending.clone()), pending));
+    }
+    let before = read_to_string_opt(&path.to_path_buf())?;
+    let original = before.clone().unwrap_or_default();
+    Ok((before, original))
+}
+
+fn plan_tmux(
+    direction: Direction,
+    c: Component,
+    tmux_path: Option<&PathBuf>,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let Some(path) = tmux_path.cloned() else {
+        return Ok(());
+    };
+    let (before, original) = file_base(actions, &path)?;
+    let (after, outcome) = match direction {
+        Direction::Install => files::tmux::upsert(&original, c),
+        Direction::Uninstall => files::tmux::remove(&original, c),
+    };
+    actions.push(Action::EditFile {
+        component: c,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+/// `[ask]` in config.toml. Same shape as the collaboration planner —
+/// both are a single grant toggled in one table.
+fn plan_ask(direction: Direction, component: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::ask::default_path() else {
+        return Ok(());
+    };
+    let (before, original) = file_base(actions, &path)?;
+    let (after, outcome) = match direction {
+        Direction::Install => {
+            files::ask::upsert(&original).context("enabling ask in config.toml")?
+        }
+        Direction::Uninstall => {
+            files::ask::remove(&original).context("disabling ask in config.toml")?
+        }
+    };
+    actions.push(Action::EditFile {
+        component,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+fn plan_claude(
+    direction: Direction,
+    c: Component,
+    actions: &mut Vec<Action>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let Some(path) = files::claude::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => {
+            let (text, report) =
+                files::claude::upsert(&original).context("merging claude settings.json")?;
+            if matches!(
+                report.statusline,
+                files::claude::StatusLineDecision::SkippedUserOwned
+            ) {
+                warnings.push(
+                    "Claude Code already has a custom statusLine — leaving it alone. \
+                     To layer tend over it, see `tend hook claude-statusline --forward`."
+                        .into(),
+                );
+            }
+            (text, report.outcome)
+        }
+        Direction::Uninstall => {
+            files::claude::remove(&original).context("scrubbing claude settings.json")?
+        }
+    };
+    actions.push(Action::EditFile {
+        component: c,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+fn plan_codex(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::codex::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => {
+            files::codex::upsert(&original).context("merging codex config.toml")?
+        }
+        Direction::Uninstall => {
+            files::codex::remove(&original).context("scrubbing codex config.toml")?
+        }
+    };
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    Ok(())
+}
+
+fn plan_gemini(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::gemini::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => {
+            files::gemini::upsert(&original).context("merging gemini settings.json")?
+        }
+        Direction::Uninstall => {
+            files::gemini::remove(&original).context("scrubbing gemini settings.json")?
+        }
+    };
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    Ok(())
+}
+
+/// agy's hooks live in their own file, so unlike `plan_gemini` this creates
+/// `~/.gemini/config/hooks.json` when absent — that is the normal case, since
+/// agy only writes it once its own `/hooks` command is used.
+fn plan_antigravity(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::antigravity::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => {
+            files::antigravity::upsert(&original).context("merging agy hooks.json")?
+        }
+        Direction::Uninstall => {
+            files::antigravity::remove(&original).context("scrubbing agy hooks.json")?
+        }
+    };
+    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    Ok(())
+}
+
+fn plan_systemd(
+    direction: Direction,
+    c: Component,
+    detect: &Detection,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let Some(path) = files::systemd::default_unit_path() else {
+        return Ok(());
+    };
+    match direction {
+        Direction::Install => {
+            if !detect.systemd_user_available {
+                return Ok(());
+            }
+            let before = read_to_string_opt(&path)?;
+            let (after, outcome) = files::systemd::upsert(before.as_deref());
+            actions.push(Action::EditFile {
+                component: c,
+                path,
+                before,
+                after,
+                outcome,
+            });
+            actions.push(Action::EnableSystemdUnit);
+        }
+        Direction::Uninstall => {
+            actions.push(Action::DisableSystemdUnit);
+            if path.is_file() {
+                actions.push(Action::DeleteFile { component: c, path });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The login hook is a unit file plus a registration on Linux and macOS,
+/// and a Task Scheduler task alone on Windows. Linux without a reachable
+/// user manager has nowhere to put it.
+fn plan_login_restore(
+    direction: Direction,
+    c: Component,
+    detect: &Detection,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let path = files::login_restore::unit_path();
+    match direction {
+        Direction::Install => {
+            if std::env::consts::OS == "linux" && !detect.systemd_user_available {
+                return Ok(());
+            }
+            if let (Some(path), Some(want)) = (path, files::login_restore::render()) {
+                let before = read_to_string_opt(&path)?;
+                let (after, outcome) = files::login_restore::upsert(before.as_deref(), &want);
+                actions.push(Action::EditFile {
+                    component: c,
+                    path,
+                    before,
+                    after,
+                    outcome,
+                });
+            }
+            actions.push(Action::ManageLoginRestore { enable: true });
+        }
+        Direction::Uninstall => {
+            actions.push(Action::ManageLoginRestore { enable: false });
+            if let Some(path) = path.filter(|path| path.is_file()) {
+                actions.push(Action::DeleteFile { component: c, path });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_launchd(
+    direction: Direction,
+    c: Component,
+    detect: &Detection,
+    actions: &mut Vec<Action>,
+) -> Result<()> {
+    let Some(path) = files::launchd::default_unit_path() else {
+        return Ok(());
+    };
+    match direction {
+        Direction::Install => {
+            if !detect.launchctl_available {
+                return Ok(());
+            }
+            let before = read_to_string_opt(&path)?;
+            let want = files::launchd::render_plist(&files::launchd::locate_tendd());
+            let (after, outcome) = files::launchd::upsert(before.as_deref(), &want);
+            actions.push(Action::EditFile {
+                component: c,
+                path: path.clone(),
+                before,
+                after,
+                outcome,
+            });
+            actions.push(Action::EnableLaunchdUnit { plist_path: path });
+        }
+        Direction::Uninstall => {
+            actions.push(Action::DisableLaunchdUnit);
+            if path.is_file() {
+                actions.push(Action::DeleteFile { component: c, path });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn plan_shellrc(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+    let Some(path) = files::shellrc::default_path() else {
+        return Ok(());
+    };
+    let before = read_to_string_opt(&path)?;
+    let original = before.clone().unwrap_or_default();
+    let (after, outcome) = match direction {
+        Direction::Install => files::shellrc::upsert(&original),
+        Direction::Uninstall => files::shellrc::remove(&original),
+    };
+    actions.push(Action::EditFile {
+        component: c,
+        path,
+        before,
+        after,
+        outcome,
+    });
+    Ok(())
+}
+
+fn read_to_string_opt(p: &PathBuf) -> Result<Option<String>> {
+    match std::fs::read_to_string(p) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("reading {}", p.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::init::components::Component;
+
+    /// A socket `default_socket()` can never produce — its fallback form
+    /// is `/tmp/tend-<uid>.sock`, always numeric after the dash. Tests
+    /// that want the pin planned must use a path like this, or they'd
+    /// silently depend on the uid of whoever runs them.
+    fn fake_socket() -> PathBuf {
+        PathBuf::from("/tmp/tend-test.sock")
+    }
+
+    #[test]
+    fn empty_components_yields_empty_plan() {
+        let d = Detection::default();
+        let plan = build(Direction::Install, &[], &d, &fake_socket()).unwrap();
+        assert!(plan.actions.is_empty());
+        assert!(!plan.has_changes());
+    }
+
+    /// The seam the silent overwrite went through. Several components share
+    /// one file — `tmux-popup` and `tmux-statusline` in `~/.tmux.conf`, `ask`
+    /// / `collaboration` / `dashboard` in one `config.toml` — and planning the
+    /// second from disk gives it text that has never seen the first one's
+    /// block. `apply` then writes them in turn and the first is gone, with
+    /// nothing on screen wrong: each component's own plan was accurate.
+    ///
+    /// Driven directly rather than through `build`, because the planners read
+    /// the operator's real `$HOME`: a machine whose `~/.tmux.conf` already
+    /// carries both blocks passes an end-to-end assertion no matter which way
+    /// the bug goes.
+    #[test]
+    fn a_planned_edit_folds_onto_the_one_already_planned_for_that_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tmux.conf");
+        std::fs::write(&path, "on disk\n").expect("seed the file");
+
+        let actions = vec![Action::EditFile {
+            component: Component::TmuxPopup,
+            path: path.clone(),
+            before: Some("on disk\n".into()),
+            after: "on disk\nfirst component's block\n".into(),
+            outcome: Outcome::Inserted,
+        }];
+
+        let (before, original) = file_base(&actions, &path).expect("resolve the base");
+        assert_eq!(
+            original, "on disk\nfirst component's block\n",
+            "the next component must build on the pending edit, not the file",
+        );
+        assert_eq!(
+            before.as_deref(),
+            Some("on disk\nfirst component's block\n"),
+            "and record it as `before`, so the backup is the file as it will stand",
+        );
+    }
+
+    /// The first component to touch a file still reads it, including the
+    /// `None` that says it does not exist yet.
+    #[test]
+    fn the_first_planned_edit_reads_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("tmux.conf");
+
+        let (before, original) = file_base(&[], &path).expect("resolve the base");
+        assert_eq!(before, None, "a missing file has no `before` to back up");
+        assert!(original.is_empty());
+
+        std::fs::write(&path, "on disk\n").expect("seed the file");
+        let (before, original) = file_base(&[], &path).expect("resolve the base");
+        assert_eq!(before.as_deref(), Some("on disk\n"));
+        assert_eq!(original, "on disk\n");
+    }
+
+    /// An edit planned for a *different* file is not the base for this one.
+    #[test]
+    fn a_pending_edit_elsewhere_is_not_this_file_s_base() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mine = dir.path().join("config.toml");
+        let theirs = dir.path().join("tmux.conf");
+        std::fs::write(&mine, "[ask]\n").expect("seed the file");
+
+        let actions = vec![Action::EditFile {
+            component: Component::TmuxPopup,
+            path: theirs,
+            before: None,
+            after: "someone else's file\n".into(),
+            outcome: Outcome::Inserted,
+        }];
+
+        let (_, original) = file_base(&actions, &mine).expect("resolve the base");
+        assert_eq!(original, "[ask]\n");
+    }
+
+    #[test]
+    fn tmux_install_produces_edit_then_env_then_source() {
+        // Detection irrelevant for tmux components — they don't gate on it.
+        let d = Detection::default();
+        let plan = build(
+            Direction::Install,
+            &[Component::TmuxPopup],
+            &d,
+            &fake_socket(),
+        )
+        .unwrap();
+
+        // Expected action order: popup edit → tmux-env edit → source.
+        // A custom socket's propagation lands in conf even when only the
+        // popup component was selected.
+        assert!(
+            matches!(plan.actions.first(), Some(Action::EditFile { .. })),
+            "first action must be the popup EditFile"
+        );
+
+        let env_after = plan
+            .actions
+            .iter()
+            .any(|a| matches!(a, Action::EditFile { after, .. } if after.contains("TEND_SOCKET")));
+        assert!(
+            env_after,
+            "a custom socket's tmux-env block must be auto-included with any tmux component"
+        );
+
+        assert!(
+            matches!(plan.actions.last(), Some(Action::SourceTmuxConf { .. })),
+            "last action must be SourceTmuxConf so the new env line takes effect live"
+        );
+    }
+
+    #[test]
+    fn tmux_install_pins_provided_socket_path() {
+        let d = Detection::default();
+        let socket = PathBuf::from("/run/user/501/tend.sock");
+        let plan = build(
+            Direction::Install,
+            &[Component::TmuxStatusLine],
+            &d,
+            &socket,
+        )
+        .unwrap();
+        let pinned = plan.actions.iter().any(|a| {
+            matches!(
+                a,
+                Action::EditFile { after, .. }
+                    if after.contains(r#"set-environment -g TEND_SOCKET "/run/user/501/tend.sock""#)
+            )
+        });
+        assert!(pinned, "env block must pin the resolved socket path");
+    }
+
+    #[test]
+    fn default_socket_is_never_pinned_into_tmux_conf() {
+        // The pin's whole value is telling a pane something it can't
+        // derive. For the default socket it can, and writing it anyway
+        // bakes this host's uid into a file that is routinely symlinked
+        // out of a dotfiles repo onto other machines.
+        let d = Detection::default();
+        let plan = build(
+            Direction::Install,
+            &[Component::TmuxStatusLine, Component::TmuxPopup],
+            &d,
+            &tend::paths::default_socket(),
+        )
+        .unwrap();
+        // Asserted as a delta, not as absence: these tests read the real
+        // `~/.tmux.conf`, so whoever runs them may well have the word
+        // TEND_SOCKET in the file already (a stale pin, or a comment
+        // about one). "Never adds a pin, may remove one" is the actual
+        // contract, and it holds whatever the developer's file contains.
+        let pin = "set-environment -g TEND_SOCKET";
+        for action in &plan.actions {
+            if let Action::EditFile { before, after, .. } = action {
+                let was = before.as_deref().unwrap_or_default().matches(pin).count();
+                let now = after.matches(pin).count();
+                assert!(
+                    now <= was,
+                    "planning the default socket must never add a pin (had {was}, planned {now})"
+                );
+            }
+        }
+
+        // The reconcile still has to run and still has to be sourced —
+        // that is what scrubs a pin an older tend already wrote.
+        assert!(
+            matches!(plan.actions.last(), Some(Action::SourceTmuxConf { .. })),
+            "removal must still be sourced so the stale pin stops applying"
+        );
+    }
+
+    #[test]
+    fn only_a_socket_off_the_default_earns_a_pin() {
+        let default = PathBuf::from("/run/user/1044/tend.sock");
+        assert!(
+            !needs_socket_pin(&default, &default),
+            "a pane derives the default itself"
+        );
+        assert!(
+            needs_socket_pin(&PathBuf::from("/var/run/tend-custom.sock"), &default),
+            "a config-overridden socket is unguessable and must be pinned"
+        );
+        // `Path`'s comparison walks components, so a redundant `.` is not
+        // mistaken for a custom socket and does not earn a spurious pin.
+        assert!(!needs_socket_pin(
+            &PathBuf::from("/run/user/1044/./tend.sock"),
+            &default
+        ));
+    }
+
+    #[test]
+    fn uninstall_deletes_file_emptied_by_removal() {
+        // A file tend created from scratch (opencode tend.ts, or a
+        // codex config with nothing but our hooks) is empty after the
+        // block is stripped — we should delete it, not leave a 0-byte orphan.
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Uninstall,
+            Component::OpencodeHooks,
+            PathBuf::from("/home/u/.config/opencode/plugins/tend.ts"),
+            Some("// block\n".into()),
+            "   \n".into(),
+            Outcome::Removed,
+            &mut actions,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::DeleteFile { .. }]),
+            "empty remainder on uninstall must become a DeleteFile, got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn uninstall_keeps_file_with_remaining_user_content() {
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Uninstall,
+            Component::CodexHooks,
+            PathBuf::from("/home/u/.codex/config.toml"),
+            Some("[user]\nkey = 1\n\n[[hooks.X]]\n".into()),
+            "[user]\nkey = 1\n".into(),
+            Outcome::Removed,
+            &mut actions,
+        );
+        assert!(
+            matches!(actions.as_slice(), [Action::EditFile { .. }]),
+            "a non-empty remainder must stay an EditFile so user content survives"
+        );
+    }
+
+    #[test]
+    fn install_never_deletes_even_with_empty_after() {
+        // Defensive: the demotion is uninstall-only. An empty `after`
+        // on install (shouldn't happen, but be safe) must not delete.
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Install,
+            Component::OpencodeHooks,
+            PathBuf::from("/x"),
+            Some("x".into()),
+            String::new(),
+            Outcome::Replaced,
+            &mut actions,
+        );
+        assert!(matches!(actions.as_slice(), [Action::EditFile { .. }]));
+    }
+
+    #[test]
+    fn uninstall_absent_file_is_not_deleted() {
+        // File never existed (before None) → nothing to delete.
+        let mut actions = Vec::new();
+        push_edit_or_delete(
+            Direction::Uninstall,
+            Component::GeminiHooks,
+            PathBuf::from("/x"),
+            None,
+            String::new(),
+            Outcome::AlreadyAbsent,
+            &mut actions,
+        );
+        assert!(matches!(actions.as_slice(), [Action::EditFile { .. }]));
+    }
+    #[test]
+    fn automation_install_uses_selected_config_and_preserves_pending_edits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("selected.toml");
+        let pending = "# pending\n[ask]\nenabled = true\n";
+        let mut plan = Plan {
+            direction: Direction::Install,
+            components: vec![Component::Automation],
+            actions: vec![Action::EditFile {
+                component: Component::Ask,
+                path: path.clone(),
+                before: None,
+                after: pending.into(),
+                outcome: Outcome::Inserted,
+            }],
+            warnings: Vec::new(),
+        };
+        extend_automation(&mut plan, Some(&path)).unwrap();
+        let Action::EditFile {
+            path: selected,
+            before,
+            after,
+            ..
+        } = plan.actions.last().unwrap()
+        else {
+            panic!("expected config edit");
+        };
+        assert_eq!(selected, &path);
+        assert_eq!(before.as_deref(), Some(pending));
+        assert!(after.contains("# pending"));
+        let config: tend::Config = toml::from_str(after).unwrap();
+        assert!(config.ask.enabled);
+        assert_eq!(config.automation.rule.len(), 5);
+        assert!(config.automation.rule.iter().all(|rule| !rule.enabled));
+        assert!(!path.exists(), "planning must not mutate files");
+        extend_automation(&mut plan, Some(&path)).unwrap();
+        assert_eq!(plan.actions.len(), 2, "reinstall must be a no-op");
+        plan.direction = Direction::Uninstall;
+        extend_automation(&mut plan, Some(&path)).unwrap();
+        assert_eq!(plan.actions.len(), 2, "uninstall retains operator rules");
+    }
+}

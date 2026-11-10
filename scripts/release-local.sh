@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and attach muxa release archives from a local machine.
+# Build and attach tend release archives from a local machine.
 #
 # The same archives the release workflow makes, for when it is not run:
 # build on each machine that can (Linux targets here, Apple targets on a
@@ -14,11 +14,11 @@
 # through `uvx --from cargo-zigbuild`) against glibc 2.17. Archives match
 # the workflow's layout and "<sha256>  <file>" sidecars, so
 # scripts/bump-tap.sh reads them as is.
-# The macOS DMG is not built here (apps/muxa-macos/Scripts/package-dmg.sh).
+# The macOS DMG is not built here (apps/tend-macos/Scripts/package-dmg.sh).
 
 set -euo pipefail
 
-repo=Open330/muxa
+repo=Open330/tend
 targets_all=(
   x86_64-unknown-linux-gnu
   aarch64-unknown-linux-gnu
@@ -65,30 +65,30 @@ build_one() {
     cd "$src"
     if [[ "$target" == *-apple-* ]]; then
       # A Mac builds both Apple targets natively (rustup target add …).
-      cargo build --release --locked --target "$target" -p muxa-cli -p muxad
+      cargo build --release --locked --target "$target" -p tend-cli -p tendd
     # Linux always goes through zig, even for the host, pinned to an old
     # glibc: a native build would require the build host's glibc, and zig's
     # own default is newer than what earlier releases supported.
     elif command -v cargo-zigbuild >/dev/null; then
-      cargo zigbuild --release --locked --target "$target.$glibc" -p muxa-cli -p muxad
+      cargo zigbuild --release --locked --target "$target.$glibc" -p tend-cli -p tendd
     elif command -v uvx >/dev/null; then
       uvx --from cargo-zigbuild cargo-zigbuild zigbuild --release --locked \
-        --target "$target.$glibc" -p muxa-cli -p muxad
+        --target "$target.$glibc" -p tend-cli -p tendd
     else
       die "cross-building $target needs cargo-zigbuild or uv"
     fi
   )
 
-  local name="muxa-$tag-$target"
+  local name="tend-$tag-$target"
   local stage="$out/$name"
   rm -rf "$stage" && mkdir -p "$stage"
   # The release profile strips symbols, as the workflow's builds do.
-  cp "$src/target/$target/release/muxa" "$src/target/$target/release/muxad" "$stage/"
+  cp "$src/target/$target/release/tend" "$src/target/$target/release/tendd" "$stage/"
   if [ "$target" = "$host" ]; then
-    [ "$("$stage/muxa" --version)" = "muxa $version" ] || die "$target binary does not report $version"
+    [ "$("$stage/tend" --version)" = "tend $version" ] || die "$target binary does not report $version"
   fi
   (cd "$src" && cp LICENSE-MIT LICENSE-APACHE README.md CHANGELOG.md \
-    examples/muxad.service examples/muxa.tmux.conf examples/claude-settings.json "$stage/")
+    examples/tendd.service examples/tend.tmux.conf examples/claude-settings.json "$stage/")
   (cd "$out" && tar czf "$name.tar.gz" "$name")
   if command -v sha256sum >/dev/null; then
     (cd "$out" && sha256sum "$name.tar.gz" > "$name.sha256")
@@ -119,8 +119,8 @@ case "$action" in
     assets=$(gh release view "$tag" --repo "$repo" --json assets --jq '.assets[].name')
     for target in "${targets_all[@]}"; do
       for ext in tar.gz sha256; do
-        grep -qxF "muxa-$tag-$target.$ext" <<<"$assets" \
-          || die "muxa-$tag-$target.$ext is not attached; build it first"
+        grep -qxF "tend-$tag-$target.$ext" <<<"$assets" \
+          || die "tend-$tag-$target.$ext is not attached; build it first"
       done
     done
     file=$(mktemp)

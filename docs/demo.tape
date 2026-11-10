@@ -1,4 +1,4 @@
-# muxa hero demo — "your whole agent fleet on one screen"
+# tend hero demo — "your whole agent fleet on one screen"
 #
 #   vhs docs/demo.tape   →   docs/demo.gif
 #
@@ -14,7 +14,7 @@
 #                            carries the selected agent's full detail
 #   13–20s   the swarm     — k9s-style clusters with live spinners and an
 #                            expandable subagent tree
-#   20–25s   teleport      — `muxa attend` jumps to whoever's blocked longest
+#   20–25s   teleport      — `tend attend` jumps to whoever's blocked longest
 #
 # docs/demo-setup.sh builds the fleet; docs/demo-teardown.sh removes it.
 
@@ -24,7 +24,7 @@ Set Shell bash
 Set FontFamily "JetBrainsMono Nerd Font Mono"
 Set FontSize 14
 # 1320x620 at font 14 gives a 130x27 terminal. The width is not
-# cosmetic: `muxa watch` only splits out the inspector at >= 120 columns,
+# cosmetic: `tend watch` only splits out the inspector at >= 120 columns,
 # and vhs reserves enough padding that the obvious 1200x760 lands at 117 —
 # close enough to look deliberate, wide enough to look broken. Re-measure
 # with `tput cols` before changing any of these three numbers.
@@ -35,12 +35,12 @@ Set TypingSpeed 45ms
 Set PlaybackSpeed 1
 
 # ── Prelude — invisible setup ────────────────────────────────────────────
-# demo-setup.sh owns the whole fixture: config, shims, tmux server, muxad,
+# demo-setup.sh owns the whole fixture: config, shims, tmux server, tendd,
 # and the seeded fleet. Keeping it out of the tape matters because every
 # line here is one vhs has to type, at typing speed, on every render.
 Hide
 Set TypingSpeed 1ms
-Type "export MUXA_DEMO_TMUX=$(command -v tmux)"
+Type "export TEND_DEMO_TMUX=$(command -v tmux)"
 Enter
 Type "export PATH=$PWD/target/debug:$HOME/.cargo/bin:$PATH"
 Enter
@@ -54,7 +54,7 @@ Sleep 12s
 Type "clear"
 Enter
 # No `exec` — the postlude needs this shell back after the client detaches.
-Type "$MUXA_DEMO_TMUX -u -f /dev/null -S /tmp/muxa-demo-sandbox/tmux.sock attach -t ctl:0"
+Type "$TEND_DEMO_TMUX -u -f /dev/null -S /tmp/tend-demo-sandbox/tmux.sock attach -t ctl:0"
 Enter
 Sleep 2s
 Set TypingSpeed 45ms
@@ -64,7 +64,7 @@ Show
 # Workspace › work rows on one screen. The sort floats needs-attention rows —
 # error, rate-limited, choice, input — above the ones that are just busy,
 # so the top of the list is always the work queue.
-Type "muxa watch"
+Type "tend watch"
 Enter
 Sleep 3500ms
 # `gg` rather than a bare `Down`: the cursor opens on whatever work the
@@ -94,7 +94,7 @@ Sleep 500ms
 # ── 3. The swarm (13–20s) ────────────────────────────────────────────────
 # One cluster per work, animated spinners on the working agents, and an
 # expandable tree under the agents that spawned Task subagents.
-Type "muxa watch --view swarm"
+Type "tend watch --view swarm"
 Enter
 Sleep 3500ms
 Type "gg"
@@ -110,7 +110,7 @@ Sleep 500ms
 # ── 4. Teleport (20–25s) ─────────────────────────────────────────────────
 # Don't hunt across sixteen sessions — jump the tmux client straight to
 # whichever agent has been blocked the longest.
-Type "muxa attend"
+Type "tend attend"
 Enter
 Sleep 4s
 

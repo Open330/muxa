@@ -6,7 +6,7 @@ Reviewed the workbench's search ranking, destination identity, query and selecti
 updates, native search-field input, command dispatch, editor tab/group lifecycle,
 prompt send guards, draft preservation, configuration write/conflict handling,
 and Ask automation judgment boundaries. Ran the complete macOS test target and
-the muxa, muxad, and muxa-cli Rust test suites, plus Rust Clippy.
+the tend, tendd, and tend-cli Rust test suites, plus Rust Clippy.
 
 This is a regression review of these paths, not a claim that every application
 state, platform combination, or production integration is free of bugs.

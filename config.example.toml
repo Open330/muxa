@@ -1,30 +1,30 @@
-# muxa daemon configuration — copy to ~/.config/muxa/config.toml
+# tend daemon configuration — copy to ~/.config/tend/config.toml
 
 # Unix socket the daemon listens on.
-# Defaults to $XDG_RUNTIME_DIR/muxa.sock (or /tmp/muxa-$UID.sock as fallback).
-# socket = "/run/user/1000/muxa.sock"
+# Defaults to $XDG_RUNTIME_DIR/tend.sock (or /tmp/tend-$UID.sock as fallback).
+# socket = "/run/user/1000/tend.sock"
 
-# Env-only: MUXA_TMUX_SOCKET scopes muxa to a single tmux socket path instead
+# Env-only: TEND_TMUX_SOCKET scopes tend to a single tmux socket path instead
 # of enumerating every server under /tmp/tmux-$UID. It scopes BOTH the
 # multi-server pane scan AND hook ingest: events whose captured $TMUX socket
 # is a different server are dropped. Opt-in — unset keeps the global view.
-# Set it on the daemon (e.g. in the launchd/systemd unit) to isolate muxa to
+# Set it on the daemon (e.g. in the launchd/systemd unit) to isolate tend to
 # one server: handy for single-server users, tests, isolated demo/CI
 # recordings, or excluding agents another multiplexer (e.g. cmux) runs on its
-# own server but which share muxa's globally-installed agent hooks:
-#   MUXA_TMUX_SOCKET=/tmp/tmux-1000/work muxad
+# own server but which share tend's globally-installed agent hooks:
+#   TEND_TMUX_SOCKET=/tmp/tmux-1000/work tendd
 
 [ui]
-# theme = "classic"      # classic (default), oh-my-muxa, focus, ops, mono, high-contrast, minimal
+# theme = "classic"      # classic (default), oh-my-tend, focus, ops, mono, high-contrast, minimal
 
 [notifier]
 # enabled = true
 # backend = "libnotify"   # libnotify | none   (more backends TBD)
 
-# Backfill discovery: when muxad starts, scan tmux panes for running agents
+# Backfill discovery: when tendd starts, scan tmux panes for running agents
 # (matched against `pane_current_command`) and synthesize Started events so
-# they appear in `muxa status` without waiting for a fresh hook. The same
-# routine powers `muxa registry sync`. Default on.
+# they appear in `tend status` without waiting for a fresh hook. The same
+# routine powers `tend registry sync`. Default on.
 [discovery]
 # enabled = true
 
@@ -35,14 +35,14 @@
 # is a tuning knob, not a correctness one.
 [reconciler]
 # enabled       = true
-# interval_secs = 30                # 30s default — closed panes disappear from `muxa watch` within seconds
+# interval_secs = 30                # 30s default — closed panes disappear from `tend watch` within seconds
 # paneless_stale_timeout_secs = 86400  # 24h. Age out fully orphaned rows (no pane, surface, or pid) to
 #                                      # Stopped so the GC reaps them — e.g. codex sessions driven through a
 #                                      # detached app-server/remote bridge that fire paneless hooks and never
 #                                      # stop on their own. Only the registry row is removed; the tmux session
-#                                      # (if any) is untouched. `muxa registry prune` does this on demand. Set 0 to disable.
+#                                      # (if any) is untouched. `tend registry prune` does this on demand. Set 0 to disable.
 
-# Screen-manifest fallback detection: for agent CLIs muxa has NO hooks for
+# Screen-manifest fallback detection: for agent CLIs tend has NO hooks for
 # (cursor-agent, amp, copilot, aider, goose, and any you declare), the daemon
 # periodically captures the pane and matches TOML manifest rules against the
 # visible tail to infer Working / WaitingInput / Idle. Last-resort only: hooks
@@ -51,7 +51,7 @@
 # Codex panes are the metadata-only exception: their visible Conversation recap
 # is retained for watch/peek summaries without changing hook-owned state.
 # manifests ship in the binary; drop overrides at
-# $XDG_CONFIG_HOME/muxa/agents/<name>.toml (same name replaces a bundled one).
+# $XDG_CONFIG_HOME/tend/agents/<name>.toml (same name replaces a bundled one).
 # See docs/SCREEN_DETECTION.md.
 [screen_detect]
 # enabled       = true
@@ -60,10 +60,10 @@
 #                                   # add one recap capture per matching pane on each tick.
 
 # Defaults and conventions advertised to MCP-connected agents. These values
-# are included in the MCP initialization guide, returned by `muxa_guide`, and
-# used by `muxa_start_agent` when the matching argument is omitted. Without an
+# are included in the MCP initialization guide, returned by `tend_guide`, and
+# used by `tend_start_agent` when the matching argument is omitted. Without an
 # `agent`, callers still have to choose one. Options are additional arguments
-# after Muxa's built-in provider profile (for example, codex already gets
+# after Tend's built-in provider profile (for example, codex already gets
 # `--yolo`) and before the initial prompt. Restart an MCP-connected agent after
 # changing this section because its stdio server loaded the old config.
 [mcp.guide]
@@ -80,13 +80,13 @@
 # the wrong one: `--model` is spelled differently per CLI, and one shared list
 # would either fit a single provider or have to be guarded at every launch.
 #
-# These apply to EVERY path that starts an agent — `muxa agent start`, `muxa
-# work start`, a `muxa work up` pipeline, `muxa_start_agent`, and an automatic
-# `muxa_call_peer` spawn. Options land after Muxa's built-in provider profile
+# These apply to EVERY path that starts an agent — `tend agent start`, `tend
+# work start`, a `tend work up` pipeline, `tend_start_agent`, and an automatic
+# `tend_call_peer` spawn. Options land after Tend's built-in provider profile
 # (codex already gets `--yolo`) and before the initial prompt.
 #
 # Anything named explicitly REPLACES these rather than adding to them —
-# `muxa agent start --option`, an MCP `options` array, or a pipeline agent's
+# `tend agent start --option`, an MCP `options` array, or a pipeline agent's
 # own `options` — so an override never puts `--model` on the line twice.
 # An unknown provider key fails the load rather than sitting inert.
 # [agent.claude]
@@ -122,8 +122,8 @@
 # agent's top-level Idle state. Working / waiting / choice / error panes and
 # synthetic screen-detected agents are never auto-woken. `wake_payload`
 # controls whether the body or a short mailbox notification is delivered.
-# Headless one-shot questions from `muxa watch` (`a` asks, `A` browses).
-# Off by default: enabling it lets muxad spawn an agent CLI that bills
+# Headless one-shot questions from `tend watch` (`a` asks, `A` browses).
+# Off by default: enabling it lets tendd spawn an agent CLI that bills
 # your account.
 # [ask]
 # enabled = true
@@ -142,23 +142,23 @@
 # Existing JSON is imported once and retained as a migration backup; its
 # duplicate message bodies are not covered by retention. A .sqlite/.sqlite3/.db
 # path is used directly.
-# path              = "/home/$USER/.local/share/muxa/collaboration.json"
+# path              = "/home/$USER/.local/share/tend/collaboration.json"
 # max_message_bytes = 16384
 # retention_days    = 90 # omit to retain indefinitely; prunes eligible whole
 #                        # terminal threads at daemon startup
 
 # Prompt audit log: every PromptSubmitted event is appended to a bounded
-# NDJSON file plus an in-memory ring per pane. Powers `muxa recap --all`
+# NDJSON file plus an in-memory ring per pane. Powers `tend recap --all`
 # even after the live agent record has been reaped (daemon restart, pane
 # close, etc.). Default path lives in $XDG_DATA_HOME.
 # window (default): requests stay inside the sender's tmux window.
 # host: an explicit pane target may address any tracked agent on this host
-# — this is what lets `muxa watch`'s composer send to the row under the
+# — this is what lets `tend watch`'s composer send to the row under the
 # cursor. peer/@alias/role: selectors stay window-scoped either way.
 # scope = "window"
 
 # Central physical-host management over persistent, outbound OpenSSH stdio
-# relays. The remote side needs the same muxa version and an owner-local muxad;
+# relays. The remote side needs the same tend version and an owner-local tendd;
 # no TCP listener is opened on either side. SSH identity, ProxyJump, port, and
 # host-key policy belong in ~/.ssh/config. See docs/FLEET.md.
 [fleet]
@@ -171,22 +171,22 @@
 # max_parallel_connects = 6
 # capture_policy        = "selected" # selected | never; pane text is fetched on demand only
 
-# Optional metadata for the built-in controller node. `muxa fleet host label local`
-# and `muxa fleet host annotate local` edit these tables. muxad supplies immutable
-# muxa.io/local, muxa.io/transport, and kubernetes.io/* identity labels.
+# Optional metadata for the built-in controller node. `tend fleet host label local`
+# and `tend fleet host annotate local` edit these tables. tendd supplies immutable
+# tend.io/local, tend.io/transport, and kubernetes.io/* identity labels.
 # [fleet.local.labels]
 # environment = "development"
 
 # [fleet.local.annotations]
-# "muxa.dev/owner" = "platform-team"
+# "tend.dev/owner" = "platform-team"
 
 # [fleet.hosts.devbox]
-# ssh           = "muxa-devbox"    # OpenSSH Host alias; no embedded flags
-# muxa_path     = "muxa"
+# ssh           = "tend-devbox"    # OpenSSH Host alias; no embedded flags
+# tend_path     = "tend"
 # enabled       = true
 # connect       = "auto"           # auto | on_demand
 # mode          = "observe"        # observe | control
-# remote_socket = "/run/user/1000/muxa.sock" # optional
+# remote_socket = "/run/user/1000/tend.sock" # optional
 
 # Kubernetes-style labels are selector/indexing metadata. Values are short
 # identifiers; use annotations for descriptive or URL-like data.
@@ -196,22 +196,22 @@
 # accelerator = "gpu"
 
 # [fleet.hosts.devbox.annotations]
-# "muxa.dev/owner" = "platform-team"
-# "muxa.dev/runbook" = "https://example.invalid/runbooks/devbox"
+# "tend.dev/owner" = "platform-team"
+# "tend.dev/runbook" = "https://example.invalid/runbooks/devbox"
 
 [history]
 # enabled               = true
-# path                  = "/home/$USER/.local/share/muxa/prompts.ndjson"
+# path                  = "/home/$USER/.local/share/tend/prompts.ndjson"
 # max_per_pane          = 200       # cap entries kept per pane (memory + disk)
 # max_age_days          = 30        # compaction drops anything older
 # compact_interval_secs = 3600      # rewrites the file every hour
 
-# Activity ledger: append-only duration events used by `muxa stats` and
-# `muxa stats report`. Records closed agent-state intervals plus closed tmux
+# Activity ledger: append-only duration events used by `tend stats` and
+# `tend stats report`. Records closed agent-state intervals plus closed tmux
 # foreground intervals, so duration survives pane/session removal.
 [activity]
 # enabled               = true
-# path                  = "/home/$USER/.local/share/muxa/activity.ndjson"
+# path                  = "/home/$USER/.local/share/tend/activity.ndjson"
 # max_age_days          = 30
 # compact_interval_secs = 3600
 
@@ -222,17 +222,17 @@
 # to coalesce bursts), so idle daemons make zero disk traffic.
 [state]
 # enabled     = true
-# path        = "/home/$USER/.local/share/muxa/state.json"
+# path        = "/home/$USER/.local/share/tend/state.json"
 # debounce_ms = 200                  # coalesce window between dirty signal and write
 
-# `muxa config export` / `diff` / `apply`: share portable settings between
+# `tend config export` / `diff` / `apply`: share portable settings between
 # hosts. This table is this host's own choice and is never exported.
 # See docs/CONFIGURATION.md#sharing-settings-between-hosts.
 # [config_sync]
 # categories = ["pipeline", "skills", "automation"]   # default: all
 # ignore     = ["pipeline.solo", "ticket"]
 
-# Moving agents onto another account (`muxa swap`, and the `swap_account`
+# Moving agents onto another account (`tend swap`, and the `swap_account`
 # automation action). Accounts come from [[accounts.<provider>]] above, or an
 # installed aas when none are listed. See docs/ACCOUNT_SWAP.md.
 [swap]
@@ -241,23 +241,23 @@
 # continue_when = "limited"          # limited | always | never
 # aas           = "aas"              # optional aas backend binary (also found in /opt/homebrew/bin, ~/.cargo/bin)
 
-# Workspace snapshots. muxad takes an automatic one every
+# Workspace snapshots. tendd takes an automatic one every
 # `auto_interval_minutes` when the workspace changed since the last snapshot
 # of its server, and keeps the newest `keep_auto` of them. Snapshots taken by
-# hand (`muxa snapshot`, Muxa.app) or by `muxa reload` are never pruned.
+# hand (`tend snapshot`, Tend.app) or by `tend reload` are never pruned.
 [snapshot]
 # auto_interval_minutes = 15         # 0 turns automatic snapshots off
 # keep_auto             = 10
 
 # tmux session foreground-time tracker. A session counts as active while an
-# interactive tmux client has that session foregrounded. `muxa watch`
+# interactive tmux client has that session foregrounded. `tend watch`
 # shows the workspace cumulative total in its DUR column.
 [session_activity]
 # enabled       = true
-# path          = "/home/$USER/.local/share/muxa/session-activity.json"
+# path          = "/home/$USER/.local/share/tend/session-activity.json"
 # interval_secs = 5
 
-# `muxa stats` / `muxa stats report` ACTIVE (engaged time) estimate. Each human action
+# `tend stats` / `tend stats report` ACTIVE (engaged time) estimate. Each human action
 # (a prompt or a tmux keypress/scroll) is padded into a window; these tune it.
 [stats]
 # active_lookback_secs     = 60    # seconds credited before each action
@@ -274,10 +274,10 @@
 #                                  # only on submitted prompts and thinking.
 
 # Logging is controlled via the standard RUST_LOG env var, e.g.:
-#   RUST_LOG=muxa=debug,tokio=warn muxad
-# Default when unset: "muxa=info".
+#   RUST_LOG=tend=debug,tokio=warn tendd
+# Default when unset: "tend=info".
 
-# `muxa watch` TUI columns. Default keeps the table prompt-forward; uncomment
+# `tend watch` TUI columns. Default keeps the table prompt-forward; uncomment
 # to opt back into model / ctx / cost, always-visible workload, or to reorder.
 #
 # Valid column keys: pane, kind, state, state_age, model, ctx, cost, limits, workload,
@@ -290,7 +290,7 @@
 # view = "pane"       # full session → window → pane depth
 # layout = "tree"     # selectable hierarchy (default)
 # layout = "swarm"    # dense collaboration-room clusters
-# layout = "work"     # flat one row per Work, like `muxa work list` with a
+# layout = "work"     # flat one row per Work, like `tend work list` with a
 #                     # live state gauge
 # Collaboration history has its own presentation axis, independent of the
 # topology layout above. `v` toggles it at runtime.
@@ -324,13 +324,13 @@
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
 # agents launched outside tmux). Default true because picker actions
 # can't target them anyway; the footer surfaces a `+N paneless` count so
-# they remain discoverable. `muxa watch --include-paneless` reveals them
+# they remain discoverable. `tend watch --include-paneless` reveals them
 # for one invocation without flipping this flag.
 # hide_paneless = true
 
-# Animate the state glyph in the `muxa watch` TUI: a spinning braille dot for
+# Animate the state glyph in the `tend watch` TUI: a spinning braille dot for
 # `working` and a rotating half-circle for `starting`. Purely a watch-TUI
-# affordance — `muxa status` and the tmux status-line always render the static
+# affordance — `tend status` and the tmux status-line always render the static
 # `[ui] icons` glyph. Default true; set false for calm static icons (or a
 # terminal without braille support).
 # spinner = true
@@ -399,7 +399,7 @@
 # # Just the user's prompt:
 # # template = "{last_prompt}"
 
-# HTTP dashboard. Off by default. When enabled, muxad serves a small
+# HTTP dashboard. Off by default. When enabled, tendd serves a small
 # read-only web UI + JSON/SSE API alongside its unix-socket IPC.
 #
 # Security model:
@@ -417,10 +417,10 @@
 # Generate a token with `openssl rand -hex 32` (or any 32+ random bytes).
 # CLI flags / env vars override these values per-field:
 #   --dashboard / --no-dashboard
-#   --dashboard-bind   / MUXA_DASHBOARD_BIND
-#   --dashboard-auth   / MUXA_DASHBOARD_AUTH
-#   --dashboard-token  / MUXA_DASHBOARD_TOKEN
-#   --allow-public     / MUXA_DASHBOARD_ALLOW_PUBLIC
+#   --dashboard-bind   / TEND_DASHBOARD_BIND
+#   --dashboard-auth   / TEND_DASHBOARD_AUTH
+#   --dashboard-token  / TEND_DASHBOARD_TOKEN
+#   --allow-public     / TEND_DASHBOARD_ALLOW_PUBLIC
 [dashboard]
 # enabled       = true
 # bind          = "127.0.0.1:7878"
@@ -465,7 +465,7 @@
 
 # [sinks.webhook] forwards `Transition` events to a Slack or Discord
 # webhook so you can be paged on your phone the moment an agent flips
-# to `WaitingInput` or `Error` while you're AFK from `muxa watch`.
+# to `WaitingInput` or `Error` while you're AFK from `tend watch`.
 # Auto-detects the wire format from the URL: hooks.slack.com →
 # `{"text": "..."}`, discord.com/api/webhooks → `{"content": "..."}`,
 # anything else → the full `Transition` JSON.
@@ -481,17 +481,17 @@
 [sinks.webhook]
 # enabled         = true
 # endpoint        = "https://hooks.slack.com/services/T0/B0/abc"
-# endpoint_env    = "MUXA_SLACK_URL"
+# endpoint_env    = "TEND_SLACK_URL"
 # flavor          = "slack"            # slack | discord | generic
 # on_states       = ["WaitingInput", "Error"]
 # rate_limit_secs = 60                 # per (kind, session, state)
 
 # ---------------------------------------------------------------------------
-# `muxa work up` — declarative work pipelines
+# `tend work up` — declarative work pipelines
 #
 # One command takes a ticket id and leaves you with a staffed tmux window:
 #
-#     muxa work up proj-1234
+#     tend work up proj-1234
 #
 # It resolves the ticket, routes it to a workspace/session, and creates
 # whichever agent panes the pipeline declares but the window does not have
@@ -499,25 +499,25 @@
 # Add `--dry-run` to see the plan without touching tmux. See docs/PIPELINE.md.
 #
 # What the work *is* rides in as a request, phrased the same way
-# `muxa_call_peer` takes one — `--skill` expands a [message.skills] entry,
+# `tend_call_peer` takes one — `--skill` expands a [message.skills] entry,
 # then `--body`, then `--context`:
 #
-#     muxa work up proj-1234 --body "fix the double reap"
+#     tend work up proj-1234 --body "fix the double reap"
 #
 # and the same request is delivered two ways depending on what exists: into
 # the launch prompt of an agent that has no pane yet, and typed into the
 # pane of one that is already running. Agents can call this as
-# `muxa_start_work` over MCP.
+# `tend_start_work` over MCP.
 # ---------------------------------------------------------------------------
 
 # How a work id becomes ticket context.
 #
-# muxa does not speak Linear, Jira, or GitHub. It spends one headless agent
+# tend does not speak Linear, Jira, or GitHub. It spends one headless agent
 # turn asking an agent to fetch the ticket, because you already taught your
 # agent CLI how — a skill, an MCP server, `gh`, a token in the environment.
-# Adding a provider here is a prompt, not a muxa release.
+# Adding a provider here is a prompt, not a tend release.
 #
-# With no [ticket.source] entries nothing is ever spawned and `muxa work up`
+# With no [ticket.source] entries nothing is ever spawned and `tend work up`
 # runs on the work id alone.
 [ticket]
 # agent           = "claude"    # resolver CLI: claude | codex (print mode)
@@ -545,7 +545,7 @@
 
 # Routing: work id → where its tmux surfaces live and which pipeline staffs
 # them. Ordered, first match wins, so put the catch-all last. Without any
-# route, `muxa work up --pipeline <name>` still works and uses the current
+# route, `tend work up --pipeline <name>` still works and uses the current
 # directory.
 # [[route]]
 # match     = '^proj-'
@@ -567,10 +567,10 @@
 
 # A pipeline is a desired set of panes, not a script. `alias` is the key the
 # desired-vs-actual diff runs on: it is recorded on the pane, so it survives
-# muxad, the CLI, and the agent restarting. Keep it unique and stable.
+# tendd, the CLI, and the agent restarting. Keep it unique and stable.
 #
 # Placeholders: {{id}} (lowercase work id, for branches and paths), {{work}}
-# (as muxa stores it), {{workspace}}, {{cwd}}, {{alias}}, {{role}},
+# (as tend stores it), {{workspace}}, {{cwd}}, {{alias}}, {{role}},
 # {{ticket.title|body|url|state|id|branch}}, and {{request}} — the composed
 # --skill/--body/--context. If no template here places {{request}}, it is
 # prepended to every agent's prompt, so a pipeline written before you passed

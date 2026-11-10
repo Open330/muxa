@@ -1,4 +1,4 @@
-# Contributing to muxa
+# Contributing to tend
 
 ## Toolchain
 
@@ -17,7 +17,7 @@ cargo test --workspace
 
 # dashboard JavaScript tests (node's built-in runner; pass the files, since
 # `node --test <directory>` does not pick them up)
-node --test crates/muxa/tests-js/*.test.mjs
+node --test crates/tend/tests-js/*.test.mjs
 
 # lint (CI-equivalent)
 cargo fmt --all -- --check
@@ -28,12 +28,12 @@ cargo clippy --workspace --all-targets -- -D warnings
 
 ```bash
 # terminal A
-cargo run --bin muxad
+cargo run --bin tendd
 
 # terminal B — simulate a Claude Code hook
 echo '{"session_id":"sess-1","prompt":"hi"}' \
-  | cargo run --bin muxa -- hook claude --event user_prompt_submit
-cargo run --bin muxa -- status
+  | cargo run --bin tend -- hook claude --event user_prompt_submit
+cargo run --bin tend -- status
 ```
 
 ## Real-world topology: rules that keep biting
@@ -48,15 +48,15 @@ invariants:
   lack session-level workspace metadata. Before you count panes, require
   "exactly one" match, key anything by session, persist a session name, or do
   per-pane work (process scans, captures, IPC, typing into a pane), pass the
-  listing through `muxa::tmux::canonical_panes`. Use
-  `muxa::tmux::base_session_name` for durable labels. Keep raw rows only for
+  listing through `tend::tmux::canonical_panes`. Use
+  `tend::tmux::base_session_name` for durable labels. Keep raw rows only for
   actions taken on behalf of one client, such as moving that terminal's view.
 - **Codex 0.160+ shares one `codex app-server` across TUIs.** Its hooks, MCP
   servers and shell commands carry the pane variables of whichever pane
   started it, so never trust `TMUX_PANE`/`RMUX_PANE` under it. Identify a
   thread by its thread id (`_meta.threadId`, `$CODEX_THREAD_ID`). Bind it
-  only from evidence (see `crates/muxa/src/codex_binding.rs`).
-- **Agents keep long-lived `muxa mcp` processes.** A fix to them reaches
+  only from evidence (see `crates/tend/src/codex_binding.rs`).
+- **Agents keep long-lived `tend mcp` processes.** A fix to them reaches
   running agents only after the agents restart.
 
 Before merging changes in these areas, verify them live as well as with unit
@@ -64,19 +64,19 @@ tests. The live checks must cover:
 
 1. A grouped session with at least one `~view~` client, not only a plain
    session.
-2. Two agents in the same cwd, `/new` inside a running TUI, and a muxad
+2. Two agents in the same cwd, `/new` inside a running TUI, and a tendd
    restart.
 3. For each regression test: revert the fix and confirm that the test fails.
-4. A throwaway `muxad` with its own `XDG_DATA_HOME`/`XDG_STATE_HOME`/
+4. A throwaway `tendd` with its own `XDG_DATA_HOME`/`XDG_STATE_HOME`/
    `TMUX_TMPDIR`. Without them it writes the real history and scans the real
    multiplexer.
 
 Tests that execute a fixture script must create it with
-`muxa::test_support::write_executable`, not `fs::write` followed by `chmod`.
+`tend::test_support::write_executable`, not `fs::write` followed by `chmod`.
 Tests run in parallel threads. A child forked by another test inherits the
 open write handle until it execs, and the fixture then fails to start with
 ETXTBSY ("Text file busy"), which looks like a random flake. Likewise, query
-a test's own tmux through `muxa::tmux::tmux_binary()`: a bare `tmux` can be
+a test's own tmux through `tend::tmux::tmux_binary()`: a bare `tmux` can be
 rmux's shim.
 
 CI runs clippy on unpinned stable, so run `rustup update stable` before
@@ -86,15 +86,15 @@ pushing. New lints otherwise appear in CI on code you did not touch.
 
 The stdin-JSON adapters (`claude`, `codex`, `gemini`, `antigravity`,
 `opencode`) all implement the `HookAdapter` trait defined in
-`crates/muxa/src/adapters/hook.rs`. To add a new agent:
+`crates/tend/src/adapters/hook.rs`. To add a new agent:
 
-1. Create `crates/muxa/src/adapters/<agent>.rs`.
+1. Create `crates/tend/src/adapters/<agent>.rs`.
 2. Define `Input` (serde-deserializable payload shape) and `Event` (hook
    event enum).
 3. `impl HookAdapter for <Agent>Adapter` with the three required items:
    `KIND`, `parse_event`, `normalize`.
-4. Register the module in `crates/muxa/src/adapters/mod.rs`.
-5. Add a `HookCmd::<Agent>` variant in `crates/muxa-cli/src/main.rs` and wire
+4. Register the module in `crates/tend/src/adapters/mod.rs`.
+5. Add a `HookCmd::<Agent>` variant in `crates/tend-cli/src/main.rs` and wire
    it through `handle_hook`.
 6. Add a hook-config snippet under `examples/`.
 
@@ -112,14 +112,14 @@ for the deferred stub.
 
 1. Bump `version` in the workspace `Cargo.toml`, run a build so `Cargo.lock`
    follows, and open a `## [X.Y.Z] - date` section in `CHANGELOG.md`.
-   For user-facing app changes, add highlights to `MuxaWhatsNew.catalog` in
-   `apps/muxa-macos/Sources/OnboardingLogic.swift` and their Korean translations.
+   For user-facing app changes, add highlights to `TendWhatsNew.catalog` in
+   `apps/tend-macos/Sources/OnboardingLogic.swift` and their Korean translations.
    Check Welcome, install docs, and landing copy against the release; regenerate
    dashboard screenshots with `scripts/landing-shots/capture.mjs` after UI changes.
-2. Reinstall locally first (`cargo install --path crates/muxa-cli --force
-   --locked`, same for `crates/muxad`, then restart muxad) — shipping a
+2. Reinstall locally first (`cargo install --path crates/tend-cli --force
+   --locked`, same for `crates/tendd`, then restart tendd) — shipping a
    version you have not run is how a broken release gets tagged. For Mac app
-   changes, run `apps/muxa-macos/Scripts/build-app.sh` without `MUXA_SKIP_EMBED`
+   changes, run `apps/tend-macos/Scripts/build-app.sh` without `TEND_SKIP_EMBED`
    and verify the app's bundle version and both helpers' `--version` agree.
 3. Commit as `release: vX.Y.Z`, push `main`, then push the annotated tag.
 
@@ -153,7 +153,7 @@ than after.
    Either way it needs the `TAP_GITHUB_TOKEN` secret (a fine-grained PAT with
    Contents read/write on `Open330/homebrew-tap`). A missing token skips the
    update with a notice; an expired or invalid token fails authentication.
-   In either case, check the remote formula and `muxa-app` cask versions after
+   In either case, check the remote formula and `tend-app` cask versions after
    publication. Recover the CLI formula with `scripts/bump-tap.sh vX.Y.Z`,
    which is idempotent. That script does not update the Mac cask: update its
    version and DMG checksum separately, or repair the secret and rerun the
@@ -178,16 +178,16 @@ checksum, in the workflow's layout. Linux targets go through cargo-zigbuild
 against glibc 2.17 (a native build would require the build host's glibc).
 `publish` refuses until all four targets are attached, then uses the tag's
 `CHANGELOG.md` section as the notes. The Mac app DMG is separate
-(`apps/muxa-macos/Scripts/package-dmg.sh`).
+(`apps/tend-macos/Scripts/package-dmg.sh`).
 
 ## Project layout
 
-- `crates/muxa` — shared library: state, config, IPC, backends, agent adapters,
+- `crates/tend` — shared library: state, config, IPC, backends, agent adapters,
   dashboard, and notifications
-- `crates/muxad` — daemon binary
-- `crates/muxa-cli` — CLI binary and terminal UIs
-- `crates/muxa-zellij-plugin` — zellij plugin
-- `apps/muxa-macos` — native Mac app and bundled runtime build scripts
+- `crates/tendd` — daemon binary
+- `crates/tend-cli` — CLI binary and terminal UIs
+- `crates/tend-zellij-plugin` — zellij plugin
+- `apps/tend-macos` — native Mac app and bundled runtime build scripts
 - `site` — GitHub Pages entry point using the dashboard's shared landing assets
 
 See `PROTOCOL.md` for the wire protocol spec.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drive `muxa onboard --tour live` the way a learner would, and check that the
+"""Drive `tend onboard --tour live` the way a learner would, and check that the
 tour follows.
 
 The live tour advertises something specific: it never intercepts a keystroke,
@@ -19,7 +19,7 @@ needs, so a slow runner costs seconds rather than a false failure, and a step
 that genuinely never arrives still fails, saying which step it reached and what
 was on screen when it gave up.
 
-    scripts/live-tour-smoke.py [--muxa target/debug/muxa]
+    scripts/live-tour-smoke.py [--tend target/debug/tend]
 """
 
 import argparse
@@ -35,13 +35,13 @@ import termios
 import threading
 import time
 
-SANDBOX_PREFIX = "muxa-onboarding"
+SANDBOX_PREFIX = "tend-onboarding"
 SANDBOX = ""
 STEP_MARK = re.compile(r"onboarding · (\d+)/(\d+)")
 TOTAL_STEPS = 16
 # What the learner's `PS1` renders. Its arrival is how the driver knows their
 # shell is up and there is something to type at.
-PROMPT = "muxa-onboarding $"
+PROMPT = "tend-onboarding $"
 
 # How often a wait re-asks its question. Each ask costs a tmux command or two.
 POLL = 0.1
@@ -63,7 +63,7 @@ EXIT_DEADLINE = 120.0
 
 # The tour polls tmux four times a second (`POLL` in `onboarding/live.rs`).
 # Two steps complete on a state that opens and closes again — the session tree,
-# and `muxa watch` — so the tour has to catch them *while* they are open, and
+# and `tend watch` — so the tour has to catch them *while* they are open, and
 # nothing outside the tour can observe that it did. The driver therefore holds
 # each one open for well past the tour's poll, which is the one place left
 # where a duration is load-bearing; it is at least a multiple of a period the
@@ -73,9 +73,9 @@ HELD_OPEN = TOUR_POLL * 8
 
 
 class Terminal:
-    """A pty with a `muxa onboard --tour live` running in it."""
+    """A pty with a `tend onboard --tour live` running in it."""
 
-    def __init__(self, muxa: str, lang: str, no_quiz: bool = False) -> None:
+    def __init__(self, tend: str, lang: str, no_quiz: bool = False) -> None:
         global SANDBOX
         self.exited = False
         self._buffer = bytearray()
@@ -87,12 +87,12 @@ class Terminal:
             # The tour refuses to nest, and CI may well run inside tmux.
             for stale in ("TMUX", "TMUX_PANE"):
                 os.environ.pop(stale, None)
-            argv = [muxa, "onboard", "--tour", "live", "--lang", lang]
+            argv = [tend, "onboard", "--tour", "live", "--lang", lang]
             if no_quiz:
                 argv.append("--no-quiz")
-            os.execv(muxa, argv)
+            os.execv(tend, argv)
             os._exit(127)
-        # The live tour scopes every artifact to the muxa process PID. Keep the
+        # The live tour scopes every artifact to the tend process PID. Keep the
         # driver on that same namespace so parallel smoke jobs cannot observe
         # or tear down one another's tmux server and daemon.
         SANDBOX = f"{SANDBOX_PREFIX}-{self.pid}"
@@ -183,28 +183,28 @@ def title_text() -> str:
 
 # The sandbox's exports, kept from the first time it answered. Once the tour
 # has ended (or failed) the sandbox is down and `env` prints nothing; without
-# these, a probe would inherit the caller's own MUXA_SOCKET/XDG_DATA_HOME and
+# these, a probe would inherit the caller's own TEND_SOCKET/XDG_DATA_HOME and
 # read the operator's real daemon — a failure dump showing someone else's
 # mailbox as if it were the tour's.
 SANDBOX_EXPORTS: dict[str, str] = {}
 # Where a probe points when the sandbox never came up: nowhere, so it fails.
 SEALED = {
-    "MUXA_SOCKET": "/nonexistent/muxa-live-tour.sock",
-    "MUXA_CONFIG": "/nonexistent/muxa-live-tour.toml",
-    "XDG_DATA_HOME": "/nonexistent/muxa-live-tour-data",
+    "TEND_SOCKET": "/nonexistent/tend-live-tour.sock",
+    "TEND_CONFIG": "/nonexistent/tend-live-tour.toml",
+    "XDG_DATA_HOME": "/nonexistent/tend-live-tour-data",
 }
 
 
 def sandbox_exports() -> dict[str, str]:
     exports = {}
     for line in subprocess.run(
-        ["bash", "scripts/muxa-sandbox.sh", "env", "--name", SANDBOX],
+        ["bash", "scripts/tend-sandbox.sh", "env", "--name", SANDBOX],
         capture_output=True, text=True,
     ).stdout.splitlines():
         if line.startswith("export ") and "=" in line:
             key, _, value = line[len("export "):].partition("=")
             exports[key] = value.split(':"$PATH"')[0].strip("'")
-    if "MUXA_SOCKET" in exports:
+    if "TEND_SOCKET" in exports:
         SANDBOX_EXPORTS.clear()
         SANDBOX_EXPORTS.update(exports)
     return dict(SANDBOX_EXPORTS) or dict(SEALED)
@@ -216,16 +216,16 @@ def sandbox_env() -> dict[str, str]:
     It never falls back to the caller's own daemon."""
     env = dict(os.environ)
     env.update(sandbox_exports())
-    env["TMUX"] = env.get("MUXA_SANDBOX_TMUX_ENV", "")
+    env["TMUX"] = env.get("TEND_SANDBOX_TMUX_ENV", "")
     env["TMUX_PANE"] = tmux("display-message", "-p", "#{pane_id}").stdout.strip()
     return env
 
 
-def sandbox_muxa(muxa: str, *args: str) -> str:
-    """Run muxa as the learner's pane, which is the only origin the daemon
+def sandbox_tend(tend: str, *args: str) -> str:
+    """Run tend as the learner's pane, which is the only origin the daemon
     accepts for a mailbox query."""
     return subprocess.run(
-        [muxa, *args], capture_output=True, text=True, env=sandbox_env()
+        [tend, *args], capture_output=True, text=True, env=sandbox_env()
     ).stdout
 
 
@@ -346,7 +346,7 @@ def nothing_left_behind(report: Report) -> None:
     report.check("no daemon survives", strays == "", strays)
 
 
-def escape_hatch(muxa: str, args, report: "Report") -> int:
+def escape_hatch(tend: str, args, report: "Report") -> int:
     """Issue #76 was a gate with no way around it. This checks the live tour
     cannot repeat that: `--no-quiz` offers the way past from the first step, and
     F12 walks the whole tour without the learner doing any of it.
@@ -354,7 +354,7 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
     Skipping has to leave the world consistent too — the agents move into a pane
     the learner split, and there has to be one for them to move into."""
     print("escape hatch")
-    terminal = Terminal(muxa, args.lang, no_quiz=True)
+    terminal = Terminal(tend, args.lang, no_quiz=True)
     try:
         report.check("step 1 is showing", wait_step(terminal, 1), failure_detail(terminal))
         report.check(
@@ -377,7 +377,7 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
         # attached. Step 1 is the single step outside tmux, and its way past is
         # that it is a plain command.
         wait(terminal, "the learner's shell", lambda: PROMPT in terminal.text(), STEP_DEADLINE)
-        terminal.send(b"tmux new-session -s muxa-onboarding\r")
+        terminal.send(b"tmux new-session -s tend-onboarding\r")
         report.check("step 1 done for real", wait_step(terminal, 2), failure_detail(terminal))
 
         target = 3
@@ -419,7 +419,7 @@ def escape_hatch(muxa: str, args, report: "Report") -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--muxa", default=os.environ.get("MUXA_BIN", "target/debug/muxa"))
+    parser.add_argument("--tend", default=os.environ.get("TEND_BIN", "target/debug/tend"))
     parser.add_argument("--lang", default="en")
     parser.add_argument(
         "--mode",
@@ -428,13 +428,13 @@ def main() -> int:
         help="tour: type a learner's commands. skip: use the escape hatch instead.",
     )
     args = parser.parse_args()
-    muxa = os.path.abspath(args.muxa)
+    tend = os.path.abspath(args.tend)
 
     report = Report()
     if args.mode == "skip":
-        return escape_hatch(muxa, args, report)
+        return escape_hatch(tend, args, report)
 
-    terminal = Terminal(muxa, args.lang)
+    terminal = Terminal(tend, args.lang)
     try:
         print("act I — tmux")
         report.check(
@@ -459,7 +459,7 @@ def main() -> int:
         # The step is printed before the tour starts the learner's shell, so
         # having seen it is not yet having somewhere to type.
         wait(terminal, "the learner's shell", lambda: PROMPT in terminal.text(), STEP_DEADLINE)
-        terminal.send(b"tmux new-session -s muxa-onboarding\r")
+        terminal.send(b"tmux new-session -s tend-onboarding\r")
         report.check("2  creating a session", wait_step(terminal, 2), failure_detail(terminal))
         report.check("2  the step confirms what just happened", "✓" in banner(), banner())
 
@@ -510,7 +510,7 @@ def main() -> int:
         terminal.send(b"tmux ls\r")
         report.check("6  running tmux ls", wait_step(terminal, 6), failure_detail(terminal))
 
-        terminal.send(b"tmux attach -t muxa-onboarding\r")
+        terminal.send(b"tmux attach -t tend-onboarding\r")
         report.check("7  reattaching", wait_step(terminal, 7), failure_detail(terminal))
 
         terminal.send(b"\x02%")
@@ -528,8 +528,8 @@ def main() -> int:
             failure_detail(terminal),
         )
 
-        print("act II — muxa")
-        # A bare Enter, not a typed command: `claude` is neither tmux nor muxa,
+        print("act II — tend")
+        # A bare Enter, not a typed command: `claude` is neither tmux nor tend,
         # and the sandbox only pretends to have it. The tour brings the agents
         # up in response.
         terminal.send(b"\r")
@@ -551,7 +551,7 @@ def main() -> int:
         # Three anonymous boxes make the mailbox steps unreadable, so each pane
         # says who it is on its own border.
         titles = tmux(
-            "list-panes", "-t", "muxa-onboarding:", "-F", "#{pane_title}"
+            "list-panes", "-t", "tend-onboarding:", "-F", "#{pane_title}"
         ).stdout
         report.check(
             "9  every pane says who it is",
@@ -566,12 +566,12 @@ def main() -> int:
             tmux("display-message", "-p", "#{window_zoomed_flag}").stdout.strip() == "0",
             tmux("display-message", "-p", "#{window_zoomed_flag}").stdout,
         )
-        # The learner's pane has to fit `muxa watch` and the agents' have to fit
+        # The learner's pane has to fit `tend watch` and the agents' have to fit
         # their own frames; on a 200-column window both sides clear that easily,
         # and the point of the check is that neither was starved to zero.
         visible = [
             int(w) for w in tmux(
-                "list-panes", "-t", "muxa-onboarding:", "-F", "#{pane_width}"
+                "list-panes", "-t", "tend-onboarding:", "-F", "#{pane_width}"
             ).stdout.split()
         ]
         report.check(
@@ -592,10 +592,10 @@ def main() -> int:
             tmux("list-windows", "-a", "-F", "#{window_name}").stdout.split(),
         )
 
-        terminal.send(b"muxa watch\r")
+        terminal.send(b"tend watch\r")
         report.check("10  running watch", wait_step(terminal, 10), failure_detail(terminal))
 
-        # Watch is the entry point the rest of muxa hangs off, so the step it
+        # Watch is the entry point the rest of tend hangs off, so the step it
         # opens has to name its keys — the tour cannot see them pressed.
         explains_keys = {"en": "j/k move", "ko": "j/k 이동"}[args.lang]
         report.check(
@@ -625,7 +625,7 @@ def main() -> int:
             ),
             title_text(),
         )
-        terminal.send(b"muxa attend\r")
+        terminal.send(b"tend attend\r")
         report.check("12  attend", wait_step(terminal, 12), failure_detail(terminal))
 
         explains_return = {"en": "pane you were in", "ko": "직전에 있던 pane"}[args.lang]
@@ -644,19 +644,19 @@ def main() -> int:
             "13  back in your own pane", wait_step(terminal, 13), failure_detail(terminal)
         )
 
-        terminal.send(b'muxa msg send @claude "how far along?"\r')
+        terminal.send(b'tend msg send @claude "how far along?"\r')
         report.check("14  messaging a peer", wait_step(terminal, 14), failure_detail(terminal))
 
         report.check(
-            "14  claude replied through muxa on its own",
+            "14  claude replied through tend on its own",
             wait(
                 terminal,
                 "claude's reply",
                 lambda: '"completed"'
-                in sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--json"),
+                in sandbox_tend(tend, "msg", "list", "--mailbox", "sent", "--json"),
                 DAEMON_DEADLINE,
             ),
-            sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--json")[-300:],
+            sandbox_tend(tend, "msg", "list", "--mailbox", "sent", "--json")[-300:],
         )
         # The step tells them `list --full` shows what came back (the default
         # list is metadata only). Reading it the way they will (no `--json`)
@@ -668,24 +668,24 @@ def main() -> int:
                 terminal,
                 "the reply body",
                 lambda: answer
-                in sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--full"),
+                in sandbox_tend(tend, "msg", "list", "--mailbox", "sent", "--full"),
                 DAEMON_DEADLINE,
             ),
-            sandbox_muxa(muxa, "msg", "list", "--mailbox", "sent", "--full")[-300:],
+            sandbox_tend(tend, "msg", "list", "--mailbox", "sent", "--full")[-300:],
         )
-        receipt = sandbox_muxa(muxa, "msg", "send", "@claude", "ping", "--no-reply")
+        receipt = sandbox_tend(tend, "msg", "send", "@claude", "ping", "--no-reply")
         report.check(
             "14  `msg send` answers in one line, not a JSON dump",
             receipt.count("\n") == 1 and receipt.startswith("sent  "),
             receipt[:200],
         )
 
-        terminal.send(b"muxa msg list --full\r")
+        terminal.send(b"tend msg list --full\r")
         report.check(
             "15  reading the mailbox", wait_step(terminal, 15), failure_detail(terminal)
         )
 
-        terminal.send(b"muxa msg inbox\r")
+        terminal.send(b"tend msg inbox\r")
         report.check(
             "16  claiming the inbox", wait_step(terminal, 16), failure_detail(terminal)
         )

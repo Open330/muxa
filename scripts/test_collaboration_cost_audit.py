@@ -24,7 +24,7 @@ class CostAuditTests(unittest.TestCase):
             for i, minute in enumerate((1, 2, 20)):
                 for payload in [
                     {"type": "custom_tool_call", "call_id": str(i), "name": "exec",
-                     "input": "text(ALL_TOOLS.filter(x => x.name.includes('muxa')))"},
+                     "input": "text(ALL_TOOLS.filter(x => x.name.includes('tend')))"},
                     {"type": "custom_tool_call_output", "call_id": str(i), "output": "한글"},
                 ]:
                     rows.append({"timestamp": f"2026-10-20T01:{minute:02}:00Z",
@@ -33,7 +33,7 @@ class CostAuditTests(unittest.TestCase):
             claude = root / "claude.jsonl"
             claude.write_text("\n".join(json.dumps(row) for row in [
                 {"timestamp": "2026-10-20T01:01:00Z", "type": "assistant", "message": {"content": [
-                    {"type": "tool_use", "id": "one", "name": "mcp__muxa__muxa_room_context", "input": {}}]}},
+                    {"type": "tool_use", "id": "one", "name": "mcp__tend__tend_room_context", "input": {}}]}},
                 {"timestamp": "2026-10-20T01:01:01Z", "type": "user", "message": {"content": [
                     {"type": "tool_result", "tool_use_id": "one", "content": "private result"}]}},
             ]))
@@ -42,12 +42,12 @@ class CostAuditTests(unittest.TestCase):
             self.assertEqual(report["sessions_scanned"], 2)
             self.assertEqual(report["ipc"], [{"client": "watch", "operation": "list", "calls": 1, "failed": 0}])
             by_tool = {row["tool"]: row for row in report["tool_results"]}
-            discovery = by_tool["exec:muxa-discovery (mixed output)"]
+            discovery = by_tool["exec:tend-discovery (mixed output)"]
             self.assertEqual(discovery["calls"], 3)
             self.assertEqual(discovery["output_bytes"], 18)  # UTF-8, not character count.
             self.assertEqual(discovery["same_result_repeats"], 1)
             self.assertEqual(discovery["same_result_repeat_bytes"], 6)
-            self.assertEqual(by_tool["mcp__muxa__muxa_room_context"]["calls"], 1)
+            self.assertEqual(by_tool["mcp__tend__tend_room_context"]["calls"], 1)
             self.assertNotIn("private result", json.dumps(report))
 
     def test_ipc_metrics_keep_legacy_rows_and_do_not_count_invalid_samples(self):
@@ -148,8 +148,8 @@ class CostAuditTests(unittest.TestCase):
             self.assertTrue(all(row["p95_elapsed_us"] is None for row in shapes))
 
     def test_missing_audit_and_source_mentions_do_not_invent_model_calls(self):
-        self.assertIsNone(audit.muxa_call("Bash", {"command": "rg muxa src/main.rs"}))
-        self.assertIsNone(audit.muxa_call("unrelated_muxa_room_context", {}))
+        self.assertIsNone(audit.tend_call("Bash", {"command": "rg tend src/main.rs"}))
+        self.assertIsNone(audit.tend_call("unrelated_tend_room_context", {}))
         with tempfile.TemporaryDirectory() as directory:
             report = audit.summarize(Path(directory) / "missing", [],
                                      dt.datetime(2026, 10, 20, tzinfo=dt.timezone.utc), 300)

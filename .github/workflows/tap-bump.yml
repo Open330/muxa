@@ -1,6 +1,6 @@
 name: tap-bump
 
-# Keep Open330/homebrew-tap's Formula/muxa.rb pointing at the newest
+# Keep Open330/homebrew-tap's Formula/tend.rb pointing at the newest
 # published release. Never on tag push: the release workflow creates a
 # *draft* whose asset URLs 404 until it is published, and a formula
 # pointing at a 404 is worse than one that is merely stale.
@@ -20,7 +20,7 @@ name: tap-bump
 # GITHUB_TOKEN cannot push to a sibling repo). Preferred: the
 # `HOMEBREW_TAP_DEPLOY_KEY` **organization** secret, the private half of an SSH
 # deploy key with write access on homebrew-tap. The tap serves several Open330
-# projects (aas, agt, barshelf, amux, muxa), so one org-wide key serves every
+# projects (aas, agt, barshelf, amux, tend), so one org-wide key serves every
 # release workflow that publishes there. A deploy key is scoped to that one
 # repo and never expires.
 # Fallback: `TAP_GITHUB_TOKEN`, a fine-grained PAT with Contents read/write.
@@ -79,7 +79,7 @@ jobs:
           gh release download "$tag" --repo "$GITHUB_REPOSITORY" --pattern '*.sha256'
           sum_for() {
             # Sidecar format: "<sha256>  <archive name>" (first field).
-            awk '{print $1; exit}' "muxa-${tag}-$1.sha256"
+            awk '{print $1; exit}' "tend-${tag}-$1.sha256"
           }
           {
             echo "mac_arm=$(sum_for aarch64-apple-darwin)"
@@ -92,10 +92,10 @@ jobs:
           # carries no DMG, and the cask is then left pointing at the last
           # release that had one rather than at a download that 404s.
           version="${{ steps.ref.outputs.version }}"
-          if [ -f "Muxa-${version}.dmg.sha256" ]; then
-            echo "dmg=$(awk '{print $1; exit}' "Muxa-${version}.dmg.sha256")" >> "$GITHUB_OUTPUT"
+          if [ -f "Tend-${version}.dmg.sha256" ]; then
+            echo "dmg=$(awk '{print $1; exit}' "Tend-${version}.dmg.sha256")" >> "$GITHUB_OUTPUT"
           else
-            echo "::notice::release $tag has no Muxa DMG — leaving the cask untouched"
+            echo "::notice::release $tag has no Tend DMG — leaving the cask untouched"
             echo "dmg=" >> "$GITHUB_OUTPUT"
           fi
 
@@ -126,36 +126,36 @@ jobs:
             echo "::notice::Neither HOMEBREW_TAP_DEPLOY_KEY nor TAP_GITHUB_TOKEN is configured — skipping the tap bump. Update Open330/homebrew-tap manually or add a deploy key."
             exit 0
           fi
-          cat > tap/Formula/muxa.rb <<EOF
-          class Muxa < Formula
+          cat > tap/Formula/tend.rb <<EOF
+          class Tend < Formula
             desc "Agent CLI observability and orchestration layer for terminal multiplexers"
-            homepage "https://github.com/Open330/muxa"
+            homepage "https://github.com/Open330/tend"
             version "${VERSION}"
             license "MIT OR Apache-2.0"
 
             on_macos do
               if Hardware::CPU.arm?
-                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-aarch64-apple-darwin.tar.gz"
+                url "https://github.com/Open330/tend/releases/download/v#{version}/tend-v#{version}-aarch64-apple-darwin.tar.gz"
                 sha256 "${MAC_ARM}"
               else
-                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-x86_64-apple-darwin.tar.gz"
+                url "https://github.com/Open330/tend/releases/download/v#{version}/tend-v#{version}-x86_64-apple-darwin.tar.gz"
                 sha256 "${MAC_X86}"
               end
             end
 
             on_linux do
               if Hardware::CPU.arm?
-                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/Open330/tend/releases/download/v#{version}/tend-v#{version}-aarch64-unknown-linux-gnu.tar.gz"
                 sha256 "${LINUX_ARM}"
               else
-                url "https://github.com/Open330/muxa/releases/download/v#{version}/muxa-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
+                url "https://github.com/Open330/tend/releases/download/v#{version}/tend-v#{version}-x86_64-unknown-linux-gnu.tar.gz"
                 sha256 "${LINUX_X86}"
               end
             end
 
             def install
-              bin.install "muxa"
-              bin.install "muxad"
+              bin.install "tend"
+              bin.install "tendd"
             end
 
             # No backticks or unescaped dollar signs in here: this file is
@@ -163,69 +163,69 @@ jobs:
             # as a command and expand the other.
             def caveats
               <<~CAVEATS
-                Upgrading does not replace a muxad that is already running: the
+                Upgrading does not replace a tendd that is already running: the
                 new binary lands on disk, and the live process keeps serving
-                from the old one. This version of muxad notices the swap on its
+                from the old one. This version of tendd notices the swap on its
                 own and re-execs onto the new build within about 30 seconds.
 
                 To pick it up immediately, or after disabling that in
                 [daemon] restart_on_new_binary:
 
-                  muxa daemon restart
+                  tend daemon restart
 
-                Run 'muxa doctor' if anything looks stale; it reports a daemon
+                Run 'tend doctor' if anything looks stale; it reports a daemon
                 whose version has drifted from the CLI's.
               CAVEATS
             end
 
             service do
-              run [opt_bin/"muxad"]
+              run [opt_bin/"tendd"]
               keep_alive true
-              log_path var/"log/muxad.log"
-              error_log_path var/"log/muxad.err.log"
+              log_path var/"log/tendd.log"
+              error_log_path var/"log/tendd.err.log"
             end
 
             test do
-              assert_match version.to_s, shell_output("#{bin}/muxa --version")
+              assert_match version.to_s, shell_output("#{bin}/tend --version")
             end
           end
           EOF
-          # Muxa.app has no self-updater, so `brew upgrade` is the only way an
+          # Tend.app has no self-updater, so `brew upgrade` is the only way an
           # installed app ever moves forward. That is what earns the cask its
           # place; it is not merely a nicer install.
           #
-          # Named muxa-app, not muxa: the tap already ships Formula/muxa.rb,
-          # and a formula and cask of the same name make `brew install muxa`
+          # Named tend-app, not tend: the tap already ships Formula/tend.rb,
+          # and a formula and cask of the same name make `brew install tend`
           # ambiguous.
           if [ -n "${DMG_SHA}" ]; then
           mkdir -p tap/Casks
-          cat > tap/Casks/muxa-app.rb <<EOF
-          cask "muxa-app" do
+          cat > tap/Casks/tend-app.rb <<EOF
+          cask "tend-app" do
             version "${VERSION}"
             sha256 "${DMG_SHA}"
 
-            url "https://github.com/Open330/muxa/releases/download/v#{version}/Muxa-#{version}.dmg"
-            name "Muxa"
-            desc "Native workbench for the muxa agent orchestration daemon"
-            homepage "https://github.com/Open330/muxa"
+            url "https://github.com/Open330/tend/releases/download/v#{version}/Tend-#{version}.dmg"
+            name "Tend"
+            desc "Native workbench for the tend agent orchestration daemon"
+            homepage "https://github.com/Open330/tend"
 
             # No Sparkle in this app: Homebrew is the update path, so leave
             # auto_updates at its default of false.
             depends_on macos: :ventura
 
-            app "Muxa.app"
+            app "Tend.app"
 
-            uninstall quit: "dev.muxa.mac"
+            uninstall quit: "dev.tend.mac"
 
-            # Only what the app alone owns. The muxa CLI shares
-            # ~/Library/Application Support/muxa, config.toml included, and
+            # Only what the app alone owns. The tend CLI shares
+            # ~/Library/Application Support/tend, config.toml included, and
             # removing the app must not take the daemon's configuration with
             # it.
             zap trash: [
-              "~/Library/Caches/dev.muxa.mac",
-              "~/Library/HTTPStorages/dev.muxa.mac",
-              "~/Library/Preferences/dev.muxa.mac.plist",
-              "~/Library/Saved Application State/dev.muxa.mac.savedState",
+              "~/Library/Caches/dev.tend.mac",
+              "~/Library/HTTPStorages/dev.tend.mac",
+              "~/Library/Preferences/dev.tend.mac.plist",
+              "~/Library/Saved Application State/dev.tend.mac.savedState",
             ]
           end
           EOF
@@ -233,12 +233,12 @@ jobs:
           cd tap
           # --porcelain, not `git diff`: the cask can be a file that did not
           # exist in this clone, and a plain diff does not see an untracked one.
-          git add -- Formula/muxa.rb Casks 2>/dev/null || git add -- Formula/muxa.rb
+          git add -- Formula/tend.rb Casks 2>/dev/null || git add -- Formula/tend.rb
           if [ -z "$(git status --porcelain)" ]; then
             echo "tap already up to date"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "muxa ${VERSION}"
+          git commit -m "tend ${VERSION}"
           git push

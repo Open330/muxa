@@ -1,6 +1,6 @@
 # Agent runtime 구조 검토와 통합 개선 계획
 
-기준: muxa `78f3e148ad9434af309205c7a09b27e1c461dc17`에서 시작한 개선 계획.
+기준: tend `78f3e148ad9434af309205c7a09b27e1c461dc17`에서 시작한 개선 계획.
 아래 타입·설정·명령은 구현 완료가 표시되지 않은 한 제안이다.
 
 실행 소유권·영속 명령·실행 식별자를 보강한 뒤 권한 프로필, 완료 검증,
@@ -55,7 +55,7 @@ takeover, 읽지 않는 클라이언트의 쓰기 정체를 다룬다. 단순히
 
 추가 점검에서는 한 host의 명령 큐가 포화되면 공유 router까지 대기하던 경로를
 제거했다. 해당 요청에 재시도 오류를 반환하며, 다른 host의 요청은 계속 전달한다.
-조회 비용 비교는 `cargo bench -p muxa --bench runtime_reads`로 재현할 수 있다.
+조회 비용 비교는 `cargo bench -p tend --bench runtime_reads`로 재현할 수 있다.
 전체 점검 범위와 남은 측정 항목은 [성능 점검 기록](PERFORMANCE_REVIEW.ko.md)에 정리한다.
 
 ## 유지할 구조
@@ -74,17 +74,17 @@ takeover, 읽지 않는 클라이언트의 쓰기 정체를 다룬다. 단순히
 
 `work_control.rs`는 실제 reconciliation을 CLI가 소유한다고 명시한다.
 daemon의 Work 요청은 CLI를 실행하고, CLI는 다시 daemon IPC로 상태를 갱신한다.
-daemon의 pipeline reconciler도 `muxa work reconcile --all`을 실행한다.
+daemon의 pipeline reconciler도 `tend work reconcile --all`을 실행한다.
 
-- 근거: [work_control.rs](../../crates/muxa/src/work_control.rs),
-  [work_up.rs](../../crates/muxa-cli/src/work_up.rs),
-  [pipeline_reconciler.rs](../../crates/muxad/src/pipeline_reconciler.rs).
+- 근거: [work_control.rs](../../crates/tend/src/work_control.rs),
+  [work_up.rs](../../crates/tend-cli/src/work_up.rs),
+  [pipeline_reconciler.rs](../../crates/tendd/src/pipeline_reconciler.rs).
 - 현재 코드를 재사용한다는 장점은 있다. 그러나 명령의 생명주기, 취소,
   배포된 CLI 버전, 재시도 책임이 여러 계층에 걸친다.
 - 기존 background reconciler는 `.output().await`에 명시적 timeout이 없었다.
   첫 변경에서 공통 bounded runner와 종료 시 취소를 적용했다. 실행 정책을
   CLI가 소유하는 구조는 그대로이므로 service 경계 정리는 후속 작업이다.
-- 개선: `muxa` library 내부 runtime service가 결정과 실행을 소유하고,
+- 개선: `tend` library 내부 runtime service가 결정과 실행을 소유하고,
   CLI/MCP/웹/Mac은 같은 명령 API를 사용한다. tmux subprocess 자체는 정상적인
   backend 경계로 남긴다. 첫 단계부터 별도 서비스나 crate를 늘릴 필요는 없다.
 
@@ -100,9 +100,9 @@ Work snapshot의 execution identity는 host/socket/session/window로 구성된�
 mailbox에 run_id 필드는 있지만, pipeline 실행 전체를 연결하는 독립적 Run/Attempt
 이력과 동일한 것은 아니다.
 
-- 근거: [ipc.rs](../../crates/muxa/src/ipc.rs)의 `WorkUpManager`,
-  [pipeline_run.rs](../../crates/muxa/src/pipeline_run.rs)의 `Inner`, `register`,
-  [work.rs](../../crates/muxa/src/work.rs)의 `ExecutionIdentity`.
+- 근거: [ipc.rs](../../crates/tend/src/ipc.rs)의 `WorkUpManager`,
+  [pipeline_run.rs](../../crates/tend/src/pipeline_run.rs)의 `Inner`, `register`,
+  [work.rs](../../crates/tend/src/work.rs)의 `ExecutionIdentity`.
 - 개선: 영속 `run_id`, 단계별 `attempt_id`, 명령별 `operation_id`를 구분한다.
   generation은 낡은 결과를 거부하는 용도로 유지하고 식별자의 대체물로 쓰지 않는다.
 - Work 시작 재호출은 활성 Run으로 수렴한다. 명시적 새 실행은 새 Run,
@@ -118,7 +118,7 @@ mailbox에 run_id 필드는 있지만, pipeline 실행 전체를 연결하는 �
 뒤 순서대로 실행한다. 동일 generation에서 이전 실행자가 느리게 살아 있는 동안
 예약이 재획득되면, 이전 report를 구별할 수 없는 구조다.
 
-- 근거: [pipeline_run.rs](../../crates/muxa/src/pipeline_run.rs)의
+- 근거: [pipeline_run.rs](../../crates/tend/src/pipeline_run.rs)의
   `CLAIM_LEASE_SECONDS`, `claim_ready`, `report`, `claimable`.
 - 기존 `recover_unreported_alias`는 생성 후 report 전에 죽은 pane을 재발견한다.
   따라서 중복 방지와 복구가 전혀 없다는 평가는 틀리다.
@@ -136,9 +136,9 @@ mailbox에 run_id 필드는 있지만, pipeline 실행 전체를 연결하는 �
 실행 여부를 확인한 뒤 완료로 기록하며 검증 명령을 실행하지 않는다.
 관리형 런처는 주요 provider에 권한 우회 플래그를 기본 추가한다.
 
-- 근거: [work_pipeline_spec.rs](../../crates/muxa/src/work_pipeline_spec.rs),
-  [pipeline_run.rs](../../crates/muxa/src/pipeline_run.rs)의 `done`,
-  [agent_launch.rs](../../crates/muxa-cli/src/agent_launch.rs)의 `native_launch`.
+- 근거: [work_pipeline_spec.rs](../../crates/tend/src/work_pipeline_spec.rs),
+  [pipeline_run.rs](../../crates/tend/src/pipeline_run.rs)의 `done`,
+  [agent_launch.rs](../../crates/tend-cli/src/agent_launch.rs)의 `native_launch`.
 - 개선: 기존 TOML의 agent 형식은 유지하되 내부에 AgentAttempt와
   VerificationAttempt를 구분한다. 초기에는 agent에 딸린 선택적 검증이면 충분하다.
   범용 workflow DSL은 만들지 않는다.
@@ -169,7 +169,7 @@ mailbox에는 이미 thread·parent·run·artifact가 있으므로 새 메시지
 CLI / MCP / Watch / Web / Mac
               │ 같은 명령·조회 계약
               ▼
-       muxad RuntimeService
+       tendd RuntimeService
        ├─ 실행 정책 / provider capabilities / 검증
        ├─ 영속 command·run·attempt·event 저장소
        └─ bounded executor / 복구 / 취소
@@ -219,7 +219,7 @@ identity를 사용하고 코드 검증 보장 범위를 별도로 표시한다.
 
 같은 checkout이 실행 중 바뀌면 결과를 현재 코드의 성공으로 승격하지 않는다.
 실행 전후 fingerprint 비교만으로 중간 변경이 전혀 없었다고 증명할 수는 없다.
-초기 strict 검증은 해당 checkout의 muxa 관리 writer를 멈춘 상태 또는 별도 snapshot에서
+초기 strict 검증은 해당 checkout의 tend 관리 writer를 멈춘 상태 또는 별도 snapshot에서
 실행하고, 외부 writer까지 통제하지 못한 live 검증은 그 한계를 결과에 남긴다.
 강한 보장이 필요한 snapshot 검증은 원본 dirty 변경과 필요한 untracked 입력을 포함한
 정확한 snapshot 생성 규칙을 먼저 정의한다.

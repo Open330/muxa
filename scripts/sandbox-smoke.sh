@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Lifecycle test for scripts/muxa-sandbox.sh.
+# Lifecycle test for scripts/tend-sandbox.sh.
 #
 #   scripts/sandbox-smoke.sh
 #
@@ -14,19 +14,19 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SANDBOX="$SCRIPT_DIR/muxa-sandbox.sh"
-NAME=muxa-smoke
+SANDBOX="$SCRIPT_DIR/tend-sandbox.sh"
+NAME=tend-smoke
 ROOT=/tmp/$NAME-sandbox
-PIDFILE=$ROOT/muxad.pid
+PIDFILE=$ROOT/tendd.pid
 SANDBOX_TMUX_SOCKET=$ROOT/tmux.sock
-CUSTOM_MUXAD=/tmp/$NAME-muxad-review
+CUSTOM_TENDD=/tmp/$NAME-tendd-review
 
 # The suite deliberately runs inside whatever the caller is sitting in, so the
 # nesting refusal has to be waived for every call except the one testing it.
-# `--extra-path` puts the freshly built `muxa` on the sandbox PATH. Without it
-# the isolation checks below reach for whatever `muxa` the host happens to have
+# `--extra-path` puts the freshly built `tend` on the sandbox PATH. Without it
+# the isolation checks below reach for whatever `tend` the host happens to have
 # installed, which passes on a developer machine and fails on a clean runner —
-# and a suite that only works where muxa is already installed is testing the
+# and a suite that only works where tend is already installed is testing the
 # wrong thing.
 sb() { # <command> [args…]
   local command=$1
@@ -56,7 +56,7 @@ cleanup() {
     wait "$innocent_pid" 2>/dev/null || true
   fi
   sb down >/dev/null 2>&1 || true
-  rm -f "$CUSTOM_MUXAD"
+  rm -f "$CUSTOM_TENDD"
   if [ "$foreign_root_created" -eq 1 ]; then
     rm -f "$ROOT/sentinel"
     rmdir "$ROOT" 2>/dev/null || true
@@ -101,11 +101,11 @@ echo "isolation"
 env_output=$(sb env 2>/dev/null)
 
 # Fail closed. `eval ""` is not a no-op here — it leaves the caller's real
-# MUXA_SOCKET and real tmux in place, so an isolation suite that evaluated an
+# TEND_SOCKET and real tmux in place, so an isolation suite that evaluated an
 # empty `env` would go on to inspect the host fleet and report it as isolated.
 if [ -z "$env_output" ]; then
   no "env prints exports" "nothing to evaluate; skipping the isolation checks"
-  no "MUXA_SOCKET points at the sandbox" "no env"
+  no "TEND_SOCKET points at the sandbox" "no env"
   no "the tmux shim sees only the sandbox server" "no env"
   no "the sandbox daemon answers, with an empty fleet" "no env"
 else
@@ -115,24 +115,24 @@ else
   # able to reach the caller's daemon or the caller's tmux server.
   isolation=$(
     # A consumer may inherit an explicit multi-host selection. Sandbox wins.
-    export MUXA_HOSTS=tmux,cmux,herdr
-    export MUXA_HOST=cmux
+    export TEND_HOSTS=tmux,cmux,herdr
+    export TEND_HOST=cmux
     eval "$env_output"
-    printf 'hosts=%s/%s\n' "$MUXA_HOSTS" "$MUXA_HOST"
-    printf 'server_hosts=%s\n' "$(tmux show-environment -g MUXA_HOSTS)"
-    printf 'socket=%s\n' "$MUXA_SOCKET"
+    printf 'hosts=%s/%s\n' "$TEND_HOSTS" "$TEND_HOST"
+    printf 'server_hosts=%s\n' "$(tmux show-environment -g TEND_HOSTS)"
+    printf 'socket=%s\n' "$TEND_SOCKET"
     printf 'sessions=%s\n' "$(tmux list-sessions -F '#{session_name}' 2>/dev/null | tr '\n' ',')"
-    printf 'agents=%s\n' "$(muxa status 2>&1 | head -1)"
+    printf 'agents=%s\n' "$(tend status 2>&1 | head -1)"
   )
 
   case "$isolation" in
-    *'hosts=tmux/tmux'*'server_hosts=MUXA_HOSTS=tmux'*) ok "sandbox pins both consumers and pane hosts to tmux" ;;
+    *'hosts=tmux/tmux'*'server_hosts=TEND_HOSTS=tmux'*) ok "sandbox pins both consumers and pane hosts to tmux" ;;
     *) no "sandbox pins both consumers and pane hosts to tmux" "$isolation" ;;
   esac
 
   case "$isolation" in
-    *"socket=$ROOT/muxad.sock"*) ok "MUXA_SOCKET points at the sandbox" ;;
-    *) no "MUXA_SOCKET points at the sandbox" "$isolation" ;;
+    *"socket=$ROOT/tendd.sock"*) ok "TEND_SOCKET points at the sandbox" ;;
+    *) no "TEND_SOCKET points at the sandbox" "$isolation" ;;
   esac
 
   case "$isolation" in
@@ -162,10 +162,10 @@ check "down reaps the stray" 0 $?
 sb status >/dev/null 2>&1
 check "status is 'absent' after down" 4 $?
 
-cp "$REPO_DIR/target/debug/muxad" "$CUSTOM_MUXAD"
-chmod +x "$CUSTOM_MUXAD"
+cp "$REPO_DIR/target/debug/tendd" "$CUSTOM_TENDD"
+chmod +x "$CUSTOM_TENDD"
 sb up >/dev/null 2>&1
-sb daemon --muxad "$CUSTOM_MUXAD" >/dev/null 2>&1
+sb daemon --tendd "$CUSTOM_TENDD" >/dev/null 2>&1
 custom_pid=$(cat "$PIDFILE")
 rm -f "$PIDFILE"
 sb down >/dev/null 2>&1
@@ -175,7 +175,7 @@ if kill -0 "$custom_pid" 2>/dev/null; then
 else
   ok "the custom-named daemon is gone"
 fi
-rm -f "$CUSTOM_MUXAD"
+rm -f "$CUSTOM_TENDD"
 
 # --------------------------------------------------------------------------
 echo "nothing left behind"

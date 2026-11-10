@@ -1,6 +1,6 @@
 # Topology contract
 
-Muxa has one canonical runtime hierarchy:
+Tend has one canonical runtime hierarchy:
 
 ```text
 TopologySnapshot

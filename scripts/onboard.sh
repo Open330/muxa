@@ -1,15 +1,15 @@
 #!/bin/sh
-# Run the real Muxa onboarding without installing Muxa.
+# Run the real Tend onboarding without installing Tend.
 #
-#   curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/onboard.sh | sh
 #
 # Forward flags with `sh -s --`:
 #
-#   curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
-#   curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
+#   curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/onboard.sh | sh -s -- --lang ko
+#   curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/onboard.sh | sh -s -- --print
 #
 # This script fetches the release binary for the host into a temporary
-# directory, verifies its published SHA-256, runs `muxa onboard`, and deletes
+# directory, verifies its published SHA-256, runs `tend onboard`, and deletes
 # the temporary copy on exit. It installs no daemon, config, or PATH entry; the
 # live tour's isolated tmux server and sandbox are also removed when it exits.
 
@@ -24,7 +24,7 @@ usage() {
     'Usage: onboard.sh [--lang auto|en|ko] [--print] [--no-quiz]' \
     '' \
     'Downloads a checksum-verified release binary to a temporary directory,' \
-    'runs the real muxa onboard, then deletes the binary. Nothing is installed.' \
+    'runs the real tend onboard, then deletes the binary. Nothing is installed.' \
     '' \
     'Options:' \
     '  --lang auto|en|ko  Display language (default: detect from locale)' \
@@ -34,7 +34,7 @@ usage() {
 }
 
 fail() {
-  printf 'muxa-onboard: %s\n' "$*" >&2
+  printf 'tend-onboard: %s\n' "$*" >&2
   exit 1
 }
 
@@ -62,7 +62,7 @@ case "$language" in
   *) fail "unsupported language: $language (expected auto, en, or ko)" ;;
 esac
 
-release_repo=${MUXA_ONBOARD_REPO:-Open330/muxa}
+release_repo=${TEND_ONBOARD_REPO:-Open330/tend}
 download_dir=
 
 detect_release_target() {
@@ -111,7 +111,7 @@ run_release_onboarding() {
   command -v mktemp >/dev/null 2>&1 || return 1
   target=$(detect_release_target) || return 1
 
-  version=${MUXA_ONBOARD_VERSION:-}
+  version=${TEND_ONBOARD_VERSION:-}
   if [ -z "$version" ]; then
     version=$(fetch_url "https://api.github.com/repos/$release_repo/releases/latest" 2>/dev/null |
       sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1) || return 1
@@ -121,10 +121,10 @@ run_release_onboarding() {
   download_dir=$(mktemp -d 2>/dev/null) || { download_dir=; return 1; }
   trap 'rm -rf "$download_dir"' EXIT INT TERM HUP
 
-  release=muxa-$version-$target
+  release=tend-$version-$target
   base=https://github.com/$release_repo/releases/download/$version
 
-  printf 'muxa-onboard: fetching muxa %s (%s) — runs from a temp dir, nothing is installed\n' \
+  printf 'tend-onboard: fetching tend %s (%s) — runs from a temp dir, nothing is installed\n' \
     "$version" "$target" >&2
   fetch_url "$base/$release.tar.gz" "$download_dir/$release.tar.gz" || return 1
   fetch_url "$base/$release.sha256" "$download_dir/$release.sha256" || return 1
@@ -132,15 +132,15 @@ run_release_onboarding() {
   published=$(sed -n 's/^\([0-9a-fA-F]\{64\}\).*/\1/p' "$download_dir/$release.sha256" | head -1)
   actual=$(sha256_of "$download_dir/$release.tar.gz") || return 1
   if [ -z "$published" ] || [ "$published" != "$actual" ]; then
-    printf 'muxa-onboard: checksum mismatch for %s; refusing to run it\n' "$release.tar.gz" >&2
+    printf 'tend-onboard: checksum mismatch for %s; refusing to run it\n' "$release.tar.gz" >&2
     return 1
   fi
 
   tar -xzf "$download_dir/$release.tar.gz" -C "$download_dir" || return 1
-  muxa_bin=$download_dir/$release/muxa
-  [ -x "$muxa_bin" ] || muxa_bin=$(find "$download_dir" -type f -name muxa 2>/dev/null | head -1)
-  [ -n "$muxa_bin" ] && [ -f "$muxa_bin" ] || return 1
-  chmod +x "$muxa_bin" 2>/dev/null || :
+  tend_bin=$download_dir/$release/tend
+  [ -x "$tend_bin" ] || tend_bin=$(find "$download_dir" -type f -name tend 2>/dev/null | head -1)
+  [ -n "$tend_bin" ] && [ -f "$tend_bin" ] || return 1
+  chmod +x "$tend_bin" 2>/dev/null || :
 
   # No `--tour`: this runs whichever release is published, and every release
   # up to and including v0.8.36 predates the flag and exits on it — pinning
@@ -155,16 +155,16 @@ run_release_onboarding() {
   # terminal from which the live tour must read commands.
   status=0
   if ( : </dev/tty ) 2>/dev/null; then
-    "$muxa_bin" "$@" </dev/tty || status=$?
+    "$tend_bin" "$@" </dev/tty || status=$?
   elif [ "$print_only" -eq 1 ]; then
-    "$muxa_bin" "$@" || status=$?
+    "$tend_bin" "$@" || status=$?
   else
     # Nowhere to hand the tour a terminal — a container started without one,
     # a CI step, a hook. The live tour would open a shell that reads EOF and
     # exits before the first step, so give the written guide, which teaches
     # the same actions and needs only stdout.
-    printf 'muxa-onboard: no terminal available; showing the written guide instead\n' >&2
-    "$muxa_bin" "$@" --print || status=$?
+    printf 'tend-onboard: no terminal available; showing the written guide instead\n' >&2
+    "$tend_bin" "$@" --print || status=$?
   fi
   discard_download
   exit "$status"
@@ -172,5 +172,5 @@ run_release_onboarding() {
 
 if ! run_release_onboarding; then
   discard_download
-  fail 'could not download and verify a release for this host; see https://github.com/Open330/muxa/releases/latest'
+  fail 'could not download and verify a release for this host; see https://github.com/Open330/tend/releases/latest'
 fi

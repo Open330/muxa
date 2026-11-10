@@ -1,11 +1,11 @@
-# Muxa Work domain
+# Tend Work domain
 
 The dashboard and execution topology use related but different identities.
-Muxa owns the logical work model; tmux supplies an execution surface.
+Tend owns the logical work model; tmux supplies an execution surface.
 
 ```text
 Workspace
-└── Work (muxa-owned outcome)
+└── Work (tend-owned outcome)
     ├── External issue reference (optional: Linear, GitHub, Jira, ...)
     └── Run (execution attempt)
         └── Agent session
@@ -31,24 +31,24 @@ Workspace
 - External issue status never moves the local board stage automatically.
 - Agent waiting/error states produce signals without replacing the local stage.
 - Unmanaged windows remain `Unlinked executions` and are inspected through
-  execution-focused surfaces such as `muxa watch`.
+  execution-focused surfaces such as `tend watch`.
 
 ## Current tmux compatibility
 
 Managed tmux currently binds one workspace to a session, one active Work run to
 a window, and agent sessions to panes. This is a lifecycle policy and storage
 adapter, not the logical cardinality: the snapshot and dashboards already allow
-multiple Runs under one Work. Existing `@muxa_work_id` metadata and v1 dashboard
+multiple Runs under one Work. Existing `@tend_work_id` metadata and v1 dashboard
 records are migrated rather than discarded.
 
-`muxa work up ENG-1234` may use the external display key as the default Work ID
+`tend work up ENG-1234` may use the external display key as the default Work ID
 for convenience. The resulting Work and the Linear/GitHub/Jira issue remain
 separate objects: the Work owns its local stage and goal, while the external
 reference owns provider status and URL.
 
 ## 한국어 요약
 
-- `Work`는 Muxa가 소유하는 결과 단위이며 ticket/issue 자체가 아닙니다.
+- `Work`는 Tend가 소유하는 결과 단위이며 ticket/issue 자체가 아닙니다.
 - Linear/GitHub/Jira 항목은 Work에 연결되는 선택적 외부 참조입니다.
 - tmux session/window/pane은 Workspace/Work/Agent의 영구 정체성이 아니라 현재
   Run을 실행하기 위한 binding입니다.

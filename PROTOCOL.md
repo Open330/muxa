@@ -1,14 +1,14 @@
-# muxa wire protocol
+# tend wire protocol
 
 This document describes the wire protocol spoken between
-`muxa` (the CLI), third-party adapters, and `muxad` (the daemon).
+`tend` (the CLI), third-party adapters, and `tendd` (the daemon).
 
-Current version: **`6`** (defined in `crates/muxa/src/event.rs`).
+Current version: **`6`** (defined in `crates/tend/src/event.rs`).
 
 ## Stability
 
 Pre-1.0 (current): the wire protocol may change between **minor** releases
-(0.x → 0.x+1). Adapters should pin a specific muxa version while we iterate
+(0.x → 0.x+1). Adapters should pin a specific tend version while we iterate
 on the schema; the constants below (`PROTOCOL_VERSION`,
 `HISTORY_SCHEMA_VERSION`, `STATE_SCHEMA_VERSION`) are negotiation tokens, not
 stable API.
@@ -21,7 +21,7 @@ Post-1.0: the protocol is stable within a major version; breaking changes bump
 ## Transport
 
 - A local, owner-private, full-duplex byte stream addressed by a path that
-  both ends derive independently. `crates/muxa/src/transport.rs` owns the
+  both ends derive independently. `crates/tend/src/transport.rs` owns the
   platform-specific half; nothing above it names a socket type.
 - Encoding: **line-delimited JSON** (one UTF-8 JSON object per line, `\n`
   terminated). `serde_json` does not emit raw newlines inside values, so
@@ -34,8 +34,8 @@ request/response pairs over the same stream.
 On Unix, the supported host:
 
 - Unix-domain stream socket.
-- Default path: `$XDG_RUNTIME_DIR/muxa.sock`, falling back to
-  `/tmp/muxa-<uid>.sock`.
+- Default path: `$XDG_RUNTIME_DIR/tend.sock`, falling back to
+  `/tmp/tend-<uid>.sock`.
 - Permissions: `0600` (owner-only). The daemon `chmod`s after bind.
 - Peer credentials via `SO_PEERCRED`; collaboration provenance records them
   as `caller_pid` / `caller_uid` / `caller_gid`.
@@ -43,7 +43,7 @@ On Unix, the supported host:
 On Windows (a native host through rmux — see `docs/WINDOWS.md`) the same
 protocol runs over a named pipe. The differences are not cosmetic:
 
-- Address: `\\.\pipe\muxa-<stem>-<digest>`, derived from the same path.
+- Address: `\\.\pipe\tend-<stem>-<digest>`, derived from the same path.
   `$XDG_RUNTIME_DIR` being unset, that path defaults under `%LOCALAPPDATA%`.
 - Exclusivity comes from `first_pipe_instance`, not from a bind failing on an
   existing file. `reject_remote_clients` keeps the pipe off SMB.
@@ -57,13 +57,13 @@ protocol runs over a named pipe. The differences are not cosmetic:
 
 Physical-host Fleet uses a second, versioned JSON-lines protocol over an
 OpenSSH stdio channel. It is intentionally not a network service. The remote
-`muxa relay --stdio` announces a stable node UUID and capabilities, then
+`tend relay --stdio` announces a stable node UUID and capabilities, then
 exchanges full snapshots, revisioned transitions/keepalives, exact capture,
 prompt, or collaboration/mailbox requests, results, errors, and explicit
 resync markers. Collaboration operations are advertised by the optional
 `collaboration` capability; exact durable reply lookup additionally requires
 `collaboration_get`, so mixed-version controllers reject it before sending an
-unsupported frame. Running `muxa work …` on the remote node is advertised by
+unsupported frame. Running `tend work …` on the remote node is advertised by
 the relay capability `work_command`; a controller talking to an older relay
 runs the same argv over a one-shot OpenSSH command instead (see
 [`work_command`](#work-control-work_up-work_up_status-work_command)). See
@@ -72,7 +72,7 @@ separately from this local IPC protocol.
 
 The controller itself is always represented as host `local`. Its snapshot and
 commands use the same `FleetSnapshot`/`FleetOperation` schema and exact pane
-keys, but muxad executes them against its in-process Store/backends without an
+keys, but tendd executes them against its in-process Store/backends without an
 SSH or relay hop. `[fleet] enabled` therefore controls only remote transports.
 
 ## Request
@@ -151,7 +151,7 @@ IPC socket are owner-only (`0600`).
 
 #### `fleet_snapshot`
 
-Read muxad's per-physical-host cache, including the always-present `local`
+Read tendd's per-physical-host cache, including the always-present `local`
 node. `selector` is an optional Kubernetes-style label selector. This
 operation never opens request-scoped SSH.
 
@@ -186,7 +186,7 @@ collaboration mutations are not retried. The collaboration operations are
 `collaboration_claim`, and `collaboration_reply`. `collaboration_get` carries
 both a relay correlation id and the durable collaboration request id; the
 former routes the frame while the latter selects and acknowledges an exact
-reply. Their durable data remains in the selected physical node's muxad rather
+reply. Their durable data remains in the selected physical node's tendd rather
 than being copied into the controller.
 
 ```json
@@ -199,7 +199,7 @@ than being copied into the controller.
 ```
 
 The `work_command` operation (`{ "kind": "work_command", "args": [...],
-"stdin": "..." | null }`) runs an allowlisted `muxa work …` argv on the host
+"stdin": "..." | null }`) runs an allowlisted `tend work …` argv on the host
 and answers through three additive `FleetCommandResult` fields:
 `command_exit_code`, `command_stdout`, `command_stderr`. They are absent on
 every other operation and in replies from a relay that predates the
@@ -210,12 +210,12 @@ and `work_up` with a `host` rather than dispatching it themselves.
 
 Advertised by `work_control_v1` (`work_up`/`work_up_status`) and
 `work_command_v1` (`work_command`, and the `host` field on `work_up`). The
-daemon never reimplements Work: it launches the exact `muxa` binary that
-ships with it (`$MUXA_CLI`, else the sibling of `muxad`, else `muxa` on
-`PATH`) with `MUXA_SOCKET` pinned to its own socket, or, for a Fleet host,
-that host's `muxa`.
+daemon never reimplements Work: it launches the exact `tend` binary that
+ships with it (`$TEND_CLI`, else the sibling of `tendd`, else `tend` on
+`PATH`) with `TEND_SOCKET` pinned to its own socket, or, for a Fleet host,
+that host's `tend`.
 
-`work_up` starts `muxa work up <work> --json --yes …` as a bounded (600 s,
+`work_up` starts `tend work up <work> --json --yes …` as a bounded (600 s,
 2 MiB) asynchronous operation and returns immediately; clients poll
 `work_up_status` with the `operation_id`. The request object carries `work`
 plus optional `external`, `pipeline`, `workspace`, `cwd`, `skill`, `body`,
@@ -265,22 +265,22 @@ exceed 1 MiB. On a remote host, `mode = "observe"` permits only the read-only
   "work_command": { "exit_code": 0, "stdout": "{ … }\n", "stderr": "" } }
 ```
 
-Remote execution has two transports, chosen by muxad per host:
+Remote execution has two transports, chosen by tendd per host:
 
-1. **Relay** — when the connected `muxa relay --stdio` advertises the
+1. **Relay** — when the connected `tend relay --stdio` advertises the
    `work_command` capability, the argv travels as a `work_command` relay
    request and the remote node spawns its own binary
-   (`std::env::current_exe()`, `MUXA_SOCKET` pinned to its daemon) under the
+   (`std::env::current_exe()`, `TEND_SOCKET` pinned to its daemon) under the
    same allowlist and bounds. The relay transport additionally accepts `work
    up`, which is how a remote `work_up` operation travels.
 2. **OpenSSH fallback** — when the relay predates the capability, or no relay
-   is connected (on-demand or offline host), muxad runs
+   is connected (on-demand or offline host), tendd runs
    `ssh -T -o BatchMode=yes -o ClearAllForwardings=yes -o ConnectTimeout=<fleet.connect_timeout_secs>
-   -- <host.ssh> <host.muxa_path> [--socket <host.remote_socket>] 'work' 'options' '--json'`
+   -- <host.ssh> <host.tend_path> [--socket <host.remote_socket>] 'work' 'options' '--json'`
    with every `work …` argument single-quoted for the remote login shell and
    `stdin` forwarded. OpenSSH's own failure (exit 255) is reported as an
-   `error`; any other exit code is the remote `muxa` speaking. The remote host
-   therefore needs a `muxa` that already has the requested subcommand, but
+   `error`; any other exit code is the remote `tend` speaking. The remote host
+   therefore needs a `tend` that already has the requested subcommand, but
    no particular relay version.
 
 Either way the controller re-checks the allowlist and the host's access mode
@@ -373,7 +373,7 @@ never send `hello` keep the legacy strict-match behaviour (any
 non-matching `protocol` is rejected).
 
 ```json
-{ "protocol": 2, "kind": "hello", "client": "muxa/0.6.0" }
+{ "protocol": 2, "kind": "hello", "client": "tend/0.6.0" }
 ```
 
 - `protocol` (required): the version the client wants to speak. Must
@@ -443,7 +443,7 @@ unchanged).
 ## Control methods
 
 These methods let a client **drive** agents rather than only observe them.
-They back muxa's control plane — the `muxa mcp` MCP server exposes each as a
+They back tend's control plane — the `tend mcp` MCP server exposes each as a
 tool so a coding agent can orchestrate the others (see `docs/MCP.md`).
 
 **Safety.** `send_prompt` injects keystrokes into another agent's pane — a
@@ -456,7 +456,7 @@ administrators (its default DACL), so on Windows they hold that access too.
 
 **Pre-1.0 evolution.** These methods are additive (they do not bump
 `PROTOCOL_VERSION`). Like the rest of the pre-1.0 surface they may change
-shape between minor releases; pin a muxa version if you build on them.
+shape between minor releases; pin a tend version if you build on them.
 
 #### `send_prompt`
 
@@ -549,7 +549,7 @@ Response: `{ "ok": true, "protocol": 3, "capture": "<visible pane text>" }`.
 #### Collaboration mailbox
 
 These additive methods back the high-level same-window tools documented in
-`docs/COLLABORATION.md`. `origin` is derived by muxa's CLI/MCP process from
+`docs/COLLABORATION.md`. `origin` is derived by tend's CLI/MCP process from
 `TMUX_PANE` and the tmux socket; the daemon correlates it with live agent and
 pane topology. The default target `peer` is accepted only when exactly one
 other agent occupies the same stable tmux window.
@@ -688,7 +688,7 @@ lagged-marker control frame described below. It defaults **off** so a
 pre-marker client — whose `Transition` parser would choke on the frame and
 abandon push mode — keeps the historical behavior: on overflow the server
 silently continues and the client reconciles via its fallback `snapshot` poll.
-muxa's own client (used by `muxa watch` and `muxa mcp`) sends
+tend's own client (used by `tend watch` and `tend mcp`) sends
 `lagged_markers: true`, because its `TransitionStream` reader understands the
 frame.
 
@@ -701,11 +701,11 @@ tolerated by readers:
   consumed too slowly and the broadcast buffer overflowed, dropping `N`
   transitions. **Emitted only to connections that sent
   `lagged_markers: true`.** The stream continues; the client should reconcile
-  the gap with a fresh `snapshot`. muxa's own `TransitionStream` reader skips
+  the gap with a fresh `snapshot`. tend's own `TransitionStream` reader skips
   this frame automatically.
 
-Used by `muxa watch` (to replace 500 ms polling with push updates) and by
-`muxa mcp`'s `muxa_wait_for_change` tool.
+Used by `tend watch` (to replace 500 ms polling with push updates) and by
+`tend mcp`'s `tend_wait_for_change` tool.
 
 ##### `Transition` schema (in `subscribe` stream)
 
@@ -876,7 +876,7 @@ is gone.
   event; the daemon fills them in from subsequent events.
 - **GC.** Agents in state `stopped` for more than 60 minutes are evicted
   by the daemon's GC sweeper (interval: 60s). The thresholds are
-  hardcoded — they live as `const` in `muxad`, not in config.
+  hardcoded — they live as `const` in `tendd`, not in config.
 
 ---
 
@@ -910,7 +910,7 @@ is gone.
 - Added `collaboration_issue_handle` and the `handle_namespace_v1`
   capability. The daemon becomes the single arbiter of a room's handle
   namespace, because it is the only place that sees all three of its
-  writers at once: the `@muxa_agent_alias` pane option, registered
+  writers at once: the `@tend_agent_alias` pane option, registered
   identities, and handles promised to callers that have not written them
   yet. Allocating anywhere else means allocating from a partial view, which
   is how one room came to answer to `@claude` twice.

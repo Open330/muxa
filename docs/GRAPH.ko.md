@@ -1,16 +1,16 @@
 # 터미널 협업 그래프
 
-`muxa graph`는 현재 터미널에서 session → window → pane 관계와 협업 메시지를
+`tend graph`는 현재 터미널에서 session → window → pane 관계와 협업 메시지를
 탐색하는 TUI다. 브라우저, HTTP 서버, 대시보드 설정이 필요하지 않다. SSH에서도
 같은 명령으로 실행한다.
 
 ```sh
-cargo build -p muxa-cli
-./target/debug/muxa graph
+cargo build -p tend-cli
+./target/debug/tend graph
 ```
 
 기본적으로 최근 메시지 200개를 불러온다. 시작 범위를 바꾸려면
-`muxa graph --limit 500`을 사용한다. `n`으로 이전 기록을 추가로 읽으며 최대
+`tend graph --limit 500`을 사용한다. `n`으로 이전 기록을 추가로 읽으며 최대
 5,000개까지 표시한다. 상단에 불러온 수와 전체 기록 수를 표시한다.
 
 session마다 바깥 영역을 만들고, 그 안에 window별 영역과 pane을 배치한다.
@@ -61,7 +61,7 @@ pane/agent는 녹색이다. 회색 계층선과 메시지 화살표를 함께 �
 새로고침 후에도 유지하며, 고정하지 않은 노드는 주변 연결에 맞춰 부드럽게
 안정화된다. 종료된 pane의 과거 대화도 표시하므로 전체 live pane 목록과는
 다를 수 있다. 기록 경로는 선택한 `--config`의 `[collaboration].path`
-또는 기본 Muxa 데이터 경로를 따른다. 데몬 재시작이나 웹 대시보드 활성화는
+또는 기본 Tend 데이터 경로를 따른다. 데몬 재시작이나 웹 대시보드 활성화는
 필요하지 않다.
 
 좁은 터미널에서는 그래프와 메시지를 위아래로 표시하고, 상세에 포커스를 주면

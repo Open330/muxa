@@ -4,18 +4,18 @@ Status: **Phase 1 + Phase 2 implemented.** Verified against herdr **0.7.4**
 (socket protocol **16**, schema dumped via `herdr api schema --json`).
 
 [herdr](https://herdr.dev) is an agent-native terminal multiplexer. Unlike
-zellij — where muxa's rich path needs a WASM plugin — herdr ships a full
-local socket API out of the box, so muxa gets pane enumeration, captures,
+zellij — where tend's rich path needs a WASM plugin — herdr ships a full
+local socket API out of the box, so tend gets pane enumeration, captures,
 pid maps, focus, *and* herdr's own agent-state detection without installing
 anything into herdr.
 
 ## Why
 
-muxa's positioning is a multiplexer-neutral observability/analytics layer:
+tend's positioning is a multiplexer-neutral observability/analytics layer:
 tmux is the mature backend, zellij has a CLI baseline, herdr is the third
-host. On herdr, muxa keeps its unique value (activity ledger, ACT/WACT,
+host. On herdr, tend keeps its unique value (activity ledger, ACT/WACT,
 stats/report/timeline, prompt history, notifications) while herdr provides
-the pane host and — in Phase 2 — agent-state detection for agents muxa has
+the pane host and — in Phase 2 — agent-state detection for agents tend has
 no hooks for.
 
 ## herdr ground truth (verified locally)
@@ -32,7 +32,7 @@ no hooks for.
   (`{code,message}`).
 - Pane env vars inside panes: `HERDR_ENV=1`, `HERDR_PANE_ID`,
   `HERDR_SOCKET_PATH`, `HERDR_WORKSPACE_ID`, `HERDR_TAB_ID`.
-- Methods muxa uses: `pane.list`, `pane.get`, `pane.read`
+- Methods tend uses: `pane.list`, `pane.get`, `pane.read`
   (`source: visible|recent|recent_unwrapped|detection`),
   `pane.process_info` (shell pid, tty, foreground processes),
   `pane.focus`, `ping`; Phase 2 adds `events.subscribe`. The subscribable
@@ -40,7 +40,7 @@ no hooks for.
   `pane.scroll_changed` — pane create/close are *not* subscribable, so
   pane liveness stays with the reconciler's `observe_panes` polling.
   Phase 2 reverse path (implemented): `pane.report_agent` /
-  `pane.release_agent` push muxa's hook-derived state into herdr's UI.
+  `pane.release_agent` push tend's hook-derived state into herdr's UI.
 - `PaneInfo` (herdr): `pane_id`, `tab_id`, `workspace_id`, `terminal_id`,
   `cwd`, `focused`, `title`, `terminal_title`, `agent`, `agent_status`
   (`idle|working|blocked|done|unknown`), …
@@ -49,7 +49,7 @@ no hooks for.
 ## Pane-id namespace
 
 herdr pane ids are namespaced as **`herdr:<herdr_pane_id>`** everywhere
-inside muxa (registry rows, prompt-history keys, `by_pane` queries),
+inside tend (registry rows, prompt-history keys, `by_pane` queries),
 following the zellij plugin's `zellij:terminal:<id>` precedent. The prefix
 (`backend::herdr::PANE_ID_PREFIX`) is stripped before ids go back over the
 herdr socket. Rationale: no collision with tmux `%N`, and cross-host code
@@ -57,25 +57,25 @@ can tell which host governs a row (see reaping guard below).
 
 ## Phase 1 — pane host parity
 
-1. **Host detection** (`backend/mod.rs`, done): `MUXA_HOST=herdr`
+1. **Host detection** (`backend/mod.rs`, done): `TEND_HOST=herdr`
    override; auto-detect `HERDR_PANE_ID`/`HERDR_ENV`, ordered
    `ZELLIJ` → `HERDR` → `TMUX`. The daemon usually runs outside any
-   host env — set `MUXA_HOST=herdr` in its environment (launchd/systemd
+   host env — set `TEND_HOST=herdr` in its environment (launchd/systemd
    or shell) to observe herdr.
 
    **Nested-host tie-break — one policy, both places.** Env presence
    alone can't tell an inner host from an outer one: a herdr pane launched
    from a tmux shell *inherits* the outer `$TMUX`/`$TMUX_PANE` (empirically
-   verified), and tmux launched inside a herdr pane inherits `$HERDR_*`. muxa
+   verified), and tmux launched inside a herdr pane inherits `$HERDR_*`. tend
    resolves the ambiguity **herdr-wins** — launching herdr from a tmux shell
    is the common migration path, so on a `HERDR_* + TMUX` tie both the host
    detector (`detect_from`) *and* the hook pane-stamper
    (`adapters/hook.rs::host_pane_env`) pick herdr. Keeping the two in lockstep
    is what makes the pane a hook is stamped onto and the backend that observes
    it agree. **Caveat:** the rarer nesting — tmux running *inside* a herdr
-   pane — is misdetected by this default; set **`MUXA_HOST=tmux`** to force it
+   pane — is misdetected by this default; set **`TEND_HOST=tmux`** to force it
    (the override is honored by both `detect_from` and `host_pane_env`;
-   `MUXA_HOST=herdr`/`zellij` force those hosts analogously).
+   `TEND_HOST=herdr`/`zellij` force those hosts analogously).
 2. **`HerdrBackend`** (`backend/herdr.rs`): direct-query `PaneBackend`
    over the socket, tmux-shape (stateless; callers already wrap calls in
    `spawn_blocking`). Per-call connect with ~1s per-read timeout, matching the
@@ -85,7 +85,7 @@ can tell which host governs a row (see reaping guard below).
    (the per-read timeout resets on every line; only the aggregate deadline
    bounds the total).
    - `list_panes` → `pane.list` + per-pane `pane.process_info` to fill
-     `current_command`/`pane_pid`/`tty`. Mapping into muxa `PaneInfo`:
+     `current_command`/`pane_pid`/`tty`. Mapping into tend `PaneInfo`:
      `session` = herdr `workspace_id`, `window_index` = `tab_id`,
      `pane_index` = raw herdr pane id, `current_path` = `cwd`,
      `socket` = `None` (never reuse the tmux-socket identity channel).
@@ -107,7 +107,7 @@ can tell which host governs a row (see reaping guard below).
 3. **Hook correlation** (`adapters/hook.rs`): `host_pane_env()` learns
    `HERDR_PANE_ID` and applies the `herdr:` prefix. `$TMUX` is unset
    inside herdr, so `AgentId.tmux_socket` stays `None` and the
-   `MUXA_TMUX_SOCKET` ingest scope gate passes herdr events untouched
+   `TEND_TMUX_SOCKET` ingest scope gate passes herdr events untouched
    (`event_in_scope_with` treats `None` as in-scope). Do **not** stamp
    `HERDR_SOCKET_PATH` into `tmux_socket` — the gate would canonicalize
    and drop it.
@@ -132,7 +132,7 @@ can tell which host governs a row (see reaping guard below).
    alive by emitting activity; a dead one ages out. The check takes a *set*
    of observing kinds (today always the one active backend) so a future
    multi-host daemon can pass several without changing shape. Note
-   `muxa registry prune` targets *paneless* orphans only — a foreign-host row still
+   `tend registry prune` targets *paneless* orphans only — a foreign-host row still
    carries its `herdr:`/`zellij:` pane id, so this age-out (not `prune`) is
    what clears it.
 5. **CLI attach** (`main.rs jump_to_pane`, done): `HostKind::Herdr` arm →
@@ -146,7 +146,7 @@ can tell which host governs a row (see reaping guard below).
    instead of `tmux list-clients`. The focused workspace becomes a single
    `SessionInfo` with one "attached client", so the *same*
    `apply_sample_report` accounting credits foreground time to it and emits
-   the same ledger intervals + `session-activity.json`. The muxa session key
+   the same ledger intervals + `session-activity.json`. The tend session key
    is the raw `workspace_id` (`w1`), matching `PaneInfo.session` from
    `HerdrBackend::list_panes` so ledger keys line up with pane rows. No
    focused workspace, or an unreachable/absent server, yields an empty
@@ -163,7 +163,7 @@ can tell which host governs a row (see reaping guard below).
    `HumanInteraction` (keypress/scroll) ticks are emitted on herdr hosts —
    only the workspace-foreground observation.
 
-7. **Watch work view** (`muxa-cli/src/watch.rs`, done): the workspace/work
+7. **Watch work view** (`tend-cli/src/watch.rs`, done): the workspace/work
    view sources its "sessions" per host — tmux shells `list-sessions`,
    herdr derives them from `workspace.list`
    (`backend::herdr::herdr_list_workspaces`, the `list_sessions` analog).
@@ -194,7 +194,7 @@ can tell which host governs a row (see reaping guard below).
    drop live tmux panes during a mixed-host migration (they'd vanish from
    `/api/panes` and the timeline); merging keeps both. Both `/api/panes` and
    the timeline handler's pane→session map go through the same refresh, so
-   they agree on herdr. Field mapping reuses the muxa `PaneInfo` the
+   they agree on herdr. Field mapping reuses the tend `PaneInfo` the
    backend already returns (`pane_id` `herdr:<id>`, `session` =
    `workspace_id`, `window_index` = `tab_id`, `pane_index` = raw id,
    `current_command`/`current_path` enriched); the two dashboard-only
@@ -202,26 +202,26 @@ can tell which host governs a row (see reaping guard below).
    socket identity (the web UI's socket-filter chip splits on `/`, and the
    daemon observes exactly one herdr server) and an empty `attach_command`
    (herdr has no copyable shell attach line — the CLI focuses over the
-   socket). `MUXA_TMUX_SOCKET` is *not* consulted on the herdr path — it
+   socket). `TEND_TMUX_SOCKET` is *not* consulted on the herdr path — it
    scopes tmux sockets only, consistent with the ingest scope gate that
    passes socket-less herdr events. The tmux scanner path is byte-identical
    (`backend == None`/non-herdr → unchanged `scanner::scan`). zellij stays
    empty (no pane-metadata surface until the WASM plugin lands).
 
-Out of scope for Phase 1: `muxa status-line` (a tmux status-right concept;
+Out of scope for Phase 1: `tend status-line` (a tmux status-right concept;
 herdr has its own sidebar).
 
 ## Phase 2 — herdr-native agent state (event bridge)
 
-**Implemented** (`muxad::herdr_bridge`). A muxad background task — spawned
+**Implemented** (`tendd::herdr_bridge`). A tendd background task — spawned
 only when the active backend is herdr (`backend.kind() == HostKind::Herdr`)
 — holds a socket connection and translates herdr's own agent-state
-detection into synthetic muxa rows, giving muxa visibility into every
-agent herdr detects (cursor, amp, copilot, …) without muxa hooks.
+detection into synthetic tend rows, giving tend visibility into every
+agent herdr detects (cursor, amp, copilot, …) without tend hooks.
 
 **Translation** (`translate`, a pure event-json → events fn, unit-tested):
 
-| herdr `agent_status` | muxa `AgentEvent`   | resulting state |
+| herdr `agent_status` | tend `AgentEvent`   | resulting state |
 |----------------------|---------------------|-----------------|
 | `working`            | `ToolStarted`       | `Working`       |
 | `blocked`            | `NotificationFired` (`NeedsInput`) | `WaitingInput` |
@@ -266,16 +266,16 @@ producers.
 Pane liveness stays with the reconciler (pane close is not a subscribable
 herdr event kind).
 
-### Reverse path — muxa's hook state into herdr (`pane.report_agent`)
+### Reverse path — tend's hook state into herdr (`pane.report_agent`)
 
-**Implemented** (`muxad::herdr_bridge`, `report_decision` + a second
+**Implemented** (`tendd::herdr_bridge`, `report_decision` + a second
 transition-subscriber task, both herdr-host only). herdr treats an installed
 integration's report as authoritative over its *own* screen detection, so when
-muxa has real hook truth for a pane, it hands that truth to herdr's sidebar
+tend has real hook truth for a pane, it hands that truth to herdr's sidebar
 instead of letting herdr guess from scrollback. The task subscribes to the same
 `Store::subscribe()` transition stream the desktop notifier and activity ledger
 use; on every state change it decides via the pure `report_decision` fn and, for
-a reportable row, fires `pane.report_agent` (`source = "muxa"`) at the herdr
+a reportable row, fires `pane.report_agent` (`source = "tend"`) at the herdr
 socket. Failures are non-fatal (bounded request timeout, debug-logged, dropped)
 and never hold the transition channel back.
 
@@ -283,7 +283,7 @@ and never hold the transition channel back.
 nothing unless the row is *both* on a `herdr:` pane (the prefix is stripped for
 the wire `pane_id`) *and* non-synthetic. Mapping:
 
-| muxa `AgentState`              | herdr call / state                       |
+| tend `AgentState`              | herdr call / state                       |
 |--------------------------------|------------------------------------------|
 | `Working`                      | `pane.report_agent` `working`            |
 | `WaitingInput`/`WaitingChoice` | `pane.report_agent` `blocked` (+message) |
@@ -296,23 +296,23 @@ the wire `pane_id`) *and* non-synthetic. Mapping:
 `GeminiCli`→`gemini`, `Antigravity`→`agy`, `Opencode`→`opencode`, else the kind
 name), matching the
 forward bridge's `classify_agent` so the same pane carries the same label in
-both directions. `agent_session_id` is muxa's real session id, and a
+both directions. `agent_session_id` is tend's real session id, and a
 process-global monotonic `seq` lets herdr discard out-of-order reports. `blocked`
 rows carry `last_notification` as the `message` so herdr shows *what* the agent
 is waiting on / erroring about.
 
 **No feedback loop — the load-bearing invariant.** Synthetic rows (the ones the
 forward bridge *mints* from herdr's own detection) are NEVER reported back:
-echoing them would form a cycle — report → herdr adopts muxa as authority →
+echoing them would form a cycle — report → herdr adopts tend as authority →
 herdr stops emitting `pane.agent_status_changed` → the forward bridge starves →
 the synthetic row goes stale. The two directions stay disjoint by pane
 ownership. A `herdr:` pane with a real hook row is reported here, and the forward
 bridge's `apply_update` already *drops* herdr's screen-detection updates for that
-same pane — so herdr's flapping is silenced from both ends and muxa is the single
+same pane — so herdr's flapping is silenced from both ends and tend is the single
 source of truth. A `herdr:` pane with only a synthetic bridge row is never
 reported; herdr keeps detecting and the forward bridge keeps mirroring it.
 
-**Release.** `Stopped` is muxa's terminal state — reached on a `SessionEnded`
+**Release.** `Stopped` is tend's terminal state — reached on a `SessionEnded`
 hook and on reconciler/GC reaping (the reaper flips the row to `Stopped`, which
 emits a transition) — and triggers `pane.release_agent`, returning authority to
 herdr's own detection. A row GC-evicted *after* it already went `Stopped` emits
@@ -326,4 +326,4 @@ at startup isn't reported to herdr until its *next* transition.
 - herdr is pre-1.0; the protocol number (16) is checked at connect time
   and mismatches degrade to "backend unreachable" with a logged warning,
   never a crash.
-- Nested-host auto-detection is heuristic; `MUXA_HOST` overrides.
+- Nested-host auto-detection is heuristic; `TEND_HOST` overrides.

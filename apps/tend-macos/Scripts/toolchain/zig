@@ -1,0 +1,10 @@
+#!/bin/bash
+
+set -euo pipefail
+
+if [ -z "${TEND_REAL_ZIG:-}" ] || [ ! -x "$TEND_REAL_ZIG" ]; then
+    echo "TEND_REAL_ZIG must point to the pinned Zig executable" >&2
+    exit 1
+fi
+
+exec "$TEND_REAL_ZIG" "$@"

@@ -1,10 +1,10 @@
 # Architecture
 
-`muxa`는 의도적으로 작게 유지합니다: daemon 하나, CLI 하나, local file, database 없음.
+`tend`는 의도적으로 작게 유지합니다: daemon 하나, CLI 하나, local file, database 없음.
 
 ## Managed Work와 tmux binding
 
-Muxa는 작업 단위 tmux 모델에 최적화되어 있습니다.
+Tend는 작업 단위 tmux 모델에 최적화되어 있습니다.
 
 | 논리 객체 | tmux binding | 불변 조건 |
 | --- | --- | --- |
@@ -12,7 +12,7 @@ Muxa는 작업 단위 tmux 모델에 최적화되어 있습니다.
 | Work | 현재 Run의 Window | Work는 window 종료 뒤에도 지속되며 외부 이슈 identity와 분리됩니다. |
 | Agent session | Pane | 모든 managed agent session은 해당 Run window 안의 독립 pane에서 실행됩니다. |
 
-CLI, `muxa watch`, daemon registry, `muxa mcp`가 이 binding을 공유합니다.
+CLI, `tend watch`, daemon registry, `tend mcp`가 이 binding을 공유합니다.
 같은 Workspace의 같은 Work는 현재 Run window를 재사용하거나 cwd가 다르면
 실패해야 합니다. agent 추가는 pane 추가, Run 종료는 window 종료, Workspace
 실행 종료는 session 종료로 이어지며 파괴적 제어는 unmanaged target을 거부합니다.
@@ -23,7 +23,7 @@ CLI, `muxa watch`, daemon registry, `muxa mcp`가 이 binding을 공유합니다
 agent hook/status event
         |
         v
-      muxa hook  ---- unix socket ---->  muxad in-memory registry
+      tend hook  ---- unix socket ---->  tendd in-memory registry
                                              |
                                              +--> state.json
                                              +--> prompts.ndjson
@@ -38,7 +38,7 @@ file도 함께 사용합니다.
 
 controller daemon은 항상 별도의 physical-node plane을 만들고 in-process Store/backend에서
 자신의 `local` node를 게시합니다. `[fleet]`을 켜면 remote host별 task가 remote user의
-local muxad로 향하는 OpenSSH stdio relay 하나를 소유하고 자신의
+local tendd로 향하는 OpenSSH stdio relay 하나를 소유하고 자신의
 `FleetStore` entry만 갱신합니다. remote agent는 local `Store`에 넣지 않으므로 local
 reconcile, pane-id 재사용, GC가 다른 node의 truth를 손상시키지 않습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
@@ -50,9 +50,9 @@ IPC로 `FleetStore` invalidation을 구독해 coalesce하고 revision이 바뀐 
 
 | Component | 역할 |
 | --- | --- |
-| `muxad` | daemon. registry, IPC server, background task, optional dashboard 소유. |
-| `muxa` | status, watch, attend, recap, stats/report, activity query, init, hook CLI. |
-| Agent adapters | Claude/Codex/Gemini/Antigravity hook event를 muxa state transition으로 변환. |
+| `tendd` | daemon. registry, IPC server, background task, optional dashboard 소유. |
+| `tend` | status, watch, attend, recap, stats/report, activity query, init, hook CLI. |
+| Agent adapters | Claude/Codex/Gemini/Antigravity hook event를 tend state transition으로 변환. |
 | tmux backend | pane/session, pane capture, foreground session activity 조회. |
 | Activity ledger | state/tmux/human interval의 append-only duration source. |
 | FleetManager | always-present local adapter, 독립 SSH relay state machine, node identity/권한, revision reconcile, host별 cache. |
@@ -68,7 +68,7 @@ IPC로 `FleetStore` invalidation을 구독해 coalesce하고 revision이 바뀐 
 | `collaboration.sqlite3` | indexed mailbox, thread/Work metadata, exact-session alias/role. 기존 `collaboration.json`은 한 번 import한 뒤 migration backup으로 남습니다. |
 | `host-id` | Fleet handshake에 쓰는 owner-only stable physical-node UUID. |
 
-경로는 설정 가능하며 기본값은 `$XDG_DATA_HOME/muxa` 아래입니다.
+경로는 설정 가능하며 기본값은 `$XDG_DATA_HOME/tend` 아래입니다.
 
 ## Security
 
@@ -100,7 +100,7 @@ cargo fmt --all -- --check
 자주 쓰는 focused check:
 
 ```bash
-cargo test -p muxa-cli -- --nocapture
-cargo test -p muxa activity::tests -- --nocapture
-cargo check -p muxa-cli
+cargo test -p tend-cli -- --nocapture
+cargo test -p tend activity::tests -- --nocapture
+cargo check -p tend-cli
 ```

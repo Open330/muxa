@@ -5,12 +5,12 @@
 For “where is the agent working on this?”, start with the local live lookup:
 
 ```sh
-muxa agent find 'ENG-8226' --json
-muxa agent find '화자 분리' --limit 5 --json
-muxa agent find 'AGENT_SESSION_ID' --json
+tend agent find 'ENG-8226' --json
+tend agent find '화자 분리' --limit 5 --json
+tend agent find 'AGENT_SESSION_ID' --json
 ```
 
-MCP callers use `muxa_agent_find(query="ENG-8226")`. All whitespace-separated
+MCP callers use `tend_agent_find(query="ENG-8226")`. All whitespace-separated
 keywords must match, case-insensitively, across workspace/window names, paths,
 alias, titles, recap and latest prompt/response. Extract a few keywords from a
 natural-language question; try alternate spellings if needed. Results prefer
@@ -69,13 +69,13 @@ The default inventory maximum age is the configured reconciliation interval
 plus two seconds (32 seconds with the default settings); a standalone server or
 disabled reconciler uses two seconds. `freshness` reports the actual observation
 time, age, configured bound and whether the document index was reused. Window
-changes performed through Muxa lifecycle commands, MCP or Watch invalidate the
+changes performed through Tend lifecycle commands, MCP or Watch invalidate the
 inventory immediately after the mutation; the following lookup refreshes it.
 External multiplexer changes are bounded by the observation age. Registry
 changes update agent text/state independently. A new or moved live binding
 missing from inventory triggers one demand scan per newly missing binding.
 
-Use `muxa agent find 'TASK_KEYWORDS' --refresh --json` (MCP `refresh=true`) when
+Use `tend agent find 'TASK_KEYWORDS' --refresh --json` (MCP `refresh=true`) when
 an immediate observation is needed. Startup, expired data and explicit refresh
 all use the same collection path. Overlapping force requests share an in-flight
 demand observation; a later sequential force request performs a new one. A late
@@ -91,23 +91,23 @@ If a task has disappeared from live metadata, use historical search below,
 then look up the resulting agent session ID. An empty live result does not mean
 the historical work never happened.
 
-New `muxa ask` conversations using Claude, Codex or Gemini are guided to this
+New `tend ask` conversations using Claude, Codex or Gemini are guided to this
 lookup first. Existing conversations retain their original guidance; start with
-`muxa ask --new 'ENG-8226 작업하던 에이전트 위치 찾아줘'` after updating muxad.
+`tend ask --new 'ENG-8226 작업하던 에이전트 위치 찾아줘'` after updating tendd.
 Direct API providers do not have shell/MCP workspace tools; this change does not
 give them live workspace access.
 
 ## Search historical evidence
 
-`muxa agent search` and MCP `muxa_agent_search` search local Claude Code and Codex
+`tend agent search` and MCP `tend_agent_search` search local Claude Code and Codex
 transcripts, including sessions that have ended or started before the requested
-day. `muxa agent read` / `muxa_agent_read` read surrounding events and paired tool
+day. `tend agent read` / `tend_agent_read` read surrounding events and paired tool
 calls/results. They do not require a running daemon, contact a model, or query
 MinIO/GitHub/other services mentioned in a transcript.
 
 ```sh
-muxa agent search '2026.10.22 11:54 KST에 acme-internal 버킷을 우리가 만들었는지' --json
-muxa agent read EVENT_ID --before 5 --after 10 --json
+tend agent search '2026.10.22 11:54 KST에 acme-internal 버킷을 우리가 만들었는지' --json
+tend agent read EVENT_ID --before 5 --after 10 --json
 ```
 
 ## Natural-language retrieval
@@ -136,14 +136,14 @@ plan note asking the caller to supply the intended bounds.
 
 ```sh
 # Time-only inspection finds commands whose text never mentions the bucket.
-muxa agent search --from 2026-10-22T11:40:00+09:00 \
+tend agent search --from 2026-10-22T11:40:00+09:00 \
   --to 2026-10-22T12:10:00+09:00 --kind tool_call --json
 
 # Follow a conversation, avoiding the current investigation's copied evidence.
-muxa agent search --session-id HISTORICAL_ID --exclude-session CURRENT_ID --json
+tend agent search --session-id HISTORICAL_ID --exclude-session CURRENT_ID --json
 
 # Broaden the vocabulary, or restrict the provider / exact recorded cwd.
-muxa agent search '버킷 생성' --term create_bucket --term 'mc mb' \
+tend agent search '버킷 생성' --term create_bucket --term 'mc mb' \
   --provider codex --cwd /project --json
 ```
 
@@ -151,7 +151,7 @@ muxa agent search '버킷 생성' --term create_bucket --term 'mc mb' \
 
 Every hit includes `event_id`, provider, historical `session_id`, cwd, event
 timestamp, kind, original path, physical line and byte offset, matched terms,
-and a bounded excerpt. Use `muxa_agent_read` before treating an excerpt as
+and a bounded excerpt. Use `tend_agent_read` before treating an excerpt as
 evidence. Its `events` are in source order; `related` contains paired tool
 events beyond the requested context. `is_error` is supplied only when the
 provider recorded a structured error flag; success is never inferred from prose.
@@ -193,7 +193,7 @@ Default roots are `~/.claude/projects`, `~/.codex/sessions` and
 Set `--only-roots` / `only_roots=true` to search only the explicitly supplied
 files/directories, for a targeted investigation without indexing every home.
 Canonical paths deduplicate aliases and symlinks. This node's files are searched;
-there is no implicit remote-host lookup. Historical sessions predating Muxa are
+there is no implicit remote-host lookup. Historical sessions predating Tend are
 included when their transcripts are present. Claude text/tool blocks and Codex
 canonical `response_item` messages/calls/outputs are supported; Codex lifecycle
 mirrors, token/coordination metadata, reasoning, binary content and compaction/API-request snapshots are not indexed.
@@ -201,7 +201,7 @@ Automatic instruction/skill text is omitted from results by default; opt in
 with `include_instructions` / `--include-instructions`. An explicit
 `kinds=["instruction"]` / `--kind instruction` also includes them.
 
-The disposable index is `$XDG_DATA_HOME/muxa/agent-records-v2.sqlite` (the platform
+The disposable index is `$XDG_DATA_HOME/tend/agent-records-v2.sqlite` (the platform
 data directory when XDG is unset). It is owner-only on Unix. Provider files are
 never modified. On first use, the previous v1 derived index and its SQLite sidecar
 files are retired because they could contain text cached before the redaction
@@ -254,7 +254,7 @@ human actions, remote sessions, or deleted records are represented.
 
 ## MCP
 
-The tools are advertised by `muxa mcp` alongside the existing live-agent tools.
+The tools are advertised by `tend mcp` alongside the existing live-agent tools.
 After installing the new CLI, reconnect/reload MCP as appropriate for the host
 to discover them. See [MCP setup](MCP.md).
 

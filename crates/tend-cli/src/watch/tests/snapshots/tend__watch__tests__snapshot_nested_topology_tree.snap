@@ -1,0 +1,20 @@
+---
+source: crates/tend-cli/src/watch.rs
+expression: "snapshot_helpers::buffer_string(&terminal)"
+---
+ tend watch   2 sessions · 3 windows · 4 panes   sort NAME   <clock>
+j/k move  ·  / filter  ·  : commands  ·  ? help
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+┌ Topology ──────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+│  STATE   SESSION / WINDOW / PANE                           AGE     SUMMARY                                         │
+│  ▶       tmux:amux ▸ junia › DOCS                          <rel> release approval                                │
+│  ◆ ● ○   tmux:default ▼ tend                               —       2 windows · 3 agents                            │
+│> ◆ ●       ├─ ▼ TEST-0001                                  <rel> 2 agents · reviewing changes / editing middlewar│
+│  ●         │ ├─   %12  codex                               <rel> editing middleware                              │
+│  ◆         │ └─   %13  codex                               <rel> reviewing changes                               │
+│            └─ ▼ TEST-0002                                  <rel> docs update                                     │
+│  ○           └─   %18  codex                               <rel> docs update                                     │
+│                                                                                                                    │
+│                                                                                                                    │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+ j/k  move   h/l  tree   /  filter   :  commands   ⏎  jump   o  preview   m  message   Alt-M  move   M  mailbox   ?  h

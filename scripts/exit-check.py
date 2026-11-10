@@ -20,11 +20,11 @@ spec.loader.exec_module(smoke)
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--muxa", default="target/debug/muxa")
+    ap.add_argument("--tend", default="target/debug/tend")
     ap.add_argument("--lang", default="en")
     args = ap.parse_args(ARGV)
 
-    terminal = smoke.Terminal(args.muxa, args.lang)
+    terminal = smoke.Terminal(args.tend, args.lang)
     failures = 0
     try:
         # The first step is printed before the tour starts the learner's shell,
@@ -36,7 +36,7 @@ def main() -> int:
             smoke.STEP_DEADLINE,
         )
         # Far enough in to be attached, with a session the `exit` can close.
-        terminal.send(b"tmux new-session -s muxa-onboarding\r")
+        terminal.send(b"tmux new-session -s tend-onboarding\r")
         if not smoke.wait_step(terminal, 2):
             print(f"  FAIL  could not reach step 2 (at {smoke.step()})")
             return 1

@@ -1,0 +1,293 @@
+import Foundation
+
+struct TendWorkGroup: Identifiable, Sendable {
+    let identity: TendWorkIdentity
+    let pipelineRun: TendPipelineRun?
+    let participants: [TendHostedAgent]
+
+    var id: TendWorkIdentity { identity }
+    var workspaceID: String { identity.workspaceID }
+    var workID: String { identity.workID }
+
+    var title: String {
+        return workID
+    }
+
+    var pipelineLabel: String {
+        pipelineRun?.pipeline ?? String(localized: "Observed Work")
+    }
+
+    var cwd: String? {
+        if let cwd = pipelineRun?.cwd, !cwd.isEmpty { return cwd }
+        if let cwd = participants.lazy.compactMap({ $0.pane?.currentPath }).first(where: { !$0.isEmpty }) {
+            return cwd
+        }
+        return participants.lazy.compactMap(\.agent.cwd).first(where: { !$0.isEmpty })
+    }
+
+    var hostAliases: [String] {
+        Array(Set(participants.map(\.host.alias))).sorted()
+    }
+
+    var attentionCount: Int {
+        let agentAttention = participants.lazy.filter { $0.agent.status.needsAttention }.count
+        let pipelineAttention = pipelineRun?.aliases.values.lazy.filter {
+            $0.status == "blocked" || $0.status == "failed"
+        }.count ?? 0
+        return max(agentAttention, pipelineAttention)
+    }
+
+    var workingCount: Int {
+        participants.lazy.filter {
+            $0.agent.state == "working" || $0.agent.state == "starting"
+        }.count
+    }
+
+    var completedCount: Int {
+        pipelineRun?.aliases.values.lazy.filter { $0.status == "done" }.count ?? 0
+    }
+
+    var totalCount: Int {
+        pipelineRun?.desired.count ?? participants.count
+    }
+
+    func desiredAgent(for participant: TendHostedAgent) -> TendDesiredAgent? {
+        guard let pipelineRun else { return nil }
+        if let alias = participant.pane?.agentAlias,
+           let desired = pipelineRun.desired.first(where: { $0.alias == alias }) {
+            return desired
+        }
+        guard let paneID = participant.pane?.paneID else { return nil }
+        let alias = pipelineRun.aliases.values.first(where: { $0.pane == paneID })?.alias
+        return alias.flatMap { matched in
+            pipelineRun.desired.first(where: { $0.alias == matched })
+        }
+    }
+}
+
+struct TendWatchPaneIdentity: Codable, Hashable, Sendable {
+    let hostAlias: String
+    let socket: String
+    let paneID: String
+}
+
+struct TendWatchSessionIdentity: Codable, Hashable, Sendable {
+    let hostAlias: String
+    let socket: String
+    let sessionID: String
+}
+
+struct TendWatchWindowIdentity: Codable, Hashable, Sendable {
+    let hostAlias: String
+    let socket: String
+    let sessionID: String
+    let windowID: String
+}
+
+enum TendModuleRoute: Codable, Hashable, Sendable {
+    case shell(String)
+    case fleetPane(TendWatchPaneIdentity)
+}
+
+struct TendWatchPane: Identifiable, Sendable {
+    let host: TendFleetHostIdentity
+    let pane: TendPaneInfo
+    let agent: TendAgent?
+
+    var id: TendWatchPaneIdentity {
+        TendWatchPaneIdentity(
+            hostAlias: host.alias,
+            socket: pane.endpointSocket,
+            paneID: pane.paneID
+        )
+    }
+}
+
+struct TendWatchWindow: Identifiable, Sendable {
+    let hostAlias: String
+    let socket: String
+    let sessionID: String
+    let windowID: String
+    let name: String
+    let index: String
+    let panes: [TendWatchPane]
+
+    var id: String { "\(hostAlias):\(socket):\(sessionID):\(windowID)" }
+
+    var identity: TendWatchWindowIdentity {
+        TendWatchWindowIdentity(
+            hostAlias: hostAlias,
+            socket: socket,
+            sessionID: sessionID,
+            windowID: windowID
+        )
+    }
+}
+
+struct TendWatchSession: Identifiable, Sendable {
+    let hostAlias: String
+    let socket: String
+    let sessionID: String
+    let name: String
+    let windows: [TendWatchWindow]
+
+    var id: String { "\(hostAlias):\(socket):\(sessionID)" }
+
+    var identity: TendWatchSessionIdentity {
+        TendWatchSessionIdentity(
+            hostAlias: hostAlias,
+            socket: socket,
+            sessionID: sessionID
+        )
+    }
+}
+
+struct TendWatchHost: Identifiable, Sendable {
+    let host: TendFleetHost
+    let sessions: [TendWatchSession]
+
+    var id: String { host.alias }
+    var paneCount: Int { sessions.reduce(0) { $0 + $1.windows.reduce(0) { $0 + $1.panes.count } } }
+}
+
+struct TendOperatorMessage: Identifiable, Hashable, Sendable {
+    let host: TendFleetHostIdentity
+    /// Any exact pane on the host. The Fleet mailbox is console-scoped for
+    /// sent requests, so this is a routing endpoint rather than the target.
+    let routePane: TendPaneInfo
+    let request: TendCollaborationRequest
+
+    var id: String { "\(host.alias):\(request.id)" }
+    var isHumanRequest: Bool { request.to.console == true && request.from.console != true }
+    var counterpart: TendCollaborationParticipant { isHumanRequest ? request.from : request.to }
+    var needsReply: Bool {
+        if isHumanRequest { return request.needsHumanResponse }
+        return request.expectsReply && request.reply == nil && !["completed", "cancelled", "expired"].contains(request.status)
+    }
+    var hasUnreadReply: Bool { !isHumanRequest && request.reply != nil && request.replyReadAt == nil }
+    var needsHumanDecision: Bool {
+        if isHumanRequest { return request.needsHumanResponse }
+        let terminalStatus = request.reply?.status ?? request.status
+        return ["blocked", "declined", "failed"].contains(terminalStatus)
+    }
+
+    /// A request whose own status already reached `blocked`, `declined`, or
+    /// `failed` without a reply will not be answered by the agent, so the
+    /// Inbox must not present it as "waiting". `needsReply` keeps counting it
+    /// for the activity badge; this flag drives the Waiting scope, the
+    /// Waiting metric, and the row wording.
+    var isAwaitingAgentReply: Bool { needsReply && !needsHumanDecision }
+
+    /// Most recent durable change on the conversation: the reply time when a
+    /// reply exists, otherwise the time the command was sent. tendd emits
+    /// ISO-8601 timestamps, so lexical order is chronological.
+    var activityAt: String { request.reply?.at ?? request.createdAt }
+
+    /// Needs Action is a work queue rather than a log: decisions the operator
+    /// has not read yet come first, then the most recently changed
+    /// conversation, with the stable id as the final tie-breaker.
+    static func needsActionOrder(_ lhs: Self, _ rhs: Self) -> Bool {
+        if lhs.hasUnreadReply != rhs.hasUnreadReply { return lhs.hasUnreadReply }
+        if lhs.activityAt != rhs.activityAt { return lhs.activityAt > rhs.activityAt }
+        return lhs.id < rhs.id
+    }
+}
+
+/// Presentation for per-host operator-mailbox failures. The state itself is
+/// the plain `[hostAlias: reason]` dictionary `AppModel.inboxHostFailures`, so
+/// the Inbox editor and, later, the sidebar render the same wording.
+enum TendInboxHostFailureText {
+    /// One compact line, e.g. "2 hosts unreachable: laptop, devbox". The
+    /// singular/plural form comes from the String Catalog.
+    static func summary(_ failures: [String: String]) -> String? {
+        guard !failures.isEmpty else { return nil }
+        let hosts = failures.keys.sorted()
+        return String(localized: "\(hosts.count) hosts unreachable: \(hosts.joined(separator: ", "))")
+    }
+
+    /// One "alias: reason" line per host, sorted by alias.
+    static func details(_ failures: [String: String]) -> [String] {
+        failures.keys.sorted().map { "\($0): \(failures[$0] ?? "")" }
+    }
+}
+
+extension TendExecutionSnapshot {
+    func workGroups(pipelineRuns: [TendPipelineRun]) -> [TendWorkGroup] {
+        let visible = hostedAgents.filter { $0.agent.state != "stopped" }
+        let localWindowEndpoints = hosts.reduce(into: [String: Set<String>]()) { endpoints, host in
+            guard host.local, let panes = host.remote?.panes else { return }
+            for pane in panes {
+                endpoints[pane.windowID, default: []].insert(pane.endpointSocket)
+            }
+        }
+        var assigned = Set<String>()
+        var groups: [TendWorkGroup] = []
+
+        for run in pipelineRuns {
+            let participants = visible.filter { participant in
+                guard let pane = participant.pane,
+                      !assigned.contains(participant.id) else { return false }
+                if let stamped = pane.workIdentity {
+                    return stamped == run.identity
+                }
+                guard participant.host.local else { return false }
+                if let windowID = run.windowID {
+                    guard pane.windowID == windowID,
+                          localWindowEndpoints[windowID]?.count == 1 else { return false }
+                    return true
+                }
+                return run.aliases.values.contains { $0.pane == pane.paneID }
+            }
+            assigned.formUnion(participants.map(\.id))
+            groups.append(
+                TendWorkGroup(
+                    identity: run.identity,
+                    pipelineRun: run,
+                    participants: participants.sorted(by: Self.participantComesBefore)
+                )
+            )
+        }
+        var observed: [TendWorkIdentity: [TendHostedAgent]] = [:]
+        for participant in visible where !assigned.contains(participant.id) {
+            guard let identity = participant.pane?.workIdentity else { continue }
+            observed[identity, default: []].append(participant)
+        }
+        for (identity, participants) in observed {
+            assigned.formUnion(participants.map(\.id))
+            groups.append(
+                TendWorkGroup(
+                    identity: identity,
+                    pipelineRun: nil,
+                    participants: participants.sorted(by: Self.participantComesBefore)
+                )
+            )
+        }
+
+        return groups.sorted { left, right in
+            if (left.attentionCount > 0) != (right.attentionCount > 0) {
+                return left.attentionCount > 0
+            }
+            if (left.workingCount > 0) != (right.workingCount > 0) {
+                return left.workingCount > 0
+            }
+            if left.workspaceID != right.workspaceID {
+                return left.workspaceID.localizedStandardCompare(right.workspaceID) == .orderedAscending
+            }
+            return left.title.localizedStandardCompare(right.title) == .orderedAscending
+        }
+    }
+
+    private static func participantComesBefore(
+        _ left: TendHostedAgent,
+        _ right: TendHostedAgent
+    ) -> Bool {
+        let leftPriority = left.agent.status.priority
+        let rightPriority = right.agent.status.priority
+        if leftPriority != rightPriority { return leftPriority < rightPriority }
+        if left.host.local != right.host.local { return left.host.local }
+        if left.host.alias != right.host.alias { return left.host.alias < right.host.alias }
+        return left.agent.id < right.agent.id
+    }
+
+
+}

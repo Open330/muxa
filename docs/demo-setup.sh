@@ -1,26 +1,26 @@
 #!/usr/bin/env bash
-# Bootstrap the muxa-watch hero recording.
+# Bootstrap the tend-watch hero recording.
 #
 # Everything here is fixture. The recording has to show a *fleet* — a dozen
 # agents spread across every state, mid-collaboration, with answered
 # questions in the history — and none of that can be produced by waiting
 # around for real agents during a 40-second take. So we stand up an
-# isolated tmux server, feed muxad the same hook payloads the real agent
-# CLIs send, and seed the mailbox through the real `muxa msg` path.
+# isolated tmux server, feed tendd the same hook payloads the real agent
+# CLIs send, and seed the mailbox through the real `tend msg` path.
 #
-# The isolation itself is not this script's job — `scripts/muxa-sandbox.sh`
+# The isolation itself is not this script's job — `scripts/tend-sandbox.sh`
 # owns the private socket, config, data directory, tmux server and PATH shim,
 # and `scripts/sandbox-smoke.sh` is what proves its teardown is total. This
 # script is the fixture layered on top.
 #
 # Steps:
 #   1. Write the demo config, then bring up the sandbox with it. Add the
-#      `claude`/`codex` shims, which make `muxa watch`'s ask feature answer
+#      `claude`/`codex` shims, which make `tend watch`'s ask feature answer
 #      instantly, for free, and identically on every render.
 #   2. Create the demo's own sessions on the sandbox tmux server.
 #   3. Seed the ask history, then start the daemon — in that order, because
 #      the ask store is read once at boot.
-#   4. Seed agents across every state muxa can render, including two with
+#   4. Seed agents across every state tend can render, including two with
 #      live Task subagents so the swarm view has trees to expand.
 #   5. Seed the collaboration mailbox.
 #   6. Seed the activity ledger so durations read as real.
@@ -30,23 +30,23 @@
 
 set -euo pipefail
 
-TMUX_LBL=muxa-demo
+TMUX_LBL=tend-demo
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-SANDBOX="$REPO_DIR/scripts/muxa-sandbox.sh"
+SANDBOX="$REPO_DIR/scripts/tend-sandbox.sh"
 PAINT="$SCRIPT_DIR/demo-paint.sh"  # believable agent frames instead of bare `cat`
-CONFIG_SRC=/tmp/muxa-demo-config.src.toml
+CONFIG_SRC=/tmp/tend-demo-config.src.toml
 
-MUXAD_BIN="${MUXA_DEMO_MUXAD:-$REPO_DIR/target/debug/muxad}"
-if [ ! -x "$MUXAD_BIN" ]; then
-  MUXAD_BIN=$(command -v muxad)
+TENDD_BIN="${TEND_DEMO_TENDD:-$REPO_DIR/target/debug/tendd}"
+if [ ! -x "$TENDD_BIN" ]; then
+  TENDD_BIN=$(command -v tendd)
 fi
 
 # Real tmux binary, resolved absolutely so it bypasses the PATH shim the
 # sandbox installs. Docker/CI has it at /usr/bin/tmux; a Homebrew mac has it
-# elsewhere, so the tape passes MUXA_DEMO_TMUX after resolving `command -v
+# elsewhere, so the tape passes TEND_DEMO_TMUX after resolving `command -v
 # tmux` pre-shim.
-TM="${MUXA_DEMO_TMUX:-/usr/bin/tmux}"
+TM="${TEND_DEMO_TMUX:-/usr/bin/tmux}"
 
 rfc3339_ago() {
   local seconds="$1"
@@ -63,7 +63,7 @@ rfc3339_ago() {
 # Not belt-and-braces — required. A daemon left over from an interrupted
 # render is still running and still holds its own copy of the socket. Two of
 # them then trade it back and forth and the recording shows "daemon not
-# reachable" at random points, which reads as muxa crashing.
+# reachable" at random points, which reads as tend crashing.
 bash "$SCRIPT_DIR/demo-teardown.sh"
 
 # ---------------------------------------------------------------------------
@@ -74,7 +74,7 @@ bash "$SCRIPT_DIR/demo-teardown.sh"
 # short: every line the tape types is a line vhs has to type at 45ms/char
 # on every render.
 #
-# `wake = "never"` matters. The default `idle_only` lets muxad inject the
+# `wake = "never"` matters. The default `idle_only` lets tendd inject the
 # wake prompt into a recipient's pane — which, in a recording whose panes
 # are painted fixtures, would scribble over the frame mid-take.
 #
@@ -83,7 +83,7 @@ bash "$SCRIPT_DIR/demo-teardown.sh"
 # teardown into the next render.
 cat > "$CONFIG_SRC" <<'TOML'
 [ui]
-theme = 'oh-my-muxa'
+theme = 'oh-my-tend'
 
 [discovery]
 enabled = false
@@ -113,7 +113,7 @@ agent = 'claude'
 cwd = '/tmp'
 
 [watch]
-theme = 'oh-my-muxa'
+theme = 'oh-my-tend'
 # `window` is the work level: a window is a Work's current Run.
 view = 'window'
 sort = ['state']
@@ -129,19 +129,19 @@ bash "$SANDBOX" up \
   --name "$TMUX_LBL" \
   --config "$CONFIG_SRC" \
   --tmux "$TM" \
-  --muxad "$MUXAD_BIN" \
+  --tendd "$TENDD_BIN" \
   --extra-path "$REPO_DIR/target/debug" \
   --allow-inside-tmux
 
-# MUXA_SOCKET, MUXA_CONFIG, XDG_DATA_HOME, MUXA_TMUX_SOCKET and the shimmed
-# PATH all arrive here. Nothing below may reach a real muxa surface.
+# TEND_SOCKET, TEND_CONFIG, XDG_DATA_HOME, TEND_TMUX_SOCKET and the shimmed
+# PATH all arrive here. Nothing below may reach a real tend surface.
 eval "$(bash "$SANDBOX" env --name "$TMUX_LBL")"
 # The sandbox addresses its tmux server by socket path (and its own config),
 # not by `-L` label; every call below goes through this.
-tm() { "$MUXA_SANDBOX_TMUX" -u -f "$MUXA_SANDBOX_TMUX_CONFIG" -S "$MUXA_TMUX_SOCKET" "$@"; }
-SHIM_DIR=$MUXA_SANDBOX_SHIM
+tm() { "$TEND_SANDBOX_TMUX" -u -f "$TEND_SANDBOX_TMUX_CONFIG" -S "$TEND_TMUX_SOCKET" "$@"; }
+SHIM_DIR=$TEND_SANDBOX_SHIM
 
-# Ask stand-ins. `muxa watch`'s `a` shells out to the real agent CLI, which
+# Ask stand-ins. `tend watch`'s `a` shells out to the real agent CLI, which
 # would bill the user, take an unpredictable 10-40s, and answer differently
 # on every render — three separate reasons a recording can't use it. These
 # emit exactly what the parsers in ask.rs read: claude's single result
@@ -169,7 +169,7 @@ case " $* " in *" exec "*) ;; *) exec cat ;; esac
 sleep 1.4
 cat <<'JSON'
 {"type":"thread.started","thread_id":"demo-thread-codex"}
-{"type":"item.completed","item":{"type":"agent_message","text":"Shortest path is `muxa attend` — it focuses whichever agent has been\nblocked longest, so you do not have to pick.\n\nRight now that is `web`, blocked 4m12s on a permission prompt for\ncrates/muxa/src/dashboard/server.rs. `auth` is second at 2m48s.\n\nIf you would rather clear them in order, `muxa attend --cycle` rotates\nthrough the queue; bind it to a tmux key and it becomes a doorbell."}}
+{"type":"item.completed","item":{"type":"agent_message","text":"Shortest path is `tend attend` — it focuses whichever agent has been\nblocked longest, so you do not have to pick.\n\nRight now that is `web`, blocked 4m12s on a permission prompt for\ncrates/tend/src/dashboard/server.rs. `auth` is second at 2m48s.\n\nIf you would rather clear them in order, `tend attend --cycle` rotates\nthrough the queue; bind it to a tmux key and it becomes a doorbell."}}
 {"type":"turn.completed"}
 JSON
 EOF
@@ -177,10 +177,10 @@ chmod +x "$SHIM_DIR/codex"
 
 export PATH="$SHIM_DIR:$REPO_DIR/target/debug:$PATH"
 
-# Ask history, written before muxad starts because the ask store is read
+# Ask history, written before tendd starts because the ask store is read
 # once at boot. Statuses and field names mirror ask.rs.
 seed_ask_history() {
-  local ask_file="$XDG_DATA_HOME/muxa/ask.json"
+  local ask_file="$XDG_DATA_HOME/tend/ask.json"
   mkdir -p "$(dirname "$ask_file")"
   cat > "$ask_file" <<EOF
 {
@@ -189,7 +189,7 @@ seed_ask_history() {
     {
       "id": "ask-0001",
       "prompt": "what is the difference between wake = 'never' and wake = 'idle_only'?",
-      "answer": "\`never\` is pull-only: a request lands in the recipient's mailbox and\nsits there until that agent calls muxa_inbox of its own accord. Nothing\nis ever written into its pane.\n\n\`idle_only\` adds one narrow push only at the recipient's top-level Idle\nprompt — not mid-turn or mid-tool-call. Its default \`wake_payload =\nnotice\` injects a short mailbox line; opt-in \`full\` atomically claims\nand injects one structured request body per idle generation. Reply bodies\nalways stay in the mailbox.\n\nThe Idle restriction prevents incoming text from interleaving with work\nthe agent is already composing.",
+      "answer": "\`never\` is pull-only: a request lands in the recipient's mailbox and\nsits there until that agent calls tend_inbox of its own accord. Nothing\nis ever written into its pane.\n\n\`idle_only\` adds one narrow push only at the recipient's top-level Idle\nprompt — not mid-turn or mid-tool-call. Its default \`wake_payload =\nnotice\` injects a short mailbox line; opt-in \`full\` atomically claims\nand injects one structured request body per idle generation. Reply bodies\nalways stay in the mailbox.\n\nThe Idle restriction prevents incoming text from interleaving with work\nthe agent is already composing.",
       "status": "answered",
       "agent": "claude",
       "agent_session_id": "demo-thread-claude",
@@ -201,7 +201,7 @@ seed_ask_history() {
     {
       "id": "ask-0002",
       "prompt": "which of my agents have been blocked longest?",
-      "answer": "web has been on a permission prompt for 4m12s, auth on a multiple\nchoice for 2m48s. sdk is in error rather than blocked — no prompt will\nclear it.\n\n\`muxa attend\` jumps to web; \`muxa attend --cycle\` rotates through all\nthree.",
+      "answer": "web has been on a permission prompt for 4m12s, auth on a multiple\nchoice for 2m48s. sdk is in error rather than blocked — no prompt will\nclear it.\n\n\`tend attend\` jumps to web; \`tend attend --cycle\` rotates through all\nthree.",
       "status": "answered",
       "agent": "codex",
       "agent_session_id": "demo-thread-codex",
@@ -236,12 +236,12 @@ EOF
 # Every other pane sits on `cat` or a painted frame so there is no prompt
 # noise behind the TUI.
 
-cat > /tmp/muxa-demo-bashrc <<'BASHRC'
+cat > /tmp/tend-demo-bashrc <<'BASHRC'
 export PS1='$ '
 unset PROMPT_COMMAND
 BASHRC
 
-# The server, and the MUXA_TMUX_SOCKET pin every pane inherits at creation
+# The server, and the TEND_TMUX_SOCKET pin every pane inherits at creation
 # time, are already in place from `sandbox up`. Without that pin a pane
 # enumerates every tmux server on the host and the recording fills up with
 # the maintainer's own sessions — the first take showed 59.
@@ -251,7 +251,7 @@ BASHRC
 # makes those features look broken in the recording. The frame is staged as
 # a file and the pane just prints it, which keeps prompt text — em dashes,
 # quotes, backticks — away from tmux's shell quoting entirely.
-FRAME_DIR=/tmp/muxa-demo-frames
+FRAME_DIR=/tmp/tend-demo-frames
 rm -rf "$FRAME_DIR"; mkdir -p "$FRAME_DIR"
 frame() { # <slug> <agent> <state> <prompt> [tool]... → echoes the pane command
   local slug="$1"; shift
@@ -264,22 +264,22 @@ frame() { # <slug> <agent> <state> <prompt> [tool]... → echoes the pane comman
 # `ctl` is the operator's own terminal — the session the recording attaches
 # to and types into. It is deliberately *not* one of the interesting agents:
 # the inspector renders the selected pane's live screen, so running the TUI
-# from a pane the cursor might land on makes muxa render a mirror of itself,
+# from a pane the cursor might land on makes tend render a mirror of itself,
 # which reads as a bug. It is still seeded as an agent further down, because
 # the collaboration mailbox is scoped to its origin pane and `b`/`m` need
 # one.
 tm new-session -d -s ctl -x 220 -y 46 \
   -n fleet \
-  "bash --rcfile /tmp/muxa-demo-bashrc"
+  "bash --rcfile /tmp/tend-demo-bashrc"
 
 tm new-session -d -s main -x 220 -y 46 \
   -n ipc \
   "$(frame main claude working 'continue with protocol compatibility tests and update the watch work summary docs' \
-      'editing  crates/muxa/src/ipc.rs' 'Task ×3  Explore, general-purpose, code-reviewer')"
+      'editing  crates/tend/src/ipc.rs' 'Task ×3  Explore, general-purpose, code-reviewer')"
 # `-d` keeps the current window as main:0 — without it new-window switches
 # focus to itself, so attach would land on `vim` (cat-stdin) instead of
 # the painted pane.
-# `review` hosts codex mid-approval — this is where `muxa attend` lands, so it
+# `review` hosts codex mid-approval — this is where `tend attend` lands, so it
 # paints a believable approval prompt instead of an empty shell.
 tm new-window -d -t main: -n review \
   "$(frame review codex approval 'audit the legacy auth middleware for raw bearer tokens' \
@@ -300,13 +300,13 @@ mkpane() { # <session> <window> [command] → echoes the new pane id
     -t "$1:$2" "${3:-cat}"
 }
 
-P_OPS=$(mk ops "$(frame ops gemini done 'review PR #482 — the new sorting knob in muxa watch' \
-  'read  crates/muxa-cli/src/watch.rs' 'posted 4 comments')")
+P_OPS=$(mk ops "$(frame ops gemini done 'review PR #482 — the new sorting knob in tend watch' \
+  'read  crates/tend-cli/src/watch.rs' 'posted 4 comments')")
 mkwin ops logs >/dev/null
 P_API=$(mk api "$(frame api claude working 'port the reconciler onto the new PaneBackend trait' \
-  'editing  crates/muxa/src/reconcile.rs' 'Task ×2  Explore, general-purpose')")
+  'editing  crates/tend/src/reconcile.rs' 'Task ×2  Explore, general-purpose')")
 P_WEB=$(mk web "$(frame web claude approval 'fix the SSE reconnect backoff' \
-  'read  crates/muxa/src/dashboard/server.rs')")
+  'read  crates/tend/src/dashboard/server.rs')")
 P_INFRA=$(mk infra "$(frame infra codex working 'terraform: split the network module and pin providers' \
   'ran  terraform plan -out tf.plan' 'editing  modules/network/main.tf')")
 P_AUTH=$(mk auth "$(frame auth claude choice 'rotate the JWT signing keys across environments')")
@@ -327,13 +327,13 @@ P_EDGE=$(mk edge "$(frame edge codex working 'cache the geo lookup at the edge' 
   'ran  wrangler deploy --dry-run')")
 P_CRM=$(mk crm "$(frame crm claude rate-limit 'migrate the contact importer off the deprecated bulk endpoint' \
   'editing  app/importers/contacts.rb')")
-mk lab >/dev/null   # bare session — no agent, proves muxa tracks the whole server
+mk lab >/dev/null   # bare session — no agent, proves tend tracks the whole server
 
 # Second agents inside existing work windows. A work row that expands into
 # two child agents is the hierarchy the work view teaches; a fleet of
 # singletons never shows it.
 P_API_REV=$(mkpane api 0 "$(frame api-rev codex working 'review the PaneBackend port' \
-  'read  crates/muxa/src/reconcile.rs' 'ran  cargo clippy -p muxa')")
+  'read  crates/tend/src/reconcile.rs' 'ran  cargo clippy -p tend')")
 P_WEB_E2E=$(mkpane web 0 "$(frame web-e2e claude done 're-record the playwright traces for the timeline view' \
   'ran  npx playwright test --update-snapshots')")
 
@@ -341,7 +341,7 @@ P_WEB_E2E=$(mkpane web 0 "$(frame web-e2e claude done 're-record the playwright 
 # should attach to.
 # The sandbox's placeholder kept the server alive until the demo had sessions
 # of its own; it would otherwise show up as an empty row in the recording.
-tm kill-session -t "$MUXA_SANDBOX_HOLDER"
+tm kill-session -t "$TEND_SANDBOX_HOLDER"
 tm select-window -t ctl:0
 
 # The operator's pane: where the recording types, and the origin the
@@ -351,29 +351,29 @@ PA=$(tm display-message -p -t main:0.0 '#{pane_id}')
 PB=$(tm display-message -p -t main:1.0 '#{pane_id}')
 
 # ---------------------------------------------------------------------------
-# 3) muxad, scoped to the demo server
+# 3) tendd, scoped to the demo server
 # ---------------------------------------------------------------------------
 # The ask store is read once, at daemon start. Seeding it afterwards and
-# restarting muxad to pick it up would be worse than useless: `[state]` is
+# restarting tendd to pick it up would be worse than useless: `[state]` is
 # disabled for the demo, so the restart would drop the whole seeded fleet.
 seed_ask_history
 
-bash "$SANDBOX" daemon --name "$TMUX_LBL" --tmux "$TM" --muxad "$MUXAD_BIN"
+bash "$SANDBOX" daemon --name "$TMUX_LBL" --tmux "$TM" --tendd "$TENDD_BIN"
 
 # ---------------------------------------------------------------------------
 # 4) Seed the fleet
 # ---------------------------------------------------------------------------
 
-# muxad is pinned to the demo tmux server, and it drops any event stamped
+# tendd is pinned to the demo tmux server, and it drops any event stamped
 # with a different one. A hook client reads that stamp from `$TMUX` — which,
 # when you regenerate this GIF from inside your own tmux session, points at
 # your real server and every seeded event is silently skipped. So each
 # seeding call claims the demo server explicitly rather than inheriting
 # whatever the caller happens to be sitting in.
-DEMO_TMUX_ENV=$MUXA_SANDBOX_TMUX_ENV
+DEMO_TMUX_ENV=$TEND_SANDBOX_TMUX_ENV
 
 hook() { # <pane> <agent> <event> <json>
-  TMUX="$DEMO_TMUX_ENV" TMUX_PANE="$1" muxa hook "$2" --event "$3" <<<"$4"
+  TMUX="$DEMO_TMUX_ENV" TMUX_PANE="$1" tend hook "$2" --event "$3" <<<"$4"
 }
 
 # --- Claude transcript fixture ---------------------------------------------
@@ -381,12 +381,12 @@ hook() { # <pane> <agent> <event> <json>
 # itself is read from the JSONL file. We stage a small fake transcript that
 # matches Claude Code's on-disk format closely enough for
 # `transcript::last_assistant_text` to find the assistant turn.
-TRANSCRIPT_DIR=/tmp/muxa-demo-transcripts
+TRANSCRIPT_DIR=/tmp/tend-demo-transcripts
 mkdir -p "$TRANSCRIPT_DIR"
 CLAUDE_TRANSCRIPT="$TRANSCRIPT_DIR/claude-s-a.jsonl"
 cat > "$CLAUDE_TRANSCRIPT" <<'JSONL'
 {"type":"user","message":{"role":"user","content":[{"type":"text","text":"refactor the ipc module to use length-prefixed frames"}]}}
-{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Switched the on-the-wire framing from newline-delimited JSON to length-prefixed (u32 BE + body) frames. The old framing assumed payloads never contained literal newlines, which broke the moment we started ingesting transcript snippets. Updated:\n  • crates/muxa/src/ipc.rs — Server::handle_conn / Client::recv now share a length_prefixed::read_frame helper that returns Result<Vec<u8>, FrameError>.\n  • Migrated every existing call site, including the dashboard SSE bridge.\n  • Added round-trip tests for empty / 1-byte / 4 KiB / 4 MiB payloads.\n\nLet me know if you want me to also bump the protocol version constant in event.rs — strictly speaking this is wire-incompatible with older clients."}]}}
+{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Switched the on-the-wire framing from newline-delimited JSON to length-prefixed (u32 BE + body) frames. The old framing assumed payloads never contained literal newlines, which broke the moment we started ingesting transcript snippets. Updated:\n  • crates/tend/src/ipc.rs — Server::handle_conn / Client::recv now share a length_prefixed::read_frame helper that returns Result<Vec<u8>, FrameError>.\n  • Migrated every existing call site, including the dashboard SSE bridge.\n  • Added round-trip tests for empty / 1-byte / 4 KiB / 4 MiB payloads.\n\nLet me know if you want me to also bump the protocol version constant in event.rs — strictly speaking this is wire-incompatible with older clients."}]}}
 JSONL
 
 # --- main: claude working with subagents, codex blocked on approval --------
@@ -408,7 +408,7 @@ hook "$PA" claude stop \
 hook "$PA" claude user_prompt_submit \
   '{"session_id":"s-a","prompt":"continue with protocol compatibility tests and update the watch work summary docs"}'
 
-# In-flight Task subagents so `muxa watch --view swarm` renders a populated
+# In-flight Task subagents so `tend watch --view swarm` renders a populated
 # subagent tree (each is a pre_tool_use{Task} with no matching post, so they
 # stay live for the recording).
 subagents() { # <pane> <session_id> <kind:description>...
@@ -437,7 +437,7 @@ hook "$P_API_REV" codex pre_tool_use '{"session_id":"s-api-rev","tool_name":"she
 hook "$P_WEB" claude user_prompt_submit \
   '{"session_id":"s-web","prompt":"fix the SSE reconnect backoff"}'
 hook "$P_WEB" claude notification \
-  '{"session_id":"s-web","notification_type":"permission_prompt","message":"Allow edit to crates/muxa/src/dashboard/server.rs?"}'
+  '{"session_id":"s-web","notification_type":"permission_prompt","message":"Allow edit to crates/tend/src/dashboard/server.rs?"}'
 hook "$P_WEB_E2E" claude user_prompt_submit \
   '{"session_id":"s-web-e2e","prompt":"re-record the playwright traces for the timeline view"}'
 hook "$P_WEB_E2E" claude stop '{"session_id":"s-web-e2e"}'
@@ -469,7 +469,7 @@ hook "$P_CRM" claude stop_failure \
   '{"session_id":"s-crm","error":"rate_limit","last_assistant_message":"Hit the 5-hour limit mid-migration. Picking back up from the importer once it resets."}'
 
 # --- the long tail: enough working/blocked agents that the list reads as a
-#     fleet rather than a handful of rows. This is the state muxa exists for
+#     fleet rather than a handful of rows. This is the state tend exists for
 #     — one screen you can actually triage from.
 hook "$P_SEARCH" claude user_prompt_submit \
   '{"session_id":"s-search","prompt":"swap the tantivy index build onto a background thread and add a progress channel"}'
@@ -501,19 +501,19 @@ hook "$P_DATA" claude stop '{"session_id":"s-data"}'
 
 # --- ops: gemini, idle -----------------------------------------------------
 hook "$P_OPS" gemini before_agent \
-  '{"session_id":"s-c","prompt":"review PR #482 — focus on the new sorting knob in muxa watch and whether the [Workspace, Activity] default surprises power users with many short-lived panes."}'
+  '{"session_id":"s-c","prompt":"review PR #482 — focus on the new sorting knob in tend watch and whether the [Workspace, Activity] default surprises power users with many short-lived panes."}'
 hook "$P_OPS" gemini after_agent '{"session_id":"s-c"}'
 
 # ---------------------------------------------------------------------------
 # 5) Collaboration mailbox
 # ---------------------------------------------------------------------------
-# Sent through the real `muxa msg` path rather than written into the
+# Sent through the real `tend msg` path rather than written into the
 # collaboration store, so the recording exercises the same code an agent
-# would. `$PA` is the pane the recording runs `muxa watch` from, and the
+# would. `$PA` is the pane the recording runs `tend watch` from, and the
 # mailbox is scoped to its origin pane — so these have to point at it.
 
 msg() { # <from-pane> <to-pane> <kind> <body>
-  TMUX="$DEMO_TMUX_ENV" TMUX_PANE="$1" muxa msg send "$2" "$4" --kind "$3" >/dev/null
+  TMUX="$DEMO_TMUX_ENV" TMUX_PANE="$1" tend msg send "$2" "$4" --kind "$3" >/dev/null
 }
 
 msg "$P_API_REV" "$PCTL" review \
@@ -534,7 +534,7 @@ msg "$PCTL" "$P_SDK" task \
 # minutes for durations to accumulate. These closed intervals make the
 # stats/activity scenes representative while staying fully isolated under
 # XDG_DATA_HOME.
-ACTIVITY_FILE="$XDG_DATA_HOME/muxa/activity.ndjson"
+ACTIVITY_FILE="$XDG_DATA_HOME/tend/activity.ndjson"
 mkdir -p "$(dirname "$ACTIVITY_FILE")"
 
 T_WORK_START=$(rfc3339_ago 1560)
@@ -557,26 +557,26 @@ cat > "$ACTIVITY_FILE" <<EOF
 {"type":"state_transition","v":1,"at":"$T_WAIT_END","kind":"claude_code","session_id":"s-a","pane":"$PA","session_name":"main","cwd":"/home/you/proj","from":"waiting_input","to":"working","state_entered_at":"$T_WAIT_START","duration_secs":180}
 {"type":"state_transition","v":1,"at":"$T_ERR_END","kind":"codex","session_id":"s-b","pane":"$PB","session_name":"main","cwd":"/home/you/legacy","from":"error","to":"working","state_entered_at":"$T_ERR_START","duration_secs":120}
 {"type":"session_foreground","v":1,"session_id":"demo-main","session_name":"main","started_at":"$T_TMUX_START","ended_at":"$T_TMUX_END","duration_secs":1500}
-{"type":"human_interaction","v":1,"kind":"muxa_prompt_input","pane":"$PA","session_id":"s-a","session_name":"main","started_at":"$T_PROMPT_START","ended_at":"$T_PROMPT_END","duration_secs":110}
+{"type":"human_interaction","v":1,"kind":"tend_prompt_input","pane":"$PA","session_id":"s-a","session_name":"main","started_at":"$T_PROMPT_START","ended_at":"$T_PROMPT_END","duration_secs":110}
 {"type":"human_interaction","v":1,"kind":"tmux_attach","pane":"$PB","session_id":"s-b","session_name":"main","started_at":"$T_ATTACH_START","ended_at":"$T_ATTACH_END","duration_secs":80}
-{"type":"human_interaction","v":1,"kind":"muxa_watch","pane":"$PA","session_id":"s-a","session_name":"main","started_at":"$T_WATCH_START","ended_at":"$T_WATCH_END","duration_secs":120}
+{"type":"human_interaction","v":1,"kind":"tend_watch","pane":"$PA","session_id":"s-a","session_name":"main","started_at":"$T_WATCH_START","ended_at":"$T_WATCH_END","duration_secs":120}
 EOF
 
 # ---------------------------------------------------------------------------
-# 7) Wire muxa into the demo server so the recording shows the integration
+# 7) Wire tend into the demo server so the recording shows the integration
 # ---------------------------------------------------------------------------
 tm set-option -g status-interval 1
 # Status bar at the top — much more legible in a GIF than the default bottom
 # bar squeezed against the recording's edge.
 tm set-option -g status-position top
 tm set-option -g status-style "bg=#0d1117,fg=#f0f6fc"
-tm set-option -g status-left  "#[bg=#58a6ff,fg=#0d1117,bold] muxa-demo #[default] "
+tm set-option -g status-left  "#[bg=#58a6ff,fg=#0d1117,bold] tend-demo #[default] "
 tm set-option -g status-left-length 20
 tm set-option -g status-right \
-  "#[fg=#f0f6fc,bold]#(muxa status-line --pane #{pane_id})#[default]   #[fg=#79c0ff,bold]%H:%M#[default] "
+  "#[fg=#f0f6fc,bold]#(tend status-line --pane #{pane_id})#[default]   #[fg=#79c0ff,bold]%H:%M#[default] "
 tm set-option -g status-right-length 120
 
-# The real binding muxa init writes: full-client popup, caller pinned so
+# The real binding tend init writes: full-client popup, caller pinned so
 # Enter attaches the terminal the popup was opened from.
 tm bind-key s run-shell -b \
-  "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 \"muxa watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""
+  "tmux display-popup -c '#{client_name}' -B -E -w 100% -h 100% -x 0 -y 0 \"tend watch --caller-client '#{client_name}' --caller-pane '#{pane_id}'\""

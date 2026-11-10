@@ -1,15 +1,15 @@
 // Shared landing/onboarding design and navigation regression checks.
-// MUXA_PLAYWRIGHT_PACKAGE=/path/to/playwright-core node scripts/landing-shots/pages-smoke.mjs http://127.0.0.1:8766 /tmp/muxa-pages-check
+// TEND_PLAYWRIGHT_PACKAGE=/path/to/playwright-core node scripts/landing-shots/pages-smoke.mjs http://127.0.0.1:8766 /tmp/tend-pages-check
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 const require=createRequire(import.meta.url);
-const {chromium}=require(process.env.MUXA_PLAYWRIGHT_PACKAGE||"playwright");
-const origin=process.argv[2],output=process.argv[3]||"/tmp/muxa-pages-check";
+const {chromium}=require(process.env.TEND_PLAYWRIGHT_PACKAGE||"playwright");
+const origin=process.argv[2],output=process.argv[3]||"/tmp/tend-pages-check";
 if(!origin)throw new Error("Pass the assembled site's preview URL");
 mkdirSync(output,{recursive:true});
-const browser=await chromium.launch({executablePath:process.env.MUXA_TEST_CHROMIUM||"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",headless:true});
+const browser=await chromium.launch({executablePath:process.env.TEND_TEST_CHROMIUM||"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",headless:true});
 try {
   for(const locale of ["ko-KR","en-US"])for(const colorScheme of ["light","dark"])for(const mobile of [false,true]){
     const context=await browser.newContext({locale,colorScheme,reducedMotion:"reduce",viewport:mobile?{width:390,height:844}:{width:1280,height:1000}});

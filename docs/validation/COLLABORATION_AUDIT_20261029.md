@@ -1,4 +1,4 @@
-# Muxa 통신 전반 점검 — 2026-10-29
+# Tend 통신 전반 점검 — 2026-10-29
 
 기준 소스는 `e303a4c`, 운영 합본은 `d796808`이다. 짧은 요청 문구의 크기만
 비교하던 이전 검증을 확장해 생성부터 재연결까지 확인했다. 코드에서 확인한 보장,
@@ -19,7 +19,7 @@
 | 응답·시간 초과 | terminal status, 중단, 취소, 만료, 늦은 보고 | 전달·수신과 peer가 선언한 성공은 구분한다. timeout이 작업 취소나 새 요청 재전송으로 이어지지 않는다. 기존 늦은 보고·supersession·만료 테스트를 재실행한다. |
 | 알림·복구 | quiet notice, reply wake 예약·해제, 중단된 peer | 예약은 revision을 발행하지 않아 실패 재시도 루프를 만들지 않는다. 중단 확인 시 완료된 부모 요청도 복구 action을 정리하며, 미확인 수신자에게 자동으로 작업을 재배정하지 않는다. |
 | 캐시·탐색 | 위치 변경, inventory 만료·실패, 동시 조회 | 기존 daemon directory의 변경 무효화·동시 refresh 합류·부정확한 관찰 경고를 유지한다. 발신자 식별을 위한 별도 전체 snapshot 조회와 client 위치 캐시는 제거한다. |
-| MCP 갱신 | 최신 이미지의 닫힌 cached client, stale 프로세스 수 | `--all --reconnect`는 최신 이미지로 실행 중인 공유 호스트도 선택한다. 선택한 호스트를 stale로 잘못 집계하지 않는다. 실제 재연결은 진행 중인 Muxa 도구 호출을 끊을 수 있으므로 이 플래그를 명시한 경우에만 수행한다. |
+| MCP 갱신 | 최신 이미지의 닫힌 cached client, stale 프로세스 수 | `--all --reconnect`는 최신 이미지로 실행 중인 공유 호스트도 선택한다. 선택한 호스트를 stale로 잘못 집계하지 않는다. 실제 재연결은 진행 중인 Tend 도구 호출을 끊을 수 있으므로 이 플래그를 명시한 경우에만 수행한다. |
 
 ## 측정
 
@@ -65,7 +65,7 @@ debug 테스트의 단일 비교이며 디스크·네트워크·모델 실행 �
 운영의 모든 요청이 이 비율로 빨라진다는 뜻이 아니다. 재현 명령:
 
 ```sh
-MUXA_HISTORY_SCALING_REPORT=/tmp/history-cost.json cargo test -p muxa \
+TEND_HISTORY_SCALING_REPORT=/tmp/history-cost.json cargo test -p tend \
   collaboration_history_scaling_probe -- --ignored --nocapture
 ```
 
@@ -121,4 +121,4 @@ claim한 재조회보다 아직 Queued인 요청을 우선한다. 기존 primary
   주입은 이 환경의 검증 범위에 포함하지 않는다.
 
 검증 로그와 본문 없는 측정 결과는 로컬
-`~/.local/share/muxa/validation/comprehensive-20261029/`에 보관한다.
+`~/.local/share/tend/validation/comprehensive-20261029/`에 보관한다.

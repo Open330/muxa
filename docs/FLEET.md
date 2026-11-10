@@ -1,10 +1,10 @@
-# Muxa Fleet
+# Tend Fleet
 
-Muxa Fleet is the physical-host control plane above the existing
+Tend Fleet is the physical-host control plane above the existing
 session/window/pane model:
 
 ```text
-local muxad
+local tendd
   FleetManager
     ├─ in-process      ─ host local ─ session ─ window ─ pane (agent)
     ├─ SSH stdio relay ─ host dev ─ session ─ window ─ pane (agent)
@@ -14,20 +14,20 @@ local muxad
 
 The controller is always published as the first, in-process `local` host.
 Each configured remote host gets one independent, persistent OpenSSH process. The
-remote command is `muxa relay --stdio`, which talks only to that user's local
-owner-only muxad Unix socket. Fleet does not expose a remote TCP port, forward
+remote command is `tend relay --stdio`, which talks only to that user's local
+owner-only tendd Unix socket. Fleet does not expose a remote TCP port, forward
 an agent socket, or copy terminal contents continuously.
 
-This is distinct from Muxa's historical “pane host” terminology. A Fleet host
+This is distinct from Tend's historical “pane host” terminology. A Fleet host
 is a physical node. tmux, cmux, rmux, herdr, and zellij remain backend kinds inside
 that node.
 
 ## Human attention across clients
 
 An agent can explicitly request a required decision with
-`muxa msg attention "Approve staging deployment?" --action approval`, or call
-`muxa_request_attention` with `body` and `action` (`approval`, `choice`, or
-`information`). Retain the request ID and wait with `muxa_wait_reply`; reuse a
+`tend msg attention "Approve staging deployment?" --action approval`, or call
+`tend_request_attention` with `body` and `action` (`approval`, `choice`, or
+`information`). Retain the request ID and wait with `tend_wait_reply`; reuse a
 UUID `dispatch_id` for retries. Read the response body: completion is not consent.
 
 The source host stores the durable request and response. Each connected Mac
@@ -46,15 +46,15 @@ reads and replies require that source to be reachable.
 
 ## Prerequisites
 
-- Install the same Muxa version on the controller and every remote host.
-- Run muxad for the same Unix user on every remote host.
+- Install the same Tend version on the controller and every remote host.
+- Run tendd for the same Unix user on every remote host.
 - Configure and test non-interactive OpenSSH authentication and host-key trust.
 - Put users, ports, keys, ProxyJump, and other SSH policy in `~/.ssh/config`.
 
 For example:
 
 ```sshconfig
-Host muxa-devbox
+Host tend-devbox
   HostName devbox.example.com
   User june
   IdentityFile ~/.ssh/id_ed25519
@@ -64,7 +64,7 @@ Host muxa-devbox
 Then verify the transport before adding it:
 
 ```bash
-ssh -T -o BatchMode=yes muxa-devbox muxa relay --stdio
+ssh -T -o BatchMode=yes tend-devbox tend relay --stdio
 ```
 
 The command emits one JSON hello frame and waits for requests; `Ctrl-C` is
@@ -75,60 +75,60 @@ expected for this manual probe.
 No setup is required for the controller node:
 
 ```bash
-muxa fleet status
-muxa fleet host show local
-muxa fleet host doctor local
-muxa fleet host label local environment=development
-muxa fleet host annotate local muxa.dev/owner=platform
+tend fleet status
+tend fleet host show local
+tend fleet host doctor local
+tend fleet host label local environment=development
+tend fleet host annotate local tend.dev/owner=platform
 ```
 
 `local` has the same stable NodeId and topology shape as a remote node, but it
 does not use SSH and is always connected in control mode. It cannot be added,
 removed, disabled, or disconnected. User metadata is stored under
-`[fleet.local]`. muxad owns the truthful `muxa.io/local`,
-`muxa.io/transport`, and `kubernetes.io/{hostname,os,arch}` labels; selectors
+`[fleet.local]`. tendd owns the truthful `tend.io/local`,
+`tend.io/transport`, and `kubernetes.io/{hostname,os,arch}` labels; selectors
 may use them, but user configuration cannot override them.
 
-Register hosts through the CLI so Muxa validates and atomically updates the
+Register hosts through the CLI so Tend validates and atomically updates the
 TOML inventory:
 
 ```bash
-muxa fleet host add dev muxa-devbox \
+tend fleet host add dev tend-devbox \
   --label environment=development \
   --label region=icn \
-  --annotation muxa.dev/owner=platform \
+  --annotation tend.dev/owner=platform \
   --mode observe
 
-muxa fleet host doctor dev
-muxa fleet host list
-muxa fleet host show dev
+tend fleet host doctor dev
+tend fleet host list
+tend fleet host show dev
 ```
 
 The first remote-host command enables outbound SSH Fleet connections. The
 local node remains available when `[fleet] enabled = false`. Host mutations
-ask muxad to restart itself so the connection set and authorization policy are reloaded together.
+ask tendd to restart itself so the connection set and authorization policy are reloaded together.
 If the daemon cannot be reached, the config edit remains valid and the CLI
 prints a reminder to restart it manually.
 
 Labels follow Kubernetes key/value rules and are meant for selection:
 
 ```bash
-muxa fleet host label dev tier=worker accelerator=gpu
-muxa fleet host label dev tier=worker --overwrite
-muxa fleet host label dev accelerator-              # remove
-muxa fleet host tag dev region=icn                   # visible alias of label
+tend fleet host label dev tier=worker accelerator=gpu
+tend fleet host label dev tier=worker --overwrite
+tend fleet host label dev accelerator-              # remove
+tend fleet host tag dev region=icn                   # visible alias of label
 ```
 
 Annotation keys use the same namespaced key rules but their values may hold
 descriptive text or URLs:
 
 ```bash
-muxa fleet host annotate dev muxa.dev/runbook=https://example.invalid/dev
+tend fleet host annotate dev tend.dev/runbook=https://example.invalid/dev
 ```
 
 The controller alias is human-friendly configuration identity. The relay also
-creates `$XDG_DATA_HOME/muxa/host-id` as an owner-only stable UUID. Rename an
-SSH alias, hostname, or inventory alias without changing node identity. Muxa
+creates `$XDG_DATA_HOME/tend/host-id` as an owner-only stable UUID. Rename an
+SSH alias, hostname, or inventory alias without changing node identity. Tend
 refuses two live aliases that report the same node UUID, preventing accidental
 double control of one machine.
 
@@ -152,40 +152,40 @@ apply to remote inventory entries:
 - `mode = "control"` additionally permits exact-pane prompt delivery.
 - `connect = "auto"` keeps a relay connected with bounded exponential
   reconnect backoff.
-- `connect = "on_demand"` remains disconnected until `muxa fleet connect`.
+- `connect = "on_demand"` remains disconnected until `tend fleet connect`.
 
-Use `muxa fleet host disable` to keep metadata but suppress all connections, and
-`muxa fleet host enable` to restore it.
+Use `tend fleet host disable` to keep metadata but suppress all connections, and
+`tend fleet host enable` to restore it.
 
 ## Operating the fleet
 
 ```bash
-muxa fleet status
-muxa fleet status -l 'environment=production,region in (icn,nrt)'
-muxa fleet status -o wide
-muxa fleet status -L environment,region
-muxa fleet status --show-labels
-muxa fleet status -o json                 # `--json` remains compatible
-muxa fleet watch
-muxa watch --fleet --selector 'accelerator=gpu'
+tend fleet status
+tend fleet status -l 'environment=production,region in (icn,nrt)'
+tend fleet status -o wide
+tend fleet status -L environment,region
+tend fleet status --show-labels
+tend fleet status -o json                 # `--json` remains compatible
+tend fleet watch
+tend watch --fleet --selector 'accelerator=gpu'
 
-muxa fleet panes local
-muxa fleet capture local '%12'
-muxa fleet send local '%12' 'Please summarize the current result.'
-muxa fleet attach local '%12'
+tend fleet panes local
+tend fleet capture local '%12'
+tend fleet send local '%12' 'Please summarize the current result.'
+tend fleet attach local '%12'
 
-muxa fleet connect dev
-muxa fleet disconnect dev
-muxa fleet refresh dev
-muxa fleet panes dev
-muxa fleet capture dev '%12'
-muxa fleet send dev '%12' 'Please summarize the current result.'
-muxa fleet attach dev '%12'
+tend fleet connect dev
+tend fleet disconnect dev
+tend fleet refresh dev
+tend fleet panes dev
+tend fleet capture dev '%12'
+tend fleet send dev '%12' 'Please summarize the current result.'
+tend fleet attach dev '%12'
 ```
 
 A bare pane id or `session/window/pane` path is accepted only when unique
 across all backend endpoints on that physical host. If even the display path
-is ambiguous, `muxa fleet panes HOST --json` prints the complete `PaneKey` JSON
+is ambiguous, `tend fleet panes HOST --json` prints the complete `PaneKey` JSON
 accepted by capture/send/attach and MCP tools. Internally, every command carries
 the complete node/backend/session/window/pane identity, and the relay verifies
 that identity again against a fresh pane list before a control action.
@@ -199,7 +199,7 @@ terminal row. Use `-L` for selected Kubernetes-style label columns,
 details as space permits, or `-o json` for the lossless machine interface.
 
 When the selector contains only the controller's `local` node, Fleet watch
-delegates to the full native `muxa watch` surface. There is no redundant host
+delegates to the full native `tend watch` surface. There is no redundant host
 row, and all existing inspectors, tree/swarm modes, collaboration/mailbox,
 ask, previews, command palette, message-skill editing, and configuration
 persistence remain available. Once a second physical node is visible, the
@@ -228,12 +228,12 @@ The multi-node Fleet TUI uses the same focused navigation conventions:
   shared message-skill palette. In that palette, `F2`/`Ctrl-A` registers a
   skill and Delete/`Ctrl-D` removes the selected skill. `M` (or `b`) opens that
   pane's mailbox, where `i` claims queued requests and `e` replies. These
-  operations use the selected physical host's local muxad over the existing
+  operations use the selected physical host's local tendd over the existing
   SSH relay.
   Each mailbox tab returns its 32 newest requests to keep the interactive
   response bounded; the node remains the durable source of truth.
 - Enter attaches directly on `local` or through a separate remote SSH TTY,
-  and `?` shows help. `muxa init` binds `prefix+s` to local watch and
+  and `?` shows help. `tend init` binds `prefix+s` to local watch and
   `prefix+S` to Fleet watch.
 - `--view`, `--layout tree|swarm|work`, `--sort`, and `--theme` use the same values
   as native watch. `focus` expansion follows the selected view depth,
@@ -295,9 +295,9 @@ partial acknowledgement.
 
 ## Other interfaces
 
-`muxa mcp` exposes `muxa_fleet_status`, `muxa_fleet_capture`,
-`muxa_fleet_send_prompt`, and the durable collaboration pair
-`muxa_fleet_call_peer` / `muxa_fleet_wait_reply`. Control tools require an
+`tend mcp` exposes `tend_fleet_status`, `tend_fleet_capture`,
+`tend_fleet_send_prompt`, and the durable collaboration pair
+`tend_fleet_call_peer` / `tend_fleet_wait_reply`. Control tools require an
 explicit host and pane and never auto-select or create a remote agent. Remote
 hosts recheck observe/control mode on every command, while `local` is
 owner-socket control. When a call's bounded wait expires, pass its exact
@@ -311,7 +311,7 @@ When the web dashboard is enabled, its authenticated read surface includes
 
 Durable collaboration data remains owned by each physical node. Fleet watch
 does not copy it into a central database: `m`, `M`, claim, and reply commands
-are routed to the selected node's muxad over the authenticated SSH stdio relay.
+are routed to the selected node's tendd over the authenticated SSH stdio relay.
 The `collaboration` capability gates these commands, and `collaboration_get`
 separately gates exact reply retrieval. Mixed-version nodes therefore fail
 with an upgrade instruction instead of silently degrading durable requests
@@ -325,8 +325,8 @@ into keystrokes.
   `BatchMode=yes` and never disables host-key checking.
 - Fleet forces `ClearAllForwardings=yes` and does not request agent forwarding.
 - Start new hosts in observe mode, then promote only the hosts that need
-  control with `muxa fleet host add ... --mode control --overwrite`.
-- Treat access to the controller's muxad socket, config file, and SSH keys as
+  control with `tend fleet host add ... --mode control --overwrite`.
+- Treat access to the controller's tendd socket, config file, and SSH keys as
   shell-equivalent authority.
 - Use labels for selection, not secrets. Annotations are displayed in the
   inspector and must not contain credentials either.
@@ -340,8 +340,8 @@ Fleet reply waits share a controller-side subscription per exact host/pane/reque
 `mailbox_watch` hosts reconcile on mailbox changes and reconnection rather than
 polling every 500 ms; older hosts use capped exponential backoff. Independent
 waiters retain their deadlines and release the worker when none remain.
-Use `muxa_fleet_update_request` for consolidated guidance and `muxa_update_request`
-for progress on that same durable request. `muxa_fleet_wait_reply(after_update=0)`
+Use `tend_fleet_update_request` for consolidated guidance and `tend_update_request`
+for progress on that same durable request. `tend_fleet_wait_reply(after_update=0)`
 can return progress before terminal completion. See [MCP.md](MCP.md) for sequence,
 retention, authority and compatibility contracts.
 
@@ -353,12 +353,12 @@ selector-based placement, configurable workspace paths, and durable dispatch.
 ## Preview and synchronize automation settings
 
 ```sh
-muxa fleet sync --from devbox --to local,mac-pro,mac-mini --diff
-muxa fleet sync --from devbox --to local,mac-pro,mac-mini --apply
+tend fleet sync --from devbox --to local,mac-pro,mac-mini --diff
+tend fleet sync --from devbox --to local,mac-pro,mac-mini --apply
 ```
 
 To share more than automation, or between hosts that are not in a Fleet, use
-[`muxa config export` / `apply`](CONFIGURATION.md#sharing-settings-between-hosts),
+[`tend config export` / `apply`](CONFIGURATION.md#sharing-settings-between-hosts),
 which carries every portable category through a file.
 
 `local` and `localhost` mean the controller's daemon. The default is a preview;

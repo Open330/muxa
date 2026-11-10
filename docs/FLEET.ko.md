@@ -1,10 +1,10 @@
-# Muxa Fleet
+# Tend Fleet
 
-Muxa Fleet은 기존 session/window/pane 구조 위에 physical host 계층을 더하는
+Tend Fleet은 기존 session/window/pane 구조 위에 physical host 계층을 더하는
 중앙 control plane입니다.
 
 ```text
-local muxad
+local tendd
   FleetManager
     ├─ in-process      ─ host local ─ session ─ window ─ pane(agent)
     ├─ SSH stdio relay ─ host dev ─ session ─ window ─ pane(agent)
@@ -14,7 +14,7 @@ local muxad
 
 controller는 항상 첫 번째 `local` host로 in-process 게시됩니다. 설정된 remote
 host마다 독립적인 OpenSSH process 하나를 유지합니다. 원격에서는
-`muxa relay --stdio`가 실행되어 같은 사용자의 owner-only muxad Unix socket과만
+`tend relay --stdio`가 실행되어 같은 사용자의 owner-only tendd Unix socket과만
 통신합니다. 원격 TCP port를 열거나 agent socket을 forwarding하지 않으며 terminal
 내용도 상시 복제하지 않습니다.
 
@@ -26,16 +26,16 @@ zellij “pane host”는 각 node 내부의 backend kind로 그대로 유지됩
 에이전트는 실행 중인 호스트에서 다음 명령이나 MCP 도구를 사용합니다.
 
 ```sh
-muxa msg attention "staging 배포를 승인해 주세요. 테스트는 통과했고 production은 변경하지 않습니다." --action approval
+tend msg attention "staging 배포를 승인해 주세요. 테스트는 통과했고 production은 변경하지 않습니다." --action approval
 ```
 
-MCP에서는 `muxa_request_attention`에 `body`와 `action`(`approval`, `choice`,
+MCP에서는 `tend_request_attention`에 `body`와 `action`(`approval`, `choice`,
 `information`)을 전달합니다. `dispatch_id`에 같은 UUID를 재사용하면 전송 재시도로
-같은 질문이 중복 생성되지 않습니다. 반환된 요청 ID로 `muxa_wait_reply`를 기다립니다.
+같은 질문이 중복 생성되지 않습니다. 반환된 요청 ID로 `tend_wait_reply`를 기다립니다.
 완료 상태 자체가 승인을 의미하지 않으므로 실제 답장 본문을 확인해야 합니다.
 
 요청과 답장은 **에이전트가 있는 원본 호스트**의 durable mailbox에 저장됩니다.
-Muxa for Mac은 연결된 모든 Fleet 호스트의 사람용 수신함을 모아 Work의 Attention,
+Tend for Mac은 연결된 모든 Fleet 호스트의 사람용 수신함을 모아 Work의 Attention,
 Inbox의 Needs Action, Dock 배지와 macOS 알림에 표시합니다. 한 Mac에서 답하면
 같은 호스트를 읽는 다른 Mac에도 답장과 처리 상태가 반영됩니다. 알림 수신 여부는
 각 Mac의 알림 설정을 따르며, 같은 요청의 배너는 기기별로 한 번만 보냅니다.
@@ -45,9 +45,9 @@ Inbox의 Needs Action, Dock 배지와 macOS 알림에 표시합니다. 한 Mac�
 `~/.ssh/config`에 준비합니다.
 
 ```sh
-muxa fleet host add devbox devbox --mode control
-muxa fleet host add mac-pro mac-pro --mode control
-muxa fleet host add mac-mini mac-mini --mode control
+tend fleet host add devbox devbox --mode control
+tend fleet host add mac-pro mac-pro --mode control
+tend fleet host add mac-mini mac-mini --mode control
 ```
 
 `mac-pro`를 사용하는 경우에는 `mac-air`, `devbox`, `mac-mini`를 그 기기의
@@ -57,20 +57,20 @@ Fleet에도 등록합니다. 현재 기기는 항상 `local`로 포함됩니다.
 
 모든 호스트의 CLI·데몬·relay와 Mac 앱을 이 기능이 포함된 같은 버전으로 맞추고,
 에이전트의 MCP 연결도 새 도구 목록으로 갱신해야 합니다. 기존
-`muxa msg send human --human-action approval "..."` 경로도 유지됩니다.
+`tend msg send human --human-action approval "..."` 경로도 유지됩니다.
 `[collaboration] enabled = true`가 필요하며, 알림을 닫거나 요청을 읽는 동작은
 승인이나 답장이 아닙니다. 원본 호스트가 오프라인인 동안 다른 Mac은 마지막으로
 가져온 내용만 보여주며, 답장 전송에는 원본 호스트 연결이 필요합니다.
 
 ## 준비
 
-- controller와 모든 remote host에 같은 Muxa version을 설치합니다.
-- 각 remote host에서 같은 Unix user로 muxad를 실행합니다.
+- controller와 모든 remote host에 같은 Tend version을 설치합니다.
+- 각 remote host에서 같은 Unix user로 tendd를 실행합니다.
 - non-interactive OpenSSH 인증과 host-key trust를 먼저 확인합니다.
 - user, port, key, ProxyJump 등 SSH 정책은 `~/.ssh/config`에 둡니다.
 
 ```sshconfig
-Host muxa-devbox
+Host tend-devbox
   HostName devbox.example.com
   User june
   IdentityFile ~/.ssh/id_ed25519
@@ -80,7 +80,7 @@ Host muxa-devbox
 등록 전 transport를 확인할 수 있습니다.
 
 ```bash
-ssh -T -o BatchMode=yes muxa-devbox muxa relay --stdio
+ssh -T -o BatchMode=yes tend-devbox tend relay --stdio
 ```
 
 JSON hello 한 줄이 출력된 뒤 요청을 기다리면 정상입니다. 수동 확인에서는
@@ -91,56 +91,56 @@ JSON hello 한 줄이 출력된 뒤 요청을 기다리면 정상입니다. 수�
 controller node는 별도 설정 없이 바로 사용할 수 있습니다.
 
 ```bash
-muxa fleet status
-muxa fleet host show local
-muxa fleet host doctor local
-muxa fleet host label local environment=development
-muxa fleet host annotate local muxa.dev/owner=platform
+tend fleet status
+tend fleet host show local
+tend fleet host doctor local
+tend fleet host label local environment=development
+tend fleet host annotate local tend.dev/owner=platform
 ```
 
 `local`도 remote node와 같은 stable NodeId와 topology를 가지지만 SSH를 사용하지 않고
 항상 connected/control 상태입니다. add/remove/disable/disconnect할 수 없으며 사용자
-metadata는 `[fleet.local]`에 저장됩니다. `muxa.io/local`, `muxa.io/transport`,
-`kubernetes.io/{hostname,os,arch}`는 muxad가 관리하는 사실 label이므로 selector에는
+metadata는 `[fleet.local]`에 저장됩니다. `tend.io/local`, `tend.io/transport`,
+`kubernetes.io/{hostname,os,arch}`는 tendd가 관리하는 사실 label이므로 selector에는
 쓸 수 있지만 사용자가 덮어쓸 수 없습니다.
 
 CLI를 사용하면 TOML을 검증하고 atomic하게 변경합니다.
 
 ```bash
-muxa fleet host add dev muxa-devbox \
+tend fleet host add dev tend-devbox \
   --label environment=development \
   --label region=icn \
-  --annotation muxa.dev/owner=platform \
+  --annotation tend.dev/owner=platform \
   --mode observe
 
-muxa fleet host doctor dev
-muxa fleet host list
-muxa fleet host show dev
+tend fleet host doctor dev
+tend fleet host list
+tend fleet host show dev
 ```
 
 첫 remote host 명령은 outbound SSH Fleet 연결을 활성화합니다. `[fleet] enabled = false`여도
 local node는 계속 보입니다. 변경 후에는 연결 목록과 권한 정책이
-함께 다시 로드되도록 muxad self-restart를 요청합니다. daemon에 연결할 수 없으면
+함께 다시 로드되도록 tendd self-restart를 요청합니다. daemon에 연결할 수 없으면
 config 변경은 보존하고 수동 restart 안내를 출력합니다.
 
 label은 Kubernetes key/value 규칙을 따르는 selection metadata입니다.
 
 ```bash
-muxa fleet host label dev tier=worker accelerator=gpu
-muxa fleet host label dev tier=worker --overwrite
-muxa fleet host label dev accelerator-              # 제거
-muxa fleet host tag dev region=icn                   # label의 visible alias
+tend fleet host label dev tier=worker accelerator=gpu
+tend fleet host label dev tier=worker --overwrite
+tend fleet host label dev accelerator-              # 제거
+tend fleet host tag dev region=icn                   # label의 visible alias
 ```
 
 annotation key도 namespaced key 규칙을 따르지만 value에는 설명이나 URL을 넣을 수
 있습니다.
 
 ```bash
-muxa fleet host annotate dev muxa.dev/runbook=https://example.invalid/dev
+tend fleet host annotate dev tend.dev/runbook=https://example.invalid/dev
 ```
 
 controller alias는 사람이 읽는 config identity입니다. relay는 별도로
-`$XDG_DATA_HOME/muxa/host-id`에 owner-only stable UUID를 만듭니다. SSH alias,
+`$XDG_DATA_HOME/tend/host-id`에 owner-only stable UUID를 만듭니다. SSH alias,
 hostname, inventory alias를 바꿔도 node identity는 유지됩니다. 동일 UUID를 보고하는
 두 alias가 동시에 연결되면 한 물리 장비를 중복 제어하지 않도록 거부합니다.
 
@@ -162,39 +162,39 @@ local node는 항상 connected/control이며, 아래 설정은 remote inventory�
   거부합니다. 기본값입니다.
 - `mode = "control"`: exact-pane prompt 전송까지 허용합니다.
 - `connect = "auto"`: bounded exponential backoff로 persistent relay를 유지합니다.
-- `connect = "on_demand"`: `muxa fleet connect` 전까지 연결하지 않습니다.
+- `connect = "on_demand"`: `tend fleet connect` 전까지 연결하지 않습니다.
 
-`muxa fleet host disable`은 metadata를 남기고 연결만 막으며, `muxa fleet host enable`로 다시
+`tend fleet host disable`은 metadata를 남기고 연결만 막으며, `tend fleet host enable`로 다시
 활성화합니다.
 
 ## 사용
 
 ```bash
-muxa fleet status
-muxa fleet status -l 'environment=production,region in (icn,nrt)'
-muxa fleet status -o wide
-muxa fleet status -L environment,region
-muxa fleet status --show-labels
-muxa fleet status -o json                 # `--json`도 계속 지원
-muxa fleet watch
-muxa watch --fleet --selector 'accelerator=gpu'
+tend fleet status
+tend fleet status -l 'environment=production,region in (icn,nrt)'
+tend fleet status -o wide
+tend fleet status -L environment,region
+tend fleet status --show-labels
+tend fleet status -o json                 # `--json`도 계속 지원
+tend fleet watch
+tend watch --fleet --selector 'accelerator=gpu'
 
-muxa fleet panes local
-muxa fleet capture local '%12'
-muxa fleet send local '%12' '현재 결과를 요약해주세요.'
-muxa fleet attach local '%12'
+tend fleet panes local
+tend fleet capture local '%12'
+tend fleet send local '%12' '현재 결과를 요약해주세요.'
+tend fleet attach local '%12'
 
-muxa fleet connect dev
-muxa fleet disconnect dev
-muxa fleet refresh dev
-muxa fleet panes dev
-muxa fleet capture dev '%12'
-muxa fleet send dev '%12' '현재 결과를 요약해주세요.'
-muxa fleet attach dev '%12'
+tend fleet connect dev
+tend fleet disconnect dev
+tend fleet refresh dev
+tend fleet panes dev
+tend fleet capture dev '%12'
+tend fleet send dev '%12' '현재 결과를 요약해주세요.'
+tend fleet attach dev '%12'
 ```
 
 bare pane id나 `session/window/pane` path는 해당 물리 host의 모든 backend endpoint에서
-유일할 때만 허용합니다. display path도 모호하면 `muxa fleet panes HOST --json`이
+유일할 때만 허용합니다. display path도 모호하면 `tend fleet panes HOST --json`이
 capture/send/attach와 MCP 도구에 그대로 전달할 수 있는 complete `PaneKey` JSON을
 출력합니다. 내부 명령은 완전한 node/backend/session/window/pane identity를 전달하고,
 relay가 control 직전에 fresh pane list로 다시 확인합니다.
@@ -207,7 +207,7 @@ label 전체를 보통 터미널 행에 넣지 않습니다. 필요한 label은 
 interface는 `-o json`으로 봅니다.
 
 selector 결과가 controller의 `local` 하나뿐이면 Fleet watch는 완전한 native
-`muxa watch`로 진입합니다. 불필요한 host row를 추가하지 않으며 기존 Inspector,
+`tend watch`로 진입합니다. 불필요한 host row를 추가하지 않으며 기존 Inspector,
 tree/swarm, collaboration/mailbox, ask, preview, command palette, message skill 편집과
 설정 저장을 모두 그대로 사용합니다. 두 번째 physical node가 보일 때만 host 계층을
 표시합니다.
@@ -229,11 +229,11 @@ multi-node Fleet TUI 동작:
   엽니다. palette 안에서 `F2`/`Ctrl-A`는 skill 등록, Delete/`Ctrl-D`는 선택한
   skill 삭제입니다. `M`(또는 `b`)은 해당 pane의 mailbox를 열고 그 안에서 `i` claim,
   `e` reply를 수행합니다. 이 동작은 기존 SSH relay로 선택한 physical host의
-  muxad에 전달됩니다.
+  tendd에 전달됩니다.
   interactive response 크기를 제한하기 위해 mailbox tab마다 최신 32개를
   표시하며, durable 원본은 계속 해당 node가 소유합니다.
 - Enter는 `local`이면 직접 이동하고 remote이면 SSH attach하며, `?`는 help입니다.
-  `muxa init`은 `prefix+s`를 local watch, `prefix+S`를 Fleet watch에 연결합니다.
+  `tend init`은 `prefix+s`를 local watch, `prefix+S`를 Fleet watch에 연결합니다.
 - `--view`, `--layout tree|swarm|work`, `--sort`, `--theme`은 native watch와 같은 값을
   사용합니다. `focus` 확장은 선택한 view 깊이를 지키고, `manual`은 구조 키로만
   바뀌며, 전역 `J`/`K` 이동은 대상의 ancestor만 엽니다.
@@ -280,9 +280,9 @@ mutation은 자동 retry하지 않습니다. 결과는 text delivery와 Enter su
 
 ## 다른 interface
 
-`muxa mcp`는 `muxa_fleet_status`, `muxa_fleet_capture`,
-`muxa_fleet_send_prompt`와 durable collaboration용 `muxa_fleet_call_peer`,
-`muxa_fleet_wait_reply`를 제공합니다. control 도구는 host와 pane을 명시해야 하며 원격
+`tend mcp`는 `tend_fleet_status`, `tend_fleet_capture`,
+`tend_fleet_send_prompt`와 durable collaboration용 `tend_fleet_call_peer`,
+`tend_fleet_wait_reply`를 제공합니다. control 도구는 host와 pane을 명시해야 하며 원격
 에이전트를 자동 선택하거나 생성하지 않습니다. remote는 매 명령마다 observe/control
 검사를 적용하고 `local`은 owner-only socket control입니다. 호출 대기 시간이 끝나면
 결과의 정확한 `pane_key`와 `request_id`를 wait 도구에 그대로 넘기면 됩니다. 요청과
@@ -295,14 +295,14 @@ Fleet 응답 대기는 controller에서 `(host, pane_key, request_id)`별로 공
 대기자별 timeout은 독립적이고 마지막 대기 연결이 종료되면 구독도 정리합니다.
 구형 호스트/controller에만 1→2→4→8→16→30초 간격의 backoff를 적용합니다.
 
-진행 중 보완 지시는 `muxa_fleet_update_request(host, pane_key, request_id, body)`,
-수임자의 진행보고는 `muxa_update_request(request_id, body)`로 기존 요청에 남깁니다.
-`muxa_fleet_wait_reply`에 `after_update: 0`을 주면 완료 전 새 update에도 반환하고,
+진행 중 보완 지시는 `tend_fleet_update_request(host, pane_key, request_id, body)`,
+수임자의 진행보고는 `tend_update_request(request_id, body)`로 기존 요청에 남깁니다.
+`tend_fleet_wait_reply`에 `after_update: 0`을 주면 완료 전 새 update에도 반환하고,
 이후 `next_after_update`로 이어서 기다릴 수 있습니다. `initiator`는 원래 조율자의
 식별 정보이며 권한을 추가하지 않습니다. `console`을 수신 pane으로 사용하지 않습니다.
 
 update는 작업 완료·새 작업 생성·터미널 입력을 하지 않습니다. 에이전트는 합의한
-검토 시점에 `muxa_list_messages`로 변경사항을 읽고 마지막에 `muxa_reply`를 한 번
+검토 시점에 `tend_list_messages`로 변경사항을 읽고 마지막에 `tend_reply`를 한 번
 제출합니다. 지시를 검증한 뒤 묶어서 전달하고, 큰 근거는 파일 경로로 연결합니다.
 update당 8 KiB, 요청당 최근 32개/본문 합계 32 KiB를 보관합니다. 원격 update는
 `collaboration_update` capability와 control mode가 필요합니다.
@@ -313,7 +313,7 @@ dashboard `auth = "none"`에서는 기존 정책대로 모든 write가 비활성
 
 durable collaboration data의 소유권은 계속 각 physical node에 있습니다. Fleet watch는
 이를 중앙 DB로 복제하지 않고 `m`, `M`, claim, reply를 authenticated SSH stdio relay로
-선택한 node의 muxad에 전달합니다. `collaboration` 및 exact reply 조회용
+선택한 node의 tendd에 전달합니다. `collaboration` 및 exact reply 조회용
 `collaboration_get` relay capability가 이 명령을 gate하므로 구버전 node에서는 durable
 request를 keystroke로 조용히 낮추지 않고 upgrade 안내를 표시합니다.
 
@@ -325,7 +325,7 @@ request를 keystroke로 조용히 낮추지 않고 upgrade 안내를 표시합�
   host-key 검사를 끄지 않습니다.
 - Fleet은 `ClearAllForwardings=yes`를 강제하고 agent forwarding을 요청하지 않습니다.
 - 새 host는 observe로 시작하고 필요한 node만 control로 승격합니다.
-- controller의 muxad socket, config, SSH key 접근은 shell-equivalent 권한으로
+- controller의 tendd socket, config, SSH key 접근은 shell-equivalent 권한으로
   취급합니다.
 - label/annotation에 secret을 넣지 않습니다. inspector에 표시됩니다.
 
@@ -335,8 +335,8 @@ backend를 관측하는 기능은 [MULTI_HOST.md](MULTI_HOST.md)를 참고하세
 ## automation 설정 비교와 전파
 
 ```sh
-muxa fleet sync --from devbox --to local,mac-pro,mac-mini --diff
-muxa fleet sync --from devbox --to local,mac-pro,mac-mini --apply
+tend fleet sync --from devbox --to local,mac-pro,mac-mini --diff
+tend fleet sync --from devbox --to local,mac-pro,mac-mini --apply
 ```
 
 기본은 미리보기이며 `--diff`로 명시할 수도 있습니다. 초기 범위는

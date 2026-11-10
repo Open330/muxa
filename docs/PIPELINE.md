@@ -1,12 +1,12 @@
-# Work pipelines — `muxa work up`
+# Work pipelines — `tend work up`
 
-`muxa work start` is the imperative primitive: one invocation, one agent
-session. `muxa work up` is the declarative one. You give it a stable Muxa Work
+`tend work start` is the imperative primitive: one invocation, one agent
+session. `tend work up` is the declarative one. You give it a stable Tend Work
 id and, optionally, a separate external issue key; it creates or converges the
 current Run.
 
 ```console
-$ muxa work up auth-cleanup --external ENG-1234
+$ tend work up auth-cleanup --external ENG-1234
 work auth-cleanup is in workspace webapp via pipeline triad
   cwd      ~/worktrees/auth-cleanup (worktree auth-cleanup, created)
   external linear:ENG-1234 Reaper double-reaps a lying pane  [In Progress]
@@ -24,17 +24,17 @@ session (see [WORK_MODEL.md](WORK_MODEL.md)).
 ## Getting set up
 
 `[ticket]`, `[[route]]`, and `[pipeline.*]` are the most structured
-configuration muxa asks for and the least guessable — nested tables, an
+configuration tend asks for and the least guessable — nested tables, an
 ordered array of routes, regexes, placeholder templates. So you do not have
 to write them from this document:
 
 ```console
-$ muxa work init
+$ tend work init
 ◇  Describe the work pipeline you want
 │  eng-* tickets: codex planner, codex implementer, claude reviewer
 ```
 
-muxa spends one headless agent turn turning that sentence into TOML, then
+tend spends one headless agent turn turning that sentence into TOML, then
 does the part it does *not* delegate: parse the result, compile every
 regex, check that every pipeline a route names exists and that every agent
 it lists could actually launch, print what it would change, and only write
@@ -48,34 +48,34 @@ rewritten through `toml_edit`, so your comments and every other section
 survive verbatim.
 
 Every path here spends **one headless agent turn, billed to your agent
-account**. muxa says what it is about to run before it runs it, and
+account**. tend says what it is about to run before it runs it, and
 `--dry-run` skips only the file write — the turn still happens and still
 bills. Non-interactive callers must pass `--yes` to confirm the spend.
 
 ```console
-muxa work init                                # ask interactively
-muxa work init --describe "..."               # non-interactive
-muxa work init --dry-run                      # show the proposal, write nothing
-muxa work init --agent codex                  # use a different resolver
+tend work init                                # ask interactively
+tend work init --describe "..."               # non-interactive
+tend work init --dry-run                      # show the proposal, write nothing
+tend work init --agent codex                  # use a different resolver
 ```
 
-Want one pipeline rather than the whole config? `muxa work compose
+Want one pipeline rather than the whole config? `tend work compose
 "<description>"` spends one **read-only** agent turn and prints the
 pipeline as the JSON `pipeline set` reads — nothing is written. The draft
 is validated with the same rules as `pipeline set`, and a draft that would
-not launch is sent back once with the reason before muxa gives up.
+not launch is sent back once with the reason before tend gives up.
 `--current <path|->` refines an earlier draft (the description is then the
 change to make), `--agent <id>` picks any `[ask]` provider, and `--json`
 prints the whole response (`pipeline`, `notes`, `raw`) — the same shape
-Muxa.app's pipeline editor gets from the daemon's `work_compose` request.
+Tend.app's pipeline editor gets from the daemon's `work_compose` request.
 
 ```console
-muxa work compose "implementer in claude, reviewer in codex after it"
-muxa work compose "add a gemini tester after review" --current pair.json --json
+tend work compose "implementer in claude, reviewer in codex after it"
+tend work compose "add a gemini tester after review" --current pair.json --json
 ```
 
 Do not want to spend a turn? Three built-in presets cover the common
-line-ups, and `muxa work preset apply` writes one into `config.toml` the
+line-ups, and `tend work preset apply` writes one into `config.toml` the
 same way — through `toml_edit`, validated as a whole `Config` before the
 file is touched, and refusing to replace an existing `[pipeline.<name>]`
 unless you pass `--overwrite`:
@@ -83,15 +83,15 @@ unless you pass `--overwrite`:
 | Preset | Line-up |
 | --- | --- |
 | `solo` | one `claude` implementer |
-| `pair` | `claude` implementer → `codex` reviewer, the reviewer waiting on `muxa work done` |
+| `pair` | `claude` implementer → `codex` reviewer, the reviewer waiting on `tend work done` |
 | `triad` | `codex` planner → `codex` implementer → `claude` reviewer, `main-vertical` layout |
 
 ```console
-muxa work preset list                              # what each preset staffs
-muxa work preset apply solo --route '.*'           # [pipeline.solo] + a catch-all [[route]]
-muxa work preset apply triad --route '^eng-'       # add a second pipeline and its route
-muxa work preset apply pair --overwrite            # replace [pipeline.pair] you edited
-muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
+tend work preset list                              # what each preset staffs
+tend work preset apply solo --route '.*'           # [pipeline.solo] + a catch-all [[route]]
+tend work preset apply triad --route '^eng-'       # add a second pipeline and its route
+tend work preset apply pair --overwrite            # replace [pipeline.pair] you edited
+tend work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
 ```
 
 `--route` appends `[[route]] match = <regex>, pipeline = <name>` only when
@@ -99,37 +99,37 @@ no route with that exact `match` exists; an existing one is reported and
 left pointing wherever it pointed. Once applied, a preset is an ordinary
 pipeline in your file — edit it freely.
 
-Launchers ask what is configured with `muxa work options`: routes in config
+Launchers ask what is configured with `tend work options`: routes in config
 order, pipelines by name, `[message.skills]` with a one-line summary, the
-presets above, and `[ticket].agent`. `--json` is the contract Muxa.app's
+presets above, and `[ticket].agent`. `--json` is the contract Tend.app's
 Start Work sheet is built on; `configured` is `false` until at least one
 `[pipeline.*]` exists. Each pipeline and agent carries its raw `prompt`
 template, so an editor can hand the entry straight back.
 
-Editors write back through the same shape. `muxa work pipeline set <name>
+Editors write back through the same shape. `tend work pipeline set <name>
 --from-json <path|->` takes one `pipelines[]` entry as `options --json`
 prints it (with or without its `name`), runs the checks a launch would fail
 — allowlisted programs, unique aliases, `after` edges that resolve and do
 not cycle, `direction` auto, right, or down — and writes `[pipeline.<name>]`
 through `toml_edit`, replacing an existing pipeline where it stands and
-leaving every other section, comment, and value alone. `muxa work pipeline
+leaving every other section, comment, and value alone. `tend work pipeline
 remove <name>` refuses while a `[[route]]` still names the pipeline unless
-`--force`, which also clears `pipeline` on those routes. `muxa work route
+`--force`, which also clears `pipeline` on those routes. `tend work route
 set --match <regex>` adds or updates the one `[[route]]` with exactly that
 `match` (`--pipeline`, `--workspace`, `--cwd`, `--position <n>`; `--clear-*`
-removes a field; `worktree` and `prepare` are never touched), and `muxa work
+removes a field; `worktree` and `prepare` are never touched), and `tend work
 route remove --match <regex>` deletes it. Every command validates the merged
 file as a whole `Config` before an atomic write, refuses without touching
 the file otherwise, and prints only JSON with `--json`.
 
 ```console
-muxa work pipeline set pair --from-json pair.json     # {"pipeline","replaced","config_path"}
-muxa work options --json | jq '.pipelines[] | select(.name == "triad")' \
-  | muxa work pipeline set triad --from-json -        # round trip, unchanged
-muxa work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
-muxa work route set --match '^eng-' --pipeline triad --position 0   # {"match","position","created","config_path"}
-muxa work route set --match '.*' --clear-workspace    # unset flags change nothing
-muxa work route remove --match '^eng-'                # {"match","removed","config_path"}
+tend work pipeline set pair --from-json pair.json     # {"pipeline","replaced","config_path"}
+tend work options --json | jq '.pipelines[] | select(.name == "triad")' \
+  | tend work pipeline set triad --from-json -        # round trip, unchanged
+tend work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
+tend work route set --match '^eng-' --pipeline triad --position 0   # {"match","position","created","config_path"}
+tend work route set --match '.*' --clear-workspace    # unset flags change nothing
+tend work route remove --match '^eng-'                # {"match","removed","config_path"}
 ```
 
 Prefer to write it by hand? The annotated reference is in
@@ -154,9 +154,9 @@ Four ideas carry the whole feature.
 
 ### Ticket lookup is delegated to an agent
 
-muxa does not speak Linear, Jira, or GitHub, and deliberately never will.
+tend does not speak Linear, Jira, or GitHub, and deliberately never will.
 It spends one headless agent turn (`claude -p` / `codex exec`, the same
-bridge `muxa ask` uses) asking an agent to fetch the ticket — because you
+bridge `tend ask` uses) asking an agent to fetch the ticket — because you
 already taught your agent CLI how, through a skill, an MCP server, `gh`, or
 a token in the environment. Adding a provider is a prompt, not a release.
 
@@ -221,13 +221,13 @@ cwd     = '~/workspace-agent/{{id}}'
 prepare = 'workspace-tool create {{id}} {{ticket.branch}}'
 ```
 
-Muxa renders placeholders, runs the command only while creating a work whose
+Tend renders placeholders, runs the command only while creating a work whose
 window does not exist, then verifies that `cwd` exists. `--dry-run` prints the
 command without executing it, and unresolved placeholders are refused before
 they reach the shell. `prepare` and `worktree` are mutually exclusive because
 only one mechanism may own provisioning.
 
-You do not need a route to get started: `muxa work up eng-1234 --pipeline
+You do not need a route to get started: `tend work up eng-1234 --pipeline
 triad` treats the explicit flag as its own routing decision and uses the
 current directory.
 
@@ -263,8 +263,8 @@ prompt  = 'You own review. Critique the implementer; do not edit.'
 ```
 
 `alias` is the load-bearing field: it is the key the desired-vs-actual diff
-runs on, and it is recorded on the pane itself (`@muxa_agent_alias`), so it
-outlives muxad, the CLI process, and the agent restarting inside the pane.
+runs on, and it is recorded on the pane itself (`@tend_agent_alias`), so it
+outlives tendd, the CLI process, and the agent restarting inside the pane.
 Keep aliases unique within a pipeline and stable once panes exist under
 them.
 
@@ -282,7 +282,7 @@ fixing once at the end rather than three times along the way.
 
 ### Re-running converges
 
-Run `muxa work up` again and it compares the pipeline against the panes the
+Run `tend work up` again and it compares the pipeline against the panes the
 window already has:
 
 - alias has no pane → **launch** it
@@ -290,7 +290,7 @@ window already has:
 - alias has a live pane and you passed a request → **send** it to that pane
 
 ```console
-$ muxa work up eng-1234           # the reviewer's pane was closed
+$ tend work up eng-1234           # the reviewer's pane was closed
   = plan       running                %12
   = impl       running                %13
   + review     claude    reviewer     %21
@@ -302,10 +302,10 @@ something died refills exactly the gap.
 ## The request: `--body`, `--skill`, `--context`
 
 What the work *is* comes in as a request, phrased exactly the way
-`muxa_call_peer` takes one:
+`tend_call_peer` takes one:
 
 ```console
-$ muxa work up eng-1234 \
+$ tend work up eng-1234 \
     --skill review-plan \
     --body "fix the double reap so the reconciler stops eating live panes" \
     --context "tests already pass on main"
@@ -314,7 +314,7 @@ $ muxa work up eng-1234 \
 The registered `[message.skills]` entry expands first, then the body, then
 the context under an `Invocation context:` heading — one composer, shared
 with the collaboration tools, so a phrase that works for a peer works for a
-pipeline. Nothing else is attached: muxa never folds in a transcript or a
+pipeline. Nothing else is attached: tend never folds in a transcript or a
 diff on your behalf.
 
 The same request has **two deliveries, chosen by what already exists**:
@@ -325,7 +325,7 @@ The same request has **two deliveries, chosen by what already exists**:
 | has a live pane | typed into that pane |
 
 ```console
-$ muxa work up eng-1234 --body "rebase onto main before you continue"
+$ tend work up eng-1234 --body "rebase onto main before you continue"
   » plan       prompted               %12
   » impl       prompted               %13
   » review     prompted               %21
@@ -353,7 +353,7 @@ a human opened is how orchestration earns distrust.
 
 ## Placeholders
 
-Templates use `{{double}}` braces, and only keys muxa knows are substituted —
+Templates use `{{double}}` braces, and only keys tend knows are substituted —
 everything else survives verbatim. That is what lets a resolver prompt
 contain the literal `{"id": "..."}` shape it is asking for, and it makes a
 typo show up in the prompt instead of silently blanking.
@@ -361,7 +361,7 @@ typo show up in the prompt instead of silently blanking.
 | Key | Value |
 | --- | --- |
 | `{{id}}` | work id, lowercased — for branch names and directories |
-| `{{work}}` | work id as muxa stores and displays it (`ENG-1234`) |
+| `{{work}}` | work id as tend stores and displays it (`ENG-1234`) |
 | `{{workspace}}` | resolved workspace/session |
 | `{{cwd}}` | resolved working directory |
 | `{{alias}}`, `{{role}}`, `{{program}}` | the agent being rendered |
@@ -388,38 +388,38 @@ So an agent's launch prompt is three layers, outermost first:
 ## Command reference
 
 ```console
-muxa work init                       # write the config by describing it
-muxa work compose "<description>" [--agent <id>] [--current <path|->] [--json]   # draft one pipeline as JSON; writes nothing
-muxa work preset list                # built-in line-ups: solo, pair, triad
-muxa work preset apply <name> --route '<regex>'   # write one, no agent turn
-muxa work options [--json]           # routes, pipelines, skills, presets for a launcher
-muxa work pipeline set <name> --from-json <path|->   # write/replace [pipeline.<name>] from that JSON shape
-muxa work pipeline remove <name> [--force]           # drop it; --force also clears routes naming it
-muxa work route set --match '<regex>' [--pipeline <name>] [--position <n>]   # add/update one [[route]]
-muxa work route remove --match '<regex>'             # drop that route
-muxa work up <work> --external <id>  # link issue, route, create what is missing
-muxa work up <id>                    # compatibility: also look up <id> as an issue
-muxa work up <id> --dry-run          # print the plan, touch nothing
-muxa work up <id> --pipeline triad   # override the route's pipeline
-muxa work up <id> --body "..."       # what the work is; launches or steers
-muxa work up <id> --skill review-plan --context "..."   # same composer as muxa_call_peer
-muxa work up <id> --no-ticket        # skip lookup, launch on the id alone
-muxa work up <id> --refresh          # ignore the cached ticket
-muxa work up <id> --json             # structured plan + result
-muxa work down <id>                  # close the window and every agent in it
+tend work init                       # write the config by describing it
+tend work compose "<description>" [--agent <id>] [--current <path|->] [--json]   # draft one pipeline as JSON; writes nothing
+tend work preset list                # built-in line-ups: solo, pair, triad
+tend work preset apply <name> --route '<regex>'   # write one, no agent turn
+tend work options [--json]           # routes, pipelines, skills, presets for a launcher
+tend work pipeline set <name> --from-json <path|->   # write/replace [pipeline.<name>] from that JSON shape
+tend work pipeline remove <name> [--force]           # drop it; --force also clears routes naming it
+tend work route set --match '<regex>' [--pipeline <name>] [--position <n>]   # add/update one [[route]]
+tend work route remove --match '<regex>'             # drop that route
+tend work up <work> --external <id>  # link issue, route, create what is missing
+tend work up <id>                    # compatibility: also look up <id> as an issue
+tend work up <id> --dry-run          # print the plan, touch nothing
+tend work up <id> --pipeline triad   # override the route's pipeline
+tend work up <id> --body "..."       # what the work is; launches or steers
+tend work up <id> --skill review-plan --context "..."   # same composer as tend_call_peer
+tend work up <id> --no-ticket        # skip lookup, launch on the id alone
+tend work up <id> --refresh          # ignore the cached ticket
+tend work up <id> --json             # structured plan + result
+tend work down <id>                  # close the window and every agent in it
 ```
 
-`muxa work down` is a spelling of `muxa work close`; both refuse to touch an
+`tend work down` is a spelling of `tend work close`; both refuse to touch an
 unmanaged window, and both need `--workspace` when the same work id exists in
 more than one workspace.
 
 ## Over MCP
 
-The same thing is available to agents as `muxa_start_work`, with the same
+The same thing is available to agents as `tend_start_work`, with the same
 arguments:
 
 ```text
-muxa_start_work {
+tend_start_work {
   "work": "auth-cleanup",
   "external": "ENG-1234",
   "body": "fix the double reap",
@@ -428,7 +428,7 @@ muxa_start_work {
 }
 ```
 
-Prefer it over several `muxa_start_agent` calls: those cannot tell an agent
+Prefer it over several `tend_start_agent` calls: those cannot tell an agent
 that already exists from one that still has to be created, so they duplicate
 a team instead of converging on it. See [MCP.md](MCP.md).
 
@@ -447,7 +447,7 @@ the local Work title or workflow stage. The board's local stage (`queued`,
 attention remain signals:
 
 ```console
-$ muxa work list
+$ tend work list
 ┌────────────────────────────────────────────────────────────────────────┐
 │ WORK           WORKSPACE   AGENTS          DONE   STAGE    CWD         │
 ╞════════════════════════════════════════════════════════════════════════╡
@@ -455,7 +455,7 @@ $ muxa work list
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-`DONE` counts the agents that reported `muxa work done` against the ones
+`DONE` counts the agents that reported `tend work done` against the ones
 the pipeline named. It is the difference between a run that converged and
 one that stalled — both leave every pane idle. A window with no pipeline
 aliases shows `-` rather than `0/1`: nothing there was asked to report.

@@ -1,8 +1,8 @@
 # Agent collaboration
 
-Muxa can treat a tmux window as a collaboration room and broker durable
+Tend can treat a tmux window as a collaboration room and broker durable
 request/reply messages between its top-level agents. tmux supplies topology;
-the message body travels through muxad's owner-only Unix socket and local
+the message body travels through tendd's owner-only Unix socket and local
 mailbox, not through terminal screen scraping.
 
 ## Human task priority
@@ -12,7 +12,7 @@ injecting a prompt or being claimed by the generic inbox. Human console requests
 and terminal replies to the primary's own outgoing requests still work.
 
 Automatic, provider and role selection choose only `worker` sessions. Peers
-created by `muxa_call_peer` are workers. Missing workers are created by default
+created by `tend_call_peer` are workers. Missing workers are created by default
 using configured provider permissions, without injected bypass flags. Set
 `collaboration.auto_spawn_workers=false` to disable creation, or override it per
 call with `spawn_if_missing`. Explicit `worker_bypass_permissions=true` enables
@@ -20,42 +20,42 @@ bypass flags for these workers. Work pipeline agents that have a `role` launch
 as workers; set `purpose = "primary"` on one to keep it protected. General
 `start` and role-less pipeline agents remain primary.
 
-Muxa-launched Claude workers set `crossSessionInbound=accept` through a
+Tend-launched Claude workers set `crossSessionInbound=accept` through a
 process-local `--settings` argument, so Claude's default permission-mode parity
 does not strand a dedicated worker's incoming messages. This changes message
 receipt only; the worker's tool permission mode still follows its configured
 launch profile. An explicit operator `--settings` argument is preserved. Existing
-sessions and primary sessions keep their own inbound policy. Muxa coordination
-uses the Muxa mailbox and request IDs; Claude's native `SendMessage` channel is
-not a substitute for a Muxa delivery receipt.
+sessions and primary sessions keep their own inbound policy. Tend coordination
+uses the Tend mailbox and request IDs; Claude's native `SendMessage` channel is
+not a substitute for a Tend delivery receipt.
 
 To apply the same receive policy to sessions that are already running, set
 `"crossSessionInbound": "accept"` in `~/.claude/settings.json`. Claude
 [reloads settings](https://code.claude.com/docs/en/settings#when-edits-take-effect)
 without restarting sessions and
 [rechecks held messages](https://code.claude.com/docs/en/cross-session-messaging#non-interactive-sessions). This is a
-user-wide choice affecting every Claude session on this machine; Muxa does not
+user-wide choice affecting every Claude session on this machine; Tend does not
 set it automatically. It changes message receipt, not tool execution permissions.
 Explicit stricter project/local policies still apply, and messages already
-declined or expired cannot be recovered by changing the policy. Keep Muxa
+declined or expired cannot be recovered by changing the policy. Keep Tend
 coordination on its durable mailbox rather than resending through native tools.
 
 After a request is handed over, a provider permission prompt is tracked as
 `peer_interrupted` with reason `approval_required` (or `input_required` for
-provider input and legacy permission notifications). Muxa immediately creates one
+provider input and legacy permission notifications). Tend immediately creates one
 linked operator Inbox recovery item and keeps the original request open. This
-state survives daemon restart. When the recipient resumes, Muxa clears the
+state survives daemon restart. When the recipient resumes, Tend clears the
 interruption and retires its unanswered recovery item automatically; it neither
 resends the request nor reports the work complete merely because approval ended.
 Startup/trust choices before handover do not become delivery failures.
 
 Automatic creation requires the daemon capability
-`collaboration_worker_spawn_v1`. muxad reserves creation capacity for the observed
+`collaboration_worker_spawn_v1`. tendd reserves creation capacity for the observed
 room, provider and compatible role before the CLI creates a pane. Concurrent
 provider and matching role calls share the pending launch. Busy workers remain
 reusable; this does not add caller affinity or change logical-recipient routing.
 Older daemons without this capability refuse automatic creation. Upgrade/restart
-muxad and run `muxa doctor`; existing eligible workers can still be reused.
+tendd and run `tend doctor`; existing eligible workers can still be reused.
 
 The launch UUID is persisted before creation, stamped on the new pane, and reused
 for the process-fenced worker grant. A renewable lease covers startup. Expiry
@@ -110,7 +110,7 @@ or `/quit` once, with no draft clearing, dialog answers, interrupt or signal
 escalation. A direct-exec pane is preserved with `remain-on-exit`; refusals restore
 its exact previous local override. It waits up to ten seconds for positive process
 exit evidence. Unknown screens, unobservable processes and unsupported providers
-refuse safely. Human input outside Muxa remains outside this gate.
+refuse safely. Human input outside Tend remains outside this gate.
 
 `exited` closes only the matching fenced launch and observed registry row; grant
 history remains intact. A refusal before input becomes `aborted`. A partially
@@ -120,14 +120,14 @@ An operator can finish a pre-stop drain as aborted, or finish a committed/uncert
 drain as exited only with positive evidence that its original process is gone.
 This recovery never kills a process or releases uncertainty merely on timeout.
 
-Use `muxa start --agent claude --purpose worker` to launch a worker, or
-`muxa identity purpose worker` inside an existing dedicated worker session.
-`muxa identity purpose primary` protects that session again. Purpose is persisted
+Use `tend start --agent claude --purpose worker` to launch a worker, or
+`tend identity purpose worker` inside an existing dedicated worker session.
+`tend identity purpose primary` protects that session again. Purpose is persisted
 for the exact provider session; a new session does not inherit it from a pane,
 role or alias. A launched worker's first session binds once to its actual CLI
 process; restarting or reusing the pane does not grant worker purpose.
 
-`muxa identity purpose worker --session ID` sets exact live agent sessions,
+`tend identity purpose worker --session ID` sets exact live agent sessions,
 for example workers launched before purposes existed whose requests now sit
 queued. Run it yourself or have an agent run it on your instruction; the
 change is audited with the caller. Queued requests to a promoted session are
@@ -137,14 +137,14 @@ idle turn, without being re-sent.
 High-level calls naming a primary reuse or create a worker of the same provider
 for generic work. Set `context_bound=true` only when the exact target conversation
 is required. Those requests and low-level exact-pane/alias messages remain
-queued on the primary. Accept one deliberately with `muxa msg accept REQUEST --json` or
-`muxa_inbox(request_id=REQUEST)`. Already claimed work stays with its owner.
+queued on the primary. Accept one deliberately with `tend msg accept REQUEST --json` or
+`tend_inbox(request_id=REQUEST)`. Already claimed work stays with its owner.
 
 When the user tells an agent to deliver to a primary, the agent adds
-`--user-authorized` to `muxa msg send` or `muxa peer` (MCP
+`--user-authorized` to `tend msg send` or `tend peer` (MCP
 `user_authorized=true`). The primary then takes the request without anyone
 accepting it, and an exact primary target is kept rather than rerouted to a
-worker. muxad never types such a request into the human's terminal, where it
+worker. tendd never types such a request into the human's terminal, where it
 could merge with an unsent draft. The session's provider hook *offers* it at
 the next turn boundary instead: at the end of the current turn the agent
 continues with the offer (Claude Code and Codex `Stop` hooks), or the offer
@@ -169,7 +169,7 @@ New peers use configured provider defaults; conversation history, exact model
 and account settings are not cloned from the primary.
 
 
-`prefix + q` (`muxa peek`) displays registered roles and primary/worker purpose,
+`prefix + q` (`tend peek`) displays registered roles and primary/worker purpose,
 plus up to three actual incoming/outgoing requests with their delivery or reply
 status in a separate `Links` panel below each prompt/response card. Cards show
 full pane addresses such as `rmux:%37`; connecting arrows follow the actual pane
@@ -182,7 +182,7 @@ and server; message edges remain cyan. Creation describes the pane's origin,
 not its current task owner. `primary` is a human-priority purpose, not a manager
 role. Existing panes are not assigned guessed creators. New launches with a
 verified agent caller retain provenance in pane metadata across daemon restarts
-and archive it under the data directory's `muxa/spawns/<launch-id>.json`, without
+and archive it under the data directory's `tend/spawns/<launch-id>.json`, without
 prompt bodies. The overlay never scans that archive.
 Pane addresses use stable server-and-pane colors in card titles, creation history
 and peer rows. Only addresses are colored; relationship lines retain their type
@@ -205,12 +205,12 @@ shared-server threads cannot take their launch grants.
 
 ## The whole model
 
-- One tmux window is one collaboration room. In the managed Muxa model, that
+- One tmux window is one collaboration room. In the managed Tend model, that
   window is the current Run's coordination boundary, not the durable Work or
   external issue identity.
-- An **agent** speaking through MCP or `muxa msg` is the represented sender: it
+- An **agent** speaking through MCP or `tend msg` is the represented sender: it
   is the pane it runs in, and the reply routes back there and wakes it.
-- `muxa watch` is not an agent. It is the **operator console** — the human at
+- `tend watch` is not an agent. It is the **operator console** — the human at
   the keyboard is the sender, whatever the pane the popup was opened from
   happens to contain.
 - Select any agent; `m` sends and `M` opens the mailbox.
@@ -221,7 +221,7 @@ no setup: press `prefix+s` anywhere, point at a row, press `m`.
 
 ### The console
 
-`muxa watch` sends as `console`, a sender with a fixed identity and no pane of
+`tend watch` sends as `console`, a sender with a fixed identity and no pane of
 its own. That has three consequences worth knowing:
 
 - **Every row is a target, including the pane you opened watch from.** There is
@@ -248,26 +248,26 @@ from the process environment or ancestry (with the evidence type), and whether
 that pane matches the asserted origin. A console request records the pane the
 operator dialled from, so the audit trail still says where it came from. Wake
 prompts make the same distinction explicit: a recipient sees `from console via
-muxa watch (caller %N, pid …)`.
+tend watch (caller %N, pid …)`.
 
 ## Enable
 
 The standard init preset also installs global entry points, a shared
-`muxa-collaboration` skill, and user MCP registrations for Codex and Claude Code.
+`tend-collaboration` skill, and user MCP registrations for Codex and Claude Code.
 Existing installations can add them with
-`muxa init --component agent-instructions,agent-skills,agent-mcp`.
+`tend init --component agent-instructions,agent-skills,agent-mcp`.
 See [Global agent integration](AGENT_INTEGRATION.md). The manual wiring below is
 only needed when those components were not selected.
 
 Collaboration is off until you grant it, because an incoming request can wake a
-peer by typing a short prompt into its pane. `muxa init` asks for that grant
+peer by typing a short prompt into its pane. `tend init` asks for that grant
 along with everything else it touches, and the `standard` preset includes it:
 
 ```bash
-muxa init --component collaboration
+tend init --component collaboration
 ```
 
-That writes the block below to `config.toml` (`muxa init --component
+That writes the block below to `config.toml` (`tend init --component
 collaboration --uninstall` removes it). Hand-editing works just as well:
 
 ```toml
@@ -281,28 +281,28 @@ wake_payload = "operator_full"
 ```
 
 An existing `wake` is never overwritten — a deliberate `never` means "give me
-the mailbox but stay out of my panes", and re-running `muxa init` respects it.
+the mailbox but stay out of my panes", and re-running `tend init` respects it.
 
-Restart `muxad` and register `muxa mcp` with each agent host:
+Restart `tendd` and register `tend mcp` with each agent host:
 
 ```bash
-claude mcp add --scope user muxa -- muxa mcp
-codex mcp add muxa -- muxa mcp
+claude mcp add --scope user tend -- tend mcp
+codex mcp add tend -- tend mcp
 ```
 
 Codex users should then add the following line under the generated
-`[mcp_servers.muxa]` table in `~/.codex/config.toml`:
+`[mcp_servers.tend]` table in `~/.codex/config.toml`:
 
 ```toml
-env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "MUXA_SOCKET"]
+env_vars = ["RMUX", "RMUX_PANE", "TMUX", "TMUX_PANE", "TEND_SOCKET"]
 ```
 
 Restart agents that were already running so they reload their MCP server list.
-Once connected, muxa's initialization instructions surface same-window peers
+Once connected, tend's initialization instructions surface same-window peers
 as reviewers or narrowly scoped delegated subagents. An agent can call
-`muxa_collaboration_guide` to retrieve the contract again.
+`tend_collaboration_guide` to retrieve the contract again.
 
-An agent launched through Muxa does not need `--prompt` to become a peer.
+An agent launched through Tend does not need `--prompt` to become a peer.
 The launcher records the provider and immediately registers the observed CLI
 through discovery. Before the first hook, a matching live process is exposed
 as a pending peer, selectable by provider, pane, alias, role, or automatic
@@ -315,24 +315,24 @@ Existing `prefix+s` watch bindings need no additional shortcut after upgrading.
 
 Claude's MCP process inherits native pane-host variables; Codex forwards them
 via the `env_vars` allowlist above. For an older default-endpoint Codex
-registration, muxa also attempts to recover the pane from process ancestry
-across active backends. muxad validates the resolved origin against its live
+registration, tend also attempts to recover the pane from process ancestry
+across active backends. tendd validates the resolved origin against its live
 agent and pane registries; collaboration tools do not accept an arbitrary
 sender pane.
 
 Codex 0.160+ attaches every TUI to one shared `codex app-server` (its
 `daemon_auto_start` feature). That server runs hooks, MCP servers, and shell
 commands for all attached threads with the pane variables of whichever pane
-started it, so `env_vars` cannot identify the caller there. Muxa detects the
+started it, so `env_vars` cannot identify the caller there. Tend detects the
 shared server from process ancestry and identifies the thread by its exact
 session id instead: the `_meta.threadId` Codex stamps on each MCP call, or
-`$CODEX_THREAD_ID` for `muxa msg`/`muxa peers` run from a Codex shell. The
-origin carries that id and muxad matches it before the pane. Hooks from the
-shared server report no pane; muxad binds the session from its `codex resume
+`$CODEX_THREAD_ID` for `tend msg`/`tend peers` run from a Codex shell. The
+origin carries that id and tendd matches it before the pane. Hooks from the
+shared server report no pane; tendd binds the session from its `codex resume
 <id>` process or a pane whose cwd is unique. When neither applies, the thread
 stays unbound and collaboration tools report that rather than borrow another
 pane's identity. Start such a Codex with `codex --no-daemon` to keep its pane.
-Running `muxa mcp` processes keep their old code until the app-server restarts.
+Running `tend mcp` processes keep their old code until the app-server restarts.
 
 ## Quiet progress and actionable notifications
 
@@ -342,15 +342,15 @@ or marked delivered by suppression. Questions, reviews, tasks, and notices that
 explicitly require a reply retain automatic wake delivery. Terminal replies
 still wake their requester independently of the original request's setting.
 
-MCP `muxa_send_message` accepts an optional `notify` boolean. CLI examples:
+MCP `tend_send_message` accepts an optional `notify` boolean. CLI examples:
 
 ```sh
 # Consolidated progress: read with the next checkpoint inbox pull.
-muxa msg send @reviewer "Build passed; two findings remain" --kind notice --parent REQUEST_ID
+tend msg send @reviewer "Build passed; two findings remain" --kind notice --parent REQUEST_ID
 # Resource handoff: wake the recipient without asking for acknowledgement.
-muxa msg send @reviewer "Device released; your verification can start" --kind notice --notify true
+tend msg send @reviewer "Device released; your verification can start" --kind notice --notify true
 # Explicit pull-only request: reply is still required once claimed.
-muxa msg send @reviewer "Review at the agreed checkpoint" --kind review --notify false
+tend msg send @reviewer "Review at the agreed checkpoint" --kind review --notify false
 ```
 
 `notify=true` respects `wake="never"` and idle-only delivery; it does not type
@@ -362,9 +362,9 @@ This policy requires the updated daemon; older daemons do not enforce `notify`.
 message `kind="notice"` or whether a wake is sent.
 
 Agree on checkpoints at dispatch. Omit acknowledgements and unchanged status;
-record progress on the original request where `muxa_update_request` is available,
+record progress on the original request where `tend_update_request` is available,
 or use one consolidated quiet child notice with `--parent`. Read notices as a
-batch with `muxa_inbox` / `muxa msg inbox` at build/test or review checkpoints.
+batch with `tend_inbox` / `tend msg inbox` at build/test or review checkpoints.
 Urgent blockers, decisions, edit conflicts, and handoffs use explicit notification.
 Completion uses the original request's terminal reply, with no duplicate notice.
 
@@ -382,11 +382,11 @@ only other agent; with three or more participants use a handle — `@claude`,
 
 Every agent pane gets a handle without anyone asking for one. The first agent
 of a runtime in a room becomes `@claude`, `@codex`, `@gemini`, `@agy`, or
-`@opencode`; a second of the same kind becomes `@claude2`, and so on. muxa
+`@opencode`; a second of the same kind becomes `@claude2`, and so on. tend
 mints it on the agent's first hook event of a session and stores it on the pane
-as `@muxa_agent_alias`, so it outlives muxad, the CLI, and the agent restarting
+as `@tend_agent_alias`, so it outlives tendd, the CLI, and the agent restarting
 in place. It is not minted over a name that already exists, so a pipeline alias
-or a hand-set one wins. `muxa peek` prints the handle in each pane's header
+or a hand-set one wins. `tend peek` prints the handle in each pane's header
 next to its pane id.
 
 The daemon issues every handle. It is the only place that sees a room whole —
@@ -399,7 +399,7 @@ and keeps `%1242`.
 explicit pane target (for example `pane:rmux:%12` or `pane:%12`) to other
 windows and sessions. `peer`, `@alias` and `role:` stay within the sender's
 room, and pane IDs repeated on different servers are rejected as ambiguous.
-Keep the backend prefix returned by Muxa. Requests are also pinned to the
+Keep the backend prefix returned by Tend. Requests are also pinned to the
 target's current agent session, so a new process reusing that pane cannot
 inherit old work.
 
@@ -412,7 +412,7 @@ advertise `collaboration_exact_session_v1`; the watch Work board requires it.
 
 To address whoever holds a role in a work rather than one pane, use a path:
 `workspace/work/role`, `workspace/work/role@alias` or `workspace/work/@alias`,
-for example `muxa msg send webapp/ENG-8111/implementer "status?"`. It must
+for example `tend msg send webapp/ENG-8111/implementer "status?"`. It must
 match exactly one live agent and follows the same scope rule as pane targets.
 Such requests, and those sent to `@alias` or `role:`, remember the slot they
 named. Until a request is delivered (unclaimed, no wake sent yet), it follows
@@ -430,11 +430,11 @@ An exact agent session can also register its own room-local alias and
 advisory roles, which override the minted one for routing:
 
 ```bash
-muxa identity set --alias reviewer --role review --role rust
-muxa identity show
-muxa msg send @reviewer "review the auth change" --kind review
-muxa msg send role:rust "investigate this lifetime error"
-muxa identity clear
+tend identity set --alias reviewer --role review --role rust
+tend identity show
+tend msg send @reviewer "review the auth change" --kind review
+tend msg send role:rust "investigate this lifetime error"
+tend identity clear
 ```
 
 Aliases are unique among live peers in a room. Roles may be shared, but a
@@ -442,31 +442,31 @@ Aliases are unique among live peers in a room. Roles may be shared, but a
 is refused. Identity never follows a later agent that reuses the pane.
 
 ```bash
-muxa peers
-muxa msg send peer "review the auth change" --kind review
-muxa msg send peer "verify the fix" --kind review \
+tend peers
+tend msg send peer "review the auth change" --kind review
+tend msg send peer "verify the fix" --kind review \
   --parent req_... --workspace webapp --work ENG-7345 --run resolve-2 \
   --artifact commit:d4bf2aa --link https://example.test/review
-muxa msg send peer "review the risks in this plan" --kind review \
+tend msg send peer "review the risks in this plan" --kind review \
   --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"ENG-6924 plan","locator":{"display":".air/eng-6924-plan.air.json","disclosure":"local-only"}}'
-muxa msg inbox
-muxa msg reply req_... "review complete" --status completed
-muxa msg wait req_... --timeout-secs 300 --body
-muxa msg list --mailbox sent
-muxa msg list --scope room     # every participant in this window
-muxa msg list --scope all      # every room this daemon holds
-muxa msg list --scope all --since 7d --work ENG-7345 --kind review \
+tend msg inbox
+tend msg reply req_... "review complete" --status completed
+tend msg wait req_... --timeout-secs 300 --body
+tend msg list --mailbox sent
+tend msg list --scope room     # every participant in this window
+tend msg list --scope all      # every room this daemon holds
+tend msg list --scope all --since 7d --work ENG-7345 --kind review \
   --status completed --limit 50 --offset 0
-muxa msg cancel req_... # queued requests only
-muxa msg send peer "retry with write access" --withdraw req_...  # replaces req_...
-muxa msg withdraw req_...  # gave up on it: its late reply will not wake you
+tend msg cancel req_... # queued requests only
+tend msg send peer "retry with write access" --withdraw req_...  # replaces req_...
+tend msg withdraw req_...  # gave up on it: its late reply will not wake you
 ```
 
 Agent-to-agent wakes carry a request ID, rather than pasting the request body
 into the recipient's conversation. Read that one request with
-`muxa_inbox(request_id="REQUEST")` or `muxa msg accept REQUEST --json`;
+`tend_inbox(request_id="REQUEST")` or `tend msg accept REQUEST --json`;
 then reuse the request ID for updates and the final reply. This avoids
-repeating other claimed requests. `muxa msg inbox --json` shares the compact MCP
+repeating other claimed requests. `tend msg inbox --json` shares the compact MCP
 view, including the complete body, permitted paths, attachments and task
 contract. Use `--json --full` only for the legacy audit record. Inbox sender and
 update authors keep a label and agent session ID (plus `console:true` for the
@@ -475,11 +475,11 @@ basis revision aliases and empty attachments are omitted. Permission flags and
 `paths: []` stay explicit. Work/parent/role context and unusual or UI provenance
 remain available; requests at least 30 minutes old expose `request_age_minutes`; the attempt is the canonical requested basis. Receipts and
 list views retain routing, and full records retain all audit details. Subsequent progress reads can use
-`muxa msg list --request-id REQUEST --after-update SEQUENCE --json`.
+`tend msg list --request-id REQUEST --after-update SEQUENCE --json`.
 
-`muxa msg inbox` text output includes the reply obligation, permitted paths and attachments alongside the task. `muxa msg wait --timeout SECONDS` is an alias for `--timeout-secs SECONDS`.
+`tend msg inbox` text output includes the reply obligation, permitted paths and attachments alongside the task. `tend msg wait --timeout SECONDS` is an alias for `--timeout-secs SECONDS`.
 
-`muxa msg wait` defaults to compact JSON describing delivery and final reply
+`tend msg wait` defaults to compact JSON describing delivery and final reply
 receipt, not work success. A timeout is a JSON observation (`reason: timeout`)
 with exit code 2; this describes the wait, not the work result. Transport errors remain nonzero. Use `--body` to print only the
 final reply, or `--body --output /tmp/reply.txt` to write it directly without
@@ -507,12 +507,12 @@ explicit). `--parent <request-id>` creates a causal edge and inherits the
 parent's canonical thread; a missing parent, different room/participant pair,
 or conflicting explicit thread is rejected. `workspace_id`, `work_id`, and
 `run_id` keep the durable Work identity separate from one execution attempt.
-Muxa stamps missing Work fields from managed pane/window metadata and derives a
+Tend stamps missing Work fields from managed pane/window metadata and derives a
 run identity from the execution binding when available; explicit CLI/MCP
 values win. Generic `artifacts` and `links` are metadata only, not file or URL
 authority.
 
-`muxa msg list` combines `--since`, `--workspace`, `--work`, `--thread`,
+`tend msg list` combines `--since`, `--workspace`, `--work`, `--thread`,
 `--kind`, `--status`, and `--window` (`--room` is an alias) by conjunction,
 then applies `--offset` and `--limit` to the newest-first snapshot. Filtering
 is client-side so a new CLI talking to an older daemon cannot silently return
@@ -521,7 +521,7 @@ not a stable cursor across concurrent writes. The unfiltered `--json` form
 remains the legacy bare array. `--since` accepts durations such as `2h`/`7d`,
 local dates, RFC 3339 timestamps, and the same calendar keywords as timeline.
 
-The same lifecycle is available interactively in `muxa watch`: `m` sends to the
+The same lifecycle is available interactively in `tend watch`: `m` sends to the
 selected room peer, `M` opens non-claiming mailbox history, `i` claims the
 inbox, and `e` replies. On a window row, `M` reads the whole room; on a session
 row it reads every room grouped by window. Those aggregate views are read-only.
@@ -541,7 +541,7 @@ that does not exist.
 The watch composer gives `? QUESTION`, `◆ REVIEW`, `▶ TASK`, and `! NOTICE`
 distinct colors. `○ READ-ONLY` delegates investigation and an answer only;
 `● EXECUTE` authorizes commands and file changes. These modes are contracts
-delivered to the receiver, not commands executed directly by muxa.
+delivered to the receiver, not commands executed directly by tend.
 
 `question` and `review` are read-only contracts by default. Use `--execute`
 and one or more `--path` arguments to explicitly delegate edits. Path scopes
@@ -552,20 +552,20 @@ worktrees remain the safest choice for concurrent edits.
 
 | Tool | Purpose |
 | --- | --- |
-| `muxa_collaboration_guide` | Retrieve reviewer, question, delegated-subagent, and AIR handoff contracts. |
-| `muxa_room_context` | Identify self, list same-window peers, and show unread count. |
-| `muxa_call_peer` | Expand a registered skill, select a peer, send a durable request, optionally wait, and explicitly spawn when confirmed. |
-| `muxa_peer_report` | Read the newest completed report from a prior peer request, or retrieve an exact request id. |
-| `muxa_set_identity` | Replace this exact session's room-local alias and roles. |
-| `muxa_send_message` | Create a durable peer request. |
-| `muxa_inbox` | Claim/read requests for this exact agent session. |
-| `muxa_list_messages` | List incoming, sent, or all requests without claiming. |
-| `muxa_reply` | Return a completed/blocked/declined/failed response. |
-| `muxa_wait_reply` | Event-driven wait for the structured terminal response. |
-| `muxa_withdraw_reply_wake` | Stop being woken for replies to your own requests you gave up on or replaced; work and replies are unchanged. |
-| `muxa_cancel_message` | Cancel a sent request while it is still queued. |
+| `tend_collaboration_guide` | Retrieve reviewer, question, delegated-subagent, and AIR handoff contracts. |
+| `tend_room_context` | Identify self, list same-window peers, and show unread count. |
+| `tend_call_peer` | Expand a registered skill, select a peer, send a durable request, optionally wait, and explicitly spawn when confirmed. |
+| `tend_peer_report` | Read the newest completed report from a prior peer request, or retrieve an exact request id. |
+| `tend_set_identity` | Replace this exact session's room-local alias and roles. |
+| `tend_send_message` | Create a durable peer request. |
+| `tend_inbox` | Claim/read requests for this exact agent session. |
+| `tend_list_messages` | List incoming, sent, or all requests without claiming. |
+| `tend_reply` | Return a completed/blocked/declined/failed response. |
+| `tend_wait_reply` | Event-driven wait for the structured terminal response. |
+| `tend_withdraw_reply_wake` | Stop being woken for replies to your own requests you gave up on or replaced; work and replies are unchanged. |
+| `tend_cancel_message` | Cancel a sent request while it is still queued. |
 
-`muxa_send_message` and `muxa_call_peer` accept the same optional causal and
+`tend_send_message` and `tend_call_peer` accept the same optional causal and
 Work metadata (`thread_id`, `parent_request_id`, `workspace_id`, `work_id`,
 `run_id`) plus `artifacts` and `links`. Mutation receipts return these
 correlation fields without echoing the body the model just supplied; mailbox
@@ -575,10 +575,10 @@ from message text.
 
 ## Natural calls from an agent conversation
 
-A Claude or Codex agent connected to `muxa mcp` treats `@peer` and
-`@muxa-peer` as reserved Muxa collaboration expressions. Provider mentions such
+A Claude or Codex agent connected to `tend mcp` treats `@peer` and
+`@tend-peer` as reserved Tend collaboration expressions. Provider mentions such
 as `@codex`, a unique `@alias`, `role:name`, or a natural “call a colleague”
-request for new work map to `muxa_call_peer`. A registered skill can be included
+request for new work map to `tend_call_peer`. A registered skill can be included
 as `/name`:
 
 ```text
@@ -587,11 +587,11 @@ as `/name`:
 ```
 
 Possessive references such as “`@peer`'s report”, “the peer reply”, or “resolve
-the peer findings” map to `muxa_peer_report` first, so the agent evaluates the
+the peer findings” map to `tend_peer_report` first, so the agent evaluates the
 actual structured mailbox response rather than fabricating external review
 state. Without an explicit PR number or GitHub PR URL in user-provided or
 grounded context, peer review language must not invoke GitHub PR/review tools or
-invent a PR; repository/cwd context alone is insufficient. If Muxa tools are
+invent a PR; repository/cwd context alone is insufficient. If Tend tools are
 unavailable, the correct recovery is to restart the agent, never to substitute
 GitHub.
 
@@ -599,10 +599,10 @@ The high-level tool keeps the mailbox semantics below while removing the need
 for the model to compose several low-level calls. It defaults to
 `kind=review`, `work_mode=read_only`, selects a healthy peer deterministically,
 and waits for the structured reply. Execute mode requires an explicit task
-authorization. If no eligible worker exists, Muxa creates one by default using
+authorization. If no eligible worker exists, Tend creates one by default using
 the configured provider permissions. Refresh MCP connections after upgrading
-Muxa so existing agents receive the current tool schemas and instructions.
-For an automatic spawn, Muxa arms the daemon transition subscription
+Tend so existing agents receive the current tool schemas and instructions.
+For an automatic spawn, Tend arms the daemon transition subscription
 before creating the pane and re-reads room context only when that pane's agent
 registers; there is no fixed 500 ms registration loop. Registration is a grace
 period, not a precondition: `spawn_timeout_secs` (default 10) bounds how long
@@ -610,42 +610,42 @@ the call waits before the request is queued against the *pane* instead of a
 session. That fallback is what makes lazily-registering agents work at all —
 codex fires `SessionStart` when its first prompt is submitted, not when its TUI
 boots, so waiting for registration before sending would deadlock against the
-very request being sent. muxad delivers a pane-addressed request as soon as the
+very request being sent. tendd delivers a pane-addressed request as soon as the
 pane reads idle, and the first agent session to register on that pane adopts
 it — same room, same pane, same control endpoint — after which the request is
-session-pinned like any other. Readiness needs muxa to see an agent process on
+session-pinned like any other. Readiness needs tend to see an agent process on
 the pane, so the fallback is limited to providers discovery classifies or a
 screen manifest covers; a spawned `opencode` pane still fails fast instead of
 queueing work nothing would deliver. The result
 reports `peer_pending: true` and a `request_id` — wait on that with
-`muxa_wait_reply`, never with `tmux capture-pane` polling.
+`tend_wait_reply`, never with `tmux capture-pane` polling.
 
-Waiting is a single blocking MCP call, not a model-driven polling loop. muxad
+Waiting is a single blocking MCP call, not a model-driven polling loop. tendd
 subscribes to a monotonic durable-mailbox revision and re-reads the exact
 request only when that revision changes or at the final timeout boundary. If a
 new client reaches an older daemon that rejects `collaboration_wait`, it uses a
 bounded `collaboration_get` compatibility loop inside that same call, without
 additional model turns. If a
-call is sent with `wait=false`, the sender can continue independently; muxad
+call is sent with `wait=false`, the sender can continue independently; tendd
 reacts to the reply and injects one short notification after the sender becomes
-idle. Agents should not monitor Muxa-managed peers with `sleep`, raw
+idle. Agents should not monitor Tend-managed peers with `sleep`, raw
 `tmux capture-pane`, or repeated status/capture calls.
 
 On Codex, a blocking call may cross the host's 30-second execution boundary
 and yield a background cell. Resume that exact cell with the host wait function
-and `yield_time_ms=60000`; do not issue another Muxa wait for the same work.
+and `yield_time_ms=60000`; do not issue another Tend wait for the same work.
 
 ## Reviewers and delegated subagents
 
-For substantial work, call `muxa_collaboration_guide` and
-`muxa_room_context` first. Send reviewers `kind=review` with
+For substantial work, call `tend_collaboration_guide` and
+`tend_room_context` first. Send reviewers `kind=review` with
 `work_mode=read_only`. Send implementation work as `kind=task` with
 `work_mode=execute` and a narrow, non-overlapping path scope. Continue
 independent work while the peer handles the request, then wait for the reply,
 verify it, and integrate it.
 
 The receiver should claim its inbox promptly, honor kind/work mode/paths, and
-always produce a terminal `muxa_reply`. Avoid concurrent edits to the same
+always produce a terminal `tend_reply`. Avoid concurrent edits to the same
 files; use separate worktrees when scopes cannot be isolated.
 
 ## AIR artifact handoff and visualization
@@ -664,7 +664,7 @@ The exact supported profiles are:
 
 Artifact IDs must be `urn:air:sha256:` followed by a 64-character lowercase
 SHA-256 digest. A locator has `local-only` or `redacted` disclosure and is only
-a display hint, never file or execution authority. muxa validates reference
+a display hint, never file or execution authority. tend validates reference
 syntax but does not claim artifact conformance: validate, edit, and graph the
 artifact in AIR Workbench. Do not invent a collaboration trace profile or put
 prompts, messages, filesystem paths, or provider identifiers into an AIR
@@ -674,7 +674,7 @@ session snapshot.
 
 The mailbox is persisted to an owner-only SQLite database before delivery.
 The historical default config path remains
-`$XDG_DATA_HOME/muxa/collaboration.json`, but muxa maps it to the authoritative
+`$XDG_DATA_HOME/tend/collaboration.json`, but tend maps it to the authoritative
 `collaboration.sqlite3`. On first startup it imports an existing JSON snapshot
 transactionally and marks the import complete; legacy requests receive their
 own request id as `thread_id`. A configured `.sqlite`, `.sqlite3`, or `.db`
@@ -686,27 +686,27 @@ controls once rollback is no longer required.
 New mutations update indexed rows instead of rewriting the full history.
 SQLite, WAL, and shared-memory files are set to `0600`. `retention_days` is
 unset by default and therefore keeps history indefinitely. When configured,
-muxad prunes at startup only whole threads whose newest activity is older than
+tendd prunes at startup only whole threads whose newest activity is older than
 the cutoff and whose requests are terminal and fully delivered; it never
 splits a parent chain or removes pending delivery/wake or unread reply state.
 The separate body-free audit ledger is unchanged. Do not downgrade and run an
-older muxad against the retained JSON after migration: it can write a stale
+older tendd against the retained JSON after migration: it can write a stale
 fork that the already-marked SQLite database will not import again. Back up
 both files before any downgrade.
 
 ## Wake-up safety
 
-With `idle_only`, muxad injects only when the exact
+With `idle_only`, tendd injects only when the exact
 participant is `Idle`. It never injects into `Working`, `WaitingInput`,
 `WaitingChoice`, or `Error` panes. Unmanaged synthetic screen-detected agents
 are not room participants and are never selected automatically.
 
-A Muxa-launched CLI with a matching live process is exposed as a pending peer
+A Tend-launched CLI with a matching live process is exposed as a pending peer
 before its first prompt. Such a request carries a *pending pane* recipient,
 and the pane's synthetic row supplies the idle gate for delivering it. A startup
 approval gate
 still blocks delivery, because the bundled screen manifests classify it as
-`WaitingInput`/`WaitingChoice` rather than `Idle`. A pane with no muxa launch
+`WaitingInput`/`WaitingChoice` rather than `Idle`. A pane with no tend launch
 mark and no classified agent process is never addressable this way, so a
 human's shell can never receive a queued request.
 
@@ -721,7 +721,7 @@ direct request is submitted per idle agent generation; the next waits for a
 real Idle transition. Terminal reply bodies always remain in the mailbox.
 
 `operator_full` is a delivery policy, not proof of human authorization. It
-uses the sender identity muxad resolved for the request; `work_mode =
+uses the sender identity tendd resolved for the request; `work_mode =
 "execute"` never changes the payload policy or upgrades an agent-originated
 request into an operator request. The source line in the delivered envelope
 still records the operator surface and caller provenance for the recipient.
@@ -733,14 +733,14 @@ operator-originated ones. A body containing terminal control characters
 automatically falls back to `notice` rather than being transformed or pasted
 unsafely.
 Direct delivery records whether prompt text was written
-before the separate Enter keystroke. After interruption, muxad retries only
+before the separate Enter keystroke. After interruption, tendd retries only
 Enter when text is known to be buffered; if writing was uncertain, it falls
 back to a short inbox recovery notice instead of injecting the body twice. A
 manual inbox read supersedes either recovery path.
 
-Reading a terminal result through `muxa_wait_reply` acknowledges it and
+Reading a terminal result through `tend_wait_reply` acknowledges it and
 prevents a later reply wake. Room context reports incoming unread requests and
-unacknowledged replies separately. `muxa_list_messages` is non-claiming history;
+unacknowledged replies separately. `tend_list_messages` is non-claiming history;
 the sender may cancel only while a request remains `queued`, before the
 recipient has claimed it.
 
@@ -750,10 +750,10 @@ Requests addressed to a pending launch stay pinned to that pane and room.
 
 Every collaboration IPC operation (context, identity, send, inbox, list,
 reply, get, wait, and cancel) is also appended to
-`$XDG_DATA_HOME/muxa/collaboration-audit.ndjson`. The `0600` ledger records the
+`$XDG_DATA_HOME/tend/collaboration-audit.ndjson`. The `0600` ledger records the
 represented origin/session, OS-observed caller, target/request id, and outcome,
-but never duplicates message or reply bodies. `muxa msg list --json --full` and
-`muxa_list_messages` with `full=true` expose the creation provenance stored on each request;
+but never duplicates message or reply bodies. `tend msg list --json --full` and
+`tend_list_messages` with `full=true` expose the creation provenance stored on each request;
 requests created before this field existed simply omit it.
 
 Provenance remains audit evidence, not a permission gate. An observed/asserted
@@ -771,9 +771,9 @@ CLI message lists default to 20 metadata rows, without original instructions,
 reply bodies, updates or provenance. `--json` retains an array with `id`, stored
 `status`, endpoints and transport receipt fields. Use `--full` to restore full
 records; `--limit` and `--offset` explicitly control history pages.
-`muxa msg list --request-id REQUEST --full --json` fetches one authorized request
+`tend msg list --request-id REQUEST --full --json` fetches one authorized request
 directly instead of downloading mailbox history. For the final reply alone use
-`muxa msg wait REQUEST --body --output FILE`. Prefer completion wakes to repeated
+`tend msg wait REQUEST --body --output FILE`. Prefer completion wakes to repeated
 short timeout waits.
 
 `--limit 0` explicitly requests all matching rows. When a page is truncated,
@@ -783,22 +783,22 @@ provenance now require `--full`; existing diagnostic scripts should add it.
 
 ### Quiet updates and efficient reads
 
-Use `muxa msg update REQUEST "guidance or progress" [--json]` to append to an
+Use `tend msg update REQUEST "guidance or progress" [--json]` to append to an
 existing open request. Updates preserve its authority and paths, do not create a
 child request, and do not wake the recipient. Both participants may update;
 terminal requests reject updates. Repeating the same latest update is idempotent.
 The JSON acknowledgement includes the request id and `next_after_update`.
 
-`muxa msg send ... --notify` is shorthand for `--notify true`; explicit
+`tend msg send ... --notify` is shorthand for `--notify true`; explicit
 `--notify false` remains supported. Preserve command exit status and stderr;
 piping through `grep` can hide argument errors as empty output. Read replies with
-`muxa msg wait REQUEST --body [--output FILE]` rather than guessing JSON fields.
+`tend msg wait REQUEST --body [--output FILE]` rather than guessing JSON fields.
 Use completion wakes or substantive checkpoints instead of repeated one-second
 probes. Foreground MCP waits should use 30–60 seconds; the Fleet default is 30.
 Retain resolved tool schemas until a capability/version change or an actual
 unknown-tool/argument error calls for rediscovery.
 
-Read incremental CLI guidance with `muxa msg list --request-id REQUEST --after-update SEQUENCE --json`; resume from `next_after_update`. This returns
+Read incremental CLI guidance with `tend msg list --request-id REQUEST --after-update SEQUENCE --json`; resume from `next_after_update`. This returns
 only newer updates and omits the original task and final reply bodies.
 
 ### Measuring message overhead
@@ -821,8 +821,8 @@ This is a fixture budget, not a promise for arbitrarily long identities,
 optional delegation context or attachments. Reference wakes have a separate
 320-byte base-fixture budget and never contain the body. Replacing a minimal
 sender with its full endpoint must fail the budget test. Optional test artifacts
-are written with `MUXA_OVERHEAD_REPORT`, `MUXA_OVERHEAD_REQUEST` (a full request
-array to measure) and `MUXA_WAKE_OVERHEAD_REPORT`.
+are written with `TEND_OVERHEAD_REPORT`, `TEND_OVERHEAD_REQUEST` (a full request
+array to measure) and `TEND_WAKE_OVERHEAD_REPORT`.
 
 CLI `send`, `reply`, `cancel` and `attention --json` acknowledge mutations
 without repeating the supplied body. Initial sends retain resolved routing;
@@ -833,12 +833,12 @@ that full view is requested, avoiding an unnecessary body round-trip as well.
 ### Short checks and quiet handoffs
 
 For a quick question or review with no independent local work, use
-`muxa_call_peer(wait=true)` (the default). It returns the final structured reply
+`tend_call_peer(wait=true)` (the default). It returns the final structured reply
 in the original call; a separate send receipt and later wait are unnecessary.
 Use `wait=false` while useful local work remains. A one-way handoff uses
 `kind=notice`, `expects_reply=false`, and the default quiet notification. Reserve
 `notify=true` for an actionable blocker, decision, conflict, or resource handoff.
-Amend an existing open request with `muxa_update_request` rather than opening a
+Amend an existing open request with `tend_update_request` rather than opening a
 new task; updates are quiet and retain the original authority and paths.
 
 Opt in with `[collaboration] wake_payload = "adaptive"`. Operator messages keep
@@ -863,12 +863,12 @@ The 768-byte body cap accommodates up to 256 three-byte Korean characters;
 additional context or JSON escaping can still hit the 1024-byte document cap.
 
 For reproducible renderer measurements, run the `adaptive_delivery_cost_matrix`
-test in `muxad` on both revisions with `MUXA_DELIVERY_MATRIX_REPORT` pointing to
-separate JSON files. Run `adaptive_reply_cost_matrix` in `muxa-cli` with
-`MUXA_REPLY_MATRIX_REPORT` set. Combine them with
+test in `tendd` on both revisions with `TEND_DELIVERY_MATRIX_REPORT` pointing to
+separate JSON files. Run `adaptive_reply_cost_matrix` in `tend-cli` with
+`TEND_REPLY_MATRIX_REPORT` set. Combine them with
 `python scripts/short-delivery-cost-report.py BEFORE AFTER REPLIES`.
 For the frozen `5470a27` baseline, the current delivery test can also write
-`BEFORE` directly with `MUXA_DELIVERY_BASELINE_REPORT`; this uses the previous
+`BEFORE` directly with `TEND_DELIVERY_BASELINE_REPORT`; this uses the previous
 frame and 512-byte cap with the unchanged instruction document.
 This measures synchronous received text across initial delivery, the sender's
 result and the recipient's reply receipt, with extra bytes divided by the
@@ -1002,17 +1002,17 @@ framework is introduced, and these diagnostics do no extra work when debug is of
 
 ### Peer requests from the CLI
 
-Use `muxa peer codex "Review the change; report findings without editing"`
-when MCP is unavailable. It shares `muxa_call_peer` worker selection, launch
+Use `tend peer codex "Review the change; report findings without editing"`
+when MCP is unavailable. It shares `tend_call_peer` worker selection, launch
 permissions, contracts and durable receipts. The default returns immediately;
 `--wait --timeout-secs 60` waits for a reply. Keep the request id and resume with
-`muxa msg wait REQUEST_ID`. A timeout exits nonzero without resending work.
+`tend msg wait REQUEST_ID`. A timeout exits nonzero without resending work.
 `--intent task --execute` is required for edits. `--context-bound` targets the
 exact conversation and retains primary-session acceptance. Low-level
-`muxa msg send %N` preserves exact mailbox delivery; protected-primary receipts
+`tend msg send %N` preserves exact mailbox delivery; protected-primary receipts
 explain how to cancel that queued request before using worker routing.
 
-On macOS, `muxa init --component muxad-launchd --yes` records the installing
+On macOS, `tend init --component tendd-launchd --yes` records the installing
 shell's PATH in the LaunchAgent so headless providers can find user-installed
 CLIs and account shims. Run it from the shell that normally launches your agents.
 
@@ -1020,11 +1020,11 @@ CLIs and account shims. Run it from the shell that normally launches your agents
 ### Mechanical worker startup
 
 Fresh Claude and Codex workers without an initial prompt are prepared before
-`muxa peer` sends its durable request. The launcher joins wrapped terminal lines,
+`tend peer` sends its durable request. The launcher joins wrapped terminal lines,
 checks a stable input composer, and answers only recognized initial setup gates
 for the explicitly requested working directory. Folder settings, tool approvals,
 logins, unknown dialogs, drafts and running turns are never silently accepted.
-Muxa retains the configured approval mode and does not directly rewrite global
+Tend retains the configured approval mode and does not directly rewrite global
 permission or trust files. Accepting folder trust lets the provider persist trust
 for that cwd and enable its project configuration (including hooks or MCP).
 Explicitly configured bypass consent is not inferred. Direct worker starts now
@@ -1051,15 +1051,15 @@ and do not claim a verified input-ready receipt.
 An exact dedicated worker can be rechecked without a model turn:
 
 ```sh
-muxa agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux-socket default
+tend agent prepare --pane %N --launch-id LAUNCH_ID --cwd /path/to/project --tmux-socket default
 ```
 
 The command verifies the worker launch marker, process birth and directory
 before each setup key; it refuses a primary or recycled pane. It reports JSON
 and exits nonzero unless a stable empty input composer is observed.
 
-Claude workers also receive the existing Muxa-managed `agent-integration` bootstrap/skill directory as a context root; unrelated user configuration directories are not added.
+Claude workers also receive the existing Tend-managed `agent-integration` bootstrap/skill directory as a context root; unrelated user configuration directories are not added.
 
 Codex folder-trust dialogs remain blocked pending verification of their sandbox effects. A retained worker marked pending or blocked cannot receive a new high-level peer request until preparation succeeds.
 
-After resolving a dialog manually, rerun `muxa agent prepare` to update the retained readiness marker. Codex automatic preparation currently requires a cwd that needs no folder-trust confirmation.
+After resolving a dialog manually, rerun `tend agent prepare` to update the retained readiness marker. Codex automatic preparation currently requires a cwd that needs no folder-trust confirmation.

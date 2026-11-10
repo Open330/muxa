@@ -1,15 +1,15 @@
 // Real key-input regression check for the browser demo.
-// MUXA_PLAYWRIGHT_PACKAGE=/path/to/playwright-core node scripts/landing-shots/learn-smoke.mjs http://localhost:8765 /tmp/muxa-learn-check
+// TEND_PLAYWRIGHT_PACKAGE=/path/to/playwright-core node scripts/landing-shots/learn-smoke.mjs http://localhost:8765 /tmp/tend-learn-check
 import assert from "node:assert/strict";
 import { createRequire } from "node:module";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 const require = createRequire(import.meta.url);
-const { chromium } = require(process.env.MUXA_PLAYWRIGHT_PACKAGE || "playwright");
-const origin = process.argv[2], output = process.argv[3] || "/tmp/muxa-learn-check";
+const { chromium } = require(process.env.TEND_PLAYWRIGHT_PACKAGE || "playwright");
+const origin = process.argv[2], output = process.argv[3] || "/tmp/tend-learn-check";
 if (!origin) throw new Error("Pass the assembled site's preview URL");
 mkdirSync(output, { recursive: true });
-const browser = await chromium.launch({ executablePath: process.env.MUXA_TEST_CHROMIUM || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
+const browser = await chromium.launch({ executablePath: process.env.TEND_TEST_CHROMIUM || "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", headless: true });
 try {
   for (const locale of ["ko-KR", "en-US"]) {
     const context = await browser.newContext({ viewport: { width: 1280, height: 920 }, locale });
@@ -34,7 +34,7 @@ try {
     await page.keyboard.type("echo ac"); await page.keyboard.press("ArrowLeft"); await page.keyboard.type("b"); await page.keyboard.press("Enter");
     await screenHas("echo abc");
     await page.keyboard.press("ArrowUp"); await page.keyboard.press("Control+u");
-    await page.keyboard.type("muxa att"); await page.keyboard.press("Tab"); await screenHas("muxa attend"); await page.keyboard.press("Control+c");
+    await page.keyboard.type("tend att"); await page.keyboard.press("Tab"); await screenHas("tend attend"); await page.keyboard.press("Control+c");
     await page.keyboard.type("cd src"); await page.keyboard.press("Enter");
     await page.keyboard.type("cat retry.ts"); await page.keyboard.press("Enter"); await screenHas("export async function retry");
     if (locale === "ko-KR") {
@@ -201,7 +201,7 @@ try {
       const box = await page.locator(".lp-pane.is-active .xterm-screen").boundingBox(); assert.ok(box.width > 100);
     }
     console.log(`${locale}: nine persistent panes across four windows, pane focus, zoom, watch popup, attach, readline, attend, Unicode review and mailbox passed; single-action guidance and persistent chapter switching passed`);
-    // Newcomers learn tmux in the same terminal before continuing to muxa.
+    // Newcomers learn tmux in the same terminal before continuing to tend.
     const basicsPage=await context.newPage();
     await basicsPage.goto(`${origin}/learn/`);
     await basicsPage.locator('.xterm-helper-textarea').first().waitFor({state:"attached"});

@@ -1,4 +1,4 @@
-# muxa collaboration demo — "talk to the fleet without leaving the list"
+# tend collaboration demo — "talk to the fleet without leaving the list"
 #
 #   vhs docs/demo-collab.tape   →   docs/demo-collab.gif
 #
@@ -27,7 +27,7 @@ Set FontSize 14
 # because the ask panel stacks a list and a detail pane inside the list
 # box, and a short terminal cuts the answer down to two lines.
 #
-# The width is not cosmetic either: `muxa watch` only splits out the
+# The width is not cosmetic either: `tend watch` only splits out the
 # inspector at >= 120 columns, and vhs reserves enough padding that the
 # obvious 1200x760 lands at 117 — close enough to look deliberate, wide
 # enough to look broken. Re-measure with `tput cols` before changing any
@@ -41,7 +41,7 @@ Set PlaybackSpeed 1
 # ── Prelude — invisible setup ────────────────────────────────────────────
 Hide
 Set TypingSpeed 1ms
-Type "export MUXA_DEMO_TMUX=$(command -v tmux)"
+Type "export TEND_DEMO_TMUX=$(command -v tmux)"
 Enter
 Type "export PATH=$PWD/target/debug:$HOME/.cargo/bin:$PATH"
 Enter
@@ -54,10 +54,10 @@ Enter
 Sleep 12s
 Type "clear"
 Enter
-Type "$MUXA_DEMO_TMUX -u -f /dev/null -S /tmp/muxa-demo-sandbox/tmux.sock attach -t ctl:0"
+Type "$TEND_DEMO_TMUX -u -f /dev/null -S /tmp/tend-demo-sandbox/tmux.sock attach -t ctl:0"
 Enter
 Sleep 2s
-Type "muxa watch"
+Type "tend watch"
 Enter
 Sleep 3s
 Set TypingSpeed 45ms
@@ -75,7 +75,7 @@ Escape
 Sleep 800ms
 
 # ── 2. Messaging the cursor row (7–15s) ──────────────────────────────────
-# `m` addresses whichever work/agent row the cursor is on — not the window muxa
+# `m` addresses whichever work/agent row the cursor is on — not the window tend
 # watch happens to be running in. Tab picks the contract kind, Ctrl-E the
 # work mode, and the agent gets a request it must answer.
 # `gg` first: the cursor is wherever the mailbox left it, and the row this

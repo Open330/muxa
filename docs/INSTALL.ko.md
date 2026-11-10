@@ -12,11 +12,11 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 ## 설치 전 체험
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/onboard.sh | sh
 ```
 
 이 경로는 아무것도 설치하지 않습니다. script가 플랫폼에 맞는 release archive를
-임시 디렉터리로 받아 공개된 SHA-256을 검증한 뒤 진짜 `muxa onboard`를 실행하고,
+임시 디렉터리로 받아 공개된 SHA-256을 검증한 뒤 진짜 `tend onboard`를 실행하고,
 끝나면 지웁니다. daemon, config, PATH 항목은 남지 않습니다. live tour는 실행 중에만
 전용 tmux server, daemon, mailbox를 사용하고 종료할 때 sandbox 전체를 삭제합니다.
 launcher로 내려받으려면 network, 지원되는 release 플랫폼, checksum 도구, `tar`가
@@ -24,36 +24,36 @@ launcher로 내려받으려면 network, 지원되는 release 플랫폼, checksum
 없으면 명확한 오류로 끝납니다. tour flag는 `sh -s --` 뒤에 전달합니다.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --lang ko
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/onboard.sh | sh -s -- --print
+curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/onboard.sh | sh -s -- --lang ko
+curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/onboard.sh | sh -s -- --print
 ```
 
-Muxa를 설치한 뒤에는 `muxa onboard`로 같은 16단계 live tour를 바로 실행하거나,
-tmux를 사용할 수 없을 때 `muxa onboard --print`로 written guide를 볼 수 있습니다.
+Tend를 설치한 뒤에는 `tend onboard`로 같은 16단계 live tour를 바로 실행하거나,
+tmux를 사용할 수 없을 때 `tend onboard --print`로 written guide를 볼 수 있습니다.
 
 ## One-Shot 설치
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/install.sh | sh
 ```
 
-스크립트는 `muxa`, `muxad`를 build/install 한 뒤 `muxa init`으로 tmux,
+스크립트는 `tend`, `tendd`를 build/install 한 뒤 `tend init`으로 tmux,
 agent hook, optional systemd, optional dashboard를 연결합니다. wizard에
 flag를 넘길 때는 `sh -s --`를 사용합니다:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh -s -- --preset standard --yes
-curl -fsSL https://raw.githubusercontent.com/Open330/muxa/main/scripts/install.sh | sh -s -- --dry-run
+curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/install.sh | sh -s -- --preset standard --yes
+curl -fsSL https://raw.githubusercontent.com/Open330/tend/main/scripts/install.sh | sh -s -- --dry-run
 ```
 
 ## Source에서 설치
 
 ```bash
-git clone https://github.com/Open330/muxa.git
-cd muxa
-cargo install --path crates/muxad --locked
-cargo install --path crates/muxa-cli --locked
-muxa init
+git clone https://github.com/Open330/tend.git
+cd tend
+cargo install --path crates/tendd --locked
+cargo install --path crates/tend-cli --locked
+tend init
 ```
 
 `cargo install`은 `~/.cargo/bin`에 설치합니다. 해당 경로가 `PATH`에 있어야 합니다.
@@ -61,44 +61,44 @@ muxa init
 ## Homebrew
 
 ```bash
-brew install open330/tap/muxa
-muxa init
+brew install open330/tap/tend
+tend init
 ```
 
-macOS와 Linux의 arm64/x86_64용 사전 빌드 `muxa`·`muxad`를 설치합니다.
+macOS와 Linux의 arm64/x86_64용 사전 빌드 `tend`·`tendd`를 설치합니다.
 CLI formula와 Mac 앱 cask는 별도이며 함께 설치할 수 있습니다.
 
-### Muxa for Mac
+### Tend for Mac
 
 ```bash
-brew install --cask open330/tap/muxa-app
+brew install --cask open330/tap/tend-app
 ```
 
-공증된 `Muxa.app`을 `/Applications`에 설치합니다. 앱은
-`Contents/Helpers`에 `muxa`와 `muxad`를 포함하므로 CLI formula 없이도 실행할 수
+공증된 `Tend.app`을 `/Applications`에 설치합니다. 앱은
+`Contents/Helpers`에 `tend`와 `tendd`를 포함하므로 CLI formula 없이도 실행할 수
 있습니다. 터미널의 `PATH`에서도 CLI를 쓰려면 formula를 함께 설치하세요.
 
 앱 자체 업데이트 기능은 없습니다. 다음 명령으로 업데이트합니다.
 
 ```bash
 brew update
-brew upgrade --cask open330/tap/muxa-app
+brew upgrade --cask open330/tap/tend-app
 ```
 
-[릴리즈 페이지](https://github.com/Open330/muxa/releases)에서 DMG를 직접 받을
-수도 있으며 이 경우 앱을 직접 교체해야 합니다. `brew uninstall --cask muxa-app`은
+[릴리즈 페이지](https://github.com/Open330/tend/releases)에서 DMG를 직접 받을
+수도 있으며 이 경우 앱을 직접 교체해야 합니다. `brew uninstall --cask tend-app`은
 앱을 제거하고, `--zap`은 설정과 캐시도 제거합니다. 데몬·CLI가 공유하는
-`~/Library/Application Support/muxa`는 유지합니다.
+`~/Library/Application Support/tend`는 유지합니다.
 
-소스 빌드와 네이티브 터미널 구조는 [Muxa for Mac](MACOS.md)을 참고하세요.
+소스 빌드와 네이티브 터미널 구조는 [Tend for Mac](MACOS.md)을 참고하세요.
 
 ## Pre-Built Binary
 
-[Releases page](https://github.com/Open330/muxa/releases)에서 archive를
-받아 `muxa`, `muxad`를 `PATH`에 둔 뒤 실행합니다:
+[Releases page](https://github.com/Open330/tend/releases)에서 archive를
+받아 `tend`, `tendd`를 `PATH`에 둔 뒤 실행합니다:
 
 ```bash
-muxa init
+tend init
 ```
 
 현재 release target:
@@ -108,7 +108,7 @@ muxa init
 - `x86_64-apple-darwin`
 - `aarch64-apple-darwin`
 
-## `muxa init`
+## `tend init`
 
 권장 wiring 경로입니다. 사용 가능한 도구를 감지하고, component 선택,
 file edit preview, uninstall을 처리합니다.
@@ -117,40 +117,40 @@ file edit preview, uninstall을 처리합니다.
 
 | 목표 | 명령 |
 | --- | --- |
-| 대화형 wizard | `muxa init` |
-| headless 설치 | `muxa init --preset standard --yes` |
-| preview only | `muxa init --dry-run` |
-| reverse install | `muxa init --uninstall` |
-| component 하나만 | `muxa init --component tmux-popup --yes` |
-| preset에서 일부 제외 | `muxa init --preset standard --no muxad-systemd --yes` |
+| 대화형 wizard | `tend init` |
+| headless 설치 | `tend init --preset standard --yes` |
+| preview only | `tend init --dry-run` |
+| reverse install | `tend init --uninstall` |
+| component 하나만 | `tend init --component tmux-popup --yes` |
+| preset에서 일부 제외 | `tend init --preset standard --no tendd-systemd --yes` |
 
 tmux edit은 marker block으로 감쌉니다:
 
 ```text
-# >>> muxa managed (tmux-popup) >>>
+# >>> tend managed (tmux-popup) >>>
 ...
-# <<< muxa managed (tmux-popup) <<<
+# <<< tend managed (tmux-popup) <<<
 ```
 
-JSON/TOML agent config는 command-prefix matching으로 muxa hook entry만
-제거할 수 있게 처리합니다. write 전에는 `<file>.muxa-backup-<unix_ts>` 백업을 만듭니다.
+JSON/TOML agent config는 command-prefix matching으로 tend hook entry만
+제거할 수 있게 처리합니다. write 전에는 `<file>.tend-backup-<unix_ts>` 백업을 만듭니다.
 
 `standard`, `full` preset은 Codex와 Claude Code에 전역 진입 지침, 공통 협업 스킬
 심링크, MCP 등록도 제공합니다. 기존 설치에는
-`muxa init --component agent-instructions,agent-skills,agent-mcp`로 추가합니다.
+`tend init --component agent-instructions,agent-skills,agent-mcp`로 추가합니다.
 설치 후 에이전트를 재시작합니다. 경로, 업데이트와 개별 제거 방법은
 [전역 에이전트 연동](AGENT_INTEGRATION.ko.md)을 참고하세요.
 
 ## Daemon 생명주기
 
-CLI가 `--socket`, `MUXA_SOCKET`, config, XDG 기본값 순서로 소켓을 결정하므로
+CLI가 `--socket`, `TEND_SOCKET`, config, XDG 기본값 순서로 소켓을 결정하므로
 일반적인 생명주기 명령에는 소켓 인자가 필요하지 않습니다.
 
 ```bash
-muxa daemon start
-muxa daemon status
-muxa daemon restart
-muxa daemon stop
+tend daemon start
+tend daemon status
+tend daemon restart
+tend daemon stop
 ```
 
 ## Daemon 수동 실행
@@ -158,22 +158,22 @@ muxa daemon stop
 foreground:
 
 ```bash
-muxad
+tendd
 ```
 
 background:
 
 ```bash
-muxad &
+tendd &
 ```
 
 systemd user service:
 
 ```bash
 mkdir -p ~/.local/share/systemd/user
-cp examples/muxad.service ~/.local/share/systemd/user/
+cp examples/tendd.service ~/.local/share/systemd/user/
 systemctl --user daemon-reload
-systemctl --user enable --now muxad.service
+systemctl --user enable --now tendd.service
 ```
 
 ## tmux 수동 연결
@@ -182,15 +182,15 @@ systemctl --user enable --now muxad.service
 
 ```tmux
 set -g status-interval 2
-set -g status-right "#(muxa status-line --pane #{pane_id}) | %H:%M"
+set -g status-right "#(tend status-line --pane #{pane_id}) | %H:%M"
 ```
 
 optional popup:
 
 ```tmux
-bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
-bind-key S display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch --fleet"
-bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
+bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "tend watch"
+bind-key S display-popup -B -E -w 100% -h 100% -x 0 -y 0 "tend watch --fleet"
+bind-key D display-popup -E -w 95% -h 90% "tend dashboard"
 ```
 
 `prefix+s`는 local watch, `prefix+S`는 physical-host Fleet watch를 엽니다.
@@ -204,52 +204,52 @@ tmux source-file ~/.tmux.conf
 
 ## Agent 수동 연결
 
-직접 편집보다 `muxa init`이 안전합니다. 수동으로 연결할 때는 기존 user hook을
-덮어쓰지 말고 muxa hook command를 append 하세요.
+직접 편집보다 `tend init`이 안전합니다. 수동으로 연결할 때는 기존 user hook을
+덮어쓰지 말고 tend hook command를 append 하세요.
 
 | Agent | Config |
 | --- | --- |
 | Claude Code | `examples/claude-settings.json`을 `~/.claude/settings.json`에 merge. |
-| OpenAI Codex | 호환되는 hook은 `muxa init`으로 연결합니다. 데몬은 로컬 세션 rollout 로그도 2초마다 읽어 lifecycle을 복구합니다. |
-| Google Gemini CLI | `crates/muxa/src/adapters/gemini.rs`의 hook block을 `~/.gemini/settings.json`에 merge. |
-| Google Antigravity CLI | `crates/muxa/src/adapters/antigravity.rs`의 `muxa` block을 `~/.gemini/config/hooks.json`에 추가. Gemini CLI의 `settings.json`이 **아니라** agy 전용 `hooks.json`입니다. |
+| OpenAI Codex | 호환되는 hook은 `tend init`으로 연결합니다. 데몬은 로컬 세션 rollout 로그도 2초마다 읽어 lifecycle을 복구합니다. |
+| Google Gemini CLI | `crates/tend/src/adapters/gemini.rs`의 hook block을 `~/.gemini/settings.json`에 merge. |
+| Google Antigravity CLI | `crates/tend/src/adapters/antigravity.rs`의 `tend` block을 `~/.gemini/config/hooks.json`에 추가. Gemini CLI의 `settings.json`이 **아니라** agy 전용 `hooks.json`입니다. |
 
 ## 확인
 
 ```bash
-muxa status
-muxa status-line --pane "$TMUX_PANE"
-muxa watch
+tend status
+tend status-line --pane "$TMUX_PANE"
+tend watch
 ```
 
 ## 업그레이드
 
-`muxa upgrade`는 설치 채널(소스 체크아웃, Homebrew, 릴리스 바이너리)에 맞게
-제자리 업데이트하고 muxad를 다시 실행합니다. 교체 전후로 다음도 처리합니다.
+`tend upgrade`는 설치 채널(소스 체크아웃, Homebrew, 릴리스 바이너리)에 맞게
+제자리 업데이트하고 tendd를 다시 실행합니다. 교체 전후로 다음도 처리합니다.
 
 1. **먼저 작업 공간을 스냅샷합니다.** 경로는
    `pre-upgrade snapshot: …/snapshots/<id>`로 출력됩니다.
 2. **아직 옛 빌드로 도는 것을 알려 줍니다.** hook은 다음 이벤트부터 새
-   `muxa`를 씁니다. 에이전트가 띄운 `muxa mcp` 서버는 그 에이전트가
-   재시작할 때까지 옛 코드로 돕니다. `muxa upgrade`가 끝날 때(그리고 나중에
-   `muxa doctor`로) 이런 서버를 소유자별로 보여 주고, 각각 실행할 명령을
+   `tend`를 씁니다. 에이전트가 띄운 `tend mcp` 서버는 그 에이전트가
+   재시작할 때까지 옛 코드로 돕니다. `tend upgrade`가 끝날 때(그리고 나중에
+   `tend doctor`로) 이런 서버를 소유자별로 보여 주고, 각각 실행할 명령을
    알려 줍니다.
    - **Codex 공유 app-server**(Codex 0.160+는 모든 스레드에 하나를 공유):
      해당 세션들이 쉬고 있을 때
      `CODEX_HOME=<home> codex app-server daemon restart`를 실행합니다.
    - **pane 안의 에이전트:** 각 에이전트를 재시작하면 대화가 이어집니다.
-     모든 pane을 한 번에 재시작하려면 멀티플렉서 밖에서 `muxa reload`를
+     모든 pane을 한 번에 재시작하려면 멀티플렉서 밖에서 `tend reload`를
      실행합니다. 스냅샷 → 서버 재시작 → 각 에이전트를 resume 명령으로 다시
      실행합니다.
 
-   `muxa mcp`를 직접 종료해서 교체하려고 하지 마세요. 에이전트가 다시 띄우지
-   않아서, 그 에이전트가 재시작될 때까지 muxa 도구가 실패합니다.
+   `tend mcp`를 직접 종료해서 교체하려고 하지 마세요. 에이전트가 다시 띄우지
+   않아서, 그 에이전트가 재시작될 때까지 tend 도구가 실패합니다.
 3. **작업 공간을 복원할 수 있게 합니다.** 재시작 중에 pane이 사라졌다면
    업그레이드 전 상태로 되돌립니다.
 
    ```bash
-   muxa restore ~/.local/share/muxa/snapshots/<id>         # 계획만 출력
-   muxa restore ~/.local/share/muxa/snapshots/<id> --run   # 없는 것만 다시 생성
+   tend restore ~/.local/share/tend/snapshots/<id>         # 계획만 출력
+   tend restore ~/.local/share/tend/snapshots/<id> --run   # 없는 것만 다시 생성
    ```
 
    이미 있는 세션, window, pane은 그대로 두고 없는 것만 만들기 때문에, 여러
@@ -258,16 +258,16 @@ muxa watch
 ## Rollback
 
 ```bash
-muxa init --uninstall
-pkill muxad
+tend init --uninstall
+pkill tendd
 tmux source-file ~/.tmux.conf
 ```
 
-수동 rollback이 필요하면 `.muxa-backup-<unix_ts>` 파일을 복원합니다.
+수동 rollback이 필요하면 `.tend-backup-<unix_ts>` 파일을 복원합니다.
 
-`muxa init`은 capacity 재시도, 사용량 제한 후 재개, 입력 대기 알림,
+`tend init`은 capacity 재시도, 사용량 제한 후 재개, 입력 대기 알림,
 오류 지속 알림, 선택된 Yes/Proceed 확인 규칙 다섯 개를 비활성 상태로 설치합니다.
-`muxa automation enable <name>`으로 필요한 규칙을 켤 수 있습니다.
+`tend automation enable <name>`으로 필요한 규칙을 켤 수 있습니다.
 같은 이름의 기존 규칙은 설정과 활성 상태를 유지합니다. 바이너리만
-업데이트한 경우에도 다음 muxad 시작 시 빠진 규칙을 추가합니다.
+업데이트한 경우에도 다음 tendd 시작 시 빠진 규칙을 추가합니다.
 자세한 내용은 [Automation](AUTOMATION.md)을 참고하세요.

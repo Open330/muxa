@@ -1,7 +1,7 @@
-# muxa dashboard
+# tend dashboard
 
 A work-oriented HTTP UI bolted onto the daemon. Its primary view reads the
-canonical muxa hierarchy: **Workspace → Work → Run → Agent session**, with tmux
+canonical tend hierarchy: **Workspace → Work → Run → Agent session**, with tmux
 session/window/pane retained only as the current execution binding. An optional
 Linear/GitHub/Jira issue is a reference attached to Work; it is not the Work
 identity itself.
@@ -36,7 +36,7 @@ bound to loopback and configure the public origin as described below.
 | `GET /api/works`    | Canonical v2 Workspace/Work/Run snapshot plus unlinked executions.            |
 | `GET /api/work-metadata` | Durable titles, goals, next actions, and manual workflow stages.        |
 | `GET /api/collaboration` | Indexed collaboration requests for the node/edge graph and sequence drill-down. |
-| `GET /api/terminal-sessions` | Muxa-owned PTY sessions.                                           |
+| `GET /api/terminal-sessions` | Tend-owned PTY sessions.                                           |
 | `GET /api/timeline` | Timeline document from `activity.ndjson` plus currently-open agent/tmux spans. |
 | `GET /api/events`   | SSE stream: `snapshot` (initial), `transition` (live), `lagged` (backpressure)|
 | `GET /api/windows/{window}/layout?socket=` | Pane geometry (`left`/`top`/`width`/`height` in cells, `active`, `zoomed`) for one tmux window. |
@@ -49,8 +49,8 @@ bound to loopback and configure the public origin as described below.
 | `POST /api/work-control/prompt` | Prompt every live agent run linked to one Work. Accepts `text`, or shared-composer `skill`/`body`/`context`. |
 | `POST /api/work-control/up` | Start or converge a Work pipeline and optionally link an external issue. Requires `allow_work_start`. |
 | `POST /api/work-control/abort` | Send Ctrl-C to every live agent run linked to one Work.          |
-| `POST /api/terminal-sessions/{id}/input` | Send input to a Muxa-owned PTY.                         |
-| `POST /api/terminal-sessions/{id}/terminate` | Terminate a Muxa-owned PTY.                          |
+| `POST /api/terminal-sessions/{id}/input` | Send input to a Tend-owned PTY.                         |
+| `POST /api/terminal-sessions/{id}/terminate` | Terminate a Tend-owned PTY.                          |
 
 `auth = "token"` protects all API endpoints. `auth = "public_read"` leaves
 GET/SSE endpoints public but always requires the bearer token for write/control
@@ -67,14 +67,14 @@ never create request-scoped SSH connections. See
 
 ## Quick start
 
-### Recommended: generate and persist a token with `muxa init`
+### Recommended: generate and persist a token with `tend init`
 
 ```sh
-muxa init --component dashboard
+tend init --component dashboard
 ```
 
 The initializer enables the loopback dashboard, generates a token, persists it
-in `~/.config/muxa/config.toml`, and prints a one-time bootstrap URL such as
+in `~/.config/tend/config.toml`, and prints a one-time bootstrap URL such as
 `http://127.0.0.1:7878/#token=...`.
 
 ### Manual loopback setup with a token
@@ -83,15 +83,15 @@ For a manual setup, provide the token explicitly:
 
 ```sh
 TOK=$(openssl rand -hex 32)
-muxad --dashboard --dashboard-token "$TOK"
+tendd --dashboard --dashboard-token "$TOK"
 # then in the browser:  http://127.0.0.1:7878/#token=$TOK
 ```
 
 The page captures `#token=...` into `localStorage` and rewrites the URL.
 Subsequent requests carry `Authorization: Bearer <tok>`. The token persists
 across tab close and browser restart, so you only need to paste it once per
-browser profile. To revoke, clear the `muxa.token` key (DevTools → Application
-→ Local Storage) or restart `muxad` with a different token.
+browser profile. To revoke, clear the `tend.token` key (DevTools → Application
+→ Local Storage) or restart `tendd` with a different token.
 
 Legacy `?token=...` URLs are still accepted for compatibility and immediately
 scrubbed, but fragments are the supported bootstrap format because browsers do
@@ -99,7 +99,7 @@ not send them in HTTP requests or `Referer` headers.
 
 A browser that can read nothing (reads return 401: no operator session and no
 working token) gets a landing page instead of an empty dashboard. It says what
-muxa is and offers the ways in: **Sign in** when
+tend is and offers the ways in: **Sign in** when
 [operator sign-in](#operator-sign-in-with-oidc) is configured, and **Use access
 token**, which stores the token like `#token=` and reloads. A stored token that
 the server rejects is reported there. `public_read` and `auth = "none"`
@@ -107,8 +107,8 @@ dashboards never show it, since their reads succeed without credentials. The
 page is served from the daemon itself and loads nothing from other origins.
 Its dashboard screenshots show a made-up fleet; regenerate them with
 `node scripts/landing-shots/capture.mjs` (Playwright, Chrome and `cwebp`).
-The hero film is captured from a real muxa in the isolated sandbox (tmux,
-the status line, `muxa attend`, `muxa peek`) with
+The hero film is captured from a real tend in the isolated sandbox (tmux,
+the status line, `tend attend`, `tend peek`) with
 `scripts/landing-shots/film.sh`, which writes `landing-frames.mjs`.
 
 ### Loopback-only without authentication (dev / single-user)
@@ -116,7 +116,7 @@ the status line, `muxa attend`, `muxa peek`) with
 Disabling auth requires an explicit opt-out:
 
 ```toml
-# ~/.config/muxa/config.toml
+# ~/.config/tend/config.toml
 [dashboard]
 enabled = true
 auth = "none"
@@ -126,7 +126,7 @@ auth = "none"
 Or via flags:
 
 ```sh
-muxad --dashboard --dashboard-auth none
+tendd --dashboard --dashboard-auth none
 ```
 
 Open <http://127.0.0.1:7878/>.
@@ -154,7 +154,7 @@ The equivalent CLI invocation is:
 
 ```sh
 TOK=$(openssl rand -hex 32)
-muxad --dashboard \
+tendd --dashboard \
       --dashboard-bind 0.0.0.0:7878 \
       --dashboard-auth public_read \
       --dashboard-token "$TOK" \
@@ -168,7 +168,7 @@ fails at startup:
 
 ```sh
 TOK=$(openssl rand -hex 32)
-muxad --dashboard \
+tendd --dashboard \
       --dashboard-bind 0.0.0.0:7878 \
       --dashboard-token "$TOK" \
       --allow-public
@@ -176,7 +176,7 @@ muxad --dashboard \
 
 Open `http://<host>:7878/#token=$TOK` in the browser.
 
-If you skip `--allow-public` or `--dashboard-token`, `muxad` refuses to start
+If you skip `--allow-public` or `--dashboard-token`, `tendd` refuses to start
 with a clear message — same applies to TOML configs.
 
 ### Public bind without API auth or editing
@@ -195,7 +195,7 @@ auth = "none"
 Or via flags/env:
 
 ```sh
-muxad --dashboard \
+tendd --dashboard \
       --dashboard-bind 0.0.0.0:7878 \
       --allow-public \
       --dashboard-auth none
@@ -217,17 +217,17 @@ already enforces env-beats-flag for the fields it covers).
 
 | Key                  | Type    | Default            | CLI / env                                                       |
 | -------------------- | ------- | ------------------ | --------------------------------------------------------------- |
-| `enabled`            | bool    | `false`            | `--dashboard` / `--no-dashboard` / `MUXA_DASHBOARD_ENABLED`     |
-| `bind`               | string  | `"127.0.0.1:7878"` | `--dashboard-bind` / `MUXA_DASHBOARD_BIND`                      |
-| `auth`               | string  | `"token"`          | `--dashboard-auth` / `MUXA_DASHBOARD_AUTH` (`token`, `public_read`, or `none`) |
-| `token`              | string  | unset (required with `token`/`public_read`) | `--dashboard-token` / `MUXA_DASHBOARD_TOKEN` |
-| `allow_public`       | bool    | `false`            | `--allow-public` / `MUXA_DASHBOARD_ALLOW_PUBLIC`                |
+| `enabled`            | bool    | `false`            | `--dashboard` / `--no-dashboard` / `TEND_DASHBOARD_ENABLED`     |
+| `bind`               | string  | `"127.0.0.1:7878"` | `--dashboard-bind` / `TEND_DASHBOARD_BIND`                      |
+| `auth`               | string  | `"token"`          | `--dashboard-auth` / `TEND_DASHBOARD_AUTH` (`token`, `public_read`, or `none`) |
+| `token`              | string  | unset (required with `token`/`public_read`) | `--dashboard-token` / `TEND_DASHBOARD_TOKEN` |
+| `allow_public`       | bool    | `false`            | `--allow-public` / `TEND_DASHBOARD_ALLOW_PUBLIC`                |
 | `pane_cache_ttl_ms`  | u64     | `2000`             | (TOML only)                                                     |
 
 ## How "global" works
 
 The daemon's agent registry is already global per user — every tmux server
-forwards `AgentEvent`s to the same `muxad`. The dashboard's *new* trick is
+forwards `AgentEvent`s to the same `tendd`. The dashboard's *new* trick is
 the pane scanner: it enumerates every tmux socket under `$TMUX_TMPDIR`,
 `/tmp/tmux-$UID/`, and (on macOS) `/private/tmp/tmux-$UID/`, runs `tmux -S
 <sock> list-panes -a` against each, and folds the results.
@@ -241,7 +241,7 @@ hammering refresh loop doesn't fork tmux 60 times a minute.
 
 ## Work-oriented projection
 
-`muxa::work::build_snapshot` is the single projection used by the HTTP and CLI
+`tend::work::build_snapshot` is the single projection used by the HTTP and CLI
 dashboards. The browser consumes `/api/works`; it does not infer Work from a
 session name, a ticket-shaped window name, or repository cwd.
 
@@ -256,9 +256,9 @@ session name, a ticket-shaped window name, or repository cwd.
 
 ### Workspace rail
 
-muxa's managed layout is Workspace = tmux session, Run = window, Agent = pane,
+tend's managed layout is Workspace = tmux session, Run = window, Agent = pane,
 so the **Workspaces** rail lists every live tmux session, whether or not
-anything in it was started with `muxa work up`. It is the union of the
+anything in it was started with `tend work up`. It is the union of the
 sessions in `/api/panes` (plus any that only appear in `unlinked_executions`)
 and the managed workspaces in `/api/works`; a managed workspace whose id equals
 a session name is the same entry. Each entry shows its window and agent
@@ -333,14 +333,14 @@ not silently rewrite the operator's workflow stage. Selecting a Work opens a
 drawer that shows local stage, external issue status, Run state, and Agent state
 as separate facts. Expanding execution reveals all linked Runs and panes.
 
-Durable records live in `$XDG_DATA_HOME/muxa/dashboard-work.json` (normally
-`~/.local/share/muxa/dashboard-work.json`). Schema v2 keys records by logical
+Durable records live in `$XDG_DATA_HOME/tend/dashboard-work.json` (normally
+`~/.local/share/tend/dashboard-work.json`). Schema v2 keys records by logical
 Work identity. Schema v1 host/socket/session/window annotations are migrated
 with their old binding retained for compatibility. Writes remain atomic and
 serialized by the daemon.
 
-Managed tmux options (`@muxa_workspace_id`, `@muxa_work_id`, agent role/task)
-link a Run to Work. `muxa work up` also stores optional external-source metadata
+Managed tmux options (`@tend_workspace_id`, `@tend_work_id`, agent role/task)
+link a Run to Work. `tend work up` also stores optional external-source metadata
 on the window, which `/api/works` discovers and persists. Unmanaged windows stay
 in `unlinked_executions`; they are never guessed into Work from their names.
 Their sessions still appear as workspaces in the rail (see
@@ -406,7 +406,7 @@ other URL parameters; copy-conversation is available to authenticated operators.
 
 When `[fleet] enabled = true` and `[fleet.hosts]` lists SSH hosts, the
 dashboard shows a **Fleet** panel above the session tree: one card per host
-(this node first) with its connection state, muxa version, relay latency,
+(this node first) with its connection state, tend version, relay latency,
 agent and pane counts, and how many agents need you (waiting on input or a
 choice, or in error). A host that is offline shows the relay's error.
 Selecting an online host lists its agents: state, kind, session and pane,
@@ -419,7 +419,7 @@ same read policy as `/api/agents`; it is read-only, and
 
 ## Sessions, windows and panes
 
-muxa tracks every agent by where it runs: a tmux (or rmux) **session**, a
+tend tracks every agent by where it runs: a tmux (or rmux) **session**, a
 **window** in it, and a **pane** in that window. The **Sessions** panel near
 the top of the page is organized the same way.
 
@@ -539,7 +539,7 @@ See [Third-party notices](#third-party-notices).
 The board could steer Work it had not started — prompt its Runs, abort them,
 annotate it — but not create the team. `POST /api/work-control/up`, and the
 board header's **start work** control, close that: give it a stable Work id and,
-optionally, a separate external issue key. Muxa routes it to a workspace and
+optionally, a separate external issue key. Tend routes it to a workspace and
 directory and creates whichever agent panes the pipeline declares but the Run
 does not have yet.
 Pressing it twice fills gaps rather than duplicating the team; with a `body` it
@@ -553,7 +553,7 @@ authority, so it gets its own grant — the way `[ask]` and `[collaboration]` do
 Disabled, the route answers `501` rather than `403`, because the token is fine;
 the capability simply is not offered here.
 
-The daemon runs the `muxa` binary for this rather than reimplementing the
+The daemon runs the `tend` binary for this rather than reimplementing the
 pipeline. The launcher and the managed-tmux registry live in the CLI crate,
 which depends on the library the daemon links, so calling them in-process would
 mean inverting that dependency or keeping a second implementation alive.
@@ -570,7 +570,7 @@ The all-session overview places activity on the same wall-clock axis as the
 selected session timeline. Overlapping agent intervals are unioned into rows
 for working, waiting, error, idle, and starting; interaction and tmux presence
 have their own rows. Gaps remain empty. Totals still report summed agent time
-and the shared `muxa stats` attribution, so simultaneous agents can accumulate
+and the shared `tend stats` attribution, so simultaneous agents can accumulate
 more work time than the width of a wall-clock interval.
 
 Numeric client-view sessions are folded into their base session in the
@@ -589,12 +589,12 @@ into that local calendar day. Timeline
 lanes are grouped by session by default, with agent, human, and tmux
 foreground lanes shown under the same session header.
 
-The overview's `act` metric follows the same meaning as `muxa stats ACT`:
+The overview's `act` metric follows the same meaning as `tend stats ACT`:
 engaged human time estimated from submitted prompts, tmux input ticks, and
 time spent present while agents are waiting for a human answer. Prompt/input
 padding is clipped to active presence (tmux foreground, prompt input, or tmux
-attach; not a plain open `muxa watch` interval). The `human` metric follows
-`muxa stats HUMAN`: the union of tmux foreground time and muxa-recorded human
+attach; not a plain open `tend watch` interval). The `human` metric follows
+`tend stats HUMAN`: the union of tmux foreground time and tend-recorded human
 interaction intervals. Timeline lanes still show raw human-interaction spans
 separately as `interaction`.
 
@@ -644,11 +644,11 @@ that strips the carve-out (or use mTLS).
 
 ## Scope and limits
 
-- External issue references are captured at `muxa work up` time. Continuous
+- External issue references are captured at `tend work up` time. Continuous
   two-way Linear/GitHub/Jira synchronization, dependencies, and estimates are
   not implemented.
 - Control is intentionally narrow: Work/pane prompt and abort plus
-  Muxa-owned PTY input/terminate. There are no direct configuration/file editing
+  Tend-owned PTY input/terminate. There are no direct configuration/file editing
   APIs. Sending a prompt to a shell pane can execute shell commands.
 - No mobile UI. The CSS scales OK to ~600 px but isn't designed for phones.
 - Operator access uses a bearer token, or optionally
@@ -656,18 +656,18 @@ that strips the carve-out (or use mTLS).
   recipients use OIDC with access limited to their shared panes; they cannot
   manage the dashboard.
 
-The [`dashboard::router`](../crates/muxa/src/dashboard/server.rs) function is
+The [`dashboard::router`](../crates/tend/src/dashboard/server.rs) function is
 public for embedding and integration tests.
 
 ### Third-party notices
 
-The dashboard embeds `muxa-nerd-symbols.woff2`, a subset of Symbols Nerd Font
+The dashboard embeds `tend-nerd-symbols.woff2`, a subset of Symbols Nerd Font
 Mono from [Nerd Fonts](https://github.com/ryanoasis/nerd-fonts) v3.5.1 (MIT,
 copyright Ryan L McIntyre). The icon sets it contains keep their own licenses
 (Font Awesome and Codicons CC BY 4.0, Material Design Apache 2.0, Pomicons and
 Weather Icons SIL OFL 1.1, the rest MIT). The license text, source URL,
 checksums and the command that produced the subset are in
-[`crates/muxa/src/dashboard/web/fonts/`](../crates/muxa/src/dashboard/web/fonts/README.md);
+[`crates/tend/src/dashboard/web/fonts/`](../crates/tend/src/dashboard/web/fonts/README.md);
 the daemon also serves the license at `/static/fonts/LICENSE-nerd-fonts-symbols.txt`.
 
 <a id="operator-sign-in-with-oidc"></a>
@@ -698,20 +698,20 @@ token holder add their own account without editing the provider's groups.
 enabled = true
 bind = "127.0.0.1:7878"
 auth = "token"
-# Keep the token (dashboard.token or MUXA_DASHBOARD_TOKEN). It remains the
+# Keep the token (dashboard.token or TEND_DASHBOARD_TOKEN). It remains the
 # API/CLI credential and the way in when the provider is unavailable.
 
 [dashboard.login]
-public_url = "https://muxa.example.com"      # origin only; HTTP only on loopback
+public_url = "https://tend.example.com"      # origin only; HTTP only on loopback
 issuer_url = "https://login.example.com/realms/example"
-client_id = "muxa-dashboard"
-# required_group = "muxa-operators"          # optional while enrollment is on
+client_id = "tend-dashboard"
+# required_group = "tend-operators"          # optional while enrollment is on
 # enrollment = true                          # default; false = group-only sign-in
-# viewer_group = "muxa-viewers"              # optional read-only group
+# viewer_group = "tend-viewers"              # optional read-only group
 # viewer_rules = ["email:*@example.com"]     # optional read-only viewer rules
 # groups_claim = "groups"                    # default "groups"
 # scopes = ["groups"]                        # requested in addition to "openid email"
-# client_secret_env = "MUXA_LOGIN_CLIENT_SECRET"  # confidential clients: env var NAME
+# client_secret_env = "TEND_LOGIN_CLIENT_SECRET"  # confidential clients: env var NAME
 ```
 
 Provider requirements:
@@ -721,7 +721,7 @@ Provider requirements:
 - Authorization code flow with **PKCE S256**. A public client
   (`token_endpoint_auth_method = none`) works; a confidential client uses
   `client_secret_env`.
-- The exact redirect URI `https://muxa.example.com/auth/callback`.
+- The exact redirect URI `https://tend.example.com/auth/callback`.
 - A signed ID token whose `groups_claim` holds the group names, as a JSON array
   of strings or a single string. Some providers release it only with an extra
   scope (add it to `scopes`) or a client/claim mapper. `email` is shown in the
@@ -753,9 +753,9 @@ Flow and session contract:
 | `POST /api/viewers` | Operator only: JSON `{"rule": "email:*@example.com"}`; 201, 400 for an invalid rule, 409 for a duplicate or the 128-rule limit. |
 | `POST /api/viewers/{id}/remove` | Operator only: removes a dashboard rule and ends viewer sessions it no longer allows. |
 
-- The session cookie is `__Host-muxa-op` (`muxa-op-dev` over loopback HTTP),
+- The session cookie is `__Host-tend-op` (`tend-op-dev` over loopback HTTP),
   `HttpOnly; Secure; SameSite=Strict; Path=/`, lasting 8 hours. A short-lived
-  `__Host-muxa-op-login` cookie (`SameSite=Lax`) binds the pending login to the
+  `__Host-tend-op-login` cookie (`SameSite=Lax`) binds the pending login to the
   browser that started it.
 - Group membership is checked at sign-in. Removing someone from the group takes
   effect when their session expires, they sign out, or the daemon restarts.
@@ -765,7 +765,7 @@ Flow and session contract:
 - Every read route, SSE included, accepts either the bearer token or an
   operator or viewer session cookie. Write and management routes answer a
   viewer session with 403. A **state-changing request authorized by the cookie** must also
-  send `Origin: <public_url>` and `X-Muxa-Operator: 1`, or it is refused with
+  send `Origin: <public_url>` and `X-Tend-Operator: 1`, or it is refused with
   403. The dashboard's own JavaScript does this; bearer-token clients do not need
   to. `POST /auth/logout` has the same requirement.
 - Sign-in state is separate from pane sharing: a recipient session never
@@ -775,7 +775,7 @@ Behind a reverse proxy or tunnel, preserve the public `Host` header (the
 loopback-bound dashboard accepts the configured public host and rejects other
 names), forward cookies unchanged, and do not cache `/auth/*` or `/api/*`.
 Omit query strings on `/auth/callback` from access logs: they contain the
-authorization code. Muxa's own logs redact `code`, `state` and `token`.
+authorization code. Tend's own logs redact `code`, `state` and `token`.
 
 Opening the dashboard on another origin (for example `http://127.0.0.1:7878`)
 still works with the token; its **sign in** button sends the browser to the
@@ -788,7 +788,7 @@ not an operator is not turned away:
 
 1. The callback holds the verified issuer, subject and email for five minutes in
    a pending enrollment bound to this browser by an `HttpOnly; SameSite=Lax`
-   cookie, `__Host-muxa-op-enroll` (`muxa-op-enroll-dev` over loopback HTTP),
+   cookie, `__Host-tend-op-enroll` (`tend-op-enroll-dev` over loopback HTTP),
    and redirects to `/auth/enroll`.
 2. That page shows the signed-in account and asks for the dashboard's access
    token. Its script sends the token once, as JSON, to `POST /auth/enroll`.
@@ -811,7 +811,7 @@ Security notes:
   the dashboard token, and so already has full operator rights, can enroll an
   account. A pending enrollment authorizes no API route by itself.
 - `POST /auth/enroll` requires the pending cookie, `Origin: <public_url>` and
-  `X-Muxa-Operator: 1`, and a JSON body. A cross-site page can neither send the
+  `X-Tend-Operator: 1`, and a JSON body. A cross-site page can neither send the
   `Lax` cookie on a POST nor add the header without a CORS preflight the
   dashboard never grants. The page's CSP allows only its own same-origin script
   and blocks native form submission, so the token cannot end up in a URL.
@@ -826,7 +826,7 @@ Security notes:
 - At most 64 accounts can be enrolled. Pane-sharing recipient sessions cannot
   enroll or reach `/api/operators`.
 - The viewer upgrade uses the same `POST /auth/enroll` checks: the `Strict`
-  session cookie plus `Origin` and `X-Muxa-Operator: 1`, the constant-time
+  session cookie plus `Origin` and `X-Tend-Operator: 1`, the constant-time
   comparison, the global backoff, and five wrong tokens per viewer session,
   after which that session is ended.
 - `enrollment = false` restores group-only sign-in: the refusal page returns,
@@ -854,10 +854,10 @@ them as `email:ann@example.com` and `email:*@example.com`. The API and
 - An account that is both an operator and a viewer signs in as an operator.
 
 Enrolled accounts and viewer rules are stored in SQLite at
-`$XDG_DATA_HOME/muxa/dashboard-operators/operators.sqlite3` (the platform data
+`$XDG_DATA_HOME/tend/dashboard-operators/operators.sqlite3` (the platform data
 directory, next to the pane-sharing store): mode `0600` in a `0700` directory,
 held under an exclusive lock so a second daemon cannot open it, and refused if
-the file is not a muxa operator store. Each row holds the issuer, subject, the
+the file is not a tend operator store. Each row holds the issuer, subject, the
 display email, and the enrollment and last sign-in times; viewer rules keep the
 rule, its issuer and when it was added. Nothing is opened when sign-in is off.
 
@@ -876,7 +876,7 @@ signs in on a separate page; the operator bearer token must not be sent to them.
 
 Configure an OIDC application that supports authorization code flow with PKCE
 and returns `email` and `email_verified = true` in its ID token. Register the exact
-redirect URI `https://muxa.example.com/share/auth/callback` with that provider.
+redirect URI `https://tend.example.com/share/auth/callback` with that provider.
 Example configuration (replace the example host and issuer):
 
 ```toml
@@ -884,14 +884,14 @@ Example configuration (replace the example host and issuer):
 enabled = true
 bind = "127.0.0.1:7878"
 auth = "token"
-# Supply the operator token through MUXA_DASHBOARD_TOKEN or dashboard.token.
+# Supply the operator token through TEND_DASHBOARD_TOKEN or dashboard.token.
 
 [dashboard.sharing]
-public_url = "https://muxa.example.com"
+public_url = "https://tend.example.com"
 issuer_url = "https://login.example.com"
-client_id = "muxa-dashboard"
+client_id = "tend-dashboard"
 # Optional for confidential clients; this is the environment variable NAME.
-client_secret_env = "MUXA_SHARING_CLIENT_SECRET"
+client_secret_env = "TEND_SHARING_CLIENT_SECRET"
 # Optional: absolute path on a private local filesystem.
 # storage_path = "/absolute/path/to/shares.sqlite3"
 ```
@@ -909,7 +909,7 @@ Up to 256 invitations are retained until expiry, including revoked invitations;
 if the limit is reached, wait for previous invitations to expire.
 Sessions last at most 8 hours. Invitations, bound identities, revocations and command
 receipts are saved in a private SQLite database under the platform data directory
-(`muxa/dashboard-sharing/shares.sqlite3`). **Daemon restarts preserve invitations;
+(`tend/dashboard-sharing/shares.sqlite3`). **Daemon restarts preserve invitations;
 recipients sign in again.** The pane process must still be the original process.
 Session cookies and pending login flows remain in memory and are never saved. The first successful
 login binds the verified invited email to the provider's subject identifier.
@@ -944,7 +944,7 @@ without executing again; an interrupted/uncertain receipt returns 409 and is
 never replayed, including after restart. A changed payload under the same ID is
 rejected. IDs omitted by legacy callers cannot deduplicate separate requests.
 Recipient writes require the session cookie, the configured
-origin and `X-Muxa-Share: 1`.
+origin and `X-Tend-Share: 1`.
 
 ### Deployment and recovery
 
@@ -954,11 +954,11 @@ origin and `X-Muxa-Share: 1`.
 2. Configure `dashboard.sharing` and supply the named secret environment variable
    to the daemon service, then restart. `storage_path` may override the database
    location with an absolute file path on a local filesystem. Keep the database
-   and its lock file private to the daemon user; muxa creates them with mode 0600.
+   and its lock file private to the daemon user; tend creates them with mode 0600.
 3. Forward the HTTPS origin to the loopback dashboard without rewriting `Host`,
    stripping cookies or caching `/share/*` and `/api/*` responses. Configure the
    proxy access log to omit query strings on `/share/auth/callback`: they contain
-   authorization codes. Muxa's own HTTP logs redact code, state and operator
+   authorization codes. Tend's own HTTP logs redact code, state and operator
    tokens, including percent-encoded parameter names.
 4. In **Shares**, choose **Check login setup**. It checks discovery and signing
    key reachability; it cannot validate a client secret or email claim without an
@@ -971,7 +971,7 @@ provider discovery. Both require the operator bearer token. Recipients can use
 **Sign out all devices** to end their current account's browser sessions without
 revoking the invitations themselves.
 
-Muxa commits an invitation, account binding or revocation before confirming it.
+Tend commits an invitation, account binding or revocation before confirming it.
 It also records command acceptance before sending input. If storage fails, the
 change is not acknowledged and a new command is not executed. If the process dies
 between acceptance and completion, the command's result is uncertain: inspect the
@@ -997,15 +997,15 @@ reconnection, restart, recipient isolation and revocation. It needs Python's
 ```sh
 cargo build --workspace --bins
 # Configure these only if playwright/Chromium are outside their default locations.
-export MUXA_PLAYWRIGHT_PACKAGE=/path/to/playwright
-export MUXA_TEST_CHROMIUM=/path/to/chromium
+export TEND_PLAYWRIGHT_PACKAGE=/path/to/playwright
+export TEND_TEST_CHROMIUM=/path/to/chromium
 python3 scripts/dashboard-sharing-smoke.py
 ```
 
 On Windows the harness runs the panes on a private rmux label instead
-(`MUXA_TEST_RMUX_LABEL`, default `muxa-share-smoke`) and needs PowerShell
-and Python on `PATH`; build with `cargo build -p muxad` and point
-`MUXA_TEST_CHROMIUM` at an installed Chrome.
+(`TEND_TEST_RMUX_LABEL`, default `tend-share-smoke`) and needs PowerShell
+and Python on `PATH`; build with `cargo build -p tendd` and point
+`TEND_TEST_CHROMIUM` at an installed Chrome.
 
 This harness creates only loopback listeners and fixture identities. Passing it
 does not replace the deployment's own HTTPS and real-provider login check.
@@ -1015,7 +1015,7 @@ does not replace the deployment's own HTTPS and real-provider login check.
 `openidconnect` currently brings in `rsa` for ID-token signature verification.
 The dependency scanner exception for [RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html)
 is limited to that advisory: its private-key timing disclosure does not apply to
-Muxa's public-key verification path. Muxa does not import RSA private keys, sign
+Tend's public-key verification path. Tend does not import RSA private keys, sign
 RSA client assertions or decrypt RSA messages. The upstream advisory has no
 patched version as of this review (2026-09-27). Reassess this exception before
 adding any private-key RSA operation or changing the OIDC dependency.

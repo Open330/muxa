@@ -1,7 +1,7 @@
 # CLI dashboard
 
-`muxa dashboard`는 `muxa watch`를 **Work board** 화면으로 엽니다. `Alt-3` /
-`:screen board` / `muxa watch --screen board`와 같은 화면입니다. 웹 대시보드가 쓰는
+`tend dashboard`는 `tend watch`를 **Work board** 화면으로 엽니다. `Alt-3` /
+`:screen board` / `tend watch --screen board`와 같은 화면입니다. 웹 대시보드가 쓰는
 canonical `WorkSnapshot`(저장된 Work, 외부 이슈, 모든 Run과 그 agent)을 읽습니다.
 board 자체는 [WATCH.ko.md](WATCH.ko.md)를 보세요. 이 문서는 명령과, 이전 카드
 콘솔을 대체하면서 바뀐 점을 다룹니다.
@@ -9,17 +9,17 @@ board 자체는 [WATCH.ko.md](WATCH.ko.md)를 보세요. 이 문서는 명령과
 ## 열기
 
 ```bash
-muxa dashboard
-muxa dashboard --since 7d        # 요약의 ACT/WACT 기간
-muxa dashboard --sort active     # attention(기본), activity, active, name
-muxa dashboard --include-paneless
-muxa dashboard --theme mono
+tend dashboard
+tend dashboard --since 7d        # 요약의 ACT/WACT 기간
+tend dashboard --sort active     # attention(기본), activity, active, name
+tend dashboard --include-paneless
+tend dashboard --theme mono
 ```
 
-`prefix + D`는 popup에서 `muxa dashboard`를 실행하며 `muxa init`이 설치합니다.
+`prefix + D`는 popup에서 `tend dashboard`를 실행하며 `tend init`이 설치합니다.
 다른 watch 화면은 키 하나로 갑니다(`Alt-1` topology, `Alt-2` 협업).
 
-플래그는 그 실행에만 적용됩니다. `--since`는 `muxa stats --since`와 같은 값을
+플래그는 그 실행에만 적용됩니다. `--since`는 `tend stats --since`와 같은 값을
 받고(`today`, `24h`, `7d`, 로컬 날짜, RFC3339, `all`), 잘못된 값은 화면을 열기
 전에 오류가 됩니다. board 안의 `:sort`는 순서를 바꾸고 저장합니다
 (`[watch] board_sort`).
@@ -48,6 +48,6 @@ muxa dashboard --theme mono
   행에 `ACT` 열이, detail에 ACT·WACT가, 모서리에 모든 세션 합계가 나오며
   `--sort active`로 그 순서로 정렬합니다. 작업 중인 agent 수 기준은 `:sort busy`로
   쓸 수 있습니다.
-- **muxa가 소유한 PTY session**은 Work가 아니어서 나오지 않습니다. `muxa watch`가
+- **tend가 소유한 PTY session**은 Work가 아니어서 나오지 않습니다. `tend watch`가
   보여줍니다.
 - 이전 카드 콘솔은 제거되었습니다.

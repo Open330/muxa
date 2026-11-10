@@ -1,11 +1,11 @@
 // First-paint regression: slow assets, failed modules and JavaScript disabled.
-// MUXA_PLAYWRIGHT_PACKAGE=/path/to/playwright-core node scripts/landing-shots/loading-smoke.mjs http://127.0.0.1:8768
+// TEND_PLAYWRIGHT_PACKAGE=/path/to/playwright-core node scripts/landing-shots/loading-smoke.mjs http://127.0.0.1:8768
 import assert from "node:assert/strict";
 import {createRequire} from "node:module";
-const {chromium}=createRequire(import.meta.url)(process.env.MUXA_PLAYWRIGHT_PACKAGE||"playwright");
+const {chromium}=createRequire(import.meta.url)(process.env.TEND_PLAYWRIGHT_PACKAGE||"playwright");
 const origin=process.argv[2];
 if(!origin)throw new Error("Pass the site's preview URL");
-const browser=await chromium.launch({executablePath:process.env.MUXA_TEST_CHROMIUM||"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",headless:true});
+const browser=await chromium.launch({executablePath:process.env.TEND_TEST_CHROMIUM||"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",headless:true});
 try{
   for(const path of ["/","/learn/"])for(const colorScheme of ["light","dark"]){
     const context=await browser.newContext({locale:"ko-KR",colorScheme});

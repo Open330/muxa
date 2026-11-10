@@ -1,0 +1,193 @@
+//! `tend` — observability for AI coding agents in tmux.
+//!
+//! See README.md for the high-level model. Library consumers reach the
+//! main types through this facade; internal cross-module access uses the
+//! full `tend::ipc::Server` form.
+//!
+//! # Public API surface
+//!
+//! The following items are considered the **stable** library surface and
+//! follow semver from the beta release onward:
+//!
+//! - [`Config`], [`Error`]
+//! - [`Agent`], [`PromptRecord`], [`Store`], [`SharedStore`], [`Transition`],
+//!   [`ReconcileReport`]
+//! - [`AgentEvent`], [`AgentId`], [`AgentKind`], [`AgentState`],
+//!   [`NotificationLevel`]
+//! - [`PromptHistory`], [`HistoryEntry`] (return / argument types of stable
+//!   `Store` methods such as [`Store::with_history`] and
+//!   [`Store::recent_prompts`])
+//! - The pane backend abstraction: [`PaneBackend`], [`SharedBackend`],
+//!   [`BackendCaps`], [`HostKind`], [`RmuxBackend`], [`TmuxBackend`], [`ZellijBackend`],
+//!   [`default_backend`]
+//!
+//! Everything else re-exported from this crate is internal task wiring used
+//! by the `tendd` and `tend` binaries in this workspace. Those items are
+//! marked `#[doc(hidden)]` and may move or change shape between minor
+//! releases without notice — please do not depend on them from external
+//! crates.
+//!
+//! The schema version constants ([`PROTOCOL_VERSION`],
+//! [`HISTORY_SCHEMA_VERSION`], [`STATE_SCHEMA_VERSION`]) remain `pub` so the
+//! daemon and on-disk readers can negotiate compatibility, but they describe
+//! an **unstable wire format** — the values may bump on any minor release
+//! when the underlying schema changes.
+
+pub mod account_provider;
+pub mod account_route;
+pub mod account_swap;
+pub mod accounts;
+pub mod activity;
+pub mod adapters;
+pub mod agent_control;
+pub mod agent_conversation;
+pub mod agent_directory;
+pub mod agent_locator;
+pub mod agent_records;
+pub mod ask;
+pub mod automation;
+pub mod automation_choice;
+pub mod automation_defaults;
+pub mod automation_judge;
+pub mod backend;
+pub mod binary_upgrade;
+pub mod child_env;
+mod codex_binding;
+pub mod collaboration;
+pub mod collaboration_audit;
+pub mod config;
+pub mod config_file;
+pub mod config_sync;
+pub mod dashboard;
+pub mod discovery;
+pub mod error;
+pub mod event;
+pub mod fleet;
+mod fleet_wait;
+pub mod history;
+pub mod ipc;
+pub mod launch_identity;
+pub mod metrics;
+pub mod notify;
+pub mod orchestration;
+pub mod paths;
+pub mod pipeline;
+pub mod pipeline_run;
+mod process_snapshot;
+pub mod process_tree;
+mod prompt_headline;
+#[cfg(unix)]
+#[doc(hidden)]
+pub mod test_support;
+pub use prompt_headline::prompt_headline;
+pub mod prompt_delivery;
+pub mod reconcile;
+pub mod request;
+pub mod scope_filter;
+pub mod screen;
+pub mod session;
+pub mod session_activity;
+pub mod shell;
+pub mod sinks;
+pub mod snapshot;
+pub mod state;
+pub(crate) mod swap_job;
+#[doc(hidden)]
+pub mod swap_service;
+pub mod timeline;
+pub mod tmux;
+pub mod topology;
+pub mod transport;
+pub mod work;
+pub mod work_compose;
+#[doc(hidden)]
+pub mod work_control;
+// WS-F: snapshot
+pub mod mux_snapshot_control;
+pub mod work_pipeline_spec;
+pub mod work_presets;
+pub mod worker_stop;
+pub mod worktree_inventory;
+pub mod worktree_receipt;
+
+// ---------------------------------------------------------------------------
+// Stable public surface.
+// ---------------------------------------------------------------------------
+
+pub use backend::{
+    active_backends, default_backend, rmux::RmuxBackend, tmux::TmuxBackend, zellij::ZellijBackend,
+    BackendCaps, HostKind, PaneBackend, SharedBackend,
+};
+pub use config::Config;
+pub use error::CoreError as Error;
+pub use event::{
+    AgentEvent, AgentId, AgentKind, AgentState, NotificationLevel, SurfaceKind, SurfaceRef,
+};
+pub use fleet::{
+    FleetCommandResult, FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime,
+    FleetSnapshot, FleetStore, GlobalPaneRef, HostAccessMode, LabelSelector, NodeId,
+    RemoteSnapshot,
+};
+pub use history::{HistoryEntry, PromptHistory};
+pub use process_tree::{WorkloadProcess, WorkloadProcessKind, WorkloadSummary};
+pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};
+pub use topology::{
+    BackendEndpoint, BackendTopologyCapabilities, HierarchyCapability, PaneKey, PaneNode,
+    SessionKey, SessionNode, StateDistribution, TopologyInput, TopologyNodeKey, TopologyNodeRef,
+    TopologySessionInput, TopologySnapshot, WindowKey, WindowNode, TOPOLOGY_SCHEMA_VERSION,
+};
+
+// ---------------------------------------------------------------------------
+// Unstable wire-format constants — `pub` so daemon/readers can negotiate
+// compatibility, but the value may change on any minor release.
+// ---------------------------------------------------------------------------
+
+#[doc(inline)]
+pub use event::PROTOCOL_VERSION;
+#[doc(inline)]
+pub use history::HISTORY_SCHEMA_VERSION;
+#[doc(inline)]
+pub use snapshot::STATE_SCHEMA_VERSION;
+
+// ---------------------------------------------------------------------------
+// Internal task wiring. Still `pub` so the workspace binaries can reach
+// them, but `#[doc(hidden)]` to keep them off the documented surface and
+// signal "do not depend on this from outside the workspace".
+// ---------------------------------------------------------------------------
+
+#[doc(hidden)]
+pub use activity::{
+    ActivityEntry, ActivityLog, ActivityOptions, HumanInteractionEntry, HumanInteractionInput,
+    HumanInteractionKind, SessionForegroundEntry, StateTransitionEntry, StateTransitionInput,
+    ACTIVITY_SCHEMA_VERSION,
+};
+#[doc(hidden)]
+pub use discovery::{run_discovery, scan_panes, synthetic_session_id, Discovered, DiscoveryReport};
+#[doc(hidden)]
+pub use error::{CoreError, Result};
+#[doc(hidden)]
+pub use history::{CompactReport, HistoryOptions, PaneSessionCache};
+#[doc(hidden)]
+pub use metrics::{Metrics, MetricsSnapshot};
+#[doc(hidden)]
+pub use reconcile::{LivenessSource, Reconciler};
+#[doc(hidden)]
+pub use scope_filter::ScopeExclusions;
+#[doc(hidden)]
+pub use screen::{load_manifests, AgentManifest, ManifestSet, ScreenState};
+#[doc(hidden)]
+pub use session::{
+    PtySessionBackend, SessionBackend, SessionBackendCaps, SessionBackendKind, SessionError,
+    SessionOutput, SessionRef, SharedSessionBackend, SpawnSession, TerminalSnapshot,
+};
+#[doc(hidden)]
+pub use session_activity::{
+    SessionActivity, SessionActivitySource, SessionActivityTracker, SESSION_ACTIVITY_SCHEMA_VERSION,
+};
+#[doc(hidden)]
+pub use snapshot::{Snapshotter, SnapshotterOptions};
+#[doc(hidden)]
+pub use timeline::{
+    TimelineBuildInput, TimelineDocument, TimelineFilters, TimelineInterval,
+    TimelineIntervalSource, TimelineLane, TimelineLaneKind, TimelineRange, TimelineTotals,
+};

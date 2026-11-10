@@ -2,7 +2,7 @@
 
 This follow-up implements the five remaining findings from the additional
 audit. Raw local evidence lives in
-`~/.local/share/muxa/validation/followup-20261029/`.
+`~/.local/share/tend/validation/followup-20261029/`.
 
 ## Database lifecycle and reuse
 

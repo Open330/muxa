@@ -1,4 +1,4 @@
-// A small, fictional muxa fleet for the landing page screenshots. Nothing
+// A small, fictional tend fleet for the landing page screenshots. Nothing
 // here comes from a real machine: names, paths, prompts and ids are made
 // up, and timestamps are relative to `now` so the shots always look live.
 
@@ -95,7 +95,7 @@ function paneJson(a) {
     title: a.title,
     current_path: ws.cwd,
     socket: "default",
-    muxa: { managed_workspace: false, managed_work: false, managed_agent: false },
+    tend: { managed_workspace: false, managed_work: false, managed_agent: false },
     attach_command: `tmux attach-session -t ${a.session} \\; select-pane -t ${a.pane}`,
   };
 }

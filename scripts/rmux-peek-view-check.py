@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Verify peek on a linked view while popup env names a detached base.
 
-Private rmux socket and shell panes only. Run after cargo build -p muxa-cli.
+Private rmux socket and shell panes only. Run after cargo build -p tend-cli.
 """
 import fcntl
 import os
@@ -16,17 +16,17 @@ import tempfile
 import termios
 import time
 
-binary = Path(__file__).resolve().parents[1] / 'target/debug/muxa'
+binary = Path(__file__).resolve().parents[1] / 'target/debug/tend'
 rmux = shutil.which('rmux')
 assert rmux and binary.exists()
-with tempfile.TemporaryDirectory(prefix='muxa-peek-view-') as directory:
+with tempfile.TemporaryDirectory(prefix='tend-peek-view-') as directory:
     root = Path(directory)
-    env = dict(os.environ, TERM='xterm-256color', MUXA_HOST='rmux', MUXA_HOSTS='rmux')
+    env = dict(os.environ, TERM='xterm-256color', TEND_HOST='rmux', TEND_HOSTS='rmux')
     for key in ('RMUX', 'RMUX_PANE', 'TMUX', 'TMUX_PANE'):
         env.pop(key, None)
     config = root / 'config.toml'
     config.write_text('')
-    env['MUXA_CONFIG'] = str(config)
+    env['TEND_CONFIG'] = str(config)
     base = [rmux, '-S', str(root / 'socket')]
     children = []
 

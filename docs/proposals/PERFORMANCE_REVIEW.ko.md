@@ -20,7 +20,7 @@ SSH 네트워크·실제 agent 실행·장시간 운영의 전체 성능 보장�
 
 ## 조회 비용 비교
 
-`cargo bench -p muxa --bench runtime_reads`로 재현한다. 벤치마크는 같은 저장소에서
+`cargo bench -p tend --bench runtime_reads`로 재현한다. 벤치마크는 같은 저장소에서
 기존 조회식과 새 조회식을 각각 200회 실행한다. 빌드 완료 후 실행 파일을 3회
 반복 실행했고, 아래는 각 실행의 평균 중 중앙값이다. p95/p99가 아니다.
 

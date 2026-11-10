@@ -1,11 +1,11 @@
 // Regenerate the dashboard screenshots shown on the landing page.
 //
-//   MUXA_PLAYWRIGHT_PACKAGE=playwright-core node scripts/landing-shots/capture.mjs
+//   TEND_PLAYWRIGHT_PACKAGE=playwright-core node scripts/landing-shots/capture.mjs
 //
-// Serves crates/muxa/src/dashboard/web as-is, answers /api/* from the
+// Serves crates/tend/src/dashboard/web as-is, answers /api/* from the
 // fictional fleet in fixtures.mjs (no daemon, no real data), captures each
 // shot in light and dark, and writes WebP files next to the landing page.
-// Needs Chrome (channel "chrome", or MUXA_TEST_CHROMIUM) and `cwebp`.
+// Needs Chrome (channel "chrome", or TEND_TEST_CHROMIUM) and `cwebp`.
 
 import { createRequire } from "node:module";
 import { createServer } from "node:http";
@@ -17,10 +17,10 @@ import { fileURLToPath } from "node:url";
 import * as fx from "./fixtures.mjs";
 
 const require = createRequire(import.meta.url);
-const { chromium } = require(process.env.MUXA_PLAYWRIGHT_PACKAGE || "playwright");
+const { chromium } = require(process.env.TEND_PLAYWRIGHT_PACKAGE || "playwright");
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const WEB = resolve(HERE, "../../crates/muxa/src/dashboard/web");
+const WEB = resolve(HERE, "../../crates/tend/src/dashboard/web");
 const OUT = join(WEB, "landing");
 const manifest = readFileSync(resolve(HERE, "../../Cargo.toml"), "utf8");
 const version = manifest.match(/\[workspace\.package\][\s\S]*?^version = "([^"]+)"/m)?.[1];
@@ -93,14 +93,14 @@ const SHOTS = [
 const server = serve();
 await new Promise((r) => server.listen(0, "127.0.0.1", r));
 const origin = `http://127.0.0.1:${server.address().port}`;
-const browser = await chromium.launch(process.env.MUXA_TEST_CHROMIUM ? { executablePath: process.env.MUXA_TEST_CHROMIUM } : { channel: "chrome" });
-const tmp = mkdtempSync(join(tmpdir(), "muxa-shots-"));
+const browser = await chromium.launch(process.env.TEND_TEST_CHROMIUM ? { executablePath: process.env.TEND_TEST_CHROMIUM } : { channel: "chrome" });
+const tmp = mkdtempSync(join(tmpdir(), "tend-shots-"));
 try {
   for (const scheme of ["light", "dark"]) {
     for (const shot of SHOTS) {
       const context = await browser.newContext({ viewport: shot.viewport, deviceScaleFactor: 2, colorScheme: scheme, locale: "en-US" });
       // The dashboard remembers panel state per browser; start clean and expanded.
-      await context.addInitScript(() => { try { localStorage.clear(); localStorage.setItem("muxa.token", "demo"); } catch {} });
+      await context.addInitScript(() => { try { localStorage.clear(); localStorage.setItem("tend.token", "demo"); } catch {} });
       const page = await context.newPage();
       page.on("pageerror", (e) => { throw e; });
       await page.goto(origin);

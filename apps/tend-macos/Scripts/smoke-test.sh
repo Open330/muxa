@@ -1,0 +1,161 @@
+#!/bin/bash
+
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+APP_DIR=$(cd "$SCRIPT_DIR/.." && pwd)
+CONFIGURATION=${CONFIGURATION:-Debug}
+APP_PATH=${1:-"$APP_DIR/.build/DerivedData/Build/Products/$CONFIGURATION/Tend.app"}
+APP_EXECUTABLE="$APP_PATH/Contents/MacOS/Tend"
+TEND_EXECUTABLE="$APP_PATH/Contents/Helpers/tend"
+
+if [ ! -x "$APP_EXECUTABLE" ]; then
+    echo "Tend.app is not built: $APP_PATH" >&2
+    exit 1
+fi
+if [ ! -x "$TEND_EXECUTABLE" ]; then
+    echo "Tend.app is missing its bundled tend Work runtime: $TEND_EXECUTABLE" >&2
+    exit 1
+fi
+"$TEND_EXECUTABLE" --version >/dev/null
+
+SMOKE_DIR=$(mktemp -d)
+SOCKET_PATH="$SMOKE_DIR/tendd.sock"
+APP_LOG="$SMOKE_DIR/tend.log"
+APP_PID=
+DAEMON_PIDS=
+mkdir -p "$SMOKE_DIR/home" "$SMOKE_DIR/config" "$SMOKE_DIR/data"
+cat >"$SMOKE_DIR/config.toml" <<'TOML'
+[automation]
+enabled = false
+[ask]
+enabled = false
+[discovery]
+enabled = false
+TOML
+
+cleanup() {
+    if [ -n "$APP_PID" ] && kill -0 "$APP_PID" 2>/dev/null; then
+        kill "$APP_PID" 2>/dev/null || true
+        wait "$APP_PID" 2>/dev/null || true
+    fi
+    for daemon_pid in $DAEMON_PIDS; do
+        [ "$daemon_pid" = "$APP_PID" ] || kill "$daemon_pid" 2>/dev/null || true
+    done
+    for attempt in $(seq 1 100); do
+        running=0
+        for daemon_pid in $DAEMON_PIDS; do
+            if [ "$daemon_pid" != "$APP_PID" ] && kill -0 "$daemon_pid" 2>/dev/null; then
+                running=1
+            fi
+        done
+        [ "$running" -eq 0 ] && break
+        sleep 0.1
+    done
+    if [ "$running" -ne 0 ]; then
+        echo "Smoke daemon is still stopping; retained $SMOKE_DIR" >&2
+        return 1
+    fi
+    rm -rf "$SMOKE_DIR"
+}
+trap cleanup EXIT
+
+ipc() {
+    python3 - "$SOCKET_PATH" "$1" <<'PY'
+import json
+import socket
+import sys
+
+socket_path, request = sys.argv[1:]
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+    client.settimeout(3)
+    client.connect(socket_path)
+    client.sendall(request.encode() + b"\n")
+    chunks = bytearray()
+    while b"\n" not in chunks:
+        chunk = client.recv(65536)
+        if not chunk:
+            break
+        chunks.extend(chunk)
+
+response = json.loads(bytes(chunks).split(b"\n", 1)[0])
+if not response.get("ok"):
+    raise SystemExit(response.get("error", "tendd rejected smoke request"))
+print(json.dumps(response, separators=(",", ":")))
+PY
+}
+
+HOME="$SMOKE_DIR/home" XDG_CONFIG_HOME="$SMOKE_DIR/config" XDG_DATA_HOME="$SMOKE_DIR/data" \
+    TEND_CONFIG="$SMOKE_DIR/config.toml" TEND_HOSTS=herdr TEND_SOCKET="$SOCKET_PATH" \
+    "$APP_EXECUTABLE" >"$APP_LOG" 2>&1 &
+APP_PID=$!
+
+for _ in $(seq 1 50); do
+    [ -S "$SOCKET_PATH" ] && break
+    if ! kill -0 "$APP_PID" 2>/dev/null; then
+        cat "$APP_LOG" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+test -S "$SOCKET_PATH"
+DAEMON_PIDS=$(lsof -t "$SOCKET_PATH" 2>/dev/null | sort -u || true)
+
+hello=$(ipc '{"protocol":6,"kind":"hello","client":"tend-macos-smoke"}')
+python3 - "$hello" <<'PY'
+import json
+import sys
+
+response = json.loads(sys.argv[1])
+required = {
+    "session_bytes_v1",
+    "session_attachment_identity_v1",
+    "work_control_v1",
+    "ask_status_v1",
+    "ask_one_turn_credential_v1",
+    "ask_conversations_v1",
+    "automation_ask_v1",
+    "config_launch_v1",
+    "config_orchestration_v1",
+}
+missing = required.difference(response.get("capabilities", []))
+if missing:
+    raise SystemExit(f"tendd did not advertise required capabilities: {sorted(missing)}")
+PY
+
+# Exercise the app's typed policy endpoint and bundled CLI without launching work.
+policy=$(ipc '{"protocol":6,"kind":"config_orchestration_read"}')
+update=$(python3 - "$policy" <<'PYTHON'
+import json, sys
+value = json.loads(sys.argv[1])
+value["orchestration"]["enabled"] = True
+print(json.dumps({"protocol":6,"kind":"config_orchestration_write",
+    "expected_text":value["config"]["text"],"settings":value["orchestration"]}))
+PYTHON
+)
+ipc "$update" >/dev/null
+options=$(ipc '{"protocol":6,"kind":"work_command","args":["work","dispatch-options"]}')
+python3 - "$options" <<'PYTHON'
+import json, sys
+result = json.loads(sys.argv[1])["work_command"]
+assert result["exit_code"] == 0, result["stderr"]
+assert json.loads(result["stdout"])["enabled"] is True
+PYTHON
+
+spawned=$(ipc '{"protocol":6,"kind":"spawn_session","command":"/bin/sh","args":["-c","/usr/bin/yes tend-macos-smoke | /usr/bin/head -c 524288; sleep 5"],"env":[],"cwd":"/tmp","name":"macOS smoke","cols":80,"rows":24}')
+session_id=$(python3 - "$spawned" <<'PY'
+import json
+import sys
+print(json.loads(sys.argv[1])["session"]["id"])
+PY
+)
+
+# Give the SwiftUI list time to select the session, construct a Ghostty surface,
+# and render a burst large enough to exercise output truncation and replay.
+sleep 3
+kill -0 "$APP_PID"
+ipc "{\"protocol\":6,\"kind\":\"terminate_session\",\"session_id\":\"$session_id\"}" >/dev/null
+
+cleanup
+trap - EXIT
+echo "Tend.app smoke test passed"

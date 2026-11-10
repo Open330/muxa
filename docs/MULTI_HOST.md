@@ -5,23 +5,23 @@
 > of several SSH-reachable physical nodes, see [FLEET.md](FLEET.md). Fleet
 > preserves this backend set independently inside every node.
 
-Status: **daemon + CLI implemented.** `muxad` observes every backend in
-`muxa::active_backends()` simultaneously (for example tmux + rmux + herdr during a
+Status: **daemon + CLI implemented.** `tendd` observes every backend in
+`tend::active_backends()` simultaneously (for example tmux + rmux + herdr during a
 migration) — the reconciler, discovery, session-activity sampling,
 pane-session cache, history enrichment, and the herdr bridge/report
 tasks all iterate the set. The CLI reads now aggregate across the same
-set: `muxa watch` is the cross-multiplexer unified console (tmux + herdr
+set: `tend watch` is the cross-multiplexer unified console (tmux + herdr
 in one view, with per-row host badges), which no single multiplexer can
 offer, and attach dispatches per row. See the CLI section below.
 
 ## Why
 
-Today muxad runs exactly one `PaneBackend`, chosen from env at startup
+Today tendd runs exactly one `PaneBackend`, chosen from env at startup
 (`detect_host_env`). During a tmux→herdr migration — the exact situation
-muxa's herdr support targets — agents live on both hosts at once, and a
+tend's herdr support targets — agents live on both hosts at once, and a
 single-backend daemon only observes one side. The other side's rows
 still ingest via hooks (env-based pane ids are host-agnostic) but get no
-liveness/discovery/foreground coverage, and `muxa watch` shows panes
+liveness/discovery/foreground coverage, and `tend watch` shows panes
 from only one host.
 
 ## What already works in our favor
@@ -57,10 +57,10 @@ The herdr work landed the key enablers:
   current shell resolves to via `detect_host_env`) leads the auto-detected
   set, so `backends[0]` is that host — consumers treat the first backend as
   primary (dashboard, watch initial cursor). Config override:
-  `MUXA_HOSTS=rmux,tmux,herdr` (env, verbatim order);
-  `MUXA_HOST=<one>` keeps meaning "exactly this one" for compatibility.
+  `TEND_HOSTS=rmux,tmux,herdr` (env, verbatim order);
+  `TEND_HOST=<one>` keeps meaning "exactly this one" for compatibility.
 - The daemon threads the set. Single-backend consumers changed shape
-  (all **implemented** in `crates/muxad/src/main.rs` unless noted):
+  (all **implemented** in `crates/tendd/src/main.rs` unless noted):
   - **Reconciler**: one `Reconciler` over the whole set
     (`Reconciler::with_sources`). Each tick observes every backend
     **concurrently** (`spawn_blocking` fan-out, joined) and reconciles
@@ -110,7 +110,7 @@ The herdr work landed the key enablers:
     every backend except zellij). Routed to the zellij backend in the set
     if present, else the primary — so pushes land in the same instance
     discovery/reconciler read.
-- **CLI reads stay aggregated** (presentation follow-up): watch/`muxa
+- **CLI reads stay aggregated** (presentation follow-up): watch/`tend
   panes` list from every active backend (concat; rows already carry their
   namespace). `current_pane`/`focus_pane` resolve per pane-id namespace.
 
@@ -130,12 +130,12 @@ With the set in place, the CLI reads aggregate across it:
   namespace; labels mirror the dashboard TUI's `CardHost`). Single-host
   users see no change — the badge only disambiguates a mixed view.
 - **Attach dispatch**: `jump_to_pane` (shared by `watch` Enter and
-  `muxa attend`) resolves the host from `pane_id_host_kind(pane_id)`
+  `tend attend`) resolves the host from `pane_id_host_kind(pane_id)`
   *first* — a `herdr:` row focuses via a herdr backend even when the
   process-global host is tmux — falling back to the process-global
   backend's kind for unrecognized ids (`dispatch_kind`).
-- **Other surfaces**: `muxa registry panes`, `stats`, and `timeline` enumerate
-  via `all_panes()` (concat across the set); `muxa registry panes` prints a
+- **Other surfaces**: `tend registry panes`, `stats`, and `timeline` enumerate
+  via `all_panes()` (concat across the set); `tend registry panes` prints a
   per-host empty hint for any host in the set that contributed zero.
   Live pane captures (the `watch` preview and inspector, on every screen
   including the Work board) target the exact topology pane, whose endpoint
@@ -160,9 +160,9 @@ With the set in place, the CLI reads aggregate across it:
   tick budget.
 - **Row identity collisions**: none known — namespaces are disjoint by
   the pane-id prefix design.
-- **`MUXA_TMUX_SOCKET` scoping**: stays tmux-only; herdr has no
+- **`TEND_TMUX_SOCKET` scoping**: stays tmux-only; herdr has no
   multi-instance scoping (single socket per session; named sessions are
-  explicit paths). A `MUXA_HERDR_SOCKET`-style scope can follow if
+  explicit paths). A `TEND_HERDR_SOCKET`-style scope can follow if
   needed.
 - **Watch session-view sorting** across heterogeneous hosts (tmux
   attached_clients vs herdr's always-1) — pick "activity recency" as the

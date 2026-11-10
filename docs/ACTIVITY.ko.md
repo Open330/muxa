@@ -1,23 +1,23 @@
 # Activity Ledger
 
-`muxa`의 duration 데이터는 `activity.ndjson`에 저장됩니다. 이 파일은
-`muxa stats`, `muxa stats report`, raw 조회 명령인 `muxa stats activity`의 기준입니다.
+`tend`의 duration 데이터는 `activity.ndjson`에 저장됩니다. 이 파일은
+`tend stats`, `tend stats report`, raw 조회 명령인 `tend stats activity`의 기준입니다.
 
 ## 빠른 조회
 
 ```bash
-muxa stats --since today
-muxa stats --since yesterday --group-by session
-muxa stats --since week --group-by project
-muxa stats --since month --exclude-session 'monitor*'
-muxa stats report --since week
-muxa stats report --since last-month --exclude-pane '%42'
-muxa timeline --since today --session main
-muxa stats activity --since today --type human
-muxa stats activity --since today --type agent --format json
+tend stats --since today
+tend stats --since yesterday --group-by session
+tend stats --since week --group-by project
+tend stats --since month --exclude-session 'monitor*'
+tend stats report --since week
+tend stats report --since last-month --exclude-pane '%42'
+tend timeline --since today --session main
+tend stats activity --since today --type human
+tend stats activity --since today --type agent --format json
 ```
 
-`muxa stats`와 `muxa stats report`의 세션별 집계는 `webapp~view~123` 같은 view를
+`tend stats`와 `tend stats report`의 세션별 집계는 `webapp~view~123` 같은 view를
 `webapp`로 합칩니다. 과거 기록에도 적용되며, 합친 뒤 정렬과 행 수 제한을
 적용합니다. view 사이에 겹치는 사용자 체류 시간과 ACT/WACT는 중복 계산하지
 않으며, agent 작업 시간은 기존처럼 합산합니다.
@@ -37,14 +37,14 @@ muxa stats activity --since today --type agent --format json
 
 ## 정렬
 
-`muxa stats`의 행은 기본적으로 prompt 수 기준으로 정렬됩니다. `--sort`로 임의의
+`tend stats`의 행은 기본적으로 prompt 수 기준으로 정렬됩니다. `--sort`로 임의의
 컬럼을 기준으로 정렬하고 `--reverse`로 방향을 뒤집을 수 있습니다. 숫자 컬럼은
 기본 내림차순(큰 값 먼저), `name`은 기본 오름차순입니다.
 
 ```bash
-muxa stats --since today --sort wait              # 대기 시간이 긴 순
-muxa stats --since today --sort work --reverse    # 작업 시간이 짧은 순
-muxa stats --since today --group-by session --sort name
+tend stats --since today --sort wait              # 대기 시간이 긴 순
+tend stats --since today --sort work --reverse    # 작업 시간이 짧은 순
+tend stats --since today --group-by session --sort name
 ```
 
 계속 켜둔 monitoring scope는 `--exclude-pane`, `--exclude-session`으로 rows와
@@ -58,12 +58,12 @@ totals에서 모두 제외할 수 있습니다. 값은 반복하거나 comma-sep
 
 ## Stats 시간 그래프
 
-`muxa stats`에 `--graph`를 추가하면 active human time의 hands-on subset인
+`tend stats`에 `--graph`를 추가하면 active human time의 hands-on subset인
 `WACT`만 terminal-native 시간 그래프로 보여줍니다.
 
 ```bash
-muxa stats --since today --graph
-muxa stats --since week --graph
+tend stats --since today --graph
+tend stats --since week --graph
 ```
 
 버킷 크기는 선택한 window에 따라 자동으로 정해집니다: 2일 이하는 시간별, 60일
@@ -77,7 +77,7 @@ muxa stats --since week --graph
 (keypress/scroll), agent가 human 답변을 기다리는 동안의 thinking time을
 합칩니다. 다만 prompt/input padding은 같은 session/pane의 active presence
 (tmux foreground, prompt input, tmux attach)와 겹치는 구간으로 자릅니다.
-단순히 열려 있는 `muxa watch` interval은 `HUMAN`에는 들어가지만 `ACT`를
+단순히 열려 있는 `tend watch` interval은 `HUMAN`에는 들어가지만 `ACT`를
 늘리는 presence로 쓰지 않습니다. 그래서 padding 때문에 한 session의 `ACT`가
 관측된 foreground/interaction 시간을 넘어가지 않습니다. 여러 session의 window가
 겹치면 가장 최근 touch session에 귀속해서 중복 집계하지 않습니다.
@@ -98,14 +98,14 @@ thinking에서 온 경우에만 셉니다. scrollback tick은 engaged `ACT`에�
 
 ## Stats 타임라인
 
-`muxa stats`에 `--timeline`을 추가하면 프로젝트마다 에이전트가 *언제*
+`tend stats`에 `--timeline`을 추가하면 프로젝트마다 에이전트가 *언제*
 일했는지 실제 시계 축 위에 그려 보여줍니다.
 
 ```bash
-muxa stats --timeline                          # 최근 7일, 하루에 한 블록
-muxa stats --timeline --since today --hours 9-24
-muxa stats --timeline --layout range --since month --limit 0
-muxa stats --timeline --group-by session
+tend stats --timeline                          # 최근 7일, 하루에 한 블록
+tend stats --timeline --since today --hours 9-24
+tend stats --timeline --layout range --since month --limit 0
+tend stats --timeline --group-by session
 ```
 
 한 행은 한 프로젝트(에이전트 작업 디렉터리 이름)입니다. `--group-by session`
@@ -130,25 +130,25 @@ Working 상태로 남기 때문에 제외합니다. 두 규칙 때문에 행의 
 타임라인은 표 출력 전용이라 `--graph`, `--format`, `--json`, `--markdown`,
 `--sort`, `--reverse`와 함께 쓸 수 없습니다.
 
-아래 `muxa timeline`은 에이전트별 인터랙티브 화면이고, `stats --timeline`은
+아래 `tend timeline`은 에이전트별 인터랙티브 화면이고, `stats --timeline`은
 프로젝트별 요약입니다.
 
 ## Timeline
 
-`muxa timeline`은 같은 duration 데이터를 interactive TUI로 표시합니다.
+`tend timeline`은 같은 duration 데이터를 interactive TUI로 표시합니다.
 overview는 기본적으로 session별로 묶고, 각 session 아래에 agent/human/tmux
 foreground lane을 보여줍니다. focus view는 선택한 lane을 timestamped interval
 목록처럼 따라갑니다.
 
 ```bash
-muxa timeline --since today
-muxa timeline --since today --session main
-muxa timeline --since today --exclude-session 'monitor*'
-muxa timeline --since 24h --agent codex
-muxa timeline --since today --group-by kind --sort waiting
-muxa timeline --view heatmap --since 12w
-muxa timeline --day 2026-06-06
-muxa timeline --since today --format json
+tend timeline --since today
+tend timeline --since today --session main
+tend timeline --since today --exclude-session 'monitor*'
+tend timeline --since 24h --agent codex
+tend timeline --since today --group-by kind --sort waiting
+tend timeline --view heatmap --since 12w
+tend timeline --day 2026-06-06
+tend timeline --since today --format json
 ```
 
 agent transition row는 진입한 상태(`to`)가 아니라 떠난 상태(`from`)를
@@ -160,13 +160,13 @@ TUI keybinding, grouping mode, dashboard 동작, JSON export 설명은
 
 ## Ledger 타입
 
-`muxa stats activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:
+`tend stats activity --type ...` 은 raw ledger 를 타입별로 필터링합니다:
 
 | Type | 의미 |
 | ---- | ---- |
 | `agent` | working, waiting, error 같은 agent 상태 transition interval. |
 | `tmux` | interactive tmux client 에서 관측된 닫힌 foreground interval. |
-| `human` | muxa 자체가 기록한 human interaction interval. |
+| `human` | tend 자체가 기록한 human interaction interval. |
 
 기존 호환성을 위해 `--type state`는 숨겨진 alias 로 남아 있으며
 `--type agent`와 같습니다.
@@ -184,7 +184,7 @@ terminal 출력에서 `--verbose`를 붙였을 때 보이며, JSON과 Markdown e
 | `WAIT` | input/choice 를 기다린 시간. |
 | `ERR` | error 상태에 머문 시간. agent 가 quota/rate-limit 류 block 을 error 로 보고하면 여기에 포함됩니다. |
 | `TMUX` | interactive tmux client 에서 해당 session 이 foreground였던 시간. |
-| `HUMAN` | tmux foreground 시간과 muxa human interaction interval 의 union. |
+| `HUMAN` | tmux foreground 시간과 tend human interaction interval 의 union. |
 | `THINK` | attention 상태와 human presence 가 겹친 시간. |
 | `ACT` | prompt, tmux input tick, thinking으로 추정한 engaged human time. |
 | `WACT` | `ACT`의 hands-on subset. scrollback이 소유한 engaged time은 제외합니다. |
@@ -193,8 +193,8 @@ terminal 출력에서 `--verbose`를 붙였을 때 보이며, JSON과 Markdown e
 
 `THINK`는 `HUMAN`보다 의도적으로 좁습니다. agent 가 attention 을 필요로 하는
 상태(`WaitingInput`, `WaitingChoice`, `Error`)이고, 동시에 human presence 가
-있을 때만 계산합니다. 여기서 human presence 는 tmux foreground, muxa prompt
-input, tmux attach 입니다. 단순히 `muxa watch`를 열어둔 시간은 `HUMAN`에는
+있을 때만 계산합니다. 여기서 human presence 는 tmux foreground, tend prompt
+input, tmux attach 입니다. 단순히 `tend watch`를 열어둔 시간은 `HUMAN`에는
 들어가지만 `THINK`에는 들어가지 않습니다. 대시보드를 열어둔 시간이 실제
 사고 시간이라고 단정하기 어렵기 때문입니다.
 

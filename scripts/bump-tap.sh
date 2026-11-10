@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Point Open330/homebrew-tap at a published muxa release.
+# Point Open330/homebrew-tap at a published tend release.
 #
 # The tap-bump workflow does this automatically, but only when the
 # TAP_GITHUB_TOKEN secret is configured; without it the job succeeds with
 # a "skipping" notice and the formula silently stays behind. This script
 # is the same edit done by hand: four checksums pulled from the release
-# and written into Formula/muxa.rb.
+# and written into Formula/tend.rb.
 #
 #   scripts/bump-tap.sh v0.8.30
 #
@@ -28,7 +28,7 @@ version="${tag#v}"
 
 command -v gh >/dev/null || { echo "error: gh is required" >&2; exit 1; }
 
-if [ "$(gh release view "$tag" --repo Open330/muxa --json isDraft --jq .isDraft)" = "true" ]; then
+if [ "$(gh release view "$tag" --repo Open330/tend --json isDraft --jq .isDraft)" = "true" ]; then
   echo "error: $tag is still a draft — publish it first" >&2
   exit 1
 fi
@@ -38,7 +38,7 @@ trap 'rm -rf "$work"' EXIT
 
 echo "==> collecting checksums for $tag"
 mkdir "$work/sums"
-(cd "$work/sums" && gh release download "$tag" --repo Open330/muxa --pattern '*.sha256')
+(cd "$work/sums" && gh release download "$tag" --repo Open330/tend --pattern '*.sha256')
 
 targets=(
   aarch64-apple-darwin
@@ -48,15 +48,15 @@ targets=(
 )
 sums=()
 for target in "${targets[@]}"; do
-  file="$work/sums/muxa-$tag-$target.sha256"
+  file="$work/sums/tend-$tag-$target.sha256"
   [ -s "$file" ] || { echo "error: missing checksum for $target" >&2; exit 1; }
   # Sidecar format: "<sha256>  <archive name>".
   sums+=("$(awk '{print $1; exit}' "$file")")
 done
 
-echo "==> updating Formula/muxa.rb"
+echo "==> updating Formula/tend.rb"
 gh repo clone Open330/homebrew-tap "$work/tap" -- --depth 1 --quiet
-formula="$work/tap/Formula/muxa.rb"
+formula="$work/tap/Formula/tend.rb"
 
 # Rewrite in place: the version string, then the four sha256 literals in
 # the order the formula lists them (mac arm, mac x86, linux arm, linux
@@ -90,7 +90,7 @@ if git diff --quiet; then
   echo "formula already at $version — nothing to push"
   exit 0
 fi
-git add Formula/muxa.rb
-git commit -q -m "muxa $version"
+git add Formula/tend.rb
+git commit -q -m "tend $version"
 git push --quiet
-echo "==> pushed muxa $version to Open330/homebrew-tap"
+echo "==> pushed tend $version to Open330/homebrew-tap"

@@ -1,0 +1,2410 @@
+//! Persistent SSH connection manager for physical Tend Fleet hosts.
+
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
+use std::path::Path;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use tend::collaboration::CollaborationOrigin;
+use tend::config::{FleetCapturePolicy, FleetConfig, FleetConnectPolicy, FleetHostConfig};
+use tend::fleet::{
+    drain_bounded, load_or_create_node_id, read_bounded_line, sanitize_capture_text,
+    sanitize_raw_capture_base64, sanitize_terminal_text, validate_label_value,
+    FleetCapturedWindowPane, FleetCommandEnvelope, FleetCommandReceiver, FleetCommandResult,
+    FleetHostSnapshot, FleetHostState, FleetOperation, FleetRuntime, FleetStore,
+    FleetWindowCapture, HostAccessMode, NodeId, RelayFrame, RelayHello, RelayRequest,
+    RemoteSnapshot, FLEET_BOUNDED_CLAIM_CAPABILITY, FLEET_CAPABILITIES, FLEET_MAX_DIAGNOSTIC_BYTES,
+    FLEET_MAX_FRAME_BYTES, FLEET_PROTOCOL_VERSION, FLEET_SEND_KEYS_CAPABILITY,
+    FLEET_WORKTREE_INVENTORY_CAPABILITY, FLEET_WORK_COMMAND_CAPABILITY, LOCAL_HOST_ALIAS,
+};
+use tend::tmux::SessionInfo;
+use tend::work_control::{self, SshWorkTarget, WorkCommandLimits, WorkCommandSurface};
+use tend::{HostKind, PaneKey, SharedBackend, SharedStore, WindowKey};
+use time::OffsetDateTime;
+use tokio::io::{AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, Command};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, RwLock, Semaphore};
+use uuid::Uuid;
+
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const MAX_PENDING_REQUESTS: usize = 64;
+
+pub(crate) async fn start(
+    cfg: &FleetConfig,
+    local_agents: SharedStore,
+    backends: Vec<SharedBackend>,
+    local_client: tend::ipc::Client,
+    daemon_generation: u64,
+    mailbox_changes: watch::Receiver<u64>,
+    shutdown: broadcast::Receiver<()>,
+) -> (FleetRuntime, tokio::task::JoinHandle<()>) {
+    let store = Arc::new(FleetStore::new());
+    let (runtime, receiver) = FleetRuntime::new(Arc::clone(&store));
+    let local_transitions = local_agents.subscribe();
+    let local_revision = Arc::new(AtomicU64::new(0));
+    let (node_id, identity_error) = local_node_id();
+    let local_snapshot =
+        collect_local_snapshot(&local_agents, &backends, Arc::clone(&local_revision)).await;
+    store
+        .upsert_host(local_host(
+            cfg,
+            node_id.clone(),
+            daemon_generation,
+            local_snapshot,
+            identity_error.clone(),
+        ))
+        .await;
+    for (alias, host) in &cfg.hosts {
+        store.upsert_host(base_host(alias, host, cfg.enabled)).await;
+    }
+    let config = cfg.clone();
+    let handle = tokio::spawn(async move {
+        run_manager(ManagerInput {
+            cfg: config,
+            store,
+            commands: receiver,
+            local: LocalManagerInput {
+                agents: local_agents,
+                backends,
+                client: local_client,
+                mailbox_changes,
+                transitions: local_transitions,
+                revision: local_revision,
+                identity_error,
+                node_id,
+            },
+            shutdown,
+        })
+        .await;
+    });
+    (runtime, handle)
+}
+
+fn base_host(alias: &str, cfg: &FleetHostConfig, fleet_enabled: bool) -> FleetHostSnapshot {
+    FleetHostSnapshot {
+        alias: alias.into(),
+        local: false,
+        ssh_target: cfg.ssh.clone(),
+        labels: cfg.labels.clone(),
+        annotations: cfg.annotations.clone(),
+        mode: cfg.mode,
+        state: if fleet_enabled && cfg.enabled {
+            FleetHostState::Connecting
+        } else {
+            FleetHostState::Disabled
+        },
+        node_id: None,
+        hostname: None,
+        os: None,
+        arch: None,
+        tend_version: None,
+        protocol: None,
+        capabilities: Vec::new(),
+        daemon_generation: None,
+        boot_id: None,
+        latency_ms: None,
+        last_seen_at: None,
+        received_at: None,
+        error: None,
+        remote: None,
+    }
+}
+
+struct ManagerInput {
+    cfg: FleetConfig,
+    store: Arc<FleetStore>,
+    commands: FleetCommandReceiver,
+    local: LocalManagerInput,
+    shutdown: broadcast::Receiver<()>,
+}
+
+struct LocalManagerInput {
+    agents: SharedStore,
+    backends: Vec<SharedBackend>,
+    client: tend::ipc::Client,
+    transitions: broadcast::Receiver<tend::Transition>,
+    mailbox_changes: watch::Receiver<u64>,
+    revision: Arc<AtomicU64>,
+    identity_error: Option<String>,
+    node_id: NodeId,
+}
+
+async fn run_manager(input: ManagerInput) {
+    let ManagerInput {
+        cfg,
+        store,
+        mut commands,
+        local,
+        mut shutdown,
+    } = input;
+    let permits = Arc::new(Semaphore::new(cfg.max_parallel_connects));
+    let node_registry = Arc::new(RwLock::new(BTreeMap::from([(
+        local.node_id,
+        LOCAL_HOST_ALIAS.to_string(),
+    )])));
+    let mut routes = HashMap::new();
+    let mut handles = Vec::new();
+
+    let (local_tx, local_rx) = mpsc::channel(64);
+    routes.insert(LOCAL_HOST_ALIAS.to_string(), local_tx);
+    handles.push(tokio::spawn(
+        LocalTask {
+            fleet: cfg.clone(),
+            store: Arc::clone(&store),
+            agents: local.agents,
+            backends: local.backends,
+            client: local.client,
+            commands: local_rx,
+            transitions: local.transitions,
+            mailbox_changes: local.mailbox_changes,
+            revision: local.revision,
+            identity_error: local.identity_error,
+            shutdown: shutdown.resubscribe(),
+        }
+        .run(),
+    ));
+
+    for (alias, host) in &cfg.hosts {
+        if !cfg.enabled || !host.enabled {
+            continue;
+        }
+        let (tx, rx) = mpsc::channel(64);
+        routes.insert(alias.clone(), tx);
+        let task = HostTask {
+            alias: alias.clone(),
+            config: host.clone(),
+            fleet: cfg.clone(),
+            store: Arc::clone(&store),
+            permits: Arc::clone(&permits),
+            node_registry: Arc::clone(&node_registry),
+            commands: rx,
+            shutdown: shutdown.resubscribe(),
+        };
+        handles.push(tokio::spawn(task.run()));
+    }
+
+    loop {
+        tokio::select! {
+            _ = shutdown.recv() => break,
+            command = commands.recv() => {
+                let Some(command) = command else { break; };
+                if let Some(route) = routes.get(&command.host) {
+                    route_host_command(route, HostCommand::from(command));
+                } else {
+                    let _ = command.reply.send(Err(format!(
+                        "fleet host '{}' is not configured or is disabled",
+                        command.host
+                    )));
+                }
+            }
+        }
+    }
+
+    drop(routes);
+    for handle in handles {
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle).await;
+    }
+}
+
+// Never await one saturated host queue in the shared router: doing so
+// blocks commands for every other host and delays shutdown handling.
+fn route_host_command(route: &mpsc::Sender<HostCommand>, command: HostCommand) {
+    if let Err(error) = route.try_send(command) {
+        let message = match &error {
+            mpsc::error::TrySendError::Full(_) => "fleet host command queue is full; retry later",
+            mpsc::error::TrySendError::Closed(_) => "fleet host command handler is unavailable",
+        };
+        let _ = error.into_inner().reply.send(Err(message.into()));
+    }
+}
+
+fn local_node_id() -> (NodeId, Option<String>) {
+    let Some(path) = tend::paths::default_node_id_file() else {
+        return (
+            NodeId::generate(),
+            Some("no data directory is available; local NodeId is ephemeral".into()),
+        );
+    };
+    match load_or_create_node_id(&path) {
+        Ok(node_id) => (node_id, None),
+        Err(error) => (
+            NodeId::generate(),
+            Some(format!(
+                "could not persist local NodeId at {}: {error}; identity is ephemeral",
+                path.display()
+            )),
+        ),
+    }
+}
+
+fn local_host(
+    cfg: &FleetConfig,
+    node_id: NodeId,
+    daemon_generation: u64,
+    remote: RemoteSnapshot,
+    identity_error: Option<String>,
+) -> FleetHostSnapshot {
+    let hostname = local_hostname();
+    let mut labels = cfg.local.labels.clone();
+    labels.insert("tend.io/local".into(), "true".into());
+    labels.insert("tend.io/transport".into(), "local".into());
+    labels.insert("kubernetes.io/os".into(), std::env::consts::OS.into());
+    labels.insert("kubernetes.io/arch".into(), std::env::consts::ARCH.into());
+    if validate_label_value(&hostname).is_ok() {
+        labels.insert("kubernetes.io/hostname".into(), hostname.clone());
+    }
+    let now = OffsetDateTime::now_utc();
+    FleetHostSnapshot {
+        alias: LOCAL_HOST_ALIAS.into(),
+        local: true,
+        ssh_target: "local://".into(),
+        labels,
+        annotations: cfg.local.annotations.clone(),
+        mode: HostAccessMode::Control,
+        state: if identity_error.is_some() {
+            FleetHostState::Degraded
+        } else {
+            FleetHostState::Online
+        },
+        node_id: Some(node_id),
+        hostname: Some(hostname),
+        os: Some(std::env::consts::OS.into()),
+        arch: Some(std::env::consts::ARCH.into()),
+        tend_version: Some(env!("CARGO_PKG_VERSION").into()),
+        protocol: Some(FLEET_PROTOCOL_VERSION),
+        capabilities: FLEET_CAPABILITIES
+            .iter()
+            .map(|capability| (*capability).to_string())
+            .collect(),
+        daemon_generation: Some(daemon_generation),
+        boot_id: Some(local_boot_id()),
+        latency_ms: Some(0),
+        last_seen_at: Some(remote.observed_at),
+        received_at: Some(now),
+        error: identity_error,
+        remote: Some(remote),
+    }
+}
+
+struct LocalTask {
+    fleet: FleetConfig,
+    store: Arc<FleetStore>,
+    agents: SharedStore,
+    backends: Vec<SharedBackend>,
+    client: tend::ipc::Client,
+    commands: mpsc::Receiver<HostCommand>,
+    transitions: broadcast::Receiver<tend::Transition>,
+    mailbox_changes: watch::Receiver<u64>,
+    revision: Arc<AtomicU64>,
+    identity_error: Option<String>,
+    shutdown: broadcast::Receiver<()>,
+}
+
+impl LocalTask {
+    async fn run(mut self) {
+        let mut refresh = tokio::time::interval(Duration::from_secs(self.fleet.refresh_secs));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut mailbox_open = true;
+        // Reconcile replies persisted before this local observer started.
+        self.mailbox_changes.mark_changed();
+        // The initial snapshot was collected before the manager was exposed.
+        refresh.tick().await;
+        loop {
+            tokio::select! {
+                _ = self.shutdown.recv() => break,
+                _ = refresh.tick() => self.refresh().await,
+                mailbox = self.mailbox_changes.changed(), if mailbox_open => {
+                    if mailbox.is_ok() {
+                        let revision = *self.mailbox_changes.borrow_and_update();
+                        self.store.notify_mailbox(LOCAL_HOST_ALIAS, revision).await;
+                    } else {
+                        mailbox_open = false;
+                    }
+                }
+                transition = self.transitions.recv() => {
+                    match transition {
+                        Ok(transition) => {
+                            let revision = self.revision.fetch_add(1, Ordering::SeqCst) + 1;
+                            self.store.apply_transition(LOCAL_HOST_ALIAS, revision, transition).await;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            self.revision.fetch_add(skipped, Ordering::SeqCst);
+                            self.refresh().await;
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            self.store.mutate_host(LOCAL_HOST_ALIAS, |host| {
+                                host.state = FleetHostState::Degraded;
+                                host.error = Some("local agent transition stream closed".into());
+                            }).await;
+                            break;
+                        }
+                    }
+                }
+                command = self.commands.recv() => {
+                    let Some(command) = command else { break; };
+                    // A `work` child may run for its whole budget; never let
+                    // it stall local refreshes and transition handling.
+                    let Some(command) = self.spawn_work_command(command) else { continue; };
+                    let Some(command) = spawn_worktree_inventory(command) else { continue; };
+                    let result = self.execute(command.operation).await;
+                    let _ = command.reply.send(result);
+                }
+            }
+        }
+    }
+
+    /// Run a `work_command` on this host in its own task, or hand any other
+    /// command back to the caller.
+    fn spawn_work_command(&self, command: HostCommand) -> Option<HostCommand> {
+        let FleetOperation::WorkCommand { args, stdin } = command.operation else {
+            return Some(command);
+        };
+        let socket = self.client.socket().to_path_buf();
+        let reply = command.reply;
+        tokio::spawn(async move {
+            let _ = reply.send(run_local_work_command(args, stdin, &socket).await);
+        });
+        None
+    }
+
+    async fn refresh(&self) {
+        let snapshot =
+            collect_local_snapshot(&self.agents, &self.backends, Arc::clone(&self.revision)).await;
+        let observed = snapshot.observed_at;
+        let identity_error = self.identity_error.clone();
+        let current = self.store.host_snapshot(LOCAL_HOST_ALIAS).await;
+        let changed = current
+            .as_ref()
+            .and_then(|host| host.remote.as_ref())
+            .is_none_or(|remote| remote_payload_changed(remote, &snapshot));
+        let update = |host: &mut FleetHostSnapshot| {
+            host.remote = Some(merge_remote_snapshot(host.remote.take(), snapshot));
+            host.state = if identity_error.is_some() {
+                FleetHostState::Degraded
+            } else {
+                FleetHostState::Online
+            };
+            host.last_seen_at = Some(observed);
+            host.received_at = Some(OffsetDateTime::now_utc());
+            host.error = identity_error;
+        };
+        if changed {
+            self.store.mutate_host(LOCAL_HOST_ALIAS, update).await;
+        } else {
+            self.store
+                .mutate_host_silent(LOCAL_HOST_ALIAS, update)
+                .await;
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // one exhaustive local Fleet operation table
+    async fn execute(&self, operation: FleetOperation) -> Result<FleetCommandResult, String> {
+        match operation {
+            FleetOperation::Connect => Ok(FleetCommandResult::accepted(
+                "local host is always connected",
+            )),
+            FleetOperation::Disconnect => {
+                Err("local host cannot be disconnected from its own tendd".into())
+            }
+            FleetOperation::Refresh => {
+                self.refresh().await;
+                let revision = self.revision.load(Ordering::SeqCst);
+                Ok(FleetCommandResult::accepted(format!(
+                    "refreshed local revision {revision}"
+                )))
+            }
+            FleetOperation::Capture { pane } => {
+                if self.fleet.capture_policy == FleetCapturePolicy::Never {
+                    return Err("fleet capture policy is 'never'".into());
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "capture", 0);
+                local_capture(&self.backends, pane).await
+            }
+            FleetOperation::CaptureWindow { window } => {
+                if self.fleet.capture_policy == FleetCapturePolicy::Never {
+                    return Err("fleet capture policy is 'never'".into());
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "capture_window", 0);
+                local_capture_window(&self.backends, window).await
+            }
+            FleetOperation::SendPrompt { pane, text, submit } => {
+                if text.len() > FLEET_MAX_FRAME_BYTES {
+                    return Err(format!(
+                        "local prompt exceeds {FLEET_MAX_FRAME_BYTES} bytes"
+                    ));
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "send_prompt", text.len());
+                local_send_prompt(&self.backends, pane, text, submit).await
+            }
+            FleetOperation::SendKeys { pane, keys } => {
+                if keys.is_empty() || keys.len() > tend::fleet::FLEET_MAX_KEYS {
+                    return Err(format!(
+                        "send_keys takes 1 to {} keys",
+                        tend::fleet::FLEET_MAX_KEYS
+                    ));
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "send_keys", keys.len());
+                local_send_keys(&self.backends, pane, keys).await
+            }
+            // Runs in its own task; see `spawn_worktree_inventory`.
+            FleetOperation::WorktreeInventory => {
+                Err("worktree inventory runs in its own task".into())
+            }
+            FleetOperation::CollaborationSend { pane, request } => {
+                exact_local_backend(&self.backends, &pane).await?;
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_send", request.body.len());
+                let origin = fleet_collaboration_origin(&pane, true);
+                let target = format!("pane:{}", pane.pane_id);
+                self.client
+                    .collaboration_send(&origin, &target, &request)
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationMailbox {
+                pane,
+                operator_only,
+                if_unchanged,
+            } => {
+                if !operator_only {
+                    exact_local_backend(&self.backends, &pane).await?;
+                }
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_mailbox", 0);
+                self.client
+                    .collaboration_mailbox_snapshot(
+                        &fleet_collaboration_origin(&pane, true),
+                        operator_only,
+                        if_unchanged.as_deref(),
+                    )
+                    .await
+                    .map(FleetCommandResult::collaboration_snapshot)
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationGet { pane, request_id } => {
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_get", 0);
+                self.client
+                    .collaboration_get(&fleet_collaboration_origin(&pane, true), &request_id)
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationClaim { pane } => {
+                exact_local_backend(&self.backends, &pane).await?;
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_claim", 0);
+                self.client
+                    .collaboration_claim_recent_mailbox(&fleet_collaboration_origin(&pane, false))
+                    .await
+                    .map(|incoming| FleetCommandResult::collaboration_mailbox(incoming, Vec::new()))
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationUpdate {
+                pane,
+                request_id,
+                body,
+            } => {
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_update", body.len());
+                self.client
+                    .collaboration_update(
+                        &fleet_collaboration_origin(&pane, true),
+                        &request_id,
+                        &body,
+                    )
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::CollaborationReply {
+                pane,
+                request_id,
+                status,
+                body,
+                report,
+            } => {
+                audit_operation(LOCAL_HOST_ALIAS, "collaboration_reply", body.len());
+                let request = self
+                    .client
+                    .collaboration_get(&fleet_collaboration_origin(&pane, true), &request_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                if !request.to.console {
+                    exact_local_backend(&self.backends, &pane).await?;
+                }
+                self.client
+                    .collaboration_reply_report_view(
+                        &fleet_collaboration_origin(&pane, request.to.console),
+                        &request_id,
+                        status,
+                        &body,
+                        &[],
+                        &[],
+                        report.as_ref(),
+                        tend::collaboration::CollaborationReadView::Full,
+                    )
+                    .await
+                    .map(FleetCommandResult::collaboration_request)
+                    .map_err(|error| error.to_string())
+            }
+            FleetOperation::WorkCommand { .. } => {
+                Err("work commands run in their own task; see spawn_work_command".into())
+            }
+        }
+    }
+}
+
+/// Run an allowlisted `tend work …` argv next to this daemon with the sibling
+/// `tend` binary, pinned to the daemon's own socket.
+async fn run_local_work_command(
+    args: Vec<String>,
+    stdin: Option<String>,
+    socket: &Path,
+) -> Result<FleetCommandResult, String> {
+    work_control::validate_work_command(&args, stdin.as_deref(), WorkCommandSurface::Relay)
+        .map_err(|error| error.to_string())?;
+    audit_operation(
+        LOCAL_HOST_ALIAS,
+        "work_command",
+        stdin.as_ref().map_or(0, String::len),
+    );
+    let limits = WorkCommandLimits::for_args(&args);
+    work_control::execute_work_command(
+        &work_control::resolve_tend_binary(),
+        &args,
+        stdin.as_deref(),
+        Some(socket),
+        limits,
+    )
+    .await
+    .map(FleetCommandResult::command)
+    .map_err(|error| error.to_string())
+}
+
+/// One worktree scan at a time on this host.
+static WORKTREE_SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Runs the local worktree inventory in its own task, so a slow disk never
+/// stalls refreshes, transitions or other commands, or hands any other
+/// command back. A second request while one runs is refused.
+fn spawn_worktree_inventory(command: HostCommand) -> Option<HostCommand> {
+    if !matches!(command.operation, FleetOperation::WorktreeInventory) {
+        return Some(command);
+    }
+    let reply = command.reply;
+    let Ok(permit) = WORKTREE_SCAN.try_acquire() else {
+        let _ = reply.send(Err(
+            "a worktree check is already running on this host".into()
+        ));
+        return None;
+    };
+    audit_operation(LOCAL_HOST_ALIAS, "worktree_inventory", 0);
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(|| {
+            tend::worktree_inventory::inventory(
+                false,
+                Some(tend::worktree_inventory::FLEET_MAX_ROWS),
+            )
+        })
+        .await
+        .map(FleetCommandResult::worktrees)
+        .map_err(|error| format!("worktree inventory failed: {error}"));
+        drop(permit);
+        let _ = reply.send(result);
+    });
+    None
+}
+
+/// The worktree inventory goes only to a relay that says it answers it; an
+/// older one would drop the request and leave the caller waiting.
+fn worktree_inventory_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::WorktreeInventory) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_WORKTREE_INVENTORY_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot list its worktrees; upgrade tend on that host"
+    ))
+}
+
+/// Navigation keys reach only a relay that says it takes them; an older one
+/// would drop the request and leave the caller waiting.
+fn send_keys_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    if !matches!(operation, FleetOperation::SendKeys { .. }) {
+        return None;
+    }
+    if hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == FLEET_SEND_KEYS_CAPABILITY)
+    {
+        return None;
+    }
+    Some(format!(
+        "host '{alias}' cannot take navigation keys; upgrade tend on that host"
+    ))
+}
+
+fn relay_supports_work_command(capabilities: &[String]) -> bool {
+    capabilities
+        .iter()
+        .any(|capability| capability == FLEET_WORK_COMMAND_CAPABILITY)
+}
+
+/// Ignore observation timestamps/revision churn when deciding whether a
+/// periodic authoritative scan needs to invalidate native clients.
+fn remote_payload_changed(left: &RemoteSnapshot, right: &RemoteSnapshot) -> bool {
+    let left = serde_json::to_vec(&(&left.agents, &left.panes, &left.sessions, &left.backends));
+    let right = serde_json::to_vec(&(
+        &right.agents,
+        &right.panes,
+        &right.sessions,
+        &right.backends,
+    ));
+    match (left, right) {
+        (Ok(left), Ok(right)) => left != right,
+        _ => true,
+    }
+}
+
+fn fleet_collaboration_origin(pane: &PaneKey, console: bool) -> CollaborationOrigin {
+    let endpoint = &pane.window.session.endpoint;
+    CollaborationOrigin {
+        exact_session: false,
+        pane: pane.pane_id.clone(),
+        socket: matches!(endpoint.host, HostKind::Tmux | HostKind::Rmux)
+            .then(|| endpoint.socket.clone()),
+        console,
+        agent_session_id: None,
+    }
+}
+
+async fn collect_local_snapshot(
+    agents: &SharedStore,
+    backends: &[SharedBackend],
+    revision: Arc<AtomicU64>,
+) -> RemoteSnapshot {
+    // Pin before scans so transitions received while a backend is enumerating
+    // have a newer revision and are overlaid by `merge_remote_snapshot`.
+    let snapshot_revision = revision.load(Ordering::SeqCst);
+    let pane_tasks = backends
+        .iter()
+        .map(|backend| {
+            let backend = backend.clone();
+            tokio::task::spawn_blocking(move || backend.list_panes())
+        })
+        .collect::<Vec<_>>();
+    let session_tasks = backends
+        .iter()
+        .map(|backend| {
+            let kind = backend.kind();
+            tokio::task::spawn_blocking(move || local_sessions_for_backend(kind))
+        })
+        .collect::<Vec<_>>();
+    let agents = agents.snapshot().await;
+    let mut panes = Vec::new();
+    for task in pane_tasks {
+        match task.await {
+            Ok(observed) => panes.extend(observed),
+            Err(error) => tracing::warn!(%error, "local Fleet pane scan panicked"),
+        }
+    }
+    let mut sessions = Vec::new();
+    for task in session_tasks {
+        match task.await {
+            Ok(observed) => sessions.extend(observed),
+            Err(error) => tracing::warn!(%error, "local Fleet session scan panicked"),
+        }
+    }
+    RemoteSnapshot {
+        revision: snapshot_revision,
+        observed_at: OffsetDateTime::now_utc(),
+        agents,
+        panes,
+        sessions,
+        backends: local_backend_info(backends),
+    }
+}
+
+fn local_sessions_for_backend(kind: HostKind) -> Vec<SessionInfo> {
+    match kind {
+        HostKind::Tmux => tend::tmux::list_sessions().unwrap_or_default(),
+        HostKind::Herdr => {
+            let socket = tend::backend::herdr::default_socket_path();
+            tend::backend::herdr::herdr_list_workspaces(&socket)
+                .into_iter()
+                .map(|workspace| SessionInfo {
+                    group: None,
+                    session_id: workspace.id,
+                    name: workspace.label,
+                    attached_clients: 0,
+                })
+                .collect()
+        }
+        HostKind::Cmux | HostKind::Rmux | HostKind::Zellij => Vec::new(),
+    }
+}
+
+fn local_backend_info(backends: &[SharedBackend]) -> Vec<tend::fleet::FleetBackendInfo> {
+    backends
+        .iter()
+        .map(|backend| tend::fleet::FleetBackendInfo::new(backend.kind(), backend.caps()))
+        .collect()
+}
+
+async fn exact_local_backend(
+    backends: &[SharedBackend],
+    key: &PaneKey,
+) -> Result<SharedBackend, String> {
+    let backend = backends
+        .iter()
+        .find(|backend| backend.kind() == key.window.session.endpoint.host)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "{} backend is unavailable",
+                key.window.session.endpoint.host
+            )
+        })?;
+    let scanner = backend.clone();
+    let panes = tokio::task::spawn_blocking(move || scanner.list_panes())
+        .await
+        .map_err(|error| format!("local pane scan panicked: {error}"))?;
+    if !panes
+        .iter()
+        .any(|pane| PaneKey::from_pane(backend.kind(), pane) == *key)
+    {
+        return Err("exact local pane target is stale or no longer exists".into());
+    }
+    Ok(backend)
+}
+
+async fn local_capture(
+    backends: &[SharedBackend],
+    pane: PaneKey,
+) -> Result<FleetCommandResult, String> {
+    let backend = exact_local_backend(backends, &pane).await?;
+    if !backend.caps().capture_pane {
+        return Err(format!(
+            "{} backend does not support pane capture",
+            backend.kind()
+        ));
+    }
+    let socket = pane.window.session.endpoint.socket;
+    let pane_id = pane.pane_id;
+    let capture =
+        tokio::task::spawn_blocking(move || backend.capture_pane_on(Some(&socket), &pane_id))
+            .await
+            .map_err(|error| format!("local capture task panicked: {error}"))?;
+    Ok(FleetCommandResult::capture_with_raw(capture))
+}
+
+async fn local_capture_window(
+    backends: &[SharedBackend],
+    window: WindowKey,
+) -> Result<FleetCommandResult, String> {
+    if window.session.endpoint.host != HostKind::Tmux {
+        return Err("window geometry is currently available only for tmux backends".into());
+    }
+    let backend = backends
+        .iter()
+        .find(|backend| backend.kind() == HostKind::Tmux)
+        .cloned()
+        .ok_or_else(|| "tmux backend is unavailable".to_string())?;
+    let verify_backend = backend.clone();
+    let verify_window = window.clone();
+    let exists = tokio::task::spawn_blocking(move || {
+        verify_backend
+            .list_panes()
+            .iter()
+            .any(|pane| PaneKey::from_pane(verify_backend.kind(), pane).window == verify_window)
+    })
+    .await
+    .map_err(|error| format!("local window verification panicked: {error}"))?;
+    if !exists {
+        return Err("exact local window target is stale or no longer exists".into());
+    }
+    let capture = tokio::task::spawn_blocking(move || {
+        let socket = window.session.endpoint.socket.clone();
+        let (geometries, zoomed) =
+            tend::tmux::layout::window_panes_on(Some(&socket), &window.window_id);
+        let visible = geometries
+            .into_iter()
+            .filter(|geometry| !zoomed || geometry.active)
+            .collect::<Vec<_>>();
+        let mut panes = Vec::with_capacity(visible.len());
+        for batch in visible.chunks(8) {
+            panes.extend(std::thread::scope(|scope| {
+                batch
+                    .iter()
+                    .map(|geometry| {
+                        let backend = backend.clone();
+                        let socket = socket.clone();
+                        let geometry = geometry.clone();
+                        scope.spawn(move || {
+                            let text = backend
+                                .capture_pane_on(Some(&socket), &geometry.pane_id)
+                                .map(sanitize_capture_text);
+                            FleetCapturedWindowPane { geometry, text }
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .filter_map(|handle| handle.join().ok())
+                    .collect::<Vec<_>>()
+            }));
+        }
+        FleetWindowCapture {
+            window,
+            panes,
+            zoomed,
+            observed_at: OffsetDateTime::now_utc(),
+        }
+    })
+    .await
+    .map_err(|error| format!("local window capture panicked: {error}"))?;
+    let result = FleetCommandResult::window_capture(capture);
+    let encoded = serde_json::to_vec(&result)
+        .map_err(|error| format!("encoding local window capture: {error}"))?;
+    if encoded.len() > FLEET_MAX_FRAME_BYTES {
+        return Err(format!(
+            "local window capture exceeds {FLEET_MAX_FRAME_BYTES} bytes"
+        ));
+    }
+    Ok(result)
+}
+
+async fn local_send_prompt(
+    backends: &[SharedBackend],
+    pane: PaneKey,
+    text: String,
+    submit: bool,
+) -> Result<FleetCommandResult, String> {
+    let backend = exact_local_backend(backends, &pane).await?;
+    if !backend.caps().send_text {
+        return Err(format!(
+            "{} backend does not support text injection",
+            backend.kind()
+        ));
+    }
+    let socket = pane.window.session.endpoint.socket;
+    let pane_id = pane.pane_id;
+    let outcome = tokio::task::spawn_blocking(move || {
+        if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
+            return None;
+        }
+        let submitted = if submit {
+            std::thread::sleep(tend::backend::prompt_submit_grace(&pane_id));
+            backend.send_text_on(Some(&socket), &pane_id, "\r")
+        } else {
+            false
+        };
+        Some(tend::ipc::SendPromptOutcome {
+            sent: true,
+            submitted,
+            submission_confirmed: None,
+        })
+    })
+    .await
+    .map_err(|error| format!("local send task panicked: {error}"))?
+    .ok_or_else(|| "backend refused text injection".to_string())?;
+    Ok(FleetCommandResult::sent(outcome))
+}
+
+async fn local_send_keys(
+    backends: &[SharedBackend],
+    pane: PaneKey,
+    keys: Vec<tend::fleet::FleetKey>,
+) -> Result<FleetCommandResult, String> {
+    let backend = exact_local_backend(backends, &pane).await?;
+    if !backend.caps().send_text {
+        return Err(format!(
+            "{} backend does not support key input",
+            backend.kind()
+        ));
+    }
+    let socket = pane.window.session.endpoint.socket;
+    let pane_id = pane.pane_id;
+    let pressed = tokio::task::spawn_blocking(move || {
+        tend::fleet::press_keys(backend.as_ref(), Some(&socket), &pane_id, &keys)
+    })
+    .await
+    .map_err(|error| format!("local key task panicked: {error}"))?;
+    if !pressed {
+        return Err("backend refused key input".to_string());
+    }
+    Ok(FleetCommandResult::sent(tend::ipc::SendPromptOutcome {
+        sent: true,
+        submitted: false,
+        submission_confirmed: None,
+    }))
+}
+
+fn local_hostname() -> String {
+    tend::fleet::local_hostname().unwrap_or_else(|| "unknown".into())
+}
+
+fn local_boot_id() -> String {
+    tend::fleet::local_boot_id().unwrap_or_else(|| format!("process-{}", std::process::id()))
+}
+
+struct HostCommand {
+    operation: FleetOperation,
+    reply: oneshot::Sender<Result<FleetCommandResult, String>>,
+}
+
+impl From<FleetCommandEnvelope> for HostCommand {
+    fn from(value: FleetCommandEnvelope) -> Self {
+        Self {
+            operation: value.operation,
+            reply: value.reply,
+        }
+    }
+}
+
+struct HostTask {
+    alias: String,
+    config: FleetHostConfig,
+    fleet: FleetConfig,
+    store: Arc<FleetStore>,
+    permits: Arc<Semaphore>,
+    node_registry: Arc<RwLock<BTreeMap<NodeId, String>>>,
+    commands: mpsc::Receiver<HostCommand>,
+    shutdown: broadcast::Receiver<()>,
+}
+
+enum PendingReply {
+    Command(oneshot::Sender<Result<FleetCommandResult, String>>),
+    Refresh(oneshot::Sender<Result<FleetCommandResult, String>>),
+}
+
+struct PendingRequest {
+    reply: PendingReply,
+    deadline: Instant,
+}
+
+impl PendingRequest {
+    fn new(reply: PendingReply, timeout: Duration) -> Self {
+        Self {
+            reply,
+            deadline: Instant::now() + timeout,
+        }
+    }
+}
+
+impl HostTask {
+    async fn run(mut self) {
+        let mut desired = self.config.connect == FleetConnectPolicy::Auto;
+        let mut backoff = Duration::from_secs(1);
+        loop {
+            if !desired {
+                self.store
+                    .mutate_host(&self.alias, |host| {
+                        host.state = FleetHostState::Offline;
+                        host.error = Some("connection is on demand".into());
+                    })
+                    .await;
+                tokio::select! {
+                    _ = self.shutdown.recv() => break,
+                    command = self.commands.recv() => {
+                        let Some(command) = command else { break; };
+                        // No relay is up; a `work` argv still reaches the host
+                        // over a one-shot OpenSSH command.
+                        let Some(command) = self.intercept_work_command(command, None) else { continue; };
+                        match command.operation {
+                            FleetOperation::Connect => {
+                                desired = true;
+                                let _ = command.reply.send(Ok(FleetCommandResult::accepted("connecting")));
+                            }
+                            _ => {
+                                let _ = command.reply.send(Err(format!(
+                                    "host '{}' is disconnected; run `tend fleet connect {}` first",
+                                    self.alias, self.alias
+                                )));
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
+
+            self.store
+                .mutate_host(&self.alias, |host| {
+                    host.state = FleetHostState::Connecting;
+                    host.error = None;
+                })
+                .await;
+
+            let permit = tokio::select! {
+                _ = self.shutdown.recv() => break,
+                permit = Arc::clone(&self.permits).acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+            };
+            let connection = self.connect().await;
+            drop(permit);
+
+            match connection {
+                Ok(connected) => {
+                    backoff = Duration::from_secs(1);
+                    let result = self.serve_connection(connected, &mut desired).await;
+                    if let Err(error) = result {
+                        self.record_disconnect(&error).await;
+                    }
+                }
+                Err(error) => self.record_disconnect(&error).await,
+            }
+
+            if !desired {
+                continue;
+            }
+            let delay = backoff + deterministic_jitter(&self.alias, backoff);
+            tokio::select! {
+                _ = self.shutdown.recv() => break,
+                () = tokio::time::sleep(delay) => {},
+                command = self.commands.recv() => {
+                    let Some(command) = command else { break; };
+                    let Some(command) = self.intercept_work_command(command, None) else { continue; };
+                    match command.operation {
+                        FleetOperation::Disconnect => {
+                            desired = false;
+                            let _ = command.reply.send(Ok(FleetCommandResult::accepted("disconnected")));
+                        }
+                        FleetOperation::Connect | FleetOperation::Refresh => {
+                            let _ = command.reply.send(Ok(FleetCommandResult::accepted("reconnecting")));
+                        }
+                        _ => {
+                            let _ = command.reply.send(Err("host is offline; command was not sent".into()));
+                        }
+                    }
+                }
+            }
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+    }
+
+    async fn connect(&self) -> Result<Connected, String> {
+        let started = Instant::now();
+        let mut command = Command::new("ssh");
+        command
+            .kill_on_drop(true)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .args([
+                "-T",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ClearAllForwardings=yes",
+                "-o",
+                &format!("ConnectTimeout={}", self.fleet.connect_timeout_secs),
+                "--",
+                &self.config.ssh,
+                &self.config.tend_path,
+            ]);
+        if let Some(socket) = &self.config.remote_socket {
+            command.arg("--socket").arg(socket);
+        }
+        command.args(["relay", "--stdio"]);
+
+        let mut child = command
+            .spawn()
+            .map_err(|error| format!("could not start OpenSSH: {error}"))?;
+        let stdin = child.stdin.take().ok_or("OpenSSH stdin is unavailable")?;
+        let stdout = child.stdout.take().ok_or("OpenSSH stdout is unavailable")?;
+        let stderr = child.stderr.take().ok_or("OpenSSH stderr is unavailable")?;
+        let stderr_task = tokio::spawn(async move {
+            let mut stderr = stderr;
+            let bytes = drain_bounded(&mut stderr, FLEET_MAX_DIAGNOSTIC_BYTES)
+                .await
+                .unwrap_or_default();
+            sanitize_remote_error(&String::from_utf8_lossy(&bytes))
+        });
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        let read = tokio::time::timeout(
+            Duration::from_secs(self.fleet.connect_timeout_secs),
+            read_relay_line(&mut reader, &mut line),
+        )
+        .await
+        .map_err(|_| "timed out waiting for the remote relay handshake".to_string())?
+        .map_err(|error| error.to_string())?;
+        if read == 0 {
+            let _ = child.wait().await;
+            let stderr = stderr_task.await.unwrap_or_default();
+            return Err(if stderr.is_empty() {
+                "remote relay exited before its handshake".into()
+            } else {
+                stderr
+            });
+        }
+        let frame: RelayFrame = serde_json::from_str(line.trim())
+            .map_err(|error| format!("invalid remote relay handshake: {error}"))?;
+        let RelayFrame::Hello { hello } = frame else {
+            return Err("remote relay did not send hello first".into());
+        };
+        if hello.fleet_protocol < FLEET_PROTOCOL_VERSION
+            || hello.min_fleet_protocol > FLEET_PROTOCOL_VERSION
+        {
+            return Err(format!(
+                "fleet protocol mismatch: local={FLEET_PROTOCOL_VERSION}, remote=[{},{}]",
+                hello.min_fleet_protocol, hello.fleet_protocol
+            ));
+        }
+        {
+            let mut registry = self.node_registry.write().await;
+            if let Some(other) = registry.get(&hello.node_id) {
+                if other != &self.alias {
+                    return Err(format!(
+                        "node id {} is already connected as host '{other}'",
+                        hello.node_id
+                    ));
+                }
+            }
+            registry.insert(hello.node_id.clone(), self.alias.clone());
+        }
+        let latency_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.apply_hello(&hello, latency_ms).await;
+        Ok(Connected {
+            child,
+            stdin,
+            reader,
+            stderr_task,
+            hello,
+            last_frame: Instant::now(),
+        })
+    }
+
+    /// Handle a `work_command` before the relay sees it: refuse it for an
+    /// observe-only host, let a relay that advertises the operation carry it,
+    /// or run it over a one-shot OpenSSH command when the relay predates the
+    /// operation or is not connected. Returns the command to the caller when
+    /// it is any other operation, or when the relay should carry it.
+    fn intercept_work_command(
+        &self,
+        command: HostCommand,
+        relay_capabilities: Option<&[String]>,
+    ) -> Option<HostCommand> {
+        let FleetOperation::WorkCommand { args, stdin } = command.operation else {
+            return Some(command);
+        };
+        let reply = command.reply;
+        if let Err(error) = self.authorize_work_command(&args, stdin.as_deref()) {
+            let _ = reply.send(Err(error));
+            return None;
+        }
+        if relay_capabilities.is_some_and(relay_supports_work_command) {
+            return Some(HostCommand {
+                operation: FleetOperation::WorkCommand { args, stdin },
+                reply,
+            });
+        }
+        self.spawn_ssh_work_command(args, stdin, reply);
+        None
+    }
+
+    fn authorize_work_command(&self, args: &[String], stdin: Option<&str>) -> Result<(), String> {
+        work_control::validate_work_command(args, stdin, WorkCommandSurface::Relay)
+            .map_err(|error| error.to_string())?;
+        work_control::authorize_work_command(&self.alias, self.config.mode, args)
+            .map_err(|error| error.to_string())
+    }
+
+    /// Fallback transport: `ssh … <tend_path> [--socket …] 'work' …` with
+    /// stdin forwarded, for a host whose `tend` predates the relay operation.
+    fn spawn_ssh_work_command(
+        &self,
+        args: Vec<String>,
+        stdin: Option<String>,
+        reply: oneshot::Sender<Result<FleetCommandResult, String>>,
+    ) {
+        audit_operation(
+            &self.alias,
+            "work_command_ssh",
+            stdin.as_ref().map_or(0, String::len),
+        );
+        let target = SshWorkTarget {
+            ssh: self.config.ssh.clone(),
+            tend_path: self.config.tend_path.clone(),
+            remote_socket: self.config.remote_socket.clone(),
+            connect_timeout: Some(Duration::from_secs(self.fleet.connect_timeout_secs)),
+        };
+        let limits = WorkCommandLimits::for_args(&args);
+        tokio::spawn(async move {
+            let result =
+                work_control::execute_ssh_work_command(&target, &args, stdin.as_deref(), limits)
+                    .await
+                    .map(|output| sanitize_command_result(FleetCommandResult::command(output)))
+                    .map_err(|error| sanitize_remote_error(&error.to_string()));
+            let _ = reply.send(result);
+        });
+    }
+
+    async fn apply_hello(&self, hello: &RelayHello, latency_ms: u64) {
+        self.store
+            .mutate_host(&self.alias, |host| {
+                host.node_id = Some(hello.node_id.clone());
+                host.hostname = Some(hello.hostname.clone());
+                host.os = Some(hello.os.clone());
+                host.arch = Some(hello.arch.clone());
+                host.tend_version = Some(hello.tend_version.clone());
+                host.protocol = Some(hello.fleet_protocol);
+                host.capabilities.clone_from(&hello.capabilities);
+                host.daemon_generation = hello.daemon_generation;
+                host.boot_id = Some(hello.boot_id.clone());
+                host.latency_ms = Some(latency_ms);
+                host.last_seen_at = Some(hello.server_time);
+                host.received_at = Some(OffsetDateTime::now_utc());
+                host.error = None;
+                // Relay revisions are scoped to one SSH/relay stream and
+                // restart from zero after reconnect. Drop the stale revision
+                // here so a new revision 1 cannot be mistaken for an old
+                // duplicate. Offline state retained the snapshot until this
+                // authenticated hello completed.
+                host.remote = Some(tend::fleet::RemoteSnapshot {
+                    revision: 0,
+                    observed_at: hello.server_time,
+                    agents: Vec::new(),
+                    panes: Vec::new(),
+                    sessions: Vec::new(),
+                    backends: hello.backends.clone(),
+                });
+            })
+            .await;
+    }
+
+    #[allow(clippy::too_many_lines)] // connection loop owns ordering, deadlines, and pending replies
+    async fn serve_connection(
+        &mut self,
+        mut connected: Connected,
+        desired: &mut bool,
+    ) -> Result<(), String> {
+        let mut pending = HashMap::<String, PendingRequest>::new();
+        if let Err(error) = send_request(
+            &mut connected.stdin,
+            &RelayRequest::Snapshot {
+                request_id: request_id(),
+            },
+        )
+        .await
+        {
+            let mut registry = self.node_registry.write().await;
+            if registry.get(&connected.hello.node_id) == Some(&self.alias) {
+                registry.remove(&connected.hello.node_id);
+            }
+            drop(registry);
+            let _ = connected.child.kill().await;
+            let _ = connected.child.wait().await;
+            let stderr = connected.stderr_task.await.unwrap_or_default();
+            return Err(if stderr.is_empty() {
+                error
+            } else {
+                format!("{error}: {stderr}")
+            });
+        }
+        let mut refresh = tokio::time::interval(Duration::from_secs(self.fleet.refresh_secs));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        refresh.tick().await;
+        let mut keepalive = tokio::time::interval(Duration::from_secs(self.fleet.keepalive_secs));
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        keepalive.tick().await;
+        let mut health = tokio::time::interval(Duration::from_secs(1));
+        health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut line = String::new();
+
+        let outcome: Result<(), String> = loop {
+            line.clear();
+            tokio::select! {
+                _ = self.shutdown.recv() => {
+                    *desired = false;
+                    break Ok(());
+                }
+                command = self.commands.recv() => {
+                    let Some(command) = command else {
+                        *desired = false;
+                        break Ok(());
+                    };
+                    let Some(command) = self.intercept_work_command(
+                        command,
+                        Some(&connected.hello.capabilities),
+                    ) else {
+                        continue;
+                    };
+                    if let FleetOperation::Disconnect = command.operation {
+                        *desired = false;
+                        let _ = command.reply.send(Ok(FleetCommandResult::accepted("disconnected")));
+                        break Ok(());
+                    }
+                    if let FleetOperation::Connect = command.operation {
+                        let _ = command.reply.send(Ok(FleetCommandResult::accepted("already connected")));
+                        continue;
+                    }
+                    if matches!(
+                        command.operation,
+                        FleetOperation::SendPrompt { .. }
+                            | FleetOperation::SendKeys { .. }
+                            | FleetOperation::CollaborationSend { .. }
+                            | FleetOperation::CollaborationGet { .. }
+                            | FleetOperation::CollaborationClaim { .. }
+                            | FleetOperation::CollaborationReply { .. }
+                            | FleetOperation::CollaborationUpdate { .. }
+                    )
+                        && self.config.mode != HostAccessMode::Control
+                    {
+                        let _ = command.reply.send(Err(format!(
+                            "host '{}' is observe-only; set mode = 'control' to perform control actions",
+                            self.alias
+                        )));
+                        continue;
+                    }
+                    if matches!(
+                        command.operation,
+                        FleetOperation::CollaborationSend { .. }
+                            | FleetOperation::CollaborationMailbox { .. }
+                            | FleetOperation::CollaborationGet { .. }
+                            | FleetOperation::CollaborationClaim { .. }
+                            | FleetOperation::CollaborationReply { .. }
+                            | FleetOperation::CollaborationUpdate { .. }
+                    ) && !connected.hello.capabilities.iter().any(|capability| capability == "collaboration")
+                    {
+                        let _ = command.reply.send(Err(format!(
+                            "host '{}' does not support Fleet collaboration; upgrade tend on that host",
+                            self.alias
+                        )));
+                        continue;
+                    }
+                    if let Some(refusal) =
+                        send_keys_refusal(&self.alias, &connected.hello, &command.operation)
+                            .or_else(|| {
+                                worktree_inventory_refusal(
+                                    &self.alias,
+                                    &connected.hello,
+                                    &command.operation,
+                                )
+                            })
+                    {
+                        let _ = command.reply.send(Err(refusal));
+                        continue;
+                    }
+                    if let Some(refusal) =
+                        unbounded_claim_refusal(&self.alias, &connected.hello, &command.operation)
+                    {
+                        let _ = command.reply.send(Err(refusal));
+                        continue;
+                    }
+                    if command.operation.requires_task_contract() && !connected.hello.capabilities.iter().any(|c|c==tend::collaboration::TASK_CONTRACT_CAPABILITY) {
+                        let _=command.reply.send(Err(format!("host '{}' does not support task contracts; upgrade tend",self.alias)));
+                        continue;
+                    }
+                    if matches!(command.operation, FleetOperation::CollaborationUpdate { .. })
+                        && !connected.hello.capabilities.iter().any(|c| c == "collaboration_update") {
+                        let _ = command.reply.send(Err(format!("host '{}' does not support request updates; upgrade tend", self.alias)));
+                        continue;
+                    }
+                    if matches!(command.operation, FleetOperation::CollaborationGet { .. })
+                        && !connected
+                            .hello
+                            .capabilities
+                            .iter()
+                            .any(|capability| capability == "collaboration_get")
+                    {
+                        let _ = command.reply.send(Err(format!(
+                            "host '{}' does not support exact Fleet collaboration replies; upgrade tend on that host",
+                            self.alias
+                        )));
+                        continue;
+                    }
+                    if matches!(
+                        command.operation,
+                        FleetOperation::Capture { .. } | FleetOperation::CaptureWindow { .. }
+                    )
+                        && self.fleet.capture_policy == FleetCapturePolicy::Never
+                    {
+                        let _ = command.reply.send(Err("fleet capture_policy is 'never'".into()));
+                        continue;
+                    }
+                    if pending.len() >= MAX_PENDING_REQUESTS {
+                        let _ = command.reply.send(Err(format!(
+                            "host '{}' already has {MAX_PENDING_REQUESTS} commands awaiting acknowledgement",
+                            self.alias
+                        )));
+                        continue;
+                    }
+                    let id = request_id();
+                    let command_timeout = Duration::from_secs(self.fleet.command_timeout_secs);
+                    let request = match command.operation {
+                        FleetOperation::Refresh => {
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Refresh(command.reply), command_timeout),
+                            );
+                            RelayRequest::Snapshot { request_id: id }
+                        }
+                        FleetOperation::Capture { pane } => {
+                            audit_operation(&self.alias, "capture", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::Capture { request_id: id, pane }
+                        }
+                        FleetOperation::CaptureWindow { window } => {
+                            audit_operation(&self.alias, "capture_window", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CaptureWindow { request_id: id, window }
+                        }
+                        FleetOperation::SendPrompt { pane, text, submit } => {
+                            audit_operation(&self.alias, "send_prompt", text.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::SendPrompt { request_id: id, pane, text, submit }
+                        }
+                        FleetOperation::SendKeys { pane, keys } => {
+                            audit_operation(&self.alias, "send_keys", keys.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::SendKeys { request_id: id, pane, keys }
+                        }
+                        FleetOperation::WorktreeInventory => {
+                            audit_operation(&self.alias, "worktree_inventory", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::WorktreeInventory { request_id: id }
+                        }
+                        FleetOperation::CollaborationSend { pane, request } => {
+                            audit_operation(&self.alias, "collaboration_send", request.body.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            if request.task_contract.is_some() || request.supersedes_request_id.is_some() { RelayRequest::CollaborationSendContract {request_id:id,pane,request} } else { RelayRequest::CollaborationSend { request_id: id, pane, request } }
+                        }
+                        FleetOperation::CollaborationMailbox { pane, operator_only, if_unchanged } => {
+                            audit_operation(&self.alias, "collaboration_mailbox", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationMailbox { request_id: id, pane, operator_only, if_unchanged }
+                        }
+                        FleetOperation::CollaborationGet { pane, request_id } => {
+                            audit_operation(&self.alias, "collaboration_get", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationGet {
+                                request_id: id,
+                                pane,
+                                collaboration_request_id: request_id,
+                            }
+                        }
+                        FleetOperation::CollaborationClaim { pane } => {
+                            audit_operation(&self.alias, "collaboration_claim", 0);
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            RelayRequest::CollaborationClaim { request_id: id, pane }
+                        }
+                        FleetOperation::CollaborationUpdate { pane, request_id, body } => {
+                            audit_operation(&self.alias, "collaboration_update", body.len());
+                            pending.insert(id.clone(), PendingRequest::new(PendingReply::Command(command.reply), command_timeout));
+                            RelayRequest::CollaborationUpdate { request_id: id, pane, collaboration_request_id: request_id, body }
+                        }
+                        FleetOperation::CollaborationReply { pane, request_id, status, body, report } => {
+                            audit_operation(&self.alias, "collaboration_reply", body.len());
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
+                            );
+                            if report.is_some() {
+                                RelayRequest::CollaborationReplyContract {request_id:id,pane,collaboration_request_id:request_id,status,body,report}
+                            } else {
+                                RelayRequest::CollaborationReply {request_id:id,pane,collaboration_request_id:request_id,status,body,report}
+                            }
+                        }
+                        FleetOperation::WorkCommand { args, stdin } => {
+                            audit_operation(&self.alias, "work_command", stdin.as_ref().map_or(0, String::len));
+                            // The remote child owns its own budget; the relay
+                            // round trip only adds the usual command slack.
+                            let deadline = WorkCommandLimits::for_args(&args).timeout + command_timeout;
+                            pending.insert(
+                                id.clone(),
+                                PendingRequest::new(PendingReply::Command(command.reply), deadline),
+                            );
+                            RelayRequest::WorkCommand { request_id: id, args, stdin }
+                        }
+                        FleetOperation::Connect | FleetOperation::Disconnect => unreachable!(),
+                    };
+                    if let Err(error) = send_request(&mut connected.stdin, &request).await {
+                        if let Some(reply) = pending.remove(request.request_id()) {
+                            fail_pending(reply.reply, error.clone());
+                        }
+                        break Err(error);
+                    }
+                }
+                _ = refresh.tick() => {
+                    if let Err(error) = send_request(
+                        &mut connected.stdin,
+                        &RelayRequest::Snapshot { request_id: request_id() },
+                    ).await {
+                        break Err(error);
+                    }
+                }
+                _ = keepalive.tick() => {
+                    if let Err(error) = send_request(
+                        &mut connected.stdin,
+                        &RelayRequest::Ping { request_id: request_id() },
+                    ).await {
+                        break Err(error);
+                    }
+                }
+                _ = health.tick() => {
+                    expire_pending(
+                        &mut pending,
+                        Instant::now(),
+                        self.fleet.command_timeout_secs,
+                    );
+                    if connected.last_frame.elapsed() > Duration::from_secs(self.fleet.offline_after_secs) {
+                        break Err(format!(
+                            "no relay frame received for {} seconds",
+                            self.fleet.offline_after_secs
+                        ));
+                    }
+                    match connected.child.try_wait() {
+                        Ok(Some(status)) => break Err(format!("OpenSSH exited with {status}")),
+                        Ok(None) => {}
+                        Err(error) => break Err(error.to_string()),
+                    }
+                }
+                read = read_relay_line(&mut connected.reader, &mut line) => {
+                    let read = match read {
+                        Ok(read) => read,
+                        Err(error) => break Err(error.to_string()),
+                    };
+                    if read == 0 {
+                        break Err("SSH relay closed its output".into());
+                    }
+                    connected.last_frame = Instant::now();
+                    let frame: RelayFrame = match serde_json::from_str(line.trim()) {
+                        Ok(frame) => frame,
+                        Err(error) => break Err(format!("invalid relay frame: {error}")),
+                    };
+                    if let Err(error) = self.handle_frame(frame, &mut connected, &mut pending).await {
+                        break Err(error);
+                    }
+                }
+            }
+        };
+
+        for (_, request) in pending {
+            fail_pending(
+                request.reply,
+                "SSH connection closed before command acknowledgement".into(),
+            );
+        }
+        let mut registry = self.node_registry.write().await;
+        if registry.get(&connected.hello.node_id) == Some(&self.alias) {
+            registry.remove(&connected.hello.node_id);
+        }
+        drop(registry);
+        let _ = connected.child.kill().await;
+        let _ = connected.child.wait().await;
+        let stderr = connected.stderr_task.await.unwrap_or_default();
+        if !*desired {
+            self.store
+                .mutate_host(&self.alias, |host| {
+                    host.state = FleetHostState::Offline;
+                    host.error = Some("disconnected by operator".into());
+                })
+                .await;
+            return Ok(());
+        }
+        match outcome {
+            Ok(()) if stderr.is_empty() => Err("SSH relay disconnected".into()),
+            Ok(()) => Err(stderr),
+            Err(error) if stderr.is_empty() => Err(error),
+            Err(error) => Err(format!("{error}: {stderr}")),
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // exhaustive wire-frame state transition table
+    async fn handle_frame(
+        &self,
+        frame: RelayFrame,
+        connected: &mut Connected,
+        pending: &mut HashMap<String, PendingRequest>,
+    ) -> Result<(), String> {
+        match frame {
+            RelayFrame::Snapshot {
+                request_id,
+                snapshot,
+            } => {
+                let observed = snapshot.observed_at;
+                let revision = snapshot.revision;
+                let current = self.store.host_snapshot(&self.alias).await;
+                let changed = current
+                    .as_ref()
+                    .and_then(|host| host.remote.as_ref())
+                    .is_none_or(|remote| remote_payload_changed(remote, &snapshot));
+                let update = |host: &mut FleetHostSnapshot| {
+                    // Never regress a newer transition that raced a slow
+                    // full scan. Pane/session inventories are still fresh,
+                    // but agent state and revision remain monotonic.
+                    let snapshot = merge_remote_snapshot(host.remote.take(), snapshot);
+                    host.remote = Some(snapshot);
+                    host.state = FleetHostState::Online;
+                    host.last_seen_at = Some(observed);
+                    host.received_at = Some(OffsetDateTime::now_utc());
+                    host.error = None;
+                };
+                if changed {
+                    self.store.mutate_host(&self.alias, update).await;
+                } else {
+                    self.store.mutate_host_silent(&self.alias, update).await;
+                }
+                if let Some(request) = pending.remove(&request_id) {
+                    match request.reply {
+                        PendingReply::Refresh(reply) | PendingReply::Command(reply) => {
+                            let _ = reply.send(Ok(FleetCommandResult::accepted(format!(
+                                "refreshed revision {revision}"
+                            ))));
+                        }
+                    }
+                }
+            }
+            RelayFrame::Transition {
+                revision,
+                transition,
+            } => {
+                self.store
+                    .apply_transition(&self.alias, revision, transition)
+                    .await;
+            }
+            RelayFrame::Keepalive {
+                revision,
+                observed_at,
+                mailbox_revision,
+            } => {
+                let mut needs_resync = false;
+                self.store
+                    .mutate_host_silent(&self.alias, |host| {
+                        host.last_seen_at = Some(observed_at);
+                        host.received_at = Some(OffsetDateTime::now_utc());
+                        if host
+                            .remote
+                            .as_ref()
+                            .is_some_and(|remote| remote.revision < revision)
+                        {
+                            host.state = FleetHostState::Degraded;
+                            host.error = Some("remote revision is ahead; resynchronizing".into());
+                            needs_resync = true;
+                        }
+                    })
+                    .await;
+                if let Some(mailbox_revision) = mailbox_revision {
+                    self.store
+                        .notify_mailbox(&self.alias, mailbox_revision)
+                        .await;
+                }
+                if needs_resync {
+                    self.store.mutate_host(&self.alias, |_| {}).await;
+                    send_request(
+                        &mut connected.stdin,
+                        &RelayRequest::Snapshot {
+                            request_id: request_id(),
+                        },
+                    )
+                    .await?;
+                }
+            }
+            RelayFrame::Result { request_id, result } => {
+                let result = sanitize_command_result(result);
+                if let Some(request) = pending.remove(&request_id) {
+                    match request.reply {
+                        PendingReply::Command(reply) | PendingReply::Refresh(reply) => {
+                            let _ = reply.send(Ok(result));
+                        }
+                    }
+                }
+            }
+            RelayFrame::Error {
+                request_id,
+                code,
+                message,
+            } => {
+                let code = sanitize_remote_error(&code);
+                let message = sanitize_remote_error(&message);
+                if let Some(request) = pending.remove(&request_id) {
+                    fail_pending(request.reply, format!("remote {code}: {message}"));
+                } else {
+                    tracing::warn!(host = %self.alias, %code, %message, "unmatched relay error");
+                }
+            }
+            RelayFrame::ResyncRequired { reason } => {
+                let reason = sanitize_remote_error(&reason);
+                let display_reason = reason.clone();
+                self.store
+                    .mutate_host(&self.alias, |host| {
+                        host.state = FleetHostState::Degraded;
+                        host.error = Some(reason);
+                    })
+                    .await;
+                // The relay's local transition subscription is gone. A full
+                // snapshot can repair current state but cannot restore future
+                // push events; reconnect the relay process instead.
+                return Err(format!("relay stream requires reconnect: {display_reason}"));
+            }
+            RelayFrame::Hello { .. } => return Err("relay sent a duplicate hello frame".into()),
+        }
+        Ok(())
+    }
+
+    async fn record_disconnect(&self, error: &str) {
+        let error = sanitize_remote_error(error);
+        let state = classify_error(&error);
+        self.store
+            .mutate_host(&self.alias, |host| {
+                host.state = state;
+                host.error = Some(error);
+                // Deliberately retain `remote`: callers see the last-known
+                // snapshot with stale/offline metadata instead of a false
+                // empty fleet.
+            })
+            .await;
+    }
+}
+
+struct Connected {
+    child: Child,
+    stdin: ChildStdin,
+    reader: BufReader<tokio::process::ChildStdout>,
+    stderr_task: tokio::task::JoinHandle<String>,
+    hello: RelayHello,
+    last_frame: Instant,
+}
+
+async fn read_relay_line(
+    reader: &mut BufReader<tokio::process::ChildStdout>,
+    line: &mut String,
+) -> std::io::Result<usize> {
+    read_bounded_line(reader, line, FLEET_MAX_FRAME_BYTES).await
+}
+
+async fn send_request(stdin: &mut ChildStdin, request: &RelayRequest) -> Result<(), String> {
+    let mut bytes = serde_json::to_vec(request).map_err(|error| error.to_string())?;
+    if bytes.len() > FLEET_MAX_FRAME_BYTES {
+        return Err(format!(
+            "relay request exceeds {FLEET_MAX_FRAME_BYTES} bytes"
+        ));
+    }
+    bytes.push(b'\n');
+    stdin
+        .write_all(&bytes)
+        .await
+        .map_err(|error| error.to_string())?;
+    stdin.flush().await.map_err(|error| error.to_string())
+}
+
+fn request_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+fn fail_pending(reply: PendingReply, error: String) {
+    match reply {
+        PendingReply::Command(reply) | PendingReply::Refresh(reply) => {
+            let _ = reply.send(Err(error));
+        }
+    }
+}
+
+fn expire_pending(pending: &mut HashMap<String, PendingRequest>, now: Instant, timeout_secs: u64) {
+    let expired = pending
+        .iter()
+        .filter_map(|(id, request)| (request.deadline <= now).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    for id in expired {
+        if let Some(request) = pending.remove(&id) {
+            fail_pending(
+                request.reply,
+                format!("remote command timed out after {timeout_secs} seconds"),
+            );
+        }
+    }
+}
+
+fn classify_error(error: &str) -> FleetHostState {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("permission denied")
+        || lower.contains("host key verification failed")
+        || lower.contains("remote host identification has changed")
+    {
+        FleetHostState::AuthFailed
+    } else if lower.contains("protocol mismatch") {
+        FleetHostState::VersionSkew
+    } else {
+        FleetHostState::Offline
+    }
+}
+
+fn sanitize_remote_error(error: &str) -> String {
+    let mut clean = sanitize_terminal_text(error);
+    if clean.len() > FLEET_MAX_DIAGNOSTIC_BYTES {
+        let mut boundary = FLEET_MAX_DIAGNOSTIC_BYTES;
+        while !clean.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        clean.truncate(boundary);
+        clean.push('…');
+    }
+    clean.trim().to_string()
+}
+
+fn sanitize_command_result(mut result: FleetCommandResult) -> FleetCommandResult {
+    result.message = result
+        .message
+        .map(|message| sanitize_remote_error(&message));
+    result.capture = result.capture.map(sanitize_capture_text);
+    result.capture_raw_base64 = result
+        .capture_raw_base64
+        .and_then(sanitize_raw_capture_base64);
+    if let Some(window) = &mut result.window_capture {
+        for pane in &mut window.panes {
+            pane.text = pane.text.take().map(sanitize_capture_text);
+        }
+    }
+    // Command streams keep their full (already bounded) length: `--json`
+    // output must stay parseable, so only terminal controls are removed.
+    result.command_stdout = result
+        .command_stdout
+        .map(|text| sanitize_terminal_text(&text));
+    result.command_stderr = result
+        .command_stderr
+        .map(|text| sanitize_terminal_text(&text));
+    result
+}
+
+fn merge_remote_snapshot(
+    current: Option<tend::fleet::RemoteSnapshot>,
+    mut snapshot: tend::fleet::RemoteSnapshot,
+) -> tend::fleet::RemoteSnapshot {
+    let Some(current) = current.filter(|current| current.revision > snapshot.revision) else {
+        return snapshot;
+    };
+    for current_agent in current.agents {
+        if let Some(agent) = snapshot.agents.iter_mut().find(|agent| {
+            agent.kind == current_agent.kind && agent.session_id == current_agent.session_id
+        }) {
+            *agent = current_agent;
+        } else {
+            snapshot.agents.push(current_agent);
+        }
+    }
+    snapshot.revision = current.revision;
+    snapshot.observed_at = snapshot.observed_at.max(current.observed_at);
+    snapshot
+}
+
+fn deterministic_jitter(alias: &str, base: Duration) -> Duration {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    alias.hash(&mut hasher);
+    let max_ms = u64::try_from(base.as_millis()).unwrap_or(u64::MAX) / 4 + 1;
+    Duration::from_millis(hasher.finish() % max_ms)
+}
+
+fn audit_operation(host: &str, operation: &str, body_bytes: usize) {
+    tracing::info!(
+        fleet_host = host,
+        fleet_operation = operation,
+        body_bytes,
+        "fleet control request"
+    );
+}
+
+/// Refuse a Fleet inbox claim before any frame reaches a relay that does not
+/// bound it: such a relay claims the whole remote inbox and then returns only
+/// part of it, leaving the rest claimed but never shown. Read-only mailbox
+/// listing is unaffected.
+fn unbounded_claim_refusal(
+    alias: &str,
+    hello: &RelayHello,
+    operation: &FleetOperation,
+) -> Option<String> {
+    (matches!(operation, FleetOperation::CollaborationClaim { .. })
+        && !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == FLEET_BOUNDED_CLAIM_CAPABILITY))
+    .then(|| {
+        format!(
+            "host '{alias}' runs a tend relay that claims its whole inbox but returns only part of it; upgrade tend on that host before claiming over Fleet"
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tend::event::{AgentEvent, AgentId, AgentKind, AgentState};
+    use tend::state::Store;
+
+    #[test]
+    fn unbounded_relays_cannot_claim_but_can_still_list_mailboxes() {
+        let pane = PaneKey {
+            window: WindowKey {
+                session: tend::SessionKey {
+                    endpoint: tend::BackendEndpoint {
+                        host: HostKind::Rmux,
+                        socket: "/tmp/rmux-test/default".into(),
+                    },
+                    session_id: "$1".into(),
+                },
+                window_id: "@1".into(),
+            },
+            pane_id: "rmux:%1".into(),
+        };
+        let hello = |capabilities: &[&str]| RelayHello {
+            fleet_protocol: FLEET_PROTOCOL_VERSION,
+            min_fleet_protocol: FLEET_PROTOCOL_VERSION,
+            node_id: NodeId::generate(),
+            hostname: "remote".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            tend_version: "0.0.0".into(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            daemon_generation: None,
+            boot_id: "boot".into(),
+            backends: Vec::new(),
+            server_time: OffsetDateTime::now_utc(),
+        };
+        let claim = FleetOperation::CollaborationClaim { pane: pane.clone() };
+        let list = FleetOperation::CollaborationMailbox {
+            pane,
+            operator_only: false,
+            if_unchanged: None,
+        };
+        // A relay from before bounded claims advertised collaboration alone.
+        let legacy = hello(&["collaboration", "collaboration_get"]);
+        let refusal = unbounded_claim_refusal("remote", &legacy, &claim).unwrap();
+        assert!(refusal.contains("host 'remote'"), "{refusal}");
+        assert!(refusal.contains("upgrade tend"), "{refusal}");
+        assert!(unbounded_claim_refusal("remote", &legacy, &list).is_none());
+        // Current relays advertise the shared list, which carries the bound.
+        let current = hello(FLEET_CAPABILITIES);
+        assert!(FLEET_CAPABILITIES.contains(&FLEET_BOUNDED_CLAIM_CAPABILITY));
+        assert!(unbounded_claim_refusal("remote", &current, &claim).is_none());
+        assert!(unbounded_claim_refusal("remote", &current, &list).is_none());
+    }
+
+    #[test]
+    fn navigation_keys_reach_only_relays_that_take_them() {
+        let pane = PaneKey {
+            window: WindowKey {
+                session: tend::SessionKey {
+                    endpoint: tend::BackendEndpoint {
+                        host: HostKind::Tmux,
+                        socket: "default".into(),
+                    },
+                    session_id: "$1".into(),
+                },
+                window_id: "@1".into(),
+            },
+            pane_id: "%1".into(),
+        };
+        let hello = |capabilities: &[&str]| RelayHello {
+            fleet_protocol: FLEET_PROTOCOL_VERSION,
+            min_fleet_protocol: FLEET_PROTOCOL_VERSION,
+            node_id: NodeId::generate(),
+            hostname: "remote".into(),
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            tend_version: "0.0.0".into(),
+            capabilities: capabilities.iter().map(|c| (*c).to_owned()).collect(),
+            daemon_generation: None,
+            boot_id: "boot".into(),
+            backends: Vec::new(),
+            server_time: OffsetDateTime::now_utc(),
+        };
+        let keys = FleetOperation::SendKeys {
+            pane: pane.clone(),
+            keys: vec![tend::fleet::FleetKey::Down, tend::fleet::FleetKey::Enter],
+        };
+        let capture = FleetOperation::Capture { pane };
+        // A relay from before navigation keys advertised send_prompt only.
+        let legacy = hello(&["capture", "send_prompt"]);
+        let refusal = send_keys_refusal("remote", &legacy, &keys).unwrap();
+        assert!(refusal.contains("host 'remote'"), "{refusal}");
+        assert!(refusal.contains("upgrade tend"), "{refusal}");
+        assert!(send_keys_refusal("remote", &legacy, &capture).is_none());
+        let current = hello(FLEET_CAPABILITIES);
+        assert!(send_keys_refusal("remote", &current, &keys).is_none());
+        // The worktree inventory follows the same rule.
+        let inventory = FleetOperation::WorktreeInventory;
+        let refusal = worktree_inventory_refusal("remote", &legacy, &inventory).unwrap();
+        assert!(refusal.contains("upgrade tend"), "{refusal}");
+        assert!(worktree_inventory_refusal("remote", &legacy, &keys).is_none());
+        assert!(worktree_inventory_refusal("remote", &current, &inventory).is_none());
+    }
+
+    #[test]
+    fn local_host_is_first_class_with_truthful_managed_labels() {
+        let mut cfg = FleetConfig::default();
+        cfg.local
+            .labels
+            .insert("environment".into(), "development".into());
+        cfg.local
+            .annotations
+            .insert("example.com/owner".into(), "June".into());
+        let observed_at = OffsetDateTime::now_utc();
+        let remote = RemoteSnapshot {
+            revision: 4,
+            observed_at,
+            agents: Vec::new(),
+            panes: Vec::new(),
+            sessions: Vec::new(),
+            backends: Vec::new(),
+        };
+        let host = local_host(&cfg, NodeId::generate(), 9, remote, None);
+        assert!(host.local);
+        assert_eq!(host.alias, LOCAL_HOST_ALIAS);
+        assert_eq!(host.ssh_target, "local://");
+        assert_eq!(host.mode, HostAccessMode::Control);
+        assert_eq!(host.state, FleetHostState::Online);
+        assert_eq!(host.labels["tend.io/local"], "true");
+        assert_eq!(host.labels["tend.io/transport"], "local");
+        assert_eq!(host.labels["environment"], "development");
+        assert_eq!(host.annotations["example.com/owner"], "June");
+        assert_eq!(host.daemon_generation, Some(9));
+        assert_eq!(host.remote.unwrap().revision, 4);
+    }
+
+    #[tokio::test]
+    async fn local_mailbox_updates_do_not_require_a_running_ipc_server() {
+        let store = Arc::new(FleetStore::new());
+        let cfg = FleetConfig {
+            refresh_secs: 3600,
+            ..FleetConfig::default()
+        };
+        store
+            .upsert_host(local_host(
+                &cfg,
+                NodeId::generate(),
+                0,
+                RemoteSnapshot {
+                    revision: 0,
+                    observed_at: OffsetDateTime::now_utc(),
+                    agents: Vec::new(),
+                    panes: Vec::new(),
+                    sessions: Vec::new(),
+                    backends: Vec::new(),
+                },
+                None,
+            ))
+            .await;
+        let mut updates = store.subscribe();
+        let agents = tend::Store::shared();
+        let (changes, mailbox_changes) = watch::channel(0_u64);
+        let (_commands, receiver) = mpsc::channel(1);
+        let (stop, shutdown) = broadcast::channel(1);
+        let dir = tempfile::tempdir().unwrap();
+        let task = LocalTask {
+            fleet: cfg,
+            store,
+            transitions: agents.subscribe(),
+            agents,
+            backends: Vec::new(),
+            client: tend::ipc::Client::new(dir.path().join("absent.sock")),
+            mailbox_changes,
+            commands: receiver,
+            revision: Arc::new(AtomicU64::new(0)),
+            identity_error: None,
+            shutdown,
+        };
+        // No new change is required to invalidate pre-existing mailbox reads.
+        // The initial revision must be announced even if it was already seen.
+        changes.send_replace(42);
+        let mut task = task;
+        task.mailbox_changes.borrow_and_update();
+        let task = tokio::spawn(task.run());
+        let update = tokio::time::timeout(Duration::from_secs(1), updates.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(update.host, LOCAL_HOST_ALIAS);
+        assert_eq!(update.mailbox_revision, Some(42));
+        changes.send_replace(43);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), updates.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .mailbox_revision,
+            Some(43)
+        );
+        drop(changes);
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn saturated_host_queue_rejects_work_without_blocking_other_hosts() {
+        let (busy, _busy_rx) = mpsc::channel(1);
+        let (free, mut free_rx) = mpsc::channel(1);
+        let (reply, _result) = oneshot::channel();
+        route_host_command(
+            &busy,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        let (reply, result) = oneshot::channel();
+        route_host_command(
+            &busy,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        assert!(result.await.unwrap().unwrap_err().contains("queue is full"));
+        let (reply, _result) = oneshot::channel();
+        route_host_command(
+            &free,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        assert!(matches!(
+            free_rx.try_recv().unwrap().operation,
+            FleetOperation::Refresh
+        ));
+        drop(free_rx);
+        let (reply, result) = oneshot::channel();
+        route_host_command(
+            &free,
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+        );
+        assert!(result.await.unwrap().unwrap_err().contains("unavailable"));
+    }
+
+    fn host_task(mode: HostAccessMode) -> HostTask {
+        let (_commands_tx, commands) = mpsc::channel(1);
+        let (_shutdown_tx, shutdown) = broadcast::channel(1);
+        HostTask {
+            alias: "dev".into(),
+            config: FleetHostConfig {
+                ssh: "dev.example".into(),
+                mode,
+                ..FleetHostConfig::default()
+            },
+            fleet: FleetConfig::default(),
+            store: Arc::new(FleetStore::new()),
+            permits: Arc::new(Semaphore::new(1)),
+            node_registry: Arc::new(RwLock::new(BTreeMap::new())),
+            commands,
+            shutdown,
+        }
+    }
+
+    fn work_command(
+        args: &[&str],
+    ) -> (
+        HostCommand,
+        oneshot::Receiver<Result<FleetCommandResult, String>>,
+    ) {
+        let (reply, receiver) = oneshot::channel();
+        (
+            HostCommand {
+                operation: FleetOperation::WorkCommand {
+                    args: args.iter().map(ToString::to_string).collect(),
+                    stdin: None,
+                },
+                reply,
+            },
+            receiver,
+        )
+    }
+
+    #[tokio::test]
+    async fn work_commands_are_authorized_before_any_transport_is_chosen() {
+        let observe = host_task(HostAccessMode::Observe);
+        let (command, reply) = work_command(&["work", "pipeline", "set", "--from-json", "-"]);
+        assert!(observe.intercept_work_command(command, None).is_none());
+        let error = reply.await.unwrap().unwrap_err();
+        assert!(error.contains("observe-only"), "{error}");
+
+        let control = host_task(HostAccessMode::Control);
+        let (command, reply) = work_command(&["work", "start", "W-1"]);
+        assert!(control.intercept_work_command(command, None).is_none());
+        let error = reply.await.unwrap().unwrap_err();
+        assert!(error.contains("not allowed"), "{error}");
+
+        // A relay that advertises the operation carries it unchanged.
+        let capabilities = vec![FLEET_WORK_COMMAND_CAPABILITY.to_string()];
+        let (command, _reply) = work_command(&["work", "options", "--json"]);
+        let forwarded = control
+            .intercept_work_command(command, Some(&capabilities))
+            .expect("relay path keeps the command");
+        assert!(matches!(
+            forwarded.operation,
+            FleetOperation::WorkCommand { ref args, stdin: None } if args[1] == "options"
+        ));
+
+        // Other operations pass straight through on every host.
+        let (reply, _receiver) = oneshot::channel();
+        let passthrough = observe.intercept_work_command(
+            HostCommand {
+                operation: FleetOperation::Refresh,
+                reply,
+            },
+            None,
+        );
+        assert!(matches!(
+            passthrough.map(|command| command.operation),
+            Some(FleetOperation::Refresh)
+        ));
+        assert!(!relay_supports_work_command(&["capture".to_string()]));
+        assert!(relay_supports_work_command(&capabilities));
+    }
+
+    #[test]
+    fn command_streams_are_sanitized_but_not_truncated_or_reflowed() {
+        let output = tend::work_control::WorkCommandOutput {
+            exit_code: 0,
+            stdout: "{\"ok\":true}\n".into(),
+            stderr: "warn \u{1b}[31mred\u{1b}[0m\n".into(),
+        };
+        let result = sanitize_command_result(FleetCommandResult::command(output));
+        assert_eq!(result.command_stdout.as_deref(), Some("{\"ok\":true}\n"));
+        assert_eq!(result.command_stderr.as_deref(), Some("warn red\n"));
+        assert_eq!(result.command_exit_code, Some(0));
+    }
+
+    #[test]
+    fn ssh_errors_are_classified_without_ansi_controls() {
+        assert_eq!(
+            classify_error("Permission denied (publickey)"),
+            FleetHostState::AuthFailed
+        );
+        assert_eq!(
+            classify_error("fleet protocol mismatch"),
+            FleetHostState::VersionSkew
+        );
+        assert_eq!(classify_error("connection reset"), FleetHostState::Offline);
+        assert_eq!(sanitize_remote_error("\u{1b}[31mboom\u{1b}[0m"), "boom");
+        let unicode = sanitize_remote_error(&"가".repeat(400));
+        assert!(unicode.ends_with('…'));
+        assert!(unicode.len() <= FLEET_MAX_DIAGNOSTIC_BYTES + '…'.len_utf8());
+    }
+
+    #[test]
+    fn reconnect_jitter_is_stable_and_bounded() {
+        let base = Duration::from_secs(4);
+        let first = deterministic_jitter("dev", base);
+        assert_eq!(first, deterministic_jitter("dev", base));
+        assert!(first <= Duration::from_secs(1));
+    }
+
+    #[tokio::test]
+    async fn newer_transition_state_overlays_a_slow_full_snapshot() {
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: "agent-1".into(),
+                    surface: None,
+                    pane: Some("%1".into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: Some("/tmp/project".into()),
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let original = store.snapshot().await.pop().unwrap();
+        let mut transitioned = original.clone();
+        transitioned.state = AgentState::Working;
+        let mut other = original.clone();
+        other.session_id = "agent-2".into();
+        let now = OffsetDateTime::now_utc();
+        let current = tend::fleet::RemoteSnapshot {
+            revision: 2,
+            observed_at: now,
+            agents: vec![transitioned],
+            panes: Vec::new(),
+            sessions: Vec::new(),
+            backends: Vec::new(),
+        };
+        let stale_scan = tend::fleet::RemoteSnapshot {
+            revision: 1,
+            observed_at: now - time::Duration::SECOND,
+            agents: vec![original, other],
+            panes: Vec::new(),
+            sessions: Vec::new(),
+            backends: Vec::new(),
+        };
+
+        let merged = merge_remote_snapshot(Some(current), stale_scan);
+        assert_eq!(merged.revision, 2);
+        assert_eq!(merged.agents.len(), 2);
+        assert_eq!(
+            merged
+                .agents
+                .iter()
+                .find(|agent| agent.session_id == "agent-1")
+                .unwrap()
+                .state,
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn command_deadlines_release_pending_callers() {
+        let (reply, mut response) = oneshot::channel();
+        let now = Instant::now();
+        let mut pending = HashMap::from([(
+            "request".into(),
+            PendingRequest {
+                reply: PendingReply::Command(reply),
+                deadline: now,
+            },
+        )]);
+        expire_pending(&mut pending, now, 7);
+        assert!(pending.is_empty());
+        let error = response.try_recv().unwrap().unwrap_err();
+        assert_eq!(error, "remote command timed out after 7 seconds");
+    }
+}

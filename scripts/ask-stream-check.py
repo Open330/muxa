@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise Global Ask through a private daemon and a fake, unbilled provider.
 
-Run after cargo build -p muxa-cli -p muxad. No live daemon/config is modified.
+Run after cargo build -p tend-cli -p tendd. No live daemon/config is modified.
 """
 import json
 import os
@@ -12,7 +12,7 @@ import tempfile
 import time
 
 repo = Path(__file__).resolve().parents[1]
-with tempfile.TemporaryDirectory(prefix='muxa-ask-stream-') as directory:
+with tempfile.TemporaryDirectory(prefix='tend-ask-stream-') as directory:
     root = Path(directory)
     endpoint = root / 'daemon.sock'
     provider = root / 'codex'
@@ -27,7 +27,7 @@ printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"
     config.write_text('[ask]\nenabled = true\nagent = "codex"\ncwd = '
                       + json.dumps(str(root)) + '\n[ask.providers.codex]\nexecutable = '
                       + json.dumps(str(provider)) + '\n')
-    history = root / 'data' / 'muxa' / 'ask.json'
+    history = root / 'data' / 'tend' / 'ask.json'
     history.parent.mkdir(parents=True)
     history.write_text(json.dumps({'entries': [{
         'id': 'archived', 'conversation_id': 'archived-conversation', 'prompt': 'old',
@@ -36,11 +36,11 @@ printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"
     }]}))
     env = dict(os.environ, XDG_CONFIG_HOME=str(root / 'config'),
                XDG_DATA_HOME=str(root / 'data'), XDG_STATE_HOME=str(root / 'state'),
-               MUXA_HOST='rmux', MUXA_HOSTS='rmux',
+               TEND_HOST='rmux', TEND_HOSTS='rmux',
                RMUX=str(root / 'absent-mux') + ',1,0')
     for key in ('TMUX', 'TMUX_PANE', 'RMUX_PANE'):
         env.pop(key, None)
-    cli = [str(repo / 'target/debug/muxa'), '--socket', str(endpoint), '--config', str(config)]
+    cli = [str(repo / 'target/debug/tend'), '--socket', str(endpoint), '--config', str(config)]
 
     def call(kind, **filters):
         with socket.socket(socket.AF_UNIX) as connection:
@@ -53,7 +53,7 @@ printf '%s\\n' '{"type":"item.completed","item":{"type":"agent_message","text":"
             return response
 
     with (root / 'daemon.log').open('wb') as log:
-        daemon = subprocess.Popen([str(repo / 'target/debug/muxad'), '--socket', str(endpoint),
+        daemon = subprocess.Popen([str(repo / 'target/debug/tendd'), '--socket', str(endpoint),
                                    '--config', str(config), '--no-dashboard'],
                                   env=env, stdout=log, stderr=log)
         ask = None

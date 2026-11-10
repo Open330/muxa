@@ -10,7 +10,7 @@ repo = Path(__file__).resolve().parents[1]
 rmux = shutil.which('rmux')
 if not rmux:
     raise SystemExit('rmux is required')
-with tempfile.TemporaryDirectory(prefix='muxa-rmux-check-') as tmp:
+with tempfile.TemporaryDirectory(prefix='tend-rmux-check-') as tmp:
     socket = tmp + '/rmux.sock'
     env = dict(os.environ, TERM='xterm-256color')
     for key in ('RMUX', 'RMUX_PANE', 'TMUX', 'TMUX_PANE'):
@@ -63,36 +63,36 @@ with tempfile.TemporaryDirectory(prefix='muxa-rmux-check-') as tmp:
         assert len(others) == 1, 'second client did not attach'
         print('before:', run('list-clients', '-F', '#{client_name} #{session_name} #{window_name}'), flush=True)
         testenv = dict(env, RMUX=socket+',0,0', RMUX_PANE='%0',
-            MUXA_RMUX_TEST_ENDPOINT=socket, MUXA_RMUX_TEST_PANE=target, MUXA_RMUX_TEST_CLIENT=client, MUXA_RMUX_TEST_OTHER_CLIENT=others[0])
-        result = subprocess.run(['cargo', 'test', '-p', 'muxa-cli', 'live_rmux_', '--', '--ignored', '--nocapture'], env=testenv, cwd=repo, timeout=300)
+            TEND_RMUX_TEST_ENDPOINT=socket, TEND_RMUX_TEST_PANE=target, TEND_RMUX_TEST_CLIENT=client, TEND_RMUX_TEST_OTHER_CLIENT=others[0])
+        result = subprocess.run(['cargo', 'test', '-p', 'tend-cli', 'live_rmux_', '--', '--ignored', '--nocapture'], env=testenv, cwd=repo, timeout=300)
         print('after:', run('list-clients', '-F', '#{client_name} #{session_name} #{window_name}'), flush=True)
         print('clients-detail:', run('list-clients', '-F', '#{client_name} #{session_id} #{session_name}'), flush=True)
         print('destination:', run('display-message', '-p', '-t', 'destination', '#{session_id}:#{window_id}.#{pane_id}'), flush=True)
         print('panes-detail:', run('list-panes', '-a', '-F', '#{session_id}:#{window_id}.#{pane_id} window_active=#{window_active} pane_active=#{pane_active}'), flush=True)
         if result.returncode: raise SystemExit(result.returncode)
-        binary = str(repo / 'target/debug/muxa')
-        def muxa(*args):
+        binary = str(repo / 'target/debug/tend')
+        def tend(*args):
             p = subprocess.run([binary, *args], env=testenv, cwd=repo, text=True, capture_output=True, timeout=15)
             if p.returncode: raise RuntimeError((args, p.stdout, p.stderr))
             return p.stdout.strip()
         window = run('display-message', '-p', '-t', 'destination:target', '#{window_id}')
-        run('set-buffer', '-b', 'muxa-window-name-check', 'cli renamed')
-        renamed = muxa('window', 'rename', '--window', window, '--buffer', 'muxa-window-name-check', '--json')
+        run('set-buffer', '-b', 'tend-window-name-check', 'cli renamed')
+        renamed = tend('window', 'rename', '--window', window, '--buffer', 'tend-window-name-check', '--json')
         assert 'cli-renamed' in renamed, renamed
         names = [row.split('\t')[1] for row in run('list-windows', '-a', '-F', '#{window_id}\t#{window_name}').splitlines() if row.split('\t')[0] == window]
         assert names and all(name == 'cli-renamed' for name in names), names
         # The hook command must work independently of watch and keep a sole
         # client's existing view without spawning another one.
-        muxa('workspace', 'view', '--client', client, '--json')
-        plain = muxa('peek', '--plain')
+        tend('workspace', 'view', '--client', client, '--json')
+        plain = tend('peek', '--plain')
         assert plain, 'peek returned no panes'
         print('CLI buffer rename, workspace view, and peek passed', flush=True)
-        subprocess.run(['cargo', 'test', '-p', 'muxa', 'live_backend_smoke_against_explicit_endpoint', '--', '--ignored'], env=testenv, cwd=repo, timeout=300, check=True)
+        subprocess.run(['cargo', 'test', '-p', 'tend', 'live_backend_smoke_against_explicit_endpoint', '--', '--ignored'], env=testenv, cwd=repo, timeout=300, check=True)
         # Exercise the actual installed hook body, including rmux's run-shell
         # environment, rather than only calling workspace view ourselves.
-        source = (repo / 'crates/muxa-cli/src/init/files/tmux.rs').read_text()
+        source = (repo / 'crates/tend-cli/src/init/files/tmux.rs').read_text()
         hook = source.split('pub const AUTO_VIEW_BODY: &str = r#"', 1)[1].split('"#;', 1)[0]
-        hook = hook.replace('muxa workspace view', binary + ' workspace view')
+        hook = hook.replace('tend workspace view', binary + ' workspace view')
         hook_file = Path(tmp) / 'auto-view.conf'
         hook_file.write_text(hook)
         run('source-file', str(hook_file))

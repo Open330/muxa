@@ -1,11 +1,11 @@
-# Work pipeline — `muxa work up`
+# Work pipeline — `tend work up`
 
-`muxa work start`가 명령형 primitive입니다. 한 번 실행하면 agent session 하나가
-생깁니다. `muxa work up`은 선언형입니다. 안정적인 Muxa Work id와 선택적인 외부
+`tend work start`가 명령형 primitive입니다. 한 번 실행하면 agent session 하나가
+생깁니다. `tend work up`은 선언형입니다. 안정적인 Tend Work id와 선택적인 외부
 이슈 키를 별도로 주면 현재 Run을 만들거나 선언 상태로 수렴시킵니다.
 
 ```console
-$ muxa work up auth-cleanup --external ENG-1234
+$ tend work up auth-cleanup --external ENG-1234
 work auth-cleanup is in workspace webapp via pipeline triad
   cwd      ~/worktrees/auth-cleanup (worktree auth-cleanup, created)
   external linear:ENG-1234 Reaper double-reaps a lying pane  [In Progress]
@@ -22,17 +22,17 @@ Workspace를, window는 현재 Run을, pane은 agent session을 바인딩합니�
 
 ## 설정부터
 
-`[ticket]`·`[[route]]`·`[pipeline.*]`는 muxa가 요구하는 가장 구조적인 설정이고
+`[ticket]`·`[[route]]`·`[pipeline.*]`는 tend가 요구하는 가장 구조적인 설정이고
 가장 짐작하기 어렵습니다 — 중첩 테이블, 순서 있는 route 배열, 정규식, 플레이스홀더
 템플릿. 그래서 이 문서를 보며 손으로 쓰지 않아도 됩니다.
 
 ```console
-$ muxa work init
+$ tend work init
 ◇  Describe the work pipeline you want
 │  eng-* 티켓은 codex 기획, codex 구현, claude 리뷰로
 ```
 
-muxa는 headless agent 한 턴으로 그 문장을 TOML로 바꾸고, **위임하지 않는 부분**을
+tend는 headless agent 한 턴으로 그 문장을 TOML로 바꾸고, **위임하지 않는 부분**을
 합니다 — 결과를 파싱하고, 정규식을 전부 컴파일하고, route가 지목한 pipeline이
 존재하는지와 나열된 agent가 실제로 뜰 수 있는지 확인하고, 무엇이 바뀔지 출력한
 뒤 확인을 받고서야 씁니다. 모델이 없는 키를 만들거나 `vim`을 agent라고 하면 이유를
@@ -43,32 +43,32 @@ muxa는 headless agent 한 턴으로 그 문장을 TOML로 바꾸고, **위임�
 쓰므로 주석과 나머지 섹션은 그대로 살아남습니다.
 
 여기의 모든 경로는 **headless agent 턴 하나를 쓰고, 그 비용은 계정에 과금됩니다.**
-muxa는 실행 전에 무엇을 호출하는지 먼저 알리고, `--dry-run`은 파일 쓰기만
+tend는 실행 전에 무엇을 호출하는지 먼저 알리고, `--dry-run`은 파일 쓰기만
 건너뜁니다 — 턴은 그대로 돌고 그대로 과금됩니다. 비대화형 호출은 `--yes`로
 그 지출을 확인해야 합니다.
 
 ```console
-muxa work init                                # 대화형으로 묻기
-muxa work init --describe "..."               # 비대화형
-muxa work init --dry-run                      # 제안만 보고 안 씀
-muxa work init --agent codex                  # 다른 resolver 사용
+tend work init                                # 대화형으로 묻기
+tend work init --describe "..."               # 비대화형
+tend work init --dry-run                      # 제안만 보고 안 씀
+tend work init --agent codex                  # 다른 resolver 사용
 ```
 
-설정 전체가 아니라 pipeline 하나만 원한다면 `muxa work compose "<설명>"`이
+설정 전체가 아니라 pipeline 하나만 원한다면 `tend work compose "<설명>"`이
 **읽기 전용** agent 턴 하나를 써서 `pipeline set`이 읽는 JSON으로 pipeline을
 출력합니다 — 아무것도 쓰지 않습니다. 초안은 `pipeline set`과 같은 규칙으로
 검증하고, 실행될 수 없는 초안은 이유를 붙여 한 번 더 요청한 뒤 포기합니다.
 `--current <path|->`는 이전 초안을 다듬고(그때 설명은 바꿀 내용), `--agent <id>`는
 `[ask]` provider 아무거나 고르며, `--json`은 응답 전체(`pipeline`, `notes`,
-`raw`)를 출력합니다 — Muxa.app의 pipeline 편집기가 daemon의 `work_compose`
+`raw`)를 출력합니다 — Tend.app의 pipeline 편집기가 daemon의 `work_compose`
 요청에서 받는 것과 같은 모양입니다.
 
 ```console
-muxa work compose "implementer는 claude, 그 뒤에 codex reviewer"
-muxa work compose "review 뒤에 gemini tester 추가" --current pair.json --json
+tend work compose "implementer는 claude, 그 뒤에 codex reviewer"
+tend work compose "review 뒤에 gemini tester 추가" --current pair.json --json
 ```
 
-턴을 쓰고 싶지 않다면 내장 preset 셋이 흔한 구성을 덮습니다. `muxa work preset
+턴을 쓰고 싶지 않다면 내장 preset 셋이 흔한 구성을 덮습니다. `tend work preset
 apply`는 같은 방식으로 — `toml_edit`으로, 파일을 건드리기 전에 전체 `Config`로
 검증하고, `--overwrite` 없이는 이미 있는 `[pipeline.<name>]`을 덮어쓰지 않으며 —
 `config.toml`에 씁니다:
@@ -76,50 +76,50 @@ apply`는 같은 방식으로 — `toml_edit`으로, 파일을 건드리기 전�
 | Preset | 구성 |
 | --- | --- |
 | `solo` | `claude` 구현자 하나 |
-| `pair` | `claude` 구현자 → `codex` 리뷰어, 리뷰어는 `muxa work done`을 기다림 |
+| `pair` | `claude` 구현자 → `codex` 리뷰어, 리뷰어는 `tend work done`을 기다림 |
 | `triad` | `codex` 기획자 → `codex` 구현자 → `claude` 리뷰어, `main-vertical` 레이아웃 |
 
 ```console
-muxa work preset list                              # 각 preset이 무엇을 띄우는지
-muxa work preset apply solo --route '.*'           # [pipeline.solo] + catch-all [[route]]
-muxa work preset apply triad --route '^eng-'       # 두 번째 pipeline과 route 추가
-muxa work preset apply pair --overwrite            # 손본 [pipeline.pair]를 교체
-muxa work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
+tend work preset list                              # 각 preset이 무엇을 띄우는지
+tend work preset apply solo --route '.*'           # [pipeline.solo] + catch-all [[route]]
+tend work preset apply triad --route '^eng-'       # 두 번째 pipeline과 route 추가
+tend work preset apply pair --overwrite            # 손본 [pipeline.pair]를 교체
+tend work preset apply solo --json                 # {"pipeline","route","route_added","replaced","config_path"}
 ```
 
 `--route`는 같은 `match`를 가진 route가 없을 때만 `[[route]] match = <regex>,
 pipeline = <name>`을 덧붙입니다. 이미 있으면 알려만 주고 원래 가리키던 곳을 그대로
 둡니다. 적용된 preset은 파일 안의 평범한 pipeline이니 마음껏 고치면 됩니다.
 
-런처는 `muxa work options`로 무엇이 설정돼 있는지 묻습니다: 설정 순서의 route,
+런처는 `tend work options`로 무엇이 설정돼 있는지 묻습니다: 설정 순서의 route,
 이름순 pipeline, 한 줄 요약이 붙은 `[message.skills]`, 위의 preset, 그리고
-`[ticket].agent`. `--json`이 Muxa.app Start Work 시트가 기대는 계약이고,
+`[ticket].agent`. `--json`이 Tend.app Start Work 시트가 기대는 계약이고,
 `configured`는 `[pipeline.*]`이 하나라도 생기기 전까지 `false`입니다. pipeline과
 agent마다 원본 `prompt` 템플릿이 실려 있어 편집기가 그 항목을 그대로 되돌려 줄 수
 있습니다.
 
-편집기는 같은 모양으로 되씁니다. `muxa work pipeline set <name> --from-json
+편집기는 같은 모양으로 되씁니다. `tend work pipeline set <name> --from-json
 <path|->`는 `options --json`이 찍은 `pipelines[]` 항목 하나를 (`name`은 있어도
 없어도) 받아, 실행 때 실패할 검사 — 허용된 program, 겹치지 않는 alias, 실제
 alias를 가리키고 순환하지 않는 `after`, right/down인 `direction` — 를 먼저
 돌리고 `[pipeline.<name>]`을 `toml_edit`으로 씁니다. 이미 있던 pipeline은 제자리에서
-교체되고, 다른 섹션·주석·값은 그대로입니다. `muxa work pipeline remove <name>`은
+교체되고, 다른 섹션·주석·값은 그대로입니다. `tend work pipeline remove <name>`은
 그 pipeline을 가리키는 `[[route]]`가 남아 있으면 거절하고, `--force`면 그 route들의
-`pipeline`도 지웁니다. `muxa work route set --match <regex>`는 `match`가 정확히
+`pipeline`도 지웁니다. `tend work route set --match <regex>`는 `match`가 정확히
 같은 `[[route]]` 하나를 추가하거나 고치고(`--pipeline`, `--workspace`, `--cwd`,
 `--position <n>`; `--clear-*`가 필드를 지우며 `worktree`와 `prepare`는 건드리지
-않음), `muxa work route remove --match <regex>`가 지웁니다. 모든 명령은 합쳐진
+않음), `tend work route remove --match <regex>`가 지웁니다. 모든 명령은 합쳐진
 파일을 통째로 `Config`로 검증한 뒤에야 원자적으로 쓰고, 아니면 파일을 건드리지
 않으며, `--json`이면 JSON만 찍습니다.
 
 ```console
-muxa work pipeline set pair --from-json pair.json     # {"pipeline","replaced","config_path"}
-muxa work options --json | jq '.pipelines[] | select(.name == "triad")' \
-  | muxa work pipeline set triad --from-json -        # 왕복해도 그대로
-muxa work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
-muxa work route set --match '^eng-' --pipeline triad --position 0   # {"match","position","created","config_path"}
-muxa work route set --match '.*' --clear-workspace    # 안 준 플래그는 아무것도 안 바꿈
-muxa work route remove --match '^eng-'                # {"match","removed","config_path"}
+tend work pipeline set pair --from-json pair.json     # {"pipeline","replaced","config_path"}
+tend work options --json | jq '.pipelines[] | select(.name == "triad")' \
+  | tend work pipeline set triad --from-json -        # 왕복해도 그대로
+tend work pipeline remove pair --force                # {"pipeline","removed","routes_cleared","config_path"}
+tend work route set --match '^eng-' --pipeline triad --position 0   # {"match","position","created","config_path"}
+tend work route set --match '.*' --clear-workspace    # 안 준 플래그는 아무것도 안 바꿈
+tend work route remove --match '^eng-'                # {"match","removed","config_path"}
 ```
 
 손으로 쓰는 게 편하시면 주석 달린 레퍼런스가
@@ -141,8 +141,8 @@ Work id ────────────────────────
 
 ## ticket 조회는 agent에게 위임합니다
 
-muxa는 Linear, Jira, GitHub를 직접 말하지 않고 앞으로도 그럴 계획이 없습니다.
-headless agent turn 하나(`claude -p` / `codex exec`, `muxa ask`가 쓰는 그
+tend는 Linear, Jira, GitHub를 직접 말하지 않고 앞으로도 그럴 계획이 없습니다.
+headless agent turn 하나(`claude -p` / `codex exec`, `tend ask`가 쓰는 그
 bridge)를 써서 agent에게 ticket 조회를 시킵니다. 이미 skill, MCP server, `gh`,
 환경변수 토큰으로 agent CLI에게 그 방법을 가르쳐 뒀기 때문입니다. provider를
 추가하는 일은 release가 아니라 prompt입니다.
@@ -193,7 +193,7 @@ route는 순서 있는 목록이고 첫 매치가 이깁니다. 구체적인 규
 status와 agent가 돌리는 모든 `find`에 걸리기 때문입니다. 이미 있는 worktree는
 재사용하고, 이미 있는 branch는 새로 만들지 않고 checkout합니다.
 
-route 없이도 시작할 수 있습니다. `muxa work up eng-1234 --pipeline triad`는 그
+route 없이도 시작할 수 있습니다. `tend work up eng-1234 --pipeline triad`는 그
 플래그 자체를 routing 결정으로 보고 현재 디렉터리를 씁니다.
 
 ## pipeline은 script가 아니라 desired state입니다
@@ -228,7 +228,7 @@ prompt  = '너는 리뷰를 맡는다. 구현을 비판하되 직접 고치지 �
 ```
 
 `alias`가 핵심입니다. desired-vs-actual diff가 이 키로 돌고, pane 자체에
-기록되므로(`@muxa_agent_alias`) muxad, CLI 프로세스, pane 안의 agent 재시작을
+기록되므로(`@tend_agent_alias`) tendd, CLI 프로세스, pane 안의 agent 재시작을
 모두 넘겨 살아남습니다. pipeline 안에서 유일해야 하고, 그 아래 pane이 생긴
 뒤에는 바꾸지 않아야 합니다.
 
@@ -244,14 +244,14 @@ peer 요청을 직접 받습니다. `purpose = 'primary'`를 주면 사람 세�
 
 ## 다시 실행하면 수렴합니다
 
-`muxa work up`을 다시 실행하면 pipeline과 window의 현재 pane을 비교합니다.
+`tend work up`을 다시 실행하면 pipeline과 window의 현재 pane을 비교합니다.
 
 - alias에 pane이 없다 → **launch**
 - alias에 살아있는 pane이 있다 → **keep**, 건드리지 않음
 - alias에 살아있는 pane이 있고 요청을 줬다 → **그 pane에 전송**
 
 ```console
-$ muxa work up eng-1234           # reviewer pane이 닫혀 있던 상태
+$ tend work up eng-1234           # reviewer pane이 닫혀 있던 상태
   = plan       running                %12
   = impl       running                %13
   + review     claude    reviewer     %21
@@ -262,10 +262,10 @@ $ muxa work up eng-1234           # reviewer pane이 닫혀 있던 상태
 
 ## 요청: `--body`, `--skill`, `--context`
 
-일감이 *무엇인지*는 요청으로 들어옵니다. `muxa_call_peer`가 받는 방식 그대로입니다.
+일감이 *무엇인지*는 요청으로 들어옵니다. `tend_call_peer`가 받는 방식 그대로입니다.
 
 ```console
-$ muxa work up eng-1234 \
+$ tend work up eng-1234 \
     --skill review-plan \
     --body "reconciler가 살아있는 pane을 먹는 double reap을 고쳐라" \
     --context "main에서는 테스트 통과함"
@@ -274,7 +274,7 @@ $ muxa work up eng-1234 \
 등록된 `[message.skills]` 항목이 먼저 펼쳐지고, 그다음 body, 그다음 context가
 `Invocation context:` 머리말 아래 붙습니다. 합성기는 협업 도구와 **한 벌을
 공유**하므로 peer에게 통하는 표현이 pipeline에도 그대로 통합니다. 그 외에는
-아무것도 안 붙습니다 — muxa가 대신 transcript나 diff를 끼워 넣지 않습니다.
+아무것도 안 붙습니다 — tend가 대신 transcript나 diff를 끼워 넣지 않습니다.
 
 같은 요청이 **상태에 따라 두 가지로 배달**됩니다.
 
@@ -284,7 +284,7 @@ $ muxa work up eng-1234 \
 | 살아있는 pane 있음 | 그 pane에 타이핑 |
 
 ```console
-$ muxa work up eng-1234 --body "이어가기 전에 main으로 rebase해라"
+$ tend work up eng-1234 --body "이어가기 전에 main으로 rebase해라"
   » plan       prompted               %12
   » impl       prompted               %13
   » review     prompted               %21
@@ -309,14 +309,14 @@ desired state로 수렴시키는 건 유용합니다. 하지만 사람이 연 pa
 
 ## Placeholder
 
-템플릿은 `{{이중}}` 중괄호를 쓰고, muxa가 아는 키만 치환하며 나머지는 그대로
+템플릿은 `{{이중}}` 중괄호를 쓰고, tend가 아는 키만 치환하며 나머지는 그대로
 둡니다. resolver prompt가 요청하는 `{"id": "..."}` 형태를 그대로 담을 수 있는
 이유이자, 오타가 조용히 빈칸이 되는 대신 prompt에 그대로 드러나는 이유입니다.
 
 | 키 | 값 |
 | --- | --- |
 | `{{id}}` | 소문자 work id — branch명과 디렉터리용 |
-| `{{work}}` | muxa가 저장·표시하는 형태의 work id (`ENG-1234`) |
+| `{{work}}` | tend가 저장·표시하는 형태의 work id (`ENG-1234`) |
 | `{{workspace}}` | 결정된 workspace/session |
 | `{{cwd}}` | 결정된 작업 디렉터리 |
 | `{{alias}}`, `{{role}}`, `{{program}}` | 렌더링 중인 agent |
@@ -342,36 +342,36 @@ prompt는 일의 모양과 URL을 나르고, 나머지는 agent가 직접 읽으
 ## 명령 정리
 
 ```console
-muxa work init                       # 말로 설명해 설정 쓰기
-muxa work compose "<설명>" [--agent <id>] [--current <path|->] [--json]   # pipeline 하나를 JSON으로 초안; 쓰지 않음
-muxa work preset list                # 내장 구성: solo, pair, triad
-muxa work preset apply <name> --route '<regex>'   # 턴 없이 하나 쓰기
-muxa work options [--json]           # 런처용 route·pipeline·skill·preset
-muxa work pipeline set <name> --from-json <path|->   # 그 JSON 모양으로 [pipeline.<name>] 쓰기/교체
-muxa work pipeline remove <name> [--force]           # 제거; --force면 가리키는 route도 정리
-muxa work route set --match '<regex>' [--pipeline <name>] [--position <n>]   # [[route]] 하나 추가/수정
-muxa work route remove --match '<regex>'             # 그 route 제거
-muxa work up <work> --external <id>  # 외부 이슈 연결 → routing → 없는 것만 생성
-muxa work up <id>                    # 호환 경로: <id>를 외부 이슈로도 조회
-muxa work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음
-muxa work up <id> --pipeline triad   # route의 pipeline을 덮어씀
-muxa work up <id> --body "..."       # 일감 내용; launch 또는 전달
-muxa work up <id> --skill review-plan --context "..."   # muxa_call_peer와 같은 합성기
-muxa work up <id> --no-ticket        # 조회 없이 id만으로 실행
-muxa work up <id> --refresh          # 캐시된 ticket 무시
-muxa work up <id> --json             # 구조화된 plan + 결과
-muxa work down <id>                  # window와 그 안의 agent 전부 종료
+tend work init                       # 말로 설명해 설정 쓰기
+tend work compose "<설명>" [--agent <id>] [--current <path|->] [--json]   # pipeline 하나를 JSON으로 초안; 쓰지 않음
+tend work preset list                # 내장 구성: solo, pair, triad
+tend work preset apply <name> --route '<regex>'   # 턴 없이 하나 쓰기
+tend work options [--json]           # 런처용 route·pipeline·skill·preset
+tend work pipeline set <name> --from-json <path|->   # 그 JSON 모양으로 [pipeline.<name>] 쓰기/교체
+tend work pipeline remove <name> [--force]           # 제거; --force면 가리키는 route도 정리
+tend work route set --match '<regex>' [--pipeline <name>] [--position <n>]   # [[route]] 하나 추가/수정
+tend work route remove --match '<regex>'             # 그 route 제거
+tend work up <work> --external <id>  # 외부 이슈 연결 → routing → 없는 것만 생성
+tend work up <id>                    # 호환 경로: <id>를 외부 이슈로도 조회
+tend work up <id> --dry-run          # 계획만 출력, tmux는 건드리지 않음
+tend work up <id> --pipeline triad   # route의 pipeline을 덮어씀
+tend work up <id> --body "..."       # 일감 내용; launch 또는 전달
+tend work up <id> --skill review-plan --context "..."   # tend_call_peer와 같은 합성기
+tend work up <id> --no-ticket        # 조회 없이 id만으로 실행
+tend work up <id> --refresh          # 캐시된 ticket 무시
+tend work up <id> --json             # 구조화된 plan + 결과
+tend work down <id>                  # window와 그 안의 agent 전부 종료
 ```
 
-`muxa work down`은 `muxa work close`의 다른 표기입니다. 둘 다 unmanaged window는
+`tend work down`은 `tend work close`의 다른 표기입니다. 둘 다 unmanaged window는
 건드리지 않고, 같은 work id가 여러 workspace에 있으면 `--workspace`를 요구합니다.
 
 ## MCP
 
-같은 기능이 agent에게는 `muxa_start_work`로 노출되고, 인자도 동일합니다.
+같은 기능이 agent에게는 `tend_start_work`로 노출되고, 인자도 동일합니다.
 
 ```text
-muxa_start_work {
+tend_start_work {
   "work": "auth-cleanup",
   "external": "ENG-1234",
   "body": "double reap을 고쳐라",
@@ -380,7 +380,7 @@ muxa_start_work {
 }
 ```
 
-`muxa_start_agent`를 여러 번 부르는 것보다 이쪽이 낫습니다. 그쪽은 이미 있는
+`tend_start_agent`를 여러 번 부르는 것보다 이쪽이 낫습니다. 그쪽은 이미 있는
 agent와 아직 만들어야 할 agent를 구분하지 못해 수렴 대신 팀을 복제합니다.
 [MCP.md](MCP.md) 참고.
 
@@ -397,7 +397,7 @@ board의 로컬 stage(`queued`·`in_progress`·`review`·`done`)는 CLI에도 �
 blocked와 attention은 별도 signal로 남습니다.
 
 ```console
-$ muxa work list
+$ tend work list
 ┌────────────────────────────────────────────────────────────────────────┐
 │ WORK           WORKSPACE   AGENTS          DONE   STAGE    CWD         │
 ╞════════════════════════════════════════════════════════════════════════╡
@@ -405,7 +405,7 @@ $ muxa work list
 └────────────────────────────────────────────────────────────────────────┘
 ```
 
-`DONE`은 pipeline이 이름 붙인 agent 중 `muxa work done`을 보고한 수입니다.
+`DONE`은 pipeline이 이름 붙인 agent 중 `tend work done`을 보고한 수입니다.
 수렴한 실행과 정체한 실행을 가르는 값입니다 — 둘 다 모든 pane이 idle이기
 때문입니다. pipeline alias가 없는 window는 `0/1`이 아니라 `-`입니다.
 거기서는 아무도 보고를 요구받지 않았습니다.

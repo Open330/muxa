@@ -1,6 +1,6 @@
 # Sinks
 
-A *sink* is an opt-in fan-out from the muxa daemon to an external system.
+A *sink* is an opt-in fan-out from the tend daemon to an external system.
 Sinks consume the in-process broadcast channels the daemon already uses
 internally (today: prompts; later: state transitions, heartbeats) and
 forward selected events to a long-lived destination.
@@ -19,9 +19,9 @@ required credentials.
 
 [oh-my-prompt](https://github.com/jiunbae/oh-my-prompt) (omp) is a small
 self-hostable service that stores prompts from coding-agent CLIs for
-search and analytics. muxa already watches the same three-adapter set
+search and analytics. tend already watches the same three-adapter set
 (Claude Code, Codex, Gemini CLI, Antigravity CLI), so the sink ships the prompts it's
-already capturing — omp owns history, muxa owns realtime. opencode
+already capturing — omp owns history, tend owns realtime. opencode
 integration is deferred — see the README's Agent support table for
 status.
 
@@ -32,7 +32,7 @@ record to your omp endpoint:
 
 | Field            | Always sent? | Source                                                      |
 | ---------------- | ------------ | ----------------------------------------------------------- |
-| `event_id`       | yes          | `muxa-{session_id}-{unix_ms}` — deterministic, dedups       |
+| `event_id`       | yes          | `tend-{session_id}-{unix_ms}` — deterministic, dedups       |
 | `created_at`     | yes          | RFC-3339 UTC timestamp from the agent event                 |
 | `prompt_text`    | yes          | the prompt as the agent recorded it                         |
 | `prompt_length`  | yes          | UTF-8 char count                                            |
@@ -40,8 +40,8 @@ record to your omp endpoint:
 | `token_estimate` | yes          | `prompt_length / 4` (matches omp's own heuristic)           |
 | `source`         | yes          | `claude-code` / `codex` / `gemini` / `antigravity` / `opencode` |
 | `cli_name`       | yes          | `claude` / `codex` / `gemini` / `agy` / `opencode`          |
-| `cli_version`    | yes          | muxa's own version (the CLI version isn't always reachable) |
-| `role`           | yes          | always `user` — muxa never sees response text               |
+| `cli_version`    | yes          | tend's own version (the CLI version isn't always reachable) |
+| `role`           | yes          | always `user` — tend never sees response text               |
 | `session_id`     | yes          | agent-reported session id                                   |
 | `cwd`            | when known   | from the agent event                                        |
 | `project`        | when known   | basename of `cwd`                                           |
@@ -58,7 +58,7 @@ this doc gets the same change in the same PR.
 ### Setup
 
 1. Stand up an omp instance and obtain the `X-User-Token` UUID for the
-   account you want to push to. (omp's docs are upstream; muxa never
+   account you want to push to. (omp's docs are upstream; tend never
    touches account creation.)
 2. Export the token in the daemon's environment, **not** in your TOML:
 
@@ -68,7 +68,7 @@ this doc gets the same change in the same PR.
 
    Choose a different env var name via `token_env` if you prefer.
 
-3. Enable the sink in `~/.config/muxa/config.toml`:
+3. Enable the sink in `~/.config/tend/config.toml`:
 
    ```toml
    [sinks.oh_my_prompt]
@@ -80,7 +80,7 @@ this doc gets the same change in the same PR.
    # flush_interval_ms = 5000                          # time-based flush
    ```
 
-4. Restart `muxad`. You should see `oh-my-prompt sink enabled` in the
+4. Restart `tendd`. You should see `oh-my-prompt sink enabled` in the
    daemon log on startup.
 
 There is intentionally **no default endpoint**. A missing or empty

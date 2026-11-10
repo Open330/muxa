@@ -1,26 +1,26 @@
 # Live TUI
 
-`muxa watch`는 주요 interactive surface입니다. 추적 중인 agent와 일반 tmux
+`tend watch`는 주요 interactive surface입니다. 추적 중인 agent와 일반 tmux
 pane을 보여주고, pane attach, live preview, 같은 window의
 agent 협업을 제공합니다.
 
 TUI 안에 머문 채 prompt 전송, turn abort, live capture 확인까지 하는
-workspace-card console이 필요하면 [`muxa dashboard`](DASHBOARD_CLI.ko.md)를
+workspace-card console이 필요하면 [`tend dashboard`](DASHBOARD_CLI.ko.md)를
 사용하세요.
 
 ## 실행
 
 ```bash
-muxa watch
-muxa watch --layout work
-muxa watch --view pane
-muxa watch --include-paneless
+tend watch
+tend watch --layout work
+tend watch --view pane
+tend watch --include-paneless
 ```
 
 기본값 `view = "window"`는 tmux window 기준으로 묶고 parent를 `workspace › work`로
 표시하는 실행 topology view입니다. session은 Workspace를, window는 현재 Run을,
 child pane은 agent session을 바인딩합니다. `view = "pane"`은 pane별로 한 줄씩
-보여줍니다. 지속되는 Work와 외부 이슈 상태는 이 tree가 아니라 `muxa dashboard`가
+보여줍니다. 지속되는 Work와 외부 이슈 상태는 이 tree가 아니라 `tend dashboard`가
 담당합니다.
 
 pane 보기에서 실제 window가 하나뿐인 session은 `session › window` 한 행으로
@@ -43,7 +43,7 @@ window였던 것처럼 보이지 않도록 전체 session → window → pane an
 | `Enter` | 선택한 pane에 바로 attach. |
 | `C` | 선택한 행이 속한 session에 shell window를 만들고 바로 이동. attach 후 `prefix + c`를 누르는 것과 같습니다. |
 | `n` | workspace session과 work window를 생성/재사용하고 agent pane 추가. |
-| `w` | pipeline 실행: work id를 입력하면 `muxa work up`을 실행하는 window로 넘어갑니다. |
+| `w` | pipeline 실행: work id를 입력하면 `tend work up`을 실행하는 window로 넘어갑니다. |
 | `R` / `:rename` | 선택한 tmux session/window 이름 또는 pane title 변경. |
 | `\|` | list/inspector 분할 순환: 50/50 → 70/30 → 30/70. |
 | `a` / `A` | 선택한 Ask 대화 이어쓰기 / 열기. 컴포저의 `Ctrl-E`와 패널의 `n`으로 새 대화 초안을 만듭니다. |
@@ -89,7 +89,7 @@ U.S. Standard / U.S. International 레이아웃에서만 기본으로 Alt가 켜
 
 ### 실행 중인 agent 이동
 
-agent pane에서 `prefix+M`을 누르거나, 로컬 `muxa watch`에서 agent를 선택하고
+agent pane에서 `prefix+M`을 누르거나, 로컬 `tend watch`에서 agent를 선택하고
 `Alt-M` 또는 `:move`를 실행합니다. 두 진입점은 같은 session → window 트리 메뉴를 엽니다.
 현재 session의 새 window, 새 session, 기존 session/window를 선택할 수 있습니다.
 목적지를 선택하고 Enter를 누르면 이동하며, 새 session은 이름만 입력하면 됩니다.
@@ -110,9 +110,9 @@ Work ID는 유지하고 workspace 소속은 목적지에 맞춥니다. workspace
 메타데이터를 복원합니다. 원래 session의 마지막 window를 옮길 때는 shell
 window를 남겨 client 접속을 유지합니다.
 
-CLI는 `muxa window move --source-window @13 --session dev --stay`,
-`muxa window move --source-window @13 --new-session review`,
-`muxa window move --source-window @13 --undo`를 지원합니다.
+CLI는 `tend window move --source-window @13 --session dev --stay`,
+`tend window move --source-window @13 --new-session review`,
+`tend window move --source-window @13 --undo`를 지원합니다.
 
 pane과 프로세스, 작업 디렉터리, 대화, 터미널 이력은 유지됩니다. 원래 session의
 마지막 pane을 옮길 때는 shell 하나를 남겨 접속과 복귀 위치를 유지합니다. 같은 tmux/rmux
@@ -125,11 +125,11 @@ pane과 프로세스, 작업 디렉터리, 대화, 터미널 이력은 유지됩
 닫혔다면 목적지를 직접 선택해야 합니다. 따라갈 때 목적지에 다른 client가 있으면
 별도 grouped session view를 사용합니다. mailbox는 기존처럼 `M`으로 열며(`b`도 유지), Fleet watch도 동일합니다.
 
-단축키 설치·갱신은 `muxa init --component tmux-popup --yes`로 합니다.
-스크립트에서는 `muxa agent move --pane %42 --new-session review --stay`,
+단축키 설치·갱신은 `tend init --component tmux-popup --yes`로 합니다.
+스크립트에서는 `tend agent move --pane %42 --new-session review --stay`,
 `--session NAME --new-window NAME`, `--window @ID`, `--undo`를 사용할 수 있습니다.
 `--server-socket`과 `--host tmux|rmux`는 터미널 서버를 지정하고, 전역 `--socket`은
-기존처럼 Muxa daemon을 지정합니다.
+기존처럼 Tend daemon을 지정합니다.
 
 ## 검색과 Attention
 
@@ -160,7 +160,7 @@ work로 이동하면 이전 work는 접히고 새 work가 펼쳐집니다. pane�
 상시 표시됩니다. `Alt-I`로 끌 수 있으며 좁은 화면에서는 기존 preview popup을
 사용합니다.
 
-여기서 120은 터미널 폭이 아니라 `muxa watch`가 실제로 받는 폭입니다. inset
+여기서 120은 터미널 폭이 아니라 `tend watch`가 실제로 받는 폭입니다. inset
 `display-popup`은 inset과 테두리를 모두 깎기 때문에, 134 column 터미널에서
 `-w 90%` popup의 내부 폭은 118에 그칩니다. 기본 `prefix + s` 바인딩이
 테두리 없는 전체 화면(`-B -w 100% -h 100%`)인 이유입니다.
@@ -184,7 +184,7 @@ collaboration 화면만 바꾸고 topology layout은 그대로 둡니다. `kill`
 ## work 레이아웃
 
 `W`를 누르면 트리 대신 Work를 한 줄씩 보여주는 평면 테이블로 바뀝니다.
-`muxa work list`와 컬럼이 그대로 일치하고(WORK, WORKSPACE, GEN, ALIASES, DONE,
+`tend work list`와 컬럼이 그대로 일치하고(WORK, WORKSPACE, GEN, ALIASES, DONE,
 CWD), CLI 테이블이 보여줄 수 없는 실시간 state 게이지가 앞에 붙습니다. `W`를 다시
 누르면 직전 레이아웃으로 돌아가므로 쓰던 swarm이 조용히 버려지지 않습니다.
 팔레트의 `layout work`, `--layout work`, `[watch] layout = "work"`로도 갑니다.
@@ -197,7 +197,7 @@ pane들은 alias 상태로 요약되기 때문입니다. 이동은 트리의 형
 
 ## 화면(Screen)
 
-`muxa watch`는 세 가지 목록 중 하나를 보여주며 `Alt-1` / `Alt-2` / `Alt-3`,
+`tend watch`는 세 가지 목록 중 하나를 보여주며 `Alt-1` / `Alt-2` / `Alt-3`,
 팔레트의 `screen topology|collab|board`, `--screen`, `[watch] screen`으로
 전환합니다.
 
@@ -214,7 +214,7 @@ pane으로 이동합니다 — request는 pane보다 오래 남으므로 상대 
 아무 일도 안 하는 대신 그 사실을 알려줍니다.
 
 `board`는 Work를 나열합니다. 저장된 Work 기록에 그 Work의 window 스캔 결과를
-붙인 것으로, `muxa dashboard`와 웹 대시보드가 읽는 것과 같은 projection입니다.
+붙인 것으로, `tend dashboard`와 웹 대시보드가 읽는 것과 같은 projection입니다.
 live Run이 없어도 Work 행은 남고 한 Work에 Run이 여러 개일 수 있어서, 행이
 window인 `layout work`가 아니라 별도 화면입니다. 손이 필요한 Work(Work에
 signal이 있거나, 안의 agent가 입력·선택을 기다리거나 실패한 경우)가 먼저
@@ -262,10 +262,10 @@ scope = "host"`이면 어떤 pane이든 닿으며, 서버 사이에 겹치는 id
 거부합니다. topology 표시(`Space`)는 여기 적용되지 않습니다. detail에는 Work의 열린 협업 —
 모든 Run의 agent에게 온, 또 그들이 보낸 미완료 요청을 요청마다 한 번씩 — 도
 표시되며, board가 떠 있는 동안 15초마다 기록 목록으로 갱신하고(claim하지 않음),
-목록을 읽지 못하면 0 대신 `unavailable`이라고 표시합니다. `workers` 줄은 muxa가 peer
+목록을 읽지 못하면 0 대신 `unavailable`이라고 표시합니다. `workers` 줄은 tend가 peer
 작업용으로 띄운 그 Work의 agent를 agent session 기준으로 세고, 오래 대기(24시간
 초과)·오류·역할 겹침 수를 보여줍니다. 읽기 전용이며, 호스트 전체를 대상으로 기본 dry-run이고 열린 작업이 있는
-worker는 건너뛰며 오류 worker는 `--error`일 때만 다루는 `muxa workers prune`을
+worker는 건너뛰며 오류 worker는 `--error`일 때만 다루는 `tend workers prune`을
 안내합니다. `b`(또는 `M`)는 그
 agent의 메일함을 행동하기 전까지 읽기 전용으로 열고, `i`는 대기 중인 요청을 claim,
 `e`는 답장하며 둘 다 console이 아니라 그 agent로서 동작합니다. 어느 메일함에서든
@@ -302,7 +302,7 @@ provider를 바꾸고, `Ctrl-E`로 현재 대화를 이어갈지 새 대화로 �
 커서에 삽입하며, `Enter`로 보냅니다. 새 대화와 첫 질문은 함께 저장되므로 초안을
 취소해도 빈 대화가 남지 않습니다. 대화 하나에서는 한 번에 한 질문만 실행할 수
 있으며, 별개의 초안을 새 대화로 보내면 기존 질문과 동시에 실행할 수 있습니다.
-muxad가 agent를
+tendd가 agent를
 print 모드로 실행해 답변을 수집하므로 pane에 입력하지 않고 관리할 세션도 없습니다.
 `Esc`로 취소하며, 입력이 이미 비어 있을 때는 `Backspace`로도 닫을 수 있습니다.
 
@@ -314,7 +314,7 @@ print 모드로 실행해 답변을 수집하므로 pane에 입력하지 않고 
 복원됩니다.
 
 실행 주체는 daemon입니다. 팝업을 닫아도 답변이 이력에 도착하고, 이력은
-`$XDG_DATA_HOME/muxa/ask.json`에 남아 재시작 후에도 조회됩니다. `[ask] enabled =
+`$XDG_DATA_HOME/tend/ask.json`에 남아 재시작 후에도 조회됩니다. `[ask] enabled =
 true`가 필요합니다 — [CONFIGURATION.ko.md](CONFIGURATION.ko.md) 참고.
 
 목록 아래 상세 영역은 답변의 첫 화면분만 보여줍니다. `Enter`(또는 `o`)를 누르면
@@ -362,7 +362,7 @@ watch가 자동으로 선택합니다. composer에서 `Tab`은 request kind를 �
 기존 입력을 지우지 않고 현재 커서 위치에 템플릿이 삽입됩니다. 인접한 내용과는
 문단으로 구분되며 같은 초안에 여러 스킬을 넣을 수도 있습니다. 선택만으로는
 전송되지 않습니다. 확장된 내용을 확인·수정한 뒤 `Enter`를 한 번 더 눌러 보냅니다.
-`muxa skill add <name> <prompt>` 또는 설정의
+`tend skill add <name> <prompt>` 또는 설정의
 `[message.skills]`로 템플릿을 등록할 수 있습니다. watch의 두 팔레트 모두에서
 `F2`는 추가/갱신 form을 열고, `Delete`는 선택한 스킬을 확인 후 삭제합니다. 기존
 `Ctrl-A`, `Ctrl-D`도 호환 alias로 유지합니다.
@@ -399,7 +399,7 @@ tracked agent를, session은 window index와 pane index가 낮은 순서의 agen
 
 `○ READ-ONLY`(초록)는 조사·답변만 허용하고 변경은 위임하지 않는 계약입니다.
 `Ctrl-E`로 바꾸는 `● EXECUTE`(빨강)는 실행과 파일 변경을 명시적으로 허용합니다.
-이는 muxa가 즉시 명령을 실행한다는 뜻이 아니라, 수신 agent가 inbox에서 읽는 작업
+이는 tend가 즉시 명령을 실행한다는 뜻이 아니라, 수신 agent가 inbox에서 읽는 작업
 계약입니다. watch는 별도 path scope 입력을 제공하지 않으므로 execute 요청에는
 메시지 본문에 수정 범위를 함께 적는 것이 좋습니다.
 
@@ -425,8 +425,8 @@ agent pane이 여러 개 있으면 `]`로 다음 agent, `[`로 이전 agent를 �
 ## tmux Popup Binding
 
 ```tmux
-bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "muxa watch"
-bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
+bind-key s display-popup -B -E -w 100% -h 100% -x 0 -y 0 "tend watch"
+bind-key D display-popup -E -w 95% -h 90% "tend dashboard"
 ```
 
 `prefix+s`가 관측과 협업의 기본 진입점입니다. `prefix+D`는 더 상세한 Dashboard를
@@ -434,25 +434,25 @@ bind-key D display-popup -E -w 95% -h 90% "muxa dashboard"
 
 ## 안정적인 tmux 이름
 
-`muxa init`은 `tmux-window-names` 컴포넌트를 기본으로 켭니다. tmux의 process 기반
+`tend init`은 `tmux-window-names` 컴포넌트를 기본으로 켭니다. tmux의 process 기반
 `automatic-rename`을 꺼서 Work window가 `node`나 `claude`로 덮어써지지 않게 하고,
-익숙한 `prefix + ,` prompt를 `muxa window rename`으로 연결합니다. window 이름의
+익숙한 `prefix + ,` prompt를 `tend window rename`으로 연결합니다. window 이름의
 공백은 `-`로 정규화하며 같은 session 안의 중복 이름은 거부합니다. 특정 window만
-동적 이름으로 되돌리려면 `muxa window rename --auto`를 실행합니다.
+동적 이름으로 되돌리려면 `tend window rename --auto`를 실행합니다.
 
 ## 한 workspace를 터미널 두 개로 보기
 
 tmux session은 current window를 하나만 가지며, attach된 모든 client가 그 window를
 봅니다. 따라서 같은 session에 두 터미널을 붙이면 서로 다른 Work window에 머무를 수
-없습니다. muxa의 제약이 아니라 tmux의 모델이고, 이를 바꾸는 유일한 수단이
+없습니다. tend의 제약이 아니라 tmux의 모델이고, 이를 바꾸는 유일한 수단이
 *session group*입니다 — window 목록은 공유하되 group 안의 각 session이 자기
 current window를 따로 가집니다.
 
-`muxa init`이 이를 `tmux-auto-view` 컴포넌트로 설치하며 기본으로 켜집니다. 도착한
+`tend init`이 이를 `tmux-auto-view` 컴포넌트로 설치하며 기본으로 켜집니다. 도착한
 client에게 자기 view를 주는 훅 두 개를 겁니다.
 
 ```tmux
-set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"muxa workspace view --client #{client_name}\"'"
+set-hook -g 'client-attached[9000]' "if -F '#{&&:#{>:#{session_attached},1},#{==:#{@no_auto_view},}}' 'run-shell \"tend workspace view --client #{client_name}\"'"
 set-hook -g 'client-session-changed[9000]' "…같은 내용…"
 ```
 
@@ -465,7 +465,7 @@ set-hook -g 'client-session-changed[9000]' "…같은 내용…"
 3.4에서 실측: attach 훅만 있으면 watch에서 점프할 때 두 터미널이 다시 한 session에
 묶이고 그때부터 서로를 따라다닙니다.
 
-터미널이 하나면 아무 일도 일어나지 않습니다. `muxa workspace view`는 자기가 그
+터미널이 하나면 아무 일도 일어나지 않습니다. `tend workspace view`는 자기가 그
 session의 유일한 client이면 no-op이므로 단일 터미널 workspace에 여분의 session이
 생기지 않고, 재그룹하는 터미널은 자기 view를 재사용해 점프마다 session이 쌓이지
 않습니다.
@@ -473,7 +473,7 @@ session의 유일한 client이면 no-op이므로 단일 터미널 workspace에 �
 이미 붙어 있는 터미널에는 직접 실행할 수도 있습니다.
 
 ```sh
-muxa workspace view
+tend workspace view
 ```
 
 view 이름은 `<session>~view~<pid>`라 원본 session 옆에 정렬됩니다. tmux가 session
@@ -517,7 +517,7 @@ tmux set-option -t <session> @no_auto_view 1
 
 ## macOS 메뉴바 (BarShelf)
 
-[BarShelf](https://github.com/Open330/barshelf)에 포함된 `muxa Watch` widget을
+[BarShelf](https://github.com/Open330/barshelf)에 포함된 `tend Watch` widget을
 사용하면 같은 agent 상태를 메뉴바 popover에서 compact하게 확인할 수 있습니다.
 latest activity 기준 상위 5개 agent를 `NAME / ST / ACT / LAST PROMPT` layout으로
 표시합니다. popover가 열려 있을 때 5초마다 갱신하고 background에서는 polling하지
@@ -526,14 +526,14 @@ latest activity 기준 상위 5개 agent를 `NAME / ST / ACT / LAST PROMPT` layo
 BarShelf gallery에서 설치하거나 다음 명령을 사용하세요.
 
 ```bash
-barshelf install https://github.com/Open330/barshelf/tree/master/widgets/muxa-watch
+barshelf install https://github.com/Open330/barshelf/tree/master/widgets/tend-watch
 ```
 
-Deno와 versioned snapshot command를 지원하는 `muxa`가 필요합니다. 기본 설치
-경로/소켓이 아닌 경우 `MUXA_BIN` 또는 widget의 custom socket setting을 지정하세요.
+Deno와 versioned snapshot command를 지원하는 `tend`가 필요합니다. 기본 설치
+경로/소켓이 아닌 경우 `TEND_BIN` 또는 widget의 custom socket setting을 지정하세요.
 
 ```bash
-muxa status --json
+tend status --json
 ```
 
 ## Columns

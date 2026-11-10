@@ -1,15 +1,15 @@
 # 설정
 
-`muxad`는 `$XDG_CONFIG_HOME/muxa/config.toml`이 있으면 읽습니다. 전체 주석
+`tendd`는 `$XDG_CONFIG_HOME/tend/config.toml`이 있으면 읽습니다. 전체 주석
 예시는 `config.example.toml`에서 확인할 수 있습니다.
 
 ## Socket
 
 ```toml
-socket = "/tmp/muxa.sock"
+socket = "/tmp/tend.sock"
 ```
 
-CLI는 `MUXA_SOCKET`도 사용합니다. daemon startup 때 tmux environment를
+CLI는 `TEND_SOCKET`도 사용합니다. daemon startup 때 tmux environment를
 self-heal해서 기존 pane도 현재 socket을 찾을 수 있게 합니다.
 
 ## History
@@ -17,24 +17,24 @@ self-heal해서 기존 pane도 현재 socket을 찾을 수 있게 합니다.
 ```toml
 [history]
 enabled = true
-path = "$XDG_DATA_HOME/muxa/prompts.ndjson"
+path = "$XDG_DATA_HOME/tend/prompts.ndjson"
 max_per_pane = 50
 max_age_days = 30
 ```
 
-prompt history는 무제한 warehouse가 아니라 retained window입니다. `muxa recap`과
-`muxa stats`의 prompt total은 이 범위를 기준으로 합니다.
+prompt history는 무제한 warehouse가 아니라 retained window입니다. `tend recap`과
+`tend stats`의 prompt total은 이 범위를 기준으로 합니다.
 
 ## Activity
 
 ```toml
 [activity]
 enabled = true
-path = "$XDG_DATA_HOME/muxa/activity.ndjson"
+path = "$XDG_DATA_HOME/tend/activity.ndjson"
 max_age_days = 30
 ```
 
-activity ledger는 agent state interval, tmux foreground interval, muxa human
+activity ledger는 agent state interval, tmux foreground interval, tend human
 interaction interval을 저장합니다. 자세한 기준은 [ACTIVITY.ko.md](ACTIVITY.ko.md).
 
 ## Session Activity
@@ -42,7 +42,7 @@ interaction interval을 저장합니다. 자세한 기준은 [ACTIVITY.ko.md](AC
 ```toml
 [session_activity]
 enabled = true
-path = "$XDG_DATA_HOME/muxa/session-activity.json"
+path = "$XDG_DATA_HOME/tend/session-activity.json"
 interval_secs = 5
 ```
 
@@ -60,10 +60,10 @@ direction = "right"  # right(기본값) | down
 instructions = "작업 하나당 window 하나를 쓰고, 무관한 프로젝트는 session을 분리한다."
 ```
 
-사용자가 평소 agent 작업을 배치하는 방식을 기록하는 설정입니다. Muxa는 이 값을
-MCP 초기화 안내에 넣고 `muxa_guide`로 다시 제공하므로, 연결된 agent가 새 작업을
+사용자가 평소 agent 작업을 배치하는 방식을 기록하는 설정입니다. Tend는 이 값을
+MCP 초기화 안내에 넣고 `tend_guide`로 다시 제공하므로, 연결된 agent가 새 작업을
 pane, window, 별도 session 중 어디에 둘지 추측하지 않아도 됩니다.
-`muxa_start_agent`에서 대응하는 인자를 생략하면 같은 값이 실제 기본값으로
+`tend_start_agent`에서 대응하는 인자를 생략하면 같은 값이 실제 기본값으로
 적용됩니다. `agent`를 설정하지 않은 경우에는 호출자가 agent를 직접 지정해야 합니다.
 
 여기의 `options`는 [`[agent.<program>]`](#agent-실행-인자)가 provider별로 표현하는
@@ -84,8 +84,8 @@ options = ["--model", "gpt-5-codex", "--search"]
 
 agent가 어떤 모델로 도는지는 그 agent가 놓이는 표면의 속성이 아니므로, 이 설정은
 특정 launcher에 붙지 않고 **provider를 키로** 갖습니다. agent를 시작하는 모든
-경로가 여기서 값을 읽습니다 — `muxa agent start`, `muxa work start`,
-`muxa work up` 파이프라인, `muxa_start_agent`, 그리고 `muxa_call_peer`의 자동 peer
+경로가 여기서 값을 읽습니다 — `tend agent start`, `tend work start`,
+`tend work up` 파이프라인, `tend_start_agent`, 그리고 `tend_call_peer`의 자동 peer
 spawn. 한 번 설정하면 전부에 적용됩니다.
 
 provider를 키로 두는 것이 안전장치이기도 합니다. `--model`은 CLI마다 다른 것을
@@ -93,7 +93,7 @@ provider를 키로 두는 것이 안전장치이기도 합니다. `--model`은 C
 "이 CLI의 모델명이 저 CLI로 새지 않도록" 가드를 걸어야 합니다. 알 수 없는
 키(`[agent.claud]`)는 조용히 무시되지 않고 로드를 실패시킵니다.
 
-인자는 Muxa 내장 provider profile 뒤(`codex`는 이미 `--yolo`, `claude`는
+인자는 Tend 내장 provider profile 뒤(`codex`는 이미 `--yolo`, `claude`는
 `--dangerously-skip-permissions`를 받습니다), 최초 prompt 앞에 들어가며 각 값은
 독립적으로 shell quote됩니다.
 
@@ -102,7 +102,7 @@ provider를 키로 두는 것이 안전장치이기도 합니다. `--model`은 C
 
 | 명시 위치 | 우선함 |
 | --- | --- |
-| `muxa agent start --option`, `muxa work start --option` | `[agent.<program>]` |
+| `tend agent start --option`, `tend work start --option` | `[agent.<program>]` |
 | MCP `options` 배열 | `[agent.<program>]` |
 | 파이프라인 agent의 `options` | `[agent.<program>]` |
 
@@ -120,7 +120,7 @@ role    = 'reviewer'
 options = ['--model', 'claude-sonnet-5']
 ```
 
-`muxa work up --dry-run`은 pane별로 최종 인자를 출력하므로, 보이는 그대로 실행됩니다.
+`tend work up --dry-run`은 pane별로 최종 인자를 출력하므로, 보이는 그대로 실행됩니다.
 
 ### `aas` 계정으로 시작하기
 
@@ -137,9 +137,9 @@ account = "auto"          # 또는 고정 계정: "work@claude"
 
 `aas`는 선택 사항입니다. 링크하지 않고 실행만 하며, `account`가 있을 때만 호출합니다.
 `aas`가 없거나, 5초 안에 답하지 않거나, 한도가 남은 계정이 없으면 예전처럼 맨 CLI로
-시작합니다(한도에 걸린 active 계정일 수 있음). 이유는 stderr와 `muxa agent start
+시작합니다(한도에 걸린 active 계정일 수 있음). 이유는 stderr와 `tend agent start
 --json`의 `account` 필드에 남습니다. 바이너리는 `[swap].aas`를 씁니다. 실행 중에 한도에
-걸린 에이전트는 [`muxa swap`](ACCOUNT_SWAP.md)이 처리합니다.
+걸린 에이전트는 [`tend swap`](ACCOUNT_SWAP.md)이 처리합니다.
 
 ## Ask
 
@@ -184,12 +184,12 @@ engine = "apple"
 model = "private-cloud"             # on-device(기본값) | private-cloud(macOS 27+)
 ```
 
-`muxa watch`에서 보내는 headless 질의입니다. `a`로 묻고 `A`로 이력을 봅니다.
-muxad가 agent를 print 모드로 실행해 답변을 수집하므로 관리할 세션이 없고, 완료
+`tend watch`에서 보내는 headless 질의입니다. `a`로 묻고 `A`로 이력을 봅니다.
+tendd가 agent를 print 모드로 실행해 답변을 수집하므로 관리할 세션이 없고, 완료
 여부가 추측이 아니라 exit code로 정해집니다. provider마다 여러 대화를 보관하고
 각 대화를 다시 이어갈 수 있습니다. 컴포저의 `Ctrl-E`는 초안을 새 대화로 표시하고,
 패널의 `n`은 새 대화 초안을 엽니다. 대화와 첫 turn은 전송할 때 함께 생성됩니다.
-`path` 기본값은 `$XDG_DATA_HOME/muxa/ask.json`이고 이력과 conversation id를 함께
+`path` 기본값은 `$XDG_DATA_HOME/tend/ask.json`이고 이력과 conversation id를 함께
 저장합니다.
 daemon이 회원님 계정으로 과금되는 CLI를 띄우는 권한이라 기본은 꺼짐입니다.
 [WATCH.ko.md](WATCH.ko.md)를 참고하세요.
@@ -205,7 +205,7 @@ sandbox/자동 검토를 유지한 채 workspace 편집을 허용하고, `defaul
 이 제한에 도달하면 headless agent 프로세스가 종료됩니다. inactivity timeout이 아닌
 전체 wall-clock 안전 제한입니다. `plan`은 읽기 전용 모드입니다(claude
 `--permission-mode plan`, codex `--sandbox read-only`, gemini `--approval-mode
-plan`). `muxa work compose`는 항상 이 모드로 초안을 만듭니다.
+plan`). `tend work compose`는 항상 이 모드로 초안을 만듭니다.
 
 ### Provider
 
@@ -215,7 +215,7 @@ JSON, 키가 담긴 환경 변수가 여기에 있습니다. 여섯 개로 고�
 --json`, `gemini -p --output-format json`)로 실행하고 질문 사이에 자체 세션을
 resume합니다. `anthropic`과 `openai`는 Messages API와 Chat Completions API를
 HTTPS로 직접 호출합니다. `apple`은 Mac 자체의 Foundation Models를 실행합니다.
-API engine은 resume할 세션이 없으므로 muxad가 자기 이력에서 그 대화의 이전
+API engine은 resume할 세션이 없으므로 tendd가 자기 이력에서 그 대화의 이전
 턴(최근 40턴 또는 60k자)을 질문 앞에 다시 넣어 보내며,
 `cwd`·`additional_dirs`·`permission_mode`는 적용되지 않습니다.
 
@@ -229,9 +229,9 @@ API engine은 resume할 세션이 없으므로 muxad가 자기 이력에서 그 
 `ModelManagerError 1046`으로 거부했습니다. Private Cloud Compute가 프로세스에
 무엇을 요구하든 command-line 헬퍼에는 그것이 없는 것으로 보입니다. 옵션은 나중
 빌드에서 쓸 수 있도록 남겨 두었고, 이 모델로 턴을 보내면 왜 답할 수 없는지
-알려줍니다. 이 프레임워크는 Swift 전용이라 muxad는
-`Muxa.app/Contents/Helpers`에 포함된 작은 헬퍼 `muxa-afm`을 통해 호출합니다.
-muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `~/Applications/Muxa.app`,
+알려줍니다. 이 프레임워크는 Swift 전용이라 tendd는
+`Tend.app/Contents/Helpers`에 포함된 작은 헬퍼 `tend-afm`을 통해 호출합니다.
+tendd는 헬퍼를 자기 실행 파일 옆, `/Applications/Tend.app`, `~/Applications/Tend.app`,
 `PATH` 순서로 찾고,
 `executable`로 다른 사본을 지정할 수 있습니다. API처럼 세션이 없으므로 대화를
 다시 넣어 보내는데, on-device 컨텍스트에 맞게 6k자로 자르고, 그래도 모델이
@@ -241,13 +241,13 @@ muxad는 헬퍼를 자기 실행 파일 옆, `/Applications/Muxa.app`, `~/Applic
 agent CLI는 shell이 있어서 workspace를 직접 볼 수 있지만, 모델만으로는 볼 수
 없어서 "다른 애플리케이션에 접근할 수 없다"고 답하게 됩니다. 그래서 Global Ask
 턴에서는 헬퍼가 모델에 읽기 전용 도구 두 개를 줍니다. 질문이 온 바로 그 daemon에
-`muxa status --json`과 `muxa recap`을 실행해 답하는 `list_agent_sessions`(추적
+`tend status --json`과 `tend recap`을 실행해 답하는 `list_agent_sessions`(추적
 중인 모든 agent의 pane, 상태, 제목, 디렉터리, 최근 prompt와 응답)와
 `read_agent_session`(pane 하나의 상세)입니다. 읽기만 가능하며 agent에 입력을
 보내거나 무엇을 바꿀 수는 없습니다. 도구를 부를지는 모델이 정하므로 agent와
 무관한 질문에는 아무것도 읽지 않습니다. `on-device`에서는 읽은 내용이 Mac 밖으로
 나가지 않고, `private-cloud`에서는 질문과 함께 Apple의 Private Cloud Compute로
-전송됩니다. `muxa work init` 같은 one-shot 턴에는 도구를 주지 않습니다. 내장
+전송됩니다. `tend work init` 같은 one-shot 턴에는 도구를 주지 않습니다. 내장
 `apple` provider는 모든 host에서 목록에 나오므로 config.toml 하나를 Mac과 Linux
 host가 함께 쓸 수 있고, 실행할 수 없는 host에서 턴을 보내면 "macOS에서만
 실행됩니다"라는 명확한 오류로 실패합니다.
@@ -257,17 +257,17 @@ host가 함께 쓸 수 있고, 실행할 수 없는 host에서 턴을 보내면 
 구동할지 정합니다. 여러 provider가 같은 engine을 공유할 수 있어 업무용과 개인용
 OpenAI 계정, Anthropic 키 두 개, 두 번째 `claude` 바이너리를 나란히 둘 수
 있습니다. 각각 자기 대화를 따로 유지하므로 provider를 바꿔도 새로 시작하지 않고
-이어집니다. `[ask] agent`와 `muxa ask --agent`는 engine이 아니라 provider id를
+이어집니다. `[ask] agent`와 `tend ask --agent`는 engine이 아니라 provider id를
 가리킵니다.
 
 engine id는 그 자체로도 provider라서 `[ask.providers]`가 아예 없어도 새로
-설치한 muxa가 그대로 동작합니다. `muxa ask providers`는 직접 구성한 provider를
+설치한 tend가 그대로 동작합니다. `tend ask providers`는 직접 구성한 provider를
 먼저, 그다음 아직 가려지지 않은 내장 provider를 보여줍니다. 내장 id로 만든
 테이블에 `engine`이 없으면 그 내장 provider를 조정하는 뜻입니다. 예전에 쓴
 `[ask.providers.anthropic] model = "…"`이 지금도 같은 의미인 이유입니다. 그런
 테이블을 제거하면 설정만 지워지고 내장 provider는 그대로 남습니다.
 
-API 키는 순서대로 client가 보낸 1회용 키, muxad 환경의 engine 고유 변수
+API 키는 순서대로 client가 보낸 1회용 키, tendd 환경의 engine 고유 변수
 (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`; CLI는 `CODEX_API_KEY`, `GEMINI_API_KEY`),
 그다음 그 provider의 `api_key_env`가 가리키는 변수에서 읽습니다. 키 자체는
 config.toml에 절대 쓰지 않습니다. 같은 engine을 쓰는 provider 둘은 engine 변수를
@@ -278,20 +278,20 @@ config.toml에 절대 쓰지 않습니다. 같은 engine을 쓰는 provider 둘�
 TUI를 열지 않아도 동일한 daemon 소유 이력을 사용할 수 있습니다.
 
 ```bash
-muxa ask --agent codex "현재 구현을 요약해줘"
-muxa ask --agent claude --detach --json "배포 계획을 검토해줘"
-muxa ask --agent anthropic "reaper가 건드리는 파일은?"
+tend ask --agent codex "현재 구현을 요약해줘"
+tend ask --agent claude --detach --json "배포 계획을 검토해줘"
+tend ask --agent anthropic "reaper가 건드리는 파일은?"
 security find-generic-password -w -s my-codex-key \
-  | muxa ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
-muxa ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정 (다음 재시작 전까지)
-muxa ask provider use codex           # 기본 provider로 지정하고 [ask] agent에 저장
-muxa ask providers [--json]           # 모든 provider: engine, 종류, 모델, 키 확보 여부, 선택 상태
-muxa ask provider add anthropic-work --engine anthropic \
+  | tend ask --agent codex --api-key-stdin "이 저장소를 검토해줘"
+tend ask --agent anthropic-work "…"   # 직접 추가한 provider를 id로 지정 (다음 재시작 전까지)
+tend ask provider use codex           # 기본 provider로 지정하고 [ask] agent에 저장
+tend ask providers [--json]           # 모든 provider: engine, 종류, 모델, 키 확보 여부, 선택 상태
+tend ask provider add anthropic-work --engine anthropic \
   --title "Anthropic (work)" --api-key-env WORK_ANTHROPIC_KEY
-muxa ask provider add claude-work --engine claude --executable /opt/homebrew/bin/claude
-muxa ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
-muxa ask provider set anthropic --clear-model         # 생략한 플래그의 키는 그대로 둡니다
-muxa ask provider remove anthropic-work               # 내장 id는 설정만 지워집니다
+tend ask provider add claude-work --engine claude --executable /opt/homebrew/bin/claude
+tend ask provider set anthropic --model claude-opus-5 --api-key-env WORK_ANTHROPIC_KEY
+tend ask provider set anthropic --clear-model         # 생략한 플래그의 키는 그대로 둡니다
+tend ask provider remove anthropic-work               # 내장 id는 설정만 지워집니다
 ```
 
 `add`는 이미 있는 id, TOML bare key가 아닌 id, 여섯 중에 없는 engine, 그리고 다른
@@ -302,7 +302,7 @@ title·model·키 변수·바이너리를 바꾸고, engine을 바꾸려면 prov
 provider로 넘어갑니다.
 
 `--api-key-stdin`은 interactive terminal 입력을 거부합니다. 키는 owner-only Unix
-socket을 거쳐 선택한 provider의 단 한 번의 child process에만 전달되며 muxa
+socket을 거쳐 선택한 provider의 단 한 번의 child process에만 전달되며 tend
 config/history나 argv에는 저장되지 않습니다. 이 옵션이 없으면 기존 Claude
 Code/Codex 로그인 또는 provider 환경을 그대로 사용합니다.
 
@@ -317,18 +317,18 @@ wake = "idle_only" # idle_only | never
 wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
 max_message_bytes = 16384
-# path = "$XDG_DATA_HOME/muxa/collaboration.json"
+# path = "$XDG_DATA_HOME/tend/collaboration.json"
 # retention_days = 90 # 생략하면 영구 보존
 ```
 
 `auto_spawn_workers`는 고수준 peer 호출에서 worker를 재사용하고 없으면 생성하게 합니다.
 `worker_bypass_permissions`는 기본 false로, provider의 권한과 옵션을 사용하며 bypass
-플래그를 추가하지 않습니다. 자동 worker에 Muxa bypass 프로필을 적용하려면 명시적으로
+플래그를 추가하지 않습니다. 자동 worker에 Tend bypass 프로필을 적용하려면 명시적으로
 켜세요. 수동 실행과 pipeline 실행 프로필은 이 설정의 영향을 받지 않습니다.
 
 같은 stable tmux window에 있는 agent 사이의 durable request/reply 기능입니다.
-과거 optional `path` 기본값은 `$XDG_DATA_HOME/muxa/collaboration.json`입니다.
-Muxa는 기존 JSON을 authoritative sibling `collaboration.sqlite3`에 한 번 import하고
+과거 optional `path` 기본값은 `$XDG_DATA_HOME/tend/collaboration.json`입니다.
+Tend는 기존 JSON을 authoritative sibling `collaboration.sqlite3`에 한 번 import하고
 JSON은 migration backup으로 유지합니다. `.sqlite`, `.sqlite3`, `.db` path를 설정하면
 그 파일을 직접 사용합니다. DB는 mailbox와 exact-session alias/role을 함께 저장합니다.
 `retention_days`는 daemon 시작 시 조건을 만족하는 전달 완료 terminal thread를
@@ -346,7 +346,7 @@ agent를 정확한 pane id로 지정할 수 있습니다.
 ## 메시지 스킬
 
 반복해서 쓰는 prompt 템플릿은 일반 TOML table에 저장하며 watch와 dashboard의
-`m` composer, watch의 `a` composer, MCP의 `muxa_call_peer`가 함께 사용합니다.
+`m` composer, watch의 `a` composer, MCP의 `tend_call_peer`가 함께 사용합니다.
 
 ```toml
 [message.skills]
@@ -356,22 +356,22 @@ agent-review = "cx alias로 codex pane을 새로 만들고, 우리의 변경사�
 직접 파일을 편집하지 않고도 관리할 수 있습니다.
 
 ```bash
-muxa skill add agent-review 'cx alias로 codex pane을 새로 만들고, 우리의 변경사항을 전달해 리뷰해줘'
-muxa skill list
-muxa skill show agent-review
-muxa skill remove agent-review
+tend skill add agent-review 'cx alias로 codex pane을 새로 만들고, 우리의 변경사항을 전달해 리뷰해줘'
+tend skill list
+tend skill show agent-review
+tend skill remove agent-review
 ```
 
 초안의 어느 위치에서든 `/`를 누르고 이름이나 본문을 입력해 검색합니다. 방향키나
 `Tab`으로 선택하고 `Enter`를 누르면 기존 입력을 지우지 않고 현재 커서 위치에
 템플릿이 삽입됩니다. 한 초안에 여러 스킬을 조합할 수도 있습니다. 이때 바로
 전송되지 않으므로 내용을 확인·수정한 뒤 `Enter`를 한 번 더 눌러 보냅니다.
-`muxa watch`의 팔레트에서는 `F2`로 추가/갱신 form을 열고 `Delete`로 선택한 스킬을
+`tend watch`의 팔레트에서는 `F2`로 추가/갱신 form을 열고 `Delete`로 선택한 스킬을
 확인 후 삭제할 수 있습니다. 기존 `Ctrl-A`, `Ctrl-D`도 호환 alias로 유지합니다.
 multi-line 템플릿은 CLI add 명령의 prompt
 자리에 `-`를 넘겨 stdin으로 등록할 수 있습니다.
 
-MCP가 연결된 agent 대화에서는 `/name`으로 같은 템플릿을 `muxa_call_peer`에
+MCP가 연결된 agent 대화에서는 `/name`으로 같은 템플릿을 `tend_call_peer`에
 선택할 수 있고, 선택적인 body와 context가 템플릿을 바꾸지 않은 채 뒤에
 추가됩니다. MCP process는 시작할 때 스킬 table을 읽으므로 스킬을 추가·수정·삭제한
 뒤에는 실행 중인 agent를 재시작하세요.
@@ -423,7 +423,7 @@ icons = "unicode"
 사람이 보는 터미널 출력(`status`, `status-line`, `attend`, `watch`)의 공통
 시각 기본값입니다.
 
-- `theme` — 시각 프리셋: `classic`, `oh-my-muxa`, `focus`, `ops`, 또는
+- `theme` — 시각 프리셋: `classic`, `oh-my-tend`, `focus`, `ops`, 또는
   모노크롬 프리셋. 한 번만 적용하려면 `--theme` 플래그로 덮어씁니다.
 - `icons` — agent 상태 글리프 세트:
   - `unicode` (기본) — Geometric Shapes 글리프(`●` working, `▶` input,
@@ -443,7 +443,7 @@ interval_secs = 30
 discovery는 tmux pane을 훑어 알려진 agent CLI(`claude`/`codex`/`gemini`/`agy`)를
 찾아 hook이 오기 전에 레지스트리를 채웁니다. 데몬 시작 시 1회 실행되고 이후
 `interval_secs`마다 재스캔하므로, 새 tmux 세션에서 갓 시작한 agent가 첫 hook을
-쏘기 전이라도 그 주기 안에 `muxa status`에 뜹니다. `interval_secs = 0`이면
+쏘기 전이라도 그 주기 안에 `tend status`에 뜹니다. `interval_secs = 0`이면
 기존 "시작 시 1회"만, `enabled = false`면 discovery를 완전히 끕니다. 재스캔은
 reconciler가 이미 호출하는 `tmux list-panes`를 재사용하므로 비용은 무시할
 수준입니다.
@@ -456,14 +456,14 @@ restart_on_new_binary = true
 binary_poll_secs = 30
 ```
 
-새 muxa를 설치해도 데몬은 저절로 재시작하지 않습니다. 패키지 매니저는 새 빌드를
+새 tend를 설치해도 데몬은 저절로 재시작하지 않습니다. 패키지 매니저는 새 빌드를
 디스크에 쓰고 `PATH` 위의 링크만 갈아끼우는데, 돌고 있는 프로세스는 열어둔 inode를
 그대로 쓰며 옛 로직을 계속 서빙합니다. 서비스 매니저도 개입하지 않습니다 —
 `KeepAlive`나 `Restart=always`는 프로세스가 *종료될 때* 반응하는데 아무것도 종료되지
 않았기 때문입니다. 그대로 두면 데몬이 몇 주 지난 빌드를 서빙하고, 와이어 포맷이
 바뀐 뒤에는 모든 CLI 호출에 `protocol mismatch`로 답하게 됩니다.
 
-그래서 muxad는 자신이 re-exec할 경로를 감시하다가, 그 경로가 두 번 연속으로 다른
+그래서 tendd는 자신이 re-exec할 경로를 감시하다가, 그 경로가 두 번 연속으로 다른
 파일을 가리키면 새 빌드로 re-exec합니다. 두 번째 확인 폴링은 설치가 끝나지 않은
 중간 상태를 새 빌드로 오인하지 않기 위한 것입니다. 데몬은 제자리에서 자신을
 교체하므로(pid 동일) launchd·systemd·맨 터미널 어디서든 동일하게 동작하고,
@@ -471,8 +471,8 @@ re-exec이 실패해도 옛 이미지가 그대로 살아 있습니다.
 
 업그레이드 순서를 다른 쪽이 관장한다면 — 예를 들어 여러 바이너리를 설치한 뒤 정해진
 순서로 재시작하는 배포라면 — `restart_on_new_binary = false`로 끄십시오. 그때는
-`muxa daemon restart`로 직접 재시작하면 되고, CLI와 버전이 어긋난 데몬은
-`muxa doctor`가 알려줍니다.
+`tend daemon restart`로 직접 재시작하면 되고, CLI와 버전이 어긋난 데몬은
+`tend doctor`가 알려줍니다.
 
 ## Reconciler
 
@@ -487,7 +487,7 @@ paneless_stale_timeout_secs = 86400
 ```
 
 stale state가 오래 남는 것을 줄입니다. timeout 값 `0`은 해당 timeout 비활성화입니다.
-같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`muxa proc register` 참고)는
+같은 루프가 pid-liveness 스윕도 돌려, 등록된 백그라운드 task(`tend proc register` 참고)는
 프로세스가 종료되면 `stopped`로 전환됩니다.
 
 Codex rollout 조회는 전체 `interval_secs` 보정 주기와 별개로 2초마다 실행됩니다.
@@ -500,9 +500,9 @@ Codex rollout 조회는 전체 `interval_secs` 보정 주기와 별개로 2초�
 ## 호스트 간 설정 공유
 
 ```sh
-muxa config export -o muxa-settings.toml      # 설정을 마친 호스트에서
-muxa config diff  muxa-settings.toml          # 다른 호스트에서 미리보기
-muxa config apply muxa-settings.toml          # 그다음 적용
+tend config export -o tend-settings.toml      # 설정을 마친 호스트에서
+tend config diff  tend-settings.toml          # 다른 호스트에서 미리보기
+tend config apply tend-settings.toml          # 그다음 적용
 ```
 
 번들은 평범한 TOML 파일이라 dotfiles를 옮기는 방식(git, `scp`, gist) 그대로
@@ -518,7 +518,7 @@ muxa config apply muxa-settings.toml          # 그다음 적용
   `[agent.<program>].account`. 계정을 바꾸는 자동화 규칙(`swap_account`)은 그
   호스트의 도구에 의존하므로 통째로 남기고, export가 그 사실을 알려 줍니다.
 - **apply는 3-way입니다.** 호스트마다 출처별로 마지막에 적용한 내용을
-  기억합니다(`$XDG_DATA_HOME/muxa/config-sync/`). 로컬 값이 그 base와 같을
+  기억합니다(`$XDG_DATA_HOME/tend/config-sync/`). 로컬 값이 그 base와 같을
   때만 바뀝니다. upstream이 그대로면 로컬 수정은 유지되고, upstream에서 지운
   항목은 동기화가 넣은 것만 지우며, 양쪽에서 바뀐 항목은 충돌입니다. 충돌이
   있으면 직접 정리하거나, 해당 항목을 ignore하거나, `--prefer local|incoming`을
@@ -528,8 +528,8 @@ muxa config apply muxa-settings.toml          # 그다음 적용
   `0` 변경 없음, `1` 변경 있음, `2` 오류나 충돌. 바뀐 항목만 보여 주고 주변
   설정은 보여 주지 않습니다.
 - **안전한 쓰기.** `apply`는 계획된 항목만 고쳐서 다른 곳의 주석과 배치를
-  그대로 둡니다. 파일을 백업하고, muxad를 거쳐 씁니다(검증하며, 그사이 파일이
-  바뀌었으면 거부). Fleet sync와 같은 lock·복구를 씁니다. 적용 후 muxad를
+  그대로 둡니다. 파일을 백업하고, tendd를 거쳐 씁니다(검증하며, 그사이 파일이
+  바뀌었으면 거부). Fleet sync와 같은 lock·복구를 씁니다. 적용 후 tendd를
   재시작해야 반영됩니다.
 
 번들은 어느 호스트에서 왔는지 기억합니다. 다른 출처의 번들은
@@ -546,7 +546,7 @@ ignore = ["pipeline.solo", "automation.rule.confirm-selected-yes", "ticket"]
 자유 텍스트는 쓰인 그대로 옮겨집니다. pipeline prompt, skill, ticket prompt,
 provider option에는 경로나 비밀값이 들어 있을 수 있으니, 번들을 공개하기 전에
 읽어 보거나 남길 항목을 `ignore`하세요. 에이전트 연동(hook, MCP, skill)은
-번들에 들어가지 않습니다. 호스트마다 `muxa init`을 실행하되, 쓰는 provider 홈마다
+번들에 들어가지 않습니다. 호스트마다 `tend init`을 실행하되, 쓰는 provider 홈마다
 `CLAUDE_CONFIG_DIR` / `CODEX_HOME`을 지정하세요.
 
 ## Fleet
@@ -566,22 +566,22 @@ capture_policy = "selected" # selected | never
 environment = "development"
 
 [fleet.local.annotations]
-"muxa.dev/owner" = "platform"
+"tend.dev/owner" = "platform"
 
 [fleet.hosts.dev]
-ssh = "muxa-devbox"
-muxa_path = "muxa"
+ssh = "tend-devbox"
+tend_path = "tend"
 enabled = true
 connect = "auto"            # auto | on_demand
 mode = "observe"            # observe | control
-# remote_socket = "/run/user/1000/muxa.sock"
+# remote_socket = "/run/user/1000/tend.sock"
 
 [fleet.hosts.dev.labels]
 environment = "development"
 region = "icn"
 
 [fleet.hosts.dev.annotations]
-"muxa.dev/owner" = "platform"
+"tend.dev/owner" = "platform"
 ```
 
 Fleet은 controller를 첫 번째 `local` host로 항상 in-process 게시하며 `enabled = false`여도
@@ -592,12 +592,12 @@ host마다 persistent OpenSSH stdio relay 하나를 유지합니다.
 manager 단계에서 차단합니다.
 
 `ssh`에는 flag가 아닌 OpenSSH destination/Host alias를 씁니다. port, identity,
-ProxyJump, host-key 정책은 `~/.ssh/config`에 둡니다. `muxa_path`와 `remote_socket`은
+ProxyJump, host-key 정책은 `~/.ssh/config`에 둡니다. `tend_path`와 `remote_socket`은
 fixed remote command token으로 검증됩니다. label은 Kubernetes-style selector에 쓰고,
 annotation은 설명형 value를 허용하지만 같은 namespaced key 문법을 사용합니다.
-inventory는 `muxa fleet host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
-controller metadata는 `muxa fleet host label local`, `muxa fleet host annotate local`로 관리하며
-muxad가 제공하는 identity label은 덮어쓸 수 없습니다.
+inventory는 `tend fleet host add/label/annotate`로 atomic하게 편집하는 것을 권장합니다.
+controller metadata는 `tend fleet host label local`, `tend fleet host annotate local`로 관리하며
+tendd가 제공하는 identity label은 덮어쓸 수 없습니다.
 [FLEET.ko.md](FLEET.ko.md)를 참고하세요.
 
 ## Dashboard
@@ -626,17 +626,17 @@ dashboard는 명시적으로 public binding을 허용하기 전까지 loopback-o
 
 ```toml
 [dashboard.sharing]
-public_url = "https://muxa.example.com"
+public_url = "https://tend.example.com"
 issuer_url = "https://login.example.com"
-client_id = "muxa-dashboard"
-client_secret_env = "MUXA_SHARING_CLIENT_SECRET" # 필요한 경우 환경 변수 이름 지정
+client_id = "tend-dashboard"
+client_secret_env = "TEND_SHARING_CLIENT_SECRET" # 필요한 경우 환경 변수 이름 지정
 # storage_path = "/absolute/path/to/shares.sqlite3" # 선택: 비공개 로컬 파일의 절대 경로
 ```
 
 `public_url`은 경로·query·fragment가 없는 origin이어야 합니다. 설정 변경 후 daemon을 재시작하세요.
 Window 공유에는 초대 시점의 pane 프로세스가 최대 16개 포함되며, 이후 만든 pane은 포함되지 않습니다.
 
-OIDC 제공자에 `https://muxa.example.com/share/auth/callback`을 등록하고,
+OIDC 제공자에 `https://tend.example.com/share/auth/callback`을 등록하고,
 ID 토큰에 검증된 이메일(`email_verified = true`)이 포함되도록 설정합니다.
 외부 접속에는 HTTPS 프록시가 필요합니다. 공유 링크·회수 상태·계정 연결·명령 처리 기록은 비공개 SQLite 파일에 저장됩니다.
 daemon 재시작 후 같은 pane 프로세스가 살아 있으면 링크를 계속 사용할 수 있고,
@@ -646,7 +646,7 @@ daemon 재시작 후 같은 pane 프로세스가 살아 있으면 링크를 계�
 운영자는 **Shares → Check login setup**에서 로그인 제공자의 discovery와 서명 키 연결을 진단할 수 있습니다.
 이 검사는 client secret이나 실제 계정의 claim을 검증하지 않습니다.
 `storage_path`로 저장 파일의 절대 경로를 지정할 수 있으며, 기본 위치는 플랫폼 데이터
-디렉터리의 `muxa/dashboard-sharing/shares.sqlite3`입니다. 같은 저장 파일을 두 daemon이
+디렉터리의 `tend/dashboard-sharing/shares.sqlite3`입니다. 같은 저장 파일을 두 daemon이
 동시에 사용할 수 없습니다. 저장 실패 시 변경을 완료했다고 응답하거나 새 명령을 실행하지
 않습니다. 브라우저는 응답이 유실된 명령을 같은 요청 ID로 확인하여 중복 실행을 막습니다.
 
@@ -660,8 +660,8 @@ forward합니다. 자세한 내용은 [SINKS.md](SINKS.md).
 
 ## Pane host 선택
 
-`MUXA_HOST=tmux|cmux|rmux|herdr|zellij`로 단일 host를 고정할 수 있습니다.
-`MUXA_HOSTS`에는 `MUXA_HOSTS=rmux,tmux`처럼 순서가 있는 host 목록을 지정합니다.
+`TEND_HOST=tmux|cmux|rmux|herdr|zellij`로 단일 host를 고정할 수 있습니다.
+`TEND_HOSTS`에는 `TEND_HOSTS=rmux,tmux`처럼 순서가 있는 host 목록을 지정합니다.
 rmux가 tmux 호환 환경변수도 함께 설정하므로 native `RMUX` 환경변수를 먼저
 판별합니다. 자세한 내용은 [CMUX.md](CMUX.md), [RMUX.md](RMUX.md), [HERDR.md](HERDR.md),
 [ZELLIJ.md](proposals/ZELLIJ.md)을 참고하세요.

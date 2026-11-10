@@ -1,14 +1,14 @@
 # Screen-manifest fallback detection
 
-Status: **implemented.** Core in `muxa::screen`, daemon task in
-`muxad::screen_detect`, shared synthetic-row machinery in `muxad::synthetic`.
+Status: **implemented.** Core in `tend::screen`, daemon task in
+`tendd::screen_detect`, shared synthetic-row machinery in `tendd::synthetic`.
 
-muxa gets authoritative agent state from **hooks** (Claude Code, Codex, Gemini,
+tend gets authoritative agent state from **hooks** (Claude Code, Codex, Gemini,
 Antigravity), from Codex session-rollout events polled every two seconds,
 and, on herdr hosts, from **herdr's own detection** bridged into synthetic rows
 (`docs/HERDR.md`). For every *other* agent CLI — cursor-agent, amp, copilot,
 aider, goose, and anything a user declares — there is no event stream at all.
-`agy` sits in both camps: muxa ships hooks for it, *and* a bundled manifest —
+`agy` sits in both camps: tend ships hooks for it, *and* a bundled manifest —
 because agy's hooks cannot report an approval prompt, so screen inference stays
 live on agy panes even when hooks are wired. See
 [Attention refinement](#attention-refinement-the-one-exception).
@@ -19,7 +19,7 @@ Screen-manifest detection is the last-resort fallback herdr validated: capture
 the pane and match TOML-declared regex rules against the visible tail to infer
 `Working` / `WaitingInput` / `Idle`.
 
-This is deliberately the **weakest** signal in muxa's precedence chain, and the
+This is deliberately the **weakest** signal in tend's precedence chain, and the
 mechanics are built so it can never override a stronger one.
 
 ## Precedence invariant
@@ -67,12 +67,12 @@ idle    = ['(?m)^\s*>\s*$']
 ```
 
 - `[agent].name` — the display name carried into the synthetic row's **`model`**
-  field (the row's `AgentKind` stays `Unknown`, since these agents have no muxa
+  field (the row's `AgentKind` stays `Unknown`, since these agents have no tend
   kind). It is also the **override key** (see below).
 - `[agent].command` — one or more command names. Matching is on the **basename**,
   **case-insensitive** (`/usr/local/bin/Cursor-Agent` → `cursor-agent`),
   mirroring `discovery::classify_command`. tmux only exposes the foreground
-  command basename, and muxa matches that basename only — there is **no
+  command basename, and tend matches that basename only — there is **no
   process-tree walk**, so an agent that runs under a `node`/`python` wrapper
   won't be picked up unless its foreground command is the agent binary itself.
 - `[rules]` — three optional regex lists. Each compiles to a `regex::RegexSet`;
@@ -81,7 +81,7 @@ idle    = ['(?m)^\s*>\s*$']
   Unicode literals (spinner glyphs) all work. An omitted category matches
   nothing.
 - **Unknown top-level keys are tolerated** (not rejected) so a manifest written
-  for a newer muxa still loads its known rules. A malformed regex, empty
+  for a newer tend still loads its known rules. A malformed regex, empty
   `name`, or empty `command`, or invalid TOML, makes the file fail to load —
   logged at `warn`, file skipped, never a crash.
 
@@ -119,7 +119,7 @@ in a **fixed order**, and every choice below is deliberate:
 
 ### State mapping (shared with the herdr bridge)
 
-| `ScreenState` | synthetic event                       | resulting muxa state |
+| `ScreenState` | synthetic event                       | resulting tend state |
 |---------------|---------------------------------------|----------------------|
 | `Working`     | `ToolStarted { tool = <name> }`       | `Working`            |
 | `Blocked`     | `NotificationFired(NeedsInput)`       | `WaitingInput`       |
@@ -134,7 +134,7 @@ prompt text).
 
 ### Row liveness
 
-When a pane muxa was tracking stops being a candidate — its foreground command
+When a pane tend was tracking stops being a candidate — its foreground command
 changed away from the agent (the agent exited but the shell stayed open) — the
 task drives that synthetic row to `Stopped` via `synthetic::stop_synthetic_row`
 (a `SessionEnded`), so it doesn't freeze at `Working`/`WaitingInput` forever
@@ -145,12 +145,12 @@ so GC won't evict it). Pane *close* is still handled by the reconciler as usual.
 
 Hook-authoritative precedence has exactly one carve-out. An agent CLI whose
 hooks cannot report "waiting on the operator" would otherwise be able to reach
-`WaitingInput` only by *not* installing muxa's hooks — the wrong trade. Today
+`WaitingInput` only by *not* installing tend's hooks — the wrong trade. Today
 that is the Antigravity CLI (`agy`); `AgentKind::hooks_report_attention()` is
 the predicate, and Claude Code, Codex, the Gemini CLI and opencode all return
 `true` and keep the original behavior unchanged.
 
-For an attention-blind row, `muxad::synthetic::pane_ownership` returns
+For an attention-blind row, `tendd::synthetic::pane_ownership` returns
 `AttentionBlind` instead of `Hooked`, and the detector applies
 `attention_refinement_events` to the **real** row:
 
@@ -188,19 +188,19 @@ not match. The newest visible recap is capped at 2 KB and stored in
 `last_activity_at`, change state, create a synthetic row, or emit a transition.
 
 That single field already feeds the existing summary priority (`response → recap → title
-→ prompt`) in `muxa watch`, `muxa status`, Fleet/macOS views, and `muxa
+→ prompt`) in `tend watch`, `tend status`, Fleet/macOS views, and `tend
 peek`. Peek also parses the fresh backdrop capture locally, closing the interval
 between Codex rendering a recap and the daemon's next detection tick.
 
 ## Manifest sources
 
 1. **Bundled** — `agy`, `codex`, `cursor`, `amp`, `copilot`, `aider`, `goose` ship in the
-   binary via `include_str!` (`crates/muxa/src/screen/agents/*.toml`).
-2. **User overrides** — `$XDG_CONFIG_HOME/muxa/agents/*.toml`. `XDG_CONFIG_HOME`
+   binary via `include_str!` (`crates/tend/src/screen/agents/*.toml`).
+2. **User overrides** — `$XDG_CONFIG_HOME/tend/agents/*.toml`. `XDG_CONFIG_HOME`
    is honored **first and explicitly** so the path works cross-platform: on
    macOS `dirs::config_dir()` returns `~/Library/Application Support` and ignores
    `XDG_CONFIG_HOME`, which would otherwise silently miss overrides. Falls back
-   to the platform config dir's `muxa/agents` when `XDG_CONFIG_HOME` is unset.
+   to the platform config dir's `tend/agents` when `XDG_CONFIG_HOME` is unset.
 
 A user file whose `[agent].name` **matches** a bundled manifest **replaces** it
 wholesale; a new name is **appended**. Files are loaded in sorted order; parse
@@ -209,7 +209,7 @@ failures `warn` + skip.
 ### Bundled-manifest confidence
 
 The bundled manifests are **best-effort and conservative**, written **without
-running** the CLIs (muxa's CI can't drive them), and every file says so in a
+running** the CLIs (tend's CI can't drive them), and every file says so in a
 header comment. `agy` is the exception: its patterns were derived from a real
 agy 1.1.17 session — captured tmux panes for `working`/`idle`, and agy's own
 confirmation-widget labels for `blocked` — so its confidence is materially
@@ -238,8 +238,8 @@ a user override — that is the intended path to high-confidence detection.
 
 ## Daemon task
 
-Configured by `[screen_detect]` (`crates/muxa/src/config.rs`, `enabled` default
-`true`, `interval_secs` default `3`). Spawned in `muxad` alongside the herdr
+Configured by `[screen_detect]` (`crates/tend/src/config.rs`, `enabled` default
+`true`, `interval_secs` default `3`). Spawned in `tendd` alongside the herdr
 tasks, **only** when: the feature is enabled, at least one **detectable**
 backend exists (non-herdr with `caps().capture_pane`), and at least one manifest
 loaded. Otherwise it returns `None` and never runs.
@@ -268,7 +268,7 @@ background producers.
 ## Shared helpers (refactor)
 
 The synthetic-row mechanics the herdr bridge already had were **extracted** into
-`muxad::synthetic` and are now shared verbatim, rather than copy-pasted:
+`tendd::synthetic` and are now shared verbatim, rather than copy-pasted:
 
 - `occupant_is_authoritative` — the "live non-synthetic row owns the pane" rule.
 - `apply_if_unowned` — the by-pane authoritative check + apply (herdr's
@@ -280,7 +280,7 @@ The synthetic-row mechanics the herdr bridge already had were **extracted** into
   onto `SyntheticState` and calls this; the event shapes are byte-identical, so
   every herdr-bridge test still passes).
 
-`muxa::discovery::synthetic_session_id` was made `pub` so screen detection mints
+`tend::discovery::synthetic_session_id` was made `pub` so screen detection mints
 the same registry key.
 
 ## Limitations
