@@ -454,7 +454,8 @@ async fn prepare_checkout(
         paths.run.display().to_string(),
         plan.request.commit.clone(),
     ]);
-    add_worktree_with_receipt(&args, plan, paths, socket).await?;
+    // Boxed: the dispatch future runs on small test-thread stacks.
+    Box::pin(add_worktree_with_receipt(&args, plan, paths, socket)).await?;
     if paths.run.join(".gitmodules").exists() {
         git(
             &[
@@ -520,7 +521,7 @@ pub async fn execute(
     };
     reserve(&path, &record)?;
     let outcome: Result<Value> = async {
-        prepare_checkout(&plan, &paths, client.socket()).await?;
+        Box::pin(prepare_checkout(&plan, &paths, client.socket())).await?;
         let request = WorkUpRequest {
             work: plan.request.work.clone(), external: None,
             pipeline: Some(plan.pipeline.clone()), workspace: Some(plan.request.workspace.clone()),
