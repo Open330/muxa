@@ -15,6 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider approval pauses on handed-over collaboration requests now create a
   durable, immediate Muxa Inbox recovery item. The original request stays open
   across restart and resumes without resending when the recipient continues.
+- On macOS, a worker launch whose process has exited is now recognised as
+  exited, so `muxa workers release` frees it and muxad closes it on its own.
+  Before, a closed pane left the launch holding room capacity forever, and
+  the release command timed out after 3s instead of showing muxad's answer.
 
 ## [0.9.8] - 2026-11-06
 
