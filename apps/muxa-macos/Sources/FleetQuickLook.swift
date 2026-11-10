@@ -272,6 +272,7 @@ struct FleetQuickLookView: View {
                     screen = capture.screenText.map { FleetQuickLookText.plain($0) } ?? ""
                     captureError = nil
                 } catch {
+                    if Task.isCancelled || error is CancellationError { return }
                     captureError = error.localizedDescription
                 }
             }

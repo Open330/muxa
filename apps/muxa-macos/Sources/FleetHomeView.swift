@@ -433,8 +433,7 @@ private struct FleetLaneColumn: View {
                             FleetWorkCard(
                                 work: work,
                                 isSelected: work.id == selectedID,
-                                select: { select(work.id) },
-                                open: open
+                                select: { select(work.id) }
                             )
                         }
                     }
@@ -515,7 +514,6 @@ private struct FleetWorkCard: View {
     let work: FleetWork
     let isSelected: Bool
     let select: () -> Void
-    let open: (MuxaHostedAgent) -> Void
     @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
@@ -547,11 +545,6 @@ private struct FleetWorkCard: View {
                 Label("Rate limited · the limit policy will resume it", systemImage: "arrow.triangle.2.circlepath")
                     .font(MuxaType.meta)
                     .foregroundStyle(.secondary)
-            }
-            if work.lane == .needsYou, let focus = work.focus {
-                Button("Open") { open(focus) }
-                    .buttonStyle(.muxaPrimary)
-                    .controlSize(.small)
             }
             HStack(spacing: 6) {
                 if let repo = work.repo {

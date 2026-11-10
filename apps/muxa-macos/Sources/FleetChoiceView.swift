@@ -24,14 +24,19 @@ struct FleetChoicePanel<Fallback: View>: View {
         self.fallback = fallback
     }
 
+    /// Which body shows depends on what was read, never on a read being in
+    /// flight: swapping bodies mid-read cancelled the read, and the
+    /// cancellation showed as an error and started the read over.
     var body: some View {
-        if dialog == nil, !loading, hosted.agent.state != "waiting_choice" {
-            // Nothing to pick on screen: the agent takes typed words.
-            fallback()
-                .task(id: hosted.agent.stateEnteredAt) { await load() }
-        } else {
-            choiceBody
+        Group {
+            if dialog != nil || hosted.agent.state == "waiting_choice" {
+                choiceBody
+            } else {
+                // Nothing to pick on screen: the agent takes typed words.
+                fallback()
+            }
         }
+        .task(id: hosted.agent.stateEnteredAt) { await load() }
     }
 
     private var choiceBody: some View {
@@ -115,7 +120,6 @@ struct FleetChoicePanel<Fallback: View>: View {
                     .foregroundStyle(.green)
             }
         }
-        .task(id: hosted.agent.stateEnteredAt) { await load() }
     }
 
     private func capture() async throws -> FleetChoiceDialog? {
@@ -128,11 +132,22 @@ struct FleetChoicePanel<Fallback: View>: View {
         loading = true
         defer { loading = false }
         do {
-            dialog = try await capture()
+            let read = try await capture()
+            guard !Task.isCancelled else { return }
+            dialog = read
             error = nil
         } catch {
+            // A read cut short (the agent moved on, the view went away) is
+            // not something the person has to act on.
+            if Self.isCancellation(error) || Task.isCancelled { return }
             self.error = error.localizedDescription
         }
+    }
+
+    static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let url = error as? URLError, url.code == .cancelled { return true }
+        return (error as NSError).domain == NSCocoaErrorDomain && (error as NSError).code == NSUserCancelledError
     }
 
     /// Moves the dialog's cursor to the option with the arrow keys and
@@ -182,6 +197,7 @@ struct FleetChoicePanel<Fallback: View>: View {
                 dialog = after
                 status = String(localized: "Chose \(option.number). \(option.label)")
             } catch {
+                if Self.isCancellation(error) { return }
                 self.error = error.localizedDescription
             }
         }
