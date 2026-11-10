@@ -794,16 +794,28 @@ def migrate_shell_and_tmux(m: Migration):
 EDITED_MUX_CONFS: list[Path] = []
 
 
+def mux_servers() -> list[list[str]]:
+    """Command prefixes for every multiplexer server to migrate: the default
+    tmux and rmux servers and tmux on an explicitly configured socket."""
+    servers = [[mux] for mux in ("tmux", "rmux") if have(mux)]
+    if have("tmux"):
+        for var in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET"):
+            prefix = ["tmux", "-S", os.environ[var]] if os.environ.get(var) else None
+            if prefix and prefix not in servers:
+                servers.append(prefix)
+    return servers
+
+
 def reload_mux_configs(m: Migration):
     """A running tmux/rmux server keeps the old key bindings (prefix+s runs
     `muxa watch`) until it re-reads its config, as `tend init` makes it do."""
-    for mux in ("tmux", "rmux"):
-        if not have(mux) or not capture([mux, "list-sessions", "-F", "#{session_id}"]).strip():
+    for prefix in mux_servers():
+        if not capture(prefix + ["list-sessions", "-F", "#{session_id}"]).strip():
             continue
         for conf in EDITED_MUX_CONFS:
-            if conf.name == ".rmux.conf" and mux != "rmux":
+            if conf.name == ".rmux.conf" and prefix[0] != "rmux":
                 continue
-            m.run([mux, "source-file", str(conf)], f"{mux}: reload {conf}")
+            m.run(prefix + ["source-file", str(conf)], f"{' '.join(prefix)}: reload {conf}")
 
 
 # Global multiplexer variables whose values are paths or backend names.
@@ -814,9 +826,7 @@ def migrate_live_tmux(m: Migration):
     """Copy @muxa_* user options on live sessions/windows/panes to @tend_*,
     so running Work keeps its identity, then unset the old ones."""
     print("\nLive tmux and rmux options")
-    servers = [[mux] for mux in ("tmux", "rmux") if have(mux)]
-    if have("tmux"):
-        servers += [["tmux", "-S", os.environ[v]] for v in ("MUXA_TMUX_SOCKET", "TEND_TMUX_SOCKET") if os.environ.get(v)]
+    servers = mux_servers()
     for tmux in servers:
         sessions = capture(tmux + ["list-sessions", "-F", "#{session_id}"]).split()
         if not sessions:
