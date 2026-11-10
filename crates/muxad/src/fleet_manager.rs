@@ -348,6 +348,7 @@ impl LocalTask {
                     // A `work` child may run for its whole budget; never let
                     // it stall local refreshes and transition handling.
                     let Some(command) = self.spawn_work_command(command) else { continue; };
+                    let Some(command) = spawn_worktree_inventory(command) else { continue; };
                     let result = self.execute(command.operation).await;
                     let _ = command.reply.send(result);
                 }
@@ -448,12 +449,9 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "send_keys", keys.len());
                 local_send_keys(&self.backends, pane, keys).await
             }
+            // Runs in its own task; see `spawn_worktree_inventory`.
             FleetOperation::WorktreeInventory => {
-                audit_operation(LOCAL_HOST_ALIAS, "worktree_inventory", 0);
-                tokio::task::spawn_blocking(|| muxa::worktree_inventory::inventory(false))
-                    .await
-                    .map(FleetCommandResult::worktrees)
-                    .map_err(|error| format!("worktree inventory failed: {error}"))
+                Err("worktree inventory runs in its own task".into())
             }
             FleetOperation::CollaborationSend { pane, request } => {
                 exact_local_backend(&self.backends, &pane).await?;
@@ -581,6 +579,35 @@ async fn run_local_work_command(
     .await
     .map(FleetCommandResult::command)
     .map_err(|error| error.to_string())
+}
+
+/// One worktree scan at a time on this host.
+static WORKTREE_SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+
+/// Runs the local worktree inventory in its own task, so a slow disk never
+/// stalls refreshes, transitions or other commands, or hands any other
+/// command back. A second request while one runs is refused.
+fn spawn_worktree_inventory(command: HostCommand) -> Option<HostCommand> {
+    if !matches!(command.operation, FleetOperation::WorktreeInventory) {
+        return Some(command);
+    }
+    let reply = command.reply;
+    let Ok(permit) = WORKTREE_SCAN.try_acquire() else {
+        let _ = reply.send(Err(
+            "a worktree check is already running on this host".into()
+        ));
+        return None;
+    };
+    audit_operation(LOCAL_HOST_ALIAS, "worktree_inventory", 0);
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(|| muxa::worktree_inventory::inventory(false))
+            .await
+            .map(FleetCommandResult::worktrees)
+            .map_err(|error| format!("worktree inventory failed: {error}"));
+        drop(permit);
+        let _ = reply.send(result);
+    });
+    None
 }
 
 /// The worktree inventory goes only to a relay that says it answers it; an

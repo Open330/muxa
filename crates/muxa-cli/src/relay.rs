@@ -411,6 +411,12 @@ async fn handle_request(
             })
         }
         RelayRequest::WorktreeInventory { request_id } => {
+            // One scan at a time; the scan bounds itself (see
+            // `muxa::worktree_inventory::SCAN_BUDGET`).
+            static SCAN: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+            let Ok(_permit) = SCAN.try_acquire() else {
+                bail!("a worktree check is already running on this host");
+            };
             let rows = tokio::task::spawn_blocking(|| muxa::worktree_inventory::inventory(false))
                 .await
                 .context("worktree inventory task panicked")?;

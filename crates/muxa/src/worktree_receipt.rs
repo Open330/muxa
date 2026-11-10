@@ -176,16 +176,18 @@ fn common_dir(path: &Path) -> Option<PathBuf> {
 }
 
 fn git_path(path: &Path, flag: &str) -> Option<PathBuf> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(path)
-        .args(["rev-parse", "--path-format=absolute", flag])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let args: [&std::ffi::OsStr; 5] = [
+        "-C".as_ref(),
+        path.as_os_str(),
+        "rev-parse".as_ref(),
+        "--path-format=absolute".as_ref(),
+        flag.as_ref(),
+    ];
+    let (ok, stdout) = crate::worktree_inventory::bounded("git", &args)?;
+    if !ok {
         return None;
     }
-    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let text = stdout.trim().to_string();
     if text.is_empty() {
         return None;
     }

@@ -14,7 +14,9 @@
 //! blocker. A worktree with no blocker is only a candidate: muxa does not
 //! yet know whether its Work is finished, and nothing is removed.
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -40,14 +42,110 @@ pub struct WorktreeRow {
 /// `all` also lists attempts that never finished or failed.
 #[must_use]
 pub fn inventory(all: bool) -> Vec<WorktreeRow> {
+    let deadline = Instant::now() + SCAN_BUDGET;
+    DEADLINE.with(|cell| cell.set(Some(deadline)));
     let panes = observe_panes();
-    crate::worktree_receipt::list()
+    let rows = crate::worktree_receipt::list()
         .into_iter()
+        .rev()
         .filter(|receipt| all || receipt.state == ReceiptState::Created)
-        .map(|receipt| inspect(receipt, &panes))
-        .collect()
+        .take(MAX_ROWS)
+        .map(|receipt| {
+            if Instant::now() >= deadline {
+                return out_of_time(receipt);
+            }
+            let mut row = inspect(receipt, &panes);
+            if Instant::now() >= deadline && row.candidate {
+                // A check cut short reads as a failure; say why.
+                row.candidate = false;
+                row.blockers.push(OUT_OF_TIME.into());
+            }
+            row
+        })
+        .collect();
+    DEADLINE.with(|cell| cell.set(None));
+    rows
 }
 
+/// The whole scan's budget: a host answers within it, however many trees
+/// or however slow its disks. Trees left when it runs out are listed as not
+/// checked.
+pub const SCAN_BUDGET: Duration = Duration::from_secs(20);
+/// One git or du call's budget; a child that overruns is killed.
+pub const COMMAND_BUDGET: Duration = Duration::from_secs(5);
+/// At most this many rows, newest receipts first, so a reply stays far below
+/// the relay frame ceiling.
+pub const MAX_ROWS: usize = 300;
+/// At most this much of a child's output is kept.
+const MAX_OUTPUT: u64 = 1024 * 1024;
+const OUT_OF_TIME: &str = "muxa ran out of time checking it";
+
+thread_local! {
+    /// The running scan's deadline, on the thread doing it.
+    static DEADLINE: Cell<Option<Instant>> = const { Cell::new(None) };
+}
+
+fn out_of_time(receipt: WorktreeReceipt) -> WorktreeRow {
+    WorktreeRow {
+        receipt,
+        candidate: false,
+        blockers: vec![OUT_OF_TIME.into()],
+        current_branch: None,
+        bytes: None,
+    }
+}
+
+/// Runs `program args` and returns whether it exited 0 and up to 1 MiB of
+/// its stdout, or None when it could not start or ran past its budget (the
+/// smaller of [`COMMAND_BUDGET`] and what the scan has left); an overrunning
+/// child is killed and reaped.
+pub(crate) fn bounded(program: &str, args: &[&std::ffi::OsStr]) -> Option<(bool, String)> {
+    use std::io::Read as _;
+    let now = Instant::now();
+    let budget = DEADLINE.with(Cell::get).map_or(COMMAND_BUDGET, |deadline| {
+        deadline.saturating_duration_since(now).min(COMMAND_BUDGET)
+    });
+    if budget.is_zero() {
+        return None;
+    }
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    // Read on another thread so a chatty child never blocks on a full pipe;
+    // keep the first MiB and throw the rest away.
+    let reader = std::thread::spawn(move || {
+        let mut kept = Vec::new();
+        let mut pipe = stdout;
+        let _ = (&mut pipe).take(MAX_OUTPUT).read_to_end(&mut kept);
+        let _ = std::io::copy(&mut pipe, &mut std::io::sink());
+        kept
+    });
+    let deadline = now + budget;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let output = reader.join().unwrap_or_default();
+    let status = status?;
+    Some((
+        status.success(),
+        String::from_utf8_lossy(&output).into_owned(),
+    ))
+}
+
+/// Every pane's directory on every active backend, and whether every
 /// backend answered in full.
 struct Panes {
     cwds: Vec<PathBuf>,
@@ -261,27 +359,19 @@ fn default_base(repo: &Path) -> Option<String> {
     .filter(|out| !out.is_empty())
 }
 
-/// stdout of a successful git command; None when git failed.
+/// stdout of a successful git command; None when git failed or overran.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
-    output
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    let mut command_line: Vec<&std::ffi::OsStr> = vec!["-C".as_ref(), dir.as_os_str()];
+    command_line.extend(args.iter().map(std::ffi::OsStr::new));
+    let (ok, stdout) = bounded("git", &command_line)?;
+    ok.then_some(stdout)
 }
 
 fn size(path: &Path) -> Option<u64> {
-    let output = std::process::Command::new("du")
-        .arg("-sk")
-        .arg(path)
-        .output()
-        .ok()?;
-    let text = String::from_utf8_lossy(&output.stdout);
+    let (ok, text) = bounded("du", &["-sk".as_ref(), path.as_os_str()])?;
+    if !ok {
+        return None;
+    }
     text.split_whitespace()
         .next()?
         .parse::<u64>()
@@ -292,6 +382,19 @@ fn size(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_child_that_overruns_the_scan_is_killed() {
+        DEADLINE.with(|cell| cell.set(Some(Instant::now() + Duration::from_millis(200))));
+        let started = Instant::now();
+        assert!(bounded("sleep", &["5".as_ref()]).is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        DEADLINE.with(|cell| cell.set(None));
+        assert_eq!(
+            bounded("echo", &["hi".as_ref()]),
+            Some((true, "hi\n".into()))
+        );
+    }
     use crate::worktree_receipt::ReceiptOrigin;
     use time::OffsetDateTime;
 
