@@ -331,6 +331,37 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn the_same_session_reporting_from_elsewhere_does_not_take_the_delivery() {
+        use crate::PromptOrigin;
+        let store = Store::shared();
+        start(&store).await;
+        let _ = store
+            .expect_prompt(
+                "rmux:%7",
+                Some("/test.sock"),
+                "continue",
+                PromptOrigin::Peer,
+            )
+            .await
+            .unwrap();
+        // The session resumed on another server: not the prompt tend typed.
+        submit(&store, "original", "/other.sock", "continue").await;
+        let elsewhere = store
+            .by_pane("rmux:%7")
+            .await
+            .into_iter()
+            .find(|agent| agent.tmux_socket.as_deref() == Some("/other.sock"))
+            .and_then(|agent| agent.last_prompt_origin);
+        assert_ne!(elsewhere, Some(PromptOrigin::Peer));
+        // Back where tend typed it, the delivery is still there.
+        submit(&store, "original", "/test.sock", "continue").await;
+        assert_eq!(
+            origin_of(&store, "original").await,
+            Some(PromptOrigin::Peer)
+        );
+    }
+
     #[test]
     fn callers_may_declare_only_a_person_peer_or_automation() {
         use crate::PromptOrigin;

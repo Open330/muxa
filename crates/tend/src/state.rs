@@ -494,6 +494,10 @@ struct ExpectedPrompt {
     token: u64,
     /// The one agent session tend tracked on the pane when it registered.
     session: String,
+    /// Where tend typed it: a hook from that session elsewhere (resumed in
+    /// another pane or on another server) is a different prompt.
+    pane: String,
+    socket: Option<String>,
     text: String,
     origin: PromptOrigin,
     registered_at: OffsetDateTime,
@@ -1469,6 +1473,8 @@ impl Store {
         expected.push(ExpectedPrompt {
             token,
             session: session.clone(),
+            pane: pane.to_string(),
+            socket: socket.map(str::to_string),
             text: text.to_string(),
             origin,
             registered_at: now,
@@ -1486,7 +1492,8 @@ impl Store {
     }
 
     /// The origin of a prompt `agent` just reported at `at`: the oldest live
-    /// registration for this session and exact text, made no later than the
+    /// registration for this session, pane, endpoint and exact text, made no
+    /// later than the
     /// hook's own time, consumed; else unknown. A hook stamped before the
     /// registration is an older prompt and never takes it.
     fn take_expected_prompt(
@@ -1499,7 +1506,15 @@ impl Store {
         let now = OffsetDateTime::now_utc();
         expected.retain(|entry| entry.until > now);
         let found = expected.iter().position(|entry| {
-            entry.session == agent.session_id && entry.text == prompt && at >= entry.registered_at
+            entry.session == agent.session_id
+                && agent.pane.as_deref() == Some(entry.pane.as_str())
+                && crate::backend::pane_endpoints_match(
+                    Some(&entry.pane),
+                    entry.socket.as_deref().unwrap_or(""),
+                    agent.tmux_socket.as_deref().unwrap_or(""),
+                )
+                && entry.text == prompt
+                && at >= entry.registered_at
         });
         found.map_or(PromptOrigin::Unknown, |index| expected.remove(index).origin)
     }
