@@ -3524,7 +3524,15 @@ fn composer_draft(screen: &str, kind: AgentKind) -> Option<String> {
                 && text
                     .split_once(". ")
                     .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
-            if menu_row || CODEX_PLACEHOLDERS.contains(&text.as_str()) {
+            // A narrow pane cuts the placeholder at a word boundary
+            // (`› Ask Codex to`), the rest wrapping below; that is no draft.
+            let cut_placeholder = text.chars().count() >= 8
+                && CODEX_PLACEHOLDERS.iter().any(|placeholder| {
+                    placeholder
+                        .strip_prefix(text.trim_end_matches('…'))
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(' '))
+                });
+            if menu_row || CODEX_PLACEHOLDERS.contains(&text.as_str()) || cut_placeholder {
                 return None;
             }
             text

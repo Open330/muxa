@@ -207,6 +207,16 @@ fn prepare_with(
         },
     );
     let (state, reason) = match resume {
+        // Codex asks before running hooks that are new or changed. Accepting
+        // lets them run outside the sandbox, so it stays the user's call.
+        _ if kind == AgentKind::Codex && codex_hook_review(&last.borrow()) => (
+            State::Blocked,
+            Some(
+                "Codex asks to review new or changed hooks before it starts; answer it in the \
+                 pane (tend does not trust hooks for you), then prepare the worker again"
+                    .into(),
+            ),
+        ),
         Resume::Ready
             if turn_running(&last.borrow()) || composer_draft(&last.borrow(), kind).is_some() =>
         {
@@ -231,6 +241,13 @@ fn prepare_with(
         answered: answered.into_iter().map(str::to_owned).collect(),
         reason,
     }
+}
+
+/// Codex's startup review of new or changed hooks, still on screen.
+fn codex_hook_review(screen: &str) -> bool {
+    let tail = super::screen_tail(screen, 20);
+    tail.contains("Hooks need review")
+        && (tail.contains("Trust all and continue") || tail.contains("Review hooks"))
 }
 
 #[cfg(test)]
@@ -432,6 +449,54 @@ mod tests {
             assert_eq!(result.state, State::Blocked);
         }
     }
+    #[test]
+    fn codex_hook_review_is_a_named_blocker_and_never_answered() {
+        let screen = "  Hooks need review\n  6 hooks are new or changed.\n  Hooks can run outside the\n  sandbox after you trust\n  them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting\n     (hooks won't run)\n  enter confirm · esc skip";
+        let clock = FakeClock {
+            base: Instant::now(),
+            elapsed: Cell::new(Duration::ZERO),
+        };
+        let result = prepare_with(
+            &clock,
+            AgentKind::Codex,
+            || Some(screen.into()),
+            || true,
+            |_| panic!("must not answer a hook review"),
+            true,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        );
+        assert_eq!(result.state, State::Blocked);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("review new or changed hooks"),
+            "{result:?}"
+        );
+        assert!(result.answered.is_empty());
+    }
+
+    #[test]
+    fn a_narrow_codex_placeholder_is_not_a_draft() {
+        let screen = "  permissions: YOLO mode\n› Ask Codex to\n  G…  ⚠ 1 · f2";
+        assert_eq!(
+            crate::account_swap::composer_draft(screen, AgentKind::Codex),
+            None
+        );
+        let typed = "› Ask Codex to fix it\n  G…  ⚠ 1 · f2";
+        assert_eq!(
+            crate::account_swap::composer_draft(typed, AgentKind::Codex).as_deref(),
+            Some("Ask Codex to fix it")
+        );
+        assert_eq!(
+            crate::account_swap::composer_draft("› Ask\n", AgentKind::Codex).as_deref(),
+            Some("Ask")
+        );
+    }
+
     #[test]
     fn narrow_claude_hard_wrapping_is_handled_without_guessing_other_dialogs() {
         let count = Cell::new(0);
