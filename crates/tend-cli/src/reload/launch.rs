@@ -162,56 +162,105 @@ impl LaunchWatch {
 /// slow start; a pane that shows Claude's own screen is let go at once.
 pub(super) const TRUST_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// Time a key gets to land before the screen is read as its answer. Without
-/// it, a capture taken before a `Down` was processed would send a second one.
-const KEY_SETTLE: Duration = Duration::from_millis(700);
+/// How long the one arrow press gets to show "Yes" selected before the
+/// prompt is left to a human.
+const MOVE_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Arrow presses spent looking for the "Yes" row before giving up. The menu
-/// has two rows, so more than this means the screen is not what it seems.
-const MAX_MOVES: u8 = 2;
+pub(super) const TRUST_UNRESOLVED_NOTE: &str =
+    "Claude is asking whether to trust this folder; answer it by hand";
+
+pub(super) const TRUST_ELSEWHERE_NOTE: &str =
+    "Claude is asking to trust a folder other than the one saved for this pane; \
+     left for you to answer";
 
 /// Where the cursor sits on Claude's folder-trust prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TrustCursor {
     OnYes,
-    Elsewhere,
+    OnNo,
 }
 
-/// Claude's folder-trust prompt, if `screen` shows it.
+/// Claude's folder-trust prompt as read off a pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TrustPrompt {
+    /// The directory the prompt asks about, as Claude printed it.
+    pub workspace: String,
+    pub cursor: TrustCursor,
+}
+
+/// Claude's folder-trust prompt, if `screen` is that prompt and nothing else.
 ///
 /// Claude asks this before it opens a conversation in a directory its
-/// config has not trusted — including on `--resume`, when the pane comes
+/// config has not trusted. That includes `--resume`, when the relaunch comes
 /// back under another account's config or the trust was never recorded.
-/// The pane is waiting on that question and nothing else, so a restore
-/// that relaunched it answers it: the directory is the one the operator was
-/// already running Claude in.
 ///
-/// Current builds put the cursor on "No, exit" (unnumbered rows); older
-/// builds put it on "1. Yes, proceed". Only the row under the cursor
-/// marker decides, so Enter is never sent while "No" is selected.
-pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustCursor> {
-    let asks = [
-        "Is this a project you created or one you trust",
-        "Do you trust the files in this folder",
-    ]
-    .iter()
-    .any(|question| screen.contains(question));
-    if !asks {
+/// The parse fails closed. It needs the whole dialog in order: the
+/// "Accessing workspace:" header with its path, the safety question,
+/// exactly the two menu rows with exactly one under the cursor, and the
+/// "Enter to confirm" footer. Any sign of Claude's running screen (banner,
+/// composer footer) rejects the capture, so a resumed conversation that
+/// quotes the dialog is never read as one.
+pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustPrompt> {
+    if claude_started(screen) {
         return None;
     }
-    let is_yes =
-        |row: &str| row.contains("Yes, I trust this folder") || row.contains("Yes, proceed");
-    if !screen.lines().any(is_yes) {
+    let lines: Vec<&str> = screen.lines().map(str::trim).collect();
+    let header = lines
+        .iter()
+        .position(|line| *line == "Accessing workspace:")?;
+    let path_start = header
+        + 1
+        + lines[header + 1..]
+            .iter()
+            .position(|line| !line.is_empty())?;
+    let path_len = lines[path_start..]
+        .iter()
+        .position(|line| line.is_empty())
+        .unwrap_or(lines.len() - path_start);
+    // A long path wraps across rows of the capture.
+    let workspace: String = lines[path_start..path_start + path_len].concat();
+    if !workspace.starts_with('/') {
         return None;
     }
-    let selected = screen
-        .lines()
-        .map(str::trim_start)
-        .find(|row| row.starts_with('❯') || row.starts_with('>') || row.starts_with('›'))?;
-    Some(if is_yes(selected) {
-        TrustCursor::OnYes
-    } else {
-        TrustCursor::Elsewhere
+    let rest = &lines[path_start + path_len..];
+    let question = rest
+        .iter()
+        .position(|line| line.contains("Is this a project you created or one you trust?"))?;
+    let rest = &rest[question + 1..];
+
+    let mut yes = None;
+    let mut no = None;
+    let mut footer = None;
+    for (index, line) in rest.iter().enumerate() {
+        if line.starts_with("Enter to confirm") {
+            footer = Some(index);
+            break;
+        }
+        let (selected, label) = match line.strip_prefix(['❯', '>', '›']) {
+            Some(label) => (true, label.trim_start()),
+            None => (false, *line),
+        };
+        let slot = match label {
+            "Yes, I trust this folder" => &mut yes,
+            "No, exit" => &mut no,
+            _ => continue,
+        };
+        if slot.replace((index, selected)).is_some() {
+            return None;
+        }
+    }
+    let ((yes_at, yes_selected), (no_at, no_selected)) = (yes?, no?);
+    let footer = footer?;
+    if yes_at > footer || no_at > footer || yes_selected == no_selected {
+        return None;
+    }
+    Some(TrustPrompt {
+        workspace,
+        cursor: if yes_selected {
+            TrustCursor::OnYes
+        } else {
+            TrustCursor::OnNo
+        },
     })
 }
 
@@ -235,27 +284,49 @@ pub(super) enum TrustKey {
     Enter,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TrustPane {
-    moves: u8,
-    last_key: Option<Duration>,
+    /// The directories this pane was saved in: as recorded, and resolved.
+    expected: Vec<String>,
+    /// When the one arrow press went out.
+    moved_at: Option<Duration>,
+    /// Whether the latest capture was the trust prompt.
+    on_prompt: bool,
 }
 
 /// Relaunched Claude panes being walked past the folder-trust prompt.
+///
+/// Each pane gets at most one arrow press and one Enter, and Enter only on a
+/// capture showing "Yes" selected after any arrow press. With only one arrow
+/// sent, no earlier key can still be in flight when that capture is read.
 #[derive(Debug, Default)]
 pub(super) struct TrustWatch {
     pending: BTreeMap<String, TrustPane>,
-    answered: BTreeSet<String>,
+    left: BTreeMap<String, &'static str>,
 }
 
 impl TrustWatch {
-    pub fn new(targets: impl IntoIterator<Item = String>) -> Self {
+    /// `targets` pairs each pane with the directories it was saved in.
+    pub fn new(targets: impl IntoIterator<Item = (String, Vec<String>)>) -> Self {
         Self {
             pending: targets
                 .into_iter()
-                .map(|target| (target, TrustPane::default()))
+                .map(|(target, expected)| {
+                    let expected = expected
+                        .into_iter()
+                        .map(|dir| normalize_dir(&dir).to_owned())
+                        .collect();
+                    (
+                        target,
+                        TrustPane {
+                            expected,
+                            moved_at: None,
+                            on_prompt: false,
+                        },
+                    )
+                })
                 .collect(),
-            answered: BTreeSet::new(),
+            left: BTreeMap::new(),
         }
     }
 
@@ -268,43 +339,66 @@ impl TrustWatch {
     }
 
     /// Read one capture of `target` and say which key, if any, to send.
+    /// Enter takes the pane off the watch; the caller decides whether it
+    /// was answered, by whether the key went out.
     pub fn observe(&mut self, target: &str, elapsed: Duration, screen: &str) -> Option<TrustKey> {
         let pane = self.pending.get_mut(target)?;
-        match claude_trust_prompt(screen) {
-            None => {
-                if claude_started(screen) {
-                    self.pending.remove(target);
-                }
-                None
-            }
-            Some(_)
-                if pane
-                    .last_key
-                    .is_some_and(|at| elapsed.saturating_sub(at) < KEY_SETTLE) =>
-            {
-                None
-            }
-            Some(TrustCursor::OnYes) => {
+        let Some(prompt) = claude_trust_prompt(screen) else {
+            pane.on_prompt = false;
+            if claude_started(screen) {
                 self.pending.remove(target);
-                self.answered.insert(target.to_owned());
+            }
+            return None;
+        };
+        pane.on_prompt = true;
+        if !pane
+            .expected
+            .iter()
+            .any(|dir| dir == normalize_dir(&prompt.workspace))
+        {
+            self.leave(target, TRUST_ELSEWHERE_NOTE);
+            return None;
+        }
+        match (prompt.cursor, pane.moved_at) {
+            (TrustCursor::OnYes, _) => {
+                self.pending.remove(target);
                 Some(TrustKey::Enter)
             }
-            Some(TrustCursor::Elsewhere) if pane.moves < MAX_MOVES => {
-                pane.moves += 1;
-                pane.last_key = Some(elapsed);
+            (TrustCursor::OnNo, None) => {
+                pane.moved_at = Some(elapsed);
                 Some(TrustKey::Down)
             }
-            Some(TrustCursor::Elsewhere) => {
-                // The arrow did not reach "Yes"; leave the prompt to a human.
-                self.pending.remove(target);
+            (TrustCursor::OnNo, Some(at)) if elapsed.saturating_sub(at) < MOVE_TIMEOUT => None,
+            (TrustCursor::OnNo, Some(_)) => {
+                // The arrow never showed "Yes" selected: no second guess.
+                self.leave(target, TRUST_UNRESOLVED_NOTE);
                 None
             }
         }
     }
 
-    /// The panes whose prompt was answered.
-    pub fn answered(self) -> BTreeSet<String> {
-        self.answered
+    /// Take `target` off the watch, left for a human with `note`.
+    pub fn leave(&mut self, target: &str, note: &'static str) {
+        self.pending.remove(target);
+        self.left.insert(target.to_owned(), note);
+    }
+
+    /// The panes left on the trust prompt, with what to tell a human. Run
+    /// when time is up: a pane still showing the prompt then is left too.
+    pub fn left_on_prompt(mut self) -> BTreeMap<String, &'static str> {
+        for (target, pane) in std::mem::take(&mut self.pending) {
+            if pane.on_prompt {
+                self.left.insert(target, TRUST_UNRESOLVED_NOTE);
+            }
+        }
+        self.left
+    }
+}
+
+fn normalize_dir(dir: &str) -> &str {
+    match dir.trim_end_matches('/') {
+        "" => "/",
+        trimmed => trimmed,
     }
 }
 
@@ -448,64 +542,141 @@ mod tests {
             .replace("   Yes, I trust", " ❯ Yes, I trust")
     }
 
+    fn watch(dirs: &[&str]) -> TrustWatch {
+        TrustWatch::new([(
+            "=a:0.0".to_owned(),
+            dirs.iter().map(|dir| (*dir).to_owned()).collect(),
+        )])
+    }
+
     #[test]
-    fn the_trust_prompt_is_read_by_its_cursor_row() {
+    fn the_trust_prompt_is_read_by_its_cursor_row_and_path() {
         assert_eq!(
             claude_trust_prompt(TRUST_PROMPT_NO),
-            Some(TrustCursor::Elsewhere)
+            Some(TrustPrompt {
+                workspace: "/tmp/untrusted-probe".into(),
+                cursor: TrustCursor::OnNo,
+            })
         );
         assert_eq!(
-            claude_trust_prompt(&moved_to_yes()),
+            claude_trust_prompt(&moved_to_yes()).map(|prompt| prompt.cursor),
             Some(TrustCursor::OnYes)
         );
-        // Older builds: numbered rows, "Yes" first.
-        let older =
-            " Do you trust the files in this folder?\n\n ❯ 1. Yes, proceed\n   2. No, exit\n";
-        assert_eq!(claude_trust_prompt(older), Some(TrustCursor::OnYes));
-        // A conversation that merely quotes the words is not the prompt.
+        // A path wider than the pane wraps; the rows join back up.
+        let wrapped = TRUST_PROMPT_NO.replace(" /tmp/untrusted-probe", " /tmp/untrusted-\n probe");
         assert_eq!(
-            claude_trust_prompt("❯ why does it say Yes, I trust this folder?\n"),
+            claude_trust_prompt(&wrapped).map(|prompt| prompt.workspace),
+            Some("/tmp/untrusted-probe".into())
+        );
+    }
+
+    #[test]
+    fn quoted_or_partial_prompts_are_not_the_prompt() {
+        // A resumed conversation quoting the dialog: the composer is there.
+        let quoted = format!(
+            "{}\n❯ \n  ⏵⏵ bypass permissions on (shift+tab to cycle)\n",
+            moved_to_yes()
+        );
+        assert_eq!(claude_trust_prompt(&quoted), None);
+        let banner = format!(" ▐▛███▛█   Claude Code v2.1.322\n{}", moved_to_yes());
+        assert_eq!(claude_trust_prompt(&banner), None);
+        // One line holding the words is not a menu.
+        assert_eq!(
+            claude_trust_prompt(
+                "> Is this a project you created or one you trust? Yes, I trust this folder\n❯ "
+            ),
+            None
+        );
+        // No footer, no header, two cursors, a doubled row: all refused.
+        assert_eq!(
+            claude_trust_prompt(&moved_to_yes().replace("Enter to confirm", "")),
+            None
+        );
+        assert_eq!(
+            claude_trust_prompt(&moved_to_yes().replace("Accessing workspace:", "")),
+            None
+        );
+        assert_eq!(
+            claude_trust_prompt(&TRUST_PROMPT_NO.replace("   Yes, I trust", " ❯ Yes, I trust")),
+            None
+        );
+        assert_eq!(
+            claude_trust_prompt(&moved_to_yes().replace("   No, exit", "   No, exit\n   No, exit")),
             None
         );
     }
 
     #[test]
     fn the_trust_prompt_is_walked_to_yes_before_enter() {
-        let mut watch = TrustWatch::new(["=a:0.0".to_owned()]);
+        let mut watch = watch(&["/tmp/untrusted-probe/"]);
         assert_eq!(
             watch.observe("=a:0.0", ms(0), TRUST_PROMPT_NO),
             Some(TrustKey::Down)
         );
-        // The arrow has not landed yet: no second key on a stale screen.
+        // The arrow has not landed yet: no second key.
         assert_eq!(watch.observe("=a:0.0", ms(300), TRUST_PROMPT_NO), None);
         assert_eq!(
             watch.observe("=a:0.0", ms(900), &moved_to_yes()),
             Some(TrustKey::Enter)
         );
         assert!(watch.is_settled());
-        assert_eq!(watch.answered().into_iter().collect::<Vec<_>>(), ["=a:0.0"]);
+        assert!(watch.left_on_prompt().is_empty());
     }
 
     #[test]
-    fn enter_is_never_sent_while_no_is_selected() {
-        let mut watch = TrustWatch::new(["=a:0.0".to_owned()]);
+    fn one_arrow_only_and_never_enter_on_no() {
+        let mut watch = watch(&["/tmp/untrusted-probe"]);
         let mut keys = Vec::new();
         for step in 0..20 {
-            keys.extend(watch.observe("=a:0.0", ms(step * 1000), TRUST_PROMPT_NO));
+            keys.extend(watch.observe("=a:0.0", ms(step * 500), TRUST_PROMPT_NO));
         }
-        assert_eq!(keys, [TrustKey::Down, TrustKey::Down]);
+        assert_eq!(keys, [TrustKey::Down]);
         assert!(watch.is_settled(), "given up, left to a human");
-        assert!(watch.answered().is_empty());
+        assert_eq!(
+            watch.left_on_prompt().into_values().collect::<Vec<_>>(),
+            [TRUST_UNRESOLVED_NOTE]
+        );
+    }
+
+    #[test]
+    fn a_prompt_for_another_directory_is_left_alone() {
+        // The saved directory was gone, so the shell's `cd` failed and Claude
+        // started somewhere else: that is not the trust the pane had.
+        let mut watch = watch(&["/home/june/project"]);
+        assert_eq!(watch.observe("=a:0.0", ms(0), &moved_to_yes()), None);
+        assert!(watch.is_settled());
+        assert_eq!(
+            watch.left_on_prompt().into_values().collect::<Vec<_>>(),
+            [TRUST_ELSEWHERE_NOTE]
+        );
     }
 
     #[test]
     fn a_claude_that_starts_without_the_prompt_is_let_go() {
-        let mut watch = TrustWatch::new(["=a:0.0".to_owned(), "=a:0.1".to_owned()]);
+        let mut watch = TrustWatch::new([
+            ("=a:0.0".to_owned(), vec!["/w".to_owned()]),
+            ("=a:0.1".to_owned(), vec!["/w".to_owned()]),
+        ]);
         assert_eq!(watch.observe("=a:0.0", ms(0), ""), None);
         assert_eq!(
             watch.observe("=a:0.0", ms(500), " ▐▛███▜▌   Claude Code v2.1.322\n❯ \n"),
             None
         );
         assert_eq!(watch.pending().cloned().collect::<Vec<_>>(), ["=a:0.1"]);
+        // Time runs out on a pane that never drew anything: not a prompt.
+        assert!(watch.left_on_prompt().is_empty());
+    }
+
+    #[test]
+    fn a_pane_still_on_the_prompt_at_the_deadline_is_reported() {
+        let mut watch = watch(&["/tmp/untrusted-probe"]);
+        assert_eq!(
+            watch.observe("=a:0.0", ms(0), TRUST_PROMPT_NO),
+            Some(TrustKey::Down)
+        );
+        assert_eq!(
+            watch.left_on_prompt().into_keys().collect::<Vec<_>>(),
+            ["=a:0.0"]
+        );
     }
 }
