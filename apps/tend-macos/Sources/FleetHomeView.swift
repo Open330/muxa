@@ -934,7 +934,9 @@ struct FleetReplyField: View {
 
     private var currentTarget: FleetReplyTarget? {
         guard let agent else { return FleetBoard.replyTarget(for: work) }
-        return agent.agent.state == "waiting_input" ? FleetReplyTarget(kind: .answer, agent: agent) : nil
+        let answers: Bool
+        if case .asked = agent.agent.status { answers = true } else { answers = agent.agent.state == "waiting_input" }
+        return answers ? FleetReplyTarget(kind: .answer, agent: agent) : nil
     }
 
     /// Text written for a question the unit has moved past.

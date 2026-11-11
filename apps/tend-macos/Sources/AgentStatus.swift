@@ -15,6 +15,9 @@ enum TendAgentStatus: Hashable, Sendable {
     /// Waiting on the person: a prompt, a choice, or a blocked tool call.
     /// Carries the raw state so the full label can say which.
     case needsInput(String)
+    /// Idle, but its turn ended by asking the person something; carries the
+    /// question. Softer than `needsInput`: inferred from the agent's text.
+    case asked(String)
     /// Under a provider rate limit; `cap.until` is when it lifts.
     case limited(TendRateLimitCap)
     case working
@@ -33,6 +36,10 @@ enum TendAgentStatus: Hashable, Sendable {
            var cap = TendRateLimitCap.current(for: agent, now: now) {
             cap.covered = TendLimitCoverage.covers(agent, now: now)
             self = .limited(cap)
+            return
+        }
+        if state == "idle", let question = agent.awaitingReply?.question {
+            self = .asked(question)
             return
         }
         self.init(state: state)
@@ -64,7 +71,7 @@ enum TendAgentStatus: Hashable, Sendable {
     /// agent switches account or resumes at the reset on its own.
     var needsAttention: Bool {
         switch self {
-        case .error, .needsInput: true
+        case .error, .needsInput, .asked: true
         case .limited(let cap): !cap.covered
         default: false
         }
@@ -76,11 +83,12 @@ enum TendAgentStatus: Hashable, Sendable {
         switch self {
         case .error: 0
         case .needsInput: 1
-        case .limited: 2
-        case .working: 3
-        case .idle: 4
-        case .done: 5
-        case .other: 6
+        case .asked: 2
+        case .limited: 3
+        case .working: 4
+        case .idle: 5
+        case .done: 6
+        case .other: 7
         }
     }
 
@@ -88,6 +96,7 @@ enum TendAgentStatus: Hashable, Sendable {
         switch self {
         case .error: String(localized: "Error")
         case .needsInput(let state): agentStateLabel(state)
+        case .asked: String(localized: "Asked you")
         case .limited(let cap):
             // One word for a cap everywhere: "Limited", with the reset time
             // when the source reported one.
@@ -104,6 +113,7 @@ enum TendAgentStatus: Hashable, Sendable {
     var shortLabel: String {
         switch self {
         case .needsInput: String(localized: "Needs input")
+        case .asked: String(localized: "Asking")
         case .limited: String(localized: "Limited")
         default: label()
         }
@@ -112,7 +122,7 @@ enum TendAgentStatus: Hashable, Sendable {
     var color: Color {
         switch self {
         case .error: .red
-        case .needsInput: .orange
+        case .needsInput, .asked: .orange
         case .limited: .purple
         case .working: .blue
         case .idle: .mint
@@ -125,6 +135,7 @@ enum TendAgentStatus: Hashable, Sendable {
         switch self {
         case .error: "exclamationmark.octagon.fill"
         case .needsInput: "hand.raised.fill"
+        case .asked: "questionmark.bubble.fill"
         case .limited: "hourglass"
         case .working: "circle.dotted"
         case .idle: "pause.circle"
@@ -145,7 +156,7 @@ extension TendWatchPane {
     var needsAttention: Bool { agentStatus?.needsAttention ?? false }
 
     /// For sorting panes: agents by status, plain shells last.
-    var statusPriority: Int { agentStatus?.priority ?? 7 }
+    var statusPriority: Int { agentStatus?.priority ?? 8 }
 }
 
 /// The dot and short label every agent row uses, so a status reads the same

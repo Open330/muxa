@@ -255,7 +255,7 @@ impl HookAdapter for ClaudeAdapter {
                     },
                     Some(transcript::TurnOutcome::Response(text)) => AgentEvent::TurnStopped {
                         id,
-                        response: Some(truncate(text, 4_000)),
+                        response: Some(super::hook::truncate_response(text)),
                         recap,
                         ai_title,
                         idle_confirmed: false,
@@ -878,11 +878,12 @@ mod tests {
         match ev {
             AgentEvent::TurnStopped { response, .. } => {
                 let text = response.expect("response present");
-                // truncate() bound is 4_000 bytes + a single ellipsis (3
-                // bytes in UTF-8) — anything larger means the truncation
-                // hook isn't running.
-                assert!(text.len() <= 4_000 + 3, "got {} bytes", text.len());
-                assert!(text.ends_with('…'));
+                // truncate_response() keeps ~4 KB from both ends around an
+                // elided middle — anything larger means the bound isn't
+                // running.
+                assert!(text.len() <= 4_000 + 8, "got {} bytes", text.len());
+                assert!(text.contains("\n\n…\n\n"));
+                assert!(text.ends_with('x'));
             }
             _ => panic!("expected TurnStopped"),
         }

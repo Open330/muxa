@@ -29,7 +29,7 @@ struct TendBrandMark: Equatable, Sendable {
         for status in statuses {
             switch status {
             case .error: error = true
-            case .needsInput: waiting = true
+            case .needsInput, .asked: waiting = true
             case .limited(let cap): if !cap.covered { waiting = true }
             case .working: working = true
             case .done: done = true

@@ -305,7 +305,7 @@ pub(super) async fn needs_attention_line(client: &Client) -> String {
     let count = agents
         .unwrap_or_default()
         .iter()
-        .filter(|a| attend::needs_attention(a.state))
+        .filter(|a| attend::agent_needs_attention(a))
         .count();
     let review = reviews
         .map(|summary| super::review_cmd::review_segment(&summary, OffsetDateTime::now_utc()))

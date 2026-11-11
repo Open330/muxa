@@ -421,6 +421,7 @@ mod tests {
             last_prompt_origin: None,
             last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 
@@ -816,6 +817,7 @@ mod tests {
             last_prompt_origin: None,
             last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         };
         assert!(occupant_is_authoritative(&agent), "live real row owns pane");
         agent.state = AgentState::Stopped;

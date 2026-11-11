@@ -54,6 +54,24 @@ pub(crate) fn needs_attention(state: AgentState) -> bool {
     )
 }
 
+/// Does this agent need the person: a blocking state, or an idle row whose
+/// turn ended by asking them something (`Agent::awaiting_reply`).
+pub(crate) fn agent_needs_attention(agent: &Agent) -> bool {
+    needs_attention(agent.state) || agent.awaiting_reply().is_some()
+}
+
+/// [`attention_rank`] for a row; an asked question ranks after every
+/// blocking state.
+fn agent_attention_rank(agent: &Agent) -> u8 {
+    if needs_attention(agent.state) {
+        attention_rank(agent.state)
+    } else if agent.awaiting_reply().is_some() {
+        3
+    } else {
+        4
+    }
+}
+
 /// Attention severity for ordering: a fresh error outranks a choice prompt,
 /// which outranks a plain input wait. Mirrors `watch`'s `state_sort_rank` so
 /// `attend` and `watch` agree on "who's most urgent" instead of `attend`
@@ -108,7 +126,7 @@ pub struct Target {
 fn candidates<'a>(agents: &'a [Agent], panes: &[PaneInfo]) -> Vec<Candidate<'a>> {
     let mut cands: Vec<Candidate<'a>> = agents
         .iter()
-        .filter(|a| needs_attention(a.state))
+        .filter(|a| agent_needs_attention(a))
         .filter_map(|a| {
             a.pane.as_deref().map(|pane| Candidate {
                 agent: a,
@@ -128,8 +146,8 @@ fn candidates<'a>(agents: &'a [Agent], panes: &[PaneInfo]) -> Vec<Candidate<'a>>
 /// invocations.
 fn longest_waiting<'c>(cands: &'c [Candidate<'_>]) -> Option<&'c Candidate<'c>> {
     cands.iter().min_by(|a, b| {
-        attention_rank(a.agent.state)
-            .cmp(&attention_rank(b.agent.state))
+        agent_attention_rank(a.agent)
+            .cmp(&agent_attention_rank(b.agent))
             .then_with(|| a.agent.state_entered_at.cmp(&b.agent.state_entered_at))
             .then_with(|| a.key.cmp(&b.key))
     })
@@ -221,8 +239,8 @@ fn print_queue(cands: &[Candidate<'_>], panes: &[PaneInfo]) {
 
     let mut ranked: Vec<&Candidate<'_>> = cands.iter().collect();
     ranked.sort_by(|a, b| {
-        attention_rank(a.agent.state)
-            .cmp(&attention_rank(b.agent.state))
+        agent_attention_rank(a.agent)
+            .cmp(&agent_attention_rank(b.agent))
             .then_with(|| a.agent.state_entered_at.cmp(&b.agent.state_entered_at))
             .then_with(|| a.key.cmp(&b.key))
     });
@@ -272,11 +290,11 @@ fn print_queue(cands: &[Candidate<'_>], panes: &[PaneInfo]) {
 fn paneless_waiters(agents: &[Agent]) -> Vec<&Agent> {
     let mut waiters: Vec<&Agent> = agents
         .iter()
-        .filter(|a| needs_attention(a.state) && a.pane.is_none())
+        .filter(|a| agent_needs_attention(a) && a.pane.is_none())
         .collect();
     waiters.sort_by(|a, b| {
-        attention_rank(a.state)
-            .cmp(&attention_rank(b.state))
+        agent_attention_rank(a)
+            .cmp(&agent_attention_rank(b))
             .then_with(|| a.state_entered_at.cmp(&b.state_entered_at))
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
@@ -461,6 +479,7 @@ mod tests {
             last_prompt_origin: None,
             last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 

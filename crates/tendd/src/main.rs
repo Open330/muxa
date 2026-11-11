@@ -3922,6 +3922,11 @@ fn record_activity_transition(
     states: &mut HashMap<String, (tend::AgentState, time::OffsetDateTime)>,
     transition: tend::state::Transition,
 ) {
+    // An Idle -> Idle broadcast only carries a changed `awaiting_reply`; the
+    // activity log records states.
+    if transition.from == transition.to {
+        return;
+    }
     let agent = transition.agent.as_ref();
     let at = agent.state_entered_at;
     let prior_entered_at = states
@@ -4439,6 +4444,7 @@ async fn enrich_from_history(
             last_prompt_origin: None,
             last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         });
     }
 

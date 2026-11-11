@@ -3391,6 +3391,7 @@ mod tests {
             last_prompt_origin: None,
             last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 }

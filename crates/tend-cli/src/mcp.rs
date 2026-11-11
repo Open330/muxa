@@ -67,8 +67,13 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str =
-    "Read tend_collaboration_guide once. Delivery is not task success; reported_status is peer-declared.";
+///
+/// The last sentence reaches every agent whatever its task. The
+/// agent-integration bootstrap carries the same rule, but agents read it
+/// only for Tend work, so an agent on ordinary work would end its turn on a
+/// prose question that tend can only infer (`tend::awaiting_reply`).
+const MCP_SERVER_INSTRUCTIONS: &str = "Read tend_collaboration_guide once. Delivery is not task success; reported_status is peer-declared. \
+     Blocked on a person's decision? Call tend_request_attention, not just prose.";
 
 /// How often `tend_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -1042,7 +1047,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_request_attention",
-            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Tend Mac app. Explain what decision is needed, why, options and recommendation. Reuse the returned request ID and wait via tend_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work.",
+            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Tend Mac app. Explain what decision is needed, why, options and recommendation. Reuse the returned request ID and wait via tend_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work; that includes ending your turn on a question only the person can answer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -5089,7 +5094,11 @@ async fn wait_for_change(client: &Client, args: &Value) -> Value {
             tokio::select! {
                 recv = stream.recv() => match recv {
                     Ok(Some(t)) => {
-                        if pane.is_none_or(|p| t.agent.pane.as_deref() == Some(p)) {
+                        // An Idle -> Idle broadcast announces a new question
+                        // (`awaiting_reply`), not a state change.
+                        if t.from != t.to
+                            && pane.is_none_or(|p| t.agent.pane.as_deref() == Some(p))
+                        {
                             return WaitOutcome::Observed(t);
                         }
                     }
@@ -7390,9 +7399,12 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(init["result"]["capabilities"]["tools"].is_object());
         let instructions = init["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.len() < 140, "instructions: {instructions}");
+        // Every session pays for these: a pointer to the guide, plus the one
+        // rule every agent needs whatever its task (asking the person).
+        assert!(instructions.len() < 200, "instructions: {instructions}");
         assert!(instructions.contains("tend_collaboration_guide"));
         assert!(instructions.contains("reported_status"));
+        assert!(instructions.contains("tend_request_attention"));
 
         let list = dispatch(
             &client,

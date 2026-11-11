@@ -83,6 +83,7 @@ fn make_realistic_agent() -> Agent {
         last_prompt_origin: None,
         last_event_at: None,
         last_response_at: None,
+        awaiting_reply: None,
     }
 }
 

@@ -5141,6 +5141,7 @@ mod tests {
             last_prompt_origin: None,
             last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         };
         tx.send(Transition {
             from: AgentState::Starting,
@@ -5257,6 +5258,7 @@ mod tests {
             last_prompt_origin: None,
             last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         };
         for _ in 0..5 {
             tx.send(Transition {

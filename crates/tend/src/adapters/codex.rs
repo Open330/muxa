@@ -228,7 +228,7 @@ impl HookAdapter for CodexAdapter {
                             .as_deref()
                             .and_then(super::codex_rollout::latest_final_response)
                     })
-                    .map(|text| truncate(text, 4_000)),
+                    .map(super::hook::truncate_response),
                 recap: None,
                 ai_title: None,
                 // Real hook: never a synthetic idle observation. A response-less
@@ -267,7 +267,10 @@ mod tests {
             else {
                 panic!("expected stop")
             };
-            assert_eq!(response, Some(truncate(text, 4_000)));
+            assert_eq!(
+                response,
+                Some(crate::adapters::hook::truncate_response(text))
+            );
             assert!(!idle_confirmed);
         }
     }
