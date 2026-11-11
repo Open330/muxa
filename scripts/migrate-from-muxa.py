@@ -80,6 +80,11 @@ PATH_FRAGMENTS = [
 COMMAND_WORD = re.compile(r"(?<![\w./@-])muxa(d?)(?![\w.-])")
 ENV_NAME = re.compile(r"\bMUXA_([A-Z0-9_]+)")
 TMUX_OPTION = re.compile(r"@muxa([_-])")
+# MCP tool names in prompt templates, skills and permission rules:
+# `muxa_call_peer` is now `tend_call_peer`, `mcp__muxa__muxa_status` is
+# `mcp__tend__tend_status`.
+MCP_SERVER_PREFIX = re.compile(r"\bmcp__muxa__(muxa_)?")
+MCP_TOOL = re.compile(r"(?<![\w./@-])muxa_(?=[a-z])")
 
 
 def moved_paths(text: str) -> str:
@@ -149,6 +154,8 @@ def surgical_rename(text: str) -> str:
                 line = pattern.sub(repl, line)
             line = ENV_NAME.sub(r"TEND_\1", line)
             line = TMUX_OPTION.sub(r"@tend\1", line)
+            line = MCP_SERVER_PREFIX.sub(lambda m: "mcp__tend__" + ("tend_" if m.group(1) else ""), line)
+            line = MCP_TOOL.sub("tend_", line)
             line = COMMAND_WORD.sub(lambda m: "tend" + ("d" if m.group(1) else ""), line)
             line = line.replace("muxa-collaboration", "tend-collaboration")
         if inside and "<<< tend managed (" in line:

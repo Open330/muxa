@@ -56,7 +56,8 @@ Muxa를 돌리던 호스트마다 실행하세요. Python 3.8 이상이 필요�
 - Muxa의 데이터, 설정, 캐시 폴더를 `tend`로 옮깁니다. `tend` 폴더가 이미 있으면 둘 다 그대로 두고 알려 줍니다.
 - 에이전트 연동 번들(`bootstrap.md`, 협업 스킬)은 이름을 전부 바꿉니다. fleet 설정 키 `muxa_path`는 `tend_path`로 바꿉니다. `config.toml`, 사용자 에이전트 정의,
   다른 도구의 설정에서는 Muxa가 쓴 부분만 바꿉니다: 훅 명령(절대 경로 `/opt/bin/muxa` 포함), MCP 서버 항목,
-  관리 블록, `MUXA_*` 변수, `@muxa_*` 옵션, 옮긴 폴더를 가리키는 경로. 사용자가 넣은 값은 그대로 둡니다:
+  관리 블록, `MUXA_*` 변수, `@muxa_*` 옵션, 프롬프트와 권한 규칙 속 MCP 도구 이름(`muxa_call_peer`,
+  `mcp__muxa__muxa_status` 등), 옮긴 폴더를 가리키는 경로. 사용자가 넣은 값은 그대로 둡니다:
   `~/code/muxa`의 `cwd`나 저장소, URL, 프로젝트 신뢰 항목.
 - Tend 쪽 항목이 이미 있으면 둘 다 그대로 두고 알려 줍니다: `tend`라는 MCP 서버, Codex의 `[mcp_servers.tend]`,
   `tend.ts`, `tend-collaboration` 링크, 키체인의 Tend 키.

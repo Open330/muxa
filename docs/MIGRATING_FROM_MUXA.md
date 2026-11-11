@@ -62,7 +62,9 @@ edit instead. `brew install python` gives a newer one.
   skill) in full. Renames the fleet key `muxa_path` to `tend_path`. In `config.toml`, user agent definitions and every other
   tool's config it changes only what Muxa wrote: hook commands (including an
   absolute `/opt/bin/muxa`), the MCP server entry, managed blocks, `MUXA_*`
-  variables, `@muxa_*` options and paths into the directories it moved.
+  variables, `@muxa_*` options, MCP tool names such as `muxa_call_peer` or
+  `mcp__muxa__muxa_status` in prompts and permission rules, and paths into
+  the directories it moved.
   Your own values keep their spelling: a `cwd` or repository at
   `~/code/muxa`, a URL, a project trust entry.
 - Leaves both entries in place and tells you when Tend's already exists:
