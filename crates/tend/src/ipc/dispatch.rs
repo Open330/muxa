@@ -915,6 +915,8 @@ pub(super) async fn handle(
                 }
                 RequestBody::SendPrompt {
                     pane,
+                    socket,
+                    session_id,
                     text,
                     submit,
                     origin,
@@ -937,18 +939,21 @@ pub(super) async fn handle(
                         )),
                         Ok(target) => {
                             let target = target.clone();
-                            // Pin the injection to the specific server this
-                            // pane's agent row was recorded on — `%5` exists on
-                            // every tmux server, so an env-scoped send could hit
-                            // the wrong one. `None` for hosts without a server
-                            // concept (herdr) or an untracked pane, which falls
-                            // back to the env-scoped default.
+                            // Check the registry after acquiring the input guard:
+                            // waiting for an earlier action may replace the session.
+                            let action_guard = collaboration.worker_action_guard(&pane).await;
+                            // Resolve endpoint/session authority before any input or
+                            // expected-prompt registration can reach the backend.
                             let agents = store.by_pane(&pane).await;
-                            match unique_pane_endpoint(&pane, &agents) {
+                            match send_prompt_endpoint(
+                                &pane,
+                                target.kind(),
+                                &agents,
+                                socket.as_deref(),
+                                session_id.as_deref(),
+                            ) {
                                 Err(error) => Response::err(error),
                                 Ok(socket) => {
-                                    let action_guard =
-                                        collaboration.worker_action_guard(&pane).await;
                                     if collaboration
                                         .worker_input_blocked(&pane, socket.as_deref())
                                         .await

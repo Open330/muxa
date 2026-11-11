@@ -804,6 +804,8 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "string", "description": "Target pane id (e.g. %12, rmux:%12, or herdr:p1)." },
+                    "socket": { "type": "string", "description": "Explicit server endpoint; required for untracked tmux/rmux panes." },
+                    "session_id": { "type": "string", "description": "Only send if this agent session still occupies the target pane and endpoint." },
                     "text": { "type": "string", "description": "Literal text to type into the pane." },
                     "submit": { "type": "boolean", "description": "Press Enter after the text. Default true." },
                 },
@@ -1588,10 +1590,26 @@ async fn call_tool_inner(
             let Some(text) = args.get("text").and_then(Value::as_str) else {
                 return Ok(error_result("send_prompt requires a `text` argument"));
             };
+            for key in ["socket", "session_id"] {
+                if args.get(key).is_some_and(|value| !value.is_string()) {
+                    return Ok(error_result(&format!(
+                        "send_prompt `{key}` must be a string"
+                    )));
+                }
+            }
             // Submit defaults to true — the common case is "prompt and run".
             let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(true);
             Ok(
-                match send_prompt_with_local_cmux(client, pane, text, submit).await {
+                match send_prompt_with_local_cmux(
+                    client,
+                    pane,
+                    text,
+                    submit,
+                    args.get("socket").and_then(Value::as_str),
+                    args.get("session_id").and_then(Value::as_str),
+                )
+                .await
+                {
                     // The daemon distinguishes "text injected" (`sent`) from
                     // "Enter delivered" (`submitted`); surface the latter so a
                     // caller whose submit was requested but not delivered learns
@@ -4859,9 +4877,15 @@ async fn send_prompt_with_local_cmux(
     pane: &str,
     prompt: &str,
     submit: bool,
+    socket: Option<&str>,
+    session_id: Option<&str>,
 ) -> std::result::Result<SendPromptOutcome, String> {
     let inside_cmux = std::env::var("CMUX_SURFACE_ID").is_ok_and(|id| !id.trim().is_empty());
-    if tend::backend::pane_id_host_kind(pane) == Some(tend::HostKind::Cmux) && inside_cmux {
+    if tend::backend::pane_id_host_kind(pane) == Some(tend::HostKind::Cmux)
+        && inside_cmux
+        && socket.is_none()
+        && session_id.is_none()
+    {
         let env_endpoint = tend::backend::cmux::endpoint_from_env();
         let mut endpoints = client
             .snapshot()
@@ -4911,7 +4935,7 @@ async fn send_prompt_with_local_cmux(
     }
 
     client
-        .send_prompt(pane, prompt, submit)
+        .send_prompt_scoped(pane, prompt, submit, socket, session_id)
         .await
         .map_err(|error| error.to_string())
 }
@@ -8393,7 +8417,7 @@ mod tests {
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
                 "params": {
                     "name": "tend_send_prompt",
-                    "arguments": { "pane": "%1", "text": "hello", "submit": true },
+                    "arguments": { "pane": "%1", "text": "hello", "submit": true, "socket": "default" },
                 },
             }),
         )
@@ -8422,6 +8446,34 @@ mod tests {
             cap["result"]["content"][0]["text"].as_str().unwrap(),
             "screen of %1",
         );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_prompt_refuses_untracked_and_mismatched_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-refused-send.sock");
+        let (client, sends, tx, handle) = spawn_daemon(&sock).await;
+        // Unknown panes and failed session preconditions must never inject.
+        for arguments in [
+            json!({"pane":"%1", "text":"stale"}),
+            json!({"pane":"%1", "text":"stale", "socket":"default", "session_id":"gone"}),
+            json!({"pane":"%1", "text":"stale", "socket":"default", "session_id":123}),
+        ] {
+            let refused = dispatch(
+                &client,
+                &json!({
+                    "jsonrpc":"2.0", "id":33, "method":"tools/call",
+                    "params":{"name":"tend_send_prompt", "arguments":arguments},
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(refused["result"]["isError"], true, "{refused}");
+        }
+        assert!(sends.lock().unwrap().is_empty());
 
         tx.send(()).unwrap();
         handle.await.unwrap();

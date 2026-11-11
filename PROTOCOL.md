@@ -470,9 +470,18 @@ injection so the agent's current line is committed (byte-identical to tmux
 **Server targeting.** A tmux pane id like `%5` exists on *every* running tmux
 server, so the daemon pins the injection to the specific server the pane's
 agent row was recorded on (its `tmux_socket`), passing `tmux -S <socket>`. An
-untracked pane, or a host without a per-server socket concept (herdr), falls
-back to the env-scoped default. This is what makes `send_prompt` land on the
-right pane in a multi-server setup.
+untracked tmux or rmux pane (including a forgotten agent) is refused with an
+`unknown pane` error before any text is injected. Supply optional `socket` to
+explicitly target a server, including an untracked pane; an empty socket is
+refused. An explicit socket also disambiguates pane ids recorded on multiple
+servers. rmux endpoints retain their full native path. Hosts without a per-server
+socket concept (herdr) may still use their backend default.
+
+Optional `session_id` requires a non-stopped agent row matching the pane and,
+when supplied, socket. A mismatch is refused even with an explicit socket;
+without a socket, the matching session's recorded endpoint pins the send.
+This checks the registry at dispatch time; it does not atomically lock the
+terminal's agent process against exiting or replacement during injection.
 
 ```json
 { "protocol": 3, "kind": "send_prompt", "pane": "%12", "text": "run the tests", "submit": true }

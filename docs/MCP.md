@@ -212,7 +212,7 @@ it:
 | `tend_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `tend_swap_account` | `action?`, `job?`, `request_key?`, `detach?`, `wait_secs?`, `host?`, `targets?`, `all?`, `provider?`, `to?`, `force?`, `continue_text?`, `continue_when?`, `continue_evidence?`, `no_continue?`, `dry_run?` | Move Claude/Codex agents onto another account and resume them in place, here or on a control-mode Fleet host (`tend swap`; see [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md)). `action` is `swap` (default), `retry` (an ended job's safely retryable targets), `status` or `cancel` (with `job`). A start or retry runs under a request key — pass your own `request_key` to hold it before anything is sent, or use the one returned — and every result, errors included, carries it with a `recovery` call (`action=status`); the tool never sends a swap twice. `status`/`cancel` return the job as it is now unless `wait_secs` (≤120) asks to wait. |
 | `tend_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
-| `tend_send_prompt` | `pane`, `text`, `submit?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
+| `tend_send_prompt` | `pane`, `text`, `submit?`, `socket?`, `session_id?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
 | `tend_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `tend_fleet_status` | `selector?`, `full?` | Cached host health, capabilities, counts and up to 20 active agent identities per host. `full=true` returns the complete hierarchy. |
 | `tend_fleet_capture` | `host`, `pane` | Capture one exact pane on a named Fleet host. |
@@ -239,6 +239,12 @@ it:
 `tend_send_prompt` is refused (surfaced to the model as a tool error) when the
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
 only reaches the focused pane. tmux, cmux, rmux, and herdr support targeted input.
+
+Untracked tmux/rmux pane ids are refused with `unknown pane`; supply `socket`
+explicitly to address a pane on a chosen server without a registry row. Optional
+`session_id` requires a matching non-stopped agent on that pane and endpoint,
+so a forgotten or replaced session cannot silently target another agent. This
+precondition checks the registry at dispatch time, not the process atomically.
 
 Pane ids carry their host namespace: tmux `%12`, rmux `rmux:%12`, herdr
 `herdr:p1`. Use the `pane` field from `tend_status` verbatim.

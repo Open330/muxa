@@ -44,6 +44,54 @@ pub(super) fn unique_pane_endpoint(pane: &str, agents: &[Agent]) -> Result<Optio
     }
 }
 
+/// Resolve send authority before registering or injecting any prompt. A missing
+/// registry row must never turn a server-local pane id into a default-server send.
+pub(super) fn send_prompt_endpoint(
+    pane: &str,
+    kind: HostKind,
+    agents: &[Agent],
+    socket: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    if socket.is_some_and(|socket| socket.trim().is_empty()) {
+        return Err("send_prompt socket must name an explicit endpoint".into());
+    }
+    let candidates = agents
+        .iter()
+        .filter(|agent| {
+            session_id.is_none_or(|session| {
+                agent.session_id == session && agent.state != crate::AgentState::Stopped
+            }) && socket.is_none_or(|socket| {
+                agent.tmux_socket.as_deref().is_some_and(|endpoint| {
+                    crate::backend::pane_endpoints_match(Some(pane), endpoint, socket)
+                })
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if session_id.is_some() && candidates.is_empty() {
+        return Err(format!(
+            "session mismatch: unknown pane {pane} for the requested session"
+        ));
+    }
+    if let Some(socket) = socket {
+        // Preserve an explicit tmux -S path as well as native rmux paths;
+        // identity normalization is only for matching registry spellings.
+        return Ok(Some(socket.to_owned()));
+    }
+    let endpoint = unique_pane_endpoint(pane, &candidates)?;
+    if endpoint
+        .as_deref()
+        .is_none_or(|endpoint| endpoint.trim().is_empty())
+        && matches!(kind, HostKind::Tmux | HostKind::Rmux)
+    {
+        return Err(format!(
+            "unknown pane {pane}: no recorded server endpoint; specify socket explicitly"
+        ));
+    }
+    Ok(endpoint)
+}
+
 /// The pane inventory a collaboration call is resolved against, plus the
 /// participants derived from it. The raw panes travel alongside because an
 /// operator console origin has no participant row — its room comes from the
