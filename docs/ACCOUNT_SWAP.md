@@ -115,7 +115,17 @@ with that account's environment, without requiring `--bare wrap`.
 `--when-idle` keeps busy or recently active targets pending in a daemon
 job. The daemon checks fresh hook state periodically (including the normal
 20-second activity quiet period) and restarts ready targets while others
-wait. The job waits at most `--idle-timeout` (default `6h`, units `s`, `m`,
+wait. Agents blocked on input, permission prompts or choice menus
+(`waiting_input` / `waiting_choice`) remain pending until the prompt is
+resolved and they become idle, or the timeout expires.
+`tend swap --status <key>` shows pending targets.
+
+Waiting releases the pane's input guard and does not block swaps on other
+agents, whether submitted by automation, a user or Fleet. The pending
+pane remains reserved to its job: another job targeting that pane is
+reported as skipped with reason `busy`; resending the same request key
+attaches to the existing job. Cancellation or timeout releases the
+reservation. The job waits at most `--idle-timeout` (default `6h`, units `s`, `m`,
 `h`, `d`); targets still busy then are reported as skipped due to timeout,
 without stopping them. `--force` takes precedence and stops mid-turn now.
 `--local` cannot wait for idle. Panes running the agent directly without

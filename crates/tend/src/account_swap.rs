@@ -425,7 +425,12 @@ fn recently_active(agent: &Agent, now: time::OffsetDateTime) -> bool {
 
 /// Whether a registered target must remain pending, using fresh hook state.
 pub(crate) fn waiting_for_idle(agent: &Agent) -> bool {
-    is_busy(agent) || recently_active(agent, time::OffsetDateTime::now_utc())
+    is_busy(agent)
+        || matches!(
+            agent.state,
+            AgentState::WaitingInput | AgentState::WaitingChoice
+        )
+        || recently_active(agent, time::OffsetDateTime::now_utc())
 }
 
 fn select_at<'a>(
@@ -6863,5 +6868,14 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         assert_eq!(select(&agents, &req).0.len(), 2);
         assert!(waiting_for_idle(&agents[0]));
         assert!(waiting_for_idle(&agents[1]));
+    }
+    #[test]
+    fn idle_wait_keeps_permission_and_choice_prompts_pending_without_recent_activity() {
+        for state in [AgentState::WaitingInput, AgentState::WaitingChoice] {
+            let agent = agent("%1", "registered", AgentKind::ClaudeCode, state);
+            assert!(waiting_for_idle(&agent));
+        }
+        let agent = agent("%1", "registered", AgentKind::ClaudeCode, AgentState::Idle);
+        assert!(!waiting_for_idle(&agent));
     }
 }

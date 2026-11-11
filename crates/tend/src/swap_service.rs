@@ -1056,6 +1056,8 @@ fn ownership_lock(store: &Path) -> Result<std::fs::File, String> {
 /// Starts a job's thread; injected so a failure to start is testable.
 type Spawner = Box<dyn Fn(String, Box<dyn FnOnce() + Send>) -> std::io::Result<()> + Send + Sync>;
 
+// Each job owns an OS thread: idle polling and blocking pane I/O never run
+// on a Tokio worker. The manager lease belongs to the service, not one job.
 fn thread_spawner() -> Spawner {
     Box::new(|name, work| {
         std::thread::Builder::new()
@@ -1800,7 +1802,10 @@ impl<E: Engine> Service<E> {
                     } else if self.reserve(&identity.endpoint, owner) {
                         None
                     } else {
-                        Some(("busy", "another swap job is acting on this pane"))
+                        Some((
+                            "busy",
+                            "another swap job has reserved this pane (possibly waiting for idle)",
+                        ))
                     };
                     if let Some((code, note)) = refused {
                         settled.push(SettledEntry {
@@ -1956,6 +1961,9 @@ impl<E: Engine> Service<E> {
                         if began.elapsed() >= request.idle_timeout {
                             self.timed_out(job, target_id, report_index, &identity);
                         } else {
+                            // Release the input exclusion while waiting. Keep only
+                            // the per-endpoint reservation, to reject duplicate swaps;
+                            // neither unrelated endpoints nor submissions are held.
                             drop(guard);
                             pending
                                 .push_back((target_id as usize, (report_index, identity, target)));

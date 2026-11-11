@@ -216,11 +216,32 @@ impl TargetGuard for FakeGuard {
     }
 }
 
+struct TrackedGuard {
+    endpoint: String,
+    held: Arc<AtomicUsize>,
+    released: Arc<AtomicUsize>,
+}
+
+impl TargetGuard for TrackedGuard {
+    fn covers(&self, endpoint: &str) -> bool {
+        self.endpoint == endpoint
+    }
+}
+
+impl Drop for TrackedGuard {
+    fn drop(&mut self) {
+        self.held.fetch_sub(1, Ordering::SeqCst);
+        self.released.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
 struct FakeProvider {
     config_path: Option<PathBuf>,
     config: Mutex<SwapConfig>,
     agents: Mutex<Vec<Agent>>,
     acquired: Mutex<Vec<String>>,
+    held_guards: Arc<AtomicUsize>,
+    released_guards: Arc<AtomicUsize>,
     /// Holds every guard acquisition until opened, when set.
     guard_gate: Mutex<Option<Arc<Gate>>>,
 }
@@ -248,7 +269,12 @@ impl ContextProvider for FakeProvider {
         if let Some(gate) = gate {
             gate.wait();
         }
-        Ok(Box::new(FakeGuard(endpoint)))
+        self.held_guards.fetch_add(1, Ordering::SeqCst);
+        Ok(Box::new(TrackedGuard {
+            endpoint,
+            held: Arc::clone(&self.held_guards),
+            released: Arc::clone(&self.released_guards),
+        }))
     }
 }
 
@@ -280,6 +306,8 @@ fn harness(script: Script) -> Harness {
         agents: Mutex::new(Vec::new()),
         config: Mutex::new(SwapConfig::default()),
         acquired: Mutex::new(Vec::new()),
+        held_guards: Arc::new(AtomicUsize::new(0)),
+        released_guards: Arc::new(AtomicUsize::new(0)),
         guard_gate: Mutex::new(None),
     });
     let executed = Arc::new(Mutex::new(Vec::new()));
@@ -702,6 +730,8 @@ fn one_live_manager_holds_the_store_until_it_is_gone() {
             agents: Mutex::new(Vec::new()),
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
+            held_guards: Arc::new(AtomicUsize::new(0)),
+            released_guards: Arc::new(AtomicUsize::new(0)),
             guard_gate: Mutex::new(None),
         }) as Arc<dyn ContextProvider>
     };
@@ -856,6 +886,8 @@ fn an_executor_that_cannot_start_ends_the_job_without_effects() {
             agents: Mutex::new(Vec::new()),
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
+            held_guards: Arc::new(AtomicUsize::new(0)),
+            released_guards: Arc::new(AtomicUsize::new(0)),
             guard_gate: Mutex::new(None),
         }) as Arc<dyn ContextProvider>,
     )
@@ -920,6 +952,8 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
             agents: Mutex::new(Vec::new()),
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
+            held_guards: Arc::new(AtomicUsize::new(0)),
+            released_guards: Arc::new(AtomicUsize::new(0)),
             guard_gate: Mutex::new(None),
         }) as Arc<dyn ContextProvider>
     };
@@ -2053,4 +2087,84 @@ fn force_takes_precedence_over_idle_wait() {
         Service::submit(&h.service, "force-idle", &request, Origin::Public, None).unwrap();
     let view = settled(&h.service, &accepted.job_id);
     assert_eq!(view.entries[0].disposition.as_deref(), Some("swapped"));
+}
+
+#[test]
+fn idle_wait_releases_input_guards_and_allows_other_jobs_but_reserves_its_target() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let next = Arc::clone(&calls);
+    let h = harness(Box::new(move || {
+        let pane = ["%1", "%2", "%3", "%1"][next.fetch_add(1, Ordering::SeqCst)];
+        vec![run(pane)]
+    }));
+    *h.provider.agents.lock().unwrap() = vec![waiting_agent("%1", true)];
+    let request = SwapOverrides {
+        when_idle: true,
+        ..overrides(&["%1"])
+    };
+    let waiting = Service::submit(&h.service, "waiting", &request, Origin::Public, None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let checked = h.provider.released_guards.load(Ordering::SeqCst) > 0;
+        if checked && h.provider.held_guards.load(Ordering::SeqCst) == 0 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "idle wait retained its input guard"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Public requests (including Fleet relay) and automation use the same
+    // manager while the first job remains pending for another endpoint.
+    for (key, pane, origin) in [
+        ("public", "%2", Origin::Public),
+        ("automation", "%3", Origin::Automation),
+    ] {
+        let guard = (origin == Origin::Automation).then(|| {
+            Box::new(FakeGuard(endpoint_key(pane, Some("/tmp/tmux-1/default"))))
+                as Box<dyn TargetGuard>
+        });
+        let accepted =
+            Service::submit(&h.service, key, &overrides(&[pane]), origin, guard).unwrap();
+        assert_eq!(
+            settled(&h.service, &accepted.job_id).entries[0]
+                .disposition
+                .as_deref(),
+            Some("swapped")
+        );
+    }
+    assert_eq!(*h.executed.lock().unwrap(), ["%2", "%3"]);
+    assert_eq!(
+        h.service
+            .status(&JobRef::Id(waiting.job_id.clone()))
+            .unwrap()
+            .state,
+        "running"
+    );
+    let duplicate = Service::submit(
+        &h.service,
+        "duplicate",
+        &overrides(&["%1"]),
+        Origin::Public,
+        None,
+    )
+    .unwrap();
+    let duplicate = settled(&h.service, &duplicate.job_id);
+    assert_eq!(duplicate.entries[0].reason.as_deref(), Some("busy"));
+    assert!(duplicate.entries[0]
+        .outcome
+        .as_ref()
+        .unwrap()
+        .note
+        .contains("reserved"));
+    let repeated = Service::submit(&h.service, "waiting", &request, Origin::Public, None).unwrap();
+    assert!(repeated.existing);
+    assert_eq!(repeated.job_id, waiting.job_id);
+    h.service
+        .cancel(&JobRef::Id(waiting.job_id.clone()))
+        .unwrap();
+    assert_eq!(settled(&h.service, &waiting.job_id).state, "done");
+    assert!(h.service.reserved.lock().unwrap().is_empty());
+    assert!(h.executed.lock().unwrap().iter().all(|pane| pane != "%1"));
 }
