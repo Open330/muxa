@@ -949,14 +949,18 @@ pub(super) async fn handle(
                                             );
                                         // Registered before typing, so the
                                         // hook reporting it carries its origin.
-                                        let expected = (submit && !text.is_empty()).then(|| {
-                                            store.expect_prompt(
-                                                &pane,
-                                                socket.as_deref(),
-                                                &text,
-                                                crate::PromptOrigin::declared(origin),
-                                            )
-                                        });
+                                        let expected = if submit && !text.is_empty() {
+                                            store
+                                                .expect_prompt(
+                                                    &pane,
+                                                    socket.as_deref(),
+                                                    &text,
+                                                    crate::PromptOrigin::declared(origin),
+                                                )
+                                                .await
+                                        } else {
+                                            None
+                                        };
                                         let (sent, submitted) =
                                             tokio::task::spawn_blocking(move || {
                                                 let _action = action_guard;
@@ -1013,19 +1017,22 @@ pub(super) async fn handle(
                     origin,
                 } => {
                     kind = "expect_prompt";
-                    // The caller has no use for the token: it forgets by
-                    // pane and text over IPC.
-                    let _token = store.expect_prompt(
-                        &pane,
-                        socket.as_deref(),
-                        &text,
-                        crate::PromptOrigin::declared(Some(origin)),
-                    );
-                    Response::ok()
+                    let token = store
+                        .expect_prompt(
+                            &pane,
+                            socket.as_deref(),
+                            &text,
+                            crate::PromptOrigin::declared(Some(origin)),
+                        )
+                        .await;
+                    Response {
+                        prompt_token: token,
+                        ..Response::ok()
+                    }
                 }
-                RequestBody::ForgetExpectedPrompt { pane, text } => {
+                RequestBody::ForgetExpectedPrompt { token } => {
                     kind = "forget_expected_prompt";
-                    store.forget_expected_prompt_text(&pane, &text);
+                    store.forget_expected_prompt(token);
                     Response::ok()
                 }
                 RequestBody::Capture { pane } => {

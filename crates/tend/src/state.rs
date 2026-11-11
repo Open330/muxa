@@ -492,10 +492,11 @@ impl PromptOrigin {
 #[derive(Debug, Clone)]
 struct ExpectedPrompt {
     token: u64,
-    pane: String,
-    socket: Option<String>,
+    /// The one agent session tend tracked on the pane when it registered.
+    session: String,
     text: String,
     origin: PromptOrigin,
+    registered_at: OffsetDateTime,
     until: OffsetDateTime,
 }
 
@@ -1426,16 +1427,38 @@ impl Store {
     /// `seq` is above a value read from it came after that read.
     #[must_use]
     /// Registers a prompt tend is about to type into `pane`, so the hook
-    /// that reports it is stamped with `origin`. Register before typing;
-    /// call [`Self::forget_expected_prompt`] when typing failed. Each
-    /// registration matches one prompt at most, within a minute.
-    pub fn expect_prompt(
+    /// that reports it is stamped with `origin`. Bound to the one agent
+    /// session tend tracks on that pane and endpoint; with none or several,
+    /// nothing is registered (None) and the prompt stays of unknown origin.
+    /// Register before typing; call [`Self::forget_expected_prompt`] with
+    /// the token when typing failed. Each registration matches one prompt at
+    /// most: from that session, with that exact text, reported no earlier
+    /// than the registration, within a minute.
+    pub async fn expect_prompt(
         &self,
         pane: &str,
         socket: Option<&str>,
         text: &str,
         origin: PromptOrigin,
-    ) -> u64 {
+    ) -> Option<u64> {
+        let candidates: Vec<String> = self
+            .agents
+            .read()
+            .await
+            .values()
+            .filter(|agent| {
+                agent.pane.as_deref() == Some(pane)
+                    && crate::backend::pane_endpoints_match(
+                        Some(pane),
+                        socket.unwrap_or(""),
+                        agent.tmux_socket.as_deref().unwrap_or(""),
+                    )
+            })
+            .map(|agent| agent.session_id.clone())
+            .collect();
+        let [session] = candidates.as_slice() else {
+            return None;
+        };
         let token = self
             .expected_prompt_token
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -1445,28 +1468,16 @@ impl Store {
         expected.retain(|entry| entry.until > now);
         expected.push(ExpectedPrompt {
             token,
-            pane: pane.to_string(),
-            socket: socket.map(str::to_string),
+            session: session.clone(),
             text: text.to_string(),
             origin,
+            registered_at: now,
             until: now + EXPECTED_PROMPT_TTL,
         });
-        token
+        Some(token)
     }
 
-    /// Drops the newest registration for `pane` and `text`, for a caller
-    /// that registered over IPC and has no token.
-    pub fn forget_expected_prompt_text(&self, pane: &str, text: &str) {
-        let mut expected = self.expected_prompts.lock().unwrap();
-        if let Some(index) = expected
-            .iter()
-            .rposition(|entry| entry.pane == pane && entry.text == text)
-        {
-            expected.remove(index);
-        }
-    }
-
-    /// Drops a registration whose prompt was never typed.
+    /// Drops the registration `token` named, after typing failed.
     pub fn forget_expected_prompt(&self, token: u64) {
         self.expected_prompts
             .lock()
@@ -1474,30 +1485,21 @@ impl Store {
             .retain(|entry| entry.token != token);
     }
 
-    /// The origin of a prompt `agent` just reported: the oldest live
-    /// registration for its pane, endpoint and exact text, consumed; else
-    /// unknown.
+    /// The origin of a prompt `agent` just reported at `at`: the oldest live
+    /// registration for this session and exact text, made no later than the
+    /// hook's own time, consumed; else unknown. A hook stamped before the
+    /// registration is an older prompt and never takes it.
     fn take_expected_prompt(
         &self,
         agent: &Agent,
         prompt: &str,
         at: OffsetDateTime,
     ) -> PromptOrigin {
-        let Some(pane) = agent.pane.as_deref() else {
-            return PromptOrigin::Unknown;
-        };
         let mut expected = self.expected_prompts.lock().unwrap();
         let now = OffsetDateTime::now_utc();
         expected.retain(|entry| entry.until > now);
         let found = expected.iter().position(|entry| {
-            entry.pane == pane
-                && entry.text == prompt
-                && entry.until - EXPECTED_PROMPT_TTL <= at + time::Duration::seconds(1)
-                && crate::backend::pane_endpoints_match(
-                    Some(pane),
-                    entry.socket.as_deref().unwrap_or(""),
-                    agent.tmux_socket.as_deref().unwrap_or(""),
-                )
+            entry.session == agent.session_id && entry.text == prompt && at >= entry.registered_at
         });
         found.map_or(PromptOrigin::Unknown, |index| expected.remove(index).origin)
     }

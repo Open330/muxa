@@ -1025,14 +1025,18 @@ async fn local_send_prompt(
     let socket = pane.window.session.endpoint.socket;
     let pane_id = pane.pane_id;
     // Registered before typing, so the hook reporting it carries its origin.
-    let expected = (submit && !text.is_empty()).then(|| {
-        store.expect_prompt(
-            &pane_id,
-            Some(&socket),
-            &text,
-            tend::PromptOrigin::declared(origin),
-        )
-    });
+    let expected = if submit && !text.is_empty() {
+        store
+            .expect_prompt(
+                &pane_id,
+                Some(&socket),
+                &text,
+                tend::PromptOrigin::declared(origin),
+            )
+            .await
+    } else {
+        None
+    };
     let forget = store.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {

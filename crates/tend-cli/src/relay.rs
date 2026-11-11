@@ -390,18 +390,20 @@ async fn handle_request(
             // Register with this host's daemon before typing, so the hook
             // reporting the prompt carries its origin. A daemon without
             // prompt_origin_v1 refuses; the prompt then stays unknown.
-            let expected = submit && !text.is_empty();
-            if expected {
-                let _ = client
+            let expected = if submit && !text.is_empty() {
+                client
                     .expect_prompt(
                         &pane_id,
                         Some(&socket),
                         &text,
                         tend::PromptOrigin::declared(origin),
                     )
-                    .await;
-            }
-            let forget = (pane_id.clone(), text.clone());
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let outcome = tokio::task::spawn_blocking(move || {
                 if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
                     return None;
@@ -420,8 +422,10 @@ async fn handle_request(
             })
             .await
             .context("send task panicked")?;
-            if expected && !outcome.as_ref().is_some_and(|outcome| outcome.submitted) {
-                let _ = client.forget_expected_prompt(&forget.0, &forget.1).await;
+            if !outcome.as_ref().is_some_and(|outcome| outcome.submitted) {
+                if let Some(token) = expected {
+                    let _ = client.forget_expected_prompt(token).await;
+                }
             }
             let outcome = outcome.context("backend refused text injection")?;
             Ok(RelayFrame::Result {

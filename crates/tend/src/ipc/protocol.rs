@@ -378,11 +378,9 @@ pub(super) enum RequestBody {
         origin: crate::PromptOrigin,
     },
 
-    /// Drops the newest registration for `pane` and `text` after typing it
-    /// failed.
+    /// Drops the registration `token` named after typing failed.
     ForgetExpectedPrompt {
-        pane: String,
-        text: String,
+        token: u64,
     },
 
     /// Control/observation: capture the visible contents of `pane` via
@@ -1066,6 +1064,10 @@ pub struct Response {
     /// the old daemon still finishing an in-flight response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// The registration an `expect_prompt` made; absent when tend could not
+    /// bind it to exactly one agent session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<SessionRef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1241,6 +1243,7 @@ impl Response {
             collaboration_open_counts: None,
             collaboration_byte_budget: None,
             generation: None,
+            prompt_token: None,
             sessions: None,
             session: None,
             terminal: None,
