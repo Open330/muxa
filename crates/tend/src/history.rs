@@ -49,10 +49,10 @@
 //! `try_send`, so a slow writer drops a disk record (with a warning) rather
 //! than backing up the broadcast pipeline.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -210,9 +210,6 @@ struct Inner {
     /// Per-pane ring buffer of recent entries. `VecDeque` so `push_back` +
     /// `pop_front` is O(1) — the eviction shape is FIFO oldest-first.
     by_pane: HashMap<String, VecDeque<HistoryEntry>>,
-    /// Compact fingerprints of every prompt seen this process, including all
-    /// records loaded at startup. Ring eviction must not re-enable retries.
-    seen: HashSet<[u8; 32]>,
 }
 
 /// Append-only prompt log with bounded in-memory caching and periodic
@@ -223,6 +220,10 @@ struct Inner {
 /// and dry runs. Cheap to clone (`Arc` internally).
 pub struct PromptHistory {
     inner: RwLock<Inner>,
+    /// Fingerprints shared by live acceptance and history append. False means a
+    /// live event claimed the prompt but its history append has not landed yet;
+    /// true means recorded/loaded. Ring eviction cannot re-enable retries.
+    seen: Mutex<HashMap<[u8; 32], bool>>,
     opts: HistoryOptions,
     /// Writer-task sender. `None` iff this instance is in-memory only.
     /// `try_send` so the event-handler path never blocks on disk I/O.
@@ -252,6 +253,7 @@ impl PromptHistory {
     pub fn in_memory_only(opts: HistoryOptions) -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(Inner::default()),
+            seen: Mutex::default(),
             pane_sessions: opts.pane_sessions.clone(),
             opts: HistoryOptions { path: None, ..opts },
             writer: None,
@@ -284,8 +286,14 @@ impl PromptHistory {
 
         let mut inner = Inner::default();
         let initial = load_from_disk(&path).await?;
+        let mut seen = HashMap::new();
         for entry in initial {
-            push_bounded(&mut inner, entry, opts.max_per_pane);
+            if seen
+                .insert(retry_key(&entry.session_id, entry.at, &entry.prompt), true)
+                .is_none()
+            {
+                push_bounded(&mut inner, entry, opts.max_per_pane);
+            }
         }
 
         let (tx, rx) = mpsc::channel(opts.writer_channel_capacity);
@@ -295,6 +303,7 @@ impl PromptHistory {
         Ok((
             Arc::new(Self {
                 inner: RwLock::new(inner),
+                seen: Mutex::new(seen),
                 pane_sessions: opts.pane_sessions.clone(),
                 opts,
                 writer: Some(tx),
@@ -307,6 +316,30 @@ impl PromptHistory {
 
     pub fn options(&self) -> &HistoryOptions {
         &self.opts
+    }
+
+    /// Claim live side effects exactly once, using the same identity as history.
+    /// This synchronous check can run under the registry lock without nesting
+    /// async locks or waiting for the deferred history append. Loaded prompts
+    /// are already claimed, including after the live agent was reaped.
+    pub(crate) fn claim_live_prompt(
+        &self,
+        session_id: &str,
+        at: OffsetDateTime,
+        prompt: &str,
+    ) -> bool {
+        match self
+            .seen
+            .lock()
+            .unwrap()
+            .entry(retry_key(session_id, at, prompt))
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(false);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
     }
 
     /// Record one prompt, ignoring repeated (`session_id`, `at`, `prompt`) identities.
@@ -326,9 +359,16 @@ impl PromptHistory {
                 .and_then(|cache| cache.get(&entry.pane));
         }
         let mut inner = self.inner.write().await;
-        if !push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane) {
+        if self
+            .seen
+            .lock()
+            .unwrap()
+            .insert(retry_key(&entry.session_id, entry.at, &entry.prompt), true)
+            == Some(true)
+        {
             return;
         }
+        push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane);
         if let Some(tx) = &self.writer {
             #[cfg(test)]
             if let Some(hook) = &self.before_enqueue_hook {
@@ -438,26 +478,22 @@ pub struct CompactReport {
 }
 
 /// Hash the retry identity without retaining a second copy of prompt text.
-fn retry_key(entry: &HistoryEntry) -> [u8; 32] {
+fn retry_key(session_id: &str, at: OffsetDateTime, prompt: &str) -> [u8; 32] {
     let mut hash = Sha256::new();
-    hash.update(entry.session_id.len().to_le_bytes());
-    hash.update(entry.session_id.as_bytes());
-    hash.update(entry.at.unix_timestamp_nanos().to_le_bytes());
-    hash.update(entry.prompt.as_bytes());
+    hash.update(session_id.len().to_le_bytes());
+    hash.update(session_id.as_bytes());
+    hash.update(at.unix_timestamp_nanos().to_le_bytes());
+    hash.update(prompt.as_bytes());
     hash.finalize().into()
 }
 
-fn push_bounded(inner: &mut Inner, entry: HistoryEntry, max_per_pane: usize) -> bool {
-    if !inner.seen.insert(retry_key(&entry)) {
-        return false;
-    }
+fn push_bounded(inner: &mut Inner, entry: HistoryEntry, max_per_pane: usize) {
     let pane = entry.pane.clone();
     let deque = inner.by_pane.entry(pane).or_default();
     deque.push_back(entry);
     while deque.len() > max_per_pane {
         deque.pop_front();
     }
-    true
 }
 
 /// Read every parseable NDJSON line from `path` into a Vec. Missing file
@@ -673,6 +709,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(h.recent_all(0).await, vec![second]);
+        assert!(!h.claim_live_prompt(&first.session_id, first.at, &first.prompt));
         h.append(first).await;
         tx.send(()).unwrap();
         writer.await.unwrap();
@@ -815,6 +852,7 @@ mod tests {
         });
         let h = Arc::new(PromptHistory {
             inner: RwLock::new(Inner::default()),
+            seen: Mutex::default(),
             opts: HistoryOptions {
                 max_age: time::Duration::days(1),
                 ..Default::default()

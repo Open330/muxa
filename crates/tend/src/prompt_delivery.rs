@@ -308,8 +308,7 @@ mod tests {
         use crate::PromptOrigin;
         let store = Store::shared();
         start(&store).await;
-        // After session start, but before the delivery was registered.
-        let earlier = OffsetDateTime::now_utc();
+        let earlier = OffsetDateTime::now_utc() - time::Duration::milliseconds(500);
         let _ = store
             .expect_prompt(
                 "rmux:%7",
@@ -320,11 +319,9 @@ mod tests {
             .await
             .unwrap();
         submit_at(&store, "original", "/test.sock", "continue", earlier).await;
-        assert_eq!(
-            origin_of(&store, "original").await,
-            Some(PromptOrigin::Unknown)
-        );
-        // The delivery is still there for the prompt it typed.
+        assert_eq!(origin_of(&store, "original").await, None);
+        // A stale hook does not change live origin. The delivery is still
+        // there for the prompt it typed.
         submit(&store, "original", "/test.sock", "continue").await;
         assert_eq!(
             origin_of(&store, "original").await,

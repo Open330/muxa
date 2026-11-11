@@ -887,9 +887,14 @@ is gone.
   loaded from `prompts.ndjson` on restart. Retry fingerprints remain for the
   daemon's lifetime (32 bytes per unique prompt plus set overhead); after restart,
   only records still retained on disk are known. Historical prompts may enter
-  history, but a `prompt_submitted` at or before the last state transition or
-  latest prompt cannot change live state, activity, latest prompt, or emit another
-  live prompt broadcast. A first event creating a new agent is accepted.
+  history, but a `prompt_submitted` strictly older than the latest ingested adapter
+  event cannot change live state, activity, latest prompt, or emit another live
+  prompt broadcast. The persisted `last_event_at` watermark advances only from
+  ingested events, never from daemon-clock state changes or screen/reconciler
+  observations. Distinct events with equal timestamps are accepted; exact prompt
+  retries are suppressed using the shared history fingerprints before live side
+  effects, including after restart. Old snapshots lacking the watermark start
+  without an adapter-time ordering bound.
   There is no general event-ID deduplication: other event kinds are **not**
   retry-safe across intervening events. Retried `started`, `tool_started`,
   `notification_fired`, `turn_stopped`, `session_ended`, or `rate_limited` may

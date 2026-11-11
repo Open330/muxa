@@ -38,8 +38,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it for untracked panes. Registered legacy rows without a socket retain their
   previous backend-default behavior. (#413)
 - Retried `prompt_submitted` ingest events no longer duplicate prompt history,
-  including retries against records loaded from disk after restart. Prompts at
-  or before the latest state transition/prompt no longer revive stopped agents
+  including retries against records loaded from disk after restart. Prompts
+  strictly older than the latest ingested adapter event no longer revive stopped agents
   or overwrite newer prompt/activity data. The protocol now states the retry
   limits of other event kinds explicitly (#412).
 

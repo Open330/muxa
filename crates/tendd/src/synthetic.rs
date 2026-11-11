@@ -202,7 +202,7 @@ pub async fn apply_if_unowned(store: &SharedStore, pane_id: &str, events: &[Agen
         return;
     }
     for ev in events {
-        store.apply(ev).await;
+        store.apply_observed(ev).await;
     }
 }
 
@@ -231,7 +231,7 @@ pub async fn stop_synthetic_row(store: &SharedStore, pane_id: &str) {
             cwd: occ.cwd.clone(),
         };
         store
-            .apply(&AgentEvent::SessionEnded {
+            .apply_observed(&AgentEvent::SessionEnded {
                 id,
                 at: OffsetDateTime::now_utc(),
             })
@@ -419,6 +419,7 @@ mod tests {
             last_activity_at: AT,
             state_entered_at: AT,
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
         }
     }
@@ -813,6 +814,7 @@ mod tests {
             last_activity_at: AT,
             state_entered_at: AT,
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
         };
         assert!(occupant_is_authoritative(&agent), "live real row owns pane");
