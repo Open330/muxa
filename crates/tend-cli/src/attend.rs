@@ -458,6 +458,7 @@ mod tests {
             started_at: entered,
             last_activity_at: entered,
             state_entered_at: entered,
+            last_response_at: None,
         }
     }
 

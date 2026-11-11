@@ -50,6 +50,7 @@ pub(super) fn fake_agent(
         started_at: now,
         last_activity_at: now,
         state_entered_at: now,
+        last_response_at: None,
     }
 }
 
@@ -1000,6 +1001,7 @@ pub(super) fn board_work(id: &str, key: Option<&PaneKey>) -> tend::work::WorkSna
         goal: Some("ship it".into()),
         next_action: None,
         stage: tend::work::BoardStage::InProgress,
+        idle: None,
         signals: Vec::new(),
         external_items: Vec::new(),
         runs: key

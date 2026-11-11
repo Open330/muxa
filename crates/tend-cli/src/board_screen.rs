@@ -629,6 +629,16 @@ pub(crate) const HEADERS: [&str; 8] = [
     "STAGE", "WORK", "TITLE", "ISSUE", "RUNS", "AGENTS", "ACT", "AGE",
 ];
 
+/// The stage as the board shows it: a queued Work an agent already worked
+/// on reads as idle, not as never started.
+pub(crate) fn work_stage_label(work: &WorkSnapshotItem) -> &'static str {
+    match work.idle {
+        Some(tend::work::WorkIdle::FinishedTurn) => "idle",
+        Some(tend::work::WorkIdle::TurnWithoutOutput) => "idle (no output seen)",
+        None => stage_label(work.stage),
+    }
+}
+
 pub(crate) fn stage_label(stage: BoardStage) -> &'static str {
     match stage {
         BoardStage::Queued => "queued",
@@ -671,11 +681,11 @@ pub(crate) fn row<'a>(
 ) -> Row<'a> {
     let stage = if needs_operator(work) {
         Span::styled(
-            format!("! {}", stage_label(work.stage)),
+            format!("! {}", work_stage_label(work)),
             theme.state_style(AgentState::WaitingInput),
         )
     } else {
-        Span::raw(format!("  {}", stage_label(work.stage)))
+        Span::raw(format!("  {}", work_stage_label(work)))
     };
     let issue = work
         .external_items
@@ -722,7 +732,7 @@ pub(crate) fn detail_lines<'a>(
             work.title.clone(),
             theme.table_header_style().add_modifier(Modifier::BOLD),
         ),
-        Span::raw(format!("  {}", stage_label(work.stage))),
+        Span::raw(format!("  {}", work_stage_label(work))),
     ];
     for signal in &work.signals {
         head.push(Span::styled(
@@ -837,6 +847,7 @@ mod tests {
             goal: None,
             next_action: None,
             stage,
+            idle: None,
             signals,
             external_items: Vec::new(),
             runs: Vec::new(),
@@ -922,6 +933,7 @@ mod tests {
             started_at: now,
             last_activity_at: now,
             state_entered_at: now,
+            last_response_at: None,
         }
     }
 
