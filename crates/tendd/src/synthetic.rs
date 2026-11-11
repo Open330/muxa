@@ -519,11 +519,13 @@ mod tests {
     /// names the process. For an npm-installed codex those disagree (`node`),
     /// which is why manifest selection consults the kind first.
     #[test]
-    fn codex_kind_names_its_manifest() {
+    fn kinds_name_their_bundled_manifests() {
         assert_eq!(AgentKind::Codex.screen_manifest_name(), Some("codex"));
         assert_eq!(AgentKind::Antigravity.screen_manifest_name(), Some("agy"));
-        // Kinds whose hooks fully cover attention ship no manifest.
-        assert_eq!(AgentKind::ClaudeCode.screen_manifest_name(), None);
+        // Claude's startup trust gates appear before its hooks can report them.
+        assert_eq!(AgentKind::ClaudeCode.screen_manifest_name(), Some("claude"));
+        assert_eq!(AgentKind::Opencode.screen_manifest_name(), None);
+        assert_eq!(AgentKind::GeminiCli.screen_manifest_name(), None);
 
         let set = tend::screen::load_manifests();
         assert!(
@@ -531,6 +533,7 @@ mod tests {
             "every name screen_manifest_name returns must resolve",
         );
         assert!(set.manifest_for_name("agy").is_some());
+        assert!(set.manifest_for_name("claude").is_some());
     }
 
     fn refine(owner_state: AgentState, observed: SyntheticState) -> Vec<AgentEvent> {
