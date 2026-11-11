@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.5] - 2026-11-11
-
 ### Added
 
 - An agent that ends its turn by asking you something in prose ("머지해도
@@ -25,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is blocked on a decision only the person can make, instead of only asking
   in prose.
 
+### Fixed
+
+- A long assistant response kept only its first 4 KB, losing its ending;
+  responses now keep their start and end.
+
+## [0.10.5] - 2026-11-11
+
+### Added
+
 - `tend swap --all --to same --when-idle` restarts each agent in place on
   its identified current account after it becomes idle, for example to pick
   up upgraded hooks and MCP configuration. Busy targets remain pending in
@@ -35,8 +42,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- A long assistant response kept only its first 4 KB, losing its ending;
-  responses now keep their start and end.
 - A second `tendd` started while one already serves the socket (for example
   launchd's copy next to one started by hand) now exits before loading or
   writing anything. Before, it loaded the registry, ran its notifiers and
