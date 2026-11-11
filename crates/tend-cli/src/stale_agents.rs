@@ -653,11 +653,13 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("spawn helper");
-        // Readable once the child has reached `exec`.
+        // Readable once the child has reached `exec`. Before that, the forked
+        // child still carries this process's environment, whose HOME fallback
+        // is a different (wrong) answer, so wait for the expected one.
         let mut found = None;
         for _ in 0..100 {
             found = codex_home_of(child.id());
-            if found.is_some() {
+            if found.as_deref() == Some(home) {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
