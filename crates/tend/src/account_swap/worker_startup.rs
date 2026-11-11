@@ -250,36 +250,55 @@ fn prepare_with(
 /// and the key-hint footer last. Text that merely mentions it (a transcript
 /// line above a normal composer) is not the menu.
 fn codex_hook_review(screen: &str) -> bool {
-    let tail = super::screen_tail(screen, 16);
+    let tail = super::screen_tail(screen, 20);
     let lines: Vec<&str> = tail
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect();
-    let Some(footer) = lines.last() else {
+    if lines
+        .iter()
+        .any(|line| line.starts_with('›') && is_codex_composer_line(line))
+    {
+        return false;
+    }
+    let Some(title) = lines.iter().rposition(|line| *line == "Hooks need review") else {
         return false;
     };
-    let option = |label: &str| {
-        lines.iter().position(|line| {
-            let line = line.trim_start_matches('›').trim_start();
-            line.split_once(". ")
-                .is_some_and(|(n, rest)| n.chars().all(|c| c.is_ascii_digit()) && rest == label)
-        })
-    };
-    let (Some(title), Some(review), Some(trust)) = (
-        lines.iter().position(|line| *line == "Hooks need review"),
-        option("Review hooks"),
-        option("Trust all and continue"),
-    ) else {
-        return false;
-    };
-    footer.starts_with("enter confirm")
-        && title < review
-        && review < trust
-        && lines[review..].iter().any(|line| line.starts_with('›'))
-        && !lines
+    // The footer is the last line or two; Codex wraps it in a narrow pane,
+    // and older builds word it "Press enter to confirm or esc to go back".
+    let footer_at = lines.len().saturating_sub(2).max(title + 1);
+    let footer = lines[footer_at..].join(" ").to_lowercase();
+    let footer_lines = if footer.contains("enter") && footer.contains("confirm") {
+        lines[footer_at..]
             .iter()
-            .any(|line| line.starts_with("› ") && is_codex_composer_line(line))
+            .position(|line| line.to_lowercase().contains("enter"))
+            .map_or(0, |start| lines.len() - footer_at - start)
+    } else {
+        return false;
+    };
+    // Numbered rows; a wrapped label continues on the next lines.
+    let mut rows: Vec<(bool, String)> = Vec::new();
+    for line in &lines[title + 1..lines.len() - footer_lines] {
+        let selected = line.starts_with('›');
+        let body = line.trim_start_matches('›').trim_start();
+        match body.split_once(". ") {
+            Some((n, label)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                rows.push((selected, label.to_owned()));
+            }
+            _ => {
+                if let Some((_, label)) = rows.last_mut() {
+                    label.push(' ');
+                    label.push_str(body);
+                }
+            }
+        }
+    }
+    let position = |label: &str| rows.iter().position(|(_, row)| row == label);
+    matches!(
+        (position("Review hooks"), position("Trust all and continue")),
+        (Some(review), Some(trust)) if review < trust
+    ) && rows.iter().any(|(selected, _)| *selected)
 }
 
 /// An empty Codex composer or one showing a placeholder.
@@ -561,6 +580,16 @@ mod tests {
             Duration::from_millis(25),
         );
         assert_eq!(result.state, State::Ready, "{result:?}");
+    }
+
+    #[test]
+    fn a_wrapped_hook_menu_and_older_footer_are_still_the_menu() {
+        let wrapped = "  Hooks need review\n  6 hooks are new or changed.\n› 1. Review hooks\n  2. Trust all and\n     continue\n  3. Continue without\n     trusting (hooks won't run)\n  enter confirm ·\n  esc skip";
+        assert!(codex_hook_review(wrapped));
+        let older = "  Hooks need review\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting\n  Press enter to confirm or esc to go back";
+        assert!(codex_hook_review(older));
+        let unselected = "  Hooks need review\n  1. Review hooks\n  2. Trust all and continue\n  enter confirm · esc skip";
+        assert!(!codex_hook_review(unselected));
     }
 
     #[test]
