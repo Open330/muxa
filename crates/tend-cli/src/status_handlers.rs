@@ -293,6 +293,30 @@ pub(super) fn attention_segment(count: usize) -> String {
     }
 }
 
+/// The global status segment: agents blocked on a human, then open review
+/// items. Each request has its own `STATUS_LINE_IPC_TIMEOUT` and they run
+/// concurrently; any failure (old daemon, unavailable review store, wedged
+/// socket) drops only that segment and never delays the status bar.
+pub(super) async fn needs_attention_line(client: &Client) -> String {
+    let (agents, reviews) = tokio::join!(
+        client.snapshot_with_timeout(STATUS_LINE_IPC_TIMEOUT),
+        client.review_summary_with_timeout(STATUS_LINE_IPC_TIMEOUT),
+    );
+    let count = agents
+        .unwrap_or_default()
+        .iter()
+        .filter(|a| attend::needs_attention(a.state))
+        .count();
+    let review = reviews
+        .map(|summary| super::review_cmd::review_segment(&summary, OffsetDateTime::now_utc()))
+        .unwrap_or_default();
+    [attention_segment(count), review]
+        .into_iter()
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 pub(super) async fn cmd_status_line(
     client: &Client,
     pane: Option<String>,
@@ -303,15 +327,7 @@ pub(super) async fn cmd_status_line(
     // tight IPC deadline + empty-on-timeout contract of the status-line
     // path so a slow daemon can never stall the tmux status bar.
     if needs_attention {
-        let agents = client
-            .snapshot_with_timeout(STATUS_LINE_IPC_TIMEOUT)
-            .await
-            .unwrap_or_default();
-        let count = agents
-            .iter()
-            .filter(|a| attend::needs_attention(a.state))
-            .count();
-        println!("{}", attention_segment(count));
+        println!("{}", needs_attention_line(client).await);
         return Ok(());
     }
 
@@ -855,4 +871,178 @@ pub(super) fn status_state_label(state: AgentState, layout: StatusTableLayout) -
 
 pub(super) fn status_state_cell(label: &str, state: AgentState, theme: CliTheme) -> Cell {
     theme.state_cell(label, state)
+}
+
+#[cfg(all(test, unix))]
+mod needs_attention_line_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, Instant};
+    use tend::review::{ActorKind, NewReview, ReviewActor, ReviewStore, ReviewTarget};
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    async fn wait_for(socket: &Path) {
+        for _ in 0..100 {
+            if socket.exists() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("socket never appeared");
+    }
+
+    async fn real_daemon(
+        socket: PathBuf,
+        reviews: ReviewStore,
+    ) -> (
+        tokio::sync::broadcast::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let server =
+            tend::ipc::Server::new(socket.clone(), tend::Store::shared()).with_reviews(reviews);
+        let (shutdown, rx) = tokio::sync::broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for(&socket).await;
+        (shutdown, handle)
+    }
+
+    async fn agent_waiting_for_input(client: &Client) {
+        let id = tend::AgentId {
+            kind: AgentKind::Codex,
+            session_id: "blocked".into(),
+            surface: None,
+            pane: Some("%7".into()),
+            tmux_socket: None,
+            cwd: None,
+        };
+        let at = OffsetDateTime::now_utc();
+        client
+            .ingest(&tend::AgentEvent::Started { id: id.clone(), at })
+            .await
+            .unwrap();
+        client
+            .ingest(&tend::AgentEvent::NotificationFired {
+                id,
+                level: tend::NotificationLevel::NeedsInput,
+                message: "approve?".into(),
+                at,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// A daemon that answers `hello` and `snapshot` like an older tendd and
+    /// rejects every other kind, or (when `hang`) accepts and never answers.
+    fn fake_daemon(socket: &Path, hang: bool) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if hang {
+                            tokio::time::sleep(Duration::from_secs(30)).await;
+                            return;
+                        }
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        let reply = match request["kind"].as_str() {
+                            Some("hello") => serde_json::json!({"ok": true, "protocol": 1}),
+                            Some("snapshot") => {
+                                serde_json::json!({"ok": true, "protocol": 1, "agents": []})
+                            }
+                            _ => serde_json::json!({
+                                "ok": false, "protocol": 1,
+                                "error": "unknown variant `review_summary`"
+                            }),
+                        };
+                        let mut bytes = serde_json::to_vec(&reply).unwrap();
+                        bytes.push(b'\n');
+                        if write.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn open_reviews_follow_the_attention_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("line.sock");
+        let (shutdown, handle) = real_daemon(socket.clone(), ReviewStore::in_memory()).await;
+        let client = Client::new(socket);
+        assert_eq!(needs_attention_line(&client).await, "");
+        agent_waiting_for_input(&client).await;
+        client
+            .review_create(&NewReview {
+                target: ReviewTarget::Session {
+                    provider: None,
+                    session_id: "s".into(),
+                },
+                summary: "check".into(),
+                anchor: None,
+                idempotency_key: None,
+                requested_by: ReviewActor {
+                    kind: ActorKind::User,
+                    label: None,
+                },
+            })
+            .await
+            .unwrap();
+        let line = needs_attention_line(&client).await;
+        assert!(
+            line.starts_with("#[fg=red]⚠ 1 needs you#[default] "),
+            "{line}"
+        );
+        assert!(line.contains("◇ 1 to review"), "{line}");
+        shutdown.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unavailable_review_store_never_hides_the_attention_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("down.sock");
+        let (shutdown, handle) =
+            real_daemon(socket.clone(), ReviewStore::unavailable("disk full")).await;
+        let client = Client::new(socket);
+        agent_waiting_for_input(&client).await;
+        assert_eq!(
+            needs_attention_line(&client).await,
+            "#[fg=red]⚠ 1 needs you#[default]"
+        );
+        shutdown.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_older_daemon_adds_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy.sock");
+        let fake = fake_daemon(&socket, false);
+        assert_eq!(needs_attention_line(&Client::new(socket)).await, "");
+        fake.abort();
+    }
+
+    #[tokio::test]
+    async fn a_wedged_daemon_is_bounded_by_the_status_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("hung.sock");
+        let fake = fake_daemon(&socket, true);
+        let started = Instant::now();
+        assert_eq!(needs_attention_line(&Client::new(socket)).await, "");
+        // Both requests run concurrently under one deadline each, so the
+        // whole line costs about one deadline, not two.
+        assert!(
+            started.elapsed() < STATUS_LINE_IPC_TIMEOUT * 2,
+            "{:?}",
+            started.elapsed()
+        );
+        fake.abort();
+    }
 }

@@ -17,6 +17,7 @@ use super::*;
         restart,
         fleet,
         pipeline_runs,
+        reviews,
         work_up,
         mux_snapshots,
         swap
@@ -36,6 +37,7 @@ pub(super) async fn handle(
     restart: Option<Arc<RestartController>>,
     fleet: Option<FleetRuntime>,
     pipeline_runs: Arc<PipelineRunStore>,
+    reviews: crate::review::ReviewStore,
     work_up: Arc<WorkUpManager>,
     mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     config_path: Option<PathBuf>,
@@ -381,6 +383,16 @@ pub(super) async fn handle(
                     };
                     let mut response = Response::with_agents(agents);
                     response.launch_identities = identities;
+                    response
+                }
+                body @ (RequestBody::ReviewCreate { .. }
+                | RequestBody::ReviewGet { .. }
+                | RequestBody::ReviewList { .. }
+                | RequestBody::ReviewSummary
+                | RequestBody::ReviewDispose { .. }) => {
+                    // One boxed arm keeps this dispatch frame from growing.
+                    let (name, response) = Box::pin(review_response(&reviews, body)).await;
+                    kind = name;
                     response
                 }
                 RequestBody::PipelineRuns => {

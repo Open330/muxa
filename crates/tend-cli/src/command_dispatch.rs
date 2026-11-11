@@ -164,6 +164,7 @@ pub(super) async fn main() -> Result<()> {
         Cmd::Automation(a) => automation::run(a, &client).await,
         Cmd::Config(a) => config_cmd::run(a, socket.clone()).await,
         Cmd::Workers(a) => worker_cmd::run(a, &Client::new(socket.clone())).await,
+        Cmd::Review(a) => Box::pin(super::review_cmd::run(*a, &client)).await,
         Cmd::Worktrees(a) => worktrees_cmd::run(a).await,
         Cmd::Servers(a) => servers_cmd::run(a, &Client::new(socket.clone())).await,
         Cmd::Host(a) => fleet_cli::run_host(a, &client, &cfg, config_path.as_deref()).await,
