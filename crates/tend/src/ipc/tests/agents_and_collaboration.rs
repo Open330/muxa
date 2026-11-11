@@ -2403,3 +2403,87 @@ async fn end_to_end_ingest_and_query() {
     tx.send(()).unwrap();
     handle.await.unwrap();
 }
+
+#[tokio::test]
+async fn expiry_summary_handles_4671_large_requests_over_ipc() {
+    let dir = tempdir().unwrap();
+    let socket = dir.path().join("expiry-summary.sock");
+    let store = Store::shared();
+    add_collaboration_agent(&store, "%1", "caller", AgentKind::Codex).await;
+    add_collaboration_agent(&store, "%2", "peer", AgentKind::ClaudeCode).await;
+    let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+    let (stop, serving) = wait_test_server(&socket, &store, &mailbox).await;
+    let client = Client::new(socket);
+    let context = client
+        .collaboration_context(&pane_origin("%1"))
+        .await
+        .unwrap();
+    // Both operator questions and recovery decisions must survive broad cleanup.
+    for recovery in [false, true] {
+        let mut sender = context.current.clone();
+        if recovery {
+            sender.agent_session_id = "tend:peer-recovery".into();
+        }
+        mailbox
+            .create(
+                sender,
+                collaboration::Participant::console(context.current.room.clone()),
+                collaboration::NewRequest {
+                    body: "human decision".into(),
+                    kind: collaboration::RequestKind::Question,
+                    human_action: Some(collaboration::HumanAction::Choice),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+    }
+    let mut ids = Vec::new();
+    for index in 0..4671 {
+        let request = mailbox
+            .create(
+                context.current.clone(),
+                context.peers[0].clone(),
+                collaboration::NewRequest {
+                    kind: collaboration::RequestKind::Notice,
+                    expects_reply: false,
+                    body: format!("PRIVATE {index} {}", "x".repeat(2048)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        ids.push(request.id);
+    }
+    // A zero-second API cutoff makes the fixture eligible without sleeps.
+    // The CLI still requires a positive age.
+    let preview = client
+        .collaboration_expire_summary(0, true, true, None)
+        .await
+        .unwrap();
+    assert_eq!(preview.total, 4671);
+    assert_eq!(preview.request_ids.len(), 100);
+    assert!(preview.truncated);
+    assert!(!serde_json::to_string(&preview).unwrap().contains("PRIVATE"));
+    let exact = client
+        .collaboration_expire_summary(0, false, true, Some(&ids[0]))
+        .await
+        .unwrap();
+    assert_eq!(exact.total, 1);
+    assert_eq!(exact.request_ids, vec![ids[0].clone()]);
+    assert!(!exact.truncated);
+    let expired = client
+        .collaboration_expire_summary(0, false, true, None)
+        .await
+        .unwrap();
+    assert_eq!(expired.total, 4670, "preview must not mutate rows");
+    let empty = client
+        .collaboration_expire_summary(0, true, false, None)
+        .await
+        .unwrap();
+    assert_eq!(empty.total, 0);
+    assert!(empty.request_ids.is_empty());
+    assert!(!empty.truncated);
+    stop.send(()).unwrap();
+    serving.await.unwrap();
+}

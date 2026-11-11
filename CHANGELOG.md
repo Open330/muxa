@@ -13,6 +13,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,
   `mcp__muxa__muxa_status` → `mcp__tend__tend_status`). Before, a migrated
   pipeline prompt could tell agents to call a tool that no longer exists.
+- `tend msg expire` and `--dry-run` use bounded IPC responses even for thousands
+  of stale requests. Human decisions, recovery questions, `--quiet-only`, and
+  exact-ID filters retain their existing protection. Requires an updated daemon;
+  legacy IPC expiry operations remain available to existing clients. CLI `--json`
+  now returns `{total, request_ids, truncated}` instead of full request objects:
+  at most 100 IDs (oversized imported IDs are omitted). Text output also shows
+  this sample and the exact total; request bodies no longer cross IPC for cleanup.
+- `tend doctor` checks live bindings and workspace marks through the selected
+  host, including `TEND_HOST=rmux` on Unix. Workspace marks are read from sessions
+  alone, so SSH shells need no current client, window, or pane target.
+
 
 ## [0.10.4] - 2026-11-11
 
@@ -21,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - macOS: the shortcut that shows agents from any app is now off until you
   pick one in Settings › General › Home. It used to take ⌥Space from every
   other app by default; a shortcut you already picked is kept.
+
 
 ## [0.10.3] - 2026-11-11
 

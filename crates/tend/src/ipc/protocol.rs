@@ -815,6 +815,15 @@ pub(super) enum RequestBody {
         dry_run: bool,
     },
 
+    /// Filtered expiry with a bounded count and ID sample response.
+    CollaborationExpireSummary {
+        older_than_secs: u64,
+        quiet_only: bool,
+        request_id: Option<String>,
+        #[serde(default)]
+        dry_run: bool,
+    },
+
     /// Wholesale pane-metadata snapshot pushed by an out-of-process
     /// backend source — today the zellij WASM plugin forwarding
     /// `PaneUpdate` events. The daemon hands the panes to its
@@ -961,6 +970,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     collaboration::COLLABORATION_HEALTH_CAPABILITY,
     "collaboration_expire_filtered_v1",
     collaboration::FILTERED_EXPIRE_CAPABILITY,
+    collaboration::EXPIRE_SUMMARY_CAPABILITY,
     collaboration::RETIRE_CAPABILITY,
     "collaboration_lifecycle",
     "collaboration_wait",
@@ -1138,6 +1148,8 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub collaboration_health: Option<collaboration::CollaborationHealth>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub collaboration_expire_summary: Option<collaboration::ExpireSummary>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_drain_plan: Option<collaboration::WorkerDrainPlan>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_drain_acquire: Option<collaboration::WorkerDrainAcquire>,
@@ -1281,6 +1293,7 @@ impl Response {
             turn_boundary_offers: None,
             collaboration_overview: None,
             collaboration_health: None,
+            collaboration_expire_summary: None,
             worker_drain_plan: None,
             worker_drain_acquire: None,
             worker_drain_token: None,

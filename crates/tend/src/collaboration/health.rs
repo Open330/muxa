@@ -10,6 +10,32 @@ pub const COLLABORATION_HEALTH_CAPABILITY: &str = "collaboration_health_v1";
 /// cannot make an old daemon ignore the filters and perform broad expiry.
 pub const FILTERED_EXPIRE_CAPABILITY: &str = "collaboration_expire_filtered_v2";
 
+pub const EXPIRE_SUMMARY_CAPABILITY: &str = "collaboration_expire_summary_v1";
+
+/// Bounded independently of mailbox size and imported request body/ID sizes.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct ExpireSummary {
+    pub total: usize,
+    pub request_ids: Vec<String>,
+    pub truncated: bool,
+}
+
+impl ExpireSummary {
+    pub fn from_requests(requests: &[CollaborationRequest]) -> Self {
+        let request_ids: Vec<_> = requests
+            .iter()
+            .filter(|request| request.id.len() <= 128)
+            .take(100)
+            .map(|request| request.id.clone())
+            .collect();
+        Self {
+            total: requests.len(),
+            truncated: request_ids.len() < requests.len(),
+            request_ids,
+        }
+    }
+}
+
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct CollaborationHealth {
     #[serde(default)]
@@ -97,6 +123,33 @@ mod tests {
             "pane":"%1","room":{"host":"tmux","window_id":"@1"},"state":"idle"}),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn expiry_summary_omits_oversized_imported_ids_and_bounds_escaped_ids() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut request = store
+            .create(
+                participant("a"),
+                participant("b"),
+                NewRequest {
+                    body: "hello".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        request.id = "x".repeat(1_000_000);
+        let summary = ExpireSummary::from_requests(std::slice::from_ref(&request));
+        assert_eq!(summary.total, 1);
+        assert!(summary.request_ids.is_empty());
+        assert!(summary.truncated);
+        request.id = "\u{0000}".repeat(128);
+        let requests = vec![request; 1000];
+        let summary = ExpireSummary::from_requests(&requests);
+        assert_eq!(summary.total, 1000);
+        assert_eq!(summary.request_ids.len(), 100);
+        assert!(serde_json::to_vec(&summary).unwrap().len() < 80_000);
     }
 
     #[tokio::test]

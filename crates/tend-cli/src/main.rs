@@ -799,10 +799,10 @@ enum MsgCmd {
         /// Age past which an unclaimed request expires (e.g. `24h`, `7d`).
         #[arg(long, value_name = "AGE")]
         older_than: String,
-        /// List what would expire without changing anything.
+        /// Preview the count and sampled IDs without changing anything.
         #[arg(long)]
         dry_run: bool,
-        /// Print the affected requests as JSON.
+        /// Print the total, up to 100 sampled IDs, and truncation status as JSON.
         #[arg(long)]
         json: bool,
         /// Only quiet one-way notices with no delivery or claim evidence.

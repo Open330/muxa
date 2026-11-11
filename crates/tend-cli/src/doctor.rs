@@ -217,14 +217,40 @@ fn check_stale_agent_servers() -> CheckResult {
 }
 
 fn check_workspace_marks() -> CheckResult {
-    match crate::tmux_work::workspace_mark_anomalies() {
+    let host = if doctor_uses_rmux() { "rmux" } else { "tmux" };
+    let output = doctor_mux_command()
+        .args(["list-sessions", "-F", crate::tmux_work::SESSION_FORMAT])
+        .output();
+    let anomalies = match output {
+        Ok(output) if output.status.success() => {
+            Ok(crate::tmux_work::workspace_mark_anomalies_from_sessions(
+                &String::from_utf8_lossy(&output.stdout),
+            ))
+        }
+        Ok(output) => {
+            let error = String::from_utf8_lossy(&output.stderr).into_owned();
+            if error.contains("no server running")
+                || error.contains("no sessions")
+                || error.contains("no current target")
+                || (error.contains("error connecting to ")
+                    && error.contains("(No such file or directory)"))
+            {
+                return CheckResult::Ok(
+                    "Workspace marks — no sessions or current target to inspect".into(),
+                );
+            }
+            Err(error)
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    match anomalies {
         // No server, or a server with no marks, is the ordinary case.
         Ok(anomalies) if anomalies.is_empty() => {
             CheckResult::Ok("Workspace marks agree with session names".to_string())
         }
         Ok(anomalies) => CheckResult::Warn(format!(
             "{}. Rebind with `tend work start --workspace <id>` from the intended \
-             session, or clear the stale mark with `tmux set-option -u -t <session> \
+             session, or clear the stale mark with `{host} set-option -u -t <session> \
              @tend_workspace_id`",
             anomalies
                 .iter()
@@ -1029,6 +1055,21 @@ impl TmuxEnvironment {
     }
 }
 
+/// Honor the configured host on Unix as well as Windows, including SSH
+/// shells without a current pane. Keep tmux scoped to its ambient server.
+fn doctor_mux_command() -> Command {
+    if doctor_uses_rmux() {
+        tend::RmuxBackend::new().command(None)
+    } else {
+        tend::tmux::tmux_command_scoped()
+    }
+}
+
+fn doctor_uses_rmux() -> bool {
+    tend::backend::detect_host_env() == Some(tend::HostKind::Rmux)
+        || (cfg!(windows) && tend::backend::detect_host_env().is_none())
+}
+
 /// Confirm the `prefix+s` binding tmux will actually run is the managed
 /// one.
 ///
@@ -1040,30 +1081,31 @@ impl TmuxEnvironment {
 /// intact and doctor green while `prefix+s` opens an inset popup, whose
 /// inner width cannot reach the 120 columns the watch inspector needs.
 fn check_tmux_watch_binding(env: &TmuxEnvironment) -> CheckResult {
-    // Scoped like the other tmux checks. Unscoped, it asked the default
-    // socket, and rmux, unlike tmux, starts a server to answer: every
-    // isolated doctor run (the test suite included) left one behind.
-    // On Windows the host is rmux, asked only through the server this shell
-    // is in for the same reason.
-    let mut command = if cfg!(windows) {
-        if tend::backend::rmux::endpoint_from_env().is_none() {
-            return CheckResult::Ok("rmux: run from an rmux pane to check its bindings".into());
-        }
-        tend::RmuxBackend::new().command(None)
-    } else {
-        tend::tmux::tmux_command_scoped()
-    };
+    let mut command = doctor_mux_command();
+    let host = if doctor_uses_rmux() { "rmux" } else { "tmux" };
     let out = command.args(["list-keys", "-T", "prefix"]).output();
     let text = match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
         // No server running yet is not a misconfiguration — there is
         // simply nothing to compare against.
         Ok(_) => {
-            return CheckResult::Ok("tmux: no running server to check bindings against".into())
+            return CheckResult::Ok(format!(
+                "{host}: no running server to check bindings against"
+            ))
         }
-        Err(e) => return CheckResult::Warn(format!("tmux: could not list keys ({e})")),
+        Err(e) => return CheckResult::Warn(format!("{host}: could not list keys ({e})")),
     };
-    watch_binding_verdict(watch_popup_binding(&text), env)
+    let binding = watch_popup_binding(&text);
+    if doctor_uses_rmux() {
+        // Native rmux owns its viewer; tmux client/config observations say
+        // nothing about whether this binding is installed or can draw.
+        return match binding {
+            Some(binding) if popup_binding_is_full_client(binding) => CheckResult::Ok("rmux: full-client `tend watch` binding is installed".into()),
+            Some(_) => CheckResult::Fail("rmux: the live `tend watch` binding is an inset popup; install a full-client binding with `tend watch --popup`".into()),
+            None => CheckResult::Warn("rmux: no prefix key runs `tend watch`; install a binding to `tend watch --popup`".into()),
+        };
+    }
+    watch_binding_verdict(binding, env)
 }
 
 /// Pure half of [`check_tmux_watch_binding`], over the live binding tmux
@@ -1569,6 +1611,74 @@ mod tests {
             .iter()
             .any(|r| message(r).contains("no interrupted")));
         server.await.unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rmux_doctor_reads_bindings_and_session_marks_without_a_current_target() {
+        use std::os::unix::fs::PermissionsExt;
+        const PROBE: &str = "TEND_TEST_DOCTOR_RMUX";
+        if std::env::var_os(PROBE).is_some() {
+            assert!(doctor_uses_rmux());
+            let binding = check_tmux_watch_binding(&user_owned_server());
+            assert!(is_ok(&binding), "{}", message(&binding));
+            assert!(message(&binding).contains("rmux: full-client"));
+            let marks = check_workspace_marks();
+            if std::env::var_os("TEND_TEST_MARK_FAILURE").is_some() {
+                assert!(matches!(marks, CheckResult::Warn(_)), "{}", message(&marks));
+            } else {
+                assert!(is_ok(&marks), "{}", message(&marks));
+            }
+            let log =
+                std::fs::read_to_string(std::env::var_os("TEND_TEST_DOCTOR_LOG").unwrap()).unwrap();
+            assert!(log.contains("list-keys -T prefix"), "{log}");
+            assert!(log.contains("list-sessions -F"), "{log}");
+            assert!(
+                !log.contains("list-windows") && !log.contains("list-panes"),
+                "{log}"
+            );
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let rmux = dir.path().join("rmux");
+        std::fs::write(&rmux, r#"#!/bin/sh
+if [ "$1" = "-V" ]; then exit 0; fi
+printf '%s\n' "$*" >> "$TEND_TEST_DOCTOR_LOG"
+if [ "$1" = "-S" ]; then shift 2; fi
+case "$1" in
+list-keys) printf 'bind-key -T prefix s run-shell "tend watch --popup"\nbind-key -T prefix ㄴ run-shell "tend watch --popup"\n';;
+list-sessions)
+  if [ -n "$TEND_TEST_MARK_FAILURE" ]; then printf 'permission denied\n' >&2; exit 1; fi
+  if [ -n "$TEND_TEST_NO_TARGET" ]; then printf 'no current target\n' >&2; exit 1; fi
+  printf 'acme\t$1\tacme\t/tmp\t1\t0\t1\t\n';;
+*) printf 'no current target\n' >&2; exit 1;;
+esac
+"#).unwrap();
+        std::fs::set_permissions(&rmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let tmux = dir.path().join("tmux");
+        std::fs::write(&tmux, "#!/bin/sh\nprintf 'WRONG HOST\n' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o755)).unwrap();
+        for mode in ["sessions", "no-target", "failure"] {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command.args(["--exact", "doctor::tests::rmux_doctor_reads_bindings_and_session_marks_without_a_current_target", "--nocapture"])
+                .env(PROBE, "1").env("TEND_HOST", "rmux").env("PATH", dir.path())
+                .env("TEND_TEST_DOCTOR_LOG", dir.path().join(format!("{mode}.log")))
+                .env_remove("RMUX").env_remove("RMUX_PANE").env_remove("TMUX").env_remove("TMUX_PANE")
+                .env_remove("TEND_TEST_NO_TARGET").env_remove("TEND_TEST_MARK_FAILURE");
+            if mode == "no-target" {
+                command.env("TEND_TEST_NO_TARGET", "1");
+            }
+            if mode == "failure" {
+                command.env("TEND_TEST_MARK_FAILURE", "1");
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     /// A server the user owns: their `~/.tmux.conf` was read, and a
