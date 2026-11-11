@@ -5839,13 +5839,14 @@ private func airPipelineFixture() -> TendPipelineDefinition {
 
 /// The identity of an artifact is a digest over its bytes, so the rendering
 /// is a compatibility surface: this id is the one AIR Workbench's own
-/// `air validate` accepted for this pipeline. Changing the rendering is
-/// allowed; doing it by accident is not.
+/// `air validate` accepted for this pipeline (recomputed after the rename
+/// to Tend, which changed the producer name, format and extension key).
+/// Changing the rendering is allowed; doing it by accident is not.
 @Test func airWorkflowDigestsAreTheOnesWorkbenchRecomputes() throws {
     let document = AirWorkflow.document(name: "resolve", airPipelineFixture(), producer: "0.1.0")
     #expect(
         document.artifactID
-            == "urn:air:sha256:0c17a3d99c521049adf2f0541ff9254668a81f26bf3960a38034d8d9b97b32e0"
+            == "urn:air:sha256:53f3c3af751e0c5cfdd65418393c091e42fdc1eb0b307f4bac72ba6e3da577c9"
     )
     #expect(document.artifactID == "urn:air:sha256:\(document.contentDigest)")
     // Recomputing agrees, and a body that has been edited no longer does.
