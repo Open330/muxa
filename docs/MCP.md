@@ -240,8 +240,10 @@ it:
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
 only reaches the focused pane. tmux, cmux, rmux, and herdr support targeted input.
 
-Untracked tmux/rmux pane ids are refused with `unknown pane`; supply `socket`
-explicitly to address a pane on a chosen server without a registry row. Optional
+For an omitted `socket`, MCP uses its own `$TMUX`/`$RMUX` endpoint. Untracked
+tmux/rmux pane ids without caller server context are refused with `unknown pane`;
+callers outside those hosts must supply `socket` explicitly. Registered legacy
+rows without a socket retain their backend-default behavior. Optional
 `session_id` requires a matching non-stopped agent on that pane and endpoint,
 so a forgotten or replaced session cannot silently target another agent. This
 precondition checks the registry at dispatch time, not the process atomically.

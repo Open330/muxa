@@ -33,7 +33,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `send_prompt` refuses untracked tmux/rmux panes instead of injecting into a
   colliding pane on the default server. Optional `socket` explicitly targets a
   server; optional `session_id` rejects a stale agent target. Both are available
-  through `tend_send_prompt` and the IPC client. (#413)
+  through `tend_send_prompt` and the IPC client. MCP uses its caller's tmux/rmux
+  environment when `socket` is omitted; callers outside those hosts must supply
+  it for untracked panes. Registered legacy rows without a socket retain their
+  previous backend-default behavior. (#413)
 
 - `scripts/migrate-from-muxa.py` now renames MCP tool names left in prompt
   templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,

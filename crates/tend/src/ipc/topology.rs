@@ -80,13 +80,11 @@ pub(super) fn send_prompt_endpoint(
         return Ok(Some(socket.to_owned()));
     }
     let endpoint = unique_pane_endpoint(pane, &candidates)?;
-    if endpoint
-        .as_deref()
-        .is_none_or(|endpoint| endpoint.trim().is_empty())
-        && matches!(kind, HostKind::Tmux | HostKind::Rmux)
-    {
+    // Legacy/discovery rows can lack endpoint metadata. Preserve their default
+    // routing; the stale-caller hazard is a target with no matching row at all.
+    if candidates.is_empty() && matches!(kind, HostKind::Tmux | HostKind::Rmux) {
         return Err(format!(
-            "unknown pane {pane}: no recorded server endpoint; specify socket explicitly"
+            "unknown pane {pane}: no matching agent row; specify socket explicitly"
         ));
     }
     Ok(endpoint)

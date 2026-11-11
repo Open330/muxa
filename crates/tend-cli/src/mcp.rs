@@ -804,7 +804,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "pane": { "type": "string", "description": "Target pane id (e.g. %12, rmux:%12, or herdr:p1)." },
-                    "socket": { "type": "string", "description": "Explicit server endpoint; required for untracked tmux/rmux panes." },
+                    "socket": { "type": "string", "description": "Explicit server endpoint; defaults to this MCP process's tmux/rmux server context." },
                     "session_id": { "type": "string", "description": "Only send if this agent session still occupies the target pane and endpoint." },
                     "text": { "type": "string", "description": "Literal text to type into the pane." },
                     "submit": { "type": "boolean", "description": "Press Enter after the text. Default true." },
@@ -4934,10 +4934,32 @@ async fn send_prompt_with_local_cmux(
         }
     }
 
+    // This process's endpoint identifies the caller's server, never the
+    // daemon's ambient server. Explicit targeting always wins.
+    let caller_socket = socket
+        .map(ToOwned::to_owned)
+        .or_else(|| prompt_socket_from_env(pane));
     client
-        .send_prompt_scoped(pane, prompt, submit, socket, session_id)
+        .send_prompt_scoped(pane, prompt, submit, caller_socket.as_deref(), session_id)
         .await
         .map_err(|error| error.to_string())
+}
+
+fn prompt_socket_from_env(pane: &str) -> Option<String> {
+    match tend::backend::pane_id_host_kind(pane) {
+        Some(tend::HostKind::Rmux) => tend::backend::rmux::endpoint_from_env(),
+        Some(tend::HostKind::Tmux) => {
+            let endpoint = tend::backend::rmux::endpoint_from_value(&std::env::var("TMUX").ok()?)?;
+            // rmux exports TMUX for compatibility; never pass it to native tmux.
+            if tend::backend::rmux::is_endpoint(&endpoint)
+                || tend::backend::rmux::endpoint_from_env().as_deref() == Some(&endpoint)
+            {
+                return None;
+            }
+            Some(endpoint)
+        }
+        _ => None,
+    }
 }
 
 /// Terminal outcome of a `tend_wait_for_change` race, before it's rendered
@@ -6377,11 +6399,20 @@ mod tests {
     /// so the MCP → IPC → backend path can be exercised in-process.
     struct FakeBackend {
         sends: Arc<Mutex<Vec<(String, String)>>>,
+        kind: HostKind,
+        sockets: Arc<Mutex<Vec<Option<String>>>>,
     }
 
     impl PaneBackend for FakeBackend {
         fn kind(&self) -> HostKind {
-            HostKind::Tmux
+            self.kind
+        }
+        fn send_text_on(&self, socket: Option<&str>, pane: &str, text: &str) -> bool {
+            self.sockets
+                .lock()
+                .unwrap()
+                .push(socket.map(ToOwned::to_owned));
+            self.send_text(pane, text)
         }
         fn list_panes(&self) -> Vec<PaneInfo> {
             Vec::new()
@@ -6494,6 +6525,8 @@ mod tests {
         let sends = Arc::new(Mutex::new(Vec::new()));
         let backend: SharedBackend = Arc::new(FakeBackend {
             sends: sends.clone(),
+            kind: HostKind::Tmux,
+            sockets: Arc::default(),
         });
         let server = Server::new(sock.to_path_buf(), Store::shared()).with_backends(vec![backend]);
         let (tx, rx) = broadcast::channel(1);
@@ -8458,7 +8491,7 @@ mod tests {
         let (client, sends, tx, handle) = spawn_daemon(&sock).await;
         // Unknown panes and failed session preconditions must never inject.
         for arguments in [
-            json!({"pane":"%1", "text":"stale"}),
+            json!({"pane":"%1", "text":"stale", "socket":""}),
             json!({"pane":"%1", "text":"stale", "socket":"default", "session_id":"gone"}),
             json!({"pane":"%1", "text":"stale", "socket":"default", "session_id":123}),
         ] {
@@ -8475,6 +8508,93 @@ mod tests {
         }
         assert!(sends.lock().unwrap().is_empty());
 
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_prompt_uses_callers_server_context() {
+        const PROBE: &str = "TEND_PROMPT_CONTEXT_PROBE";
+        let Ok(case) = std::env::var(PROBE) else {
+            for case in ["tmux", "rmux", "none", "explicit", "rmux-compat"] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args([
+                        "--exact",
+                        "mcp::tests::send_prompt_uses_callers_server_context",
+                        "--nocapture",
+                    ])
+                    .env(PROBE, case)
+                    .env_remove("TMUX")
+                    .env_remove("RMUX");
+                match case {
+                    "tmux" | "explicit" => {
+                        child.env("TMUX", "/tmp/caller-tmux/amux,123,0");
+                    }
+                    "rmux" | "rmux-compat" => {
+                        child
+                            .env("RMUX", "/tmp/rmux-501/amux,123,0")
+                            .env("TMUX", "/tmp/rmux-501/amux,123,0");
+                    }
+                    _ => {}
+                }
+                let output = child.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{case}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("caller-context.sock");
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let sockets = Arc::new(Mutex::new(Vec::new()));
+        let kind = if case == "rmux" {
+            HostKind::Rmux
+        } else {
+            HostKind::Tmux
+        };
+        let pane = if case == "rmux" { "rmux:%9" } else { "%9" };
+        let backend: SharedBackend = Arc::new(FakeBackend {
+            sends: sends.clone(),
+            kind,
+            sockets: sockets.clone(),
+        });
+        // Empty registry: only the caller's context can authorize this target.
+        let server = Server::new(sock.clone(), Store::shared()).with_backends(vec![backend]);
+        let (tx, rx) = broadcast::channel(1);
+        let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+        wait_for_socket(&sock).await;
+        let mut arguments = json!({"pane":pane, "text":"hello", "submit":false});
+        if case == "explicit" {
+            arguments["socket"] = json!("/tmp/explicit/amux");
+        }
+        let response = dispatch(
+            &Client::new(sock),
+            &json!({
+                "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                "params":{"name":"tend_send_prompt", "arguments":arguments},
+            }),
+        )
+        .await
+        .unwrap();
+        let expected = match case.as_str() {
+            "tmux" => Some("/tmp/caller-tmux/amux"),
+            "rmux" => Some("/tmp/rmux-501/amux"),
+            "explicit" => Some("/tmp/explicit/amux"),
+            _ => None,
+        };
+        if let Some(endpoint) = expected {
+            assert_ne!(response["result"]["isError"], true, "{response}");
+            assert_eq!(*sockets.lock().unwrap(), vec![Some(endpoint.into())]);
+        } else {
+            assert_eq!(response["result"]["isError"], true, "{response}");
+            assert!(response.to_string().contains("unknown pane"), "{response}");
+            assert!(sends.lock().unwrap().is_empty());
+        }
         tx.send(()).unwrap();
         handle.await.unwrap();
     }

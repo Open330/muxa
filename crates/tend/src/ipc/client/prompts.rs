@@ -22,8 +22,9 @@ impl Client {
     }
 
     /// Send on an explicit endpoint and/or require a matching agent session.
-    /// Untracked tmux/rmux panes require `socket`; a session precondition must
-    /// always match a recorded row, even with an explicit endpoint.
+    /// Untracked tmux/rmux panes require `socket`; registered legacy rows may
+    /// retain a backend default when no endpoint was recorded. A session
+    /// precondition must always match a recorded row, even with an explicit endpoint.
     pub async fn send_prompt_scoped(
         &self,
         pane: &str,

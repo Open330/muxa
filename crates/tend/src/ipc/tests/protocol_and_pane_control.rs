@@ -892,6 +892,41 @@ async fn rmux_send_prompt_refuses_same_pane_id_on_multiple_endpoints() {
     handle.await.unwrap();
 }
 
+/// Legacy/discovery rows may identify the agent without recording its socket.
+#[tokio::test]
+async fn send_prompt_preserves_registered_rows_without_socket() {
+    for (kind, pane) in [(HostKind::Tmux, "%9"), (HostKind::Rmux, "rmux:%9")] {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("legacy-row.sock");
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "legacy".into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let (backend, sends, sockets) = RecordingBackend::new_full(kind, true, true, false);
+        let (tx, handle) = serve(&sock, store, vec![backend]).await;
+        let client = Client::new(sock);
+        client.send_prompt(pane, "legacy", false).await.unwrap();
+        client
+            .send_prompt_scoped(pane, "same agent", false, None, Some("legacy"))
+            .await
+            .unwrap();
+        assert_eq!(*sockets.lock().unwrap(), vec![None, None]);
+        assert_eq!(sends.lock().unwrap().len(), 2);
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+}
+
 /// A forgotten agent must not send into a colliding pane on the default server.
 #[tokio::test]
 async fn send_prompt_refuses_untracked_pane_without_endpoint() {
