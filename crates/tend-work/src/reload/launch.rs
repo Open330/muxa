@@ -223,7 +223,7 @@ pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustPrompt> {
         .unwrap_or(lines.len() - path_start);
     // A long path wraps across rows of the capture.
     let workspace: String = lines[path_start..path_start + path_len].concat();
-    if !workspace.starts_with('/') {
+    if !is_absolute_dir(&workspace) {
         return None;
     }
     let rest = &lines[path_start + path_len..];
@@ -420,6 +420,20 @@ impl TrustWatch {
     }
 }
 
+/// Whether Claude printed a whole path: `/`-rooted, or a Windows drive or
+/// UNC path (`C:\…`, `\\server\share`). Both grammars are accepted on
+/// every host so the parse does not depend on where tend was built; the
+/// workspace must still equal a directory saved for the pane.
+fn is_absolute_dir(dir: &str) -> bool {
+    let bytes = dir.as_bytes();
+    dir.starts_with('/')
+        || dir.starts_with(r"\\")
+        || (bytes.len() > 2
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && matches!(bytes[2], b'\\' | b'/'))
+}
+
 fn normalize_dir(dir: &str) -> &str {
     match dir.trim_end_matches('/') {
         "" => "/",
@@ -593,6 +607,22 @@ mod tests {
             claude_trust_prompt(&wrapped).map(|prompt| prompt.workspace),
             Some("/tmp/untrusted-probe".into())
         );
+    }
+
+    #[test]
+    fn a_windows_workspace_is_read_as_a_whole_path() {
+        let windows =
+            TRUST_PROMPT_NO.replace("/tmp/untrusted-probe", r"C:\Users\j\untrusted-probe");
+        assert_eq!(
+            claude_trust_prompt(&windows).map(|prompt| prompt.workspace),
+            Some(r"C:\Users\j\untrusted-probe".into())
+        );
+        let unc = TRUST_PROMPT_NO.replace("/tmp/untrusted-probe", r"\\host\share\probe");
+        assert!(claude_trust_prompt(&unc).is_some());
+        for relative in ["untrusted-probe", r"C:untrusted", r"..\probe"] {
+            let screen = TRUST_PROMPT_NO.replace("/tmp/untrusted-probe", relative);
+            assert_eq!(claude_trust_prompt(&screen), None, "{relative}");
+        }
     }
 
     #[test]

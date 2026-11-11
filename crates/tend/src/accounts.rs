@@ -263,11 +263,23 @@ fn same_value(a: &str, b: &str) -> bool {
     a.trim_end_matches('/') == b.trim_end_matches('/')
 }
 
-/// `~/…` against `$HOME`; anything else unchanged.
+/// `~/…` against `$HOME`, or `%USERPROFILE%` where `HOME` is unset (as it
+/// is in a Windows console); anything else unchanged.
 #[must_use]
 pub fn expand_home(value: &str) -> String {
-    match (value.strip_prefix("~/"), std::env::var("HOME")) {
-        (Some(rest), Ok(home)) => format!("{}/{rest}", home.trim_end_matches('/')),
+    let home = std::env::var("HOME")
+        .ok()
+        .filter(|home| !home.is_empty())
+        .or_else(|| std::env::var("USERPROFILE").ok());
+    expand_home_in(value, home.as_deref())
+}
+
+fn expand_home_in(value: &str, home: Option<&str>) -> String {
+    match (
+        value.strip_prefix("~/"),
+        home.filter(|home| !home.is_empty()),
+    ) {
+        (Some(rest), Some(home)) => format!("{}/{rest}", home.trim_end_matches(['/', '\\'])),
         _ => value.to_owned(),
     }
 }
@@ -490,6 +502,21 @@ pub fn process_environ(pid: u32) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn home_expands_against_either_platforms_home() {
+        assert_eq!(
+            expand_home_in("~/.claude-work", Some("/home/j/")),
+            "/home/j/.claude-work"
+        );
+        assert_eq!(
+            expand_home_in("~/.claude-work", Some(r"C:\Users\j\")),
+            r"C:\Users\j/.claude-work"
+        );
+        assert_eq!(expand_home_in("~/.x", None), "~/.x");
+        assert_eq!(expand_home_in("~/.x", Some("")), "~/.x");
+        assert_eq!(expand_home_in("/abs/~/x", Some("/h")), "/abs/~/x");
+    }
 
     fn profile(name: &str, env: &[(&str, &str)]) -> AccountProfile {
         AccountProfile {
