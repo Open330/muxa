@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.6] - 2026-11-11
+
 ### Added
 
 - An agent that ends its turn by asking you something in prose ("머지해도
