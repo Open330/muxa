@@ -23330,6 +23330,46 @@
           }
         }
       }
+    },
+    "Send selections" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택한 항목 보내기"
+          }
+        }
+      }
+    } ,
+    "Sent %lld selected options." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%lld개 선택 항목을 보냈습니다."
+          }
+        }
+      }
+    } ,
+    "Multiple selections need an updated tendd; update tend and restart tendd" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "다중 선택을 보내려면 Tend를 업데이트하고 데몬을 다시 시작해 주세요."
+          }
+        }
+      }
+    } ,
+    "Tend could not prepare these selections. Open the pane to answer." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "선택 항목을 준비하지 못했습니다. 패널을 열어 응답해 주세요."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

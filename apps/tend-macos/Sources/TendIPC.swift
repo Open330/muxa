@@ -1392,10 +1392,13 @@ actor TendIPCClient {
     }
 
     /// Presses navigation keys in a pane (`fleet_keys_v1`): "up", "down",
-    /// "enter", "escape", "tab". Used to answer a choice dialog.
+    /// "enter", "escape", "tab", and "space" for checkbox choices.
     func sendFleetKeys(host: TendFleetHostIdentity, pane: TendPaneInfo, keys: [String]) async throws {
         guard capabilities.contains("fleet_keys_v1") else {
             throw TendIPCError.server("Choosing from Home needs an updated tendd; update tend and restart tendd")
+        }
+        if keys.contains("space"), !capabilities.contains("fleet_multiselect_v1") {
+            throw TendIPCError.server(String(localized: "Multiple selections need an updated tendd; update tend and restart tendd"))
         }
         let response = try await call([
             "protocol": Self.protocolVersion,

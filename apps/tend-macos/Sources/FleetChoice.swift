@@ -8,7 +8,11 @@ struct FleetChoiceDialog: Equatable, Sendable {
         let label: String
         /// The indented lines under the option, joined.
         let detail: String?
+        /// nil for a single-choice row; otherwise the checkbox on screen.
+        var isChecked: Bool? = nil
         var id: Int { number }
+
+        var definition: Self { Self(number: number, label: label, detail: detail) }
 
         /// Claude's "Type something." / "Other": picking it opens a field
         /// for the person's own words.
@@ -22,6 +26,36 @@ struct FleetChoiceDialog: Equatable, Sendable {
     let options: [Option]
     /// The option the dialog's cursor is on.
     var selected: Int?
+
+    var isMultipleSelection: Bool { options.contains { $0.isChecked != nil } }
+    var checkedNumbers: Set<Int> { Set(options.filter { $0.isChecked == true }.map(\.number)) }
+
+    func isSameQuestion(as other: Self) -> Bool {
+        question == other.question && isMultipleSelection == other.isMultipleSelection
+            && options.map(\.definition) == other.options.map(\.definition)
+    }
+
+    /// Reconcile the fresh screen's checks with the local draft, then submit.
+    /// The entire plan is sent in one request, never on checkbox clicks.
+    func keys(selecting numbers: Set<Int>) -> [String]? {
+        let selectable = Set(options.filter { $0.isChecked != nil }.map(\.number))
+        guard isMultipleSelection, let selected, !numbers.isEmpty,
+              numbers.isSubset(of: selectable) else { return nil }
+        let changes = checkedNumbers.symmetricDifference(numbers).sorted()
+        func plan(_ order: [Int]) -> [String] {
+            var cursor = selected
+            var keys: [String] = []
+            for number in order {
+                let steps = number - cursor
+                keys += Array(repeating: steps > 0 ? "down" : "up", count: abs(steps))
+                keys.append("space")
+                cursor = number
+            }
+            return keys + ["enter"]
+        }
+        let forward = plan(changes), backward = plan(Array(changes.reversed()))
+        return forward.count <= backward.count ? forward : backward
+    }
 
     /// Keys that move the cursor from where it is to `number`: arrows only,
     /// so nothing is typed into the dialog. Nil when the cursor is unknown.
@@ -42,12 +76,12 @@ struct FleetChoiceDialog: Equatable, Sendable {
             .map { line in line.trimmingCharacters(in: CharacterSet(charactersIn: "│ ")).isEmpty ? "" : line }
         // The last option row, then walk up to option 1.
         guard let lastRow = lines.indices.last(where: { optionRow(lines[$0]) != nil }) else { return nil }
-        var rows: [(index: Int, number: Int, label: String)] = []
+        var rows: [(index: Int, number: Int, label: String, checked: Bool?)] = []
         var cursors: [Int] = []
         var index = lastRow
         while index >= 0 {
             if let row = optionRow(lines[index]) {
-                rows.insert((index, row.number, row.label), at: 0)
+                rows.insert((index, row.number, row.label, row.checked), at: 0)
                 if isSelected(lines[index]) { cursors.append(row.number) }
                 if row.number == 1 { break }
             } else if isRule(lines[index]) {
@@ -69,7 +103,7 @@ struct FleetChoiceDialog: Equatable, Sendable {
                 .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "│ ")) }
                 .filter { !$0.isEmpty }
                 .joined(separator: " ")
-            options.append(Option(number: row.number, label: row.label, detail: detail.isEmpty ? nil : detail))
+            options.append(Option(number: row.number, label: row.label, detail: detail.isEmpty ? nil : detail, isChecked: row.checked))
         }
         // The question: text above option 1, up to a rule, a ☐ title (kept)
         // or two blank lines.
@@ -95,7 +129,7 @@ struct FleetChoiceDialog: Equatable, Sendable {
         return FleetChoiceDialog(question: text, options: options, selected: selected)
     }
 
-    private static func optionRow(_ line: String) -> (number: Int, label: String)? {
+    private static func optionRow(_ line: String) -> (number: Int, label: String, checked: Bool?)? {
         let trimmed = line.trimmingCharacters(in: CharacterSet(charactersIn: "│ "))
         var rest = Substring(trimmed)
         if let first = rest.first, "❯›>".contains(first) { rest = rest.dropFirst().drop(while: { $0 == " " }) }
@@ -103,8 +137,16 @@ struct FleetChoiceDialog: Equatable, Sendable {
         guard !digits.isEmpty, digits.count <= 2, let number = Int(digits) else { return nil }
         rest = rest.dropFirst(digits.count)
         guard rest.first == "." || rest.first == ")" else { return nil }
-        let label = rest.dropFirst().trimmingCharacters(in: .whitespaces)
-        return label.isEmpty ? nil : (number, label)
+        var label = rest.dropFirst().trimmingCharacters(in: .whitespaces)
+        var checked: Bool?
+        for (marker, value) in [("[ ]", false), ("[x]", true), ("[X]", true), ("[✓]", true), ("[✔]", true), ("☐", false), ("☑", true), ("☒", true)] {
+            if label.hasPrefix(marker) {
+                checked = value
+                label = String(label.dropFirst(marker.count)).trimmingCharacters(in: .whitespaces)
+                break
+            }
+        }
+        return label.isEmpty ? nil : (number, label, checked)
     }
 
     /// An option's description: indented text, or a blank line between rows.
