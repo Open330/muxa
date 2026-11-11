@@ -412,7 +412,7 @@ impl<L: LivenessSource> Reconciler<L> {
                             }
                         }
                     };
-                    self.store.apply(&event).await;
+                    self.store.apply_observed(&event).await;
                 }
             }
             if let Some(response) = recovery_response {
@@ -426,7 +426,7 @@ impl<L: LivenessSource> Reconciler<L> {
                     })
                 {
                     self.store
-                        .apply(&AgentEvent::TurnStopped {
+                        .apply_observed(&AgentEvent::TurnStopped {
                             id: t.id.clone(),
                             response: Some(response),
                             recap: None,
@@ -461,7 +461,7 @@ impl<L: LivenessSource> Reconciler<L> {
                 || seven.and_then(|w| w.resets_at) != t.cur_7d_reset;
             if hb_changed {
                 self.store
-                    .apply(&AgentEvent::Heartbeat {
+                    .apply_observed(&AgentEvent::Heartbeat {
                         id: t.id.clone(),
                         model: None,
                         context_used_pct: None,
@@ -503,7 +503,7 @@ impl<L: LivenessSource> Reconciler<L> {
                         }
                     };
                     self.store
-                        .apply(&AgentEvent::RateLimited {
+                        .apply_observed(&AgentEvent::RateLimited {
                             id: t.id,
                             scope,
                             source: RateLimitSource::CodexRollout,
@@ -1597,6 +1597,7 @@ mod tests {
             last_activity_at: t0,
             state_entered_at: t0,
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
         };
         store

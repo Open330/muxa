@@ -475,7 +475,7 @@ impl ScreenDetector {
                 return recap_changed;
             }
             for ev in &events {
-                self.store.apply(ev).await;
+                self.store.apply_observed(ev).await;
             }
             tracing::debug!(
                 pane = %pane_id,
