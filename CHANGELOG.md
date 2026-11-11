@@ -40,8 +40,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   conversation quoting the dialog is never mistaken for it. Restore sends at
   most one arrow press and confirms only after a capture shows "Yes"
   selected, never on "No, exit" (the default in current builds). A pane
-  left on the prompt, whether its folder differs, the arrow did not land, or
-  time ran out, is reported for you to answer and gets no follow-up nudge.
+  is reported for you to check and gets no follow-up nudge when it is left
+  on the prompt (its folder differs, or the arrow did not land) or when its
+  screen was not recognized within the time. The nudge also waits for
+  Claude's own screen and never types into anything that looks like a trust
+  dialog.
 
 ## [0.10.1] - 2026-11-11
 

@@ -1466,9 +1466,19 @@ fn continue_interrupted(
     if targets.is_empty() {
         return;
     }
+    let claude: BTreeSet<String> = snapshot
+        .panes
+        .iter()
+        .filter(|pane| {
+            pane.agent
+                .as_ref()
+                .is_some_and(|agent| agent.kind == "claude_code")
+        })
+        .map(pane_target)
+        .collect();
     let mut continued = 0;
     for target in targets {
-        if !screen_settled(endpoint, &target) {
+        if !screen_settled(endpoint, &target, claude.contains(&target)) {
             report.say(&plan::manual_line(
                 &target,
                 "was mid-turn; resumed screen never settled, so nothing was sent",
@@ -1497,21 +1507,27 @@ fn continue_interrupted(
 
 /// Wait for a resumed agent's screen to hold still, so the follow-up lands in
 /// its input box rather than in its startup.
-fn screen_settled(endpoint: &BackendEndpoint, target: &str) -> bool {
+///
+/// A screen that might be a startup trust dialog never counts as settled:
+/// the follow-up ends in Enter, which would answer it. A Claude pane must
+/// also show its own screen (banner or composer footer) first.
+fn screen_settled(endpoint: &BackendEndpoint, target: &str, claude: bool) -> bool {
     let started = Instant::now();
     let mut last = String::new();
     let mut quiet_since = Instant::now();
     while started.elapsed() < CONTINUE_READY_TIMEOUT {
         let screen = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target])
             .unwrap_or_default();
-        if launch::claude_trust_prompt(&screen).is_some() {
-            // Typing the follow-up there would answer the prompt with Enter.
+        if launch::may_be_trust_prompt(&screen) {
             return false;
         }
         if screen != last {
             last = screen;
             quiet_since = Instant::now();
-        } else if !last.trim().is_empty() && quiet_since.elapsed() >= CONTINUE_READY_QUIET {
+        } else if !last.trim().is_empty()
+            && quiet_since.elapsed() >= CONTINUE_READY_QUIET
+            && (!claude || launch::claude_started(&last))
+        {
             return true;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -1920,7 +1936,7 @@ fn answer_trust_prompts(
     }
     TrustOutcome {
         answered,
-        left: watch.left_on_prompt(),
+        left: watch.unresolved(),
     }
 }
 

@@ -169,6 +169,10 @@ const MOVE_TIMEOUT: Duration = Duration::from_secs(3);
 pub(super) const TRUST_UNRESOLVED_NOTE: &str =
     "Claude is asking whether to trust this folder; answer it by hand";
 
+pub(super) const TRUST_UNSEEN_NOTE: &str =
+    "Claude's screen was not recognized within 20s; it may be waiting on a \
+     startup prompt, so nothing more was typed";
+
 pub(super) const TRUST_ELSEWHERE_NOTE: &str =
     "Claude is asking to trust a folder other than the one saved for this pane; \
      left for you to answer";
@@ -277,6 +281,22 @@ pub(super) fn claude_started(screen: &str) -> bool {
     .any(|marker| screen.contains(marker))
 }
 
+/// Whether `screen` might be a startup trust or policy dialog in any layout,
+/// recognized or not: the word "trust" next to a confirm-or-quit choice.
+/// Deliberately broad. It only ever holds input back, never sends any.
+pub(super) fn may_be_trust_prompt(screen: &str) -> bool {
+    let screen = screen.to_lowercase();
+    screen.contains("trust")
+        && [
+            "no, exit",
+            "no, quit",
+            "enter to confirm",
+            "press enter to continue",
+        ]
+        .iter()
+        .any(|choice| screen.contains(choice))
+}
+
 /// A key to send to a pane sitting on the trust prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TrustKey {
@@ -290,7 +310,7 @@ struct TrustPane {
     expected: Vec<String>,
     /// When the one arrow press went out.
     moved_at: Option<Duration>,
-    /// Whether the latest capture was the trust prompt.
+    /// Whether the latest capture was, or might have been, a trust prompt.
     on_prompt: bool,
 }
 
@@ -344,8 +364,8 @@ impl TrustWatch {
     pub fn observe(&mut self, target: &str, elapsed: Duration, screen: &str) -> Option<TrustKey> {
         let pane = self.pending.get_mut(target)?;
         let Some(prompt) = claude_trust_prompt(screen) else {
-            pane.on_prompt = false;
-            if claude_started(screen) {
+            pane.on_prompt = may_be_trust_prompt(screen);
+            if claude_started(screen) && !pane.on_prompt {
                 self.pending.remove(target);
             }
             return None;
@@ -383,13 +403,18 @@ impl TrustWatch {
         self.left.insert(target.to_owned(), note);
     }
 
-    /// The panes left on the trust prompt, with what to tell a human. Run
-    /// when time is up: a pane still showing the prompt then is left too.
-    pub fn left_on_prompt(mut self) -> BTreeMap<String, &'static str> {
+    /// The panes not known to be past the trust prompt, with what to tell a
+    /// human. Run when time is up. Every pane still watched then counts:
+    /// only a recognized Claude screen lets a pane go, so an unfamiliar or
+    /// wrapped dialog is held back rather than assumed answered.
+    pub fn unresolved(mut self) -> BTreeMap<String, &'static str> {
         for (target, pane) in std::mem::take(&mut self.pending) {
-            if pane.on_prompt {
-                self.left.insert(target, TRUST_UNRESOLVED_NOTE);
-            }
+            let note = if pane.on_prompt {
+                TRUST_UNRESOLVED_NOTE
+            } else {
+                TRUST_UNSEEN_NOTE
+            };
+            self.left.insert(target, note);
         }
         self.left
     }
@@ -620,7 +645,7 @@ mod tests {
             Some(TrustKey::Enter)
         );
         assert!(watch.is_settled());
-        assert!(watch.left_on_prompt().is_empty());
+        assert!(watch.unresolved().is_empty());
     }
 
     #[test]
@@ -633,7 +658,7 @@ mod tests {
         assert_eq!(keys, [TrustKey::Down]);
         assert!(watch.is_settled(), "given up, left to a human");
         assert_eq!(
-            watch.left_on_prompt().into_values().collect::<Vec<_>>(),
+            watch.unresolved().into_values().collect::<Vec<_>>(),
             [TRUST_UNRESOLVED_NOTE]
         );
     }
@@ -646,7 +671,7 @@ mod tests {
         assert_eq!(watch.observe("=a:0.0", ms(0), &moved_to_yes()), None);
         assert!(watch.is_settled());
         assert_eq!(
-            watch.left_on_prompt().into_values().collect::<Vec<_>>(),
+            watch.unresolved().into_values().collect::<Vec<_>>(),
             [TRUST_ELSEWHERE_NOTE]
         );
     }
@@ -663,8 +688,32 @@ mod tests {
             None
         );
         assert_eq!(watch.pending().cloned().collect::<Vec<_>>(), ["=a:0.1"]);
-        // Time runs out on a pane that never drew anything: not a prompt.
-        assert!(watch.left_on_prompt().is_empty());
+        // Time runs out on a pane whose screen was never recognized: it is
+        // not assumed to be past any prompt.
+        assert_eq!(
+            watch.unresolved().into_iter().collect::<Vec<_>>(),
+            [("=a:0.1".to_owned(), TRUST_UNSEEN_NOTE)]
+        );
+    }
+
+    #[test]
+    fn a_dialog_the_parser_does_not_know_is_still_held_back() {
+        // A narrow pane wraps the question: no automatic answer, but the
+        // pane is not let go either, even with banner text around it.
+        let wrapped = TRUST_PROMPT_NO.replace(
+            " Quick safety check: Is this a project you created or one you trust?",
+            " Quick safety check: Is this a project you created\n or one you trust?",
+        );
+        assert_eq!(claude_trust_prompt(&wrapped), None);
+        assert!(may_be_trust_prompt(&wrapped));
+        let mut watch = watch(&["/tmp/untrusted-probe"]);
+        assert_eq!(watch.observe("=a:0.0", ms(0), &wrapped), None);
+        let with_banner = format!(" Claude Code v2.1.322\n{wrapped}");
+        assert_eq!(watch.observe("=a:0.0", ms(500), &with_banner), None);
+        assert_eq!(
+            watch.unresolved().into_values().collect::<Vec<_>>(),
+            [TRUST_UNRESOLVED_NOTE]
+        );
     }
 
     #[test]
@@ -675,7 +724,7 @@ mod tests {
             Some(TrustKey::Down)
         );
         assert_eq!(
-            watch.left_on_prompt().into_keys().collect::<Vec<_>>(),
+            watch.unresolved().into_keys().collect::<Vec<_>>(),
             ["=a:0.0"]
         );
     }
