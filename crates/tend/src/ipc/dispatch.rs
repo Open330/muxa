@@ -385,6 +385,26 @@ pub(super) async fn handle(
                     response.launch_identities = identities;
                     response
                 }
+                RequestBody::TurnEvidence { session_id, since } => {
+                    kind = "turn_evidence";
+                    // Indexing records can take a while the first time; never
+                    // longer than this, and never on the async workers.
+                    let read = tokio::task::spawn_blocking(move || {
+                        let store = crate::agent_records::RecordStore::local(&[])?;
+                        crate::agent_records::evidence::turn_evidence(&store, &session_id, &since)
+                    });
+                    match tokio::time::timeout(std::time::Duration::from_secs(15), read).await {
+                        Ok(Ok(Ok(evidence))) => Response {
+                            turn_evidence: Some(Box::new(evidence)),
+                            ..Response::ok()
+                        },
+                        Ok(Ok(Err(error))) => {
+                            Response::err(format!("could not read records: {error}"))
+                        }
+                        Ok(Err(error)) => Response::err(format!("record read failed: {error}")),
+                        Err(_) => Response::err("reading records took too long; try again"),
+                    }
+                }
                 body @ (RequestBody::ReviewCreate { .. }
                 | RequestBody::ReviewGet { .. }
                 | RequestBody::ReviewList { .. }

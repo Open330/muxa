@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- macOS: a review card shows the commands the agent ran since the request
+  and what came back, from its own records, above the agent's report of
+  the result (now labelled as such): the latest six calls paired with their
+  results by call id, with provider-recorded errors and calls with no
+  result yet. Long results keep their start and end; clipped text, and
+  incomplete records, are marked, and each call shows the
+  `tend agent read <event>` command for the full text. Read from this
+  Mac's records over a new daemon request (`turn_evidence_v1`) bounded by
+  the reviewed prompt's time; for an agent on another host the card says
+  where to read them instead of looking its session up here.
 - Agents record who caused their latest prompt when tend delivered it
   (`last_prompt_origin`, `prompt_origin_v1`): a person via tend, a peer,
   automation, or tend without a declared purpose; `unknown` when no tend

@@ -984,6 +984,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     let askEnabled: Bool?
     let askProviders: [TendAskProvider]?
     let workCommand: TendWorkCommandOutput?
+    let turnEvidence: TendTurnEvidence?
     let reviewItems: [TendReviewItem]?
     let reviewHasMore: Bool?
     let reviewItem: TendReviewItem?
@@ -998,6 +999,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case fleetResult = "fleet_result"
         case pipelineRuns = "pipeline_runs"
         case workCommand = "work_command"
+        case turnEvidence = "turn_evidence"
         case reviewItems = "review_items"
         case reviewHasMore = "review_has_more"
         case reviewItem = "review_item"
@@ -1462,6 +1464,21 @@ actor TendIPCClient {
             "disposition": TendReviewDisposition.accepted.rawValue,
         ])
         return true
+    }
+
+    /// The calls a local agent session made since `since` and their
+    /// results, from this Mac's own records (`turn_evidence_v1`). nil from
+    /// a daemon without it. Never asked for a remote host's session: a
+    /// session id means nothing on another host's records.
+    func turnEvidence(sessionID: String, since: String) async throws -> TendTurnEvidence? {
+        guard capabilities.contains("turn_evidence_v1") else { return nil }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "turn_evidence",
+            "session_id": sessionID,
+            "since": since,
+        ], timeout: 20)
+        return response.turnEvidence
     }
 
     /// The host's receipted worktrees and what would stop a cleanup from

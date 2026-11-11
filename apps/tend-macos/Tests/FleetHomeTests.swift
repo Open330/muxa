@@ -800,3 +800,29 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(changed.id == work.id)
     #expect(FleetBoard.reviewKey(changed) != key)
 }
+
+@Test func recordedCommandsDecodeWithTheirHonestyFlags() throws {
+    let json = """
+    {"session_id":"s1","more":true,"complete":false,
+     "pairs":[{"tool":"Bash","call":"cargo test","call_at":"2026-11-11T01:00:00Z",
+               "result":"test result: ok","result_at":"2026-11-11T01:00:05Z","is_error":false,
+               "clipped":false,"call_event":"e1","result_event":"e2"},
+              {"tool":"Bash","call":"git push","call_at":null,"result":null,"result_at":null,
+               "is_error":null,"clipped":true,"call_event":"e3","result_event":null}]}
+    """
+    let evidence = try JSONDecoder().decode(TendTurnEvidence.self, from: Data(json.utf8))
+    #expect(evidence.more && !evidence.complete)
+    #expect(evidence.pairs[0].result == "test result: ok")
+    #expect(evidence.pairs[1].result == nil && evidence.pairs[1].clipped)
+    // The full record is reachable by its result's event, else the call's.
+    #expect(evidence.pairs[0].readCommand == "tend agent read e2")
+    #expect(evidence.pairs[1].readCommand == "tend agent read e3")
+
+    // A long result shows its last lines, where the verdict is.
+    let long = try JSONDecoder().decode(TendTurnEvidence.Pair.self, from: Data("""
+    {"tool":"Bash","call":"cargo test","result":"a\\nb\\nc\\nd\\ne\\nFAILED","is_error":null,
+     "clipped":false,"call_event":"e9","result_event":null}
+    """.utf8))
+    let tail = try #require(long.resultTail(lines: 4))
+    #expect(tail.cut && tail.text.hasSuffix("FAILED") && !tail.text.contains("a"))
+}
