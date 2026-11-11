@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `scripts/migrate-from-muxa.py` now renames MCP tool names left in prompt
+  templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,
+  `mcp__muxa__muxa_status` → `mcp__tend__tend_status`). Before, a migrated
+  pipeline prompt could tell agents to call a tool that no longer exists.
+
 ## [0.10.4] - 2026-11-11
 
 ### Changed
