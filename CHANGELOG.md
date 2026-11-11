@@ -15,7 +15,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   snapshotter, then failed to bind; with launchd restarting it every ten
   seconds, one host logged 550 such runs in 90 minutes, each rewriting
   `state.json` from a near-empty registry.
-
+- A new Codex worker that stops at "Hooks need review" is now reported as
+  waiting on that review (tend never trusts hooks for you) instead of "busy or
+  has a draft". A Codex placeholder cut short by a narrow pane (`› Ask Codex
+  to`) is no longer mistaken for a draft, so such workers are ready.
 - `scripts/migrate-from-muxa.py` now renames MCP tool names left in prompt
   templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,
   `mcp__muxa__muxa_status` → `mcp__tend__tend_status`). Before, a migrated
