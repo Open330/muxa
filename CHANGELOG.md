@@ -27,7 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   alone, so SSH shells need no current client, window, or pane target. Checks
   require an existing rmux socket (a pane endpoint on Windows) and use rmux's
   no-start flag, so diagnostics never start a server.
-
+- `tend doctor` now checks every provider home agents actually use, not just
+  the active one: each configured `[[accounts.claude|codex]]` home and the
+  home of every running Claude/Codex process of yours (its `CLAUDE_CONFIG_DIR`
+  or `CODEX_HOME`, else its `HOME`'s default). A home with no tend MCP server,
+  a disabled one, a conflicting `tend` entry or an unreadable config is listed
+  with the number of processes reading it. Before, agents started under an
+  account profile (aas or `[[accounts]]`) could run without tend tools and
+  nothing warned.
+- `tend init --component agent-mcp` also registers the MCP server in
+  configured accounts' homes; the new `--all-homes` adds every home a running
+  agent reads. Other homes get the MCP entry only, and uninstall still follows
+  the ownership manifest.
 
 ## [0.10.4] - 2026-11-11
 
