@@ -906,6 +906,7 @@ mod tests {
             started_at: now,
             last_activity_at: now,
             state_entered_at: now,
+            last_response_at: None,
         }
     }
 

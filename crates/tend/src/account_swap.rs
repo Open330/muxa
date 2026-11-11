@@ -5319,6 +5319,7 @@ mod tests {
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,
+            last_response_at: None,
         }
     }
 

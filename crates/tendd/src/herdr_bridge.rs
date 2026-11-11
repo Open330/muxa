@@ -1321,6 +1321,7 @@ mod tests {
             started_at: AT,
             last_activity_at: AT,
             state_entered_at: AT,
+            last_response_at: None,
         }
     }
 
