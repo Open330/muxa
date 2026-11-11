@@ -288,6 +288,7 @@ mod tests {
             started_at: datetime!(2026-04-24 12:00:00 UTC),
             last_activity_at: datetime!(2026-04-24 12:00:00 UTC),
             state_entered_at: datetime!(2026-04-24 12:00:00 UTC),
+            last_prompt_origin: None,
         }
     }
 

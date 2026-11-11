@@ -44,6 +44,7 @@ fn make_prompt(prompt: &str, session: &str) -> PromptRecord {
         at: OffsetDateTime::now_utc(),
         model: Some("opus".into()),
         seq: 0,
+        origin: tend::PromptOrigin::Unknown,
     }
 }
 

@@ -5138,6 +5138,7 @@ mod tests {
             started_at: OffsetDateTime::now_utc(),
             last_activity_at: OffsetDateTime::now_utc(),
             state_entered_at: OffsetDateTime::now_utc(),
+            last_prompt_origin: None,
         };
         tx.send(Transition {
             from: AgentState::Starting,
@@ -5251,6 +5252,7 @@ mod tests {
             started_at: OffsetDateTime::now_utc(),
             last_activity_at: OffsetDateTime::now_utc(),
             state_entered_at: OffsetDateTime::now_utc(),
+            last_prompt_origin: None,
         };
         for _ in 0..5 {
             tx.send(Transition {

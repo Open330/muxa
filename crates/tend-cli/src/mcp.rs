@@ -1676,6 +1676,8 @@ async fn call_tool_inner(
                             pane: target,
                             text: text.to_string(),
                             submit,
+                            // MCP tools are called by agents.
+                            origin: Some(tend::PromptOrigin::Peer),
                         },
                     )
                     .await

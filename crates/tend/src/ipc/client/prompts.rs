@@ -35,6 +35,39 @@ impl Client {
         })
     }
 
+    /// Registers a prompt this caller is about to type into `pane` itself,
+    /// so the daemon stamps the hook that reports it with `origin`
+    /// (`prompt_origin_v1`). A daemon without it refuses; callers ignore
+    /// that and the prompt stays of unknown origin.
+    pub async fn expect_prompt(
+        &self,
+        pane: &str,
+        socket: Option<&str>,
+        text: &str,
+        origin: crate::PromptOrigin,
+    ) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "expect_prompt",
+            "pane": pane,
+            "socket": socket,
+            "text": text,
+            "origin": origin,
+        });
+        self.call_checked(&req).await.map(|_| ())
+    }
+
+    /// Drops a registration from [`Self::expect_prompt`] after typing failed.
+    pub async fn forget_expected_prompt(&self, pane: &str, text: &str) -> Result<(), RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "forget_expected_prompt",
+            "pane": pane,
+            "text": text,
+        });
+        self.call_checked(&req).await.map(|_| ())
+    }
+
     /// Capture the visible contents of `pane` through the daemon's
     /// namespace-resolved backend. Returns `None` when the pane is gone or
     /// the backend can't capture. Backs `tend mcp`'s `tend_capture_pane`.

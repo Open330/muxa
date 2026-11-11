@@ -558,6 +558,27 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(FleetBoard.reviewQueue(works, marks: marks, scope: .all, now: now).map { $0.focus?.id } == [old.id])
 }
 
+@Test func theDaemonsPromptOriginDecidesWhoAskedBeforeAnyTextGuess() throws {
+    let now = try #require(TendUsageTimestamp.parse("2026-11-09T12:00:00Z"))
+    func finished(_ id: String, prompt: String, origin: String?) throws -> TendHostedAgent {
+        var fields: [String: Any] = ["state": "idle", "state_entered_at": "2026-11-09T11:00:00Z",
+                                     "last_response": "Done.", "last_prompt": prompt]
+        if let origin { fields["last_prompt_origin"] = origin }
+        return TendHostedAgent(host: host, agent: try agent(fields, id: id), pane: nil)
+    }
+    // A person's reply through Home is theirs even though tend typed it;
+    // a peer's plain-text hand-off is not, whatever its wording.
+    let viaHome = try finished("home", prompt: "Ship it", origin: "person_via_tend")
+    let peer = try finished("peer", prompt: "Please review the diff", origin: "peer")
+    let automated = try finished("auto", prompt: "continue", origin: "automation")
+    // Unknown origin falls back to the provider-envelope heuristic.
+    let typed = try finished("typed", prompt: "Fix the README", origin: "unknown")
+    let notice = try finished("notice", prompt: "<task-notification>\n<summary>x</summary>", origin: "unknown")
+    let works = FleetBoard.works(groups: [], agents: [viaHome, peer, automated, typed, notice], now: now)
+    let asked = Set(FleetBoard.reviewQueue(works, marks: FleetReviewMarks(), scope: .all, now: now).compactMap { $0.focus?.id })
+    #expect(asked == [viaHome.id, typed.id])
+}
+
 @Test func reviewScopesStartWhereTheirNamesSay() throws {
     let now = try #require(TendUsageTimestamp.parse("2026-11-09T12:00:00Z"))
     var calendar = Calendar(identifier: .gregorian)

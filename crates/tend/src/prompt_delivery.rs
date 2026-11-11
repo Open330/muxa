@@ -130,4 +130,85 @@ mod tests {
         assert!(crate::backend::prompt_submit_grace("%7").is_zero());
         assert!(!crate::backend::prompt_submit_grace("cmux:p7").is_zero());
     }
+
+    async fn origin_of_latest(store: &Store) -> Option<crate::PromptOrigin> {
+        store.by_pane("rmux:%7").await[0].last_prompt_origin
+    }
+
+    #[tokio::test]
+    async fn a_registered_delivery_stamps_exactly_the_prompt_it_typed() {
+        use crate::PromptOrigin;
+        let store = Store::shared();
+        start(&store).await;
+        let mut prompts = store.subscribe_prompts();
+        let _ = store.expect_prompt(
+            "rmux:%7",
+            Some("/test.sock"),
+            "ship it",
+            PromptOrigin::PersonViaTend,
+        );
+        submit(&store, "original", "/test.sock", "ship it").await;
+        assert_eq!(
+            origin_of_latest(&store).await,
+            Some(PromptOrigin::PersonViaTend)
+        );
+        assert_eq!(
+            prompts.recv().await.unwrap().origin,
+            PromptOrigin::PersonViaTend
+        );
+
+        // The same text typed again, with no new delivery, is unknown: one
+        // registration describes one prompt.
+        submit(&store, "original", "/test.sock", "ship it").await;
+        assert_eq!(origin_of_latest(&store).await, Some(PromptOrigin::Unknown));
+
+        // Two identical deliveries each stamp one prompt, in order.
+        let _ = store.expect_prompt(
+            "rmux:%7",
+            Some("/test.sock"),
+            "continue",
+            PromptOrigin::Peer,
+        );
+        let _ = store.expect_prompt(
+            "rmux:%7",
+            Some("/test.sock"),
+            "continue",
+            PromptOrigin::Automation,
+        );
+        submit(&store, "original", "/test.sock", "continue").await;
+        assert_eq!(origin_of_latest(&store).await, Some(PromptOrigin::Peer));
+        submit(&store, "original", "/test.sock", "continue").await;
+        assert_eq!(
+            origin_of_latest(&store).await,
+            Some(PromptOrigin::Automation)
+        );
+
+        // Another endpoint, other text, or a delivery that failed and was
+        // forgotten do not match.
+        let _ = store.expect_prompt("rmux:%7", Some("/other.sock"), "hi", PromptOrigin::Peer);
+        submit(&store, "original", "/test.sock", "hi").await;
+        assert_eq!(origin_of_latest(&store).await, Some(PromptOrigin::Unknown));
+        let token = store.expect_prompt("rmux:%7", Some("/test.sock"), "x", PromptOrigin::Peer);
+        store.forget_expected_prompt(token);
+        submit(&store, "original", "/test.sock", "x").await;
+        assert_eq!(origin_of_latest(&store).await, Some(PromptOrigin::Unknown));
+        let _ = store.expect_prompt("rmux:%7", Some("/test.sock"), "y", PromptOrigin::Peer);
+        store.forget_expected_prompt_text("rmux:%7", "y");
+        submit(&store, "original", "/test.sock", "y").await;
+        assert_eq!(origin_of_latest(&store).await, Some(PromptOrigin::Unknown));
+    }
+
+    #[test]
+    fn callers_may_declare_only_a_person_peer_or_automation() {
+        use crate::PromptOrigin;
+        assert_eq!(PromptOrigin::declared(None), PromptOrigin::Tend);
+        assert_eq!(
+            PromptOrigin::declared(Some(PromptOrigin::Unknown)),
+            PromptOrigin::Tend
+        );
+        assert_eq!(
+            PromptOrigin::declared(Some(PromptOrigin::PersonViaTend)),
+            PromptOrigin::PersonViaTend
+        );
+    }
 }
