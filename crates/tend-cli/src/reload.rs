@@ -1869,7 +1869,7 @@ fn relaunch_command(pane: &PaneShape) -> Option<String> {
     let command = match pane.argv.as_deref() {
         Some(argv) if !argv.is_empty() => {
             let argv = match resuming {
-                Some(kind) => without_initial_prompt(argv, kind),
+                Some(kind) => without_session_id(&without_initial_prompt(argv, kind), kind),
                 None => argv.to_vec(),
             };
             tend::shell::Dialect::native().command_line(&argv)
@@ -1891,6 +1891,34 @@ fn relaunch_command(pane: &PaneShape) -> Option<String> {
         }
         _ => Some(command),
     }
+}
+
+/// Claude names a new conversation with `--session-id`, but refuses it next to
+/// `--resume` ("--session-id can only be used with --continue or --resume if
+/// --fork-session is also specified"): the resumed conversation keeps its own
+/// id. An agent tend launched with a fixed id would otherwise fail to come
+/// back. A fork names its new conversation, so `--fork-session` keeps it.
+fn without_session_id(argv: &[String], kind: &str) -> Vec<String> {
+    if kind != "claude_code" || argv.iter().any(|arg| arg == "--fork-session") {
+        return argv.to_vec();
+    }
+    let mut out = Vec::with_capacity(argv.len());
+    let mut skip_value = false;
+    for arg in argv {
+        if skip_value {
+            skip_value = false;
+            continue;
+        }
+        if arg == "--session-id" {
+            skip_value = true;
+            continue;
+        }
+        if arg.starts_with("--session-id=") {
+            continue;
+        }
+        out.push(arg.clone());
+    }
+    out
 }
 
 /// An agent pane whose command carries an initial instruction: dropping the
@@ -3081,6 +3109,56 @@ mod tests {
         let mut fresh = bare.clone();
         fresh.agent = None;
         assert!(relaunch_command(&fresh).unwrap().contains("'fix the bug'"));
+    }
+
+    /// From a real snapshot: tend started the agent with a fixed id and its
+    /// task, so the relaunch must resume that id without `--session-id`,
+    /// which Claude rejects next to `--resume`.
+    #[test]
+    fn a_resumed_claude_drops_the_session_id_it_was_started_with() {
+        let shape = |argv: &[&str]| {
+            let mut pane = pane("itda", "0", "0", Some(&argv.join(" ")));
+            pane.argv = Some(argv.iter().map(|a| (*a).to_owned()).collect());
+            pane.agent = Some(AgentShape {
+                kind: "claude_code".into(),
+                session_id: "4cc577fd".into(),
+                working: false,
+            });
+            pane
+        };
+        let with_task = shape(&[
+            "/Users/june/.local/bin/aas",
+            "e",
+            "jelly@claude",
+            "--dangerously-skip-permissions",
+            "--session-id",
+            "4cc577fd",
+            "Add i18n (Korean + English) to Itda.",
+        ]);
+        assert_eq!(
+            relaunch_command(&with_task).as_deref(),
+            Some("/Users/june/.local/bin/aas e jelly@claude --dangerously-skip-permissions --resume 4cc577fd")
+        );
+        // No task, `=` spelling: still dropped.
+        let bare = shape(&["claude", "--session-id=4cc577fd", "--model", "opus"]);
+        assert_eq!(
+            relaunch_command(&bare).as_deref(),
+            Some("claude --model opus --resume 4cc577fd")
+        );
+        // A fork names its new conversation: --session-id is valid there.
+        let fork = shape(&["claude", "--fork-session", "--session-id", "new-id"]);
+        assert!(relaunch_command(&fork)
+            .unwrap()
+            .contains("--session-id new-id"));
+        // Codex has no such flag; its argv is left alone.
+        assert_eq!(
+            without_session_id(
+                &["codex".into(), "--session-id".into(), "x".into()],
+                "codex"
+            )
+            .len(),
+            3
+        );
     }
 
     #[test]
