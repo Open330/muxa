@@ -238,10 +238,11 @@ fn command_basename(cmd: &str) -> String {
 /// The bundled manifest sources, shipped in the binary via `include_str!`.
 /// These are tend-authored and MUST parse — a parse failure is a build-time
 /// bug caught by [`tests::every_bundled_manifest_parses`].
-fn bundled_sources() -> [(&'static str, &'static str); 7] {
+fn bundled_sources() -> [(&'static str, &'static str); 8] {
     [
         ("agy", include_str!("screen/agents/agy.toml")),
         ("codex", include_str!("screen/agents/codex.toml")),
+        ("claude", include_str!("screen/agents/claude.toml")),
         ("cursor", include_str!("screen/agents/cursor.toml")),
         ("amp", include_str!("screen/agents/amp.toml")),
         ("copilot", include_str!("screen/agents/copilot.toml")),
@@ -879,6 +880,30 @@ working = ['CUSTOM-SPINNER']
             Some("cursor"),
         );
         assert!(set.manifest_for_command("bash").is_none());
-        assert!(set.manifest_for_command("claude").is_none());
+        assert!(set.manifest_for_command("claude").is_some());
+    }
+    #[test]
+    fn folder_and_hook_startup_gates_are_visible_without_hooks() {
+        let set = load_manifests();
+        let claude = set.manifest_for_name("claude").unwrap();
+        for choice in ["this folder", "these settings"] {
+            let gate = format!("Security guide\n\n ❯ No, exit\n   Yes, I trust {choice}\n Enter to confirm · Esc to cancel");
+            assert_eq!(claude.classify(&gate), Some(ScreenState::Blocked));
+            assert_ne!(
+                claude.classify(&format!("{gate}\n──────\n❯ \n──────\n? for shortcuts")),
+                Some(ScreenState::Blocked)
+            );
+        }
+        let wrapped =
+            " ❯ No, exit\n   Yes, I trust this\n   folder\n Enter to confirm ·\n Esc to cancel";
+        assert_eq!(claude.classify(wrapped), Some(ScreenState::Blocked));
+        let codex = set.manifest_for_name("codex").unwrap();
+        for gate in [
+            "Hooks need review\n6 hooks are new or changed.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting\n enter confirm · esc skip",
+            "Hooks need review\n  1. Review hooks\n› 2. Trust all and\n continue\n  3. Continue without trusting\n enter confirm ·\n esc skip",
+        ] {
+            assert_eq!(codex.classify(gate), Some(ScreenState::Blocked), "{gate}");
+            assert_ne!(codex.classify(&format!("{gate}\n› Ask Codex to do anything\n100% context left")), Some(ScreenState::Blocked));
+        }
     }
 }

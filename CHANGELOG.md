@@ -19,6 +19,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Home stages multi-select answers locally: checkbox clicks update immediately,
+  and Send selections reconciles the latest screen and sends one key batch with
+  a single final Enter. Changed questions are rejected before sending; older
+  remote runtimes show an update notice instead of accepting unsupported keys.
+- Claude folder/settings trust and Codex hook review gates are visible through
+  screen detection before hooks run. A blocked dedicated worker can recover
+  after the person answers setup, using a fenced, read-only readiness probe.
+
 - A second `tendd` started while one already serves the socket (for example
   launchd's copy next to one started by hand) now exits before loading or
   writing anything. Before, it loaded the registry, ran its notifiers and

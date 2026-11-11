@@ -36,6 +36,22 @@ fn observe(control: &Control, pane: &str) -> Option<Fence> {
 /// Only the exact new launch in its requested directory may be prepared.
 /// Capture joined logical lines: narrow panes wrap both labels and footers.
 pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<Report> {
+    prepare_inner(pane, cwd, launch_id, bypass, false)
+}
+
+/// After a person answers setup, recover readiness without pressing any key
+/// or accepting another folder, hook, settings or permission dialog.
+pub fn probe(pane: &str, cwd: &Path, launch_id: &str) -> Result<Report> {
+    prepare_inner(pane, cwd, launch_id, false, true)
+}
+
+fn prepare_inner(
+    pane: &str,
+    cwd: &Path,
+    launch_id: &str,
+    bypass: bool,
+    passive: bool,
+) -> Result<Report> {
     let control = Control::Ambient;
     let fence = observe(&control, pane).context("cannot fence worker startup")?;
     anyhow::ensure!(
@@ -64,7 +80,7 @@ pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<
         },
         &matches,
         |key| {
-            if !matches() {
+            if passive || !matches() {
                 return false;
             }
             let key = match key {
@@ -77,7 +93,7 @@ pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<
             control.run(&["send-keys", "-t", pane, key]).is_ok()
         },
         bypass,
-        Duration::from_secs(30),
+        Duration::from_secs(if passive { 3 } else { 30 }),
     );
     if !matches() {
         anyhow::bail!("worker changed before readiness could be recorded");
