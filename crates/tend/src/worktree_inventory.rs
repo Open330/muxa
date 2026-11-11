@@ -321,7 +321,8 @@ impl Liveness {
 /// being read are skipped; another user's process tend may not read is
 /// skipped too (it cannot write into this user's tree without this user's
 /// permission bits, which a worktree tend made does not grant); one of this
-/// user's own that cannot be read makes the list incomplete (None).
+/// user's own that cannot be read makes the list incomplete (None). Windows
+/// differs; see [`readable_cwds`].
 fn process_cwds() -> Option<Vec<PathBuf>> {
     #[cfg(target_os = "linux")]
     {
@@ -353,7 +354,26 @@ fn process_cwds() -> Option<Vec<PathBuf>> {
         }
         Some(cwds)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(windows)]
+    {
+        // Windows has no lsof; sysinfo reads each process's working
+        // directory from its process environment block.
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::All,
+            true,
+            ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+        );
+        readable_cwds(
+            sysinfo::get_current_pid().ok()?.as_u32(),
+            system
+                .processes()
+                .iter()
+                .map(|(pid, process)| (pid.as_u32(), process.cwd().map(Path::to_path_buf))),
+        )
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         // lsof lists the processes this user may inspect; another user's
         // are left out, as above. -F0 ends every field with NUL, so a path
@@ -371,10 +391,36 @@ fn process_cwds() -> Option<Vec<PathBuf>> {
     }
 }
 
+/// The working directories of `(pid, cwd)` processes on Windows, or None
+/// when tend could not read even its own (`me`), so the source is broken.
+///
+/// A process whose directory cannot be read is skipped, whoever owns it:
+/// a non-elevated tend cannot read an elevated or protected process, even
+/// the same user's (Defender's session helper always runs as the user), so
+/// failing closed on those would refuse every cleanup. Windows backs this
+/// up: a directory that is any process's current directory, or holds one,
+/// cannot be renamed, so setting such a worktree aside (`git worktree
+/// move`) fails instead of pulling it out from under the process.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn readable_cwds(
+    me: u32,
+    processes: impl IntoIterator<Item = (u32, Option<PathBuf>)>,
+) -> Option<Vec<PathBuf>> {
+    let mut cwds = Vec::new();
+    let mut saw_me = false;
+    for (pid, cwd) in processes {
+        if let Some(cwd) = cwd.filter(|cwd| !cwd.as_os_str().is_empty()) {
+            saw_me |= pid == me;
+            cwds.push(cwd);
+        }
+    }
+    saw_me.then_some(cwds)
+}
+
 /// The working directories in `lsof -F0n` output. A failed run may have
 /// printed some processes and not others, and lsof always reports at least
 /// itself, so a failure or nothing at all reads as unavailable.
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", windows), allow(dead_code))]
 fn lsof_cwds(ok: bool, out: &str) -> Option<Vec<PathBuf>> {
     let cwds: Vec<PathBuf> = out
         .split('\0')
@@ -920,6 +966,32 @@ mod tests {
         );
         assert_eq!(lsof_cwds(false, out), None);
         assert_eq!(lsof_cwds(true, ""), None);
+    }
+
+    #[test]
+    fn unreadable_windows_directories_are_skipped_unless_tends_own_is() {
+        let cwd = |p: &str| Some(PathBuf::from(p));
+        assert_eq!(
+            readable_cwds(
+                12,
+                vec![
+                    (0, None),
+                    (4, None),
+                    (10, Some(PathBuf::new())),
+                    (11, cwd("C:\\Users\\o")),
+                    (12, cwd("C:\\w\\tree\\")),
+                ]
+            ),
+            Some(vec![
+                PathBuf::from("C:\\Users\\o"),
+                PathBuf::from("C:\\w\\tree\\")
+            ])
+        );
+        assert_eq!(
+            readable_cwds(12, vec![(11, cwd("C:\\w")), (12, None)]),
+            None
+        );
+        assert_eq!(readable_cwds(12, vec![(11, cwd("C:\\w"))]), None);
     }
 
     #[test]
