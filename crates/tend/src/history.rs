@@ -49,12 +49,13 @@
 //! `try_send`, so a slow writer drops a disk record (with a warning) rather
 //! than backing up the broadcast pipeline.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -209,6 +210,9 @@ struct Inner {
     /// Per-pane ring buffer of recent entries. `VecDeque` so `push_back` +
     /// `pop_front` is O(1) — the eviction shape is FIFO oldest-first.
     by_pane: HashMap<String, VecDeque<HistoryEntry>>,
+    /// Compact fingerprints of every prompt seen this process, including all
+    /// records loaded at startup. Ring eviction must not re-enable retries.
+    seen: HashSet<[u8; 32]>,
 }
 
 /// Append-only prompt log with bounded in-memory caching and periodic
@@ -305,7 +309,9 @@ impl PromptHistory {
         &self.opts
     }
 
-    /// Record one prompt. Updates the in-memory ring buffer immediately and
+    /// Record one prompt, ignoring repeated (`session_id`, `at`, `prompt`) identities.
+    /// Startup seeds retry fingerprints from disk; compaction does not forget
+    /// them until restart. Updates the in-memory ring buffer immediately and
     /// fires a fire-and-forget disk write on the writer task.
     ///
     /// The disk send uses `try_send`, so a backed-up writer (rare) drops
@@ -320,7 +326,9 @@ impl PromptHistory {
                 .and_then(|cache| cache.get(&entry.pane));
         }
         let mut inner = self.inner.write().await;
-        push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane);
+        if !push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane) {
+            return;
+        }
         if let Some(tx) = &self.writer {
             #[cfg(test)]
             if let Some(hook) = &self.before_enqueue_hook {
@@ -429,13 +437,27 @@ pub struct CompactReport {
     pub rewrite_skipped: bool,
 }
 
-fn push_bounded(inner: &mut Inner, entry: HistoryEntry, max_per_pane: usize) {
+/// Hash the retry identity without retaining a second copy of prompt text.
+fn retry_key(entry: &HistoryEntry) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(entry.session_id.len().to_le_bytes());
+    hash.update(entry.session_id.as_bytes());
+    hash.update(entry.at.unix_timestamp_nanos().to_le_bytes());
+    hash.update(entry.prompt.as_bytes());
+    hash.finalize().into()
+}
+
+fn push_bounded(inner: &mut Inner, entry: HistoryEntry, max_per_pane: usize) -> bool {
+    if !inner.seen.insert(retry_key(&entry)) {
+        return false;
+    }
     let pane = entry.pane.clone();
     let deque = inner.by_pane.entry(pane).or_default();
     deque.push_back(entry);
     while deque.len() > max_per_pane {
         deque.pop_front();
     }
+    true
 }
 
 /// Read every parseable NDJSON line from `path` into a Vec. Missing file
@@ -597,6 +619,64 @@ mod tests {
 
     fn entry(pane: &str, prompt: &str, at: OffsetDateTime) -> HistoryEntry {
         HistoryEntry::new(AgentKind::ClaudeCode, "s", pane, prompt, at, None)
+    }
+
+    #[tokio::test]
+    async fn retries_dedupe_across_panes_and_ring_eviction() {
+        let h = PromptHistory::in_memory_only(HistoryOptions {
+            max_per_pane: 1,
+            ..Default::default()
+        });
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        let first = entry("%1", "hello", at);
+        h.append(first.clone()).await;
+        h.append(first.clone()).await;
+        assert_eq!(h.len().await, 1);
+        h.append(entry("%1", "newer", at + time::Duration::seconds(1)))
+            .await;
+        let mut moved = first;
+        moved.pane = "%2".into();
+        h.append(moved).await;
+        assert!(h.recent_for_pane("%2", 0).await.is_empty());
+        // Different timestamps, prompts and sessions are distinct submissions.
+        h.append(entry("%2", "hello", at + time::Duration::seconds(1)))
+            .await;
+        h.append(entry("%3", "different", at)).await;
+        let mut other_session = entry("%4", "hello", at);
+        other_session.session_id = "other".into();
+        h.append(other_session).await;
+        assert_eq!(h.len().await, 4);
+    }
+
+    #[tokio::test]
+    async fn retries_dedupe_all_loaded_records_and_do_not_append_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("prompts.ndjson");
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        let first = entry("%1", "hello", at);
+        let second = entry("%1", "newer", at + time::Duration::seconds(1));
+        // Also collapse duplicates already present in an older daemon's log.
+        let lines = [first.clone(), first.clone(), second.clone()]
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect::<String>();
+        tokio::fs::write(&path, &lines).await.unwrap();
+        let (tx, _) = broadcast::channel(1);
+        let (h, writer) = PromptHistory::spawn(
+            HistoryOptions {
+                path: Some(path.clone()),
+                max_per_pane: 1,
+                ..Default::default()
+            },
+            tx.subscribe(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.recent_all(0).await, vec![second]);
+        h.append(first).await;
+        tx.send(()).unwrap();
+        writer.await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), lines);
     }
 
     #[tokio::test]

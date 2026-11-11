@@ -1759,7 +1759,7 @@ mod tests {
     async fn reconcile_codex_saturated_weekly_plan_quota_keeps_working() {
         let store = Store::shared();
         let now = OffsetDateTime::now_utc();
-        let started = codex_started("credit-working", "%8", now);
+        let started = codex_started("credit-working", "%8", now - time::Duration::nanoseconds(1));
         store.apply(&started).await;
         store
             .apply(&AgentEvent::PromptSubmitted {

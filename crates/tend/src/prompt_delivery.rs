@@ -308,7 +308,8 @@ mod tests {
         use crate::PromptOrigin;
         let store = Store::shared();
         start(&store).await;
-        let earlier = OffsetDateTime::now_utc() - time::Duration::milliseconds(500);
+        // After session start, but before the delivery was registered.
+        let earlier = OffsetDateTime::now_utc();
         let _ = store
             .expect_prompt(
                 "rmux:%7",

@@ -882,10 +882,24 @@ is gone.
 ## Semantics
 
 - **At-least-once delivery.** Adapters should retry `ingest` on transient
-  socket errors. The daemon applies events idempotently per-field; no
-  deduplication by event id (yet).
+  socket errors, preserving the original `at` timestamp. Prompt history deduplicates
+  `(session_id, at, prompt)` independently of pane identity, including records
+  loaded from `prompts.ndjson` on restart. Retry fingerprints remain for the
+  daemon's lifetime (32 bytes per unique prompt plus set overhead); after restart,
+  only records still retained on disk are known. Historical prompts may enter
+  history, but a `prompt_submitted` at or before the last state transition or
+  latest prompt cannot change live state, activity, latest prompt, or emit another
+  live prompt broadcast. A first event creating a new agent is accepted.
+  There is no general event-ID deduplication: other event kinds are **not**
+  retry-safe across intervening events. Retried `started`, `tool_started`,
+  `notification_fired`, `turn_stopped`, `session_ended`, or `rate_limited` may
+  overwrite newer state/metadata; `tool_started` can re-add a subagent and
+  `tool_completed` for `Task` can retire another FIFO subagent. Heartbeats can
+  overwrite newer metrics/quota metadata. Do not infer exactly-once side effects
+  from an ingest acknowledgment.
 - **Ordering per session.** Adapters SHOULD send events in causal order
-  for a given `session_id`. Out-of-order events produce incorrect state.
+  for a given `session_id`. Outside the prompt guard above, out-of-order
+  events can produce incorrect state.
 - **Late-arriving identity.** `pane` and `cwd` may be `null` on the first
   event; the daemon fills them in from subsequent events.
 - **GC.** Agents in state `stopped` for more than 60 minutes are evicted
