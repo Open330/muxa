@@ -5046,7 +5046,11 @@ async fn wait_for_change(client: &Client, args: &Value) -> Value {
             tokio::select! {
                 recv = stream.recv() => match recv {
                     Ok(Some(t)) => {
-                        if pane.is_none_or(|p| t.agent.pane.as_deref() == Some(p)) {
+                        // An Idle -> Idle broadcast announces a new question
+                        // (`awaiting_reply`), not a state change.
+                        if t.from != t.to
+                            && pane.is_none_or(|p| t.agent.pane.as_deref() == Some(p))
+                        {
                             return WaitOutcome::Observed(t);
                         }
                     }

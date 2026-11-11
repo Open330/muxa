@@ -375,7 +375,30 @@ pub(crate) fn truncate_response(s: String) -> String {
     while !s.is_char_boundary(tail_start) {
         tail_start += 1;
     }
-    format!("{}\n\n…\n\n{}", &s[..head_end], &s[tail_start..])
+    // Keep Markdown code fences balanced across the cut: a head that ends
+    // inside a code block is closed, and a tail that starts inside one is
+    // reopened, so neither end's prose reads as code (or code as prose).
+    let head = &s[..head_end];
+    let tail = &s[tail_start..];
+    let close = if open_fence(head) { "\n```" } else { "" };
+    let reopen = if open_fence(&s[..tail_start]) {
+        "```\n"
+    } else {
+        ""
+    };
+    format!("{head}{close}\n\n…\n\n{reopen}{tail}")
+}
+
+/// Whether `text` ends inside a fenced code block.
+fn open_fence(text: &str) -> bool {
+    text.lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            line.starts_with("```") || line.starts_with("~~~")
+        })
+        .count()
+        % 2
+        == 1
 }
 
 #[cfg(test)]
@@ -392,6 +415,28 @@ mod tests {
         assert!(bounded.ends_with("머지해도 될까요?"));
         assert!(bounded.contains("\n\n…\n\n"));
         assert_eq!(truncate_response("short".into()), "short");
+    }
+
+    #[test]
+    fn a_cut_inside_code_keeps_fences_balanced() {
+        // The head ends inside a block whose closer was elided; the tail is
+        // prose ending on the question.
+        let text = format!(
+            "Here is the code:\n```rust\n{}\n```\n\n{}\n\nShould I deploy it now?",
+            "x".repeat(4_000),
+            "Deployment notes. ".repeat(90)
+        );
+        let bounded = truncate_response(text);
+        assert_eq!(
+            crate::awaiting_reply::classify(&bounded).as_deref(),
+            Some("Should I deploy it now?")
+        );
+        // The tail starts inside a block opened before the cut: its code
+        // stays code.
+        let text = format!("Intro.\n\n```\n{}\nwhy?\n```", "z\n".repeat(2_500));
+        let bounded = truncate_response(text);
+        assert_eq!(crate::awaiting_reply::classify(&bounded), None);
+        assert_eq!(bounded.matches("```").count() % 2, 0, "{bounded}");
     }
 
     /// Build a `read` closure from a static lookup table, matching the

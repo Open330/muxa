@@ -3869,6 +3869,9 @@ async fn spawn_activity_transition_task(
                 biased;
                 msg = rx.recv() => {
                     match msg {
+                        // An Idle -> Idle broadcast only carries a changed
+                        // `awaiting_reply`; the activity log records states.
+                        Ok(transition) if transition.from == transition.to => {}
                         Ok(transition) => {
                             record_activity_transition(
                                 &activity_log,

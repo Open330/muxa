@@ -966,6 +966,8 @@ fn mutate_for_event(
         AgentEvent::Started { .. } => {
             agent.state = AgentState::Idle;
             agent.subagents.clear();
+            // A new or resumed session has asked nothing yet.
+            agent.awaiting_reply = None;
             // A fresh session means whatever wall the previous turn ran
             // into has been cleared (or the user is starting over) —
             // drop the active-cap marker so the watch row stops glowing
@@ -1878,12 +1880,15 @@ impl Store {
         if agent.state != AgentState::Idle {
             agent.awaiting_reply = None;
         }
-        // A question newly asked on a row that stays Idle (a Codex rollout
-        // answer arriving after the stop, a second idle turn) changes no
-        // state, but it is news to the notifier: broadcast it as Idle → Idle.
-        let new_question = agent
-            .awaiting_reply()
-            .is_some_and(|marker| prev_question.as_deref() != Some(marker.question.as_str()));
+        // A question asked or retired on a row that stays Idle (a Codex
+        // rollout answer arriving after the stop, a second idle turn)
+        // changes no state, but stream clients and the notifier must see it:
+        // broadcast it as Idle → Idle.
+        let new_question = agent.state == prev_state
+            && prev_question.as_deref()
+                != agent
+                    .awaiting_reply()
+                    .map(|marker| marker.question.as_str());
 
         let stopped_launch = (agent.state == AgentState::Stopped).then(|| id.session_id.clone());
         let visible_change = new_agent
@@ -5475,6 +5480,7 @@ mod tests {
             .unwrap()
             .awaiting_reply()
             .is_some());
+        let mut transitions = store.subscribe();
         store
             .apply(&stop("s", Some("배포까지 끝났습니다."), t0))
             .await;
@@ -5483,6 +5489,44 @@ mod tests {
             .await
             .unwrap()
             .awaiting_reply
+            .is_none());
+        // Stream clients holding the old row learn that it was retired.
+        let t = transitions.try_recv().expect("broadcast");
+        assert_eq!((t.from, t.to), (AgentState::Idle, AgentState::Idle));
+        assert!(t.agent.awaiting_reply.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_new_or_resumed_session_has_asked_nothing() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let started = AgentEvent::Started {
+            id: id("s"),
+            at: t0,
+        };
+        store.apply(&started).await;
+        store.apply(&stop("s", Some("진행할까요?"), t0)).await;
+        store.apply(&started).await;
+        assert!(store
+            .by_session("s")
+            .await
+            .unwrap()
+            .awaiting_reply
+            .is_none());
+
+        // A marker a direct writer left on a Stopped row does not come back.
+        store.apply(&stop("s", Some("진행할까요?"), t0)).await;
+        {
+            let mut agents = store.agents.write().await;
+            let agent = agents.values_mut().next().unwrap();
+            agent.state = AgentState::Stopped;
+        }
+        store.apply(&started).await;
+        assert!(store
+            .by_session("s")
+            .await
+            .unwrap()
+            .awaiting_reply()
             .is_none());
     }
 

@@ -49,11 +49,6 @@ const DECISION_CUES: &[&str] = &[
     "need your approval",
     "needs your approval",
     "need your go-ahead",
-    "your call",
-    "please decide",
-    "please choose",
-    "please confirm",
-    "can you confirm",
 ];
 
 /// Phrases that ask the person to act; only in the closing paragraphs.
@@ -68,13 +63,20 @@ const REQUEST_CUES: &[&str] = &[
     "확인해 주시면",
     "should i ",
     "shall i ",
-    "do you want",
-    "which one",
-    "which option",
+    "do you want me to",
+];
+
+/// Requests that ask only when they open the sentence: "Please confirm the
+/// target." asks; "The form now says please confirm before deleting."
+/// reports.
+const REQUEST_OPENINGS: &[&str] = &[
+    "please confirm",
+    "please choose",
+    "please decide",
+    "can you confirm",
+    "could you confirm",
     "let me know which",
     "let me know whether",
-    "let me know if you want",
-    "let me know if you'd like",
 ];
 
 /// Closers that read like a question but ask nothing. Matched against the
@@ -100,6 +102,9 @@ const COURTESY: &[&str] = &[
 const OFFER_OPENINGS: &[&str] = &[
     "would you like",
     "want me to",
+    "let me know if you want",
+    "let me know if you'd like",
+    "let me know if you need",
     "원하시면",
     "필요하시면",
     "궁금하시면",
@@ -151,7 +156,9 @@ pub fn classify(response: &str) -> Option<String> {
         {
             continue;
         }
-        let request = *closing && REQUEST_CUES.iter().any(|c| lower.contains(c));
+        let request = *closing
+            && (REQUEST_CUES.iter().any(|c| lower.contains(c))
+                || REQUEST_OPENINGS.iter().any(|c| lower.starts_with(c)));
         let last_question = (sentence.ends_with('?') || sentence.ends_with('？'))
             && sentences[position + 1..]
                 .iter()
@@ -326,6 +333,9 @@ mod tests {
             "All done and merged.\n\nWould you like a walkthrough of the changes?",
             "배포했습니다. 원하시면 변경 내용을 정리해 드릴까요?",
             r#"The error said "is the socket open?" and the fix closes it first."#,
+            "All done. Let me know if you want a walkthrough.",
+            "I checked which option is faster. Option B wins.",
+            "The form now says please confirm before deleting. Tests pass.",
         ] {
             assert_eq!(classify(response), None, "{response}");
         }
@@ -345,6 +355,10 @@ mod tests {
             (
                 "A+B로 진행할까요? 배포는 백그라운드에서 계속 진행 중입니다.",
                 "A+B로 진행할까요?",
+            ),
+            (
+                "Two targets are configured.\n\nPlease confirm which one to deploy to.",
+                "Please confirm which one to deploy to.",
             ),
         ] {
             assert_eq!(classify(response).as_deref(), Some(expected), "{response}");
