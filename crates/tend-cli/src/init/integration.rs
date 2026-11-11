@@ -1088,7 +1088,12 @@ fn canonical(path: &Path) -> PathBuf {
 /// followed by a `# comment`. `None` for anything the shell would expand or
 /// that this subset does not cover; such a value is never guessed.
 fn shell_literal(raw: &str) -> Option<(String, bool)> {
-    let raw = raw.trim_start();
+    // `KEY= word` runs `word` as a command with KEY empty; it is not an
+    // assignment of `word`. Only blanks or a comment may follow a bare `=`.
+    if raw.starts_with(char::is_whitespace) {
+        let rest = raw.trim_start();
+        return (rest.is_empty() || rest.starts_with('#')).then(|| (String::new(), false));
+    }
     let (value, rest) = if let Some(body) = raw.strip_prefix('\'') {
         let end = body.find('\'')?;
         ((body[..end].to_owned(), true), &body[end + 1..])
@@ -1753,6 +1758,13 @@ mod tests {
         );
         assert_eq!(
             from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=\n"),
+            Ok(None)
+        );
+        // `KEY= word` is a command, not an assignment.
+        assert_eq!(from("CLAUDE_CONFIG_DIR= /tmp/command\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR= '/tmp/command'\n"), Err(()));
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=   # cleared\n"),
             Ok(None)
         );
         // Control flow decides whether an assignment runs: not followed.
