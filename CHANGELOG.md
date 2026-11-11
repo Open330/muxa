@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- macOS: the shortcut that shows agents from any app is now off until you
+  pick one in Settings › General › Home. It used to take ⌥Space from every
+  other app by default; a shortcut you already picked is kept.
+
 ## [0.10.3] - 2026-11-11
 
 ### Added

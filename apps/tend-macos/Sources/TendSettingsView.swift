@@ -244,7 +244,7 @@ private struct TendGeneralSettingsView: View {
     @AppStorage(TendPreferences.appearanceKey) private var appearance = TendAppearance.system.rawValue
     @AppStorage(TendPreferences.showWorkbenchOnLaunchKey) private var showWorkbenchOnLaunch = true
     @AppStorage(TendPreferences.homeAnimatesMovesKey) private var homeAnimatesMoves = true
-    @AppStorage(TendHotKeyPreset.defaultsKey) private var agentsHotKey = TendHotKeyPreset.optionSpace.rawValue
+    @AppStorage(TendHotKeyPreset.defaultsKey) private var agentsHotKey = TendHotKeyPreset.off.rawValue
     @ObservedObject private var globalHotKey = TendGlobalHotKey.shared
     @AppStorage(TendPreferences.workDirectoryKey) private var workDirectory = ""
     @Environment(\.openWindow) private var openWindow
