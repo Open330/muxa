@@ -33,6 +33,8 @@ struct HostPaths {
     home: PathBuf,
     config: PathBuf,
     skill: PathBuf,
+    /// Gets the MCP server only (another account's home).
+    mcp_only: bool,
 }
 
 pub fn codex_home() -> Option<PathBuf> {
@@ -60,6 +62,7 @@ fn hosts(detect: &Detection) -> Result<Vec<HostPaths>> {
                 config: codex.join("config.toml"),
                 home: codex,
                 skill: home.join(".agents/skills/tend-collaboration"),
+                mcp_only: false,
             });
         }
     }
@@ -76,6 +79,7 @@ fn hosts(detect: &Detection) -> Result<Vec<HostPaths>> {
                 config,
                 skill: claude.join("skills/tend-collaboration"),
                 home: claude,
+                mcp_only: false,
             });
         }
     }
@@ -180,13 +184,73 @@ pub fn extend_plan(
     detect: &Detection,
     config: Option<&Path>,
     socket: &Path,
+    all_homes: bool,
 ) -> Result<()> {
     if !plan.components.iter().any(|c| is_component(*c)) {
         return Ok(());
     }
     let root = bundle_root(config)?;
-    let hosts = hosts(detect)?;
+    let mut hosts = hosts(detect)?;
+    if plan.direction == Direction::Install && plan.components.contains(&Component::AgentMcp) {
+        let extra = mcp_only_hosts(plan, &hosts, config, all_homes)?;
+        hosts.extend(extra);
+    }
     plan_bundle(plan, &root, &hosts, config, socket)
+}
+
+/// Provider homes besides the active ones that also get the MCP server:
+/// every configured account's home, and with `all_homes` every home a
+/// running agent reads. They get the MCP entry only; instructions and the
+/// skill stay with the active home.
+fn mcp_only_hosts(
+    plan: &mut Plan,
+    active: &[HostPaths],
+    config: Option<&Path>,
+    all_homes: bool,
+) -> Result<Vec<HostPaths>> {
+    let user_home = dirs::home_dir().context("cannot locate user home for agent integration")?;
+    let active: Vec<(Host, &'static str, PathBuf)> = active
+        .iter()
+        .map(|h| (h.host, home_var(h.host), h.config.clone()))
+        .collect();
+    let mut unchecked = Unchecked::default();
+    let accounts = account_configs(config, &user_home, &mut unchecked);
+    let live = if all_homes {
+        live_agent_configs(&mut unchecked)
+    } else {
+        Vec::new()
+    };
+    let mut out = Vec::new();
+    for home in other_homes(&active, accounts, live) {
+        if !active.iter().any(|(host, _, _)| *host == home.host) {
+            continue;
+        }
+        // One spelling per file, so repeated installs through different
+        // aliases keep one ownership record.
+        let config_path = canonical(&home.config);
+        if mcp_state(home.host, &config_path) == McpState::Unreadable {
+            plan.warnings.push(format!(
+                "{} cannot be read or parsed; skipped its tend MCP registration",
+                config_path.display()
+            ));
+            continue;
+        }
+        let dir = config_path.parent().unwrap_or(&config_path).to_path_buf();
+        out.push(HostPaths {
+            host: home.host,
+            skill: dir.join(SKILL_DIR),
+            home: dir,
+            config: config_path,
+            mcp_only: true,
+        });
+    }
+    if unchecked.accounts > 0 || unchecked.processes > 0 {
+        plan.warnings.push(format!(
+            "Not every provider home could be checked: {} account(s) set theirs through the shell or an unreadable env_file, {} provider process(es) had an unreadable environment",
+            unchecked.accounts, unchecked.processes
+        ));
+    }
+    Ok(out)
 }
 
 fn plan_bundle(
@@ -223,7 +287,7 @@ fn plan_bundle(
                 root.join("bootstrap.md"),
                 BOOTSTRAP,
             )?;
-            for host in hosts {
+            for host in hosts.iter().filter(|h| !h.mcp_only) {
                 instructions(plan, &mut manifest, root, host)?;
             }
         }
@@ -242,7 +306,7 @@ fn plan_bundle(
                 root.join(SKILL_DIR).join("references/workflows.md"),
                 WORKFLOWS,
             )?;
-            for host in hosts {
+            for host in hosts.iter().filter(|h| !h.mcp_only) {
                 skill_link(plan, &mut manifest, &host.skill, &root.join(SKILL_DIR))?;
             }
         }
@@ -828,7 +892,21 @@ fn uninstall_record(plan: &mut Plan, record: &Record) -> Result<bool> {
 
 /// Read-only checks shared by init verification and doctor. No agent is spawned.
 pub fn diagnostics(config: Option<&Path>) -> Result<Vec<(bool, String)>> {
-    diagnostics_with(config, active_mcp_configs())
+    let active = active_mcp_configs();
+    let mut out = diagnostics_with(config, active.clone())?;
+    if let Some(user_home) = dirs::home_dir() {
+        let mut unchecked = Unchecked::default();
+        let accounts = account_configs(config, &user_home, &mut unchecked);
+        let live = live_agent_configs(&mut unchecked);
+        let homes = other_homes(&active, accounts, live);
+        let recorded: Vec<PathBuf> = bundle_root(config)
+            .ok()
+            .and_then(|root| load_manifest(&root.join("manifest.json")).ok())
+            .map(|m| m.records.into_iter().map(|r| r.path).collect())
+            .unwrap_or_default();
+        out.extend(other_home_gaps(&homes, &recorded, &unchecked));
+    }
+    Ok(out)
 }
 
 /// [`diagnostics`] against an explicit set of active provider configs.
@@ -926,20 +1004,456 @@ fn active_home_gaps(
         .into_iter()
         .filter(|(_, _, path)| !recorded.contains(path))
         .filter_map(|(host, var, path)| {
-            let text = fs::read_to_string(&path).unwrap_or_default();
-            let present = read_server(&text, host).ok().flatten().is_some();
             let home = path.parent().unwrap_or(&path).display().to_string();
-            (!present).then(|| {
-                (
-                    false,
-                    format!(
-                        "agent-mcp: {} has no tend server, and it is the active {var}; run `{var}={home} tend init --component agent-mcp`",
-                        path.display()
-                    ),
-                )
-            })
+            let problem = match mcp_state(host, &path) {
+                McpState::Healthy => return None,
+                McpState::Missing => format!(
+                    "has no tend server, and it is the active {var}; run `{var}={home} tend init --component agent-mcp`"
+                ),
+                McpState::Disabled => format!(
+                    "has the tend server disabled, and it is the active {var}; re-enable it, or run `{var}={home} tend init --component agent-mcp`"
+                ),
+                McpState::Conflict => format!(
+                    "has a `tend` server that does not run `tend mcp`, and it is the active {var}; reconcile that entry by hand"
+                ),
+                McpState::Unreadable => {
+                    format!("cannot be read or parsed, and it is the active {var}; fix the file")
+                }
+            };
+            Some((false, format!("agent-mcp: {} {problem}", path.display())))
         })
         .collect()
+}
+
+/// Why tend knows about a provider home other than the active one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HomeSource {
+    /// `[[accounts.<provider>]]` names it in config.toml.
+    Account,
+    /// A running agent of this user reads it.
+    Live,
+}
+
+/// A provider config other agents read, beyond the active home.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OtherHome {
+    host: Host,
+    /// The provider's config file (`.claude.json`, `config.toml`).
+    config: PathBuf,
+    source: HomeSource,
+    /// Running agents seen reading it.
+    agents: usize,
+}
+
+fn home_var(host: Host) -> &'static str {
+    match host {
+        Host::Claude => "CLAUDE_CONFIG_DIR",
+        Host::Codex => "CODEX_HOME",
+    }
+}
+
+/// The config file a provider reads with `var` set to `home`, or unset.
+fn provider_config(host: Host, home: Option<&Path>, user_home: &Path) -> PathBuf {
+    match (host, home) {
+        (Host::Claude, Some(home)) => home.join(".claude.json"),
+        (Host::Claude, None) => user_home.join(".claude.json"),
+        (Host::Codex, Some(home)) => home.join("config.toml"),
+        (Host::Codex, None) => user_home.join(".codex/config.toml"),
+    }
+}
+
+/// One path per file, whatever symlinks lead to it: aas profiles often link
+/// their files to a shared one. A missing file resolves through its nearest
+/// existing ancestor, so a home that does not exist yet keeps one spelling.
+fn canonical(path: &Path) -> PathBuf {
+    if let Ok(real) = fs::canonicalize(path) {
+        return real;
+    }
+    let mut rest = Vec::new();
+    let mut cur = path;
+    while let Some(parent) = cur.parent() {
+        if let Some(name) = cur.file_name() {
+            rest.push(name.to_owned());
+        }
+        if let Ok(real) = fs::canonicalize(parent) {
+            return rest.iter().rev().fold(real, |acc, name| acc.join(name));
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
+}
+
+/// The value of one shell assignment's right-hand side, when it is a plain
+/// literal: an unquoted word, `'…'`, or `"…"` without expansions, optionally
+/// followed by a `# comment`. `None` for anything the shell would expand or
+/// that this subset does not cover; such a value is never guessed.
+fn shell_literal(raw: &str) -> Option<(String, bool)> {
+    // `KEY= word` runs `word` as a command with KEY empty; it is not an
+    // assignment of `word`. Only blanks or a comment may follow a bare `=`.
+    if raw.starts_with(char::is_whitespace) {
+        let rest = raw.trim_start();
+        return (rest.is_empty() || rest.starts_with('#')).then(|| (String::new(), false));
+    }
+    let (value, rest) = if let Some(body) = raw.strip_prefix('\'') {
+        let end = body.find('\'')?;
+        ((body[..end].to_owned(), true), &body[end + 1..])
+    } else if let Some(body) = raw.strip_prefix('"') {
+        let end = body.find('"')?;
+        let value = &body[..end];
+        if value.contains(['$', '`', '\\']) {
+            return None;
+        }
+        ((value.to_owned(), true), &body[end + 1..])
+    } else {
+        let end = raw.find(char::is_whitespace).unwrap_or(raw.len());
+        let value = &raw[..end];
+        if value.contains([
+            '$', '`', '\\', '\'', '"', '#', ';', '&', '|', '(', ')', '<', '>',
+        ]) {
+            return None;
+        }
+        ((value.to_owned(), false), &raw[end..])
+    };
+    // Anything after the value must be blanks, or blanks then a comment:
+    // `'a'#b` is the single word `a#b` to the shell.
+    let rest_ok = rest.trim().is_empty()
+        || (rest.starts_with(char::is_whitespace) && rest.trim_start().starts_with('#'));
+    rest_ok.then_some(value)
+}
+
+/// The provider home an account selects, read without running anything.
+/// Launch sources the `env_file` and then applies `env`, so an `env` key
+/// decides whenever present, even empty. In the file the last assignment
+/// wins, as in the shell. `Ok(None)`: the account leaves the home to the
+/// launch environment (no key, or an empty value, which providers treat as
+/// unset). `Err`: the value depends on the shell, is relative, or the file
+/// cannot be read; it is reported as not checked, never guessed.
+fn account_home(
+    profile: &tend::accounts::AccountProfile,
+    var: &str,
+) -> Result<Option<PathBuf>, ()> {
+    let resolve = |value: String| -> Result<Option<PathBuf>, ()> {
+        if value.is_empty() {
+            return Ok(None);
+        }
+        let path = PathBuf::from(tend::accounts::expand_home(&value));
+        if path.is_absolute() {
+            Ok(Some(path))
+        } else {
+            Err(())
+        }
+    };
+    if let Some(value) = profile.env.get(var) {
+        if value.contains(['$', '`']) {
+            return Err(());
+        }
+        return resolve(value.clone());
+    }
+    let Some(file) = &profile.env_file else {
+        return Ok(None);
+    };
+    let text = fs::read_to_string(tend::accounts::expand_home(file)).map_err(|_| ())?;
+    // Only a file of plain assignments is read: any other line (a
+    // conditional, a function, a heredoc, a continuation) could decide
+    // whether an assignment runs at all, so the whole file is unchecked.
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let (key, raw) = line.split_once('=').ok_or(())?;
+        if key.is_empty()
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || key.starts_with(|c: char| c.is_ascii_digit())
+            || raw.ends_with('\\')
+        {
+            return Err(());
+        }
+        let (value, quoted) = shell_literal(raw).ok_or(())?;
+        if key == var {
+            found = Some((value, quoted));
+        }
+    }
+    match found {
+        None => Ok(None),
+        Some((value, _)) if value.is_empty() => Ok(None),
+        // The shell expands an unquoted leading `~/` only; a quoted one
+        // stays a relative path.
+        Some((value, quoted)) => {
+            let value = if quoted {
+                value
+            } else {
+                tend::accounts::expand_home(&value)
+            };
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                Ok(Some(path))
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
+/// What discovery could not check, reported as incomplete coverage.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct Unchecked {
+    /// Accounts whose home depends on the shell or an unreadable `env_file`.
+    accounts: usize,
+    /// Own provider processes whose environment could not be read.
+    processes: usize,
+}
+
+/// Provider homes the configured accounts select.
+fn account_configs(
+    config: Option<&Path>,
+    user_home: &Path,
+    unchecked: &mut Unchecked,
+) -> Vec<(Host, PathBuf)> {
+    let Ok(cfg) = tend::config::Config::load_or_default(config) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for (host, provider) in [(Host::Claude, "claude"), (Host::Codex, "codex")] {
+        for profile in cfg.accounts.for_provider(provider) {
+            match account_home(profile, home_var(host)) {
+                Ok(Some(home)) => out.push((host, provider_config(host, Some(&home), user_home))),
+                Ok(None) => {}
+                Err(()) => unchecked.accounts += 1,
+            }
+        }
+    }
+    out
+}
+
+/// The provider a process runs, from its command line: the program, or the
+/// script a `node` launcher runs. Codex app-servers count (they run attached
+/// threads' MCP with their own `CODEX_HOME`); helpers that share a Claude
+/// session's config (its background daemon) do not.
+fn agent_host(args: &str) -> Option<Host> {
+    let mut words = args.split_whitespace();
+    let mut program = words.next()?;
+    let base = |word: &str| word.rsplit('/').next().unwrap_or(word).to_owned();
+    if base(program) == "node" {
+        program = words.next()?;
+    }
+    let next = words.next().unwrap_or_default();
+    if matches!(next, "daemon" | "bg-pty-host" | "mcp") {
+        return None;
+    }
+    match base(program).as_str() {
+        "claude" => Some(Host::Claude),
+        "codex" => Some(Host::Codex),
+        _ => None,
+    }
+}
+
+/// The config a process with environment `environ` reads: its provider
+/// variable when absolute, else its own `HOME`'s default. `None` when that
+/// cannot be told (a relative home, no `HOME`).
+fn process_config(host: Host, environ: &[(String, String)]) -> Option<PathBuf> {
+    let get = |key: &str| {
+        environ
+            .iter()
+            .find(|(k, v)| k == key && !v.is_empty())
+            .map(|(_, v)| PathBuf::from(v))
+    };
+    match get(home_var(host)) {
+        Some(home) if home.is_absolute() => {
+            Some(provider_config(host, Some(&home), Path::new("/")))
+        }
+        Some(_) => None,
+        None => {
+            let home = get("HOME").filter(|h| h.is_absolute())?;
+            Some(provider_config(host, None, &home))
+        }
+    }
+}
+
+/// `(host, config file)` for each running provider process of this user, in
+/// one process snapshot. Only the provider variable and `HOME` are read from
+/// each environment; nothing is kept or printed.
+#[cfg(unix)]
+fn live_agent_configs(unchecked: &mut Unchecked) -> Vec<(Host, PathBuf)> {
+    let uid = std::process::Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_owned())
+        .filter(|s| !s.is_empty());
+    let Some(uid) = uid else {
+        return Vec::new();
+    };
+    let Ok(output) = std::process::Command::new("ps")
+        .args(["-U", &uid, "-o", "pid=,args="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    let agents: Vec<(u32, Host)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let (pid, args) = line.trim_start().split_once(char::is_whitespace)?;
+            Some((pid.parse().ok()?, agent_host(args.trim_start())?))
+        })
+        .collect();
+    let pids: Vec<u32> = agents.iter().map(|(pid, _)| *pid).collect();
+    let environs = tend::accounts::processes_environ_raw(&pids);
+    let mut out = Vec::new();
+    for (pid, host) in agents {
+        match environs
+            .get(&pid)
+            .cloned()
+            .flatten()
+            .map(|raw| tend::accounts::parse_environ(&raw))
+            .filter(|environ| !environ.is_empty())
+            .and_then(|environ| process_config(host, &environ))
+        {
+            Some(config) => out.push((host, config)),
+            None => unchecked.processes += 1,
+        }
+    }
+    out
+}
+
+#[cfg(not(unix))]
+fn live_agent_configs(_unchecked: &mut Unchecked) -> Vec<(Host, PathBuf)> {
+    Vec::new()
+}
+
+/// Configured and live homes that are not one of `active`, one entry per
+/// config file, with the number of running agents reading each.
+fn other_homes(
+    active: &[(Host, &'static str, PathBuf)],
+    accounts: Vec<(Host, PathBuf)>,
+    live: Vec<(Host, PathBuf)>,
+) -> Vec<OtherHome> {
+    let active: Vec<PathBuf> = active.iter().map(|(_, _, path)| canonical(path)).collect();
+    let mut out: Vec<OtherHome> = Vec::new();
+    let mut add = |host: Host, config: PathBuf, source: HomeSource, agent: bool| {
+        let key = canonical(&config);
+        if active.contains(&key) {
+            return;
+        }
+        if let Some(seen) = out
+            .iter_mut()
+            .find(|home| home.host == host && canonical(&home.config) == key)
+        {
+            seen.agents += usize::from(agent);
+            return;
+        }
+        out.push(OtherHome {
+            host,
+            config,
+            source,
+            agents: usize::from(agent),
+        });
+    };
+    for (host, config) in accounts {
+        add(host, config, HomeSource::Account, false);
+    }
+    for (host, config) in live {
+        add(host, config, HomeSource::Live, true);
+    }
+    out
+}
+
+/// What is wrong with a home's tend MCP registration, if anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum McpState {
+    Healthy,
+    Missing,
+    Disabled,
+    /// A server named `tend` that runs something else.
+    Conflict,
+    /// The config cannot be read or parsed.
+    Unreadable,
+}
+
+fn mcp_state(host: Host, config: &Path) -> McpState {
+    let text = match fs::read_to_string(config) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return McpState::Missing,
+        Err(_) => return McpState::Unreadable,
+    };
+    match read_server(&text, host) {
+        Err(_) => McpState::Unreadable,
+        Ok(None) => McpState::Missing,
+        Ok(Some(server)) if !is_tend_server(&server) => McpState::Conflict,
+        Ok(Some(server)) if server.get("enabled").and_then(Value::as_bool) == Some(false) => {
+            McpState::Disabled
+        }
+        Ok(Some(_)) => McpState::Healthy,
+    }
+}
+
+/// Other homes whose tend MCP registration is missing or broken. A home the
+/// manifest records is already re-checked by the manifest lines, so it only
+/// shows here when it is broken and processes depend on it.
+fn other_home_gaps(
+    homes: &[OtherHome],
+    recorded: &[PathBuf],
+    unchecked: &Unchecked,
+) -> Vec<(bool, String)> {
+    let recorded: Vec<PathBuf> = recorded.iter().map(|p| canonical(p)).collect();
+    let mut out: Vec<(bool, String)> = homes
+        .iter()
+        .filter_map(|home| {
+            let state = mcp_state(home.host, &home.config);
+            let is_recorded = recorded.contains(&canonical(&home.config));
+            if state == McpState::Healthy || (is_recorded && home.agents == 0) {
+                return None;
+            }
+            let why = match (home.source, home.agents) {
+                (HomeSource::Account, 0) => "a configured account uses it".to_owned(),
+                (_, n) => format!("{n} running provider process(es) read it"),
+            };
+            let (what, fix) = match state {
+                McpState::Missing => (
+                    "has no tend server",
+                    "run `tend init --component agent-mcp --all-homes`",
+                ),
+                McpState::Disabled => (
+                    "has the tend server disabled",
+                    "re-enable it, or run `tend init --component agent-mcp --all-homes`",
+                ),
+                McpState::Conflict => (
+                    "has a `tend` server that does not run `tend mcp`",
+                    "reconcile that entry by hand; tend init leaves it alone",
+                ),
+                McpState::Unreadable => (
+                    "cannot be read or parsed",
+                    "fix the file; tend init skips it",
+                ),
+                McpState::Healthy => unreachable!(),
+            };
+            let restart = if home.agents > 0 && state != McpState::Unreadable {
+                "; running agents load it on their next start"
+            } else {
+                ""
+            };
+            Some((
+                false,
+                format!(
+                    "agent-mcp: {} {what}, and {why}; {fix}{restart}",
+                    home.config.display()
+                ),
+            ))
+        })
+        .collect();
+    if unchecked.accounts > 0 || unchecked.processes > 0 {
+        out.push((
+            true,
+            format!(
+                "agent-mcp: provider homes not checked: {} account(s) set theirs through the shell or an unreadable env_file, {} own provider process(es) had an unreadable environment",
+                unchecked.accounts, unchecked.processes
+            ),
+        ));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -963,12 +1477,14 @@ mod tests {
                     home: dir.path().join("custom codex"),
                     config: dir.path().join("custom codex/config.toml"),
                     skill: dir.path().join(".agents/skills/tend-collaboration"),
+                    mcp_only: false,
                 },
                 HostPaths {
                     host: Host::Claude,
                     home: dir.path().join("custom claude"),
                     config: dir.path().join("custom claude/.claude.json"),
                     skill: dir.path().join("custom claude/skills/tend-collaboration"),
+                    mcp_only: false,
                 },
             ];
             Self { dir, root, hosts }
@@ -1031,6 +1547,465 @@ mod tests {
         assert!(out.lines().count() > 3, "{out}");
         let fresh = write_server("", Host::Claude, Some(&server)).unwrap();
         assert!(fresh.lines().count() > 3, "{fresh}");
+    }
+
+    #[test]
+    fn agent_processes_are_told_apart_from_their_helpers() {
+        assert_eq!(
+            agent_host("/Users/u/.local/bin/claude --resume abc"),
+            Some(Host::Claude)
+        );
+        assert_eq!(agent_host("claude"), Some(Host::Claude));
+        assert_eq!(
+            agent_host("/opt/homebrew/bin/codex --yolo resume x"),
+            Some(Host::Codex)
+        );
+        assert_eq!(
+            agent_host("node /usr/lib/node_modules/@openai/codex/bin/codex"),
+            Some(Host::Codex)
+        );
+        assert_eq!(
+            agent_host("/Users/u/.local/bin/claude daemon run --origin transient"),
+            None
+        );
+        assert_eq!(
+            agent_host("claude bg-pty-host --bg-pty-host /tmp/x.sock"),
+            None
+        );
+        assert_eq!(agent_host("/opt/homebrew/bin/tend mcp"), None);
+        assert_eq!(agent_host("zsh -c claude"), None);
+    }
+
+    #[test]
+    fn other_homes_count_agents_once_per_file_and_skip_the_active_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = dir.path().join("shared claude");
+        fs::create_dir_all(&shared).unwrap();
+        fs::write(shared.join(".claude.json"), "{}").unwrap();
+        // An aas-style profile whose config links to the shared file.
+        let linked = dir.path().join("profile b");
+        fs::create_dir_all(&linked).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(shared.join(".claude.json"), linked.join(".claude.json"))
+            .unwrap();
+        let active_dir = dir.path().join("active");
+        fs::create_dir_all(&active_dir).unwrap();
+        let active = vec![(
+            Host::Claude,
+            "CLAUDE_CONFIG_DIR",
+            active_dir.join(".claude.json"),
+        )];
+        let homes = other_homes(
+            &active,
+            vec![(Host::Claude, shared.join(".claude.json"))],
+            vec![
+                (Host::Claude, shared.join(".claude.json")),
+                (Host::Claude, linked.join(".claude.json")),
+                (Host::Claude, active_dir.join(".claude.json")),
+                (Host::Codex, dir.path().join("codex/config.toml")),
+            ],
+        );
+        assert_eq!(homes.len(), 2, "{homes:?}");
+        assert_eq!(homes[0].config, shared.join(".claude.json"));
+        assert_eq!(homes[0].source, HomeSource::Account);
+        assert_eq!(homes[0].agents, if cfg!(unix) { 2 } else { 1 });
+        assert_eq!(homes[1].host, Host::Codex);
+        assert_eq!(homes[1].agents, 1);
+    }
+
+    #[test]
+    fn other_homes_without_tend_are_reported_with_one_fix() {
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("bare/.claude.json");
+        let wired = dir.path().join("wired/.claude.json");
+        fs::create_dir_all(bare.parent().unwrap()).unwrap();
+        fs::create_dir_all(wired.parent().unwrap()).unwrap();
+        fs::write(&bare, "{}").unwrap();
+        fs::write(
+            &wired,
+            "{\"mcpServers\":{\"tend\":{\"command\":\"tend\",\"args\":[\"mcp\"]}}}",
+        )
+        .unwrap();
+        let account = dir.path().join("account/.claude.json");
+        let homes = vec![
+            OtherHome {
+                host: Host::Claude,
+                config: bare.clone(),
+                source: HomeSource::Live,
+                agents: 14,
+            },
+            OtherHome {
+                host: Host::Claude,
+                config: wired,
+                source: HomeSource::Live,
+                agents: 3,
+            },
+            OtherHome {
+                host: Host::Claude,
+                config: account.clone(),
+                source: HomeSource::Account,
+                agents: 0,
+            },
+        ];
+        let gaps = other_home_gaps(&homes, &[], &Unchecked::default());
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(
+            gaps[0].1.contains(&bare.display().to_string()),
+            "{}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[0]
+                .1
+                .contains("14 running provider process(es) read it"),
+            "{}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[0]
+                .1
+                .contains("`tend init --component agent-mcp --all-homes`"),
+            "{}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[0]
+                .1
+                .ends_with("running agents load it on their next start"),
+            "{}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[1].1.contains("a configured account uses it"),
+            "{}",
+            gaps[1].1
+        );
+        assert!(gaps[1].1.contains(&account.display().to_string()));
+    }
+
+    #[test]
+    fn account_homes_are_read_literally_with_launch_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("acct.env");
+        fs::write(
+            &file,
+            "export CLAUDE_CONFIG_DIR=\"/from/file\"\nCLAUDE_CODE_OAUTH_TOKEN=x\n",
+        )
+        .unwrap();
+        let profile =
+            |env: &[(&str, &str)], env_file: Option<&Path>| tend::accounts::AccountProfile {
+                name: "a".into(),
+                env: env
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+                env_file: env_file.map(|p| p.display().to_string()),
+            };
+        let var = "CLAUDE_CONFIG_DIR";
+        // An explicit entry wins over the sourced file, as at launch.
+        assert_eq!(
+            account_home(&profile(&[(var, "/explicit")], Some(&file)), var),
+            Ok(Some("/explicit".into()))
+        );
+        assert_eq!(
+            account_home(&profile(&[], Some(&file)), var),
+            Ok(Some("/from/file".into()))
+        );
+        // A token-only account inherits the launch environment: no home.
+        assert_eq!(
+            account_home(&profile(&[("CLAUDE_CODE_OAUTH_TOKEN", "t")], None), var),
+            Ok(None)
+        );
+        // Shell-dependent or relative values are not guessed, and nothing is run.
+        assert_eq!(
+            account_home(&profile(&[(var, "$HOME/x")], None), var),
+            Err(())
+        );
+        assert_eq!(
+            account_home(&profile(&[(var, "rel/x")], None), var),
+            Err(())
+        );
+        assert_eq!(
+            account_home(&profile(&[], Some(&dir.path().join("missing.env"))), var),
+            Err(())
+        );
+        let mut n = 0;
+        let mut from = |text: &str| {
+            n += 1;
+            let path = dir.path().join(format!("f{n}.env"));
+            fs::write(&path, text).unwrap();
+            account_home(&profile(&[], Some(&path)), var)
+        };
+        // A trailing comment is not part of the value.
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/a # account home\n"),
+            Ok(Some("/p/a".into()))
+        );
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR='/p/a b' # home\n"),
+            Ok(Some("/p/a b".into()))
+        );
+        // Shell forms this reader does not follow are not guessed.
+        assert_eq!(from("CLAUDE_CONFIG_DIR='/p/a'#x\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR=\"$HOME/p\"\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR=/p/$(whoami)\n"), Err(()));
+        assert_eq!(from("[ -n x ] && CLAUDE_CONFIG_DIR=/p/c\n"), Err(()));
+        // The last assignment wins, and an empty one is not undone by an
+        // earlier value.
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=/p/2\n"),
+            Ok(Some("/p/2".into()))
+        );
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=\n"),
+            Ok(None)
+        );
+        // `KEY= word` is a command, not an assignment.
+        assert_eq!(from("CLAUDE_CONFIG_DIR= /tmp/command\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR= '/tmp/command'\n"), Err(()));
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=   # cleared\n"),
+            Ok(None)
+        );
+        // Control flow decides whether an assignment runs: not followed.
+        assert_eq!(
+            from("if false; then\nCLAUDE_CONFIG_DIR=/tmp/never\nfi\n"),
+            Err(())
+        );
+        assert_eq!(from("f() {\nCLAUDE_CONFIG_DIR=/tmp/never\n}\n"), Err(()));
+        assert_eq!(
+            from("cat <<EOF\nCLAUDE_CONFIG_DIR=/tmp/never\nEOF\n"),
+            Err(())
+        );
+        assert_eq!(from("OTHER=a \\\nCLAUDE_CONFIG_DIR=/tmp/never\n"), Err(()));
+        // Only an unquoted `~/` is the home directory.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=~/acct\n"),
+            Ok(Some(PathBuf::from(format!("{home}/acct"))))
+        );
+        assert_eq!(from("CLAUDE_CONFIG_DIR='~/acct'\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR=\"~/acct\"\n"), Err(()));
+        // An explicit env entry decides even when empty: launch applies it
+        // after sourcing the file.
+        assert_eq!(
+            account_home(&profile(&[(var, "")], Some(&file)), var),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn a_process_config_comes_from_its_own_environment() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect()
+        };
+        assert_eq!(
+            process_config(
+                Host::Claude,
+                &env(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/p/a b")])
+            ),
+            Some(PathBuf::from("/p/a b/.claude.json"))
+        );
+        // Unset: that process's HOME, not doctor's.
+        assert_eq!(
+            process_config(Host::Claude, &env(&[("HOME", "/other")])),
+            Some(PathBuf::from("/other/.claude.json"))
+        );
+        assert_eq!(
+            process_config(Host::Codex, &env(&[("HOME", "/other")])),
+            Some(PathBuf::from("/other/.codex/config.toml"))
+        );
+        // Setting the variable to the default directory is a different file
+        // from leaving it unset.
+        assert_eq!(
+            process_config(
+                Host::Claude,
+                &env(&[("HOME", "/h"), ("CLAUDE_CONFIG_DIR", "/h/.claude")])
+            ),
+            Some(PathBuf::from("/h/.claude/.claude.json"))
+        );
+        assert_eq!(
+            process_config(Host::Claude, &env(&[("CLAUDE_CONFIG_DIR", "rel")])),
+            None
+        );
+        assert_eq!(
+            process_config(Host::Claude, &env(&[("PATH", "/bin")])),
+            None
+        );
+    }
+
+    #[test]
+    fn broken_registrations_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = |name: &str, text: &str| {
+            let path = dir.path().join(name);
+            fs::write(&path, text).unwrap();
+            path
+        };
+        let homes = [
+            (
+                "disabled",
+                file(
+                    "disabled.json",
+                    r#"{"mcpServers":{"tend":{"command":"tend","args":["mcp"],"enabled":false}}}"#,
+                ),
+            ),
+            (
+                "conflict",
+                file(
+                    "conflict.json",
+                    r#"{"mcpServers":{"tend":{"command":"other","args":["serve"]}}}"#,
+                ),
+            ),
+            ("malformed", file("malformed.json", "{not json")),
+            (
+                "healthy",
+                file(
+                    "healthy.json",
+                    r#"{"mcpServers":{"tend":{"command":"/opt/bin/tend","args":["mcp"]}}}"#,
+                ),
+            ),
+        ]
+        .map(|(_, config)| OtherHome {
+            host: Host::Claude,
+            config,
+            source: HomeSource::Live,
+            agents: 1,
+        });
+        let gaps = other_home_gaps(
+            &homes,
+            &[],
+            &Unchecked {
+                accounts: 1,
+                processes: 2,
+            },
+        );
+        assert_eq!(gaps.len(), 4, "{gaps:?}");
+        assert!(gaps[0].1.contains("tend server disabled"), "{}", gaps[0].1);
+        assert!(
+            gaps[1].1.contains("reconcile that entry by hand"),
+            "{}",
+            gaps[1].1
+        );
+        assert!(
+            gaps[2].1.contains("cannot be read or parsed"),
+            "{}",
+            gaps[2].1
+        );
+        assert!(
+            gaps[3].0
+                && gaps[3].1.contains("1 account(s)")
+                && gaps[3].1.contains("2 own provider process(es)"),
+            "{}",
+            gaps[3].1
+        );
+        // A recorded home nobody runs under is left to the manifest lines.
+        let idle = [OtherHome {
+            agents: 0,
+            ..homes[0].clone()
+        }];
+        assert!(
+            other_home_gaps(&idle, &[homes[0].config.clone()], &Unchecked::default()).is_empty()
+        );
+    }
+
+    #[test]
+    fn a_missing_config_under_a_symlinked_home_keeps_one_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        fs::create_dir_all(&real).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, dir.path().join("alias")).unwrap();
+            assert_eq!(
+                canonical(&dir.path().join("alias/sub/.claude.json")),
+                canonical(&real).join("sub/.claude.json")
+            );
+        }
+        assert_eq!(
+            canonical(&real.join(".claude.json")),
+            canonical(&real).join(".claude.json")
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_active_home_with_a_broken_tend_entry_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_string(&Manifest::default()).unwrap(),
+        )
+        .unwrap();
+        let cfg = |name: &str, text: &str| {
+            let path = dir.path().join(name).join(".claude.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            (Host::Claude, "CLAUDE_CONFIG_DIR", path)
+        };
+        let gaps = active_home_gaps(
+            &manifest,
+            vec![
+                cfg(
+                    "disabled",
+                    r#"{"mcpServers":{"tend":{"command":"tend","args":["mcp"],"enabled":false}}}"#,
+                ),
+                cfg("conflict", r#"{"mcpServers":{"tend":{"command":"other"}}}"#),
+                cfg(
+                    "healthy",
+                    r#"{"mcpServers":{"tend":{"command":"tend","args":["mcp"]}}}"#,
+                ),
+            ],
+        );
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(gaps[0].1.contains("tend server disabled"), "{}", gaps[0].1);
+        assert!(
+            gaps[1].1.contains("does not run `tend mcp`"),
+            "{}",
+            gaps[1].1
+        );
+    }
+
+    #[test]
+    fn another_accounts_home_gets_the_mcp_server_only() {
+        let mut f = Fixture::new();
+        let other = f.dir.path().join("profiles/claude-b");
+        fs::create_dir_all(&other).unwrap();
+        fs::write(other.join(".claude.json"), "{\"theme\":\"dark\"}").unwrap();
+        f.hosts.push(HostPaths {
+            host: Host::Claude,
+            home: other.clone(),
+            config: other.join(".claude.json"),
+            skill: other.join(SKILL_DIR),
+            mcp_only: true,
+        });
+        let plan = f.all(Direction::Install);
+        apply::run(&plan, false).unwrap();
+        let text = fs::read_to_string(other.join(".claude.json")).unwrap();
+        assert!(
+            read_server(&text, Host::Claude).unwrap().is_some(),
+            "{text}"
+        );
+        assert!(text.contains("\"theme\""), "{text}");
+        assert!(!other.join(SKILL_DIR).exists());
+        assert!(!other.join("CLAUDE.md").exists());
+        let manifest = load_manifest(&f.root.join("manifest.json")).unwrap();
+        assert!(manifest
+            .records
+            .iter()
+            .any(|r| r.path == other.join(".claude.json")));
+        // Uninstall removes it again, keeping the user's own keys.
+        let undo = f.all(Direction::Uninstall);
+        apply::run(&undo, false).unwrap();
+        let text = fs::read_to_string(other.join(".claude.json")).unwrap();
+        assert!(
+            read_server(&text, Host::Claude).unwrap().is_none(),
+            "{text}"
+        );
+        assert!(text.contains("\"theme\""), "{text}");
     }
 
     #[test]

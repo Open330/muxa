@@ -66,6 +66,12 @@ pub struct Args {
     #[arg(long = "no", value_name = "ID")]
     pub no: Vec<String>,
 
+    /// With `agent-mcp`, also register the tend MCP server in every
+    /// provider home a running agent reads (`CLAUDE_CONFIG_DIR`,
+    /// `CODEX_HOME`), not just the active one and the configured accounts'.
+    #[arg(long)]
+    pub all_homes: bool,
+
     /// After applying, start `tendd` if it isn't already running.
     /// Default on — this is what makes the wizard "leave the system
     /// in a working state" on hosts where no service-manager component
@@ -119,7 +125,13 @@ pub(crate) async fn run_for_start(
         Direction::Install
     };
     let mut plan = plan::build(direction, &chosen, &detect, &socket)?;
-    integration::extend_plan(&mut plan, &detect, config_path.as_deref(), &socket)?;
+    integration::extend_plan(
+        &mut plan,
+        &detect,
+        config_path.as_deref(),
+        &socket,
+        args.all_homes,
+    )?;
     plan::extend_automation(&mut plan, config_path.as_deref())?;
     if matches!(direction, Direction::Install) && args.start_daemon && !manages_daemon(&chosen) {
         // Append last so disk edits + service enablement happen first;

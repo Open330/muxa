@@ -353,6 +353,93 @@ pub fn process_environ_raw(pid: u32) -> Option<Vec<u8>> {
     ))
 }
 
+/// [`process_environ_raw`] for many processes in one pass: one `/proc`
+/// read each on Linux; elsewhere one sysinfo refresh and at most one `ps`
+/// run for all of them, instead of one per process. `None` for a process
+/// whose environment could not be read.
+#[cfg(target_os = "linux")]
+#[must_use]
+pub fn processes_environ_raw(pids: &[u32]) -> std::collections::HashMap<u32, Option<Vec<u8>>> {
+    pids.iter()
+        .map(|pid| (*pid, process_environ_raw(*pid)))
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+#[must_use]
+pub fn processes_environ_raw(pids: &[u32]) -> std::collections::HashMap<u32, Option<Vec<u8>>> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let mut out = std::collections::HashMap::new();
+    if pids.is_empty() {
+        return out;
+    }
+    let sys_pids: Vec<Pid> = pids.iter().map(|pid| Pid::from_u32(*pid)).collect();
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&sys_pids),
+        true,
+        ProcessRefreshKind::nothing()
+            .with_cmd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
+    );
+    let mut argvs = std::collections::HashMap::new();
+    for pid in pids {
+        let Some(process) = system.process(Pid::from_u32(*pid)) else {
+            out.insert(*pid, None);
+            continue;
+        };
+        if !process.environ().is_empty() {
+            let raw = process
+                .environ()
+                .iter()
+                .flat_map(|entry| entry.as_encoded_bytes().iter().copied().chain([0]))
+                .collect();
+            out.insert(*pid, Some(raw));
+            continue;
+        }
+        let argv: Vec<String> = process
+            .cmd()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        if cfg!(windows) || argv.is_empty() {
+            out.insert(*pid, None);
+        } else {
+            argvs.insert(*pid, argv.join(" "));
+        }
+    }
+    if argvs.is_empty() {
+        return out;
+    }
+    let list = argvs
+        .keys()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let lines = std::process::Command::new("ps")
+        .args(["eww", "-o", "pid=,command=", "-p", &list])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    for line in lines.lines() {
+        let line = line.trim_start();
+        let Some((pid, command)) = line.split_once(' ') else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            continue;
+        };
+        if let Some(argv) = argvs.remove(&pid) {
+            out.insert(pid, Some(environ_from_ps_line(command.trim_start(), &argv)));
+        }
+    }
+    for pid in argvs.into_keys() {
+        out.insert(pid, None);
+    }
+    out
+}
+
 /// The environment half of a `ps eww` line, as `NUL`-separated entries.
 /// `ps` prints argv, then every `KEY=VALUE`, all joined by spaces: an entry
 /// starts at a word shaped like `KEY=`, and other words belong to the
@@ -568,6 +655,52 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert_eq!(found.as_deref(), Some("/x/Application Support/y"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn many_running_process_environments_are_read_in_one_pass() {
+        let spawn = |value: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "accounts::tests::environ_probe_child",
+                ])
+                .env("TEND_ACCOUNT_PROBE", value)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut children = [spawn("/a/Application Support/one"), spawn("/b/two words")];
+        let pids: Vec<u32> = children.iter().map(std::process::Child::id).collect();
+        let gone = u32::MAX - 7;
+        let probe = |environs: &std::collections::HashMap<u32, Option<Vec<u8>>>, pid: u32| {
+            environs
+                .get(&pid)
+                .cloned()
+                .flatten()
+                .map(|raw| parse_environ(&raw))
+                .and_then(|env| env.into_iter().find(|(k, _)| k == "TEND_ACCOUNT_PROBE"))
+                .map(|(_, v)| v)
+        };
+        let mut seen = (None, None);
+        for _ in 0..100 {
+            let environs = processes_environ_raw(&[pids[0], pids[1], gone]);
+            assert_eq!(environs.get(&gone), Some(&None));
+            seen = (probe(&environs, pids[0]), probe(&environs, pids[1]));
+            if seen.0.is_some() && seen.1.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(seen.0.as_deref(), Some("/a/Application Support/one"));
+        assert_eq!(seen.1.as_deref(), Some("/b/two words"));
     }
 
     #[cfg(not(target_os = "linux"))]
