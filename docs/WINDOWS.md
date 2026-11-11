@@ -78,6 +78,14 @@ real client:
   prompt, reconnect, daemon restart, revocation — through
   `scripts/dashboard-sharing-smoke.py` on a private rmux label.
 - `tend restore --boot` from a logon task, into a stopped server.
+- `tend sidebar show` on a private rmux label: the sidebar opens, and its
+  `after-new-window`, `after-select-window` and `after-resize-pane` hooks
+  give a new or newly selected window its sidebar and turn a native zoom
+  into the focus layout. rmux 0.10.0 accepts every hook the sidebar sets
+  (`after-select-window`, `after-new-window`, `client-session-changed`,
+  `after-resize-pane`, `after-select-pane`, each with the `[9105]` index)
+  and lists them in `show-hooks -g`. `client-session-changed` and the
+  prefix `z`/`e` keys need an attached client and were not driven.
 
 ### Known gaps
 
@@ -95,6 +103,22 @@ real client:
   executable but allows renaming one.
 - Re-exec on upgrade spawns a successor and exits instead of `exec`ing in
   place, so the daemon's pid changes.
+- **Configured accounts** (`[[accounts.claude]]`, `[[accounts.codex]]`) are
+  refused: launching and relaunching through one builds an `env K=V …`
+  prefix for `sh` (`account_route.rs`, `account_swap.rs`
+  `profile_relaunch_line`). Accounts reached through `aas` are unaffected.
+- **`tend init --all-homes`** finds no running agents' homes: the scan of
+  live agents' `CLAUDE_CONFIG_DIR`/`CODEX_HOME` reads `ps` and is Unix-only,
+  so only the active home and configured accounts' homes get the MCP server.
+- **Stale `tend mcp` detection** cannot read which binary a running server
+  was started from (`lsof` on Unix), so it judges staleness by start time
+  against the installed binary alone.
+- **`tend mcp` does not follow upgrades**: on Unix it re-executes itself when
+  its binary is replaced; on Windows it keeps the old build until the agent
+  restarts it.
+- **Claude's folder-trust prompt** after a relaunch or swap is now parsed for
+  a drive or UNC path, but what Claude prints there on Windows has not been
+  captured; until it has, expect to answer that prompt by hand.
 
 ## Use WSL2
 
@@ -192,6 +216,13 @@ form all go through it. `tend::shell` also names programs without their path
 or `.exe`/`.cmd`, recognises `pwsh`/`powershell`/`cmd` as shells, runs scripts
 (`work up`'s `prepare`, the status-line `--forward`) through PowerShell, and
 finds npm's `.cmd` shims, which `Command::new` alone does not.
+
+A shell line nested inside a multiplexer command — the sidebar's
+`if-shell … 'run-shell -b …'` hooks — is quoted twice, each time for the
+parser that reads it: `Dialect` for the shell, `tend::shell::mux_quote` for
+tmux/rmux. Quoting both layers in `PowerShell`'s dialect lost one: rmux reads
+`'a''b'` as `ab`, and stored the hook as `run-shell -b & C:\…\tend.exe …`,
+so new windows never got a sidebar.
 
 ### 5. Unix process management — resolved
 
