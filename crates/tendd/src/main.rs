@@ -240,6 +240,13 @@ async fn run() -> Result<()> {
         .or(cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
     tracing::info!(socket = %socket.display(), "starting tendd");
+    // A second daemon used to load the registry, start its snapshotter and
+    // notifiers and heal tmux before its bind failed, then exit — and a
+    // KeepAlive service manager restarted it every ten seconds for as long
+    // as the other daemon lived, each pass rewriting state.json from its
+    // own near-empty registry. Wait as a standby instead, touching nothing,
+    // and start once the endpoint is free.
+    wait_while_another_daemon_serves(&socket).await;
 
     // Construct the shutdown broadcast up-front so every background task
     // we spawn below can subscribe and exit cleanly. The signal handler
@@ -641,6 +648,27 @@ async fn run() -> Result<()> {
     }
     Ok(())
 }
+
+/// Block, doing nothing else, while another live daemon serves `socket`.
+/// A restart drains its endpoint before re-executing, so a successor never
+/// waits on its predecessor.
+async fn wait_while_another_daemon_serves(socket: &Path) {
+    if !tend::transport::endpoint_is_live(socket) {
+        return;
+    }
+    tracing::warn!(
+        socket = %socket.display(),
+        "another tendd is already serving this socket; waiting as a standby without \
+         loading state, and starting when it exits"
+    );
+    while tend::transport::endpoint_is_live(socket) {
+        tokio::time::sleep(STANDBY_POLL).await;
+    }
+    tracing::info!(socket = %socket.display(), "the other tendd exited; starting");
+}
+
+/// How often a standby daemon checks whether the serving one is gone.
+const STANDBY_POLL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Image generation advertised in IPC `hello`: zero on a fresh process and
 /// incremented for each successful self-reexec.

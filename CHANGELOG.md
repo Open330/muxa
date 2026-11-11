@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A second `tendd` started while one already serves the socket (for example
+  launchd's copy next to one started by hand) now waits as a standby and
+  starts when the other exits. Before, it loaded the registry, ran its
+  notifiers and snapshotter, then failed to bind and exited, and launchd
+  restarted it every ten seconds: one host logged 550 such restarts in 90
+  minutes, each rewriting `state.json` from a near-empty registry.
+
 - `scripts/migrate-from-muxa.py` now renames MCP tool names left in prompt
   templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,
   `mcp__muxa__muxa_status` → `mcp__tend__tend_status`). Before, a migrated
