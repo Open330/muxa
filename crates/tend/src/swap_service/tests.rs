@@ -219,6 +219,7 @@ impl TargetGuard for FakeGuard {
 struct FakeProvider {
     config_path: Option<PathBuf>,
     config: Mutex<SwapConfig>,
+    agents: Mutex<Vec<Agent>>,
     acquired: Mutex<Vec<String>>,
     /// Holds every guard acquisition until opened, when set.
     guard_gate: Mutex<Option<Arc<Gate>>>,
@@ -228,7 +229,7 @@ impl ContextProvider for FakeProvider {
     fn snapshot(&self) -> Result<Snapshot, String> {
         Ok(Snapshot {
             node_id: "node-1".into(),
-            agents: Vec::new(),
+            agents: self.agents.lock().unwrap().clone(),
             backends: Vec::new(),
             config: self.config.lock().unwrap().clone(),
             accounts: crate::accounts::AccountsConfig::default(),
@@ -276,6 +277,7 @@ fn harness(script: Script) -> Harness {
     std::fs::write(&config_path, "").unwrap();
     let provider = Arc::new(FakeProvider {
         config_path: Some(config_path),
+        agents: Mutex::new(Vec::new()),
         config: Mutex::new(SwapConfig::default()),
         acquired: Mutex::new(Vec::new()),
         guard_gate: Mutex::new(None),
@@ -697,6 +699,7 @@ fn one_live_manager_holds_the_store_until_it_is_gone() {
     let provider = || {
         Arc::new(FakeProvider {
             config_path: None,
+            agents: Mutex::new(Vec::new()),
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
             guard_gate: Mutex::new(None),
@@ -850,6 +853,7 @@ fn an_executor_that_cannot_start_ends_the_job_without_effects() {
         },
         Arc::new(FakeProvider {
             config_path: None,
+            agents: Mutex::new(Vec::new()),
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
             guard_gate: Mutex::new(None),
@@ -913,6 +917,7 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
     let provider = || {
         Arc::new(FakeProvider {
             config_path: None,
+            agents: Mutex::new(Vec::new()),
             config: Mutex::new(SwapConfig::default()),
             acquired: Mutex::new(Vec::new()),
             guard_gate: Mutex::new(None),
@@ -1003,6 +1008,18 @@ fn a_direct_pane_is_refused_publicly_and_kept_for_automation() {
             conversation_id: "conv-%1".into(),
         }]
     );
+    let waiting = h
+        .service
+        .plan(
+            &SwapOverrides {
+                when_idle: true,
+                ..overrides(&["%1"])
+            },
+            Origin::Public,
+        )
+        .unwrap();
+    assert!(waiting.direct_targets.is_empty());
+    assert!(waiting.outcomes[0].note.contains("runs its agent directly"));
     let shell = harness(Box::new(|| vec![run("%2")]));
     assert!(shell
         .service
@@ -1889,4 +1906,151 @@ fn the_service_prunes_old_evidence_as_upkeep() {
         "{health:?}"
     );
     assert!(health.fault.is_none());
+}
+
+fn test_agent(pane: &str, sid: &str, kind: AgentKind, state: crate::event::AgentState) -> Agent {
+    let at = time::macros::datetime!(2026-10-15 12:00:00 UTC);
+    Agent {
+        ask_origin: None,
+        tmux_socket: None,
+        tmux_session: None,
+        kind,
+        session_id: sid.into(),
+        surface: None,
+        pid: None,
+        workload: crate::WorkloadSummary::default(),
+        subagents: Vec::new(),
+        pane: Some(pane.into()),
+        cwd: None,
+        state,
+        last_prompt: None,
+        last_prompt_at: None,
+        last_response: None,
+        recap: None,
+        ai_title: None,
+        pending_command: None,
+        last_notification: None,
+        model: None,
+        context_used_pct: None,
+        cost_usd: None,
+        rate_limit_5h_pct: None,
+        rate_limit_5h_resets_at: None,
+        rate_limit_7d_pct: None,
+        rate_limit_7d_resets_at: None,
+        rate_limited_until: None,
+        rate_limit_scope: None,
+        rate_limit_source: None,
+        started_at: at,
+        last_activity_at: at,
+        state_entered_at: at,
+        last_prompt_origin: None,
+        last_response_at: None,
+    }
+}
+
+fn waiting_agent(pane: &str, busy: bool) -> Agent {
+    let mut agent = test_agent(
+        pane,
+        &format!("conv-{pane}"),
+        AgentKind::ClaudeCode,
+        crate::event::AgentState::Idle,
+    );
+    agent.pane = Some(pane.into());
+    agent.tmux_socket = Some("/tmp/tmux-1/default".into());
+    agent.state = if busy {
+        crate::event::AgentState::Working
+    } else {
+        crate::event::AgentState::Idle
+    };
+    agent.last_activity_at = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
+    agent
+}
+
+#[test]
+fn pending_targets_rotate_then_use_fresh_idle_state() {
+    let h = harness(Box::new(|| vec![run("%1"), run("%2")]));
+    *h.provider.agents.lock().unwrap() =
+        vec![waiting_agent("%1", true), waiting_agent("%2", false)];
+    let request = SwapOverrides {
+        when_idle: true,
+        ..overrides(&["%1", "%2"])
+    };
+    let accepted = Service::submit(&h.service, "idle", &request, Origin::Public, None).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.executed.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(*h.executed.lock().unwrap(), vec!["%2"]);
+    let view = h
+        .service
+        .status(&JobRef::Id(accepted.job_id.clone()))
+        .unwrap();
+    assert!(view.entries[0].disposition.is_none());
+    assert_eq!(view.state, "running");
+    h.provider.agents.lock().unwrap()[0] = waiting_agent("%1", false);
+    let view = settled(&h.service, &accepted.job_id);
+    assert_eq!(view.state, "done");
+    assert_eq!(*h.executed.lock().unwrap(), vec!["%2", "%1"]);
+}
+
+#[test]
+fn idle_timeout_reports_without_executing() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    *h.provider.agents.lock().unwrap() = vec![waiting_agent("%1", true)];
+    let request = SwapOverrides {
+        when_idle: true,
+        idle_timeout: Some("0".into()),
+        ..overrides(&["%1"])
+    };
+    let accepted = Service::submit(&h.service, "timeout", &request, Origin::Public, None).unwrap();
+    let view = settled(&h.service, &accepted.job_id);
+    assert_eq!(view.state, "done");
+    assert!(h.executed.lock().unwrap().is_empty());
+    assert!(view.entries[0]
+        .outcome
+        .as_ref()
+        .unwrap()
+        .note
+        .contains("idle timeout"));
+    assert_eq!(view.entries[0].reason.as_deref(), Some("idle_timeout"));
+    // The reason survives without the in-memory outcome text.
+    h.service.live.lock().unwrap().clear();
+    let durable = h.service.status(&JobRef::Id(accepted.job_id)).unwrap();
+    assert_eq!(durable.entries[0].reason.as_deref(), Some("idle_timeout"));
+}
+
+#[test]
+fn cancelling_idle_wait_releases_target_without_executing() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    *h.provider.agents.lock().unwrap() = vec![waiting_agent("%1", true)];
+    let request = SwapOverrides {
+        when_idle: true,
+        ..overrides(&["%1"])
+    };
+    let accepted =
+        Service::submit(&h.service, "cancel-idle", &request, Origin::Public, None).unwrap();
+    h.service
+        .cancel(&JobRef::Id(accepted.job_id.clone()))
+        .unwrap();
+    let view = settled(&h.service, &accepted.job_id);
+    assert!(view.cancel_requested);
+    assert!(h.executed.lock().unwrap().is_empty());
+    assert_eq!(view.entries[0].disposition.as_deref(), Some("skipped"));
+    assert_eq!(view.entries[0].reason.as_deref(), Some("cancelled"));
+}
+
+#[test]
+fn force_takes_precedence_over_idle_wait() {
+    let h = harness(Box::new(|| vec![run("%1")]));
+    *h.provider.agents.lock().unwrap() = vec![waiting_agent("%1", true)];
+    let request = SwapOverrides {
+        when_idle: true,
+        force: true,
+        ..overrides(&["%1"])
+    };
+    let accepted =
+        Service::submit(&h.service, "force-idle", &request, Origin::Public, None).unwrap();
+    let view = settled(&h.service, &accepted.job_id);
+    assert_eq!(view.entries[0].disposition.as_deref(), Some("swapped"));
 }

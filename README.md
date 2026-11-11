@@ -123,7 +123,7 @@ See [Direction](docs/DIRECTION.md).
 | `tend timeline` | Full-screen TUI timeline of agent work, waiting, errors, human interaction, and tmux foreground time. |
 | `tend stats activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | `tend automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
-| `tend swap` | Move agents onto another account (configured accounts, or the optional `aas` provider) and resume them in place — the rate-limited ones, named panes, or all. See [docs/ACCOUNT_SWAP.md](docs/ACCOUNT_SWAP.md). |
+| `tend swap` | Restart agents on their own accounts with `--all --to same --when-idle`, or move agents onto another account (configured accounts, or the optional `aas` provider) and resume them in place — the rate-limited ones, named panes, or all. See [docs/ACCOUNT_SWAP.md](docs/ACCOUNT_SWAP.md). |
 | BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Tend for Mac | Native workbench for Work, Explore, Inbox, Ask, Shells, and Files, with a libghostty terminal and notifications; native PTYs remain owned by `tendd`. |
 | Dashboard | Optional loopback HTTP UI with live updates, timeline, collaboration graphs, and [OIDC pane/window sharing](docs/DASHBOARD.md#invite-someone-to-a-pane) with view or prompt permissions. |

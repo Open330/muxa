@@ -49,6 +49,10 @@ pub struct SwapOverrides {
     pub to: Option<String>,
     pub spread: bool,
     pub force: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub when_idle: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idle_timeout: Option<String>,
     pub bare: Option<String>,
     pub continue_text: Option<String>,
     pub continue_when: Option<String>,
@@ -88,6 +92,12 @@ impl SwapOverrides {
             AccountChoice::parse(self.to.as_deref().unwrap_or("auto"))
         };
         request.force = self.force;
+        request.when_idle = self.when_idle;
+        if let Some(timeout) = &self.idle_timeout {
+            request.idle_timeout = crate::automation::parse_duration(timeout)?
+                .try_into()
+                .map_err(|_| "idle_timeout must be nonnegative")?;
+        }
         request.bare = match self.bare.as_deref() {
             None => request.bare,
             Some("skip") => BareMode::Skip,
@@ -124,6 +134,15 @@ impl SwapOverrides {
     /// Refuse the combinations the CLI refuses, whoever the caller is: none
     /// of them is given a silent winner.
     pub fn validate(&self) -> Result<(), String> {
+        if self.idle_timeout.is_some() && !self.when_idle {
+            return Err("idle_timeout requires when_idle".into());
+        }
+        if let Some(timeout) = &self.idle_timeout {
+            if timeout.len() > MAX_NAME {
+                return Err("idle_timeout is too long".into());
+            }
+            crate::automation::parse_duration(timeout)?;
+        }
         let conflict = |a: &str, b: &str| Err(format!("{a} and {b} cannot be combined"));
         if !self.targets.is_empty() && self.all {
             return conflict("targets", "all");
@@ -476,6 +495,7 @@ pub(crate) trait Engine: Send + Sync + 'static {
         snapshot: &Snapshot,
     ) -> (SwapRequest, Vec<EngineStep<Self::Target>>);
     fn identity(&self, target: &Self::Target) -> TargetIdentity;
+    fn refresh_agent(&self, _target: &mut Self::Target, _agent: &Agent) {}
     /// Plan one target of a retry, as its parent planned it.
     fn prepare_retry(
         &self,
@@ -527,6 +547,10 @@ impl Engine for RealEngine {
 
     fn identity(&self, target: &Self::Target) -> TargetIdentity {
         target.identity()
+    }
+
+    fn refresh_agent(&self, target: &mut Self::Target, agent: &Agent) {
+        target.refresh_agent(agent);
     }
 
     fn prepare_retry(
@@ -629,6 +653,14 @@ impl Engine for DaemonEngine {
             DaemonTarget::Real(target) => target.identity(),
             #[cfg(feature = "test-support")]
             DaemonTarget::Inert(identity) => identity.clone(),
+        }
+    }
+
+    fn refresh_agent(&self, target: &mut Self::Target, agent: &Agent) {
+        match (self, target) {
+            (Self::Real(engine), DaemonTarget::Real(target)) => engine.refresh_agent(target, agent),
+            #[cfg(feature = "test-support")]
+            _ => {}
         }
     }
 
@@ -1355,7 +1387,9 @@ impl<E: Engine> Service<E> {
                     let identity = self.engine.identity(&target);
                     match refusal(&identity, origin) {
                         Some((code, note)) => {
-                            if code == DIRECT_PANE_UNSUPPORTED {
+                            if code == DIRECT_PANE_UNSUPPORTED
+                                && (!resolved.when_idle || resolved.force)
+                            {
                                 direct_targets.push(account_swap::DirectTarget {
                                     pane: identity.pane.clone(),
                                     socket: identity.socket.clone(),
@@ -1844,8 +1878,9 @@ impl<E: Engine> Service<E> {
         Ok(())
     }
 
-    /// Run a job's targets in order, halting the whole job on the first
-    /// failure to record.
+    /// Run targets in report order, rotating busy targets while waiting for idle.
+    /// Halt the whole job on the first failure to record.
+    #[allow(clippy::too_many_lines)] // boundaries, idle waiting, execution and journalling in order
     fn run(
         &self,
         job: &str,
@@ -1855,7 +1890,10 @@ impl<E: Engine> Service<E> {
         still_due: Option<&StillDue>,
     ) {
         let mut adopted = adopted;
-        for (target_id, (report_index, identity, target)) in runs.into_iter().enumerate() {
+        let began = std::time::Instant::now();
+        let mut pending: std::collections::VecDeque<_> = runs.into_iter().enumerate().collect();
+        let mut next_poll = std::time::Instant::now();
+        while let Some((target_id, (report_index, identity, mut target))) = pending.pop_front() {
             let target_id = u32::try_from(target_id).unwrap_or(u32::MAX);
             if self.fault().is_some() {
                 // Halted: later targets are never reached, their pane stays
@@ -1880,7 +1918,7 @@ impl<E: Engine> Service<E> {
                         .acquire_guard(&identity.pane, identity.socket.as_deref())
                 }
             };
-            let _guard = match held {
+            let guard = match held {
                 Ok(guard) => guard,
                 Err(why) => {
                     self.settle(
@@ -1895,6 +1933,63 @@ impl<E: Engine> Service<E> {
                     continue;
                 }
             };
+            if request.when_idle && !request.force {
+                let fresh = self.provider.snapshot().and_then(|snapshot| {
+                    snapshot
+                        .agents
+                        .into_iter()
+                        .find(|agent| {
+                            agent.session_id == identity.conversation_id
+                                && agent.pane.as_deref() == Some(&identity.pane)
+                                && agent.tmux_socket.as_deref().is_none_or(|socket| {
+                                    account_swap::endpoint_key(&identity.pane, Some(socket))
+                                        == identity.endpoint
+                                })
+                        })
+                        .ok_or_else(|| {
+                            "planned agent is no longer registered on its endpoint; left alone"
+                                .into()
+                        })
+                });
+                match fresh {
+                    Ok(agent) if account_swap::waiting_for_idle(&agent) => {
+                        if began.elapsed() >= request.idle_timeout {
+                            self.timed_out(job, target_id, report_index, &identity);
+                        } else {
+                            drop(guard);
+                            pending
+                                .push_back((target_id as usize, (report_index, identity, target)));
+                            // Rotate the queue, so a busy target never blocks ready targets.
+                            // Bound CPU use and cancellation latency to one second per round.
+                            if pending
+                                .front()
+                                .is_some_and(|(id, _)| *id <= target_id as usize)
+                            {
+                                let now = std::time::Instant::now();
+                                if now < next_poll {
+                                    std::thread::sleep(next_poll - now);
+                                }
+                                next_poll =
+                                    std::time::Instant::now() + std::time::Duration::from_secs(1);
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(agent) => self.engine.refresh_agent(&mut target, &agent),
+                    Err(why) => {
+                        self.settle(
+                            job,
+                            target_id,
+                            report_index,
+                            &identity,
+                            Disposition::Skipped,
+                            None,
+                            &why,
+                        );
+                        continue;
+                    }
+                }
+            }
             // The pane is held: the last moment a stale automation firing
             // can still step back, with nothing done.
             if let Some(Err(why)) = still_due.map(|check| check()) {
@@ -1961,6 +2056,29 @@ impl<E: Engine> Service<E> {
                 self.set_fault(format!("job {job}: could not record its end: {error}"));
             }
         }
+    }
+
+    fn timed_out(&self, job: &str, target_id: u32, report_index: usize, identity: &TargetIdentity) {
+        if let Err(error) = self.store.finish_target_with_reason(
+            &self.lease,
+            job,
+            target_id,
+            1,
+            Disposition::Skipped,
+            Some("idle_timeout"),
+        ) {
+            self.set_fault(format!("job {job}: could not record idle timeout: {error}"));
+            return;
+        }
+        self.remember(
+            job,
+            report_index,
+            skipped_outcome(
+                identity,
+                "idle timeout; target still pending; nothing was done",
+            ),
+        );
+        self.release(&identity.endpoint);
     }
 
     /// One target boundary; `None` (the service now halted) if it could not

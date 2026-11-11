@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tend swap --all --to same --when-idle` restarts each agent in place on
+  its identified current account after it becomes idle, for example to pick
+  up upgraded hooks and MCP configuration. Busy targets remain pending in
+  daemon jobs for up to `--idle-timeout` (default `6h`); status shows pending
+  targets and cancellation stops waiting. Unknown accounts are skipped,
+  bare launches stay bare, and `--force` still stops mid-turn immediately.
+  Available through `tend_swap_account` and Fleet `--host` as well.
+
 ### Fixed
 
 - A second `tendd` started while one already serves the socket (for example
