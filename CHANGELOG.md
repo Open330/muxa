@@ -38,6 +38,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it for untracked panes. Registered legacy rows without a socket retain their
   previous backend-default behavior. (#413)
 
+- Workspace snapshots now keep a Claude or Codex agent’s environment-selected
+  account home, so restore and reload resume it on the same account. Only
+  `CLAUDE_CONFIG_DIR` or `CODEX_HOME` is saved; explicit account wrappers
+  keep their selection. Older snapshots remain readable.
 - `scripts/migrate-from-muxa.py` now renames MCP tool names left in prompt
   templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,
   `mcp__muxa__muxa_status` → `mcp__tend__tend_status`). Before, a migrated

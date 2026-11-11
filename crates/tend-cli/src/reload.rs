@@ -30,6 +30,7 @@ mod launch;
 mod plan;
 #[cfg(not(target_os = "linux"))]
 mod process;
+mod provider_home;
 mod store;
 
 use plan::RestoreReport;
@@ -315,6 +316,9 @@ struct PaneShape {
     /// joined line, and in snapshots taken before this field existed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     argv: Option<Vec<String>>,
+    /// Only the provider home selected in the agent process environment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    provider_home: Option<provider_home::ProviderHome>,
     /// False when the process rewrote its argv into a status line, which
     /// reads like a command and is not one.
     #[serde(default)]
@@ -925,14 +929,23 @@ async fn capture(client: &Client, endpoint: &BackendEndpoint) -> Result<Snapshot
             agent: agent::reconcile(recorded, argv.as_deref()),
             command,
             argv,
+            provider_home: None,
             marks,
         });
         pane_pids.push(process);
     }
     #[cfg(not(target_os = "linux"))]
-    recover_codex_threads(&mut shapes, &pane_pids, &processes);
+    let find_agent = |pid| processes.provider_process(pid);
     #[cfg(target_os = "linux")]
-    let _ = pane_pids;
+    let find_agent = provider_home::provider_process;
+    provider_home::capture(
+        &mut shapes,
+        &pane_pids,
+        find_agent,
+        tend::accounts::processes_environ_raw,
+    );
+    #[cfg(not(target_os = "linux"))]
+    recover_codex_threads(&mut shapes, &pane_pids, &processes);
 
     Ok(Snapshot {
         version: SNAPSHOT_VERSION,
@@ -1975,6 +1988,11 @@ fn resume_hint(pane: &PaneShape) -> Option<String> {
 /// conversation id spliced in when tend knows one and the command does not
 /// already carry it.
 fn relaunch_command(pane: &PaneShape) -> Option<String> {
+    let command = relaunch_command_without_home(pane)?;
+    Some(provider_home::relaunch(pane, command))
+}
+
+fn relaunch_command_without_home(pane: &PaneShape) -> Option<String> {
     if starts_with_instruction(pane)
         && pane
             .agent
@@ -2661,7 +2679,12 @@ mod tests {
         }
     }
 
-    fn pane(session: &str, window: &str, index: &str, command: Option<&str>) -> PaneShape {
+    pub(super) fn pane(
+        session: &str,
+        window: &str,
+        index: &str,
+        command: Option<&str>,
+    ) -> PaneShape {
         PaneShape {
             marks: Vec::new(),
             session: session.into(),
@@ -2671,6 +2694,7 @@ mod tests {
             replayable: command.is_some_and(is_replayable),
             command: command.map(str::to_owned),
             argv: None,
+            provider_home: None,
             agent: None,
         }
     }
