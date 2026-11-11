@@ -166,6 +166,7 @@ mod tests {
                 path: "/tmp".into(),
                 command: Some("claude".into()),
                 argv: None,
+                provider_home: None,
                 replayable: true,
                 agent: Some(AgentShape {
                     kind: "claude_code".into(),
