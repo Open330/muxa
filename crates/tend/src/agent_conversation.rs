@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 /// A session file is a few hundred bytes; anything larger is not one.
 const MAX_SESSION_FILE: u64 = 64 * 1024;
 /// Only `CLAUDE_CONFIG_DIR` is wanted out of a process environment.
+#[cfg(target_os = "linux")]
 const MAX_ENVIRON: u64 = 1024 * 1024;
 
 /// One `<config dir>/sessions/<pid>.json`, as far as identity goes.

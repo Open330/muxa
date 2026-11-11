@@ -156,6 +156,11 @@ fn scan(agents: &AgentsView, limit: Option<usize>, deadline: Instant) -> Listene
         attribution: Coverage::Complete,
         observed_at,
     };
+    if cfg!(windows) {
+        return empty(Coverage::Unavailable {
+            reason: "listening servers are not listed on Windows yet".into(),
+        });
+    }
     let Some(me) = own_uid() else {
         return empty(Coverage::Unavailable {
             reason: "could not tell which user this is".into(),
@@ -532,7 +537,7 @@ fn own_uid() -> Option<u32> {
     std::fs::metadata("/proc/self").ok().map(|meta| meta.uid())
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn own_uid() -> Option<u32> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let pid = sysinfo::get_current_pid().ok()?;
@@ -543,6 +548,23 @@ fn own_uid() -> Option<u32> {
         ProcessRefreshKind::nothing().with_user(UpdateKind::Always),
     );
     system.process(pid)?.user_id().map(|uid| **uid)
+}
+
+/// Windows has no numeric uid (sysinfo reports a SID) and no listener
+/// source here yet; `scan` reports the inventory unavailable before asking.
+#[cfg(windows)]
+fn own_uid() -> Option<u32> {
+    None
+}
+
+#[cfg(all(not(target_os = "linux"), unix))]
+fn process_uid(process: &sysinfo::Process) -> Option<u32> {
+    process.user_id().map(|uid| **uid)
+}
+
+#[cfg(windows)]
+fn process_uid(_process: &sysinfo::Process) -> Option<u32> {
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -609,7 +631,7 @@ fn process_table() -> Option<HashMap<u32, Proc>> {
                 pid.as_u32(),
                 Proc {
                     ppid: process.parent().map_or(0, sysinfo::Pid::as_u32),
-                    uid: process.user_id().map(|uid| **uid),
+                    uid: process_uid(process),
                     start: started.map(|s| format!("epoch:{s}")),
                     started_at: started,
                     name: process.name().to_string_lossy().into_owned(),
