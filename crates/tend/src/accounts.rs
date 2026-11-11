@@ -657,6 +657,52 @@ mod tests {
         assert_eq!(found.as_deref(), Some("/x/Application Support/y"));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn many_running_process_environments_are_read_in_one_pass() {
+        let spawn = |value: &str| {
+            std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--ignored",
+                    "--exact",
+                    "accounts::tests::environ_probe_child",
+                ])
+                .env("TEND_ACCOUNT_PROBE", value)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut children = [spawn("/a/Application Support/one"), spawn("/b/two words")];
+        let pids: Vec<u32> = children.iter().map(std::process::Child::id).collect();
+        let gone = u32::MAX - 7;
+        let probe = |environs: &std::collections::HashMap<u32, Option<Vec<u8>>>, pid: u32| {
+            environs
+                .get(&pid)
+                .cloned()
+                .flatten()
+                .map(|raw| parse_environ(&raw))
+                .and_then(|env| env.into_iter().find(|(k, _)| k == "TEND_ACCOUNT_PROBE"))
+                .map(|(_, v)| v)
+        };
+        let mut seen = (None, None);
+        for _ in 0..100 {
+            let environs = processes_environ_raw(&[pids[0], pids[1], gone]);
+            assert_eq!(environs.get(&gone), Some(&None));
+            seen = (probe(&environs, pids[0]), probe(&environs, pids[1]));
+            if seen.0.is_some() && seen.1.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        for child in &mut children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        assert_eq!(seen.0.as_deref(), Some("/a/Application Support/one"));
+        assert_eq!(seen.1.as_deref(), Some("/b/two words"));
+    }
+
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn a_ps_line_splits_into_entries_after_the_argv() {

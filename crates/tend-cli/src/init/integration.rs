@@ -1004,18 +1004,23 @@ fn active_home_gaps(
         .into_iter()
         .filter(|(_, _, path)| !recorded.contains(path))
         .filter_map(|(host, var, path)| {
-            let text = fs::read_to_string(&path).unwrap_or_default();
-            let present = read_server(&text, host).ok().flatten().is_some();
             let home = path.parent().unwrap_or(&path).display().to_string();
-            (!present).then(|| {
-                (
-                    false,
-                    format!(
-                        "agent-mcp: {} has no tend server, and it is the active {var}; run `{var}={home} tend init --component agent-mcp`",
-                        path.display()
-                    ),
-                )
-            })
+            let problem = match mcp_state(host, &path) {
+                McpState::Healthy => return None,
+                McpState::Missing => format!(
+                    "has no tend server, and it is the active {var}; run `{var}={home} tend init --component agent-mcp`"
+                ),
+                McpState::Disabled => format!(
+                    "has the tend server disabled, and it is the active {var}; re-enable it, or run `{var}={home} tend init --component agent-mcp`"
+                ),
+                McpState::Conflict => format!(
+                    "has a `tend` server that does not run `tend mcp`, and it is the active {var}; reconcile that entry by hand"
+                ),
+                McpState::Unreadable => {
+                    format!("cannot be read or parsed, and it is the active {var}; fix the file")
+                }
+            };
+            Some((false, format!("agent-mcp: {} {problem}", path.display())))
         })
         .collect()
 }
@@ -1078,41 +1083,91 @@ fn canonical(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-/// The provider home an account selects, read without running anything:
-/// its literal `env` entry, else a literal line of its `env_file`. An
-/// explicit entry wins, as it does at launch (`env` runs after the file is
-/// sourced). `Err` when the only value depends on the shell (`$VAR`, `$(…)`);
-/// `None` for an account that leaves the home to the launch environment
-/// (token-only accounts).
+/// The value of one shell assignment's right-hand side, when it is a plain
+/// literal: an unquoted word, `'…'`, or `"…"` without expansions, optionally
+/// followed by a `# comment`. `None` for anything the shell would expand or
+/// that this subset does not cover; such a value is never guessed.
+fn shell_literal(raw: &str) -> Option<String> {
+    let raw = raw.trim_start();
+    let (value, rest) = if let Some(body) = raw.strip_prefix('\'') {
+        let end = body.find('\'')?;
+        (body[..end].to_owned(), &body[end + 1..])
+    } else if let Some(body) = raw.strip_prefix('"') {
+        let end = body.find('"')?;
+        let value = &body[..end];
+        if value.contains(['$', '`', '\\']) {
+            return None;
+        }
+        (value.to_owned(), &body[end + 1..])
+    } else {
+        let end = raw.find(char::is_whitespace).unwrap_or(raw.len());
+        let value = &raw[..end];
+        if value.contains([
+            '$', '`', '\\', '\'', '"', '#', ';', '&', '|', '(', ')', '<', '>',
+        ]) {
+            return None;
+        }
+        (value.to_owned(), &raw[end..])
+    };
+    // Anything after the value must be blanks, or blanks then a comment:
+    // `'a'#b` is the single word `a#b` to the shell.
+    let rest_ok = rest.trim().is_empty()
+        || (rest.starts_with(char::is_whitespace) && rest.trim_start().starts_with('#'));
+    rest_ok.then_some(value)
+}
+
+/// The provider home an account selects, read without running anything.
+/// Launch sources the `env_file` and then applies `env`, so an `env` key
+/// decides whenever present, even empty. In the file the last assignment
+/// wins, as in the shell. `Ok(None)`: the account leaves the home to the
+/// launch environment (no key, or an empty value, which providers treat as
+/// unset). `Err`: the value depends on the shell, is relative, or the file
+/// cannot be read; it is reported as not checked, never guessed.
 fn account_home(
     profile: &tend::accounts::AccountProfile,
     var: &str,
 ) -> Result<Option<PathBuf>, ()> {
-    let literal = |value: &str| -> Result<Option<PathBuf>, ()> {
-        let value = tend::accounts::expand_home(value);
-        if value.contains('$') || value.contains('`') {
-            return Err(());
+    let resolve = |value: String| -> Result<Option<PathBuf>, ()> {
+        if value.is_empty() {
+            return Ok(None);
         }
-        let path = PathBuf::from(value);
+        let path = PathBuf::from(tend::accounts::expand_home(&value));
         if path.is_absolute() {
             Ok(Some(path))
         } else {
             Err(())
         }
     };
-    if let Some(value) = profile.env.get(var).filter(|v| !v.is_empty()) {
-        return literal(value);
+    if let Some(value) = profile.env.get(var) {
+        if value.contains(['$', '`']) {
+            return Err(());
+        }
+        return resolve(value.clone());
     }
     let Some(file) = &profile.env_file else {
         return Ok(None);
     };
     let text = fs::read_to_string(tend::accounts::expand_home(file)).map_err(|_| ())?;
-    match tend::accounts::parse_env_file(&text)
-        .into_iter()
-        .rev()
-        .find(|(key, value)| key == var && !value.is_empty())
-    {
-        Some((_, value)) => literal(&value),
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        if !line.contains(var) {
+            continue;
+        }
+        match line
+            .strip_prefix(var)
+            .and_then(|rest| rest.strip_prefix('='))
+        {
+            Some(raw) => found = Some(shell_literal(raw).ok_or(())?),
+            // The variable appears in a form this reader does not follow
+            // (a conditional, `unset`, another variable's value).
+            None if line.starts_with('#') => {}
+            None => return Err(()),
+        }
+    }
+    match found {
+        Some(value) => resolve(value),
         None => Ok(None),
     }
 }
@@ -1649,6 +1704,43 @@ mod tests {
             account_home(&profile(&[], Some(&dir.path().join("missing.env"))), var),
             Err(())
         );
+        let mut n = 0;
+        let mut from = |text: &str| {
+            n += 1;
+            let path = dir.path().join(format!("f{n}.env"));
+            fs::write(&path, text).unwrap();
+            account_home(&profile(&[], Some(&path)), var)
+        };
+        // A trailing comment is not part of the value.
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/a # account home\n"),
+            Ok(Some("/p/a".into()))
+        );
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR='/p/a b' # home\n"),
+            Ok(Some("/p/a b".into()))
+        );
+        // Shell forms this reader does not follow are not guessed.
+        assert_eq!(from("CLAUDE_CONFIG_DIR='/p/a'#x\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR=\"$HOME/p\"\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR=/p/$(whoami)\n"), Err(()));
+        assert_eq!(from("[ -n x ] && CLAUDE_CONFIG_DIR=/p/c\n"), Err(()));
+        // The last assignment wins, and an empty one is not undone by an
+        // earlier value.
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=/p/2\n"),
+            Ok(Some("/p/2".into()))
+        );
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=\n"),
+            Ok(None)
+        );
+        // An explicit env entry decides even when empty: launch applies it
+        // after sourcing the file.
+        assert_eq!(
+            account_home(&profile(&[(var, "")], Some(&file)), var),
+            Ok(None)
+        );
     }
 
     #[test]
@@ -1785,6 +1877,44 @@ mod tests {
         assert_eq!(
             canonical(&real.join(".claude.json")),
             canonical(&real).join(".claude.json")
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_active_home_with_a_broken_tend_entry_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = dir.path().join("manifest.json");
+        fs::write(
+            &manifest,
+            serde_json::to_string(&Manifest::default()).unwrap(),
+        )
+        .unwrap();
+        let cfg = |name: &str, text: &str| {
+            let path = dir.path().join(name).join(".claude.json");
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, text).unwrap();
+            (Host::Claude, "CLAUDE_CONFIG_DIR", path)
+        };
+        let gaps = active_home_gaps(
+            &manifest,
+            vec![
+                cfg(
+                    "disabled",
+                    r#"{"mcpServers":{"tend":{"command":"tend","args":["mcp"],"enabled":false}}}"#,
+                ),
+                cfg("conflict", r#"{"mcpServers":{"tend":{"command":"other"}}}"#),
+                cfg(
+                    "healthy",
+                    r#"{"mcpServers":{"tend":{"command":"tend","args":["mcp"]}}}"#,
+                ),
+            ],
+        );
+        assert_eq!(gaps.len(), 2, "{gaps:?}");
+        assert!(gaps[0].1.contains("tend server disabled"), "{}", gaps[0].1);
+        assert!(
+            gaps[1].1.contains("does not run `tend mcp`"),
+            "{}",
+            gaps[1].1
         );
     }
 
