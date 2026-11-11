@@ -102,6 +102,19 @@ pub enum BoardStage {
     Done,
 }
 
+/// Why a Work the board files as queued is not "never started": an agent in
+/// it finished its latest turn, or started one whose output tend did not
+/// capture. Observed, not reviewed: nothing here moves a Work to review.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkIdle {
+    /// An agent answered its latest prompt and is idle.
+    FinishedTurn,
+    /// An agent was given a prompt and is idle, but no response newer than
+    /// that prompt was captured.
+    TurnWithoutOutput,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkSignal {
@@ -235,6 +248,11 @@ pub struct WorkSnapshotItem {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_action: Option<String>,
     pub stage: BoardStage,
+    /// Set when `stage` is queued only because nothing is running, though
+    /// an agent was already given work. Additive, so older clients still
+    /// read the stage as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle: Option<WorkIdle>,
     pub signals: Vec<WorkSignal>,
     pub external_items: Vec<ExternalItemRef>,
     pub runs: Vec<RunSnapshot>,
@@ -436,6 +454,11 @@ fn finish_work(
         goal: metadata.goal.clone(),
         next_action: metadata.next_action.clone(),
         stage: board_stage(metadata.stage, &runtime),
+        idle: work_idle(
+            metadata.stage,
+            board_stage(metadata.stage, &runtime),
+            &runtime,
+        ),
         signals: work_signals(metadata.stage, &runtime),
         external_items: record
             .map(|record| record.external_items.clone())
@@ -625,6 +648,11 @@ struct RuntimeSummary {
     working: usize,
     waiting: usize,
     errors: usize,
+    /// Idle or stopped agents whose latest response answers their latest
+    /// prompt.
+    finished_turns: usize,
+    /// Idle or stopped agents given a prompt with no newer response.
+    turns_without_output: usize,
     latest_at: Option<OffsetDateTime>,
 }
 
@@ -642,11 +670,44 @@ impl RuntimeSummary {
                     AgentState::Working | AgentState::Starting => summary.working += 1,
                     AgentState::WaitingInput | AgentState::WaitingChoice => summary.waiting += 1,
                     AgentState::Error => summary.errors += 1,
-                    AgentState::Idle | AgentState::Stopped => {}
+                    AgentState::Idle | AgentState::Stopped => match turn(agent) {
+                        Some(true) => summary.finished_turns += 1,
+                        Some(false) => summary.turns_without_output += 1,
+                        None => {}
+                    },
                 }
             }
         }
         summary
+    }
+}
+
+/// For an agent that is not running: Some(true) when its latest response
+/// came after its latest prompt (and says something), Some(false) when it
+/// was given a prompt but no newer response was captured, None when it was
+/// never given one. Uses the agent's own timestamps, not Work metadata,
+/// which changes on any edit.
+fn turn(agent: &crate::Agent) -> Option<bool> {
+    let prompted = agent.last_prompt_at?;
+    let answered = agent.last_response_at.is_some_and(|at| at >= prompted)
+        && agent
+            .last_response
+            .as_deref()
+            .is_some_and(|text| !text.trim().is_empty());
+    Some(answered)
+}
+
+/// The idle detail for an automatic stage that reads as queued.
+fn work_idle(stage: WorkStage, board: BoardStage, runtime: &RuntimeSummary) -> Option<WorkIdle> {
+    if stage != WorkStage::Auto || board != BoardStage::Queued {
+        return None;
+    }
+    if runtime.finished_turns > 0 {
+        Some(WorkIdle::FinishedTurn)
+    } else if runtime.turns_without_output > 0 {
+        Some(WorkIdle::TurnWithoutOutput)
+    } else {
+        None
     }
 }
 
@@ -852,6 +913,7 @@ mod tests {
             last_activity_at: now,
             state_entered_at: now,
             last_prompt_origin: None,
+            last_response_at: None,
         }
     }
 
@@ -894,5 +956,107 @@ mod tests {
             assert_eq!(runs[0].execution.session_id, "$1");
             assert!(snapshot.unlinked_executions.is_empty());
         }
+    }
+
+    fn agent_with(
+        prompt_at: Option<i64>,
+        response_at: Option<i64>,
+        response: &str,
+    ) -> crate::Agent {
+        let ts = |secs: i64| {
+            OffsetDateTime::from_unix_timestamp(1_800_000_000 + secs)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let mut agent = serde_json::json!({
+            "kind": "codex", "agent_session_id": "s", "pane": "%1", "cwd": null,
+            "state": "idle", "last_prompt": null, "last_response": response,
+            "last_notification": null, "model": null, "context_used_pct": null,
+            "cost_usd": null, "started_at": ts(0), "last_activity_at": ts(0),
+            "state_entered_at": ts(0)
+        });
+        if let Some(at) = prompt_at {
+            agent["last_prompt_at"] = ts(at).into();
+        }
+        if let Some(at) = response_at {
+            agent["last_response_at"] = ts(at).into();
+        }
+        serde_json::from_value(agent).unwrap()
+    }
+
+    #[test]
+    fn an_idle_agents_turn_is_judged_by_its_own_timestamps() {
+        assert_eq!(
+            turn(&agent_with(None, None, "")),
+            None,
+            "never given a prompt"
+        );
+        assert_eq!(turn(&agent_with(Some(10), Some(20), "Done.")), Some(true));
+        // A response from before the latest prompt answers an older one.
+        assert_eq!(turn(&agent_with(Some(30), Some(20), "Done.")), Some(false));
+        // An empty response says nothing.
+        assert_eq!(turn(&agent_with(Some(10), Some(20), "  ")), Some(false));
+        assert_eq!(turn(&agent_with(Some(10), None, "")), Some(false));
+    }
+
+    #[test]
+    fn only_an_automatic_queued_work_reads_as_idle() {
+        let finished = RuntimeSummary {
+            participants: 1,
+            finished_turns: 1,
+            ..RuntimeSummary::default()
+        };
+        assert_eq!(
+            work_idle(
+                WorkStage::Auto,
+                board_stage(WorkStage::Auto, &finished),
+                &finished
+            ),
+            Some(WorkIdle::FinishedTurn)
+        );
+        // An explicit stage keeps its meaning.
+        assert_eq!(
+            work_idle(
+                WorkStage::Queued,
+                board_stage(WorkStage::Queued, &finished),
+                &finished
+            ),
+            None
+        );
+        let silent = RuntimeSummary {
+            participants: 1,
+            turns_without_output: 1,
+            ..RuntimeSummary::default()
+        };
+        assert_eq!(
+            work_idle(WorkStage::Auto, BoardStage::Queued, &silent),
+            Some(WorkIdle::TurnWithoutOutput)
+        );
+        // Never given work: still queued, no idle detail.
+        let fresh = RuntimeSummary {
+            participants: 1,
+            ..RuntimeSummary::default()
+        };
+        assert_eq!(work_idle(WorkStage::Auto, BoardStage::Queued, &fresh), None);
+        // Something running wins.
+        let running = RuntimeSummary {
+            participants: 2,
+            working: 1,
+            finished_turns: 1,
+            ..RuntimeSummary::default()
+        };
+        assert_eq!(
+            board_stage(WorkStage::Auto, &running),
+            BoardStage::InProgress
+        );
+        assert_eq!(
+            work_idle(
+                WorkStage::Auto,
+                board_stage(WorkStage::Auto, &running),
+                &running
+            ),
+            None
+        );
     }
 }

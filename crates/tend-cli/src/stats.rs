@@ -3515,6 +3515,7 @@ pub(crate) mod tests {
             last_activity_at: state_entered_at,
             state_entered_at,
             last_prompt_origin: None,
+            last_response_at: None,
         }
     }
 

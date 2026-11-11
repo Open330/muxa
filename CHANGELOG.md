@@ -23,6 +23,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   person's, and Home's review queue decides "asked by you" from the
   recorded origin first, keeping the prompt-envelope text check only for
   unknown origin.
+- Work rows carry an `idle` detail when the board files an automatic Work
+  as queued although an agent already worked on it: `finished_turn` (its
+  latest response came after its latest prompt) or `turn_without_output`
+  (prompted, no newer response captured). The board shows "idle" instead of
+  "queued", which now means never started. Judged from each agent's own
+  prompt and response times (agents now record `last_response_at`), not
+  Work metadata, so editing a title changes nothing; explicit stages keep
+  their meaning, and nothing moves a Work to review on its own. The field
+  is additive; older clients still read the stage as before.
 - `tend review request | list | show | accept | return | withdraw`: a review
   item is an explicit request that one result (a session, a Work alias or a
   collaboration request) be looked at, kept until someone accepts, returns

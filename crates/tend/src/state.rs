@@ -318,6 +318,15 @@ pub struct Agent {
     /// typed it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_prompt_origin: Option<PromptOrigin>,
+    /// When the latest turn that reported a response stopped; compared with
+    /// `last_prompt_at`, it tells whether `last_response` answers the
+    /// latest prompt or an earlier one. None before any response.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub last_response_at: Option<OffsetDateTime>,
 }
 
 fn default_state_entered_at() -> OffsetDateTime {
@@ -405,6 +414,7 @@ impl Agent {
             last_activity_at: at,
             state_entered_at: at,
             last_prompt_origin: None,
+            last_response_at: None,
         }
     }
 
@@ -998,6 +1008,7 @@ fn mutate_for_event(
             agent.pending_command = None;
             if let Some(text) = response {
                 agent.last_response = Some(text.clone());
+                agent.last_response_at = Some(at);
             }
             // Session-summary signals ride along on turn end. Only
             // overwrite on `Some`: a recap is sparse (Claude writes one
@@ -3351,6 +3362,7 @@ mod tests {
             last_activity_at: at,
             state_entered_at: at,
             last_prompt_origin: None,
+            last_response_at: None,
         }
     }
 
@@ -5330,6 +5342,9 @@ mod tests {
             .await;
         let agent = store.by_session("s").await.unwrap();
         assert_eq!(agent.last_response.as_deref(), Some("first answer"));
+        // Its time stays the time of the turn that produced it, so a later
+        // prompt can tell the response is older than itself.
+        assert_eq!(agent.last_response_at, Some(now));
     }
 
     #[tokio::test]
@@ -7072,6 +7087,7 @@ mod tests {
                     last_activity_at: mid,
                     state_entered_at: mid,
                     last_prompt_origin: None,
+                    last_response_at: None,
                 },
             );
             agents.insert(
@@ -7110,6 +7126,7 @@ mod tests {
                     last_activity_at: new,
                     state_entered_at: new,
                     last_prompt_origin: None,
+                    last_response_at: None,
                 },
             );
         }
@@ -7177,6 +7194,7 @@ mod tests {
                         last_activity_at: at,
                         state_entered_at: at,
                         last_prompt_origin: None,
+                        last_response_at: None,
                     },
                 );
             }
@@ -7249,6 +7267,7 @@ mod tests {
             last_activity_at: t0,
             state_entered_at: t0,
             last_prompt_origin: None,
+            last_response_at: None,
         };
         let inserted = store
             .seed_if_absent(vec![

@@ -1196,6 +1196,7 @@ fn agent(session_id: &str, pane: Option<&str>, state: AgentState, prompt: &str) 
         last_activity_at: datetime!(2026-04-24 11:55:00 UTC),
         state_entered_at: datetime!(2026-04-24 11:55:00 UTC),
         last_prompt_origin: None,
+        last_response_at: None,
     }
 }
 
