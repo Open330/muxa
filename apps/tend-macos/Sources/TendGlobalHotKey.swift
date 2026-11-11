@@ -1,6 +1,10 @@
 // A shortcut that works from any app: it brings Tend forward with the agents
 // palette, those waiting on the person first. Carbon's hot keys need no
 // Accessibility permission.
+//
+// Off until the person picks one: a registered hot key is taken from every
+// other app (⌥Space is Raycast's, ChatGPT's and others' default, and types a
+// non-breaking space in editors), so Tend never claims one on its own.
 import AppKit
 import Carbon.HIToolbox
 import SwiftUI
@@ -35,7 +39,7 @@ enum TendHotKeyPreset: String, CaseIterable, Identifiable, Sendable {
     }
 
     static func current(_ defaults: UserDefaults = .standard) -> TendHotKeyPreset {
-        defaults.string(forKey: defaultsKey).flatMap(TendHotKeyPreset.init(rawValue:)) ?? .optionSpace
+        defaults.string(forKey: defaultsKey).flatMap(TendHotKeyPreset.init(rawValue:)) ?? .off
     }
 }
 

@@ -99,9 +99,10 @@ func anAnnouncementPassesToAJoiningHostEvenAfterTheFigureFalls(joinedAt: Double)
     #expect(TendUsageAlerts.due(groups: [group(20, reset: nil)], notified: notified, now: now).rearmed.count == 1)
 }
 
-@Test func theHotKeyDefaultsToOptionSpaceAndCanBeTurnedOff() {
+@Test func theHotKeyIsOffUntilChosen() {
     let defaults = UserDefaults(suiteName: "hotkey-\(UUID().uuidString)")!
-    #expect(TendHotKeyPreset.current(defaults) == .optionSpace)
-    defaults.set(TendHotKeyPreset.off.rawValue, forKey: TendHotKeyPreset.defaultsKey)
+    #expect(TendHotKeyPreset.current(defaults) == .off)
     #expect(TendHotKeyPreset.current(defaults).carbonModifiers == nil)
+    defaults.set(TendHotKeyPreset.optionSpace.rawValue, forKey: TendHotKeyPreset.defaultsKey)
+    #expect(TendHotKeyPreset.current(defaults) == .optionSpace)
 }
