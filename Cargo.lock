@@ -4623,7 +4623,7 @@ dependencies = [
 
 [[package]]
 name = "tend"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -4662,7 +4662,7 @@ dependencies = [
 
 [[package]]
 name = "tend-cli"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -4699,7 +4699,7 @@ dependencies = [
 
 [[package]]
 name = "tend-zellij-plugin"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "serde",
  "serde_json",
@@ -4708,7 +4708,7 @@ dependencies = [
 
 [[package]]
 name = "tendd"
-version = "0.10.2"
+version = "0.10.3"
 dependencies = [
  "anyhow",
  "clap 4.6.1",
