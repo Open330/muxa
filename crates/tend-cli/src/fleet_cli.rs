@@ -520,6 +520,8 @@ pub(crate) async fn run_fleet(
                         pane: target,
                         text,
                         submit,
+                        // A shell command may be a person or a script.
+                        origin: None,
                     },
                 )
                 .await?;

@@ -360,6 +360,27 @@ pub(super) enum RequestBody {
         text: String,
         #[serde(default)]
         submit: bool,
+        /// Who asked for it (`prompt_origin_v1`); recorded on the prompt the
+        /// agent reports. Only a person, peer or automation can be declared;
+        /// anything else is recorded as tend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<crate::PromptOrigin>,
+    },
+
+    /// `prompt_origin_v1`: a caller that types into `pane` itself (a Fleet
+    /// relay) registers the prompt first, so the hook reporting it is
+    /// stamped with `origin`.
+    ExpectPrompt {
+        pane: String,
+        #[serde(default)]
+        socket: Option<String>,
+        text: String,
+        origin: crate::PromptOrigin,
+    },
+
+    /// Drops the registration `token` named after typing failed.
+    ForgetExpectedPrompt {
+        token: u64,
     },
 
     /// Control/observation: capture the visible contents of `pane` via
@@ -971,6 +992,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "ask_one_shot_v1",
     "fleet_keys_v1",
     "fleet_worktrees_v1",
+    "prompt_origin_v1",
     "fleet_worktree_change_v1",
     "fleet_servers_v1",
     "automation_v1",
@@ -1042,6 +1064,10 @@ pub struct Response {
     /// the old daemon still finishing an in-flight response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// The registration an `expect_prompt` made; absent when tend could not
+    /// bind it to exactly one agent session.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_token: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sessions: Option<Vec<SessionRef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1217,6 +1243,7 @@ impl Response {
             collaboration_open_counts: None,
             collaboration_byte_budget: None,
             generation: None,
+            prompt_token: None,
             sessions: None,
             session: None,
             terminal: None,

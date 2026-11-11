@@ -595,6 +595,7 @@ mod tests {
             at: datetime!(2026-04-26 12:00:00 UTC),
             model: model.map(str::to_string),
             seq: 0,
+            origin: crate::state::PromptOrigin::Unknown,
         }
     }
 

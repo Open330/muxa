@@ -1359,6 +1359,8 @@ fn handle_key(
                                 pane: target.recipient.pane,
                                 text,
                                 submit: true,
+                                // Typed by the person driving fleet watch.
+                                origin: Some(tend::PromptOrigin::PersonViaTend),
                             },
                         );
                         app.message_targets.clear();

@@ -418,6 +418,7 @@ mod tests {
             started_at: AT,
             last_activity_at: AT,
             state_entered_at: AT,
+            last_prompt_origin: None,
             last_response_at: None,
         }
     }
@@ -811,6 +812,7 @@ mod tests {
             started_at: AT,
             last_activity_at: AT,
             state_entered_at: AT,
+            last_prompt_origin: None,
             last_response_at: None,
         };
         assert!(occupant_is_authoritative(&agent), "live real row owns pane");

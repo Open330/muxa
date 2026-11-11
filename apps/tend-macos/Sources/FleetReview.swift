@@ -68,9 +68,23 @@ extension FleetBoard {
     /// helper hand-over or a background-task notice.
     static func isRequestedByPerson(_ work: FleetWork) -> Bool {
         if work.isProbableHelper || work.isOrphanHelper || work.isEmptySession { return false }
+        // The daemon's record of who caused the latest prompt decides when it
+        // has one: a person through tend, or a peer, automation or tend
+        // itself. This applies to managed Work too: a Work whose latest turn
+        // a peer started is not a result the person asked for.
+        switch work.focus?.agent.lastPromptOrigin {
+        case "person_via_tend": return true
+        case "peer", "automation", "tend": return false
+        default: break
+        }
         if case .work = work.source { return true }
         guard let prompt = work.focus?.agent.lastPrompt?.trimmingCharacters(in: .whitespacesAndNewlines),
               !prompt.isEmpty else { return false }
+        // Unknown origin: no tend delivery matched, so a person typed it or
+        // the provider generated it. Provider envelopes (background-task
+        // notices, cross-session messages, interruptions) are recognized by
+        // text. This is a heuristic, not provenance; "[tend" covers prompts
+        // from daemons older than prompt_origin_v1.
         for machine in ["[tend", "<task-notification>", "[Cross-session", "[Request interrupted"] where prompt.hasPrefix(machine) {
             return false
         }

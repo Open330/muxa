@@ -548,6 +548,9 @@ pub enum RelayRequest {
         pane: PaneKey,
         text: String,
         submit: bool,
+        /// Who asked for it; absent from older controllers.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<crate::PromptOrigin>,
     },
     /// Navigation keys for a choice dialog, sent as raw key bytes.
     SendKeys {
@@ -760,6 +763,10 @@ pub enum FleetOperation {
         text: String,
         #[serde(default)]
         submit: bool,
+        /// Who asked for it (`prompt_origin_v1`): a person via tend, a peer
+        /// or automation. Anything else is recorded as tend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<crate::PromptOrigin>,
     },
     /// `fleet_keys_v1`: press navigation keys in a pane, so a choice dialog
     /// can be answered by moving to an option and confirming it. Only the

@@ -3536,6 +3536,20 @@ async fn send_collaboration_wake(
         participant.socket.as_deref(),
         prompt,
     );
+    // A peer delivery: registered before typing, so the hook reporting the
+    // prompt is stamped as from a peer rather than a person.
+    let expected = if prompt.is_empty() {
+        None
+    } else {
+        store
+            .expect_prompt(
+                &participant.pane,
+                participant.socket.as_deref(),
+                prompt,
+                tend::PromptOrigin::Peer,
+            )
+            .await
+    };
     let sent = send_collaboration_text(participant, prompt, backends, io_guard.clone()).await;
     let submitted = if sent {
         tokio::time::sleep(tend::backend::prompt_submit_grace(&participant.pane)).await;
@@ -3543,6 +3557,11 @@ async fn send_collaboration_wake(
     } else {
         false
     };
+    if !submitted {
+        if let Some(token) = expected {
+            store.forget_expected_prompt(token);
+        }
+    }
     if submitted {
         // A missing hook must not delay mailbox bookkeeping, the next peer's
         // wake, or shutdown. This bounded observer only logs evidence and
@@ -4406,6 +4425,7 @@ async fn enrich_from_history(
             started_at: entry.at,
             last_activity_at: entry.at,
             state_entered_at: entry.at,
+            last_prompt_origin: None,
             last_response_at: None,
         });
     }

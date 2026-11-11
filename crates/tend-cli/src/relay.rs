@@ -379,6 +379,7 @@ async fn handle_request(
             pane,
             text,
             submit,
+            origin,
         } => {
             let backend = exact_backend(&backends, &pane).await?;
             if !backend.caps().send_text {
@@ -386,6 +387,23 @@ async fn handle_request(
             }
             let socket = pane.window.session.endpoint.socket.clone();
             let pane_id = pane.pane_id.clone();
+            // Register with this host's daemon before typing, so the hook
+            // reporting the prompt carries its origin. A daemon without
+            // prompt_origin_v1 refuses; the prompt then stays unknown.
+            let expected = if submit && !text.is_empty() {
+                client
+                    .expect_prompt(
+                        &pane_id,
+                        Some(&socket),
+                        &text,
+                        tend::PromptOrigin::declared(origin),
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
             let outcome = tokio::task::spawn_blocking(move || {
                 if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
                     return None;
@@ -403,8 +421,13 @@ async fn handle_request(
                 })
             })
             .await
-            .context("send task panicked")?
-            .context("backend refused text injection")?;
+            .context("send task panicked")?;
+            if !outcome.as_ref().is_some_and(|outcome| outcome.submitted) {
+                if let Some(token) = expected {
+                    let _ = client.forget_expected_prompt(token).await;
+                }
+            }
+            let outcome = outcome.context("backend refused text injection")?;
             Ok(RelayFrame::Result {
                 request_id,
                 result: Box::new(FleetCommandResult::sent(outcome)),

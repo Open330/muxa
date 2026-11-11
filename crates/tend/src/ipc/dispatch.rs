@@ -892,7 +892,12 @@ pub(super) async fn handle(
                         }
                     }
                 }
-                RequestBody::SendPrompt { pane, text, submit } => {
+                RequestBody::SendPrompt {
+                    pane,
+                    text,
+                    submit,
+                    origin,
+                } => {
                     kind = "send_prompt";
                     match resolve_backend(&backends, &pane) {
                         // Known namespace, but no active backend observes it —
@@ -942,6 +947,20 @@ pub(super) async fn handle(
                                                 socket.as_deref(),
                                                 &text,
                                             );
+                                        // Registered before typing, so the
+                                        // hook reporting it carries its origin.
+                                        let expected = if submit && !text.is_empty() {
+                                            store
+                                                .expect_prompt(
+                                                    &pane,
+                                                    socket.as_deref(),
+                                                    &text,
+                                                    crate::PromptOrigin::declared(origin),
+                                                )
+                                                .await
+                                        } else {
+                                            None
+                                        };
                                         let (sent, submitted) =
                                             tokio::task::spawn_blocking(move || {
                                                 let _action = action_guard;
@@ -964,6 +983,11 @@ pub(super) async fn handle(
                                             })
                                             .await
                                             .unwrap_or((false, false));
+                                        if !submitted {
+                                            if let Some(token) = expected {
+                                                store.forget_expected_prompt(token);
+                                            }
+                                        }
                                         if sent {
                                             tracing::debug!(submit, submitted, "send_prompt");
                                             let mut response =
@@ -985,6 +1009,31 @@ pub(super) async fn handle(
                             }
                         }
                     }
+                }
+                RequestBody::ExpectPrompt {
+                    pane,
+                    socket,
+                    text,
+                    origin,
+                } => {
+                    kind = "expect_prompt";
+                    let token = store
+                        .expect_prompt(
+                            &pane,
+                            socket.as_deref(),
+                            &text,
+                            crate::PromptOrigin::declared(Some(origin)),
+                        )
+                        .await;
+                    Response {
+                        prompt_token: token,
+                        ..Response::ok()
+                    }
+                }
+                RequestBody::ForgetExpectedPrompt { token } => {
+                    kind = "forget_expected_prompt";
+                    store.forget_expected_prompt(token);
+                    Response::ok()
                 }
                 RequestBody::Capture { pane } => {
                     kind = "capture";

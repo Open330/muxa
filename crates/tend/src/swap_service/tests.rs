@@ -1462,6 +1462,7 @@ fn prompt(kind: AgentKind, session: &str, pane: &str, seq: u64) -> crate::state:
         at: time::OffsetDateTime::now_utc(),
         model: None,
         seq,
+        origin: crate::state::PromptOrigin::Unknown,
     }
 }
 

@@ -433,14 +433,19 @@ impl LocalTask {
                 audit_operation(LOCAL_HOST_ALIAS, "capture_window", 0);
                 local_capture_window(&self.backends, window).await
             }
-            FleetOperation::SendPrompt { pane, text, submit } => {
+            FleetOperation::SendPrompt {
+                pane,
+                text,
+                submit,
+                origin,
+            } => {
                 if text.len() > FLEET_MAX_FRAME_BYTES {
                     return Err(format!(
                         "local prompt exceeds {FLEET_MAX_FRAME_BYTES} bytes"
                     ));
                 }
                 audit_operation(LOCAL_HOST_ALIAS, "send_prompt", text.len());
-                local_send_prompt(&self.backends, pane, text, submit).await
+                local_send_prompt(&self.backends, &self.agents, pane, text, submit, origin).await
             }
             FleetOperation::SendKeys { pane, keys } => {
                 if keys.is_empty() || keys.len() > tend::fleet::FLEET_MAX_KEYS {
@@ -1004,9 +1009,11 @@ async fn local_capture_window(
 
 async fn local_send_prompt(
     backends: &[SharedBackend],
+    store: &SharedStore,
     pane: PaneKey,
     text: String,
     submit: bool,
+    origin: Option<tend::PromptOrigin>,
 ) -> Result<FleetCommandResult, String> {
     let backend = exact_local_backend(backends, &pane).await?;
     if !backend.caps().send_text {
@@ -1017,6 +1024,20 @@ async fn local_send_prompt(
     }
     let socket = pane.window.session.endpoint.socket;
     let pane_id = pane.pane_id;
+    // Registered before typing, so the hook reporting it carries its origin.
+    let expected = if submit && !text.is_empty() {
+        store
+            .expect_prompt(
+                &pane_id,
+                Some(&socket),
+                &text,
+                tend::PromptOrigin::declared(origin),
+            )
+            .await
+    } else {
+        None
+    };
+    let forget = store.clone();
     let outcome = tokio::task::spawn_blocking(move || {
         if !backend.send_prompt_text_on(Some(&socket), &pane_id, &text) {
             return None;
@@ -1034,8 +1055,13 @@ async fn local_send_prompt(
         })
     })
     .await
-    .map_err(|error| format!("local send task panicked: {error}"))?
-    .ok_or_else(|| "backend refused text injection".to_string())?;
+    .map_err(|error| format!("local send task panicked: {error}"))?;
+    if !outcome.as_ref().is_some_and(|outcome| outcome.submitted) {
+        if let Some(token) = expected {
+            forget.forget_expected_prompt(token);
+        }
+    }
+    let outcome = outcome.ok_or_else(|| "backend refused text injection".to_string())?;
     Ok(FleetCommandResult::sent(outcome))
 }
 
@@ -1604,13 +1630,13 @@ impl HostTask {
                             );
                             RelayRequest::CaptureWindow { request_id: id, window }
                         }
-                        FleetOperation::SendPrompt { pane, text, submit } => {
+                        FleetOperation::SendPrompt { pane, text, submit, origin } => {
                             audit_operation(&self.alias, "send_prompt", text.len());
                             pending.insert(
                                 id.clone(),
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
-                            RelayRequest::SendPrompt { request_id: id, pane, text, submit }
+                            RelayRequest::SendPrompt { request_id: id, pane, text, submit, origin }
                         }
                         FleetOperation::SendKeys { pane, keys } => {
                             audit_operation(&self.alias, "send_keys", keys.len());

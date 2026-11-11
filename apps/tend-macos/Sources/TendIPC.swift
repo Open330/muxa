@@ -309,6 +309,10 @@ struct TendAgent: Decodable, Hashable, Identifiable, Sendable {
     let cwd: String?
     let state: String
     let lastPrompt: String?
+    /// Who caused the latest prompt when tend delivered it (`prompt_origin_v1`):
+    /// person_via_tend, peer, automation, tend, or unknown (no tend delivery
+    /// matched). nil from an older daemon.
+    let lastPromptOrigin: String?
     let lastPromptAt: String?
     let lastResponse: String?
     let recap: String?
@@ -342,6 +346,7 @@ struct TendAgent: Decodable, Hashable, Identifiable, Sendable {
         case tmuxSocket = "tmux_socket"
         case tmuxSession = "tmux_session"
         case lastPrompt = "last_prompt"
+        case lastPromptOrigin = "last_prompt_origin"
         case lastPromptAt = "last_prompt_at"
         case lastResponse = "last_response"
         case aiTitle = "ai_title"
@@ -1470,6 +1475,9 @@ actor TendIPCClient {
         return result.worktreeChanges ?? []
     }
 
+    /// Every send from the app follows a person's action, so it is declared
+    /// as theirs; the daemon stamps the prompt the agent reports with it.
+    /// Older daemons ignore the field.
     func sendFleetPrompt(
         host: TendFleetHostIdentity,
         pane: TendPaneInfo,
@@ -1488,6 +1496,7 @@ actor TendIPCClient {
                 "pane": Self.paneKey(pane),
                 "text": text,
                 "submit": submit,
+                "origin": "person_via_tend",
             ],
         ])
         guard let result = response.fleetResult else {

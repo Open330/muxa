@@ -133,7 +133,9 @@ pub use fleet::{
 };
 pub use history::{HistoryEntry, PromptHistory};
 pub use process_tree::{WorkloadProcess, WorkloadProcessKind, WorkloadSummary};
-pub use state::{Agent, PromptRecord, ReconcileReport, SharedStore, Store, Transition};
+pub use state::{
+    Agent, PromptOrigin, PromptRecord, ReconcileReport, SharedStore, Store, Transition,
+};
 pub use topology::{
     BackendEndpoint, BackendTopologyCapabilities, HierarchyCapability, PaneKey, PaneNode,
     SessionKey, SessionNode, StateDistribution, TopologyInput, TopologyNodeKey, TopologyNodeRef,
