@@ -1087,18 +1087,18 @@ fn canonical(path: &Path) -> PathBuf {
 /// literal: an unquoted word, `'…'`, or `"…"` without expansions, optionally
 /// followed by a `# comment`. `None` for anything the shell would expand or
 /// that this subset does not cover; such a value is never guessed.
-fn shell_literal(raw: &str) -> Option<String> {
+fn shell_literal(raw: &str) -> Option<(String, bool)> {
     let raw = raw.trim_start();
     let (value, rest) = if let Some(body) = raw.strip_prefix('\'') {
         let end = body.find('\'')?;
-        (body[..end].to_owned(), &body[end + 1..])
+        ((body[..end].to_owned(), true), &body[end + 1..])
     } else if let Some(body) = raw.strip_prefix('"') {
         let end = body.find('"')?;
         let value = &body[..end];
         if value.contains(['$', '`', '\\']) {
             return None;
         }
-        (value.to_owned(), &body[end + 1..])
+        ((value.to_owned(), true), &body[end + 1..])
     } else {
         let end = raw.find(char::is_whitespace).unwrap_or(raw.len());
         let value = &raw[..end];
@@ -1107,7 +1107,7 @@ fn shell_literal(raw: &str) -> Option<String> {
         ]) {
             return None;
         }
-        (value.to_owned(), &raw[end..])
+        ((value.to_owned(), false), &raw[end..])
     };
     // Anything after the value must be blanks, or blanks then a comment:
     // `'a'#b` is the single word `a#b` to the shell.
@@ -1148,27 +1148,47 @@ fn account_home(
         return Ok(None);
     };
     let text = fs::read_to_string(tend::accounts::expand_home(file)).map_err(|_| ())?;
+    // Only a file of plain assignments is read: any other line (a
+    // conditional, a function, a heredoc, a continuation) could decide
+    // whether an assignment runs at all, so the whole file is unchecked.
     let mut found = None;
     for line in text.lines() {
         let line = line.trim();
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        if !line.contains(var) {
+        if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        match line
-            .strip_prefix(var)
-            .and_then(|rest| rest.strip_prefix('='))
+        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
+        let (key, raw) = line.split_once('=').ok_or(())?;
+        if key.is_empty()
+            || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            || key.starts_with(|c: char| c.is_ascii_digit())
+            || raw.ends_with('\\')
         {
-            Some(raw) => found = Some(shell_literal(raw).ok_or(())?),
-            // The variable appears in a form this reader does not follow
-            // (a conditional, `unset`, another variable's value).
-            None if line.starts_with('#') => {}
-            None => return Err(()),
+            return Err(());
+        }
+        let (value, quoted) = shell_literal(raw).ok_or(())?;
+        if key == var {
+            found = Some((value, quoted));
         }
     }
     match found {
-        Some(value) => resolve(value),
         None => Ok(None),
+        Some((value, _)) if value.is_empty() => Ok(None),
+        // The shell expands an unquoted leading `~/` only; a quoted one
+        // stays a relative path.
+        Some((value, quoted)) => {
+            let value = if quoted {
+                value
+            } else {
+                tend::accounts::expand_home(&value)
+            };
+            let path = PathBuf::from(value);
+            if path.is_absolute() {
+                Ok(Some(path))
+            } else {
+                Err(())
+            }
+        }
     }
 }
 
@@ -1735,6 +1755,25 @@ mod tests {
             from("CLAUDE_CONFIG_DIR=/p/1\nCLAUDE_CONFIG_DIR=\n"),
             Ok(None)
         );
+        // Control flow decides whether an assignment runs: not followed.
+        assert_eq!(
+            from("if false; then\nCLAUDE_CONFIG_DIR=/tmp/never\nfi\n"),
+            Err(())
+        );
+        assert_eq!(from("f() {\nCLAUDE_CONFIG_DIR=/tmp/never\n}\n"), Err(()));
+        assert_eq!(
+            from("cat <<EOF\nCLAUDE_CONFIG_DIR=/tmp/never\nEOF\n"),
+            Err(())
+        );
+        assert_eq!(from("OTHER=a \\\nCLAUDE_CONFIG_DIR=/tmp/never\n"), Err(()));
+        // Only an unquoted `~/` is the home directory.
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            from("CLAUDE_CONFIG_DIR=~/acct\n"),
+            Ok(Some(PathBuf::from(format!("{home}/acct"))))
+        );
+        assert_eq!(from("CLAUDE_CONFIG_DIR='~/acct'\n"), Err(()));
+        assert_eq!(from("CLAUDE_CONFIG_DIR=\"~/acct\"\n"), Err(()));
         // An explicit env entry decides even when empty: launch applies it
         // after sourcing the file.
         assert_eq!(
