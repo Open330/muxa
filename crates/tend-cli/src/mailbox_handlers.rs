@@ -726,11 +726,18 @@ pub(super) async fn cmd_msg_expire(
         return Ok(());
     }
     let verb = if dry_run { "would expire" } else { "expired" };
-    for id in &summary.request_ids {
-        println!("{verb}  {id}");
+    if summary.total == 0 {
+        println!("no eligible unclaimed requests match the age and cleanup filters ({older_than})");
+        return Ok(());
+    }
+    for request in &summary.requests {
+        println!(
+            "{verb}  {}  {:?}  {} -> {}  (queued since {})",
+            request.id, request.kind, request.from, request.to, request.created_at
+        );
     }
     if summary.truncated {
-        println!("(showing a bounded sample of request IDs)");
+        println!("(showing a bounded sample of requests)");
     }
     println!("{} request(s) {verb}", summary.total);
     Ok(())

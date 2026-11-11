@@ -16,22 +16,38 @@ pub const EXPIRE_SUMMARY_CAPABILITY: &str = "collaboration_expire_summary_v1";
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct ExpireSummary {
     pub total: usize,
-    pub request_ids: Vec<String>,
+    pub requests: Vec<ExpireSample>,
     pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExpireSample {
+    pub id: String,
+    pub kind: RequestKind,
+    pub from: String,
+    pub to: String,
+    /// Calendar date, without the time of day.
+    pub created_at: String,
 }
 
 impl ExpireSummary {
     pub fn from_requests(requests: &[CollaborationRequest]) -> Self {
-        let request_ids: Vec<_> = requests
+        let samples: Vec<_> = requests
             .iter()
             .filter(|request| request.id.len() <= 128)
             .take(100)
-            .map(|request| request.id.clone())
+            .map(|request| ExpireSample {
+                id: request.id.clone(),
+                kind: request.kind,
+                from: request.from.label().chars().take(64).collect(),
+                to: request.to.label().chars().take(64).collect(),
+                created_at: request.created_at.date().to_string(),
+            })
             .collect();
         Self {
             total: requests.len(),
-            truncated: request_ids.len() < requests.len(),
-            request_ids,
+            truncated: samples.len() < requests.len(),
+            requests: samples,
         }
     }
 }
@@ -142,14 +158,22 @@ mod tests {
         request.id = "x".repeat(1_000_000);
         let summary = ExpireSummary::from_requests(std::slice::from_ref(&request));
         assert_eq!(summary.total, 1);
-        assert!(summary.request_ids.is_empty());
+        assert!(summary.requests.is_empty());
         assert!(summary.truncated);
         request.id = "\u{0000}".repeat(128);
+        request.from.alias = Some("한".repeat(1000));
+        request.to.alias = Some("x".repeat(1000));
         let requests = vec![request; 1000];
         let summary = ExpireSummary::from_requests(&requests);
         assert_eq!(summary.total, 1000);
-        assert_eq!(summary.request_ids.len(), 100);
-        assert!(serde_json::to_vec(&summary).unwrap().len() < 80_000);
+        assert_eq!(summary.requests.len(), 100);
+        assert_eq!(summary.requests[0].from.chars().count(), 64);
+        assert_eq!(summary.requests[0].to.chars().count(), 64);
+        assert_eq!(
+            summary.requests[0].created_at,
+            requests[0].created_at.date().to_string()
+        );
+        assert!(serde_json::to_vec(&summary).unwrap().len() < 150_000);
     }
 
     #[tokio::test]

@@ -1017,9 +1017,12 @@ impl Client {
             .iter()
             .any(|c| c == collaboration::EXPIRE_SUMMARY_CAPABILITY)
         {
-            return Err(RuntimeError::Daemon(
-                "daemon lacks bounded expiry; upgrade tendd before cleanup".into(),
-            ));
+            // Brew can upgrade the CLI before the running daemon. Preserve
+            // its filtered safety contract, and surface any legacy size error.
+            let requests = self
+                .collaboration_expire_filtered(older_than_secs, dry_run, quiet_only, request_id)
+                .await?;
+            return Ok(collaboration::ExpireSummary::from_requests(&requests));
         }
         let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_expire_summary",
             "older_than_secs":older_than_secs,"dry_run":dry_run,"quiet_only":quiet_only,"request_id":request_id})).await?;

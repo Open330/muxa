@@ -2462,7 +2462,7 @@ async fn expiry_summary_handles_4671_large_requests_over_ipc() {
         .await
         .unwrap();
     assert_eq!(preview.total, 4671);
-    assert_eq!(preview.request_ids.len(), 100);
+    assert_eq!(preview.requests.len(), 100);
     assert!(preview.truncated);
     assert!(!serde_json::to_string(&preview).unwrap().contains("PRIVATE"));
     let exact = client
@@ -2470,7 +2470,7 @@ async fn expiry_summary_handles_4671_large_requests_over_ipc() {
         .await
         .unwrap();
     assert_eq!(exact.total, 1);
-    assert_eq!(exact.request_ids, vec![ids[0].clone()]);
+    assert_eq!(exact.requests[0].id, ids[0]);
     assert!(!exact.truncated);
     let expired = client
         .collaboration_expire_summary(0, false, true, None)
@@ -2482,8 +2482,62 @@ async fn expiry_summary_handles_4671_large_requests_over_ipc() {
         .await
         .unwrap();
     assert_eq!(empty.total, 0);
-    assert!(empty.request_ids.is_empty());
+    assert!(empty.requests.is_empty());
     assert!(!empty.truncated);
     stop.send(()).unwrap();
     serving.await.unwrap();
+}
+
+#[tokio::test]
+async fn expiry_summary_falls_back_to_filtered_operation_and_preserves_errors() {
+    for dry_run in [true, false] {
+        for size_error in [false, true] {
+            let dir = tempdir().unwrap();
+            let socket = dir.path().join("fallback.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).await.unwrap() == 0 {
+                            break;
+                        }
+                        let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                        if request["kind"] == "hello" {
+                            reader.get_mut().write_all(b"{\"ok\":true,\"protocol\":6,\"capabilities\":[\"collaboration_expire_filtered_v2\"]}\n").await.unwrap();
+                        } else {
+                            assert_eq!(request["kind"], "collaboration_expire_filtered");
+                            assert_eq!(request["older_than_secs"], 86400);
+                            assert_eq!(request["dry_run"], dry_run);
+                            assert_eq!(request["quiet_only"], true);
+                            assert_eq!(request["request_id"], "quiet-notice");
+                            let reply = if size_error {
+                                "{\"ok\":false,\"error\":\"ipc message exceeds 8388608 bytes\"}\n"
+                            } else {
+                                "{\"ok\":true,\"collaboration_requests\":[]}\n"
+                            };
+                            reader.get_mut().write_all(reply.as_bytes()).await.unwrap();
+                            return;
+                        }
+                    }
+                }
+            });
+            let result = Client::new(socket)
+                .collaboration_expire_summary(86400, dry_run, true, Some("quiet-notice"))
+                .await;
+            if size_error {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("ipc message exceeds 8388608 bytes"));
+            } else {
+                let summary = result.unwrap();
+                assert_eq!(summary.total, 0);
+                assert!(summary.requests.is_empty());
+            }
+            server.await.unwrap();
+        }
+    }
 }
