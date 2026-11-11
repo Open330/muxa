@@ -752,7 +752,9 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "targets": { "type": "array", "items": { "type": "string" }, "description": "Panes (%5, rmux:%5) or provider session ids. Omit for every capped agent." },
                     "all": { "type": "boolean", "description": "Every Claude/Codex agent, not only capped ones." },
                     "provider": { "type": "string", "enum": ["claude", "codex"] },
-                    "to": { "type": "string", "description": "Account name, or auto (default)." },
+                    "to": { "type": "string", "description": "Account name, auto (default), or same to restart each target on its own identified account." },
+                    "when_idle": { "type": "boolean", "description": "Keep busy targets pending until idle (daemon job); force takes precedence." },
+                    "idle_timeout": { "type": "string", "description": "Maximum idle wait, e.g. 30m or 6h (default 6h). Requires when_idle." },
                     "spread": { "type": "boolean", "description": "Round-robin agents over every account with quota left." },
                     "force": { "type": "boolean", "description": "Also stop agents that are mid-turn." },
                     "continue_text": { "type": "string", "description": "Follow-up prompt wording. Who gets it is continue_when; naming it does not widen it." },
@@ -5512,6 +5514,8 @@ const SWAP_START_FIELDS: &[&str] = &[
     "provider",
     "to",
     "spread",
+    "when_idle",
+    "idle_timeout",
     "continue_text",
     "continue_when",
     "continue",
@@ -5604,6 +5608,7 @@ fn swap_plan(
             for (name, switch) in [
                 ("all", "--all"),
                 ("spread", "--spread"),
+                ("when_idle", "--when-idle"),
                 ("no_continue", "--no-continue"),
                 ("dry_run", "--dry-run"),
             ] {
@@ -5614,6 +5619,7 @@ fn swap_plan(
             for (name, option) in [
                 ("provider", "--provider"),
                 ("to", "--to"),
+                ("idle_timeout", "--idle-timeout"),
                 ("continue_text", "--continue-text"),
                 ("continue_when", "--continue-when"),
                 ("continue", "--continue"),
@@ -9185,5 +9191,20 @@ mod tests {
             std::path::Path::new("/Users/fixture/src/project/.context"),
             Some(home)
         ));
+    }
+    #[test]
+    fn swap_same_when_idle_translates_and_rejects_read_options() {
+        let args = json!({"all": true, "to": "same", "when_idle": true, "idle_timeout": "30m", "detach": true});
+        let plan = swap_plan(&args, None, None).unwrap();
+        assert!(plan.argv.contains(&"--when-idle".to_owned()));
+        assert!(plan.argv.contains(&"--idle-timeout=30m".to_owned()));
+        assert!(plan.argv.contains(&"--to=same".to_owned()));
+        assert!(swap_plan(
+            &json!({"action": "status", "job": "k", "when_idle": true}),
+            None,
+            None
+        )
+        .is_err());
+        assert!(swap_plan(&json!({"idle_timeout": "1m"}), None, None).is_err());
     }
 }

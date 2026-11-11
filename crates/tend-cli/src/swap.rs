@@ -33,7 +33,7 @@ use tend::swap_service::{Accepted, EntryView, JobRef, JobView, SwapOverrides};
 #[command(after_help = "Examples:
   tend swap                     swap every rate-limited agent (auto-picked account)
   tend swap %5 --to work
-  tend swap --all --spread      move every idle agent, spread across accounts
+  tend swap --all --to same --when-idle   restart each agent on its own account\n  tend swap --all --spread      move every idle agent, spread across accounts
   tend swap --all --force --provider codex
   tend swap --dry-run           show the plan, touch nothing
   tend swap --status cli-…      follow a swap the daemon is running or ran
@@ -52,7 +52,8 @@ pub struct Args {
     /// Only this provider's agents.
     #[arg(long, value_enum)]
     provider: Option<Provider>,
-    /// Account to move to: an account name, or `auto` (the default) for the
+    /// Account to move to: `same` to restart on its own identified account,
+    /// an account name, or `auto` (the default) for the
     /// next account other than the agent's own (configured accounts: in
     /// config order; `aas`: its best-ranked one with quota left).
     #[arg(long, value_name = "ACCOUNT", conflicts_with = "spread")]
@@ -63,6 +64,13 @@ pub struct Args {
     /// Also stop agents that are mid-turn.
     #[arg(long)]
     force: bool,
+    /// Wait for busy/recently active targets to become idle (daemon jobs only).
+    /// --force takes precedence and stops them immediately.
+    #[arg(long, conflicts_with = "local")]
+    when_idle: bool,
+    /// Maximum wait for idle targets, e.g. 30m or 6h (default 6h).
+    #[arg(long, value_name = "DURATION", requires = "when_idle")]
+    idle_timeout: Option<String>,
     /// Agents started without `aas`: leave them (`skip`) or relaunch them
     /// under it (`wrap`). Default from `[swap] bare`.
     #[arg(long, value_enum)]
@@ -119,7 +127,7 @@ pub struct Args {
             "targets", "all", "limited", "provider", "to", "spread", "force", "bare",
             "continue_text", "continue_legacy", "continue_when", "no_continue",
             "continue_evidence", "dry_run",
-            "exclude", "local",
+            "exclude", "local", "when_idle", "idle_timeout",
         ]
     )]
     status: Option<String>,
@@ -134,7 +142,7 @@ pub struct Args {
         conflicts_with_all = [
             "targets", "all", "limited", "provider", "to", "spread", "bare",
             "continue_text", "continue_legacy", "continue_when", "no_continue",
-            "dry_run", "exclude", "local", "status",
+            "dry_run", "exclude", "local", "when_idle", "idle_timeout", "status",
         ]
     )]
     retry: Option<String>,
@@ -147,7 +155,7 @@ pub struct Args {
         conflicts_with_all = [
             "targets", "all", "limited", "provider", "to", "spread", "force", "bare",
             "continue_text", "continue_legacy", "continue_when", "no_continue",
-            "continue_evidence", "dry_run", "exclude", "local", "status", "retry",
+            "continue_evidence", "dry_run", "exclude", "local", "when_idle", "idle_timeout", "status", "retry",
         ]
     )]
     cancel: Option<String>,
@@ -248,6 +256,7 @@ fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
         AccountChoice::parse(args.to.as_deref().unwrap_or("auto"))
     };
     request.force = args.force;
+    request.when_idle = args.when_idle;
     if let Some(bare) = args.bare {
         request.bare = match bare {
             Bare::Skip => BareMode::Skip,
@@ -391,6 +400,9 @@ async fn run_local(
     config: &SwapConfig,
     accounts: &tend::accounts::AccountsConfig,
 ) -> Result<()> {
+    if args.when_idle {
+        bail!("--when-idle requires a daemon with swap job support");
+    }
     let request = request(args, config);
     let agents = client.snapshot().await.context("listing agents")?;
     let backends = tend::backend::active_backends();
@@ -434,6 +446,8 @@ fn overrides(args: &Args, explicit_config: Option<&Path>) -> SwapOverrides {
         to: args.to.clone(),
         spread: args.spread,
         force: args.force,
+        when_idle: args.when_idle,
+        idle_timeout: args.idle_timeout.clone(),
         bare: args.bare.map(|bare| {
             match bare {
                 Bare::Skip => "skip",
@@ -949,6 +963,7 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
     let status = match entry.disposition.as_deref() {
         Some("swapped") => SwapStatus::Swapped,
         Some("skipped") => SwapStatus::Skipped,
+        None => SwapStatus::Planned,
         _ => SwapStatus::Failed,
     };
     let mut outcome = entry.outcome.clone().unwrap_or_else(|| SwapOutcome {
@@ -969,7 +984,7 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
         follow_up: None,
     });
     if outcome.status != status || entry.outcome.is_none() {
-        let what = entry.disposition.as_deref().unwrap_or("not finished");
+        let what = entry.disposition.as_deref().unwrap_or("pending");
         let reason = entry
             .reason
             .as_deref()
@@ -1241,6 +1256,7 @@ fn remote_argv(args: &Args) -> Vec<String> {
         (args.limited, "--limited"),
         (args.spread, "--spread"),
         (args.force, "--force"),
+        (args.when_idle, "--when-idle"),
         (args.no_continue, "--no-continue"),
         (args.dry_run, "--dry-run"),
         (args.local, "--local"),
@@ -1258,6 +1274,9 @@ fn remote_argv(args: &Args) -> Vec<String> {
                 Provider::Codex => "codex",
             }
         ));
+    }
+    if let Some(timeout) = &args.idle_timeout {
+        words.push(format!("--idle-timeout={timeout}"));
     }
     if let Some(to) = &args.to {
         words.push(format!("--to={to}"));
@@ -2690,5 +2709,28 @@ mod tests {
             "{rendered}"
         );
         assert_eq!(render(&[]), "nothing to swap\n");
+    }
+    #[test]
+    fn idle_options_survive_fleet_and_request_translation() {
+        let cli = Cli::parse_from([
+            "swap",
+            "--all",
+            "--to",
+            "same",
+            "--when-idle",
+            "--idle-timeout",
+            "30m",
+        ]);
+        let request = overrides(&cli.args, None);
+        let resolved = request.resolve(&SwapConfig::default()).unwrap();
+        assert_eq!(resolved.to, AccountChoice::Same);
+        assert!(resolved.when_idle);
+        assert_eq!(resolved.idle_timeout, Duration::from_secs(1800));
+        let remote = remote_argv(&cli.args);
+        assert!(remote.contains(&"--when-idle".to_owned()));
+        assert!(remote.contains(&"--idle-timeout=30m".to_owned()));
+        assert!(checked_argv(&remote[1..]).is_ok());
+        assert!(Cli::try_parse_from(["swap", "--local", "--when-idle"]).is_err());
+        assert!(Cli::try_parse_from(["swap", "--idle-timeout", "1m"]).is_err());
     }
 }
