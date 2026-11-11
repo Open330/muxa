@@ -373,6 +373,12 @@ pub(super) enum RequestBody {
     /// `tend_send_prompt` tool.
     SendPrompt {
         pane: String,
+        /// Explicit server endpoint; permits an untracked pane on that server.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        socket: Option<String>,
+        /// Refuse unless this agent session still occupies the target pane.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         text: String,
         #[serde(default)]
         submit: bool,

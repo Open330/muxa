@@ -17,8 +17,26 @@ impl Client {
         text: &str,
         submit: bool,
     ) -> Result<SendPromptOutcome, RuntimeError> {
+        self.send_prompt_scoped(pane, text, submit, None, None)
+            .await
+    }
+
+    /// Send on an explicit endpoint and/or require a matching agent session.
+    /// Untracked tmux/rmux panes require `socket`; registered legacy rows may
+    /// retain a backend default when no endpoint was recorded. A session
+    /// precondition must always match a recorded row, even with an explicit endpoint.
+    pub async fn send_prompt_scoped(
+        &self,
+        pane: &str,
+        text: &str,
+        submit: bool,
+        socket: Option<&str>,
+        session_id: Option<&str>,
+    ) -> Result<SendPromptOutcome, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
+            "socket": socket,
+            "session_id": session_id,
             "kind": "send_prompt",
             "pane": pane,
             "text": text,

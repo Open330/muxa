@@ -519,7 +519,7 @@ async fn send_prompt_injects_text_then_submit_cr() {
     let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
 
     Client::new(sock.clone())
-        .send_prompt("%1", "fix the bug", true)
+        .send_prompt_scoped("%1", "fix the bug", true, Some("default"), None)
         .await
         .expect("send_prompt ok");
 
@@ -546,7 +546,7 @@ async fn send_prompt_confirms_hook_without_repeating_body_or_enter() {
         session_id: "original".into(),
         surface: None,
         pane: Some("%1".into()),
-        tmux_socket: None,
+        tmux_socket: Some("default".into()),
         cwd: None,
     };
     store
@@ -606,7 +606,7 @@ async fn send_prompt_without_submit_omits_cr() {
     let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
 
     Client::new(sock.clone())
-        .send_prompt("%1", "note", false)
+        .send_prompt_scoped("%1", "note", false, Some("default"), None)
         .await
         .expect("send_prompt ok");
 
@@ -856,7 +856,7 @@ async fn rmux_send_prompt_refuses_same_pane_id_on_multiple_endpoints() {
             .await;
     }
 
-    let (backend, sends, _sockets) = RecordingBackend::new_full(HostKind::Rmux, true, true, false);
+    let (backend, sends, sockets) = RecordingBackend::new_full(HostKind::Rmux, true, true, false);
     let (tx, handle) = serve(&sock, store, vec![backend]).await;
 
     let error = Client::new(sock.clone())
@@ -865,27 +865,172 @@ async fn rmux_send_prompt_refuses_same_pane_id_on_multiple_endpoints() {
         .expect_err("ambiguous endpoint must be refused");
     assert!(format!("{error}").contains("multiple endpoints"));
     assert!(sends.lock().unwrap().is_empty());
+    let client = Client::new(sock);
+    client
+        .send_prompt_scoped(
+            "rmux:%5",
+            "first",
+            false,
+            Some("/tmp/rmux-one/default"),
+            Some("rmux-one"),
+        )
+        .await
+        .unwrap();
+    client
+        .send_prompt_scoped("rmux:%5", "second", false, None, Some("rmux-two"))
+        .await
+        .unwrap();
+    assert_eq!(
+        *sockets.lock().unwrap(),
+        vec![
+            Some("/tmp/rmux-one/default".into()),
+            Some("/tmp/rmux-two/default".into()),
+        ]
+    );
 
     tx.send(()).unwrap();
     handle.await.unwrap();
 }
 
-/// Fix 1 — with no recorded agent row for the pane, the threaded socket is
-/// `None` (the tmux backend then falls back to the env-scoped default).
+/// Legacy/discovery rows may identify the agent without recording its socket.
 #[tokio::test]
-async fn send_prompt_threads_none_socket_when_untracked() {
+async fn send_prompt_preserves_registered_rows_without_socket() {
+    for (kind, pane) in [(HostKind::Tmux, "%9"), (HostKind::Rmux, "rmux:%9")] {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("legacy-row.sock");
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: None,
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "legacy".into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let (backend, sends, sockets) = RecordingBackend::new_full(kind, true, true, false);
+        let (tx, handle) = serve(&sock, store, vec![backend]).await;
+        let client = Client::new(sock);
+        client.send_prompt(pane, "legacy", false).await.unwrap();
+        client
+            .send_prompt_scoped(pane, "same agent", false, None, Some("legacy"))
+            .await
+            .unwrap();
+        assert_eq!(*sockets.lock().unwrap(), vec![None, None]);
+        assert_eq!(sends.lock().unwrap().len(), 2);
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+}
+
+/// A forgotten agent must not send into a colliding pane on the default server.
+#[tokio::test]
+async fn send_prompt_refuses_untracked_pane_without_endpoint() {
+    for (kind, pane) in [(HostKind::Tmux, "%9"), (HostKind::Rmux, "rmux:%9")] {
+        let dir = tempdir().unwrap();
+        let sock = dir.path().join("tend-send-unknown.sock");
+        let store = Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    tmux_socket: Some("amux".into()),
+                    kind: AgentKind::ClaudeCode,
+                    session_id: "forgotten".into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        assert!(store.forget_agent("forgotten").await);
+        let (backend, sends, sockets) = RecordingBackend::new_full(kind, true, true, false);
+        let (tx, handle) = serve(&sock, store, vec![backend]).await;
+        let client = Client::new(sock);
+        let err = client
+            .send_prompt(pane, "do not type", true)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("unknown pane"), "{err}");
+        assert!(sends.lock().unwrap().is_empty());
+        assert!(sockets.lock().unwrap().is_empty());
+        client
+            .send_prompt_scoped(pane, "explicit", false, Some("/tmp/custom/amux"), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            *sockets.lock().unwrap(),
+            vec![Some("/tmp/custom/amux".into())]
+        );
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn send_prompt_requires_matching_session_and_endpoint() {
     let dir = tempdir().unwrap();
-    let sock = dir.path().join("tend-send-nosock.sock");
-    let (backend, _sends, sockets) = RecordingBackend::new_full(HostKind::Tmux, true, true, false);
-    let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
-
-    Client::new(sock.clone())
-        .send_prompt("%9", "hi", false)
+    let sock = dir.path().join("session-precondition.sock");
+    let store = Store::shared();
+    store
+        .apply(&AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: Some("amux".into()),
+                kind: AgentKind::ClaudeCode,
+                session_id: "current".into(),
+                surface: None,
+                pane: Some("%5".into()),
+                cwd: None,
+            },
+            at: OffsetDateTime::now_utc(),
+        })
+        .await;
+    let (backend, sends, sockets) = RecordingBackend::new_full(HostKind::Tmux, true, true, false);
+    let (tx, handle) = serve(&sock, store.clone(), vec![backend]).await;
+    let client = Client::new(sock);
+    for (socket, session) in [(None, "previous"), (Some("default"), "current")] {
+        let err = client
+            .send_prompt_scoped("%5", "stale", true, socket, Some(session))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("session mismatch"), "{err}");
+    }
+    assert!(sends.lock().unwrap().is_empty());
+    client
+        .send_prompt_scoped("%5", "current", false, None, Some("current"))
         .await
-        .expect("send_prompt ok");
-
-    assert_eq!(sockets.lock().unwrap().clone(), vec![None]);
-
+        .unwrap();
+    assert_eq!(*sockets.lock().unwrap(), vec![Some("amux".into())]);
+    // A new session in the same pane leaves the predecessor stopped in the
+    // registry. Its identity must no longer satisfy the precondition.
+    store
+        .apply(&AgentEvent::Started {
+            id: AgentId {
+                tmux_socket: Some("amux".into()),
+                kind: AgentKind::ClaudeCode,
+                session_id: "replacement".into(),
+                surface: None,
+                pane: Some("%5".into()),
+                cwd: None,
+            },
+            at: OffsetDateTime::now_utc(),
+        })
+        .await;
+    let err = client
+        .send_prompt_scoped("%5", "stale", true, Some("amux"), Some("current"))
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("session mismatch"), "{err}");
+    let err = client
+        .send_prompt_scoped("%5", "blank socket", true, Some(""), None)
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("explicit endpoint"), "{err}");
+    assert_eq!(sends.lock().unwrap().len(), 1);
     tx.send(()).unwrap();
     handle.await.unwrap();
 }
@@ -903,7 +1048,7 @@ async fn send_prompt_reports_partial_failure_when_cr_fails() {
     let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
 
     let outcome = Client::new(sock.clone())
-        .send_prompt("%1", "hello", true)
+        .send_prompt_scoped("%1", "hello", true, Some("default"), None)
         .await
         .expect("text landed → Ok, not a total failure");
     assert!(outcome.sent, "text landed");
@@ -934,7 +1079,7 @@ async fn send_prompt_total_failure_skips_cr() {
     let (tx, handle) = serve(&sock, Store::shared(), vec![backend]).await;
 
     let err = Client::new(sock.clone())
-        .send_prompt("%1", "hello", true)
+        .send_prompt_scoped("%1", "hello", true, Some("default"), None)
         .await
         .expect_err("nothing landed → Err");
     assert!(format!("{err}").contains("send_text failed"), "err: {err}");

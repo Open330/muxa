@@ -184,7 +184,9 @@ use framing::{
 };
 
 mod topology;
-use topology::{resolve_backend, unique_pane_endpoint, CollaborationTopology};
+use topology::{
+    resolve_backend, send_prompt_endpoint, unique_pane_endpoint, CollaborationTopology,
+};
 
 mod automation;
 use automation::{automation_judge_test, automation_subjects};
