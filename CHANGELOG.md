@@ -7,8 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.10.2] - 2026-11-11
-
 ### Added
 
 - Agents record who caused their latest prompt when tend delivered it
@@ -25,6 +23,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   person's, and Home's review queue decides "asked by you" from the
   recorded origin first, keeping the prompt-envelope text check only for
   unknown origin.
+- `review_record` (`review_record_v1`): a claim and its disposition
+  recorded in one transaction, for a person who says they reviewed a
+  result. Needs an idempotency key; a retry returns the same item, an open
+  item under the key is decided, a different decision conflicts.
+- macOS: Home's review sheet lists explicit review requests (from agents or
+  people, `tend review request`) above the results it gathers, with Accept,
+  Return (with a note) and Withdraw. Looks Good on a result also records it
+  with this Mac's daemon, asked and accepted in one step, keyed by the
+  result and its exact state; the local mark still decides what Home hides,
+  so nothing changes when the daemon cannot record. Scoped to this Mac's
+  daemon: review stores on different Macs do not sync.
+
+## [0.10.2] - 2026-11-11
+
+### Added
+
 - Work rows carry an `idle` detail when the board files an automatic Work
   as queued although an agent already worked on it: `finished_turn` (its
   latest response came after its latest prompt) or `turn_without_output`

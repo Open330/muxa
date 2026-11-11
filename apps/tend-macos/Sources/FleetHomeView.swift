@@ -31,6 +31,24 @@ struct FleetHomeView: View {
         model.homeWorks
     }
 
+    /// Also records the review with this Mac's daemon, asked and accepted
+    /// in one step, so `tend review list --all` shows it. The local mark
+    /// stays what hides the result here; a daemon that cannot record
+    /// changes nothing.
+    private func recordReviewed(_ work: FleetWork) {
+        guard let target = FleetBoard.reviewTarget(work) else { return }
+        let key = FleetBoard.reviewKey(work)
+        let summary = work.headline.isEmpty ? String(localized: "Reviewed in Home") : String(work.headline.prefix(2000))
+        let client = model.client
+        Task {
+            do {
+                try await client.recordReviewed(target: target, key: key, summary: summary)
+            } catch {
+                TendLog.app.warning("recording a review failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -52,6 +70,7 @@ struct FleetHomeView: View {
                 markReviewed: { work in
                     reviewed.markReviewed(work)
                     reviewed.save(to: .standard)
+                    recordReviewed(work)
                 },
                 send: { text, target in try await send(text, to: target) },
                 ask: { prompt in try await model.client.askOneShot(prompt) }
@@ -278,6 +297,7 @@ struct FleetHomeView: View {
             markReviewed: {
                 reviewed.markReviewed(work)
                 reviewed.save(to: .standard)
+                recordReviewed(work)
                 selectedID = nil
             },
             agentDraft: { draftBinding(Self.agentDraftKey(work, $0)) },

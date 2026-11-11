@@ -766,3 +766,37 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(sends.begin("a"))
     #expect(sends.outcome("a") == nil)
 }
+
+@Test func reviewRequestsDecodeAndHomeKeysAreStablePerResult() throws {
+    let json = """
+    [{"id":"rv_1","target":{"kind":"work","workspace":"tend","work":"storage","alias":"impl"},
+      "generation":2,"summary":"Check the migration","anchor":"commit:1a2b3c",
+      "requested_at":"2026-11-11T01:00:00Z","requested_by":{"kind":"agent","label":"impl"}},
+     {"id":"rv_2","target":{"kind":"session","provider":"codex","session_id":"0123456789abcdef"},
+      "generation":1,"summary":"Look at this","requested_at":"2026-11-11T02:00:00Z",
+      "requested_by":{"kind":"user"}}]
+    """
+    let items = try JSONDecoder().decode([TendReviewItem].self, from: Data(json.utf8))
+    #expect(items[0].target.text == "tend/storage · impl")
+    #expect(items[0].askedBy.contains("impl"))
+    #expect(items[1].target.text == "codex 01234567")
+
+    let finished = TendHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Fix it"], id: "done"), pane: nil)
+    let work = try #require(FleetBoard.works(groups: [], agents: [finished]).first)
+    let key = FleetBoard.reviewKey(work)
+    #expect(key.hasPrefix("home:") && key.count == 69, "fits the store's 128-byte key limit")
+    #expect(key == FleetBoard.reviewKey(work), "same result, same key")
+    let target = try #require(FleetBoard.reviewTarget(work))
+    #expect(target.json["kind"] as? String == "session")
+
+    // The same session on another host alias, or the same unit in another
+    // state, is a different result and gets a different key.
+    let other = TendFleetHostIdentity(alias: "other", local: false, state: "online", mode: "control")
+    let elsewhere = TendHostedAgent(host: other, agent: try agent(["state": "idle", "last_prompt": "Fix it"], id: "done"), pane: nil)
+    let moved = try #require(FleetBoard.works(groups: [], agents: [elsewhere]).first)
+    #expect(FleetBoard.reviewKey(moved) != key)
+    let later = TendHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Fix it", "state_entered_at": "2026-11-11T09:00:00Z"], id: "done"), pane: nil)
+    let changed = try #require(FleetBoard.works(groups: [], agents: [later]).first)
+    #expect(changed.id == work.id)
+    #expect(FleetBoard.reviewKey(changed) != key)
+}
