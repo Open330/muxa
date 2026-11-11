@@ -6,7 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{RecordStore, SearchRequest};
+use super::{ReadRequest, RecordStore, SearchRequest};
 
 /// At most this many call/result pairs, the latest ones.
 pub const MAX_PAIRS: usize = 6;
@@ -84,8 +84,19 @@ pub fn turn_evidence(
                 .iter()
                 .find(|other| other.kind == "tool_result" && other.call_id.as_ref() == Some(id))
         });
+        // Search results carry only the start of each event; read the
+        // result itself so its end, where tools print their verdict, is
+        // kept.
         let (result_text, result_cut) = result
-            .map(|r| clip_ends(&r.text, RESULT_CHARS))
+            .map(|r| {
+                full_ends(store, &r.event_id).map_or_else(
+                    || (clip(&r.text, RESULT_CHARS).0, true),
+                    |(text, whole)| {
+                        let (kept, cut) = clip_ends(&text, RESULT_CHARS);
+                        (kept, cut || !whole)
+                    },
+                )
+            })
             .map_or((None, false), |(text, cut)| (Some(text), cut));
         pairs.push(EvidencePair {
             tool: event.tool_name.clone(),
@@ -112,6 +123,55 @@ pub fn turn_evidence(
         more,
         complete: found.coverage.complete,
     })
+}
+
+/// Pages read per event, at most: a result longer than this keeps its
+/// start and the last page read, and is marked as not whole.
+const MAX_PAGES: usize = 8;
+
+/// An event's full text when it fits in [`MAX_PAGES`] reads, else its first
+/// page and the last page read joined by a marked gap; and whether it is
+/// whole. None when the event cannot be read.
+fn full_ends(store: &RecordStore, event_id: &str) -> Option<(String, bool)> {
+    let mut first = String::new();
+    let mut last = String::new();
+    let mut offset = 0;
+    for page in 0..MAX_PAGES {
+        let read = store
+            .read(&ReadRequest {
+                event_id: event_id.to_string(),
+                before: 0,
+                after: 0,
+                include_tool_pair: false,
+                text_offset: offset,
+                max_chars: 64_000,
+            })
+            .ok()?;
+        let text = read
+            .events
+            .into_iter()
+            .find(|e| e.event_id == event_id)?
+            .text;
+        if page == 0 {
+            first.clone_from(&text);
+        } else {
+            last = text;
+        }
+        match read.next_text_offset {
+            Some(next) if next > offset => offset = next,
+            _ => {
+                return Some((
+                    if last.is_empty() {
+                        first
+                    } else {
+                        format!("{first}{last}")
+                    },
+                    true,
+                ));
+            }
+        }
+    }
+    Some((format!("{first}\n…\n{last}"), false))
 }
 
 /// A long result keeps its start and its end, where tools print their
@@ -186,6 +246,17 @@ mod tests {
                     serde_json::json!([{"type":"tool_use","id":"t2","name":"Bash","input":{"command":"git push"}}]),
                     "assistant",
                 ),
+                line(
+                    "2026-11-11T01:00:07Z",
+                    serde_json::json!([{"type":"tool_use","id":"t3","name":"Bash","input":{"command":"cargo test --all"}}]),
+                    "assistant",
+                ),
+                line(
+                    "2026-11-11T01:00:09Z",
+                    serde_json::json!([{"type":"tool_result","tool_use_id":"t3","content":
+                        format!("{}FAILED: 1 test failed", "running a long test suite\n".repeat(120))}]),
+                    "user",
+                ),
             ],
         );
         let cache = tempfile::tempdir().unwrap();
@@ -194,10 +265,21 @@ mod tests {
             vec![root.path().to_path_buf()],
         );
         let evidence = turn_evidence(&store, "s1", "2026-11-11T00:30:00Z").unwrap();
-        assert_eq!(evidence.pairs.len(), 2, "{evidence:?}");
+        assert_eq!(evidence.pairs.len(), 3, "{evidence:?}");
         assert!(evidence.pairs[0].call.contains("cargo test"));
         assert_eq!(evidence.pairs[0].result.as_deref(), Some("test result: ok"));
         assert!(evidence.pairs[1].call.contains("git push"));
+        // A long result keeps the verdict printed at its end.
+        assert!(
+            evidence.pairs[2]
+                .result
+                .as_deref()
+                .unwrap()
+                .ends_with("FAILED: 1 test failed"),
+            "{:?}",
+            evidence.pairs[2]
+        );
+        assert!(evidence.pairs[2].clipped);
         assert_eq!(evidence.pairs[1].result, None, "no result recorded yet");
         assert!(!evidence.more);
         // Another session's id finds nothing; without a start, nothing is

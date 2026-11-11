@@ -1082,7 +1082,9 @@ struct FleetEvidenceSection: View {
                                 .foregroundStyle(.secondary)
                         }
                         let tail = pair.resultTail(lines: 4)
-                        if pair.clipped || tail?.cut == true || pair.call.split(separator: "\n").count > 3 {
+                        // A call wraps past its three lines without a newline
+                        // too, so anything not visibly short counts as a preview.
+                        if pair.clipped || tail?.cut == true || pair.call.count > 160 || pair.call.contains("\n") {
                             Text("preview")
                                 .font(.system(size: 10, weight: .semibold))
                                 .foregroundStyle(.orange)
