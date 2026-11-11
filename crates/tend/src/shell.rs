@@ -141,6 +141,21 @@ impl Dialect {
     }
 }
 
+/// One argument for the multiplexer's own command parser — the one that reads
+/// a hook, a key binding's command, or an `if-shell`/`run-shell` argument —
+/// always quoted.
+///
+/// This is not a shell's quoting: tmux and rmux read `'…'` literally and a
+/// backslash-escaped `\'` outside quotes, on every platform, whatever shell
+/// they later hand a `run-shell` line to. A `PowerShell` line quoted with
+/// [`Dialect::quote`] doubles its `'`, which this parser reads as two adjacent
+/// strings, so the inner quotes are lost. Quote each layer for the parser
+/// that will read it: [`Dialect`] for the shell, this for the multiplexer.
+#[must_use]
+pub fn mux_quote(word: &str) -> String {
+    format!("'{}'", word.replace('\'', r"'\''"))
+}
+
 /// A process that runs `script` through the local shell: `sh -c` on Unix,
 /// `PowerShell`'s `-Command` on Windows.
 #[must_use]

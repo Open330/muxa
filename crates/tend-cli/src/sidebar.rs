@@ -547,9 +547,7 @@ fn install_bindings(
         "--window".into(),
         "#{window_id}".into(),
     ]);
-    let command = shell.command_line(&words);
-    let guarded = format!("run-shell -b {}", shell.quote(&command));
-    let hook = format!("if-shell -F '#{{{POLICY}}}' {}", shell.quote(&guarded));
+    let (hook, zoom_hook) = ensure_hooks(shell, &words);
     for name in [
         "after-select-window[9105]",
         "after-new-window[9105]",
@@ -562,10 +560,6 @@ fn install_bindings(
     );
     control.run(&["set-hook", "-g", "after-select-pane[9105]", &focus_hook])?;
     install_toggle(control, endpoint, launch)?;
-    let zoom_hook = format!(
-        "if-shell -F '#{{&&:#{{window_zoomed_flag}},#{{{PANE}}}}}' {}",
-        shell.quote(&guarded)
-    );
     control.run(&["set-hook", "-g", "after-resize-pane[9105]", &zoom_hook])?;
     // rmux currently returns an empty result for positional one-key queries.
     // Read just the prefix table and select the exact key locally.
@@ -594,7 +588,6 @@ fn install_bindings(
         "--pane".into(),
         "#{pane_id}".into(),
     ]);
-    let command = shell.command_line(&words);
     // Outside an enabled window, preserve tmux's native zoom behaviour.
     control.run(&[
         "bind-key",
@@ -604,9 +597,40 @@ fn install_bindings(
         "if-shell",
         "-F",
         "#{@tend_sidebar_pane}",
-        &format!("run-shell -b {}", shell.quote(&command)),
+        &run_shell(shell, &words),
         "resize-pane -Z",
     ])
+}
+
+/// `run-shell -b` running `argv`, as one multiplexer command. Two parsers
+/// read it: the multiplexer's, which strips [`tend::shell::mux_quote`], and
+/// the shell `run-shell` hands the line to, which reads the [`Dialect`]'s.
+/// Quoting the outer layer in the shell's dialect instead loses a level under
+/// `PowerShell`, whose doubled `''` the multiplexer reads as two strings.
+///
+/// [`Dialect`]: tend::shell::Dialect
+fn run_shell(shell: tend::shell::Dialect, argv: &[String]) -> String {
+    format!(
+        "run-shell -b {}",
+        tend::shell::mux_quote(&shell.command_line(argv))
+    )
+}
+
+/// The session hook and the zoom hook that run `ensure`: an `if-shell -F`
+/// whose command is itself parsed again when the condition holds.
+fn ensure_hooks(shell: tend::shell::Dialect, argv: &[String]) -> (String, String) {
+    let guarded = tend::shell::mux_quote(&run_shell(shell, argv));
+    let condition = |format: &str| tend::shell::mux_quote(format);
+    (
+        format!(
+            "if-shell -F {} {guarded}",
+            condition(&format!("#{{{POLICY}}}"))
+        ),
+        format!(
+            "if-shell -F {} {guarded}",
+            condition(&format!("#{{&&:#{{window_zoomed_flag}},#{{{PANE}}}}}"))
+        ),
+    )
 }
 
 /// Focus a selected node without exiting the sidebar or writing to its agent.
@@ -726,4 +750,141 @@ pub(crate) fn focused_client(control: &Control, source: &str) -> Result<String> 
         "navigation needs one client focused on this sidebar; use prefix + s"
     );
     Ok(clients[0].into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tend::shell::Dialect;
+
+    /// The words tmux's (and rmux's) command parser reads from `line`: `'…'`
+    /// literal, `"…"` and bare text with backslash escapes.
+    fn mux_words(line: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut word: Option<String> = None;
+        let mut chars = line.chars();
+        while let Some(c) = chars.next() {
+            match c {
+                ' ' | '\t' => words.extend(word.take()),
+                '\'' => {
+                    let word = word.get_or_insert_with(String::new);
+                    for c in chars.by_ref() {
+                        if c == '\'' {
+                            break;
+                        }
+                        word.push(c);
+                    }
+                }
+                '"' => {
+                    let word = word.get_or_insert_with(String::new);
+                    while let Some(c) = chars.next() {
+                        match c {
+                            '"' => break,
+                            '\\' => word.extend(chars.next()),
+                            c => word.push(c),
+                        }
+                    }
+                }
+                '\\' => word.get_or_insert_with(String::new).extend(chars.next()),
+                c => word.get_or_insert_with(String::new).push(c),
+            }
+        }
+        words.extend(word);
+        words
+    }
+
+    fn argv(program: &str, socket: &str, target: &str) -> Vec<String> {
+        [
+            program, "--socket", socket, "sidebar", "ensure", "--window", target,
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    #[test]
+    fn powershell_hooks_keep_both_quoting_levels() {
+        let words = argv(r"C:\Users\j\tend.exe", r"\\.\pipe\tend-x", "#{window_id}");
+        let line = Dialect::PowerShell.command_line(&words);
+        assert_eq!(
+            line,
+            r"& 'C:\Users\j\tend.exe' --socket '\\.\pipe\tend-x' sidebar ensure --window '#{window_id}'"
+        );
+        let run = run_shell(Dialect::PowerShell, &words);
+        assert_eq!(
+            run,
+            r"run-shell -b '& '\''C:\Users\j\tend.exe'\'' --socket '\''\\.\pipe\tend-x'\'' sidebar ensure --window '\''#{window_id}'\'''"
+        );
+        let (hook, zoom) = ensure_hooks(Dialect::PowerShell, &words);
+        assert_eq!(
+            hook,
+            r"if-shell -F '#{@tend_sidebar_config}' 'run-shell -b '\''& '\''\'\'''\''C:\Users\j\tend.exe'\''\'\'''\'' --socket '\''\'\'''\''\\.\pipe\tend-x'\''\'\'''\'' sidebar ensure --window '\''\'\'''\''#{window_id}'\''\'\'''\'''\'''"
+        );
+        // set-hook parses the hook; if-shell parses its command again; the
+        // shell finally gets the PowerShell line intact.
+        assert_eq!(
+            mux_words(&hook),
+            ["if-shell", "-F", "#{@tend_sidebar_config}", run.as_str()]
+        );
+        assert_eq!(mux_words(&run), ["run-shell", "-b", line.as_str()]);
+        assert_eq!(
+            mux_words(&zoom),
+            [
+                "if-shell",
+                "-F",
+                "#{&&:#{window_zoomed_flag},#{@tend_sidebar_pane}}",
+                run.as_str()
+            ]
+        );
+    }
+
+    #[test]
+    fn posix_hooks_are_unchanged_and_round_trip() {
+        let words = argv("/usr/local/bin/tend", "/tmp/tend it's.sock", "#{window_id}");
+        let line = Dialect::Posix.command_line(&words);
+        assert_eq!(
+            line,
+            r"/usr/local/bin/tend --socket '/tmp/tend it'\''s.sock' sidebar ensure --window '#{window_id}'"
+        );
+        let run = run_shell(Dialect::Posix, &words);
+        // POSIX quoting is also valid multiplexer quoting, so the hooks are
+        // the ones Unix hosts already had.
+        assert_eq!(run, format!("run-shell -b {}", Dialect::Posix.quote(&line)));
+        let (hook, zoom) = ensure_hooks(Dialect::Posix, &words);
+        assert_eq!(
+            hook,
+            format!("if-shell -F '#{{{POLICY}}}' {}", Dialect::Posix.quote(&run))
+        );
+        assert_eq!(
+            zoom,
+            format!(
+                "if-shell -F '#{{&&:#{{window_zoomed_flag}},#{{{PANE}}}}}' {}",
+                Dialect::Posix.quote(&run)
+            )
+        );
+        assert_eq!(
+            mux_words(&hook),
+            ["if-shell", "-F", "#{@tend_sidebar_config}", run.as_str()]
+        );
+        assert_eq!(mux_words(&run), ["run-shell", "-b", line.as_str()]);
+    }
+
+    #[test]
+    fn zoom_binding_quotes_the_pane_for_powershell() {
+        let words: Vec<String> = [r"C:\t\tend.exe", "sidebar", "zoom", "--pane", "#{pane_id}"]
+            .map(String::from)
+            .to_vec();
+        let run = run_shell(Dialect::PowerShell, &words);
+        assert_eq!(
+            run,
+            r"run-shell -b '& '\''C:\t\tend.exe'\'' sidebar zoom --pane '\''#{pane_id}'\'''"
+        );
+        assert_eq!(
+            mux_words(&run),
+            [
+                "run-shell",
+                "-b",
+                r"& 'C:\t\tend.exe' sidebar zoom --pane '#{pane_id}'"
+            ]
+        );
+    }
 }
