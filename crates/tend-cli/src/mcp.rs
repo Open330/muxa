@@ -73,7 +73,7 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// only for Tend work, so an agent on ordinary work would end its turn on a
 /// prose question that tend can only infer (`tend::awaiting_reply`).
 const MCP_SERVER_INSTRUCTIONS: &str = "Read tend_collaboration_guide once. Delivery is not task success; reported_status is peer-declared. \
-     When you are blocked on a decision, approval or information only the person can give, call tend_request_attention with the question instead of only asking in prose.";
+     Blocked on a person's decision? Call tend_request_attention, not just prose.";
 
 /// How often `tend_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -7399,9 +7399,12 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], MCP_PROTOCOL_VERSION);
         assert!(init["result"]["capabilities"]["tools"].is_object());
         let instructions = init["result"]["instructions"].as_str().unwrap();
-        assert!(instructions.len() < 140, "instructions: {instructions}");
+        // Every session pays for these: a pointer to the guide, plus the one
+        // rule every agent needs whatever its task (asking the person).
+        assert!(instructions.len() < 200, "instructions: {instructions}");
         assert!(instructions.contains("tend_collaboration_guide"));
         assert!(instructions.contains("reported_status"));
+        assert!(instructions.contains("tend_request_attention"));
 
         let list = dispatch(
             &client,

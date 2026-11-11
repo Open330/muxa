@@ -23,9 +23,10 @@ collaboration work, so ordinary agents never see it.
 **B — explicit signal (agents tell us).** Every MCP host receives
 `MCP_SERVER_INSTRUCTIONS` at initialize, whatever the task. Add one sentence:
 
-> When you are blocked on a decision, approval or information only the person
-> can give, call tend_request_attention with the question instead of only
-> asking in prose.
+> Blocked on a person's decision? Call tend_request_attention, not just prose.
+
+(Kept to one short sentence: every MCP session pays for the instructions,
+and the initialize test bounds them under 200 bytes.)
 
 The `tend_request_attention` description gains the same "ending a turn on a
 question" case. Its contract is unchanged (keep the ID, wait via
