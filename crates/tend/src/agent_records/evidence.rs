@@ -45,16 +45,21 @@ pub struct TurnEvidence {
     pub complete: bool,
 }
 
-/// The latest calls `session_id` made since `since` (RFC 3339), paired with
-/// their results.
+/// The latest calls `session_id` made since `since` (RFC 3339, the time of
+/// the prompt being reviewed), paired with their results. A turn needs a
+/// start: without one the whole session would pass for this turn's
+/// evidence, so an empty `since` is refused.
 pub fn turn_evidence(
     store: &RecordStore,
     session_id: &str,
-    since: Option<&str>,
+    since: &str,
 ) -> Result<TurnEvidence, String> {
+    if since.trim().is_empty() {
+        return Err("no request time to start the turn from".into());
+    }
     let request = SearchRequest {
         session_id: Some(session_id.to_string()),
-        from: since.map(str::to_string),
+        from: Some(since.to_string()),
         kinds: vec!["tool_call".into(), "tool_result".into()],
         limit: SCAN_EVENTS,
         ..SearchRequest::default()
@@ -80,7 +85,7 @@ pub fn turn_evidence(
                 .find(|other| other.kind == "tool_result" && other.call_id.as_ref() == Some(id))
         });
         let (result_text, result_cut) = result
-            .map(|r| clip(&r.text, RESULT_CHARS))
+            .map(|r| clip_ends(&r.text, RESULT_CHARS))
             .map_or((None, false), |(text, cut)| (Some(text), cut));
         pairs.push(EvidencePair {
             tool: event.tool_name.clone(),
@@ -107,6 +112,21 @@ pub fn turn_evidence(
         more,
         complete: found.coverage.complete,
     })
+}
+
+/// A long result keeps its start and its end, where tools print their
+/// verdict (a failing test, an exit status), and marks the gap.
+fn clip_ends(text: &str, max: usize) -> (String, bool) {
+    let trimmed = text.trim();
+    let count = trimmed.chars().count();
+    if count <= max {
+        return (trimmed.to_string(), false);
+    }
+    let head = max / 4;
+    let tail = max - head;
+    let start: String = trimmed.chars().take(head).collect();
+    let end: String = trimmed.chars().skip(count - tail).collect();
+    (format!("{start}\n…\n{end}"), true)
 }
 
 fn clip(text: &str, max: usize) -> (String, bool) {
@@ -173,15 +193,20 @@ mod tests {
             cache.path().join("index.sqlite3"),
             vec![root.path().to_path_buf()],
         );
-        let evidence = turn_evidence(&store, "s1", Some("2026-11-11T00:30:00Z")).unwrap();
+        let evidence = turn_evidence(&store, "s1", "2026-11-11T00:30:00Z").unwrap();
         assert_eq!(evidence.pairs.len(), 2, "{evidence:?}");
         assert!(evidence.pairs[0].call.contains("cargo test"));
         assert_eq!(evidence.pairs[0].result.as_deref(), Some("test result: ok"));
         assert!(evidence.pairs[1].call.contains("git push"));
         assert_eq!(evidence.pairs[1].result, None, "no result recorded yet");
         assert!(!evidence.more);
-        // Another session's id finds nothing.
-        assert!(turn_evidence(&store, "s2", None).unwrap().pairs.is_empty());
+        // Another session's id finds nothing; without a start, nothing is
+        // read, so an earlier task's commands cannot pass for this turn's.
+        assert!(turn_evidence(&store, "s2", "2026-11-11T00:30:00Z")
+            .unwrap()
+            .pairs
+            .is_empty());
+        assert!(turn_evidence(&store, "s1", "").is_err());
     }
 
     #[test]
@@ -190,5 +215,11 @@ mod tests {
         assert!(cut);
         assert_eq!(text.chars().count(), CALL_CHARS + 1);
         assert_eq!(clip("  short  ", 10), ("short".into(), false));
+        // A long result keeps its verdict at the end.
+        let output = format!("{}\nFAILED: 1 test failed", "line\n".repeat(400));
+        let (kept, cut) = clip_ends(&output, RESULT_CHARS);
+        assert!(cut);
+        assert!(kept.ends_with("FAILED: 1 test failed"));
+        assert!(kept.contains("\n…\n"));
     }
 }

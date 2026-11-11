@@ -937,12 +937,27 @@ struct TendTurnEvidence: Decodable, Hashable, Sendable {
         let isError: Bool?
         let clipped: Bool
         let callEvent: String
+        let resultEvent: String?
 
         enum CodingKeys: String, CodingKey {
             case tool, call, result, clipped
             case isError = "is_error"
             case callEvent = "call_event"
+            case resultEvent = "result_event"
         }
+
+        /// The last lines of the result, where tools print their verdict,
+        /// and whether earlier lines were left out of the card.
+        func resultTail(lines: Int) -> (text: String, cut: Bool)? {
+            guard let result else { return nil }
+            let all = result.split(separator: "\n", omittingEmptySubsequences: false)
+            guard all.count > lines else { return (result, false) }
+            return (all.suffix(lines).joined(separator: "\n"), true)
+        }
+
+        /// The command that prints the full call and result on the host
+        /// that recorded them.
+        var readCommand: String { "tend agent read \(resultEvent ?? callEvent)" }
     }
 
     let pairs: [Pair]
@@ -952,9 +967,9 @@ struct TendTurnEvidence: Decodable, Hashable, Sendable {
 
 /// Reads a local session's recorded commands; set by the review sheet.
 struct FleetEvidenceReader: Sendable {
-    let read: @Sendable (String, String?) async throws -> TendTurnEvidence?
+    let read: @Sendable (String, String) async throws -> TendTurnEvidence?
 
-    init(_ read: @escaping @Sendable (String, String?) async throws -> TendTurnEvidence?) {
+    init(_ read: @escaping @Sendable (String, String) async throws -> TendTurnEvidence?) {
         self.read = read
     }
 }
@@ -980,6 +995,9 @@ struct FleetEvidenceSection: View {
         case loading
         case loaded(TendTurnEvidence)
         case unavailable
+        /// No time for the reviewed prompt: the turn has no start, and the
+        /// whole session's commands would pass for its evidence.
+        case noBoundary
         case failed(String)
     }
 
@@ -1000,6 +1018,10 @@ struct FleetEvidenceSection: View {
                     Text("Reading recorded commands needs an updated tendd.")
                         .font(TendType.meta)
                         .foregroundStyle(.secondary)
+                case .noBoundary:
+                    Text("tend does not know when this request was made, so it cannot tell which recorded commands belong to it.")
+                        .font(TendType.meta)
+                        .foregroundStyle(.secondary)
                 case .failed(let message):
                     Label(message, systemImage: "exclamationmark.circle")
                         .font(TendType.meta)
@@ -1015,9 +1037,13 @@ struct FleetEvidenceSection: View {
                 phase = .unavailable
                 return
             }
+            guard let since = hosted.agent.lastPromptAt, !since.isEmpty else {
+                phase = .noBoundary
+                return
+            }
             phase = .loading
             do {
-                let evidence = try await reader.read(hosted.agent.agentSessionID, hosted.agent.lastPromptAt)
+                let evidence = try await reader.read(hosted.agent.agentSessionID, since)
                 phase = evidence.map(Phase.loaded) ?? .unavailable
             } catch {
                 phase = .failed(error.localizedDescription)
@@ -1055,18 +1081,29 @@ struct FleetEvidenceSection: View {
                                 .font(.system(size: 10))
                                 .foregroundStyle(.secondary)
                         }
+                        let tail = pair.resultTail(lines: 4)
+                        if pair.clipped || tail?.cut == true || pair.call.split(separator: "\n").count > 3 {
+                            Text("preview")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.orange)
+                                .help("Part of this call or result is not shown here; the command below prints it all")
+                        }
                     }
                     Text(verbatim: pair.call)
                         .font(.system(size: 11, design: .monospaced))
                         .lineLimit(3)
                         .textSelection(.enabled)
-                    if let result = pair.result {
-                        Text(verbatim: result)
+                    if let tail = pair.resultTail(lines: 4) {
+                        Text(verbatim: tail.cut ? "…\n" + tail.text : tail.text)
                             .font(.system(size: 11, design: .monospaced))
                             .foregroundStyle(.secondary)
-                            .lineLimit(4)
                             .textSelection(.enabled)
                     }
+                    Text(verbatim: pair.readCommand)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                        .textSelection(.enabled)
+                        .help("Prints the full call and result")
                 }
                 .padding(6)
                 .frame(maxWidth: .infinity, alignment: .leading)

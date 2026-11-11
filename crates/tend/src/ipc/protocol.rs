@@ -75,11 +75,12 @@ pub(super) enum RequestBody {
         request: collaboration::HandleRequest,
     },
     /// `turn_evidence_v1`: the calls `session_id` made since `since`
-    /// (RFC 3339) and their results, from this host's own records.
+    /// (RFC 3339, the reviewed prompt's time) and their results, from this
+    /// host's own records.
     TurnEvidence {
         session_id: String,
-        #[serde(default)]
-        since: Option<String>,
+        /// When the prompt being reviewed was submitted; required.
+        since: String,
     },
     /// Record a claim that a result needs review (`review_items_v1`).
     ReviewCreate {

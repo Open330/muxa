@@ -391,11 +391,7 @@ pub(super) async fn handle(
                     // longer than this, and never on the async workers.
                     let read = tokio::task::spawn_blocking(move || {
                         let store = crate::agent_records::RecordStore::local(&[])?;
-                        crate::agent_records::evidence::turn_evidence(
-                            &store,
-                            &session_id,
-                            since.as_deref(),
-                        )
+                        crate::agent_records::evidence::turn_evidence(&store, &session_id, &since)
                     });
                     match tokio::time::timeout(std::time::Duration::from_secs(15), read).await {
                         Ok(Ok(Ok(evidence))) => Response {

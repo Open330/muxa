@@ -1413,15 +1413,14 @@ actor TendIPCClient {
     /// results, from this Mac's own records (`turn_evidence_v1`). nil from
     /// a daemon without it. Never asked for a remote host's session: a
     /// session id means nothing on another host's records.
-    func turnEvidence(sessionID: String, since: String?) async throws -> TendTurnEvidence? {
+    func turnEvidence(sessionID: String, since: String) async throws -> TendTurnEvidence? {
         guard capabilities.contains("turn_evidence_v1") else { return nil }
-        var request: [String: Any] = [
+        let response = try await call([
             "protocol": Self.protocolVersion,
             "kind": "turn_evidence",
             "session_id": sessionID,
-        ]
-        if let since { request["since"] = since }
-        let response = try await call(request, timeout: 20)
+            "since": since,
+        ], timeout: 20)
         return response.turnEvidence
     }
 
