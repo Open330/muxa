@@ -4442,6 +4442,7 @@ async fn enrich_from_history(
             last_activity_at: entry.at,
             state_entered_at: entry.at,
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
             awaiting_reply: None,
         });

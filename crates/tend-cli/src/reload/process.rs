@@ -87,6 +87,30 @@ impl ProcessTable {
         }
     }
 
+    /// Find the provider process itself, including directly launched panes.
+    /// A wrapper's environment may differ from the child it launches.
+    pub(super) fn provider_process(
+        &self,
+        pane_pid: u32,
+    ) -> Option<(u32, super::provider_home::Variable)> {
+        let mut level = vec![Pid::from_u32(pane_pid)];
+        for _ in 0..8 {
+            for pid in &level {
+                if let Some(variable) = self.system.process(*pid).and_then(|process| {
+                    super::provider_home::variable_for_argv(&Self::argv(process))
+                }) {
+                    return Some((pid.as_u32(), variable));
+                }
+            }
+            level = level
+                .iter()
+                .flat_map(|pid| self.children(*pid))
+                .map(Process::pid)
+                .collect();
+        }
+        None
+    }
+
     /// When the `kind` agent under `pane_pid` started, in Unix seconds. The
     /// agent is the shallowest process whose argv names the program.
     pub(super) fn agent_started(&self, pane_pid: u32, kind: &str) -> Option<u64> {

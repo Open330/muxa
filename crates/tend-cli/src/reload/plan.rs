@@ -721,6 +721,7 @@ mod tests {
             replayable: command.is_some_and(super::super::is_replayable),
             command: command.map(str::to_owned),
             argv: None,
+            provider_home: None,
             agent: None,
         }
     }

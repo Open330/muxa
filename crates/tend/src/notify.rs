@@ -304,6 +304,7 @@ mod tests {
             last_activity_at: datetime!(2026-04-24 12:00:00 UTC),
             state_entered_at: datetime!(2026-04-24 12:00:00 UTC),
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
             awaiting_reply: None,
         }

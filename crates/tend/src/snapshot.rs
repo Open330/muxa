@@ -238,10 +238,9 @@ pub struct SnapshotterOptions {
     /// Coalescing window applied between a `dirty` wakeup and the actual
     /// disk write.
     pub debounce: Duration,
-    /// Longest a change confined to `last_activity_at` waits before it is
-    /// written. Activity stamps move on nearly every hook event and only
-    /// order and age agents after a restart, so they ride along with the
-    /// next material change or are flushed on this slower cadence.
+    /// Longest a change confined to activity/event timestamps waits before it
+    /// is written. Both move on nearly every hook event, so they ride along
+    /// with the next material change or are flushed on this slower cadence.
     pub activity_interval: Duration,
 }
 
@@ -254,7 +253,7 @@ pub const DEFAULT_ACTIVITY_INTERVAL: Duration = Duration::from_secs(30);
 struct Written {
     /// Serialized agents exactly as last written.
     agents: Vec<u8>,
-    /// The same agents with every `last_activity_at` blanked.
+    /// The same agents with activity/event timestamps blanked.
     material: Vec<u8>,
 }
 
@@ -263,7 +262,7 @@ struct Written {
 enum Change {
     /// Byte-identical agents: nothing to write.
     None,
-    /// Only activity stamps moved: may wait for the slow cadence.
+    /// Only activity/event stamps moved: may wait for the slow cadence.
     ActivityOnly,
     /// Anything else: write now.
     Material,
@@ -282,6 +281,7 @@ fn serialize_agents(agents: &[Agent]) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     let mut blanked = agents.to_vec();
     for agent in &mut blanked {
         agent.last_activity_at = OffsetDateTime::UNIX_EPOCH;
+        agent.last_event_at = None;
     }
     Ok((exact, to_bytes(&blanked)?))
 }
@@ -814,6 +814,15 @@ mod tests {
         tx.send(()).unwrap();
         task.await.unwrap();
         assert_eq!(on_disk_activity(&path, "a").await, last);
+        let persisted = load(&path).await;
+        assert_eq!(
+            persisted
+                .iter()
+                .find(|a| a.session_id == "a")
+                .unwrap()
+                .last_event_at,
+            Some(last)
+        );
     }
 
     #[tokio::test]

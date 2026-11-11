@@ -316,6 +316,14 @@ pub struct Agent {
     /// less misleading than a 1970-anchored multi-decade reading.
     #[serde(default = "default_state_entered_at", with = "time::serde::rfc3339")]
     pub state_entered_at: OffsetDateTime,
+    /// Latest ingested adapter-event timestamp. Daemon observations and local
+    /// state transitions must never advance this ordering watermark.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "time::serde::rfc3339::option"
+    )]
+    pub last_event_at: Option<OffsetDateTime>,
     /// Who caused the latest prompt, when tend delivered it: a person via
     /// tend (Home's composer, `tend send`), a peer, automation, or tend
     /// without a declared purpose. `Unknown` when no tend delivery matched
@@ -478,6 +486,7 @@ impl Agent {
             last_activity_at: at,
             state_entered_at: at,
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
             awaiting_reply: None,
         }
@@ -525,7 +534,7 @@ pub struct Transition {
     pub agent: Arc<Agent>,
 }
 
-/// In-process record emitted whenever a `PromptSubmitted` event lands.
+/// In-process record emitted for each fresh `PromptSubmitted` event.
 ///
 /// Sibling to [`Transition`] — sinks subscribe via
 /// [`Store::subscribe_prompts`] and forward these records to external
@@ -921,14 +930,18 @@ fn mutate_for_event(
     ev: &AgentEvent,
     id: &AgentId,
     at: OffsetDateTime,
+    duplicate_prompt: bool,
 ) -> (Option<PromptRecord>, Option<HistoryEntry>, bool) {
     let mut prompt_record: Option<PromptRecord> = None;
     let mut history_entry: Option<HistoryEntry> = None;
     let prev_state = agent.state;
+    let stale_prompt = matches!(ev, AgentEvent::PromptSubmitted { .. })
+        && (duplicate_prompt || agent.last_event_at.is_some_and(|last| at < last));
     // A new Codex prompt or tool execution supersedes a prior quota error.
     // Older tend versions inferred that error from utilization alone and then
     // ignored real work indefinitely. Preserve unrelated errors and agents.
-    if agent.kind == AgentKind::Codex
+    if !stale_prompt
+        && agent.kind == AgentKind::Codex
         && matches!(
             agent.rate_limit_source,
             Some(RateLimitSource::CodexRollout | RateLimitSource::Statusline)
@@ -978,18 +991,6 @@ fn mutate_for_event(
             agent.rate_limit_source = None;
         }
         AgentEvent::PromptSubmitted { prompt, .. } => {
-            agent.pending_command = None;
-            agent.last_prompt = Some(prompt.clone());
-            agent.last_prompt_at = Some(at);
-            agent.state = AgentState::Working;
-            prompt_record = Some(PromptRecord {
-                id: id.clone(),
-                prompt: prompt.clone(),
-                at,
-                model: agent.model.clone(),
-                seq: 0,
-                origin: PromptOrigin::Unknown,
-            });
             let history_key = agent
                 .pane
                 .clone()
@@ -1005,6 +1006,23 @@ fn mutate_for_event(
                     agent.model.clone(),
                 ));
             }
+            // Preserve historical evidence, but a delayed/retried prompt must
+            // not undo a later state transition or overwrite a newer prompt.
+            if stale_prompt {
+                return (None, history_entry, false);
+            }
+            agent.pending_command = None;
+            agent.last_prompt = Some(prompt.clone());
+            agent.last_prompt_at = Some(at);
+            agent.state = AgentState::Working;
+            prompt_record = Some(PromptRecord {
+                id: id.clone(),
+                prompt: prompt.clone(),
+                at,
+                model: agent.model.clone(),
+                seq: 0,
+                origin: PromptOrigin::Unknown,
+            });
         }
         AgentEvent::ToolStarted {
             subagent, command, ..
@@ -1502,8 +1520,8 @@ impl Store {
     /// Subscribe to in-process prompt events.
     ///
     /// One [`PromptRecord`] is broadcast per `PromptSubmitted` event the
-    /// store applies. Independent of the state-transition channel so
-    /// downstream sinks see every prompt — even prompts that don't change
+    /// store accepts as fresh; stale/retried prompts are excluded. Independent
+    /// of the state-transition channel so sinks see prompts that don't change
     /// the agent's state field. Same `Lagged` semantics as
     /// [`Self::subscribe`].
     pub fn subscribe_prompts(&self) -> broadcast::Receiver<PromptRecord> {
@@ -1706,9 +1724,18 @@ impl Store {
         self.apply_with_ask(ev, None).await;
     }
 
+    /// Apply daemon/screen/rollout observations without advancing adapter time.
+    pub async fn apply_observed(&self, ev: &AgentEvent) {
+        self.apply_event(ev, None, false).await;
+    }
+
+    pub async fn apply_with_ask(&self, ev: &AgentEvent, ask_entry: Option<&str>) {
+        self.apply_event(ev, ask_entry, true).await;
+    }
+
     #[allow(clippy::too_many_lines)] // one event transaction, with provenance checked before pane reconciliation
     #[tracing::instrument(level = "debug", skip(self, ev), fields(event_type))]
-    pub async fn apply_with_ask(&self, ev: &AgentEvent, ask_entry: Option<&str>) {
+    async fn apply_event(&self, ev: &AgentEvent, ask_entry: Option<&str>, ingested: bool) {
         let mut sanitized;
         let ev = if ask_entry.is_some() {
             sanitized = ev.clone();
@@ -1855,8 +1882,16 @@ impl Store {
         let metrics_changed = heartbeat_changes_metrics(agent, ev);
         let prev_state = agent.state;
         let prev_question = agent.awaiting_reply().map(|marker| marker.question.clone());
+        let duplicate_prompt = if let AgentEvent::PromptSubmitted { prompt, .. } = ev {
+            !self.history.claim_live_prompt(&id.session_id, at, prompt)
+        } else {
+            false
+        };
         let (mut prompt_record, history_entry, touches_activity) =
-            mutate_for_event(agent, ev, id, at);
+            mutate_for_event(agent, ev, id, at, duplicate_prompt);
+        if ingested {
+            agent.last_event_at = Some(agent.last_event_at.map_or(at, |last| last.max(at)));
+        }
         if let Some(record) = prompt_record.as_mut() {
             // Stamped as the prompt is recorded, under the registry's guard:
             // a delivery can only describe the prompt that consumed it.
@@ -3052,7 +3087,7 @@ impl Store {
         for binding in &adoptable {
             let cwd =
                 (!binding.pane.current_path.is_empty()).then(|| binding.pane.current_path.clone());
-            self.apply(&AgentEvent::Started {
+            self.apply_observed(&AgentEvent::Started {
                 id: AgentId {
                     kind: binding.kind,
                     session_id: binding.session_id.clone(),
@@ -3452,9 +3487,219 @@ mod tests {
             last_activity_at: at,
             state_entered_at: at,
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
             awaiting_reply: None,
         }
+    }
+
+    #[tokio::test]
+    async fn prompt_retry_preserves_history_and_stopped_state() {
+        let store = Store::shared();
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        let mut prompts = store.subscribe_prompts();
+        let prompt = AgentEvent::PromptSubmitted {
+            id: id("retry"),
+            prompt: "hello".into(),
+            at,
+        };
+        store.apply(&prompt).await;
+        store.apply(&prompt).await;
+        assert_eq!(store.history().len().await, 1);
+        assert_eq!(prompts.try_recv().unwrap().prompt, "hello");
+        assert!(prompts.try_recv().is_err());
+        let stopped_at = at + time::Duration::seconds(1);
+        store
+            .apply(&AgentEvent::SessionEnded {
+                id: id("retry"),
+                at: stopped_at,
+            })
+            .await;
+        store.apply(&prompt).await;
+        let agent = store.by_session("retry").await.unwrap();
+        assert_eq!(agent.state, AgentState::Stopped);
+        assert_eq!(agent.state_entered_at, stopped_at);
+        assert_eq!(agent.last_activity_at, stopped_at);
+        assert_eq!(agent.last_prompt.as_deref(), Some("hello"));
+        // Distinct submissions within the same coarse clock tick are valid.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("retry"),
+                prompt: "equal timestamp".into(),
+                at: stopped_at,
+            })
+            .await;
+        assert_eq!(
+            store.by_session("retry").await.unwrap().state,
+            AgentState::Working
+        );
+        // A genuinely newer submission still starts another turn.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("retry"),
+                prompt: "next turn".into(),
+                at: stopped_at + time::Duration::seconds(1),
+            })
+            .await;
+        assert_eq!(
+            store.by_session("retry").await.unwrap().state,
+            AgentState::Working
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_ordering_ignores_daemon_clock_transitions() {
+        for observed_event in [false, true] {
+            let store = Store::shared();
+            let at = OffsetDateTime::now_utc() - time::Duration::seconds(10);
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id: id("clock"),
+                    prompt: "first".into(),
+                    at,
+                })
+                .await;
+            if observed_event {
+                store
+                    .apply_observed(&AgentEvent::SessionEnded {
+                        id: id("clock"),
+                        at: OffsetDateTime::now_utc(),
+                    })
+                    .await;
+            } else {
+                let agent = store.by_session("clock").await.unwrap();
+                store.mark_drained_if_unchanged(&agent).await;
+            }
+            let stopped = store.by_session("clock").await.unwrap();
+            assert_eq!(stopped.state, AgentState::Stopped);
+            assert_eq!(stopped.last_event_at, Some(at));
+            let next_at = at + time::Duration::milliseconds(1);
+            assert!(next_at < stopped.state_entered_at);
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id: id("clock"),
+                    prompt: "real new prompt".into(),
+                    at: next_at,
+                })
+                .await;
+            let resumed = store.by_session("clock").await.unwrap();
+            assert_eq!(resumed.state, AgentState::Working);
+            assert_eq!(resumed.last_event_at, Some(next_at));
+        }
+    }
+
+    #[tokio::test]
+    async fn equal_timestamp_replays_are_suppressed_across_intervening_prompts() {
+        let store = Store::shared();
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        let first = AgentEvent::PromptSubmitted {
+            id: id("tick"),
+            prompt: "first".into(),
+            at,
+        };
+        store.apply(&first).await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("tick"),
+                prompt: "second".into(),
+                at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::SessionEnded { id: id("tick"), at })
+            .await;
+        let mut prompts = store.subscribe_prompts();
+        store.apply(&first).await;
+        let agent = store.by_session("tick").await.unwrap();
+        assert_eq!(agent.state, AgentState::Stopped);
+        assert_eq!(agent.last_prompt.as_deref(), Some("second"));
+        assert!(prompts.try_recv().is_err());
+        assert_eq!(store.history().len().await, 2);
+    }
+
+    #[tokio::test]
+    async fn adapter_watermark_survives_snapshot_and_ignores_old_events() {
+        let store = Store::shared();
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::SessionEnded {
+                id: id("snapshot"),
+                at,
+            })
+            .await;
+        // An older event must not roll back the watermark.
+        store
+            .apply(&AgentEvent::Started {
+                id: id("snapshot"),
+                at: at - time::Duration::seconds(1),
+            })
+            .await;
+        let serialized = serde_json::to_vec(&store.snapshot().await).unwrap();
+        let restored = Store::shared();
+        restored
+            .hydrate(serde_json::from_slice(&serialized).unwrap())
+            .await;
+        assert_eq!(
+            restored.by_session("snapshot").await.unwrap().last_event_at,
+            Some(at)
+        );
+        restored
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("snapshot"),
+                prompt: "too old".into(),
+                at: at - time::Duration::milliseconds(1),
+            })
+            .await;
+        assert!(restored
+            .by_session("snapshot")
+            .await
+            .unwrap()
+            .last_prompt
+            .is_none());
+        let mut legacy = serde_json::to_value(&store.snapshot().await).unwrap();
+        legacy[0].as_object_mut().unwrap().remove("last_event_at");
+        let legacy: Vec<Agent> = serde_json::from_value(legacy).unwrap();
+        assert_eq!(legacy[0].last_event_at, None);
+    }
+
+    #[test]
+    fn stale_codex_prompt_preserves_quota_error_and_pending_command() {
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        let mut agent = stored_agent("retry", AgentKind::Codex, AgentState::Error, None);
+        agent.last_event_at = Some(at + time::Duration::seconds(1));
+        agent.rate_limit_source = Some(RateLimitSource::Statusline);
+        agent.pending_command = Some("pending".into());
+        let event = AgentEvent::PromptSubmitted {
+            id: id("retry"),
+            prompt: "old".into(),
+            at,
+        };
+        let (record, _, touches_activity) =
+            mutate_for_event(&mut agent, &event, event.id(), at, false);
+        assert!(record.is_none());
+        assert!(!touches_activity);
+        assert_eq!(agent.state, AgentState::Error);
+        assert_eq!(agent.rate_limit_source, Some(RateLimitSource::Statusline));
+        assert_eq!(agent.pending_command.as_deref(), Some("pending"));
+    }
+
+    #[tokio::test]
+    async fn older_prompt_cannot_replace_a_newer_prompt_in_the_same_state() {
+        let store = Store::shared();
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        for (prompt, seconds) in [("first", 0), ("latest", 2), ("delayed", 1)] {
+            store
+                .apply(&AgentEvent::PromptSubmitted {
+                    id: id("retry"),
+                    prompt: prompt.into(),
+                    at: at + time::Duration::seconds(seconds),
+                })
+                .await;
+        }
+        let agent = store.by_session("retry").await.unwrap();
+        assert_eq!(agent.last_prompt.as_deref(), Some("latest"));
+        assert_eq!(agent.last_activity_at, at + time::Duration::seconds(2));
+        assert_eq!(store.history().len().await, 3);
     }
 
     #[tokio::test]
@@ -7383,6 +7628,7 @@ mod tests {
                     last_activity_at: mid,
                     state_entered_at: mid,
                     last_prompt_origin: None,
+                    last_event_at: None,
                     last_response_at: None,
                     awaiting_reply: None,
                 },
@@ -7423,6 +7669,7 @@ mod tests {
                     last_activity_at: new,
                     state_entered_at: new,
                     last_prompt_origin: None,
+                    last_event_at: None,
                     last_response_at: None,
                     awaiting_reply: None,
                 },
@@ -7492,6 +7739,7 @@ mod tests {
                         last_activity_at: at,
                         state_entered_at: at,
                         last_prompt_origin: None,
+                        last_event_at: None,
                         last_response_at: None,
                         awaiting_reply: None,
                     },
@@ -7566,6 +7814,7 @@ mod tests {
             last_activity_at: t0,
             state_entered_at: t0,
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
             awaiting_reply: None,
         };
