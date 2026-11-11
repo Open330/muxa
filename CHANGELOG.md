@@ -28,6 +28,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   characters are refused. `tend status-line --needs-attention` adds
   `◇ N to review · <oldest age>`. See `docs/REVIEW.md`.
 
+### Fixed
+
+- `tend restore` no longer leaves resumed Claude panes stuck on the
+  "Accessing workspace — trust this folder?" prompt. Claude asks again on
+  `--resume` when the relaunch bypasses a shell trust helper or a wrapper
+  such as `aas` points it at another account's config. Restore now watches
+  each relaunched Claude pane for up to 20s, and when that prompt is showing
+  it moves the cursor to "Yes, I trust this folder" and confirms. It never
+  presses Enter while "No, exit" is selected (the default in current builds),
+  stops after two arrow presses, and stops watching a pane as soon as
+  Claude's own screen appears. Only the directory the pane was already
+  running Claude in is trusted.
+
 ## [0.10.1] - 2026-11-11
 
 ### Added

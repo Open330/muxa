@@ -157,6 +157,157 @@ impl LaunchWatch {
     }
 }
 
+/// How long relaunched Claude panes are watched for the folder-trust prompt.
+/// The prompt is the first thing Claude draws, so this only has to cover a
+/// slow start; a pane that shows Claude's own screen is let go at once.
+pub(super) const TRUST_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Time a key gets to land before the screen is read as its answer. Without
+/// it, a capture taken before a `Down` was processed would send a second one.
+const KEY_SETTLE: Duration = Duration::from_millis(700);
+
+/// Arrow presses spent looking for the "Yes" row before giving up. The menu
+/// has two rows, so more than this means the screen is not what it seems.
+const MAX_MOVES: u8 = 2;
+
+/// Where the cursor sits on Claude's folder-trust prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrustCursor {
+    OnYes,
+    Elsewhere,
+}
+
+/// Claude's folder-trust prompt, if `screen` shows it.
+///
+/// Claude asks this before it opens a conversation in a directory its
+/// config has not trusted — including on `--resume`, when the pane comes
+/// back under another account's config or the trust was never recorded.
+/// The pane is waiting on that question and nothing else, so a restore
+/// that relaunched it answers it: the directory is the one the operator was
+/// already running Claude in.
+///
+/// Current builds put the cursor on "No, exit" (unnumbered rows); older
+/// builds put it on "1. Yes, proceed". Only the row under the cursor
+/// marker decides, so Enter is never sent while "No" is selected.
+pub(super) fn claude_trust_prompt(screen: &str) -> Option<TrustCursor> {
+    let asks = [
+        "Is this a project you created or one you trust",
+        "Do you trust the files in this folder",
+    ]
+    .iter()
+    .any(|question| screen.contains(question));
+    if !asks {
+        return None;
+    }
+    let is_yes =
+        |row: &str| row.contains("Yes, I trust this folder") || row.contains("Yes, proceed");
+    if !screen.lines().any(is_yes) {
+        return None;
+    }
+    let selected = screen
+        .lines()
+        .map(str::trim_start)
+        .find(|row| row.starts_with('❯') || row.starts_with('>') || row.starts_with('›'))?;
+    Some(if is_yes(selected) {
+        TrustCursor::OnYes
+    } else {
+        TrustCursor::Elsewhere
+    })
+}
+
+/// Whether `screen` is Claude past any startup prompt: its banner, or the
+/// footer under its composer.
+pub(super) fn claude_started(screen: &str) -> bool {
+    [
+        "Claude Code v",
+        "? for shortcuts",
+        "shift+tab to cycle",
+        "esc to interrupt",
+    ]
+    .iter()
+    .any(|marker| screen.contains(marker))
+}
+
+/// A key to send to a pane sitting on the trust prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TrustKey {
+    Down,
+    Enter,
+}
+
+#[derive(Debug, Default)]
+struct TrustPane {
+    moves: u8,
+    last_key: Option<Duration>,
+}
+
+/// Relaunched Claude panes being walked past the folder-trust prompt.
+#[derive(Debug, Default)]
+pub(super) struct TrustWatch {
+    pending: BTreeMap<String, TrustPane>,
+    answered: BTreeSet<String>,
+}
+
+impl TrustWatch {
+    pub fn new(targets: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            pending: targets
+                .into_iter()
+                .map(|target| (target, TrustPane::default()))
+                .collect(),
+            answered: BTreeSet::new(),
+        }
+    }
+
+    pub fn pending(&self) -> impl Iterator<Item = &String> {
+        self.pending.keys()
+    }
+
+    pub fn is_settled(&self) -> bool {
+        self.pending.is_empty()
+    }
+
+    /// Read one capture of `target` and say which key, if any, to send.
+    pub fn observe(&mut self, target: &str, elapsed: Duration, screen: &str) -> Option<TrustKey> {
+        let pane = self.pending.get_mut(target)?;
+        match claude_trust_prompt(screen) {
+            None => {
+                if claude_started(screen) {
+                    self.pending.remove(target);
+                }
+                None
+            }
+            Some(_)
+                if pane
+                    .last_key
+                    .is_some_and(|at| elapsed.saturating_sub(at) < KEY_SETTLE) =>
+            {
+                None
+            }
+            Some(TrustCursor::OnYes) => {
+                self.pending.remove(target);
+                self.answered.insert(target.to_owned());
+                Some(TrustKey::Enter)
+            }
+            Some(TrustCursor::Elsewhere) if pane.moves < MAX_MOVES => {
+                pane.moves += 1;
+                pane.last_key = Some(elapsed);
+                Some(TrustKey::Down)
+            }
+            Some(TrustCursor::Elsewhere) => {
+                // The arrow did not reach "Yes"; leave the prompt to a human.
+                self.pending.remove(target);
+                None
+            }
+        }
+    }
+
+    /// The panes whose prompt was answered.
+    pub fn answered(self) -> BTreeSet<String> {
+        self.answered
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,5 +420,92 @@ mod tests {
             watch.unconfirmed().into_iter().collect::<Vec<_>>(),
             ["=a:0.1"]
         );
+    }
+
+    /// Captured from Claude Code 2.1.322 in a directory it had not trusted.
+    const TRUST_PROMPT_NO: &str = "\
+────────────────────────────────────────────────
+ Accessing workspace:
+
+ /tmp/untrusted-probe
+
+ Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source
+ project, or work from your team). If not, take a moment to review what's in this folder first.
+
+ Claude Code'll be able to read, edit, and execute files here.
+
+ Security guide
+
+ ❯ No, exit
+   Yes, I trust this folder
+
+ Enter to confirm · Esc to cancel
+";
+
+    fn moved_to_yes() -> String {
+        TRUST_PROMPT_NO
+            .replace(" ❯ No, exit", "   No, exit")
+            .replace("   Yes, I trust", " ❯ Yes, I trust")
+    }
+
+    #[test]
+    fn the_trust_prompt_is_read_by_its_cursor_row() {
+        assert_eq!(
+            claude_trust_prompt(TRUST_PROMPT_NO),
+            Some(TrustCursor::Elsewhere)
+        );
+        assert_eq!(
+            claude_trust_prompt(&moved_to_yes()),
+            Some(TrustCursor::OnYes)
+        );
+        // Older builds: numbered rows, "Yes" first.
+        let older =
+            " Do you trust the files in this folder?\n\n ❯ 1. Yes, proceed\n   2. No, exit\n";
+        assert_eq!(claude_trust_prompt(older), Some(TrustCursor::OnYes));
+        // A conversation that merely quotes the words is not the prompt.
+        assert_eq!(
+            claude_trust_prompt("❯ why does it say Yes, I trust this folder?\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_trust_prompt_is_walked_to_yes_before_enter() {
+        let mut watch = TrustWatch::new(["=a:0.0".to_owned()]);
+        assert_eq!(
+            watch.observe("=a:0.0", ms(0), TRUST_PROMPT_NO),
+            Some(TrustKey::Down)
+        );
+        // The arrow has not landed yet: no second key on a stale screen.
+        assert_eq!(watch.observe("=a:0.0", ms(300), TRUST_PROMPT_NO), None);
+        assert_eq!(
+            watch.observe("=a:0.0", ms(900), &moved_to_yes()),
+            Some(TrustKey::Enter)
+        );
+        assert!(watch.is_settled());
+        assert_eq!(watch.answered().into_iter().collect::<Vec<_>>(), ["=a:0.0"]);
+    }
+
+    #[test]
+    fn enter_is_never_sent_while_no_is_selected() {
+        let mut watch = TrustWatch::new(["=a:0.0".to_owned()]);
+        let mut keys = Vec::new();
+        for step in 0..20 {
+            keys.extend(watch.observe("=a:0.0", ms(step * 1000), TRUST_PROMPT_NO));
+        }
+        assert_eq!(keys, [TrustKey::Down, TrustKey::Down]);
+        assert!(watch.is_settled(), "given up, left to a human");
+        assert!(watch.answered().is_empty());
+    }
+
+    #[test]
+    fn a_claude_that_starts_without_the_prompt_is_let_go() {
+        let mut watch = TrustWatch::new(["=a:0.0".to_owned(), "=a:0.1".to_owned()]);
+        assert_eq!(watch.observe("=a:0.0", ms(0), ""), None);
+        assert_eq!(
+            watch.observe("=a:0.0", ms(500), " ▐▛███▜▌   Claude Code v2.1.322\n❯ \n"),
+            None
+        );
+        assert_eq!(watch.pending().cloned().collect::<Vec<_>>(), ["=a:0.1"]);
     }
 }
