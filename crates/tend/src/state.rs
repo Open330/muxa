@@ -119,6 +119,11 @@ fn normalize_hydrated_agent(mut agent: Agent) -> Agent {
         agent.state = AgentState::Idle;
         agent.state_entered_at = agent.last_activity_at;
     }
+    // A marker survives a restart only on the idle row it was set on;
+    // hydration replays no transition, so it notifies nobody again.
+    if agent.state != AgentState::Idle {
+        agent.awaiting_reply = None;
+    }
     agent
 }
 
@@ -327,6 +332,65 @@ pub struct Agent {
         with = "time::serde::rfc3339::option"
     )]
     pub last_response_at: Option<OffsetDateTime>,
+    /// The latest turn ended by asking the person something, inferred from
+    /// `last_response` (`crate::awaiting_reply`). Meaningful only while the
+    /// row is `Idle`; read it through [`Agent::awaiting_reply`]. A persisted
+    /// inference, not a request: an explicit `tend_request_attention` stays
+    /// the authoritative human request. Additive on the wire
+    /// (`awaiting_reply_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_reply: Option<AwaitingReply>,
+}
+
+/// What an idle agent asked the person at the end of its turn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AwaitingReply {
+    /// The sentence that asked, trimmed for display, so a person can see
+    /// why the row is listed and judge a false positive.
+    pub question: String,
+    /// When the turn that asked it stopped. Kept across repeated
+    /// observations of the same question.
+    #[serde(with = "time::serde::rfc3339")]
+    pub since: OffsetDateTime,
+}
+
+/// Capability a daemon advertises once its rows carry `awaiting_reply`.
+pub const AWAITING_REPLY_CAPABILITY: &str = "awaiting_reply_v1";
+
+impl Agent {
+    /// The question this agent is waiting on the person to answer: set only
+    /// while the row is `Idle`, so a stale marker on a row another writer
+    /// moved on is never read.
+    #[must_use]
+    pub fn awaiting_reply(&self) -> Option<&AwaitingReply> {
+        if self.state == AgentState::Idle {
+            self.awaiting_reply.as_ref()
+        } else {
+            None
+        }
+    }
+}
+
+/// The marker a response-bearing stop leaves: what the response asks, unless
+/// the prompt it answers came from a peer or automation (the question is for
+/// that sender). `since` is kept when the same question is observed again.
+fn awaiting_reply_after(
+    agent: &Agent,
+    response: &str,
+    at: OffsetDateTime,
+) -> Option<AwaitingReply> {
+    if matches!(
+        agent.last_prompt_origin,
+        Some(PromptOrigin::Peer | PromptOrigin::Automation)
+    ) {
+        return None;
+    }
+    let question = crate::awaiting_reply::classify(response)?;
+    let since = match &agent.awaiting_reply {
+        Some(existing) if existing.question == question => existing.since,
+        _ => at,
+    };
+    Some(AwaitingReply { question, since })
 }
 
 fn default_state_entered_at() -> OffsetDateTime {
@@ -415,6 +479,7 @@ impl Agent {
             state_entered_at: at,
             last_prompt_origin: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 
@@ -1006,7 +1071,12 @@ fn mutate_for_event(
             ..
         } => {
             agent.pending_command = None;
+            // Every response-bearing stop decides the marker afresh: an
+            // answer that no longer asks clears an earlier question. A
+            // response-less stop says nothing about the text, so it keeps
+            // the current marker (cleared below if the row leaves Idle).
             if let Some(text) = response {
+                agent.awaiting_reply = awaiting_reply_after(agent, text, at);
                 agent.last_response = Some(text.clone());
                 agent.last_response_at = Some(at);
             }
@@ -1782,6 +1852,7 @@ impl Store {
         }
         let metrics_changed = heartbeat_changes_metrics(agent, ev);
         let prev_state = agent.state;
+        let prev_question = agent.awaiting_reply().map(|marker| marker.question.clone());
         let (mut prompt_record, history_entry, touches_activity) =
             mutate_for_event(agent, ev, id, at);
         if let Some(record) = prompt_record.as_mut() {
@@ -1802,11 +1873,25 @@ impl Store {
         if touches_activity {
             agent.last_activity_at = at;
         }
+        // Only an idle row asks: whatever moved it on (a prompt, a tool, an
+        // error, the overrides above) retires the question.
+        if agent.state != AgentState::Idle {
+            agent.awaiting_reply = None;
+        }
+        // A question newly asked on a row that stays Idle (a Codex rollout
+        // answer arriving after the stop, a second idle turn) changes no
+        // state, but it is news to the notifier: broadcast it as Idle → Idle.
+        let new_question = agent
+            .awaiting_reply()
+            .is_some_and(|marker| prev_question.as_deref() != Some(marker.question.as_str()));
 
         let stopped_launch = (agent.state == AgentState::Stopped).then(|| id.session_id.clone());
-        let visible_change =
-            new_agent || metrics_changed || touches_activity || agent.state != prev_state;
-        if agent.state != prev_state {
+        let visible_change = new_agent
+            || metrics_changed
+            || touches_activity
+            || agent.state != prev_state
+            || new_question;
+        if agent.state != prev_state || new_question {
             // Wrap the post-transition snapshot in an `Arc` exactly once
             // here; the broadcast channel then bumps the refcount per
             // subscriber instead of memcpy-ing the whole `Agent` (which
@@ -3363,6 +3448,7 @@ mod tests {
             state_entered_at: at,
             last_prompt_origin: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 
@@ -5306,6 +5392,172 @@ mod tests {
         assert_eq!(agent.state, AgentState::Idle);
     }
 
+    fn stop(session: &str, response: Option<&str>, at: OffsetDateTime) -> AgentEvent {
+        AgentEvent::TurnStopped {
+            id: id(session),
+            response: response.map(Into::into),
+            recap: None,
+            ai_title: None,
+            idle_confirmed: false,
+            at,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_asks_is_awaiting_a_reply_until_the_next_prompt() {
+        let store = Store::shared();
+        let mut transitions = store.subscribe();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        let t1 = datetime!(2026-04-24 12:01:00 UTC);
+        let t2 = datetime!(2026-04-24 12:02:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        store
+            .apply(&stop("s", Some("끝났습니다.\n\n머지해도 될까요?"), t0))
+            .await;
+        let agent = store.by_session("s").await.unwrap();
+        let marker = agent.awaiting_reply().expect("asked");
+        assert_eq!(marker.question, "머지해도 될까요?");
+        assert_eq!(marker.since, t0);
+
+        // The same question observed again keeps its first moment.
+        store
+            .apply(&stop("s", Some("끝났습니다.\n\n머지해도 될까요?"), t1))
+            .await;
+        let agent = store.by_session("s").await.unwrap();
+        assert_eq!(agent.awaiting_reply().unwrap().since, t0);
+
+        // The person answers: the question is retired.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("s"),
+                prompt: "네".into(),
+                at: t2,
+            })
+            .await;
+        let agent = store.by_session("s").await.unwrap();
+        assert_eq!(agent.state, AgentState::Working);
+        assert!(agent.awaiting_reply.is_none());
+
+        // The question is broadcast once; observing it again on the same
+        // Idle row broadcasts nothing new.
+        let mut seen = Vec::new();
+        while let Ok(t) = transitions.try_recv() {
+            seen.push((t.from, t.to, t.agent.awaiting_reply.is_some()));
+        }
+        let asked = seen
+            .iter()
+            .filter(|(_, to, asks)| *to == AgentState::Idle && *asks)
+            .count();
+        assert_eq!(asked, 1, "{seen:?}");
+    }
+
+    #[tokio::test]
+    async fn an_answer_that_no_longer_asks_clears_the_question() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        store.apply(&stop("s", Some("진행할까요?"), t0)).await;
+        // A response-less stop says nothing about the text: kept.
+        store.apply(&stop("s", None, t0)).await;
+        assert!(store
+            .by_session("s")
+            .await
+            .unwrap()
+            .awaiting_reply()
+            .is_some());
+        store
+            .apply(&stop("s", Some("배포까지 끝났습니다."), t0))
+            .await;
+        assert!(store
+            .by_session("s")
+            .await
+            .unwrap()
+            .awaiting_reply
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_question_arriving_on_an_idle_row_is_broadcast() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        store.apply(&stop("s", None, t0)).await;
+        let mut transitions = store.subscribe();
+        store
+            .apply(&stop("s", Some("Should I open the PR?"), t0))
+            .await;
+        let t = transitions.try_recv().expect("broadcast");
+        assert_eq!((t.from, t.to), (AgentState::Idle, AgentState::Idle));
+        assert_eq!(
+            t.agent.awaiting_reply().map(|m| m.question.as_str()),
+            Some("Should I open the PR?")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_peer_prompt_question_is_for_the_peer() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        {
+            let mut agents = store.agents.write().await;
+            let agent = agents.values_mut().next().unwrap();
+            agent.last_prompt_origin = Some(PromptOrigin::Peer);
+        }
+        store
+            .apply(&stop("s", Some("Should I also fix the tests?"), t0))
+            .await;
+        assert!(store
+            .by_session("s")
+            .await
+            .unwrap()
+            .awaiting_reply
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn hydration_keeps_a_question_only_on_an_idle_row() {
+        let store = Store::shared();
+        let t0 = datetime!(2026-04-24 12:00:00 UTC);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("s"),
+                at: t0,
+            })
+            .await;
+        let mut agent = store.by_session("s").await.unwrap();
+        agent.awaiting_reply = Some(AwaitingReply {
+            question: "진행할까요?".into(),
+            since: datetime!(2026-04-24 12:00:00 UTC),
+        });
+        agent.state = AgentState::Idle;
+        assert!(normalize_hydrated_agent(agent.clone())
+            .awaiting_reply
+            .is_some());
+        agent.state = AgentState::Working;
+        assert!(normalize_hydrated_agent(agent).awaiting_reply.is_none());
+    }
+
     #[tokio::test]
     async fn turn_stopped_without_response_preserves_prior_value() {
         let store = Store::shared();
@@ -7088,6 +7340,7 @@ mod tests {
                     state_entered_at: mid,
                     last_prompt_origin: None,
                     last_response_at: None,
+                    awaiting_reply: None,
                 },
             );
             agents.insert(
@@ -7127,6 +7380,7 @@ mod tests {
                     state_entered_at: new,
                     last_prompt_origin: None,
                     last_response_at: None,
+                    awaiting_reply: None,
                 },
             );
         }
@@ -7195,6 +7449,7 @@ mod tests {
                         state_entered_at: at,
                         last_prompt_origin: None,
                         last_response_at: None,
+                        awaiting_reply: None,
                     },
                 );
             }
@@ -7268,6 +7523,7 @@ mod tests {
             state_entered_at: t0,
             last_prompt_origin: None,
             last_response_at: None,
+            awaiting_reply: None,
         };
         let inserted = store
             .seed_if_absent(vec![

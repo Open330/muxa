@@ -49,6 +49,7 @@ pub mod automation;
 pub mod automation_choice;
 pub mod automation_defaults;
 pub mod automation_judge;
+pub mod awaiting_reply;
 pub mod backend;
 pub mod binary_upgrade;
 pub mod child_env;

@@ -49,9 +49,22 @@ enum TendNotificationRules {
     /// tendd's notifier uses the same window (`crates/tend/src/notify.rs`).
     static let debounce: TimeInterval = 30
 
+    /// The state a notification compares: the raw state, or `asked:` and the
+    /// question for an idle agent whose turn ended on one, so each new
+    /// question notifies once even though the agent stays idle.
+    static func key(_ agent: TendAgent) -> String {
+        if case .asked(let question) = agent.status { return askedPrefix + question }
+        return agent.state
+    }
+
+    static let askedPrefix = "asked:"
+
     static func event(from previous: String, to current: String) -> Event? {
         if TendAttention.states.contains(current), previous != current {
             return .attention(current)
+        }
+        if current.hasPrefix(askedPrefix), previous != current {
+            return .attention("asked")
         }
         // Only a turn that was actually working finishes: every new agent
         // passes starting → idle on its way up, and tendd's notifier skips
@@ -114,7 +127,7 @@ enum TendNotificationActions {
 
     static func category(for event: TendNotificationRules.Event) -> String {
         switch event {
-        case .attention("waiting_input"): inputCategory
+        case .attention("waiting_input"), .attention("asked"): inputCategory
         case .limited: limitedCategory
         default: agentCategory
         }
@@ -471,7 +484,7 @@ final class TendAgentAttentionCenter: ObservableObject {
     private func postTransitions(in snapshot: TendExecutionSnapshot, at date: Date) {
         var current: [String: String] = [:]
         for hosted in snapshot.hostedAgents {
-            let state = hosted.agent.state
+            let state = TendNotificationRules.key(hosted.agent)
             current[hosted.id] = state
             guard let previous = previousStates[hosted.id],
                   let observed = TendNotificationRules.event(from: previous, to: state) else { continue }
@@ -520,10 +533,15 @@ final class TendAgentAttentionCenter: ObservableObject {
             case "waiting_choice": title = String(localized: "\(name) is waiting for a choice")
             case "error", "failed": title = String(localized: "\(name) hit an error")
             case "blocked": title = String(localized: "\(name) is blocked")
+            case "asked": title = String(localized: "\(name) asked you")
             default: title = String(localized: "\(name) needs your input")
             }
-            body = TendNotificationRules.body(agent.lastNotification)
-                ?? TendNotificationRules.body(agent.lastResponse)
+            if state == "asked", case .asked(let question) = agent.status {
+                body = TendNotificationRules.body(question)
+            } else {
+                body = TendNotificationRules.body(agent.lastNotification)
+                    ?? TendNotificationRules.body(agent.lastResponse)
+            }
         case .finished:
             title = String(localized: "\(name) finished")
             body = TendNotificationRules.body(agent.lastResponse)

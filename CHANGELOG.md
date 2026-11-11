@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- An agent that ends its turn by asking you something in prose ("머지해도
+  될까요?", "Should I drop the legacy path?") now counts as waiting on you
+  instead of plain idle: `tend attend`, the tmux status segment, `tend peek`,
+  the tendd notifier and the Mac app (Home's "Your turn" lane with the
+  question and a reply field, the menu bar and Dock counts, an "asked you"
+  notification) list it until the next prompt. tend infers this from the
+  turn's last response; self-answered questions, quotes, code, courtesy
+  closers and offers do not count. Rows carry `awaiting_reply`
+  (`awaiting_reply_v1`); their state stays `idle`, so older clients are
+  unaffected.
+- tend's MCP server tells every agent to use `tend_request_attention` when it
+  is blocked on a decision only the person can make, instead of only asking
+  in prose.
+
+### Fixed
+
+- A long assistant response kept only its first 4 KB, losing its ending;
+  responses now keep their start and end.
+
 ### Fixed
 
 - `scripts/migrate-from-muxa.py` now renames MCP tool names left in prompt

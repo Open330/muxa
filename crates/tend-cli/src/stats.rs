@@ -3516,6 +3516,7 @@ pub(crate) mod tests {
             state_entered_at,
             last_prompt_origin: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 

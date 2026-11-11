@@ -517,6 +517,7 @@ mod tests {
             state_entered_at: datetime!(2026-04-30 12:00:00 UTC),
             last_prompt_origin: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 

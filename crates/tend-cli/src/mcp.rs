@@ -67,8 +67,13 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Sent to MCP hosts during initialization so collaboration is a first-class
 /// workflow rather than a capability the model has to infer from tool names.
-const MCP_SERVER_INSTRUCTIONS: &str =
-    "Read tend_collaboration_guide once. Delivery is not task success; reported_status is peer-declared.";
+///
+/// The last sentence reaches every agent whatever its task. The
+/// agent-integration bootstrap carries the same rule, but agents read it
+/// only for Tend work, so an agent on ordinary work would end its turn on a
+/// prose question that tend can only infer (`tend::awaiting_reply`).
+const MCP_SERVER_INSTRUCTIONS: &str = "Read tend_collaboration_guide once. Delivery is not task success; reported_status is peer-declared. \
+     When you are blocked on a decision, approval or information only the person can give, call tend_request_attention with the question instead of only asking in prose.";
 
 /// How often `tend_wait_for_change` reconciles against a fresh daemon
 /// snapshot while blocking on the transition stream. A broadcast lag on the
@@ -1038,7 +1043,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_request_attention",
-            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Tend Mac app. Explain what decision is needed, why, options and recommendation. Reuse the returned request ID and wait via tend_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work.",
+            "description": "Request a required human approval, choice, or missing information. Creates one durable operator request on this host, visible in every connected Fleet client including the Tend Mac app. Explain what decision is needed, why, options and recommendation. Reuse the returned request ID and wait via tend_wait_reply; never treat timeout or delivery as approval. Use only when a person is required, not for routine progress or peer work; that includes ending your turn on a question only the person can answer.",
             "inputSchema": {
                 "type": "object",
                 "properties": {

@@ -1623,11 +1623,7 @@ fn meta_line(cell: &PeekCell, width: u16) -> Option<Line<'static>> {
 pub(crate) fn hint_line(cells: &[PeekCell], pending: &str) -> Line<'static> {
     let blocked = cells
         .iter()
-        .filter(|c| {
-            c.agent
-                .as_ref()
-                .is_some_and(|a| attend::needs_attention(a.state))
-        })
+        .filter(|c| c.agent.as_ref().is_some_and(attend::agent_needs_attention))
         .count();
     let mut spans = Vec::new();
     if blocked > 0 {
@@ -2494,6 +2490,7 @@ mod tests {
             state_entered_at: now,
             last_prompt_origin: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
     }
 

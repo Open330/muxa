@@ -354,9 +354,45 @@ pub(crate) fn truncate(mut s: String, max: usize) -> String {
     s
 }
 
+/// Bytes of an assistant response kept on an event, from its start and from
+/// its end. A response is bounded like a prompt, but its *end* matters too:
+/// that is where an agent asks the person something
+/// (`crate::awaiting_reply`), so a long answer keeps both ends.
+const RESPONSE_HEAD_BYTES: usize = 2_800;
+const RESPONSE_TAIL_BYTES: usize = 1_200;
+
+/// Bound an assistant response to about 4 KB, keeping its start and its end
+/// with an elided middle marked by a paragraph holding a single ellipsis.
+pub(crate) fn truncate_response(s: String) -> String {
+    if s.len() <= RESPONSE_HEAD_BYTES + RESPONSE_TAIL_BYTES {
+        return s;
+    }
+    let mut head_end = RESPONSE_HEAD_BYTES;
+    while !s.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = s.len() - RESPONSE_TAIL_BYTES;
+    while !s.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    format!("{}\n\n…\n\n{}", &s[..head_end], &s[tail_start..])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_response_keeps_both_ends() {
+        let text = format!("시작 {}\n\n머지해도 될까요?", "가".repeat(3_000));
+        let bounded = truncate_response(text.clone());
+        assert!(bounded.len() < text.len());
+        assert!(bounded.len() <= RESPONSE_HEAD_BYTES + RESPONSE_TAIL_BYTES + 8);
+        assert!(bounded.starts_with("시작"));
+        assert!(bounded.ends_with("머지해도 될까요?"));
+        assert!(bounded.contains("\n\n…\n\n"));
+        assert_eq!(truncate_response("short".into()), "short");
+    }
 
     /// Build a `read` closure from a static lookup table, matching the
     /// `backend::tests::env_reader` shape. Missing keys read as `None`.

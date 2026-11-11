@@ -23330,6 +23330,36 @@
           }
         }
       }
+    },
+    "Asked you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "답을 기다림"
+          }
+        }
+      }
+    },
+    "Asking" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "질문함"
+          }
+        }
+      }
+    },
+    "%@ asked you" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%@이(가) 물어봤습니다"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
