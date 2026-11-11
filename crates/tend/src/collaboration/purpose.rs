@@ -493,7 +493,8 @@ impl CollaborationStore {
         Ok(())
     }
 
-    #[cfg(test)]
+    // Only the Linux-only restart test asks.
+    #[cfg(all(test, target_os = "linux"))]
     async fn has_pending_worker_launches(&self) -> bool {
         self.purposes
             .read()

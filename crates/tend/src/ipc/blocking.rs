@@ -30,6 +30,9 @@ pub fn blocking_call(
     req: &serde_json::Value,
     deadline: Duration,
 ) -> Option<serde_json::Value> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+    use transport::Stream;
+
     // A named pipe opened as a file cannot bound a read, so the call runs on
     // the async transport instead, on a thread of its own: the caller may
     // itself be inside a runtime, which cannot be blocked on from within.
