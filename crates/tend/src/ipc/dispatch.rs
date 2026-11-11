@@ -389,7 +389,8 @@ pub(super) async fn handle(
                 | RequestBody::ReviewGet { .. }
                 | RequestBody::ReviewList { .. }
                 | RequestBody::ReviewSummary
-                | RequestBody::ReviewDispose { .. }) => {
+                | RequestBody::ReviewDispose { .. }
+                | RequestBody::ReviewRecord { .. }) => {
                     // One boxed arm keeps this dispatch frame from growing.
                     let (name, response) = Box::pin(review_response(&reviews, body)).await;
                     kind = name;

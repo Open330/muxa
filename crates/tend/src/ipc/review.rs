@@ -52,6 +52,17 @@ pub(super) async fn review_response(
                 .await
                 .map(Response::with_review_item),
         ),
+        RequestBody::ReviewRecord {
+            review,
+            disposition,
+            note,
+        } => (
+            "review_record",
+            reviews
+                .record(*review, disposition, note)
+                .await
+                .map(Response::with_review_item),
+        ),
         _ => return ("review", Response::err("not a review request")),
     };
     match result {

@@ -984,6 +984,8 @@ private struct TendIPCResponse: Decodable, Sendable {
     let askEnabled: Bool?
     let askProviders: [TendAskProvider]?
     let workCommand: TendWorkCommandOutput?
+    let reviewItems: [TendReviewItem]?
+    let reviewItem: TendReviewItem?
     /// `swap_health`'s answer. Swap job requests also answer in `swap`,
     /// with another shape: that reads as nil rather than failing the reply.
     let swap: TendLenient<TendSwapHealth>?
@@ -995,6 +997,8 @@ private struct TendIPCResponse: Decodable, Sendable {
         case fleetResult = "fleet_result"
         case pipelineRuns = "pipeline_runs"
         case workCommand = "work_command"
+        case reviewItems = "review_items"
+        case reviewItem = "review_item"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
@@ -1405,6 +1409,53 @@ actor TendIPCClient {
         guard result.accepted else {
             throw TendIPCError.server(result.message ?? "Keys were rejected")
         }
+    }
+
+    /// Open review items on this Mac's daemon (`review_items_v1`), newest
+    /// first. A review item is someone's explicit request that a result be
+    /// looked at; tend never creates one on its own.
+    func reviewItems(limit: Int = 100) async throws -> [TendReviewItem] {
+        guard capabilities.contains("review_items_v1") else { return [] }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "review_list",
+            "open_only": true,
+            "limit": limit,
+        ])
+        return response.reviewItems ?? []
+    }
+
+    /// Accept, return or withdraw a review item, as the person.
+    func decideReview(id: String, disposition: TendReviewDisposition, note: String?) async throws {
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "review_dispose",
+            "id": id,
+            "disposition": disposition.rawValue,
+            "by": ["kind": "user", "label": "Tend.app"],
+        ]
+        if let note, !note.isEmpty { request["note"] = note }
+        _ = try await call(request)
+    }
+
+    /// Records that the person reviewed a result, asked and accepted in one
+    /// step (`review_record_v1`), so it shows in `tend review list --all` on
+    /// this Mac. Idempotent per `key`. False when the daemon cannot record.
+    @discardableResult
+    func recordReviewed(target: TendReviewTargetRef, key: String, summary: String) async throws -> Bool {
+        guard capabilities.contains("review_record_v1") else { return false }
+        _ = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "review_record",
+            "review": [
+                "target": target.json,
+                "summary": summary,
+                "idempotency_key": key,
+                "requested_by": ["kind": "user", "label": "Tend.app"],
+            ],
+            "disposition": TendReviewDisposition.accepted.rawValue,
+        ])
+        return true
     }
 
     /// The host's receipted worktrees and what would stop a cleanup from

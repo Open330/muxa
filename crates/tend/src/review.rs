@@ -18,6 +18,9 @@ use time::OffsetDateTime;
 
 /// Advertised by daemons that serve the `review_*` requests.
 pub const REVIEW_CAPABILITY: &str = "review_items_v1";
+/// The daemon records a claim and its disposition together
+/// ([`ReviewStore::record`]).
+pub const REVIEW_RECORD_CAPABILITY: &str = "review_record_v1";
 
 const SCHEMA_VERSION: i64 = 1;
 const SCHEMA: &str = "
@@ -508,6 +511,30 @@ impl ReviewStore {
         .await
     }
 
+    /// Record a claim already decided, in one transaction: a person who
+    /// says "I reviewed this" both asks and answers. Needs an idempotency
+    /// key: a retry returns the same item, an open item under that key is
+    /// decided, and a different disposition on a decided one conflicts.
+    /// Both events are logged.
+    pub async fn record(
+        &self,
+        new: NewReview,
+        kind: DispositionKind,
+        note: Option<String>,
+    ) -> Result<ReviewItem, ReviewError> {
+        new.validate()?;
+        if new.idempotency_key.is_none() {
+            return Err(ReviewError::Invalid(
+                "recording a decided review needs an idempotency key".into(),
+            ));
+        }
+        if let Some(note) = &note {
+            bounded("note", note, MAX_NOTE_BYTES, Text::Prose)?;
+        }
+        self.with(move |connection| record(connection, new, kind, note, OffsetDateTime::now_utc()))
+            .await
+    }
+
     /// Record a disposition. Repeating the same disposition is idempotent;
     /// a different one on a disposed item conflicts.
     pub async fn dispose(
@@ -655,6 +682,98 @@ fn create(
     Ok(item)
 }
 
+fn record(
+    connection: &mut Connection,
+    new: NewReview,
+    kind: DispositionKind,
+    note: Option<String>,
+    now: OffsetDateTime,
+) -> Result<ReviewItem, ReviewError> {
+    let by = new.requested_by.clone();
+    let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let key = new.idempotency_key.clone().unwrap_or_default();
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT body FROM review_items WHERE idempotency_key = ?1",
+            params![key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let mut item = if let Some(body) = existing {
+        let item: ReviewItem = serde_json::from_str(&body)?;
+        if item.target != new.target {
+            return Err(ReviewError::Conflict(format!(
+                "idempotency key {key:?} already names review {} for another target",
+                item.id
+            )));
+        }
+        if let Some(existing) = &item.disposition {
+            if existing.kind == kind {
+                return Ok(item);
+            }
+            return Err(ReviewError::Conflict(format!(
+                "review {} is already {}",
+                item.id,
+                existing.kind.as_str()
+            )));
+        }
+        item
+    } else {
+        let target_key = new.target.key();
+        let previous: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(generation), 0) FROM review_items WHERE target_key = ?1",
+            params![target_key],
+            |row| row.get(0),
+        )?;
+        let item = ReviewItem {
+            id: format!("rv_{}", uuid::Uuid::new_v4().simple()),
+            target: new.target,
+            generation: u64::try_from(previous).unwrap_or(0) + 1,
+            summary: new.summary,
+            anchor: new.anchor,
+            idempotency_key: new.idempotency_key,
+            requested_at: now,
+            requested_by: new.requested_by,
+            disposition: None,
+        };
+        tx.execute(
+            "INSERT INTO review_items
+                   (id, target_key, generation, idempotency_key, requested_at_ns, body)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                item.id,
+                target_key,
+                i64::try_from(item.generation).unwrap_or(i64::MAX),
+                item.idempotency_key,
+                nanos(now),
+                serde_json::to_string(&item)?,
+            ],
+        )?;
+        tx.execute(
+                "INSERT INTO review_events (item_id, at_ns, event, actor_kind) VALUES (?1, ?2, 'requested', ?3)",
+                params![item.id, nanos(now), item.requested_by.kind.as_str()],
+            )?;
+        item
+    };
+    let actor_kind = by.kind;
+    item.disposition = Some(ReviewDisposition {
+        kind,
+        by,
+        at: now,
+        note,
+    });
+    tx.execute(
+        "UPDATE review_items SET disposed_at_ns = ?2, body = ?3 WHERE id = ?1",
+        params![item.id, nanos(now), serde_json::to_string(&item)?],
+    )?;
+    tx.execute(
+        "INSERT INTO review_events (item_id, at_ns, event, actor_kind) VALUES (?1, ?2, ?3, ?4)",
+        params![item.id, nanos(now), kind.as_str(), actor_kind.as_str()],
+    )?;
+    tx.commit()?;
+    Ok(item)
+}
+
 fn dispose(
     connection: &mut Connection,
     id: &str,
@@ -738,6 +857,72 @@ mod tests {
             kind: ActorKind::User,
             label: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_decided_review_is_recorded_once_with_both_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("reviews.sqlite3");
+        let store = ReviewStore::open(&path).unwrap();
+        let mut mine = claim(session("s1"), Some("home:abc"));
+        mine.requested_by = user();
+        let item = store
+            .record(mine.clone(), DispositionKind::Accepted, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            item.disposition.as_ref().unwrap().kind,
+            DispositionKind::Accepted
+        );
+        assert!(!item.is_open());
+        assert_eq!(event_count(&path), 2, "requested and accepted");
+        // A retry (the reply was lost) returns the same item, logs nothing.
+        let again = store
+            .record(mine.clone(), DispositionKind::Accepted, None)
+            .await
+            .unwrap();
+        assert_eq!(again.id, item.id);
+        assert_eq!(event_count(&path), 2);
+        // A different decision conflicts; another target under the key
+        // conflicts; no key is refused.
+        assert!(matches!(
+            store
+                .record(mine.clone(), DispositionKind::Withdrawn, None)
+                .await,
+            Err(ReviewError::Conflict(_))
+        ));
+        let mut elsewhere = mine.clone();
+        elsewhere.target = session("s2");
+        assert!(matches!(
+            store
+                .record(elsewhere, DispositionKind::Accepted, None)
+                .await,
+            Err(ReviewError::Conflict(_))
+        ));
+        let mut keyless = mine.clone();
+        keyless.idempotency_key = None;
+        assert!(matches!(
+            store.record(keyless, DispositionKind::Accepted, None).await,
+            Err(ReviewError::Invalid(_))
+        ));
+        // An open claim under the key is decided, not duplicated.
+        let open = store
+            .create(claim(session("s3"), Some("k3")))
+            .await
+            .unwrap();
+        let mut decide = claim(session("s3"), Some("k3"));
+        decide.requested_by = user();
+        let decided = store
+            .record(
+                decide,
+                DispositionKind::Returned,
+                Some("tests missing".into()),
+            )
+            .await
+            .unwrap();
+        assert_eq!(decided.id, open.id);
+        assert_eq!(decided.disposition.unwrap().kind, DispositionKind::Returned);
+        assert_eq!(store.summary().await.unwrap().open, 0);
     }
 
     #[tokio::test]

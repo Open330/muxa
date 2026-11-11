@@ -33,6 +33,7 @@ struct FleetReviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            FleetReviewRequests(model: model)
             let queue = queue
             Group {
                 if queue.isEmpty {
@@ -912,6 +913,113 @@ private struct FleetCombinedReplySheet: View {
             if batch.allSatisfy({ results[$0.work.id] == String(localized: "Sent") }) {
                 finished()
             }
+        }
+    }
+}
+
+
+/// Explicit requests for review (`tend review request`, from agents or
+/// people), above the results Home gathered on its own. Each stays until
+/// someone accepts, returns or withdraws it. Hidden when there are none or
+/// the daemon has no review items.
+struct FleetReviewRequests: View {
+    @ObservedObject var model: AppModel
+    @State private var items: [TendReviewItem] = []
+    @State private var returning: String?
+    @State private var note = ""
+    @State private var busy: String?
+    @State private var problem: String?
+
+    var body: some View {
+        Group {
+            if !items.isEmpty || problem != nil {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Asked for review")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(verbatim: "\(items.count)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    if let problem {
+                        Label(problem, systemImage: "exclamationmark.circle")
+                            .font(TendType.meta)
+                            .foregroundStyle(.orange)
+                    }
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(items) { item in
+                                row(item)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 180)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                Divider()
+            }
+        }
+        .task { await load() }
+    }
+
+    private func row(_ item: TendReviewItem) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(verbatim: item.summary)
+                    .font(TendType.body.weight(.medium))
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                Button("Accept") { Task { await decide(item, .accepted, note: nil) } }
+                    .buttonStyle(.tendSecondary)
+                Button("Return…") { returning = item.id; note = "" }
+                    .buttonStyle(.tendGhost)
+                Button("Withdraw") { Task { await decide(item, .withdrawn, note: nil) } }
+                    .buttonStyle(.tendGhost)
+            }
+            .disabled(busy != nil)
+            Text(verbatim: [item.askedBy, item.target.text, item.anchor].compactMap { $0 }.joined(separator: " · "))
+                .font(TendType.meta)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if returning == item.id {
+                HStack {
+                    TextField("What is missing", text: $note)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { Task { await decide(item, .returned, note: note) } }
+                    Button("Return") { Task { await decide(item, .returned, note: note) } }
+                        .buttonStyle(.tendPrimary)
+                        .disabled(note.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Cancel") { returning = nil }
+                        .buttonStyle(.tendGhost)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func load() async {
+        do {
+            items = try await model.client.reviewItems()
+            problem = nil
+        } catch {
+            problem = String(localized: "Could not read review requests: \(error.localizedDescription)")
+        }
+    }
+
+    private func decide(_ item: TendReviewItem, _ disposition: TendReviewDisposition, note: String?) async {
+        busy = item.id
+        defer { busy = nil }
+        do {
+            try await model.client.decideReview(id: item.id, disposition: disposition, note: note)
+            returning = nil
+            await load()
+        } catch {
+            problem = error.localizedDescription
         }
     }
 }
