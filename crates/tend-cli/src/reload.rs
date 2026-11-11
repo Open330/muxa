@@ -1466,9 +1466,19 @@ fn continue_interrupted(
     if targets.is_empty() {
         return;
     }
+    let claude: BTreeSet<String> = snapshot
+        .panes
+        .iter()
+        .filter(|pane| {
+            pane.agent
+                .as_ref()
+                .is_some_and(|agent| agent.kind == "claude_code")
+        })
+        .map(pane_target)
+        .collect();
     let mut continued = 0;
     for target in targets {
-        if !screen_settled(endpoint, &target) {
+        if !screen_settled(endpoint, &target, claude.contains(&target)) {
             report.say(&plan::manual_line(
                 &target,
                 "was mid-turn; resumed screen never settled, so nothing was sent",
@@ -1497,17 +1507,27 @@ fn continue_interrupted(
 
 /// Wait for a resumed agent's screen to hold still, so the follow-up lands in
 /// its input box rather than in its startup.
-fn screen_settled(endpoint: &BackendEndpoint, target: &str) -> bool {
+///
+/// A screen that might be a startup trust dialog never counts as settled:
+/// the follow-up ends in Enter, which would answer it. A Claude pane must
+/// also show its own screen (banner or composer footer) first.
+fn screen_settled(endpoint: &BackendEndpoint, target: &str, claude: bool) -> bool {
     let started = Instant::now();
     let mut last = String::new();
     let mut quiet_since = Instant::now();
     while started.elapsed() < CONTINUE_READY_TIMEOUT {
         let screen = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", target])
             .unwrap_or_default();
+        if launch::may_be_trust_prompt(&screen) {
+            return false;
+        }
         if screen != last {
             last = screen;
             quiet_since = Instant::now();
-        } else if !last.trim().is_empty() && quiet_since.elapsed() >= CONTINUE_READY_QUIET {
+        } else if !last.trim().is_empty()
+            && quiet_since.elapsed() >= CONTINUE_READY_QUIET
+            && (!claude || launch::claude_started(&last))
+        {
             return true;
         }
         std::thread::sleep(Duration::from_millis(250));
@@ -1774,6 +1794,7 @@ fn replay_commands(
     report: &mut RestoreReport,
 ) -> BTreeSet<String> {
     let mut sent = Vec::new();
+    let mut claude = BTreeMap::new();
     let mut manual = Vec::new();
     for pane in &snapshot.panes {
         let target = pane_target(pane);
@@ -1795,7 +1816,12 @@ fn replay_commands(
             continue;
         }
         match mux_control::run(endpoint, &["send-keys", "-t", &target, &command, "Enter"]) {
-            Ok(()) => sent.push(target),
+            Ok(()) => {
+                if runs_claude(pane, &command) {
+                    claude.insert(target.clone(), saved_dirs(&pane.path));
+                }
+                sent.push(target);
+            }
             Err(error) => report.pane_failed(target, error),
         }
     }
@@ -1804,10 +1830,25 @@ fn replay_commands(
     let unconfirmed = confirm_launches(endpoint, sent.clone());
     let replayed = sent.len() - unconfirmed.len();
     report.say(&plan::relaunched_line(replayed));
-    let relaunched = sent
+    let mut relaunched: BTreeSet<String> = sent
         .into_iter()
         .filter(|target| !unconfirmed.contains(target))
         .collect();
+    let trusting = claude
+        .into_iter()
+        .filter(|(target, _)| relaunched.contains(target));
+    let trust = answer_trust_prompts(endpoint, trusting);
+    for target in &trust.answered {
+        report.say(&format!(
+            "  {target}: answered Claude's folder-trust prompt for the folder it was saved in"
+        ));
+    }
+    // A pane left on the prompt is not up: nothing more may be typed into
+    // it, the follow-up nudge included.
+    for (target, note) in trust.left {
+        relaunched.remove(&target);
+        manual.push((target, note.to_owned()));
+    }
     for target in unconfirmed {
         report.say(&plan::manual_line(&target, launch::UNCONFIRMED_NOTE));
         report.pane_unconfirmed(target, launch::UNCONFIRMED_NOTE.to_owned());
@@ -1817,6 +1858,86 @@ fn replay_commands(
         report.pane_left(target, note);
     }
     relaunched
+}
+
+/// Whether a relaunched pane is a Claude: tend tracked a Claude there, or
+/// the command line runs one, directly (`claude …`, `/path/to/claude …`)
+/// or through an account wrapper's `name@claude` target.
+fn runs_claude(pane: &PaneShape, command: &str) -> bool {
+    if pane
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.kind == "claude_code")
+    {
+        return true;
+    }
+    let mut words = command.split_whitespace();
+    let program = words.next().unwrap_or_default();
+    program.rsplit('/').next() == Some("claude") || words.any(|word| word.ends_with("@claude"))
+}
+
+/// The directories a pane may legitimately start Claude in: the saved path
+/// as recorded, and as the filesystem resolves it now (Claude prints the
+/// physical path: `/tmp` reads as `/private/tmp` on macOS).
+fn saved_dirs(path: &str) -> Vec<String> {
+    let mut dirs = vec![path.to_owned()];
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        dirs.push(resolved.to_string_lossy().into_owned());
+    }
+    dirs
+}
+
+/// What the folder-trust pass did.
+#[derive(Debug, Default)]
+struct TrustOutcome {
+    answered: BTreeSet<String>,
+    /// Panes left on the prompt, with what to tell a human.
+    left: BTreeMap<String, &'static str>,
+}
+
+/// Walk relaunched Claude panes past the folder-trust prompt, but only for
+/// the directory each pane was saved in. Every pane shares one deadline; a
+/// pane that shows Claude's own screen stops being watched at once.
+fn answer_trust_prompts(
+    endpoint: &BackendEndpoint,
+    targets: impl IntoIterator<Item = (String, Vec<String>)>,
+) -> TrustOutcome {
+    let mut watch = launch::TrustWatch::new(targets);
+    let mut answered = BTreeSet::new();
+    let started = Instant::now();
+    'poll: while !watch.is_settled() {
+        let pending: Vec<String> = watch.pending().cloned().collect();
+        for target in pending {
+            if started.elapsed() >= launch::TRUST_TIMEOUT {
+                break 'poll;
+            }
+            let Ok(screen) = mux_control::capture(endpoint, &["capture-pane", "-p", "-t", &target])
+            else {
+                continue;
+            };
+            let Some(key) = watch.observe(&target, started.elapsed(), &screen) else {
+                continue;
+            };
+            let name = match key {
+                launch::TrustKey::Down => "Down",
+                launch::TrustKey::Enter => "Enter",
+            };
+            match mux_control::run(endpoint, &["send-keys", "-t", &target, name]) {
+                Ok(()) if key == launch::TrustKey::Enter => {
+                    answered.insert(target);
+                }
+                Ok(()) => {}
+                Err(_) => watch.leave(&target, launch::TRUST_UNRESOLVED_NOTE),
+            }
+        }
+        if !watch.is_settled() {
+            std::thread::sleep(Duration::from_millis(250));
+        }
+    }
+    TrustOutcome {
+        answered,
+        left: watch.unresolved(),
+    }
 }
 
 /// What to tell a human about an agent pane whose command line was not
