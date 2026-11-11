@@ -23,6 +23,9 @@ command = ["codex"]
 
 [rules]
 blocked = [
+    # New/changed hooks have their own startup menu, not a Yes/No choice.
+    '(?m)^[ \t]*Hooks need review[^\n]*\n(?:[^\n]*\n){0,12}[ \t]*[›❯>][ \t]*[1-3]\.[ \t]*(?:Review hooks|Trust all and\s+continue|Continue without\s+trusting)[^\n]*\n(?:[^\n]*\n){0,8}[ \t]*(?:enter confirm|Press enter to confirm)[^\n]*(?:\n[ \t]*esc skip)?\s*\z',
+
     # The highlighted row of a numbered selection widget. Anchored to a
     # cursor marker AND the number, so ordinary prose and plain numbered
     # lists can never match. `[>›❯]` covers ASCII and the two angle glyphs

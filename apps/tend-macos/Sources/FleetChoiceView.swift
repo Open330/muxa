@@ -18,6 +18,8 @@ struct FleetChoicePanel<Fallback: View>: View {
     @State private var seen: Seen?
     @State private var loading = false
     @State private var ownWords = ""
+    @State private var multiSelection: Set<Int> = []
+    @State private var selectionFor: Fingerprint?
     /// The question the own words were written for; set when typing starts.
     @State private var ownWordsFor: Fingerprint?
     @State private var error: String?
@@ -32,11 +34,12 @@ struct FleetChoicePanel<Fallback: View>: View {
         let seen: Seen
         let question: String
         let options: [FleetChoiceDialog.Option]
+        let multiple: Bool
     }
 
     private var fingerprint: Fingerprint? {
         guard let dialog, let seen else { return nil }
-        return Fingerprint(seen: seen, question: dialog.question, options: dialog.options)
+        return Fingerprint(seen: seen, question: dialog.question, options: dialog.options.map(\.definition), multiple: dialog.isMultipleSelection)
     }
 
     /// Own words written for a question that is no longer the one shown.
@@ -88,11 +91,21 @@ struct FleetChoicePanel<Fallback: View>: View {
                     .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                 VStack(alignment: .leading, spacing: 6) {
-                    ForEach(dialog.options.filter { !$0.takesText }) { option in
+                    ForEach(dialog.options.filter { !$0.takesText && (!dialog.isMultipleSelection || $0.isChecked != nil) }) { option in
                         Button {
-                            choose(option, words: nil)
+                            if dialog.isMultipleSelection {
+                                if !multiSelection.insert(option.number).inserted {
+                                    multiSelection.remove(option.number)
+                                }
+                            } else {
+                                choose(option, words: nil)
+                            }
                         } label: {
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
+                                if dialog.isMultipleSelection {
+                                    Image(systemName: multiSelection.contains(option.number) ? "checkmark.square.fill" : "square")
+                                        .foregroundStyle(multiSelection.contains(option.number) ? Color.accentColor : Color.secondary)
+                                }
                                 Text("\(option.number)")
                                     .font(.system(size: 11, weight: .bold).monospacedDigit())
                                     .frame(width: 18, height: 18)
@@ -114,11 +127,22 @@ struct FleetChoicePanel<Fallback: View>: View {
                             .contentShape(Rectangle())
                         }
                         .buttonStyle(.plain)
-                        .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
+                        .background((dialog.isMultipleSelection && multiSelection.contains(option.number) ? Color.accentColor : Color.secondary).opacity(0.12), in: RoundedRectangle(cornerRadius: 7, style: .continuous))
                         .disabled(sending)
                     }
                 }
-                if let typed = dialog.options.first(where: \.takesText) {
+                if dialog.isMultipleSelection {
+                    HStack {
+                        Text("\(multiSelection.count) selected")
+                            .font(TendType.meta)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button("Send selections") { performChoice(option: nil, words: nil, selection: multiSelection) }
+                            .buttonStyle(.tendPrimary)
+                            .disabled(sending || loading || multiSelection.isEmpty || selectionFor != fingerprint)
+                    }
+                }
+                if !dialog.isMultipleSelection, let typed = dialog.options.first(where: \.takesText) {
                     if ownWordsAreStale {
                         VStack(alignment: .leading, spacing: 6) {
                             Label("Written for an earlier question. It was not sent.", systemImage: "exclamationmark.triangle.fill")
@@ -212,14 +236,24 @@ struct FleetChoicePanel<Fallback: View>: View {
             let target = FleetReplyTarget(kind: .answer, agent: hosted)
             let read = try await capture(host: hosted.host, pane: pane)
             guard !Task.isCancelled else { return }
-            dialog = read
             seen = read == nil ? nil : Seen(pane: paneID, target: target)
+            show(read)
             error = nil
         } catch {
             // A read cut short (the agent moved on, the view went away) is
             // not something the person has to act on.
             if Self.isCancellation(error) || Task.isCancelled { return }
             self.error = error.localizedDescription
+        }
+    }
+
+    /// Refreshes keep an unsent draft for the same question; a new question
+    /// starts from its own screen checks.
+    private func show(_ read: FleetChoiceDialog?) {
+        dialog = read
+        if selectionFor != fingerprint {
+            multiSelection = read?.checkedNumbers ?? []
+            selectionFor = fingerprint
         }
     }
 
@@ -238,9 +272,14 @@ struct FleetChoicePanel<Fallback: View>: View {
     /// person's words are typed on that row and submitted. Then the screen
     /// is read once more: a question still there means it did not go through.
     private func choose(_ option: FleetChoiceDialog.Option, words: String?) {
+        performChoice(option: option, words: words, selection: nil)
+    }
+
+    private func performChoice(option: FleetChoiceDialog.Option?, words: String?, selection: Set<Int>?) {
         guard let shown = dialog, let seen, let fingerprint else { return }
         // Own words go only to the question they were written for.
         if words != nil, ownWordsFor != fingerprint { return }
+        if selection != nil, selectionFor != fingerprint { return }
         // One choice per agent at a time, wherever it was started from.
         let agentID = hosted.id
         guard sends.begin(agentID) else { return }
@@ -249,34 +288,48 @@ struct FleetChoicePanel<Fallback: View>: View {
             do {
                 var target = try live(seen)
                 let current = try await capture(host: target.host, pane: target.pane)
-                guard let current, current.question == shown.question, current.options == shown.options else {
-                    dialog = current
+                guard let current, current.isSameQuestion(as: shown) else {
+                    show(current)
                     throw TendIPCError.server(String(localized: "The question on screen changed. Check it again before choosing."))
                 }
-                guard let moves = current.moves(to: option.number) else {
-                    throw TendIPCError.server(String(localized: "Tend could not tell which option is selected. Open the pane to choose."))
-                }
                 target = try live(seen)
-                if let words = words?.trimmingCharacters(in: .whitespacesAndNewlines), !words.isEmpty {
-                    if !moves.isEmpty {
-                        try await model.client.sendFleetKeys(host: target.host, pane: target.pane, keys: moves)
-                        try await Task.sleep(nanoseconds: 200_000_000)
-                        target = try live(seen)
+                if let selection {
+                    guard let keys = current.keys(selecting: selection), keys.count <= 32 else {
+                        throw TendIPCError.server(String(localized: "Tend could not prepare these selections. Open the pane to answer."))
                     }
-                    try await model.client.sendFleetPrompt(host: target.host, pane: target.pane, text: words, submit: true)
-                    ownWords = ""
-                } else {
-                    try await model.client.sendFleetKeys(host: target.host, pane: target.pane, keys: moves + ["enter"])
+                    // One operation for the complete delta and final Enter.
+                    try await model.client.sendFleetKeys(host: target.host, pane: target.pane, keys: keys)
+                } else if let option {
+                    guard let moves = current.moves(to: option.number) else {
+                        throw TendIPCError.server(String(localized: "Tend could not tell which option is selected. Open the pane to choose."))
+                    }
+                    if let words = words?.trimmingCharacters(in: .whitespacesAndNewlines), !words.isEmpty {
+                        if !moves.isEmpty {
+                            try await model.client.sendFleetKeys(host: target.host, pane: target.pane, keys: moves)
+                            try await Task.sleep(nanoseconds: 200_000_000)
+                            target = try live(seen)
+                        }
+                        try await model.client.sendFleetPrompt(host: target.host, pane: target.pane, text: words, submit: true)
+                        ownWords = ""
+                    } else {
+                        try await model.client.sendFleetKeys(host: target.host, pane: target.pane, keys: moves + ["enter"])
+                    }
                 }
                 try await Task.sleep(nanoseconds: 900_000_000)
                 let after = try? await capture(host: target.host, pane: target.pane)
-                if let after, after.question == shown.question, after.options == shown.options {
-                    dialog = after
+                if let after, after.isSameQuestion(as: shown) {
+                    show(after)
                     throw TendIPCError.server(String(localized: "The choice did not go through; the question is still on screen. Open the pane to answer."))
                 }
-                dialog = after
+                show(after)
                 ownWordsFor = nil
-                sends.finish(agentID, .init(succeeded: true, message: String(localized: "Chose \(option.number). \(option.label)")))
+                let message: String
+                if let selection {
+                    message = String(localized: "Sent \(selection.count) selected options.")
+                } else if let option {
+                    message = String(localized: "Chose \(option.number). \(option.label)")
+                } else { message = "" }
+                sends.finish(agentID, .init(succeeded: true, message: message))
             } catch {
                 sends.finish(agentID, Self.isCancellation(error) ? nil : .init(succeeded: false, message: error.localizedDescription))
             }

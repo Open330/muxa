@@ -824,51 +824,59 @@ mod tests {
     /// Both halves have to hold for this to pass: the kind must select the
     /// manifest, and the fresh hooked row must still be refinable.
     #[tokio::test]
-    async fn codex_startup_gate_is_detected_on_a_pane_running_as_node() {
-        let captures = Arc::new(Mutex::new(HashMap::new()));
-        captures.lock().unwrap().insert(
-            "%1".into(),
-            "  Do you trust this folder?\n› 1. Yes, continue\n  2. No, quit\n".into(),
-        );
-        // `node`, not `codex` — exactly what an npm install reports.
-        let backend: SharedBackend = Arc::new(FakeBackend::tmux(
-            vec![pane("%1", "node")],
-            captures.clone(),
-        ));
-        let store = Store::shared();
+    async fn startup_gates_are_detected_on_panes_running_as_node() {
+        for (kind, screen) in [
+            (
+                AgentKind::Codex,
+                "  Do you trust this folder?\n› 1. Yes, continue\n  2. No, quit\n",
+            ),
+            (
+                AgentKind::ClaudeCode,
+                " ❯ No, exit\n   Yes, I trust this folder\n Enter to confirm · Esc to cancel",
+            ),
+        ] {
+            let captures = Arc::new(Mutex::new(HashMap::new()));
+            captures.lock().unwrap().insert("%1".into(), screen.into());
+            // An npm install can report `node` for either agent.
+            let backend: SharedBackend = Arc::new(FakeBackend::tmux(
+                vec![pane("%1", "node")],
+                captures.clone(),
+            ));
+            let store = Store::shared();
 
-        // A live codex row tend just launched: Idle, because no hook has fired.
-        let launched_at = OffsetDateTime::now_utc();
-        store
-            .apply(&AgentEvent::Started {
-                id: AgentId {
-                    kind: AgentKind::Codex,
-                    session_id: "sess-1".into(),
-                    surface: None,
-                    pane: Some("%1".into()),
-                    tmux_socket: None,
-                    cwd: None,
-                },
-                at: launched_at,
-            })
-            .await;
-        assert_eq!(store.by_pane("%1").await[0].state, AgentState::Idle);
+            // Tend just launched this row; no agent hook has fired yet.
+            let launched_at = OffsetDateTime::now_utc();
+            store
+                .apply(&AgentEvent::Started {
+                    id: AgentId {
+                        kind,
+                        session_id: "sess-1".into(),
+                        surface: None,
+                        pane: Some("%1".into()),
+                        tmux_socket: None,
+                        cwd: None,
+                    },
+                    at: launched_at,
+                })
+                .await;
+            assert_eq!(store.by_pane("%1").await[0].state, AgentState::Idle);
 
-        let mut det = detector(vec![backend], store.clone());
-        assert_eq!(det.run_tick().await, 1, "the gate must be detected");
+            let mut det = detector(vec![backend], store.clone());
+            assert_eq!(det.run_tick().await, 1, "the gate must be detected");
 
-        let rows = store.by_pane("%1").await;
-        assert_eq!(rows.len(), 1, "refinement targets the REAL row, adds none");
-        assert_eq!(rows[0].kind, AgentKind::Codex);
-        assert_eq!(
-            rows[0].state,
-            AgentState::WaitingInput,
-            "a pane sitting on the trust gate is waiting on the operator",
-        );
-        assert!(
-            !det.tracked.contains("%1"),
-            "a real row is not ours to stop-sweep",
-        );
+            let rows = store.by_pane("%1").await;
+            assert_eq!(rows.len(), 1, "refinement targets the REAL row, adds none");
+            assert_eq!(rows[0].kind, kind);
+            assert_eq!(
+                rows[0].state,
+                AgentState::WaitingInput,
+                "a pane sitting on the trust gate is waiting on the operator",
+            );
+            assert!(
+                !det.tracked.contains("%1"),
+                "a real row is not ours to stop-sweep",
+            );
+        }
     }
 
     #[tokio::test]

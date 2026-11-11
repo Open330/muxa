@@ -1,0 +1,13 @@
+# Startup gates exist before Claude's attention hooks can report them.
+# This manifest only observes: it never accepts trust or permission choices.
+[agent]
+name = "claude"
+command = ["claude"]
+
+[rules]
+blocked = [
+  '(?m)^[ \t]*[❯›>][ \t]*(?:[12]\.[ \t]*)?(?:No, exit(?: Claude Code)?|Yes, I\s+trust\s+(?:this\s+folder|these\s+settings))\s*\n[ \t]*(?:[12]\.[ \t]*)?(?:No, exit(?: Claude Code)?|Yes, I\s+trust\s+(?:this\s+folder|these\s+settings))\s*\n[ \t]*Enter to confirm\s*·\s*Esc to cancel\s*\z',
+  '(?m)^[ \t]*(?:[12]\.[ \t]*)?(?:No, exit(?: Claude Code)?|Yes, I\s+trust\s+(?:this\s+folder|these\s+settings))\s*\n[ \t]*[❯›>][ \t]*(?:[12]\.[ \t]*)?(?:No, exit(?: Claude Code)?|Yes, I\s+trust\s+(?:this\s+folder|these\s+settings))\s*\n[ \t]*Enter to confirm\s*·\s*Esc to cancel\s*\z',
+]
+working = []
+idle = ['(?m)^[ \t]*❯[ \t\x{a0}]*$']

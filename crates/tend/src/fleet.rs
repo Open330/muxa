@@ -87,6 +87,8 @@ pub const FLEET_BOUNDED_CLAIM_CAPABILITY: &str = "collaboration_claim_bounded_v1
 /// relay cannot read the request and answers without its id, so the
 /// controller refuses before sending instead of waiting out a timeout.
 pub const FLEET_SEND_KEYS_CAPABILITY: &str = "send_keys_v1";
+/// The relay accepts Space to reconcile a checkbox selection in one batch.
+pub const FLEET_MULTISELECT_CAPABILITY: &str = "multiselect_keys_v1";
 /// Relay capability: the relay answers [`RelayRequest::WorktreeInventory`].
 pub const FLEET_WORKTREE_INVENTORY_CAPABILITY: &str = "worktree_inventory_v1";
 /// Relay capability: the relay applies [`RelayRequest::WorktreeChange`].
@@ -111,6 +113,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "raw_capture_base64",
     FLEET_WORK_COMMAND_CAPABILITY,
     FLEET_SEND_KEYS_CAPABILITY,
+    FLEET_MULTISELECT_CAPABILITY,
     FLEET_WORKTREE_INVENTORY_CAPABILITY,
     FLEET_WORKTREE_CHANGE_CAPABILITY,
     FLEET_SERVER_INVENTORY_CAPABILITY,
@@ -705,6 +708,7 @@ pub enum RelayFrame {
 pub enum FleetKey {
     Up,
     Down,
+    Space,
     Enter,
     Escape,
     Tab,
@@ -717,6 +721,7 @@ impl FleetKey {
         match self {
             Self::Up => "\u{1b}[A",
             Self::Down => "\u{1b}[B",
+            Self::Space => " ",
             Self::Enter => "\r",
             Self::Escape => "\u{1b}",
             Self::Tab => "\t",
@@ -2020,6 +2025,11 @@ mod fleet_key_tests {
             other => panic!("unexpected {other:?}"),
         }
         assert!(serde_json::from_value::<FleetKey>(serde_json::json!("rm -rf")).is_err());
+        assert_eq!(
+            serde_json::from_value::<FleetKey>(serde_json::json!("space")).unwrap(),
+            FleetKey::Space
+        );
+        assert_eq!(FleetKey::Space.bytes(), " ");
         let inventory: FleetOperation =
             serde_json::from_value(serde_json::json!({"kind": "worktree_inventory"})).unwrap();
         assert!(matches!(inventory, FleetOperation::WorktreeInventory));

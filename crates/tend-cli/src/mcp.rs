@@ -3013,17 +3013,18 @@ pub(crate) async fn call_peer(
             ]);
             let (mut allowed, launch_id) =
                 worker_dispatch_readiness(observed.as_deref().map_err(|_| ()));
-            // Older releases stamped the launch but had no readiness marker.
-            // Re-probe an idle registered worker; registration alone never proves
-            // it is past folder trust. Pending/blocked workers need explicit recovery.
+            // A person may have resolved the retained worker's setup dialog.
+            // Prove its composer ready without accepting any further dialog.
+            let recover = blocked_worker_needs_probe(observed.as_deref().map_err(|_| ()));
             if !allowed
-                && legacy_worker_needs_probe(
-                    observed.as_deref().map_err(|_| ()),
-                    selected
-                        .peer
-                        .as_ref()
-                        .is_some_and(|peer| peer.state == tend::event::AgentState::Idle),
-                )
+                && (recover
+                    || legacy_worker_needs_probe(
+                        observed.as_deref().map_err(|_| ()),
+                        selected
+                            .peer
+                            .as_ref()
+                            .is_some_and(|peer| peer.state == tend::event::AgentState::Idle),
+                    ))
             {
                 if let (Some(launch), Some(cwd)) = (
                     launch_id.clone(),
@@ -3032,12 +3033,20 @@ pub(crate) async fn call_peer(
                     let pane = pane.to_owned();
                     let result = tokio::task::spawn_blocking(move || {
                         crate::mux_control::with_endpoint(Some(endpoint), || {
-                            crate::worker_startup::prepare(
-                                &pane,
-                                std::path::Path::new(&cwd),
-                                &launch,
-                                false,
-                            )
+                            if recover {
+                                crate::worker_startup::probe(
+                                    &pane,
+                                    std::path::Path::new(&cwd),
+                                    &launch,
+                                )
+                            } else {
+                                crate::worker_startup::prepare(
+                                    &pane,
+                                    std::path::Path::new(&cwd),
+                                    &launch,
+                                    false,
+                                )
+                            }
                         })
                     })
                     .await;
@@ -4072,6 +4081,23 @@ fn legacy_worker_needs_probe(
 
 // Missing metadata on an old/primary pane remains compatible. A marked,
 // supported worker must positively prove ready; lookup errors never authorize.
+fn blocked_worker_needs_probe(observed: std::result::Result<&str, ()>) -> bool {
+    let Ok(observed) = observed else {
+        return false;
+    };
+    let fields: Vec<_> = observed
+        .trim_end_matches(['\r', '\n'])
+        .split('\t')
+        .collect();
+    fields.len() == 3
+        && !fields[0].is_empty()
+        && fields[2] == "blocked"
+        && matches!(
+            tend::discovery::classify_command(fields[1]),
+            Some(tend::event::AgentKind::ClaudeCode | tend::event::AgentKind::Codex)
+        )
+}
+
 fn worker_dispatch_readiness(observed: std::result::Result<&str, ()>) -> (bool, Option<String>) {
     let Ok(observed) = observed else {
         return (false, None);
@@ -8153,6 +8179,21 @@ mod tests {
         ));
         assert!(!legacy_worker_needs_probe(Err(()), true));
         assert!(!legacy_worker_needs_probe(Ok("\tclaude\t"), true));
+    }
+
+    #[test]
+    fn blocked_workers_get_a_passive_recovery_probe() {
+        assert!(blocked_worker_needs_probe(Ok("launch\tcodex\tblocked")));
+        assert!(blocked_worker_needs_probe(Ok("launch\tclaude\tblocked")));
+        for state in [
+            "launch\tcodex\tpending",
+            "launch\tcodex\tready",
+            "\tcodex\tblocked",
+            "launch\tunknown\tblocked",
+        ] {
+            assert!(!blocked_worker_needs_probe(Ok(state)));
+        }
+        assert!(!blocked_worker_needs_probe(Err(())));
     }
 
     #[test]

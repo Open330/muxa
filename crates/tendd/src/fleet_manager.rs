@@ -766,6 +766,16 @@ fn send_keys_refusal(
     if !matches!(operation, FleetOperation::SendKeys { .. }) {
         return None;
     }
+    if matches!(operation, FleetOperation::SendKeys { keys, .. } if keys.contains(&tend::fleet::FleetKey::Space))
+        && !hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == tend::fleet::FLEET_MULTISELECT_CAPABILITY)
+    {
+        return Some(format!(
+            "host '{alias}' cannot answer multi-select choices; upgrade tend on that host"
+        ));
+    }
     if hello
         .capabilities
         .iter()
@@ -2238,6 +2248,19 @@ mod tests {
         assert!(send_keys_refusal("remote", &legacy, &capture).is_none());
         let current = hello(FLEET_CAPABILITIES);
         assert!(send_keys_refusal("remote", &current, &keys).is_none());
+        let mut checkboxes = keys.clone();
+        if let FleetOperation::SendKeys { keys, .. } = &mut checkboxes {
+            keys.push(tend::fleet::FleetKey::Space);
+        }
+        let mut navigation_only = current.clone();
+        navigation_only
+            .capabilities
+            .retain(|capability| capability != tend::fleet::FLEET_MULTISELECT_CAPABILITY);
+        assert!(send_keys_refusal("remote", &navigation_only, &checkboxes)
+            .unwrap()
+            .contains("multi-select"));
+        assert!(send_keys_refusal("remote", &current, &checkboxes).is_none());
+
         // The worktree inventory follows the same rule.
         let inventory = FleetOperation::WorktreeInventory;
         let refusal = worktree_inventory_refusal("remote", &legacy, &inventory).unwrap();

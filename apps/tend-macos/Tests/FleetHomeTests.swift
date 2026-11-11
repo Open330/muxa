@@ -826,6 +826,54 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     let tail = try #require(long.resultTail(lines: 4))
     #expect(tail.cut && tail.text.hasSuffix("FAILED") && !tail.text.contains("a"))
 }
+@Test func multipleChoiceChecksAreDraftedAndSentAsOnePlan() throws {
+    let screen = """
+    ☐ K8s 활성 서비스 및 Argo CD 앱 점검
+
+    확인할 대상을 모두 선택하세요.
+
+    ❯ 1. [✓] 활성 서비스
+         현재 서비스 상태
+      2. [ ] Argo CD 앱
+         동기화 상태
+      3. [ ] Ingress
+      4. Type something.
+
+    Space to select · Enter to submit · ↑/↓ to navigate
+    """
+    let dialog = try #require(FleetChoiceDialog.parse(screen))
+    #expect(dialog.isMultipleSelection)
+    #expect(dialog.checkedNumbers == [1])
+    #expect(dialog.options[0].label == "활성 서비스")
+    #expect(dialog.options[1].label == "Argo CD 앱")
+    #expect(dialog.keys(selecting: [2, 3]) == ["space", "down", "space", "down", "space", "enter"])
+    // No network or key events are needed until this entire plan is sent.
+    #expect(dialog.keys(selecting: [1]) == ["enter"])
+    #expect(dialog.keys(selecting: []) == nil)
+    #expect(dialog.keys(selecting: [4]) == nil)
+    let fresh = try #require(FleetChoiceDialog.parse(screen.replacingOccurrences(of: "3. [ ]", with: "3. [x]")))
+    #expect(dialog.isSameQuestion(as: fresh))
+    #expect(fresh.keys(selecting: [2, 3]) == ["space", "down", "space", "enter"])
+    let changed = try #require(FleetChoiceDialog.parse(screen.replacingOccurrences(of: "Argo CD 앱", with: "다른 항목")))
+    #expect(!dialog.isSameQuestion(as: changed))
+    let noCursor = try #require(FleetChoiceDialog.parse(screen.replacingOccurrences(of: "❯", with: " ")))
+    #expect(noCursor.keys(selecting: [1, 2]) == nil)
+}
+
+@Test func unicodeCheckboxesDoNotBecomePartOfTheirLabels() throws {
+    let dialog = try #require(FleetChoiceDialog.parse("""
+    점검할 항목
+
+    ❯ 1. ☒ 서비스
+      2. ☐ 앱
+      3. ☑ 네트워크
+    """))
+    #expect(dialog.isMultipleSelection)
+    #expect(dialog.checkedNumbers == [1, 3])
+    #expect(dialog.options.map(\.label) == ["서비스", "앱", "네트워크"])
+    #expect(dialog.keys(selecting: [1, 3]) == ["enter"])
+}
+
 @Test func anIdleAgentThatAskedIsYourTurnWithItsQuestion() throws {
     let asked = try agent([
         "state": "idle",

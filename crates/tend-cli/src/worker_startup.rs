@@ -36,6 +36,22 @@ fn observe(control: &Control, pane: &str) -> Option<Fence> {
 /// Only the exact new launch in its requested directory may be prepared.
 /// Capture joined logical lines: narrow panes wrap both labels and footers.
 pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<Report> {
+    prepare_inner(pane, cwd, launch_id, bypass, false)
+}
+
+/// After a person answers setup, recover readiness without pressing any key
+/// or accepting another folder, hook, settings or permission dialog.
+pub fn probe(pane: &str, cwd: &Path, launch_id: &str) -> Result<Report> {
+    prepare_inner(pane, cwd, launch_id, false, true)
+}
+
+fn prepare_inner(
+    pane: &str,
+    cwd: &Path,
+    launch_id: &str,
+    bypass: bool,
+    passive: bool,
+) -> Result<Report> {
     let control = Control::Ambient;
     let fence = observe(&control, pane).context("cannot fence worker startup")?;
     anyhow::ensure!(
@@ -64,7 +80,7 @@ pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<
         },
         &matches,
         |key| {
-            if !matches() {
+            if passive || !matches() {
                 return false;
             }
             let key = match key {
@@ -77,7 +93,7 @@ pub fn prepare(pane: &str, cwd: &Path, launch_id: &str, bypass: bool) -> Result<
             control.run(&["send-keys", "-t", pane, key]).is_ok()
         },
         bypass,
-        Duration::from_secs(30),
+        Duration::from_secs(if passive { 3 } else { 30 }),
     );
     if !matches() {
         anyhow::bail!("worker changed before readiness could be recorded");
@@ -217,7 +233,15 @@ while True:
         crate::mux_control::with_endpoint(Some(endpoint.clone()), || {
             assert!(prepare(pane, dir.path(), "wrong-launch", false).is_err());
         });
-        let report = crate::mux_control::with_endpoint(Some(endpoint), || {
+        // Recovery may observe the gate, but must never answer it.
+        let blocked = crate::mux_control::with_endpoint(Some(endpoint.clone()), || {
+            probe(pane, dir.path(), "fixture-launch")
+        })
+        .unwrap();
+        assert_eq!(blocked.state, worker_startup::State::Blocked);
+        assert!(blocked.answered.is_empty());
+        assert!(!dir.path().join("keys.hex").exists());
+        let report = crate::mux_control::with_endpoint(Some(endpoint.clone()), || {
             prepare(pane, dir.path(), "fixture-launch", false)
         })
         .unwrap();
@@ -237,6 +261,16 @@ while True:
                 .trim(),
             "ready"
         );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("keys.hex")).unwrap(),
+            "1b5b420d"
+        );
+        let recovered = crate::mux_control::with_endpoint(Some(endpoint), || {
+            probe(pane, dir.path(), "fixture-launch")
+        })
+        .unwrap();
+        assert_eq!(recovered.state, worker_startup::State::Ready);
+        assert!(recovered.answered.is_empty());
         assert_eq!(
             std::fs::read_to_string(dir.path().join("keys.hex")).unwrap(),
             "1b5b420d"
