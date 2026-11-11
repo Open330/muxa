@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-11-11
+
 ### Changed
 
 - macOS: the shortcut that shows agents from any app is now off until you
