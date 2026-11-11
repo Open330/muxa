@@ -139,6 +139,8 @@ pub enum SwapScope {
 pub enum AccountChoice {
     /// The best-ranked eligible account from `aas candidates`.
     Auto,
+    /// Restart on the positively identified current account.
+    Same,
     /// Round-robin over the eligible accounts, so a batch does not drain
     /// one account at once.
     Spread,
@@ -152,6 +154,7 @@ impl AccountChoice {
         match raw.trim() {
             "" | "auto" => Self::Auto,
             "spread" => Self::Spread,
+            "same" => Self::Same,
             name => Self::Named(name.to_owned()),
         }
     }
@@ -166,6 +169,10 @@ pub struct SwapRequest {
     pub to: AccountChoice,
     /// Also stop agents that are mid-turn.
     pub force: bool,
+    /// Keep busy targets pending in a daemon job.
+    pub when_idle: bool,
+    /// Maximum time a job waits for idle targets.
+    pub idle_timeout: std::time::Duration,
     pub bare: BareMode,
     /// The follow-up prompt, already resolved against [`ContinueWhen`]'s
     /// "who gets it" by [`SwapRequest::continue_for`].
@@ -195,6 +202,8 @@ impl SwapRequest {
             provider: None,
             to: AccountChoice::Auto,
             force: false,
+            when_idle: false,
+            idle_timeout: std::time::Duration::from_secs(6 * 3600),
             bare: config.bare,
             continue_text: Some(config.continue_text.clone()).filter(|t| !t.trim().is_empty()),
             continue_when: config.continue_when,
@@ -414,6 +423,16 @@ fn recently_active(agent: &Agent, now: time::OffsetDateTime) -> bool {
     !is_rate_limited(agent) && now - agent.last_activity_at < RECENT_ACTIVITY
 }
 
+/// Whether a registered target must remain pending, using fresh hook state.
+pub(crate) fn waiting_for_idle(agent: &Agent) -> bool {
+    is_busy(agent)
+        || matches!(
+            agent.state,
+            AgentState::WaitingInput | AgentState::WaitingChoice
+        )
+        || recently_active(agent, time::OffsetDateTime::now_utc())
+}
+
 fn select_at<'a>(
     agents: &'a [Agent],
     request: &SwapRequest,
@@ -457,9 +476,9 @@ fn select_at<'a>(
             ));
         } else if agent.pane.is_none() {
             skipped.push(skip("not in a multiplexer pane"));
-        } else if is_busy(agent) && !request.force {
+        } else if is_busy(agent) && !request.force && !request.when_idle {
             skipped.push(skip("mid-turn; pass --force to stop it anyway"));
-        } else if recently_active(agent, now) && !request.force {
+        } else if recently_active(agent, now) && !request.force && !request.when_idle {
             skipped.push(skip(
                 "active in the last 20s (likely mid-turn); pass --force to stop it anyway",
             ));
@@ -506,6 +525,11 @@ fn current_account(line: &LaunchLine, candidates: &[Candidate]) -> Option<String
     line.account()
         .map(str::to_owned)
         .or_else(|| candidates.iter().find(|c| c.active).map(|c| c.name.clone()))
+}
+
+// Same requires process-bound identity; global aas active state is insufficient.
+fn same_aas_account(line: &LaunchLine) -> Option<String> {
+    line.account().map(str::to_owned)
 }
 
 /// A configured account `pid` runs on, read from its environment.
@@ -576,9 +600,8 @@ fn resumed_account(
 }
 
 /// The account each target moves to, in target order. `current` is each
-/// target's present account (when known); an agent is never "moved" onto
-/// the account it is already on. `Err` carries the reason that target is
-/// skipped.
+/// target's present account (when known). Only `Same` assigns that account
+/// again, to restart in place. `Err` carries the reason a target is skipped.
 #[must_use]
 pub fn assign(
     current: &[Option<String>],
@@ -596,6 +619,9 @@ pub fn assign(
         .map(|from| {
             let differs = |name: &str| from.as_deref() != Some(name);
             match choice {
+                AccountChoice::Same => from
+                    .clone()
+                    .ok_or_else(|| "current account cannot be identified; left alone".into()),
                 AccountChoice::Named(name) => {
                     if from.as_deref() == Some(name.as_str()) {
                         Err(format!("already on {name}"))
@@ -1651,6 +1677,10 @@ pub(crate) fn endpoint_key(pane: &str, socket: Option<&str>) -> String {
 }
 
 impl PreparedTarget {
+    pub(crate) fn refresh_agent(&mut self, agent: &Agent) {
+        self.planned.agent = agent.clone();
+    }
+
     pub(crate) fn identity(&self) -> TargetIdentity {
         let planned = &self.planned;
         let pane = planned.agent.pane.clone().unwrap_or_default();
@@ -1908,9 +1938,10 @@ fn assign_accounts(
             }
             Backend::Aas(aas) => match request.to {
                 // A named account needs no ranking.
-                AccountChoice::Named(_) => Ok(Vec::new()),
+                AccountChoice::Named(_) | AccountChoice::Same => Ok(Vec::new()),
                 _ => query_candidates(&aas, provider),
             },
+            Backend::Unavailable(_) if request.to == AccountChoice::Same => Ok(Vec::new()),
             Backend::Unavailable(reason) => Err(reason),
         };
         let candidates = match candidates {
@@ -1928,11 +1959,28 @@ fn assign_accounts(
         };
         let current: Vec<Option<String>> = group
             .iter()
-            .map(|p| current_account(&p.launch.line, &candidates))
+            .map(|p| {
+                if request.to == AccountChoice::Same {
+                    // A global aas active account does not identify a running bare process.
+                    same_aas_account(&p.launch.line)
+                } else {
+                    current_account(&p.launch.line, &candidates)
+                }
+            })
             .collect();
         let assigned = assign(&current, &candidates, &request.to);
         let candidates = Arc::new(candidates);
         for (planned, account) in group.into_iter().zip(assigned) {
+            if request.to == AccountChoice::Same {
+                if let Err(note) = &account {
+                    steps.push(Step::Done(SwapOutcome::new(
+                        &planned.agent,
+                        SwapStatus::Skipped,
+                        note,
+                    )));
+                    continue;
+                }
+            }
             steps.push(Step::Run(Box::new(PreparedTarget {
                 planned,
                 account,
@@ -1980,6 +2028,11 @@ fn profile_steps(
         .zip(chosen)
         .zip(current)
         .map(|((planned, account), from)| {
+            if request.to == AccountChoice::Same {
+                if let Err(note) = &account {
+                    return Step::Done(SwapOutcome::new(&planned.agent, SwapStatus::Skipped, note));
+                }
+            }
             Step::Run(Box::new(PreparedTarget {
                 planned,
                 account,
@@ -2028,7 +2081,7 @@ fn swap_one(
         Ok(account) => account,
         Err(note) => {
             outcome.note = match request.to {
-                AccountChoice::Named(_) => note,
+                AccountChoice::Named(_) | AccountChoice::Same => note,
                 _ => format!("{note} ({})", unavailable(candidates)),
             };
             return outcome;
@@ -6778,5 +6831,52 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
             "../".repeat(ups),
             target.display().to_string().trim_start_matches('/')
         )
+    }
+    #[test]
+    fn same_keeps_identified_accounts_even_without_quota_and_skips_unknown() {
+        assert_eq!(AccountChoice::parse("same"), AccountChoice::Same);
+        assert_eq!(
+            assign(&[Some("work".into()), None], &[], &AccountChoice::Same),
+            vec![
+                Ok("work".into()),
+                Err("current account cannot be identified; left alone".into())
+            ]
+        );
+        let wrapped =
+            LaunchLine::from_aas("aas e work@claude --dangerously-skip-permissions").unwrap();
+        assert_eq!(same_aas_account(&wrapped).as_deref(), Some("work@claude"));
+        let bare = LaunchLine::bare("claude --dangerously-skip-permissions");
+        assert!(same_aas_account(&bare).is_none());
+        let profile = account("work", "CLAUDE_CONFIG_DIR", "/acct/work");
+        let command = profile_relaunch_line(&bare, AgentKind::ClaudeCode, "sid", &profile).unwrap();
+        assert!(command.contains("CLAUDE_CONFIG_DIR=/acct/work"));
+        assert!(!command.contains("aas"));
+    }
+
+    #[test]
+    fn when_idle_includes_busy_and_recent_targets_without_force() {
+        let busy = agent(
+            "%1",
+            "registered",
+            AgentKind::ClaudeCode,
+            AgentState::Working,
+        );
+        let mut recent = agent("%2", "registered2", AgentKind::ClaudeCode, AgentState::Idle);
+        recent.last_activity_at = time::OffsetDateTime::now_utc();
+        let agents = vec![busy, recent];
+        let mut req = request(SwapScope::All);
+        req.when_idle = true;
+        assert_eq!(select(&agents, &req).0.len(), 2);
+        assert!(waiting_for_idle(&agents[0]));
+        assert!(waiting_for_idle(&agents[1]));
+    }
+    #[test]
+    fn idle_wait_keeps_permission_and_choice_prompts_pending_without_recent_activity() {
+        for state in [AgentState::WaitingInput, AgentState::WaitingChoice] {
+            let agent = agent("%1", "registered", AgentKind::ClaudeCode, state);
+            assert!(waiting_for_idle(&agent));
+        }
+        let agent = agent("%1", "registered", AgentKind::ClaudeCode, AgentState::Idle);
+        assert!(!waiting_for_idle(&agent));
     }
 }

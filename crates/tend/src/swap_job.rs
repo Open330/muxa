@@ -1231,6 +1231,20 @@ impl SwapJobStore {
         attempt: u32,
         disposition: Disposition,
     ) -> Result<(), JobError> {
+        self.finish_target_with_reason(lease, job, target, attempt, disposition, None)
+    }
+
+    /// Settle with an optional stable reason code (never prompt or account data).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn finish_target_with_reason(
+        &self,
+        lease: &Lease,
+        job: &str,
+        target: u32,
+        attempt: u32,
+        disposition: Disposition,
+        reason: Option<&str>,
+    ) -> Result<(), JobError> {
         self.with(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             fence(&tx, lease)?;
@@ -1247,9 +1261,9 @@ impl SwapJobStore {
                 });
             }
             let changed = tx.execute(
-                "UPDATE targets SET disposition = ?4, phase = 'finished'
+                "UPDATE targets SET disposition = ?4, reason = ?5, phase = 'finished'
                  WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND disposition IS NULL",
-                params![job, target, attempt, disposition.to_string()],
+                params![job, target, attempt, disposition.to_string(), reason],
             )?;
             if changed != 1 {
                 return Err(JobError::Invalid {
