@@ -718,29 +718,28 @@ pub(super) async fn cmd_msg_expire(
         request_id.is_none_or(|id| !id.trim().is_empty()),
         "--request-id must not be blank"
     );
-    let requests = client
-        .collaboration_expire_filtered(secs, dry_run, quiet_only, request_id)
+    let summary = client
+        .collaboration_expire_summary(secs, dry_run, quiet_only, request_id)
         .await?;
     if json {
-        println!("{}", serde_json::to_string_pretty(&requests)?);
+        println!("{}", serde_json::to_string_pretty(&summary)?);
         return Ok(());
     }
     let verb = if dry_run { "would expire" } else { "expired" };
-    if requests.is_empty() {
+    if summary.total == 0 {
         println!("no eligible unclaimed requests match the age and cleanup filters ({older_than})");
         return Ok(());
     }
-    for request in &requests {
+    for request in &summary.requests {
         println!(
             "{verb}  {}  {:?}  {} -> {}  (queued since {})",
-            request.id,
-            request.kind,
-            request.from.label(),
-            request.to.label(),
-            request.created_at.date(),
+            request.id, request.kind, request.from, request.to, request.created_at
         );
     }
-    println!("{} request(s) {verb}", requests.len());
+    if summary.truncated {
+        println!("(showing a bounded sample of requests)");
+    }
+    println!("{} request(s) {verb}", summary.total);
     Ok(())
 }
 

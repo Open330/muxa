@@ -2584,6 +2584,31 @@ pub(super) async fn handle(
                         Err(error) => Response::err(error.to_string()),
                     }
                 }
+                RequestBody::CollaborationExpireSummary {
+                    older_than_secs,
+                    dry_run,
+                    quiet_only,
+                    request_id,
+                } => {
+                    kind = "collaboration_expire_summary";
+                    let age =
+                        time::Duration::seconds(i64::try_from(older_than_secs).unwrap_or(i64::MAX));
+                    let cutoff = time::OffsetDateTime::now_utc()
+                        .checked_sub(age)
+                        .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+                    match collaboration
+                        .expire_queued_filtered(cutoff, dry_run, quiet_only, request_id.as_deref())
+                        .await
+                    {
+                        Ok(requests) => {
+                            let mut response = Response::ok();
+                            response.collaboration_expire_summary =
+                                Some(collaboration::ExpireSummary::from_requests(&requests));
+                            response
+                        }
+                        Err(error) => Response::err(error.to_string()),
+                    }
+                }
                 RequestBody::CollaborationRetire {
                     origin,
                     request_id,

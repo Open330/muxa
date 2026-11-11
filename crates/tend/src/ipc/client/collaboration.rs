@@ -1003,6 +1003,33 @@ impl Client {
             .map_err(RuntimeError::Json)
     }
 
+    /// Filtered expiry without sending request bodies over IPC.
+    pub async fn collaboration_expire_summary(
+        &self,
+        older_than_secs: u64,
+        dry_run: bool,
+        quiet_only: bool,
+        request_id: Option<&str>,
+    ) -> Result<collaboration::ExpireSummary, RuntimeError> {
+        let hello = self.hello(CLIENT_CALL_TIMEOUT).await?;
+        if !hello
+            .capabilities
+            .iter()
+            .any(|c| c == collaboration::EXPIRE_SUMMARY_CAPABILITY)
+        {
+            // Brew can upgrade the CLI before the running daemon. Preserve
+            // its filtered safety contract, and surface any legacy size error.
+            let requests = self
+                .collaboration_expire_filtered(older_than_secs, dry_run, quiet_only, request_id)
+                .await?;
+            return Ok(collaboration::ExpireSummary::from_requests(&requests));
+        }
+        let response = self.call_checked(&serde_json::json!({"protocol":PROTOCOL_VERSION,"kind":"collaboration_expire_summary",
+            "older_than_secs":older_than_secs,"dry_run":dry_run,"quiet_only":quiet_only,"request_id":request_id})).await?;
+        serde_json::from_value(response["collaboration_expire_summary"].clone())
+            .map_err(RuntimeError::Json)
+    }
+
     pub async fn collaboration_expire_filtered(
         &self,
         older_than_secs: u64,

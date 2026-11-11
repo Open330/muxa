@@ -51,7 +51,7 @@ const EXTERNAL_TITLE_OPTION: &str = "@tend_external_title";
 const EXTERNAL_URL_OPTION: &str = "@tend_external_url";
 const EXTERNAL_STATUS_OPTION: &str = "@tend_external_status";
 
-const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@tend_workspace_id}\t#{@tend_workspace_cwd}\t#{@tend_managed_workspace}\t#{session_attached}\t#{session_windows}\t#{session_group}";
+pub(crate) const SESSION_FORMAT: &str = "#{session_name}\t#{session_id}\t#{@tend_workspace_id}\t#{@tend_workspace_cwd}\t#{@tend_managed_workspace}\t#{session_attached}\t#{session_windows}\t#{session_group}";
 const WINDOW_FORMAT: &str = "#{session_name}\t#{session_id}\t#{window_id}\t#{window_index}\t#{window_name}\t#{@tend_work_id}\t#{@tend_work_cwd}\t#{@tend_managed_work}\t#{@tend_external_source}\t#{@tend_external_scope}\t#{@tend_external_stable_id}\t#{@tend_external_key}\t#{@tend_external_title}\t#{@tend_external_url}\t#{@tend_external_status}";
 const PANE_FORMAT: &str = "#{session_name}\t#{window_id}\t#{pane_id}\t#{@tend_agent}\t#{@tend_agent_role}\t#{@tend_agent_task}\t#{pane_current_command}\t#{pane_current_path}\t#{@tend_managed_agent}\t#{@tend_agent_workspace_id}\t#{@tend_agent_work_id}\t#{@tend_agent_alias}";
 const WINDOW_IDENTITY_FORMAT: &str =
@@ -1652,13 +1652,16 @@ impl std::fmt::Display for MarkAnomaly {
     }
 }
 
-/// Disagreements between the workspace marks and the session names, read from
-/// the live tmux server.
-pub fn workspace_mark_anomalies() -> Result<Vec<MarkAnomaly>> {
-    Ok(mark_anomalies(&list_workspaces()?, &all_session_names()?))
+/// Session marks need no current client, window, or pane target.
+pub(crate) fn workspace_mark_anomalies_from_sessions(sessions: &str) -> Vec<MarkAnomaly> {
+    let names = sessions
+        .lines()
+        .filter_map(|line| line.split_once('\t').map(|(name, _)| name.to_owned()))
+        .collect::<Vec<_>>();
+    mark_anomalies(&parse_workspaces(sessions, "", ""), &names)
 }
 
-/// The pure half of [`workspace_mark_anomalies`], so the shapes can be tested
+/// The pure half of workspace mark diagnostics, so the shapes can be tested
 /// without a tmux server.
 pub fn mark_anomalies(workspaces: &[WorkspaceInfo], session_names: &[String]) -> Vec<MarkAnomaly> {
     let mut anomalies = Vec::new();
@@ -2830,6 +2833,20 @@ fn print_result(result: &ManageResult, json: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_only_mark_diagnostics_preserve_shadowed_and_duplicate_marks() {
+        let sessions = "other\t$1\tacme\t/tmp\t1\t0\t1\t\nacme\t$2\t\t/tmp\t0\t0\t1\t\n";
+        assert!(matches!(
+            workspace_mark_anomalies_from_sessions(sessions).as_slice(),
+            [MarkAnomaly::Shadowed { .. }]
+        ));
+        let duplicate = format!("{sessions}third\t$3\tacme\t/tmp\t1\t0\t1\t\n");
+        assert!(matches!(
+            workspace_mark_anomalies_from_sessions(&duplicate).as_slice(),
+            [MarkAnomaly::Duplicated { .. }]
+        ));
+    }
 
     fn view_session(
         id: &str,

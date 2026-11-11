@@ -13,6 +13,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,
   `mcp__muxa__muxa_status` → `mcp__tend__tend_status`). Before, a migrated
   pipeline prompt could tell agents to call a tool that no longer exists.
+- `tend msg expire` and `--dry-run` use bounded IPC responses even for thousands
+  of stale requests. Human decisions, recovery questions, `--quiet-only`, and
+  exact-ID filters retain their existing protection. CLI `--json` now returns
+  `{total, truncated, requests}` instead of full request objects: at most 100 small
+  previews with ID, kind, sender/recipient labels (64 characters each), and queued
+  date (oversized imported IDs are omitted). Text output retains those preview
+  details and the explicit no-match message. Existing daemons fall back to the
+  filtered expiry operation, retaining its safety checks; their old full responses
+  can still exceed the IPC limit until the daemon is restarted after upgrading.
+- `tend doctor` checks live bindings and workspace marks through the selected
+  host, including `TEND_HOST=rmux` on Unix. Workspace marks are read from sessions
+  alone, so SSH shells need no current client, window, or pane target. Checks
+  require an existing rmux socket (a pane endpoint on Windows) and use rmux's
+  no-start flag, so diagnostics never start a server.
+
 
 ## [0.10.4] - 2026-11-11
 
