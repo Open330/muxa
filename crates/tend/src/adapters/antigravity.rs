@@ -251,7 +251,7 @@ impl HookAdapter for AntigravityAdapter {
                 response: input
                     .transcript()
                     .and_then(super::antigravity_transcript::last_assistant_text)
-                    .map(|t| truncate(t, 4_000)),
+                    .map(super::hook::truncate_response),
                 recap: None,
                 ai_title: None,
                 // agy's `Stop` payload carries `fullyIdle`, but `idle_confirmed`

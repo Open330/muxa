@@ -49,12 +49,13 @@
 //! `try_send`, so a slow writer drops a disk record (with a warning) rather
 //! than backing up the broadcast pipeline.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{hash_map::Entry, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
+use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 use tokio::fs::OpenOptions;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -219,6 +220,10 @@ struct Inner {
 /// and dry runs. Cheap to clone (`Arc` internally).
 pub struct PromptHistory {
     inner: RwLock<Inner>,
+    /// Fingerprints shared by live acceptance and history append. False means a
+    /// live event claimed the prompt but its history append has not landed yet;
+    /// true means recorded/loaded. Ring eviction cannot re-enable retries.
+    seen: Mutex<HashMap<[u8; 32], bool>>,
     opts: HistoryOptions,
     /// Writer-task sender. `None` iff this instance is in-memory only.
     /// `try_send` so the event-handler path never blocks on disk I/O.
@@ -248,6 +253,7 @@ impl PromptHistory {
     pub fn in_memory_only(opts: HistoryOptions) -> Arc<Self> {
         Arc::new(Self {
             inner: RwLock::new(Inner::default()),
+            seen: Mutex::default(),
             pane_sessions: opts.pane_sessions.clone(),
             opts: HistoryOptions { path: None, ..opts },
             writer: None,
@@ -280,8 +286,14 @@ impl PromptHistory {
 
         let mut inner = Inner::default();
         let initial = load_from_disk(&path).await?;
+        let mut seen = HashMap::new();
         for entry in initial {
-            push_bounded(&mut inner, entry, opts.max_per_pane);
+            if seen
+                .insert(retry_key(&entry.session_id, entry.at, &entry.prompt), true)
+                .is_none()
+            {
+                push_bounded(&mut inner, entry, opts.max_per_pane);
+            }
         }
 
         let (tx, rx) = mpsc::channel(opts.writer_channel_capacity);
@@ -291,6 +303,7 @@ impl PromptHistory {
         Ok((
             Arc::new(Self {
                 inner: RwLock::new(inner),
+                seen: Mutex::new(seen),
                 pane_sessions: opts.pane_sessions.clone(),
                 opts,
                 writer: Some(tx),
@@ -305,7 +318,33 @@ impl PromptHistory {
         &self.opts
     }
 
-    /// Record one prompt. Updates the in-memory ring buffer immediately and
+    /// Claim live side effects exactly once, using the same identity as history.
+    /// This synchronous check can run under the registry lock without nesting
+    /// async locks or waiting for the deferred history append. Loaded prompts
+    /// are already claimed, including after the live agent was reaped.
+    pub(crate) fn claim_live_prompt(
+        &self,
+        session_id: &str,
+        at: OffsetDateTime,
+        prompt: &str,
+    ) -> bool {
+        match self
+            .seen
+            .lock()
+            .unwrap()
+            .entry(retry_key(session_id, at, prompt))
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(false);
+                true
+            }
+            Entry::Occupied(_) => false,
+        }
+    }
+
+    /// Record one prompt, ignoring repeated (`session_id`, `at`, `prompt`) identities.
+    /// Startup seeds retry fingerprints from disk; compaction does not forget
+    /// them until restart. Updates the in-memory ring buffer immediately and
     /// fires a fire-and-forget disk write on the writer task.
     ///
     /// The disk send uses `try_send`, so a backed-up writer (rare) drops
@@ -320,6 +359,15 @@ impl PromptHistory {
                 .and_then(|cache| cache.get(&entry.pane));
         }
         let mut inner = self.inner.write().await;
+        if self
+            .seen
+            .lock()
+            .unwrap()
+            .insert(retry_key(&entry.session_id, entry.at, &entry.prompt), true)
+            == Some(true)
+        {
+            return;
+        }
         push_bounded(&mut inner, entry.clone(), self.opts.max_per_pane);
         if let Some(tx) = &self.writer {
             #[cfg(test)]
@@ -427,6 +475,16 @@ pub struct CompactReport {
     /// `true` if the rewrite was skipped because the writer queue was
     /// full. Recoverable — next tick will try again.
     pub rewrite_skipped: bool,
+}
+
+/// Hash the retry identity without retaining a second copy of prompt text.
+fn retry_key(session_id: &str, at: OffsetDateTime, prompt: &str) -> [u8; 32] {
+    let mut hash = Sha256::new();
+    hash.update(session_id.len().to_le_bytes());
+    hash.update(session_id.as_bytes());
+    hash.update(at.unix_timestamp_nanos().to_le_bytes());
+    hash.update(prompt.as_bytes());
+    hash.finalize().into()
 }
 
 fn push_bounded(inner: &mut Inner, entry: HistoryEntry, max_per_pane: usize) {
@@ -600,6 +658,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retries_dedupe_across_panes_and_ring_eviction() {
+        let h = PromptHistory::in_memory_only(HistoryOptions {
+            max_per_pane: 1,
+            ..Default::default()
+        });
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        let first = entry("%1", "hello", at);
+        h.append(first.clone()).await;
+        h.append(first.clone()).await;
+        assert_eq!(h.len().await, 1);
+        h.append(entry("%1", "newer", at + time::Duration::seconds(1)))
+            .await;
+        let mut moved = first;
+        moved.pane = "%2".into();
+        h.append(moved).await;
+        assert!(h.recent_for_pane("%2", 0).await.is_empty());
+        // Different timestamps, prompts and sessions are distinct submissions.
+        h.append(entry("%2", "hello", at + time::Duration::seconds(1)))
+            .await;
+        h.append(entry("%3", "different", at)).await;
+        let mut other_session = entry("%4", "hello", at);
+        other_session.session_id = "other".into();
+        h.append(other_session).await;
+        assert_eq!(h.len().await, 4);
+    }
+
+    #[tokio::test]
+    async fn retries_dedupe_all_loaded_records_and_do_not_append_to_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("prompts.ndjson");
+        let at = datetime!(2026-04-24 12:00:00 UTC);
+        let first = entry("%1", "hello", at);
+        let second = entry("%1", "newer", at + time::Duration::seconds(1));
+        // Also collapse duplicates already present in an older daemon's log.
+        let lines = [first.clone(), first.clone(), second.clone()]
+            .iter()
+            .map(|e| serde_json::to_string(e).unwrap() + "\n")
+            .collect::<String>();
+        tokio::fs::write(&path, &lines).await.unwrap();
+        let (tx, _) = broadcast::channel(1);
+        let (h, writer) = PromptHistory::spawn(
+            HistoryOptions {
+                path: Some(path.clone()),
+                max_per_pane: 1,
+                ..Default::default()
+            },
+            tx.subscribe(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(h.recent_all(0).await, vec![second]);
+        assert!(!h.claim_live_prompt(&first.session_id, first.at, &first.prompt));
+        h.append(first).await;
+        tx.send(()).unwrap();
+        writer.await.unwrap();
+        assert_eq!(tokio::fs::read_to_string(path).await.unwrap(), lines);
+    }
+
+    #[tokio::test]
     async fn in_memory_append_and_recent() {
         let h = PromptHistory::in_memory_only(HistoryOptions::default());
         let t0 = datetime!(2026-04-24 12:00:00 UTC);
@@ -735,6 +852,7 @@ mod tests {
         });
         let h = Arc::new(PromptHistory {
             inner: RwLock::new(Inner::default()),
+            seen: Mutex::default(),
             opts: HistoryOptions {
                 max_age: time::Duration::days(1),
                 ..Default::default()

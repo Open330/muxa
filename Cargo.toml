@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/tend", "crates/tend-cli", "crates/tendd", "crates/tend-zellij-plugin"]
 
 [workspace.package]
-version = "0.10.4"
+version = "0.10.6"
 edition = "2021"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
@@ -12,7 +12,7 @@ authors = ["Open330 Contributors"]
 
 [workspace.dependencies]
 # internal
-tend = { path = "crates/tend", version = "0.10.4" }
+tend = { path = "crates/tend", version = "0.10.6" }
 
 # external
 anyhow = "1.0.103"

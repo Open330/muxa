@@ -926,6 +926,52 @@ private struct FleetCombinedReplySheet: View {
 }
 
 
+/// One open review request with Accept, Return (with a note) and Withdraw.
+struct FleetReviewRequestRow: View {
+    let item: TendReviewItem
+    let busy: Bool
+    @Binding var returning: Bool
+    @Binding var note: String
+    let decide: (TendReviewDisposition, String?) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(verbatim: item.summary)
+                    .font(TendType.body.weight(.medium))
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                Button("Accept") { decide(.accepted, nil) }
+                    .buttonStyle(.tendSecondary)
+                Button("Return…") { returning = true }
+                    .buttonStyle(.tendGhost)
+                Button("Withdraw") { decide(.withdrawn, nil) }
+                    .buttonStyle(.tendGhost)
+            }
+            .disabled(busy)
+            Text(verbatim: [item.askedBy, item.target.text, item.anchor].compactMap { $0 }.joined(separator: " · "))
+                .font(TendType.meta)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if returning {
+                HStack {
+                    TextField("What is missing", text: $note)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { decide(.returned, note) }
+                    Button("Return") { decide(.returned, note) }
+                        .buttonStyle(.tendPrimary)
+                        .disabled(note.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Cancel") { returning = false }
+                        .buttonStyle(.tendGhost)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
 /// Explicit requests for review (`tend review request`, from agents or
 /// people), above the results Home gathered on its own, oldest first. Each
 /// stays until someone accepts, returns or withdraws it, here or elsewhere:
@@ -976,7 +1022,21 @@ struct FleetReviewRequests: View {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(items) { item in
-                                row(item)
+                                FleetReviewRequestRow(
+                                    item: item,
+                                    busy: busy != nil,
+                                    returning: Binding(
+                                        get: { returning == item.id },
+                                        set: { on in
+                                            returning = on ? item.id : nil
+                                            if on { note = "" }
+                                        }
+                                    ),
+                                    note: $note,
+                                    decide: { disposition, note in
+                                        Task { await decide(item, disposition, note: note) }
+                                    }
+                                )
                             }
                             if hasMore {
                                 Button("Load More") {
@@ -1002,43 +1062,6 @@ struct FleetReviewRequests: View {
                 try? await Task.sleep(for: Self.refreshEvery)
             }
         }
-    }
-
-    private func row(_ item: TendReviewItem) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
-                Text(verbatim: item.summary)
-                    .font(TendType.body.weight(.medium))
-                    .lineLimit(2)
-                Spacer(minLength: 8)
-                Button("Accept") { Task { await decide(item, .accepted, note: nil) } }
-                    .buttonStyle(.tendSecondary)
-                Button("Return…") { returning = item.id; note = "" }
-                    .buttonStyle(.tendGhost)
-                Button("Withdraw") { Task { await decide(item, .withdrawn, note: nil) } }
-                    .buttonStyle(.tendGhost)
-            }
-            .disabled(busy != nil)
-            Text(verbatim: [item.askedBy, item.target.text, item.anchor].compactMap { $0 }.joined(separator: " · "))
-                .font(TendType.meta)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
-            if returning == item.id {
-                HStack {
-                    TextField("What is missing", text: $note)
-                        .textFieldStyle(.roundedBorder)
-                        .onSubmit { Task { await decide(item, .returned, note: note) } }
-                    Button("Return") { Task { await decide(item, .returned, note: note) } }
-                        .buttonStyle(.tendPrimary)
-                        .disabled(note.trimmingCharacters(in: .whitespaces).isEmpty)
-                    Button("Cancel") { returning = nil }
-                        .buttonStyle(.tendGhost)
-                }
-            }
-        }
-        .padding(8)
-        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 
     /// Reads the first `shown` items, oldest first, a page at a time.
@@ -1180,7 +1203,7 @@ struct FleetEvidenceSection: View {
                         .font(TendType.meta)
                         .foregroundStyle(.orange)
                 case .loaded(let evidence):
-                    loaded(evidence)
+                    FleetEvidenceList(evidence: evidence)
                 }
             }
         }
@@ -1203,9 +1226,13 @@ struct FleetEvidenceSection: View {
             }
         }
     }
+}
 
-    @ViewBuilder
-    private func loaded(_ evidence: TendTurnEvidence) -> some View {
+/// A turn's recorded commands, as the review card shows them.
+struct FleetEvidenceList: View {
+    let evidence: TendTurnEvidence
+
+    var body: some View {
         VStack(alignment: .leading, spacing: 6) {
             if evidence.pairs.isEmpty {
                 Text(evidence.complete

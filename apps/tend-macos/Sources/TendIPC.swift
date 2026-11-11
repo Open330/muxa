@@ -337,6 +337,10 @@ struct TendAgent: Decodable, Hashable, Identifiable, Sendable {
     let stateEnteredAt: String?
     let workload: TendAgentWorkload?
     let subagents: [TendAgentSubagent]?
+    /// The question an idle agent's turn ended on (`awaiting_reply_v1`),
+    /// inferred by tendd from its last response; nil from an older daemon
+    /// and on rows that are not idle.
+    let awaitingReply: TendAwaitingReply?
 
     var id: String { agentSessionID }
 
@@ -366,7 +370,14 @@ struct TendAgent: Decodable, Hashable, Identifiable, Sendable {
         case lastActivityAt = "last_activity_at"
         case stateEnteredAt = "state_entered_at"
         case workload, subagents
+        case awaitingReply = "awaiting_reply"
     }
+}
+
+/// What an idle agent asked the person at the end of its turn.
+struct TendAwaitingReply: Decodable, Hashable, Sendable {
+    let question: String
+    let since: String?
 }
 
 struct TendAgentWorkload: Decodable, Hashable, Sendable {

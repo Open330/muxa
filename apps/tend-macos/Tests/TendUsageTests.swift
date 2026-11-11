@@ -335,7 +335,9 @@ private let weekly: TimeInterval = 3 * 86_400
     let status = TendAgentStatus(agent: capped, now: now)
     #expect(status.isLimited)
     #expect(status.needsAttention, "no policy covers it")
-    #expect(status.priority == 2)
+    // After errors, input waits and asked questions; before working agents.
+    #expect(status.priority > TendAgentStatus.asked("?").priority)
+    #expect(status.priority < TendAgentStatus.working.priority)
     var covered = TendRateLimitCap(scope: .fiveHour, until: nil)
     covered.covered = true
     #expect(!TendAgentStatus.limited(covered).needsAttention)

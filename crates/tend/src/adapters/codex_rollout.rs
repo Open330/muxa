@@ -313,7 +313,7 @@ impl TailFold {
                     let final_response = payload["last_agent_message"]
                         .as_str()
                         .filter(|text| !text.trim().is_empty())
-                        .map(|text| super::hook::truncate(text.to_owned(), 4_000))
+                        .map(|text| super::hook::truncate_response(text.to_owned()))
                         .or_else(|| self.status_response.clone());
                     StatusEvent::Stopped {
                         response: final_response,
@@ -335,7 +335,7 @@ impl TailFold {
             (Some("response_item"), Some("message")) if payload["role"] == "assistant" => {
                 if matches!(payload["phase"].as_str(), Some("final" | "final_answer")) {
                     self.status_response =
-                        final_answer_text(payload).map(|text| super::hook::truncate(text, 4_000));
+                        final_answer_text(payload).map(super::hook::truncate_response);
                     StatusEvent::Stopped {
                         response: self.status_response.clone(),
                         interrupted: false,

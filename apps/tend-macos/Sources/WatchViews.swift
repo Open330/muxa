@@ -533,7 +533,7 @@ private struct WatchPaneRowTrailing: View {
 
     var body: some View {
         if let status = pane.agentStatus {
-            AgentStatusTag(status: status, showsLabel: status.priority <= 2)
+            AgentStatusTag(status: status, showsLabel: status.priority <= 3)
         } else if let command = pane.pane.currentCommand.nonEmpty {
             Text(command)
                 .font(TendType.meta.monospaced())

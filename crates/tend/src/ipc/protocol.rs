@@ -1028,6 +1028,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "fleet_multiselect_v1",
     "fleet_worktrees_v1",
     "prompt_origin_v1",
+    crate::state::AWAITING_REPLY_CAPABILITY,
     "fleet_worktree_change_v1",
     "fleet_servers_v1",
     "automation_v1",

@@ -7,6 +7,9 @@
 //! - `* -> WaitingInput` — agent is blocked on the human
 //! - `* -> Error`        — agent hit a terminal failure
 //! - `Working -> Stopped` — session completed mid-turn (rare but useful)
+//! - `* -> Idle` with a question — the turn ended by asking the person
+//!   something (`Agent::awaiting_reply`; `Idle -> Idle` when the question
+//!   arrives after the stop)
 //!
 //! Delivery is best-effort. If the notification backend is unavailable
 //! (e.g., headless CI, `DBus` not running), each failed post is logged at
@@ -145,6 +148,9 @@ impl Notifier {
 
 /// Predicate: does this transition warrant a desktop pop?
 fn should_notify(t: &Transition) -> bool {
+    if t.to == AgentState::Idle && t.agent.awaiting_reply().is_some() {
+        return true;
+    }
     matches!(
         (t.from, t.to),
         (
@@ -185,9 +191,18 @@ fn humanize_state(state: AgentState) -> &'static str {
 
 /// Build (title, body) strings for a given transition.
 fn render(_app: &str, t: &Transition) -> (String, String) {
+    let pane = t.agent.pane.as_deref().unwrap_or("-");
+    if let Some(marker) = t
+        .agent
+        .awaiting_reply()
+        .filter(|_| t.to == AgentState::Idle)
+    {
+        let title = format!("tend · {} · asked you", t.agent.kind);
+        let question = truncate(&marker.question, BODY_TRUNCATE);
+        return (title, format!("pane {pane}: {question}"));
+    }
     let title = format!("tend · {} · {}", t.agent.kind, humanize_state(t.to));
 
-    let pane = t.agent.pane.as_deref().unwrap_or("-");
     // Prefer the notification message (it's the one the agent explicitly
     // pushed), fall back to last prompt for context.
     let detail = t
@@ -289,8 +304,39 @@ mod tests {
             last_activity_at: datetime!(2026-04-24 12:00:00 UTC),
             state_entered_at: datetime!(2026-04-24 12:00:00 UTC),
             last_prompt_origin: None,
+            last_event_at: None,
             last_response_at: None,
+            awaiting_reply: None,
         }
+    }
+
+    #[test]
+    fn an_asked_question_notifies_even_idle_to_idle() {
+        let mut asked = agent(AgentState::Idle);
+        asked.awaiting_reply = Some(crate::state::AwaitingReply {
+            question: "머지해도 될까요?".into(),
+            since: datetime!(2026-04-24 12:00:00 UTC),
+        });
+        for from in [AgentState::Working, AgentState::Idle] {
+            let t = Transition {
+                from,
+                to: AgentState::Idle,
+                agent: Arc::new(asked.clone()),
+            };
+            assert!(should_notify(&t), "{from:?} -> Idle");
+            let (title, body) = render("tend", &t);
+            assert!(title.ends_with("asked you"), "{title}");
+            assert_eq!(body, "pane %7: 머지해도 될까요?");
+        }
+        // A stale marker on a row another writer moved on asks nothing.
+        let mut stopped = asked;
+        stopped.state = AgentState::Stopped;
+        let t = Transition {
+            from: AgentState::Idle,
+            to: AgentState::Stopped,
+            agent: Arc::new(stopped),
+        };
+        assert!(!should_notify(&t));
     }
 
     #[test]

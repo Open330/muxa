@@ -538,6 +538,9 @@ enum FleetBoard {
 
     /// What the agent asks of the person, in one line.
     static func question(for agent: TendAgent, now: Date) -> String {
+        // The sentence its turn ended on; an idle row's notification is an
+        // older, unrelated notice.
+        if case .asked(let question) = agent.status(at: now) { return question }
         if let note = agent.lastNotification.flatMap(firstLine) {
             // A generic notice says nothing about the question; say what
             // kind of answer is wanted and where to see it.
@@ -694,6 +697,7 @@ extension FleetBoard {
     /// is handled in the pane, where the person sees what they answer.
     static func reply(for work: FleetWork) -> FleetReply? {
         guard let focus = work.focus, focus.pane != nil else { return nil }
+        if work.lane == .needsYou, case .asked = focus.agent.status { return .answer }
         switch (work.lane, focus.agent.state) {
         case (.needsYou, "waiting_input"): return .answer
         case (.finished, "idle"), (.finished, "done"): return .sendBack

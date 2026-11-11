@@ -873,3 +873,34 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(dialog.options.map(\.label) == ["서비스", "앱", "네트워크"])
     #expect(dialog.keys(selecting: [1, 3]) == ["enter"])
 }
+
+@Test func anIdleAgentThatAskedIsYourTurnWithItsQuestion() throws {
+    let asked = try agent([
+        "state": "idle",
+        "last_notification": "Claude is waiting for your input",
+        "awaiting_reply": ["question": "머지해도 될까요?", "since": "2026-11-11T09:00:00Z"],
+    ], id: "a")
+    let status = asked.status
+    #expect(status == .asked("머지해도 될까요?"))
+    #expect(status.needsAttention)
+    #expect(status.priority > TendAgentStatus.needsInput("waiting_input").priority)
+    #expect(FleetBoard.question(for: asked, now: .now) == "머지해도 될까요?")
+
+    // The marker means nothing once the row moves on, and an older daemon
+    // sends none: both stay what their state says.
+    let working = try agent(["awaiting_reply": ["question": "머지해도 될까요?"]], id: "b")
+    #expect(working.status == .working)
+    #expect(try agent(["state": "idle"], id: "c").status == .idle)
+}
+
+@Test func eachNewQuestionNotifiesOnce() throws {
+    let first = try agent(["state": "idle", "awaiting_reply": ["question": "A로 갈까요?"]], id: "a")
+    let second = try agent(["state": "idle", "awaiting_reply": ["question": "B로 갈까요?"]], id: "a")
+    let idle = try agent(["state": "idle"], id: "a")
+    let firstKey = TendNotificationRules.key(first)
+    #expect(TendNotificationRules.event(from: "working", to: firstKey) == .attention("asked"))
+    #expect(TendNotificationRules.event(from: TendNotificationRules.key(idle), to: firstKey) == .attention("asked"))
+    #expect(TendNotificationRules.event(from: firstKey, to: firstKey) == nil)
+    #expect(TendNotificationRules.event(from: firstKey, to: TendNotificationRules.key(second)) == .attention("asked"))
+    #expect(TendNotificationActions.category(for: .attention("asked")) == TendNotificationActions.inputCategory)
+}

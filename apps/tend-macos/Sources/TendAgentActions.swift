@@ -135,7 +135,8 @@ enum TendAgentActions {
             if target.canSwitchAccount {
                 actions.append(.init(kind: .moveToAccount, isPrimary: false, isInProgress: swapping))
             }
-        case .working, .idle, .done, .other:
+        // An agent that asked is at its prompt: the answer, not "continue".
+        case .asked, .working, .idle, .done, .other:
             if target.canSwitchAccount {
                 actions.append(.init(kind: .moveToAccount, isPrimary: false, isInProgress: swapping))
             }

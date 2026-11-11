@@ -48,7 +48,7 @@ struct TendMenuBarAgentAppearance: Equatable {
         switch status {
         case _ where finished: colors = (0x21643B, 0x8AE0AB)
         case .error: colors = (0xAA2739, 0xFF9EA8)
-        case .needsInput: colors = (0x83500B, 0xFFD18C)
+        case .needsInput, .asked: colors = (0x83500B, 0xFFD18C)
         case .limited: colors = (0x68408F, 0xD1ACF5)
         case .working: colors = (0x245F99, 0x9BCAFF)
         case .done: colors = (0x21643B, 0x8AE0AB)
