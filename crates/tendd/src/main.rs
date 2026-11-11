@@ -3869,9 +3869,6 @@ async fn spawn_activity_transition_task(
                 biased;
                 msg = rx.recv() => {
                     match msg {
-                        // An Idle -> Idle broadcast only carries a changed
-                        // `awaiting_reply`; the activity log records states.
-                        Ok(transition) if transition.from == transition.to => {}
                         Ok(transition) => {
                             record_activity_transition(
                                 &activity_log,
@@ -3914,6 +3911,11 @@ fn record_activity_transition(
     states: &mut HashMap<String, (tend::AgentState, time::OffsetDateTime)>,
     transition: tend::state::Transition,
 ) {
+    // An Idle -> Idle broadcast only carries a changed `awaiting_reply`; the
+    // activity log records states.
+    if transition.from == transition.to {
+        return;
+    }
     let agent = transition.agent.as_ref();
     let at = agent.state_entered_at;
     let prior_entered_at = states
