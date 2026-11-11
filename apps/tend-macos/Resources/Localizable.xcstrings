@@ -2709,6 +2709,16 @@
         }
       }
     },
+    "Load More" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 보기"
+          }
+        }
+      }
+    },
     "Moves the preserved folder back to where it was." : {
       "localizations" : {
         "ko" : {
@@ -9926,6 +9936,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "macOS가 %@를 거부했습니다(오류 %lld). 다른 단축키를 고르세요."
+          }
+        }
+      }
+    },
+    "oldest first" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오래된 순"
           }
         }
       }

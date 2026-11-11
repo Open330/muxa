@@ -788,4 +788,15 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(key == FleetBoard.reviewKey(work), "same result, same key")
     let target = try #require(FleetBoard.reviewTarget(work))
     #expect(target.json["kind"] as? String == "session")
+
+    // The same session on another host alias, or the same unit in another
+    // state, is a different result and gets a different key.
+    let other = TendFleetHostIdentity(alias: "other", local: false, state: "online", mode: "control")
+    let elsewhere = TendHostedAgent(host: other, agent: try agent(["state": "idle", "last_prompt": "Fix it"], id: "done"), pane: nil)
+    let moved = try #require(FleetBoard.works(groups: [], agents: [elsewhere]).first)
+    #expect(FleetBoard.reviewKey(moved) != key)
+    let later = TendHostedAgent(host: host, agent: try agent(["state": "idle", "last_prompt": "Fix it", "state_entered_at": "2026-11-11T09:00:00Z"], id: "done"), pane: nil)
+    let changed = try #require(FleetBoard.works(groups: [], agents: [later]).first)
+    #expect(changed.id == work.id)
+    #expect(FleetBoard.reviewKey(changed) != key)
 }

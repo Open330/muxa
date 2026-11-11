@@ -985,6 +985,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     let askProviders: [TendAskProvider]?
     let workCommand: TendWorkCommandOutput?
     let reviewItems: [TendReviewItem]?
+    let reviewHasMore: Bool?
     let reviewItem: TendReviewItem?
     /// `swap_health`'s answer. Swap job requests also answer in `swap`,
     /// with another shape: that reads as nil rather than failing the reply.
@@ -998,6 +999,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case pipelineRuns = "pipeline_runs"
         case workCommand = "work_command"
         case reviewItems = "review_items"
+        case reviewHasMore = "review_has_more"
         case reviewItem = "review_item"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
@@ -1411,18 +1413,22 @@ actor TendIPCClient {
         }
     }
 
-    /// Open review items on this Mac's daemon (`review_items_v1`), newest
-    /// first. A review item is someone's explicit request that a result be
-    /// looked at; tend never creates one on its own.
-    func reviewItems(limit: Int = 100) async throws -> [TendReviewItem] {
-        guard capabilities.contains("review_items_v1") else { return [] }
+    /// One page of open review items on this Mac's daemon
+    /// (`review_items_v1`), oldest first so the longest-waiting request is
+    /// always reachable, and whether more follow. A review item is someone's
+    /// explicit request that a result be looked at; tend never creates one
+    /// on its own.
+    func reviewItems(offset: Int = 0, limit: Int = 50) async throws -> (items: [TendReviewItem], hasMore: Bool) {
+        guard capabilities.contains("review_items_v1") else { return ([], false) }
         let response = try await call([
             "protocol": Self.protocolVersion,
             "kind": "review_list",
             "open_only": true,
+            "oldest_first": true,
             "limit": limit,
+            "offset": offset,
         ])
-        return response.reviewItems ?? []
+        return (response.reviewItems ?? [], response.reviewHasMore ?? false)
     }
 
     /// Accept, return or withdraw a review item, as the person.
