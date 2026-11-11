@@ -4816,8 +4816,10 @@ mod tests {
     /// The live tests point the tmux backend at their own server through the
     /// process-wide `TEND_TMUX_SOCKET`; run in parallel, one would swap the
     /// other's pane.
+    #[cfg(unix)]
     static LIVE_TMUX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
     fn live_tmux() -> std::sync::MutexGuard<'static, ()> {
         LIVE_TMUX
             .lock()
@@ -5071,6 +5073,7 @@ mod tests {
         assert_eq!(outcome.to, None);
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "drives a private tmux server; run with --ignored"]
     fn swaps_a_live_pane_between_configured_accounts() {
@@ -5176,6 +5179,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
     /// A configured account whose `env_file` is gone refuses before the
     /// agent is touched (it keeps running on its account); once the file is
     /// there, the swap goes through it.
+    #[cfg(unix)]
     #[test]
     #[ignore = "drives a private tmux server; run with --ignored"]
     #[allow(
@@ -5289,6 +5293,7 @@ while read line; do case "$line" in */exit*) echo EXITING; exit 0 ;; esac; echo 
         );
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "drives a private tmux server; run with --ignored"]
     fn swaps_a_live_pane_that_runs_its_agent_directly() {
@@ -5382,6 +5387,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         assert!(screen.contains("GOT continue"), "{screen}");
     }
 
+    #[cfg(unix)]
     #[test]
     #[ignore = "drives a private tmux server; run with --ignored"]
     fn swaps_a_live_pane_end_to_end() {

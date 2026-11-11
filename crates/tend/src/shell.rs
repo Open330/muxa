@@ -387,6 +387,7 @@ mod launch_env_tests {
                 &[("TEND_LAUNCH_ID", value)],
             )
             .unwrap();
+        assert!(line.starts_with("export TEND_LAUNCH_ID='"), "{line}");
         #[cfg(unix)]
         {
             let output = std::process::Command::new("sh")
