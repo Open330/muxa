@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tend review request | list | show | accept | return | withdraw`: a review
+  item is an explicit request that one result (a session, a Work alias or a
+  collaboration request) be looked at, kept until someone accepts, returns
+  or withdraws it. tend never creates one from what it observes. Requests
+  can be idempotent (`--key`), each new request for a target takes the next
+  generation, dispositions are final, and actors are declared, not proven.
+  Stored owner-only in `reviews.sqlite3` with an event log; control
+  characters are refused. `tend status-line --needs-attention` adds
+  `◇ N to review · <oldest age>`. See `docs/REVIEW.md`.
+
 ## [0.10.1] - 2026-11-11
 
 ### Added

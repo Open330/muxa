@@ -21,6 +21,7 @@ pub struct Server {
     pub(super) restart: Option<Arc<RestartController>>,
     pub(super) fleet: Option<FleetRuntime>,
     pub(super) pipeline_runs: Arc<PipelineRunStore>,
+    pub(super) reviews: crate::review::ReviewStore,
     pub(super) work_up: Arc<WorkUpManager>,
     pub(super) mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>, // WS-F: snapshot
     /// The daemon's `config.toml`, for the requests that read and replace it
@@ -55,6 +56,7 @@ impl Server {
             restart: None,
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
+            reviews: crate::review::ReviewStore::in_memory(),
             work_up,
             mux_snapshots,
             config_path: None,
@@ -194,6 +196,13 @@ impl Server {
         self
     }
 
+    /// Serve review items from `reviews` (see `crate::review`).
+    #[must_use]
+    pub fn with_reviews(mut self, reviews: crate::review::ReviewStore) -> Self {
+        self.reviews = reviews;
+        self
+    }
+
     #[cfg(test)]
     #[must_use]
     pub(super) fn with_handler_limit(mut self, handler_limit: usize) -> Self {
@@ -314,6 +323,7 @@ impl Server {
                     let restart = self.restart.clone();
                     let fleet = self.fleet.clone();
                     let pipeline_runs = self.pipeline_runs.clone();
+                    let reviews = self.reviews.clone();
                     let work_up = self.work_up.clone();
                     let mux_snapshots = self.mux_snapshots.clone();
                     let config_path = self.config_path.clone();
@@ -337,6 +347,7 @@ impl Server {
                                 restart,
                                 fleet,
                                 pipeline_runs,
+                                reviews,
                                 work_up,
                                 mux_snapshots,
                                 config_path,
