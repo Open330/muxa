@@ -7,8 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tend swap --all --to same --when-idle` restarts each agent in place on
+  its identified current account after it becomes idle, for example to pick
+  up upgraded hooks and MCP configuration. Busy targets remain pending in
+  daemon jobs for up to `--idle-timeout` (default `6h`); status shows pending
+  targets and cancellation stops waiting. Unknown accounts are skipped,
+  bare launches stay bare, and `--force` still stops mid-turn immediately.
+  Available through `tend_swap_account` and Fleet `--host` as well.
+
 ### Fixed
 
+- A second `tendd` started while one already serves the socket (for example
+  launchd's copy next to one started by hand) now exits before loading or
+  writing anything. Before, it loaded the registry, ran its notifiers and
+  snapshotter, then failed to bind; with launchd restarting it every ten
+  seconds, one host logged 550 such runs in 90 minutes, each rewriting
+  `state.json` from a near-empty registry.
+- A new Codex worker that stops at "Hooks need review" is now reported as
+  waiting on that review (tend never trusts hooks for you) instead of "busy or
+  has a draft". A Codex placeholder cut short by a narrow pane (`› Ask Codex
+  to`) is no longer mistaken for a draft, so such workers are ready.
 - `scripts/migrate-from-muxa.py` now renames MCP tool names left in prompt
   templates, skills and permission rules (`muxa_call_peer` → `tend_call_peer`,
   `mcp__muxa__muxa_status` → `mcp__tend__tend_status`). Before, a migrated

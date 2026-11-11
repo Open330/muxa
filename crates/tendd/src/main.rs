@@ -240,6 +240,17 @@ async fn run() -> Result<()> {
         .or(cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
     tracing::info!(socket = %socket.display(), "starting tendd");
+    // A second daemon used to load the registry, start its snapshotter and
+    // notifiers and heal tmux before its bind failed — and a KeepAlive
+    // service manager restarted it every ten seconds for as long as the
+    // other daemon lived, each pass rewriting state.json from its own
+    // near-empty registry. Refuse before touching anything instead.
+    if tend::transport::endpoint_is_live(&socket) {
+        anyhow::bail!(
+            "another tendd is already serving {}; not starting a second one (nothing was loaded or written)",
+            socket.display()
+        );
+    }
 
     // Construct the shutdown broadcast up-front so every background task
     // we spawn below can subscribe and exit cleanly. The signal handler

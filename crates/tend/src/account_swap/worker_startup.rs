@@ -207,8 +207,20 @@ fn prepare_with(
         },
     );
     let (state, reason) = match resume {
+        // Codex asks before running hooks that are new or changed. Accepting
+        // lets them run outside the sandbox, so it stays the user's call.
+        _ if kind == AgentKind::Codex && codex_hook_review(&last.borrow()) => (
+            State::Blocked,
+            Some(
+                "Codex asks to review new or changed hooks before it starts; answer it in the \
+                 pane (tend does not trust hooks for you), then prepare the worker again"
+                    .into(),
+            ),
+        ),
         Resume::Ready
-            if turn_running(&last.borrow()) || composer_draft(&last.borrow(), kind).is_some() =>
+            if turn_running(&last.borrow())
+                || composer_draft(&last.borrow(), kind)
+                    .is_some_and(|text| !(kind == AgentKind::Codex && cut_placeholder(&text))) =>
         {
             (
                 State::Blocked,
@@ -231,6 +243,81 @@ fn prepare_with(
         answered: answered.into_iter().map(str::to_owned).collect(),
         reason,
     }
+}
+
+/// Codex's startup review of new or changed hooks, as the live menu at the
+/// bottom of the screen: its title, the numbered options with one selected,
+/// and the key-hint footer last. Text that merely mentions it (a transcript
+/// line above a normal composer) is not the menu.
+fn codex_hook_review(screen: &str) -> bool {
+    let tail = super::screen_tail(screen, 20);
+    let lines: Vec<&str> = tail
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines
+        .iter()
+        .any(|line| line.starts_with('›') && is_codex_composer_line(line))
+    {
+        return false;
+    }
+    let Some(title) = lines.iter().rposition(|line| *line == "Hooks need review") else {
+        return false;
+    };
+    // The footer is the last line or two; Codex wraps it in a narrow pane,
+    // and older builds word it "Press enter to confirm or esc to go back".
+    let footer_at = lines.len().saturating_sub(2).max(title + 1);
+    let footer = lines[footer_at..].join(" ").to_lowercase();
+    let footer_lines = if footer.contains("enter") && footer.contains("confirm") {
+        lines[footer_at..]
+            .iter()
+            .position(|line| line.to_lowercase().contains("enter"))
+            .map_or(0, |start| lines.len() - footer_at - start)
+    } else {
+        return false;
+    };
+    // Numbered rows; a wrapped label continues on the next lines.
+    let mut rows: Vec<(bool, String)> = Vec::new();
+    for line in &lines[title + 1..lines.len() - footer_lines] {
+        let selected = line.starts_with('›');
+        let body = line.trim_start_matches('›').trim_start();
+        match body.split_once(". ") {
+            Some((n, label)) if !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()) => {
+                rows.push((selected, label.to_owned()));
+            }
+            _ => {
+                if let Some((_, label)) = rows.last_mut() {
+                    label.push(' ');
+                    label.push_str(body);
+                }
+            }
+        }
+    }
+    let position = |label: &str| rows.iter().position(|(_, row)| row == label);
+    matches!(
+        (position("Review hooks"), position("Trust all and continue")),
+        (Some(review), Some(trust)) if review < trust
+    ) && rows.iter().any(|(selected, _)| *selected)
+}
+
+/// An empty Codex composer or one showing a placeholder.
+fn is_codex_composer_line(line: &str) -> bool {
+    let text = line.trim_start_matches('›').trim();
+    text.is_empty() || super::CODEX_PLACEHOLDERS.contains(&text)
+}
+
+/// A known Codex placeholder cut at a word boundary by a narrow pane
+/// (`› Ask Codex to`). Only for a worker launched a moment ago, which
+/// nobody has typed into; account-swap draft capture keeps such text.
+fn cut_placeholder(text: &str) -> bool {
+    let text = text.trim_end_matches('…');
+    text.chars().count() >= 8
+        && super::CODEX_PLACEHOLDERS.iter().any(|placeholder| {
+            placeholder
+                .strip_prefix(text)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
 }
 
 #[cfg(test)]
@@ -432,6 +519,87 @@ mod tests {
             assert_eq!(result.state, State::Blocked);
         }
     }
+    #[test]
+    fn codex_hook_review_is_a_named_blocker_and_never_answered() {
+        let screen = "  Hooks need review\n  6 hooks are new or changed.\n  Hooks can run outside the\n  sandbox after you trust\n  them.\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting\n     (hooks won't run)\n  enter confirm · esc skip";
+        let clock = FakeClock {
+            base: Instant::now(),
+            elapsed: Cell::new(Duration::ZERO),
+        };
+        let result = prepare_with(
+            &clock,
+            AgentKind::Codex,
+            || Some(screen.into()),
+            || true,
+            |_| panic!("must not answer a hook review"),
+            true,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        );
+        assert_eq!(result.state, State::Blocked);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap()
+                .contains("review new or changed hooks"),
+            "{result:?}"
+        );
+        assert!(result.answered.is_empty());
+    }
+
+    #[test]
+    fn a_narrow_codex_placeholder_is_not_a_draft_for_a_fresh_worker_only() {
+        assert!(cut_placeholder("Ask Codex to"));
+        assert!(cut_placeholder("Find and fix…"));
+        assert!(!cut_placeholder("Ask Codex to fix it"));
+        assert!(!cut_placeholder("Ask"));
+        // Account-swap draft capture keeps such text: it may be typed.
+        assert_eq!(
+            crate::account_swap::composer_draft(
+                "› Find and fix\n  100% context left",
+                AgentKind::Codex
+            )
+            .as_deref(),
+            Some("Find and fix")
+        );
+        let clock = FakeClock {
+            base: Instant::now(),
+            elapsed: Cell::new(Duration::ZERO),
+        };
+        let result = prepare_with(
+            &clock,
+            AgentKind::Codex,
+            || Some("  permissions: YOLO mode\n› Ask Codex to\n  G…  ⚠ 1 · f2".into()),
+            || true,
+            |_| true,
+            false,
+            Duration::from_secs(1),
+            Duration::from_millis(100),
+            Duration::from_millis(25),
+        );
+        assert_eq!(result.state, State::Ready, "{result:?}");
+    }
+
+    #[test]
+    fn a_wrapped_hook_menu_and_older_footer_are_still_the_menu() {
+        let wrapped = "  Hooks need review\n  6 hooks are new or changed.\n› 1. Review hooks\n  2. Trust all and\n     continue\n  3. Continue without\n     trusting (hooks won't run)\n  enter confirm ·\n  esc skip";
+        assert!(codex_hook_review(wrapped));
+        let older = "  Hooks need review\n› 1. Review hooks\n  2. Trust all and continue\n  3. Continue without trusting\n  Press enter to confirm or esc to go back";
+        assert!(codex_hook_review(older));
+        let unselected = "  Hooks need review\n  1. Review hooks\n  2. Trust all and continue\n  enter confirm · esc skip";
+        assert!(!codex_hook_review(unselected));
+    }
+
+    #[test]
+    fn a_transcript_mentioning_the_hook_review_is_not_the_menu() {
+        let idle = "• The startup dialog says Hooks need review. Choose Review hooks to inspect it.\n› Ask Codex to do anything\n  100% context left";
+        assert!(!codex_hook_review(idle));
+        let quoted = "  Hooks need review\n  1. Review hooks\n  2. Trust all and continue\n› Ask Codex to do anything\n  100% context left";
+        assert!(!codex_hook_review(quoted));
+    }
+
     #[test]
     fn narrow_claude_hard_wrapping_is_handled_without_guessing_other_dialogs() {
         let count = Cell::new(0);

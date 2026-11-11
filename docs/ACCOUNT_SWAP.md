@@ -95,6 +95,51 @@ For each agent, tend:
    left to you: the swap stops there, names it, and types nothing;
 6. sends the follow-up prompt when one applies.
 
+## Restarting after an upgrade
+
+```sh
+tend swap --all --to same --when-idle --detach
+tend swap --status <request-key> --wait-secs 0
+tend swap --cancel <request-key>
+# A shorter bounded wait, on a Fleet host:
+tend swap --host build --all --to same --when-idle --idle-timeout 30m
+```
+
+`same` resolves each target's current account from configured account
+matching against its process environment, or its own `aas e <account>`
+launch token. Unknown identities are skipped with a reason. A bare process
+is never assigned the globally active `aas` account as a guess; a bare
+launch identified by a configured account keeps a bare provider launch
+with that account's environment, without requiring `--bare wrap`.
+
+`--when-idle` keeps busy or recently active targets pending in a daemon
+job. The daemon checks fresh hook state periodically (including the normal
+20-second activity quiet period) and restarts ready targets while others
+wait. Agents blocked on input, permission prompts or choice menus
+(`waiting_input` / `waiting_choice`) remain pending until the prompt is
+resolved and they become idle, or the timeout expires.
+`tend swap --status <key>` shows pending targets.
+
+Waiting releases the pane's input guard and does not block swaps on other
+agents, whether submitted by automation, a user or Fleet. The pending
+pane remains reserved to its job: another job targeting that pane is
+reported as skipped with reason `busy`; resending the same request key
+attaches to the existing job. Cancellation or timeout releases the
+reservation. The job waits at most `--idle-timeout` (default `6h`, units `s`, `m`,
+`h`, `d`); targets still busy then are reported as skipped due to timeout,
+without stopping them. `--force` takes precedence and stops mid-turn now.
+`--local` cannot wait for idle. Panes running the agent directly without
+a shell retain the daemon's existing refusal and are reported as skipped;
+waiting jobs never hand those targets to a later local execution. A daemon restart leaves an unfinished job
+for the existing swap-job recovery workflow; it does not replay restarts.
+
+Startup dialogs, background-shell preservation, scheduled-task-owner
+exclusions and follow-up policy are the same as other swaps. With the
+default `continue_when=limited`, an agent that finished while waiting does
+not receive a follow-up. MCP accepts `to="same"`, `when_idle=true`, and an
+optional `idle_timeout="30m"`; use `detach=true` to retain the job handle
+while agents finish their work.
+
 ## Choosing which agents
 
 | Command | Agents |
