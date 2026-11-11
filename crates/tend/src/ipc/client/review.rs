@@ -61,6 +61,24 @@ impl Client {
         field(&response, "review_summary")
     }
 
+    /// Record a claim and its disposition together. Requires
+    /// `review_record_v1` and an idempotency key on `review`.
+    pub async fn review_record(
+        &self,
+        review: &NewReview,
+        disposition: DispositionKind,
+        note: Option<&str>,
+    ) -> Result<ReviewItem, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "review_record",
+            "review": review,
+            "disposition": disposition,
+            "note": note,
+        });
+        field(&self.call_checked(&req).await?, "review_item")
+    }
+
     pub async fn review_dispose(
         &self,
         id: &str,

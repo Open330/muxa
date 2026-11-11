@@ -171,6 +171,16 @@
         }
       }
     },
+    "Accept" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "수락"
+          }
+        }
+      }
+    },
     "Add Approval Rule…" : {
       "localizations" : {
         "ko" : {
@@ -2479,6 +2489,26 @@
         }
       }
     },
+    "Asked by %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청: %@"
+          }
+        }
+      }
+    },
+    "Asked for review" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "검토 요청"
+          }
+        }
+      }
+    },
     "Brings Tend forward with the agents palette, those waiting on you first." : {
       "localizations" : {
         "ko" : {
@@ -2515,6 +2545,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "서버 목록을 가져오지 못했습니다: %@"
+          }
+        }
+      }
+    },
+    "Could not read review requests: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "검토 요청을 읽지 못했습니다: %@"
           }
         }
       }
@@ -2689,6 +2729,16 @@
         }
       }
     },
+    "Load More" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 보기"
+          }
+        }
+      }
+    },
     "Moves the preserved folder back to where it was." : {
       "localizations" : {
         "ko" : {
@@ -2815,6 +2865,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@의 이 worktree를 복원할까요?"
+          }
+        }
+      }
+    },
+    "Return" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "돌려보내기"
+          }
+        }
+      }
+    },
+    "Return…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "돌려보내기…"
+          }
+        }
+      }
+    },
+    "Reviewed in Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "홈에서 검토함"
           }
         }
       }
@@ -3039,6 +3119,26 @@
         }
       }
     },
+    "What is missing" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "무엇이 빠졌는지"
+          }
+        }
+      }
+    },
+    "Withdraw" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "철회"
+          }
+        }
+      }
+    },
     "Work %@" : {
       "localizations" : {
         "ko" : {
@@ -3085,6 +3185,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이전 질문에 쓴 답입니다. 보내지 않았습니다."
+          }
+        }
+      }
+    },
+    "a person" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사람"
           }
         }
       }
@@ -6257,6 +6367,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "기본값"
+          }
+        }
+      }
+    },
+    "an agent" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트"
           }
         }
       }
@@ -9936,6 +10056,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "결과 기록 없음"
+          }
+        }
+      }
+    },
+    "oldest first" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오래된 순"
           }
         }
       }

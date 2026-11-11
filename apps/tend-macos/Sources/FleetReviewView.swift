@@ -33,6 +33,7 @@ struct FleetReviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
+            FleetReviewRequests(model: model)
             let queue = queue
             Group {
                 if queue.isEmpty {
@@ -924,6 +925,158 @@ private struct FleetCombinedReplySheet: View {
     }
 }
 
+
+/// Explicit requests for review (`tend review request`, from agents or
+/// people), above the results Home gathered on its own, oldest first. Each
+/// stays until someone accepts, returns or withdraws it, here or elsewhere:
+/// the list refreshes every few seconds while the sheet is open. Hidden
+/// when there are none or the daemon has no review items.
+struct FleetReviewRequests: View {
+    @ObservedObject var model: AppModel
+    @State private var items: [TendReviewItem] = []
+    @State private var hasMore = false
+    /// How many items the list shows: one page, more after Load More.
+    @State private var shown = Self.page
+    @State private var returning: String?
+    @State private var note = ""
+    @State private var busy: String?
+    @State private var problem: String?
+
+    private static let page = 50
+    private static let refreshEvery: Duration = .seconds(5)
+
+    var body: some View {
+        Group {
+            if !items.isEmpty || problem != nil {
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Asked for review")
+                            .font(.system(size: 13, weight: .semibold))
+                        Text(verbatim: hasMore ? "\(items.count)+" : "\(items.count)")
+                            .font(.system(size: 12, weight: .semibold))
+                            .monospacedDigit()
+                            .foregroundStyle(.secondary)
+                        Text("oldest first")
+                            .font(TendType.meta)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Button {
+                            Task { await load() }
+                        } label: {
+                            Image(systemName: "arrow.clockwise")
+                        }
+                        .buttonStyle(.tendGhost)
+                        .help("Check again")
+                    }
+                    if let problem {
+                        Label(problem, systemImage: "exclamationmark.circle")
+                            .font(TendType.meta)
+                            .foregroundStyle(.orange)
+                    }
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(items) { item in
+                                row(item)
+                            }
+                            if hasMore {
+                                Button("Load More") {
+                                    shown += Self.page
+                                    Task { await load() }
+                                }
+                                .buttonStyle(.tendGhost)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 180)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 10)
+                Divider()
+            }
+        }
+        .task {
+            // Requests made or decided elsewhere (the CLI, an agent, another
+            // window) show up while the sheet stays open.
+            while !Task.isCancelled {
+                await load()
+                try? await Task.sleep(for: Self.refreshEvery)
+            }
+        }
+    }
+
+    private func row(_ item: TendReviewItem) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(verbatim: item.summary)
+                    .font(TendType.body.weight(.medium))
+                    .lineLimit(2)
+                Spacer(minLength: 8)
+                Button("Accept") { Task { await decide(item, .accepted, note: nil) } }
+                    .buttonStyle(.tendSecondary)
+                Button("Return…") { returning = item.id; note = "" }
+                    .buttonStyle(.tendGhost)
+                Button("Withdraw") { Task { await decide(item, .withdrawn, note: nil) } }
+                    .buttonStyle(.tendGhost)
+            }
+            .disabled(busy != nil)
+            Text(verbatim: [item.askedBy, item.target.text, item.anchor].compactMap { $0 }.joined(separator: " · "))
+                .font(TendType.meta)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if returning == item.id {
+                HStack {
+                    TextField("What is missing", text: $note)
+                        .textFieldStyle(.roundedBorder)
+                        .onSubmit { Task { await decide(item, .returned, note: note) } }
+                    Button("Return") { Task { await decide(item, .returned, note: note) } }
+                        .buttonStyle(.tendPrimary)
+                        .disabled(note.trimmingCharacters(in: .whitespaces).isEmpty)
+                    Button("Cancel") { returning = nil }
+                        .buttonStyle(.tendGhost)
+                }
+            }
+        }
+        .padding(8)
+        .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    /// Reads the first `shown` items, oldest first, a page at a time.
+    private func load() async {
+        do {
+            var loaded: [TendReviewItem] = []
+            var more = true
+            while more && loaded.count < shown {
+                let page = try await model.client.reviewItems(offset: loaded.count, limit: Self.page)
+                loaded += page.items
+                more = page.hasMore && !page.items.isEmpty
+            }
+            items = loaded
+            hasMore = more
+            problem = nil
+        } catch {
+            problem = String(localized: "Could not read review requests: \(error.localizedDescription)")
+        }
+    }
+
+    private func decide(_ item: TendReviewItem, _ disposition: TendReviewDisposition, note: String?) async {
+        busy = item.id
+        problem = nil
+        defer { busy = nil }
+        do {
+            try await model.client.decideReview(id: item.id, disposition: disposition, note: note)
+            returning = nil
+        } catch {
+            problem = error.localizedDescription
+        }
+        // Either way, show where it stands now: decided here, or already
+        // decided elsewhere.
+        let failure = problem
+        await load()
+        // Keep the decision's error visible over the refresh's success.
+        if failure != nil { problem = failure }
+    }
+}
 
 // MARK: - Recorded commands
 

@@ -109,6 +109,14 @@ pub(super) enum RequestBody {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Record a claim and its disposition together (`review_record_v1`):
+    /// `review.requested_by` both asks and decides. Needs an idempotency key.
+    ReviewRecord {
+        review: Box<crate::review::NewReview>,
+        disposition: crate::review::DispositionKind,
+        #[serde(default)]
+        note: Option<String>,
+    },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
     PipelineSubscribe,
@@ -978,6 +986,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "pipeline_runs_v1",
     crate::review::REVIEW_CAPABILITY,
     "turn_evidence_v1",
+    crate::review::REVIEW_RECORD_CAPABILITY,
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",

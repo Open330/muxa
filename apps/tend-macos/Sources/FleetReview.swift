@@ -5,6 +5,7 @@
 // reviewed, within a time range, and offers three ways through them:
 // one card at a time, an inbox, or a digest. Each ends in the same three
 // actions: Looks Good, Later, Send Back.
+import CryptoKit
 import Foundation
 
 enum FleetReviewScope: String, CaseIterable, Identifiable, Sendable {
@@ -198,5 +199,103 @@ enum FleetReviewAssist {
             result[id] = (entry["message"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         }
         return result
+    }
+}
+
+
+// MARK: - Review items (explicit requests)
+
+enum TendReviewDisposition: String, Sendable {
+    case accepted, returned, withdrawn
+}
+
+/// An explicit request that one result be looked at (`tend review`).
+struct TendReviewItem: Decodable, Hashable, Identifiable, Sendable {
+    struct Target: Decodable, Hashable, Sendable {
+        let kind: String
+        let provider: String?
+        let sessionID: String?
+        let workspace: String?
+        let work: String?
+        let alias: String?
+        let requestID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case kind, provider, workspace, work, alias
+            case sessionID = "session_id"
+            case requestID = "request_id"
+        }
+
+        var text: String {
+            switch kind {
+            case "work":
+                let base = [workspace, work].compactMap { $0 }.joined(separator: "/")
+                return alias.map { "\(base) · \($0)" } ?? base
+            case "session":
+                return [provider, sessionID.map { String($0.prefix(8)) }].compactMap { $0 }.joined(separator: " ")
+            default:
+                return requestID ?? kind
+            }
+        }
+    }
+
+    struct Actor: Decodable, Hashable, Sendable {
+        let kind: String
+        let label: String?
+    }
+
+    let id: String
+    let target: Target
+    let generation: UInt64
+    let summary: String
+    let anchor: String?
+    let requestedAt: String?
+    let requestedBy: Actor
+
+    enum CodingKeys: String, CodingKey {
+        case id, target, generation, summary, anchor
+        case requestedAt = "requested_at"
+        case requestedBy = "requested_by"
+    }
+
+    /// Who asked, as they declared it (not verified).
+    var askedBy: String {
+        let who = requestedBy.label ?? (requestedBy.kind == "agent" ? String(localized: "an agent") : String(localized: "a person"))
+        return String(localized: "Asked by \(who)")
+    }
+}
+
+/// A review store target, as Home names a result.
+enum TendReviewTargetRef: Hashable, Sendable {
+    case work(workspace: String, work: String)
+    case session(provider: String, sessionID: String)
+
+    var json: [String: Any] {
+        switch self {
+        case .work(let workspace, let work):
+            return ["kind": "work", "workspace": workspace, "work": work]
+        case .session(let provider, let sessionID):
+            return ["kind": "session", "provider": provider, "session_id": sessionID]
+        }
+    }
+}
+
+extension FleetBoard {
+    /// The review store's target for a result Home shows: its Work, or the
+    /// session of the agent it names.
+    static func reviewTarget(_ work: FleetWork) -> TendReviewTargetRef? {
+        if case .work(let identity) = work.source {
+            return .work(workspace: identity.workspaceID, work: identity.workID)
+        }
+        guard let agent = work.focus?.agent else { return nil }
+        return .session(provider: agent.kind, sessionID: agent.agentSessionID)
+    }
+
+    /// One key per result: the unit and the exact state it was reviewed
+    /// in, hashed to fit the store's key limit. Reviewing it again after it
+    /// changed is a new result.
+    static func reviewKey(_ work: FleetWork) -> String {
+        let digest = SHA256.hash(data: Data("\(work.id)\n\(work.revision)".utf8))
+        return "home:" + digest.map { String(format: "%02x", $0) }.joined()
     }
 }
