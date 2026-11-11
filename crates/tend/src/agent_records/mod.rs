@@ -1,5 +1,6 @@
 //! Searchable local Claude/Codex evidence, independent of the live daemon.
 //! The cache is disposable: provider JSONL files remain the source of truth.
+pub mod evidence;
 mod index;
 mod parse;
 use index::{index_file, source_current};

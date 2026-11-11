@@ -74,6 +74,13 @@ pub(super) enum RequestBody {
         socket: Option<String>,
         request: collaboration::HandleRequest,
     },
+    /// `turn_evidence_v1`: the calls `session_id` made since `since`
+    /// (RFC 3339) and their results, from this host's own records.
+    TurnEvidence {
+        session_id: String,
+        #[serde(default)]
+        since: Option<String>,
+    },
     /// Record a claim that a result needs review (`review_items_v1`).
     ReviewCreate {
         review: Box<crate::review::NewReview>,
@@ -969,6 +976,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     collaboration::USER_AUTHORIZED_DELIVERY_CAPABILITY,
     "pipeline_runs_v1",
     crate::review::REVIEW_CAPABILITY,
+    "turn_evidence_v1",
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
@@ -1064,6 +1072,9 @@ pub struct Response {
     /// the old daemon still finishing an in-flight response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    /// With `turn_evidence`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_evidence: Option<Box<crate::agent_records::evidence::TurnEvidence>>,
     /// The registration an `expect_prompt` made; absent when tend could not
     /// bind it to exactly one agent session.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1243,6 +1254,7 @@ impl Response {
             collaboration_open_counts: None,
             collaboration_byte_budget: None,
             generation: None,
+            turn_evidence: None,
             prompt_token: None,
             sessions: None,
             session: None,

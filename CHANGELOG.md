@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- macOS: a review card shows the commands the agent ran since the request
+  and what came back, from its own records, above the agent's report of
+  the result (now labelled as such): the latest six calls paired with their
+  results by call id, clipped, with provider-recorded errors, calls with no
+  result yet, and incomplete records said plainly. Read from this Mac's
+  records over a new daemon request (`turn_evidence_v1`); for an agent on
+  another host the card says where to read them instead of looking its
+  session up here.
+
 ## [0.10.2] - 2026-11-11
 
 ### Added

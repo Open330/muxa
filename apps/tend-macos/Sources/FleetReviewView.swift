@@ -48,6 +48,9 @@ struct FleetReviewView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 860, idealWidth: 960, minHeight: 620, idealHeight: 720)
+        .environment(\.fleetEvidence, FleetEvidenceReader { [client = model.client] session, since in
+            try await client.turnEvidence(sessionID: session, since: since)
+        })
     }
 
     private var actions: FleetReviewActions {
@@ -257,7 +260,12 @@ struct FleetReviewDetail: View {
                         .textSelection(.enabled)
                 }
             }
-            block("Result") {
+            if let focus = work.focus {
+                block("Recorded commands") {
+                    FleetEvidenceSection(hosted: focus, revision: work.revision)
+                }
+            }
+            block("Agent's report") {
                 if let result = FleetBoard.reviewResult(work) {
                     MarkdownContent(source: result, lineLimit: resultLines, selectable: true, font: TendType.body)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -911,6 +919,163 @@ private struct FleetCombinedReplySheet: View {
             }
             if batch.allSatisfy({ results[$0.work.id] == String(localized: "Sent") }) {
                 finished()
+            }
+        }
+    }
+}
+
+
+// MARK: - Recorded commands
+
+/// What an agent ran in its latest turn and what came back, from its own
+/// records (`tend agent search`), before its own account of the result.
+struct TendTurnEvidence: Decodable, Hashable, Sendable {
+    struct Pair: Decodable, Hashable, Sendable {
+        let tool: String?
+        let call: String
+        let result: String?
+        let isError: Bool?
+        let clipped: Bool
+        let callEvent: String
+
+        enum CodingKeys: String, CodingKey {
+            case tool, call, result, clipped
+            case isError = "is_error"
+            case callEvent = "call_event"
+        }
+    }
+
+    let pairs: [Pair]
+    let more: Bool
+    let complete: Bool
+}
+
+/// Reads a local session's recorded commands; set by the review sheet.
+struct FleetEvidenceReader: Sendable {
+    let read: @Sendable (String, String?) async throws -> TendTurnEvidence?
+
+    init(_ read: @escaping @Sendable (String, String?) async throws -> TendTurnEvidence?) {
+        self.read = read
+    }
+}
+
+private struct FleetEvidenceKey: EnvironmentKey {
+    static let defaultValue: FleetEvidenceReader? = nil
+}
+
+extension EnvironmentValues {
+    var fleetEvidence: FleetEvidenceReader? {
+        get { self[FleetEvidenceKey.self] }
+        set { self[FleetEvidenceKey.self] = newValue }
+    }
+}
+
+struct FleetEvidenceSection: View {
+    let hosted: TendHostedAgent
+    /// The result's revision: a change reads the records again.
+    let revision: String
+    @Environment(\.fleetEvidence) private var reader
+
+    private enum Phase: Equatable {
+        case loading
+        case loaded(TendTurnEvidence)
+        case unavailable
+        case failed(String)
+    }
+
+    @State private var phase: Phase = .loading
+
+    var body: some View {
+        Group {
+            if !hosted.host.local {
+                Text(String(localized: "Ran on \(hosted.host.alias). Its records are read there: tend agent search --session-id \(hosted.agent.agentSessionID)"))
+                    .font(TendType.meta)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            } else {
+                switch phase {
+                case .loading:
+                    ProgressView().controlSize(.small)
+                case .unavailable:
+                    Text("Reading recorded commands needs an updated tendd.")
+                        .font(TendType.meta)
+                        .foregroundStyle(.secondary)
+                case .failed(let message):
+                    Label(message, systemImage: "exclamationmark.circle")
+                        .font(TendType.meta)
+                        .foregroundStyle(.orange)
+                case .loaded(let evidence):
+                    loaded(evidence)
+                }
+            }
+        }
+        .task(id: "\(hosted.id)|\(hosted.agent.lastPromptAt ?? "")|\(revision)") {
+            guard hosted.host.local else { return }
+            guard let reader else {
+                phase = .unavailable
+                return
+            }
+            phase = .loading
+            do {
+                let evidence = try await reader.read(hosted.agent.agentSessionID, hosted.agent.lastPromptAt)
+                phase = evidence.map(Phase.loaded) ?? .unavailable
+            } catch {
+                phase = .failed(error.localizedDescription)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func loaded(_ evidence: TendTurnEvidence) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if evidence.pairs.isEmpty {
+                Text(evidence.complete
+                    ? String(localized: "No commands recorded since the request.")
+                    : String(localized: "No commands found, but some records could not be read."))
+                    .font(TendType.meta)
+                    .foregroundStyle(.secondary)
+            }
+            if evidence.more {
+                Text("Earlier commands in this turn are not shown.")
+                    .font(TendType.meta)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(evidence.pairs, id: \.callEvent) { pair in
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack(spacing: 6) {
+                        Text(verbatim: pair.tool ?? "tool")
+                            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                        if pair.isError == true {
+                            Text("error")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(.red)
+                        }
+                        if pair.result == nil {
+                            Text("no result recorded")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Text(verbatim: pair.call)
+                        .font(.system(size: 11, design: .monospaced))
+                        .lineLimit(3)
+                        .textSelection(.enabled)
+                    if let result = pair.result {
+                        Text(verbatim: result)
+                            .font(.system(size: 11, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(4)
+                            .textSelection(.enabled)
+                    }
+                }
+                .padding(6)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.06), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+            }
+            if !evidence.complete && !evidence.pairs.isEmpty {
+                Text("Some records could not be read; other commands may be missing.")
+                    .font(TendType.meta)
+                    .foregroundStyle(.secondary)
             }
         }
     }

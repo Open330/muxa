@@ -766,3 +766,18 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
     #expect(sends.begin("a"))
     #expect(sends.outcome("a") == nil)
 }
+
+@Test func recordedCommandsDecodeWithTheirHonestyFlags() throws {
+    let json = """
+    {"session_id":"s1","more":true,"complete":false,
+     "pairs":[{"tool":"Bash","call":"cargo test","call_at":"2026-11-11T01:00:00Z",
+               "result":"test result: ok","result_at":"2026-11-11T01:00:05Z","is_error":false,
+               "clipped":false,"call_event":"e1","result_event":"e2"},
+              {"tool":"Bash","call":"git push","call_at":null,"result":null,"result_at":null,
+               "is_error":null,"clipped":true,"call_event":"e3","result_event":null}]}
+    """
+    let evidence = try JSONDecoder().decode(TendTurnEvidence.self, from: Data(json.utf8))
+    #expect(evidence.more && !evidence.complete)
+    #expect(evidence.pairs[0].result == "test result: ok")
+    #expect(evidence.pairs[1].result == nil && evidence.pairs[1].clipped)
+}

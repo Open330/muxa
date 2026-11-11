@@ -251,6 +251,16 @@
         }
       }
     },
+    "Agent's report" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "에이전트의 보고"
+          }
+        }
+      }
+    },
     "Agents that were opened but never given a task" : {
       "localizations" : {
         "ko" : {
@@ -2589,6 +2599,16 @@
         }
       }
     },
+    "Earlier commands in this turn are not shown." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이번 턴의 앞선 명령은 표시하지 않았습니다."
+          }
+        }
+      }
+    },
     "From %@" : {
       "localizations" : {
         "ko" : {
@@ -2699,6 +2719,26 @@
         }
       }
     },
+    "No commands found, but some records could not be read." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "명령을 찾지 못했지만, 일부 기록을 읽지 못했습니다."
+          }
+        }
+      }
+    },
+    "No commands recorded since the request." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요청 이후 기록된 명령이 없습니다."
+          }
+        }
+      }
+    },
     "No listening servers associated with tend on this host." : {
       "localizations" : {
         "ko" : {
@@ -2715,6 +2755,36 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "관찰 전용 호스트입니다. 변경은 그 호스트에서 하거나 제어 권한으로 하세요."
+          }
+        }
+      }
+    },
+    "Ran on %@. Its records are read there: tend agent search --session-id %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "%1$@에서 실행됐습니다. 기록은 그 호스트에서 읽으세요: tend agent search --session-id %2$@"
+          }
+        }
+      }
+    },
+    "Reading recorded commands needs an updated tendd." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록된 명령을 읽으려면 새 tendd가 필요합니다."
+          }
+        }
+      }
+    },
+    "Recorded commands" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록된 명령"
           }
         }
       }
@@ -2805,6 +2875,16 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%2$lld개 중 %1$lld개만 보여 줍니다. 전체는 %3$@에서 tend servers를 실행하세요."
+          }
+        }
+      }
+    },
+    "Some records could not be read; other commands may be missing." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일부 기록을 읽지 못해 다른 명령이 빠졌을 수 있습니다."
           }
         }
       }
@@ -9810,12 +9890,32 @@
         }
       }
     },
+    "error" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "오류"
+          }
+        }
+      }
+    },
     "macOS refused %@ (error %lld). Pick another shortcut." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "macOS가 %@를 거부했습니다(오류 %lld). 다른 단축키를 고르세요."
+          }
+        }
+      }
+    },
+    "no result recorded" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결과 기록 없음"
           }
         }
       }

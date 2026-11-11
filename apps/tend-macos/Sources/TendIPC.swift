@@ -984,6 +984,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     let askEnabled: Bool?
     let askProviders: [TendAskProvider]?
     let workCommand: TendWorkCommandOutput?
+    let turnEvidence: TendTurnEvidence?
     /// `swap_health`'s answer. Swap job requests also answer in `swap`,
     /// with another shape: that reads as nil rather than failing the reply.
     let swap: TendLenient<TendSwapHealth>?
@@ -995,6 +996,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case fleetResult = "fleet_result"
         case pipelineRuns = "pipeline_runs"
         case workCommand = "work_command"
+        case turnEvidence = "turn_evidence"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
@@ -1405,6 +1407,22 @@ actor TendIPCClient {
         guard result.accepted else {
             throw TendIPCError.server(result.message ?? "Keys were rejected")
         }
+    }
+
+    /// The calls a local agent session made since `since` and their
+    /// results, from this Mac's own records (`turn_evidence_v1`). nil from
+    /// a daemon without it. Never asked for a remote host's session: a
+    /// session id means nothing on another host's records.
+    func turnEvidence(sessionID: String, since: String?) async throws -> TendTurnEvidence? {
+        guard capabilities.contains("turn_evidence_v1") else { return nil }
+        var request: [String: Any] = [
+            "protocol": Self.protocolVersion,
+            "kind": "turn_evidence",
+            "session_id": sessionID,
+        ]
+        if let since { request["since"] = since }
+        let response = try await call(request, timeout: 20)
+        return response.turnEvidence
     }
 
     /// The host's receipted worktrees and what would stop a cleanup from
