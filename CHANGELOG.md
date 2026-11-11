@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `tend swap --host <alias> … --when-idle [--idle-timeout …]` is accepted by
+  the Fleet host. 0.10.5 sent the switches but the host's allowlist refused
+  them ("`swap` does not accept \"--when-idle\" here").
+
 ## [0.10.6] - 2026-11-11
 
 ### Added

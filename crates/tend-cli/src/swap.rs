@@ -1670,6 +1670,29 @@ mod tests {
         tend::work_control::validate_swap_argv(&argv).unwrap();
     }
 
+    /// A Fleet host accepts the idle-wait switches the CLI forwards, so
+    /// `tend swap --host H --all --to same --when-idle` runs there.
+    #[test]
+    fn a_remote_when_idle_swap_passes_the_host_allowlist() {
+        let cli = Cli::parse_from([
+            "swap",
+            "--host",
+            "devbox",
+            "--all",
+            "--to",
+            "same",
+            "--when-idle",
+            "--idle-timeout",
+            "2h",
+            "--detach",
+        ]);
+        let mut argv = remote_argv(&cli.args);
+        argv.push("--request-key=k".into());
+        assert!(argv.iter().any(|w| w == "--when-idle"), "{argv:?}");
+        assert!(argv.iter().any(|w| w == "--idle-timeout=2h"), "{argv:?}");
+        tend::work_control::validate_swap_argv(&argv).unwrap();
+    }
+
     /// The notice names the host and promises neither outcome.
     #[test]
     fn a_remote_swap_says_ctrl_c_only_stops_the_wait() {

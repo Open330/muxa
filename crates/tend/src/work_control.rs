@@ -380,6 +380,7 @@ const SWAP_SWITCHES: &[&str] = &[
     "--dry-run",
     "--local",
     "--detach",
+    "--when-idle",
 ];
 
 /// `tend swap` options a remote run may pass, each as one non-empty
@@ -398,6 +399,7 @@ const SWAP_VALUE_FLAGS: &[&str] = &[
     "--cancel",
     "--request-key",
     "--wait-secs",
+    "--idle-timeout",
 ];
 
 /// Check a `swap` argv: JSON output, only the allowlisted flags, and plain
