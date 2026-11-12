@@ -103,7 +103,7 @@ impl ProcessFence {
             .cloned();
         let pid = if root
             .as_ref()
-            .is_some_and(|root| crate::account_swap::is_agent_process(root, kind))
+            .is_some_and(|root| crate::pane_process::is_agent_process(root, kind))
         {
             pane.pane_pid
         } else {

@@ -41,7 +41,7 @@ pub(super) async fn handle(
     work_up: Arc<WorkUpManager>,
     mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     config_path: Option<PathBuf>,
-    swap: Option<Arc<dyn crate::swap_service::SwapJobs>>,
+    swap: Option<Arc<dyn crate::swap_api::SwapJobs>>,
     mut stopping: watch::Receiver<bool>,
 ) -> Result<(), RuntimeError> {
     let mut collaboration_actor = observe_collaboration_actor(&stream);

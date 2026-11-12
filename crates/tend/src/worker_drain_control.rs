@@ -185,7 +185,7 @@ pub(super) async fn stop(
                 return (Outcome::Refused, "pane endpoint unobservable".into());
             };
             let shell =
-                crate::account_swap::pane_has_shell(info.pane_pid, stop_token.process_fence.pid);
+                crate::pane_process::pane_has_shell(info.pane_pid, stop_token.process_fence.pid);
             let mut original = None;
             match shell {
                 None => return (Outcome::Refused, "pane shell ancestry unobservable".into()),
@@ -298,7 +298,7 @@ pub(super) async fn settle_row(
     let empty = tokio::task::spawn_blocking(move || {
         let panes = listed.list_panes();
         collaboration::unique_pane(&target.pane, target.socket.as_deref(), &panes)
-            .is_some_and(|p| crate::account_swap::pane_has_agent_process(p.pane_pid) == Some(false))
+            .is_some_and(|p| crate::pane_process::pane_has_agent_process(p.pane_pid) == Some(false))
     })
     .await
     .unwrap_or(false);

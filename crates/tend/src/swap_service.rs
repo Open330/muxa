@@ -26,53 +26,31 @@ use crate::account_swap::{
 use crate::backend::SharedBackend;
 use crate::event::AgentKind;
 use crate::state::Agent;
+pub use crate::swap_api::{
+    validate_key, Accepted, EntryView, JobRef, JobView, PlanView, RetryOverrides, StillDue,
+    SwapHealth, SwapJobs, SwapOverrides, SwapReadiness, UnopenedSwap,
+};
 use crate::swap_job::{
     request_digest, AcceptedPlan, Boundary, Disposition, JobError, Lease, Liveness, OwnerIdentity,
     PlannedTarget, ResumePolicy, SettledEntry, SwapJobStore, TextRef,
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// A swap request exactly as the caller made it: only what it set, nothing
-/// filled in from configuration. Its digest identifies a repeated request,
-/// so changing a default between two sends of the same request does not
-/// make it a different one.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-#[allow(clippy::struct_excessive_bools)] // independent request switches, as on the CLI
-pub struct SwapOverrides {
-    pub targets: Vec<String>,
-    pub all: bool,
-    pub limited: bool,
-    pub provider: Option<String>,
-    pub to: Option<String>,
-    pub spread: bool,
-    pub force: bool,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub when_idle: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub idle_timeout: Option<String>,
-    pub bare: Option<String>,
-    pub continue_text: Option<String>,
-    pub continue_when: Option<String>,
-    pub no_continue: bool,
-    /// `binding` or `verified`. Left out of the digest when not typed, so a
-    /// request from before the option is the same request.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub continue_evidence: Option<String>,
-    pub exclude: Vec<String>,
-    /// The configuration file the caller loaded, if it named one. A request
-    /// planned against a different file than the daemon's is refused rather
-    /// than silently run on the daemon's.
-    pub caller_config: Option<PathBuf>,
+/// The job store schema this build writes and reads.
+pub const JOB_SCHEMA: i64 = crate::swap_job::SCHEMA_VERSION;
+
+/// [`SwapOverrides`] lives in [`crate::swap_api`]; the module completes it.
+pub trait ResolveOverrides {
+    /// The request as `config` completes it.
+    fn resolve(&self, config: &SwapConfig) -> Result<SwapRequest, String>;
 }
 
-impl SwapOverrides {
-    /// The request as `config` completes it.
-    pub fn resolve(&self, config: &SwapConfig) -> Result<SwapRequest, String> {
+impl ResolveOverrides for SwapOverrides {
+    fn resolve(&self, config: &SwapConfig) -> Result<SwapRequest, String> {
         self.validate()?;
         let scope = if !self.targets.is_empty() {
             SwapScope::Targets(self.targets.clone())
@@ -132,106 +110,6 @@ impl SwapOverrides {
     }
 }
 
-impl SwapOverrides {
-    /// Refuse the combinations the CLI refuses, whoever the caller is: none
-    /// of them is given a silent winner.
-    pub fn validate(&self) -> Result<(), String> {
-        if self.idle_timeout.is_some() && !self.when_idle {
-            return Err("idle_timeout requires when_idle".into());
-        }
-        if let Some(timeout) = &self.idle_timeout {
-            if timeout.len() > MAX_NAME {
-                return Err("idle_timeout is too long".into());
-            }
-            crate::automation::parse_duration(timeout)?;
-        }
-        let conflict = |a: &str, b: &str| Err(format!("{a} and {b} cannot be combined"));
-        if !self.targets.is_empty() && self.all {
-            return conflict("targets", "all");
-        }
-        if !self.targets.is_empty() && self.limited {
-            return conflict("targets", "limited");
-        }
-        if self.all && self.limited {
-            return conflict("all", "limited");
-        }
-        if self.spread && self.to.is_some() {
-            return conflict("spread", "to");
-        }
-        if self.no_continue && self.continue_when.is_some() {
-            return conflict("no_continue", "continue_when");
-        }
-        if self.no_continue && self.continue_text.is_some() {
-            return conflict("no_continue", "continue_text");
-        }
-        if let Some(when) = self.continue_when.as_deref() {
-            if !matches!(when, "limited" | "always" | "never") {
-                return Err(format!("unknown continue policy {when:?}"));
-            }
-        }
-        if let Some(evidence) = self.continue_evidence.as_deref() {
-            if !matches!(evidence, "binding" | "verified") {
-                return Err(format!("unknown continue evidence {evidence:?}"));
-            }
-        }
-        let names = |what: &str, names: &[String]| {
-            if names.len() > MAX_NAMES || names.iter().any(|name| name.len() > MAX_NAME) {
-                Err(format!(
-                    "{what}: at most {MAX_NAMES} names of up to {MAX_NAME} bytes"
-                ))
-            } else {
-                Ok(())
-            }
-        };
-        names("targets", &self.targets)?;
-        names("exclude", &self.exclude)?;
-        for (what, value) in [
-            ("provider", self.provider.as_deref()),
-            ("to", self.to.as_deref()),
-            ("bare", self.bare.as_deref()),
-        ] {
-            if value.is_some_and(|value| value.len() > MAX_NAME) {
-                return Err(format!("{what}: longer than {MAX_NAME} bytes"));
-            }
-        }
-        if self
-            .continue_text
-            .as_deref()
-            .is_some_and(|text| text.len() > MAX_TEXT)
-        {
-            return Err(format!("continue_text: longer than {MAX_TEXT} bytes"));
-        }
-        if self
-            .caller_config
-            .as_deref()
-            .is_some_and(|path| path.as_os_str().len() > MAX_PATH)
-        {
-            return Err(format!("caller_config: longer than {MAX_PATH} bytes"));
-        }
-        Ok(())
-    }
-}
-
-const MAX_NAMES: usize = 256;
-const MAX_NAME: usize = 256;
-const MAX_TEXT: usize = 4096;
-const MAX_PATH: usize = 4096;
-const MAX_KEY: usize = 128;
-
-/// A request key: what a lost acknowledgement is recovered by, so it is
-/// bounded and plain.
-fn validate_key(key: &str) -> Result<(), String> {
-    let plain = key
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_.:@".contains(c));
-    if key.is_empty() || key.len() > MAX_KEY || !plain {
-        return Err(format!(
-            "a request key is 1-{MAX_KEY} characters of letters, digits and -_.:@"
-        ));
-    }
-    Ok(())
-}
-
 /// What the daemon knows right now, as one consistent snapshot.
 pub struct Snapshot {
     pub node_id: String,
@@ -263,83 +141,6 @@ pub trait ContextProvider: Send + Sync {
     fn turn_probe(&self) -> Option<Arc<dyn account_swap::TurnProbe>> {
         None
     }
-}
-
-/// A job by id, or by the request key that made it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum JobRef {
-    Id(String),
-    Key(String),
-}
-
-/// One report row of a job, in the order the request reported it.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct EntryView {
-    pub report_index: usize,
-    pub pane: Option<String>,
-    /// `None` while the target is still to run, or was never reached.
-    pub disposition: Option<String>,
-    pub reason: Option<String>,
-    /// Effects whose result was never recorded: they may or may not have
-    /// happened.
-    pub uncertain_effects: u32,
-    /// The executor's own report, while the daemon that ran it holds it.
-    pub outcome: Option<SwapOutcome>,
-    /// The follow-up decision the journal recorded: `allowed`, `not_due`,
-    /// or why it was withheld.
-    #[serde(default)]
-    pub continuation: Option<String>,
-    /// The follow-up the journal recorded: the transport's word, and the
-    /// evidence once its wait ended.
-    #[serde(default)]
-    pub follow_up: Option<account_swap::FollowUpReport>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct JobView {
-    pub job_id: String,
-    pub node_id: String,
-    pub state: String,
-    pub revision: u64,
-    pub reason: Option<String>,
-    pub entries: Vec<EntryView>,
-    /// Why this job cannot go on: the service faulted while it was still
-    /// accepted or running. An ended job never carries one, whatever
-    /// happened to the service after it ended.
-    pub fault: Option<String>,
-    /// Why the service stopped taking work, if it did: its health, not this
-    /// job's result.
-    #[serde(default)]
-    pub service_fault: Option<String>,
-    /// A cancel was asked for: no target starts after it, and targets that
-    /// never started read `cancelled`.
-    #[serde(default)]
-    pub cancel_requested: bool,
-    /// When this job's effects and observations were pruned, if they were:
-    /// details they held (follow-up, continuation) are expired, not absent.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub evidence_pruned_at: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Accepted {
-    pub job_id: String,
-    /// The request key was seen before: this is the job it made then.
-    pub existing: bool,
-    pub view: JobView,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlanView {
-    pub outcomes: Vec<SwapOutcome>,
-    /// Planned targets left out because they run their agent directly: a
-    /// caller may act on exactly these itself.
-    #[serde(default)]
-    pub direct_targets: Vec<account_swap::DirectTarget>,
-    /// Whether a submit would be taken now.
-    pub executable: bool,
-    pub unavailable: Option<String>,
 }
 
 /// The agents' prompt hooks as the daemon receives them, kept only as long
@@ -432,45 +233,6 @@ impl account_swap::TurnProbe for PromptReceipts {
                     && receipt.endpoint == endpoint
             })
         })
-    }
-}
-
-/// What a retry may set: everything else is the parent's.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RetryOverrides {
-    /// `binding` or `verified`; only matters to the relaunch's report, as a
-    /// retry types no follow-up.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub continue_evidence: Option<String>,
-    /// Also stop an agent that is mid-turn now.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub force: bool,
-    /// The configuration file the caller named, if it named one: refused
-    /// unless it is the daemon's.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub caller_config: Option<PathBuf>,
-}
-
-impl RetryOverrides {
-    pub fn validate(&self) -> Result<(), String> {
-        if self
-            .caller_config
-            .as_deref()
-            .is_some_and(|path| path.as_os_str().len() > MAX_PATH)
-        {
-            return Err(format!("caller_config: longer than {MAX_PATH} bytes"));
-        }
-        self.evidence().map(|_| ())
-    }
-
-    fn evidence(&self) -> Result<Option<ContinueEvidence>, String> {
-        match self.continue_evidence.as_deref() {
-            None => Ok(None),
-            Some("binding") => Ok(Some(ContinueEvidence::Binding)),
-            Some("verified") => Ok(Some(ContinueEvidence::Verified)),
-            Some(other) => Err(format!("unknown continue evidence {other:?}")),
-        }
     }
 }
 
@@ -919,136 +681,6 @@ impl SwapService {
     pub async fn drain(&self, timeout: std::time::Duration) -> bool {
         Service::drain(Arc::clone(&self.inner), timeout).await
     }
-}
-
-/// The automation's check that its swap is still wanted: `Err` says why not.
-pub type StillDue = Box<dyn Fn() -> Result<(), String> + Send>;
-
-/// Whether the swap service takes jobs now, and if not why: read-only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SwapHealth {
-    pub readiness: SwapReadiness,
-    /// Why it is not `ready`.
-    pub reason: Option<String>,
-    /// The job store's schema, once one was opened; `None` if it never was.
-    pub schema: Option<i64>,
-    /// The schema this build writes and reads.
-    pub expected_schema: i64,
-    /// The fault that halted it, if one did (apart from other reasons).
-    pub fault: Option<String>,
-    /// Jobs this manager is running now (not rows an earlier manager left).
-    pub jobs_running: usize,
-    /// Why the last pruning of old jobs' evidence failed, if it did: upkeep,
-    /// not a fault; jobs are taken regardless.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub maintenance: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, strum::Display)]
-#[serde(rename_all = "snake_case")]
-#[strum(serialize_all = "snake_case")]
-pub enum SwapReadiness {
-    Ready,
-    /// Shutting down: no new job.
-    Draining,
-    /// A fault stopped it; it takes nothing until the daemon restarts.
-    Halted,
-    /// It never opened, or its store is no longer its own.
-    Unavailable,
-}
-
-/// The swap service a daemon could not open, kept for its reason: every
-/// request is refused with it, and health reports it.
-pub struct UnopenedSwap {
-    reason: String,
-}
-
-impl UnopenedSwap {
-    #[must_use]
-    pub fn new(reason: String) -> Self {
-        Self { reason }
-    }
-
-    fn refused<T>(&self) -> Result<T, String> {
-        Err(format!(
-            "swap jobs are unavailable on this daemon: {}",
-            self.reason
-        ))
-    }
-}
-
-impl SwapJobs for UnopenedSwap {
-    fn active(&self) -> Result<(), String> {
-        self.refused()
-    }
-
-    fn plan(&self, _: &SwapOverrides) -> Result<PlanView, String> {
-        self.refused()
-    }
-
-    fn submit(&self, _: &str, _: &SwapOverrides) -> Result<Accepted, String> {
-        self.refused()
-    }
-
-    fn retry(&self, _: &str, _: &JobRef, _: &RetryOverrides) -> Result<Accepted, String> {
-        self.refused()
-    }
-
-    fn cancel(&self, _: &JobRef) -> Result<JobView, String> {
-        self.refused()
-    }
-
-    fn status(&self, _: &JobRef) -> Result<JobView, String> {
-        self.refused()
-    }
-
-    fn health(&self) -> SwapHealth {
-        SwapHealth {
-            readiness: SwapReadiness::Unavailable,
-            reason: Some(self.reason.clone()),
-            schema: None,
-            expected_schema: crate::swap_job::SCHEMA_VERSION,
-            fault: None,
-            jobs_running: 0,
-            maintenance: None,
-        }
-    }
-
-    fn exists(&self) -> bool {
-        false
-    }
-}
-
-/// What an IPC caller may do with swap jobs. Every request through it is a
-/// public one: it can never claim the daemon's own automation privileges.
-pub trait SwapJobs: Send + Sync {
-    /// Read account metadata without planning or acting on an agent.
-    fn accounts(&self) -> Result<Vec<crate::account_provider::ProviderCandidates>, String> {
-        Err("account candidates are unavailable".into())
-    }
-
-    fn active(&self) -> Result<(), String>;
-    fn plan(&self, overrides: &SwapOverrides) -> Result<PlanView, String>;
-    fn submit(&self, request_key: &str, overrides: &SwapOverrides) -> Result<Accepted, String>;
-    fn retry(
-        &self,
-        request_key: &str,
-        parent: &JobRef,
-        overrides: &RetryOverrides,
-    ) -> Result<Accepted, String>;
-    /// Ask a job to start no further target; accepted whatever the
-    /// service's health.
-    fn cancel(&self, job: &JobRef) -> Result<JobView, String>;
-    /// How the service is, read-only: never plans, never touches a pane.
-    fn health(&self) -> SwapHealth;
-    /// A service that opened (it can have jobs), as opposed to the reason
-    /// one did not.
-    fn exists(&self) -> bool {
-        true
-    }
-    /// Readable whatever state the service is in, so a halted or recovered
-    /// job can always be inspected.
-    fn status(&self, job: &JobRef) -> Result<JobView, String>;
 }
 
 impl SwapJobs for SwapService {

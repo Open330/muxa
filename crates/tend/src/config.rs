@@ -167,7 +167,7 @@ pub struct Config {
     pub automation: crate::automation::AutomationConfig,
     /// Defaults for moving agents onto another account: `tend swap` and the
     /// `swap_account` automation action.
-    pub swap: crate::account_swap::SwapConfig,
+    pub swap: crate::swap_api::SwapConfig,
     /// Accounts tend starts and moves agents on, with no external tool:
     /// `[[accounts.claude]]` / `[[accounts.codex]]`. Host-local.
     pub accounts: crate::accounts::AccountsConfig,
@@ -252,14 +252,13 @@ impl Config {
     /// The account routing for a new `program` agent, when
     /// `[agent.<program>].account` asks for it.
     #[must_use]
-    pub fn account_route(&self, program: &str) -> Option<crate::account_route::AccountRoute> {
-        if !crate::account_route::PROVIDERS.contains(&program) {
+    pub fn account_route(&self, program: &str) -> Option<crate::swap_api::AccountRoute> {
+        if !crate::swap_api::PROVIDERS.contains(&program) {
             return None;
         }
-        let choice = crate::account_route::SpawnAccount::parse(
-            self.agent.get(program)?.account.as_deref()?,
-        )?;
-        Some(crate::account_route::AccountRoute {
+        let choice =
+            crate::swap_api::SpawnAccount::parse(self.agent.get(program)?.account.as_deref()?)?;
+        Some(crate::swap_api::AccountRoute {
             provider: program.to_owned(),
             choice,
             aas: self.swap.aas.clone(),
@@ -1818,8 +1817,7 @@ fn validate_agents(
                 "unknown agent {program:?}; expected claude, codex, agy, or opencode"
             )));
         }
-        if launch.account.is_some() && !crate::account_route::PROVIDERS.contains(&program.as_str())
-        {
+        if launch.account.is_some() && !crate::swap_api::PROVIDERS.contains(&program.as_str()) {
             return Err(ConfigError::InvalidAgent {
                 path: format!("agent.{program}.account"),
                 message: "account routing is for claude and codex only".into(),
@@ -2759,9 +2757,9 @@ options = ["--model", "gpt-5-codex"]
         assert_eq!(cfg.launch_options("codex", None), ["legacy"]);
         assert_eq!(
             cfg.account_route("codex"),
-            Some(crate::account_route::AccountRoute {
+            Some(crate::swap_api::AccountRoute {
                 provider: "codex".into(),
-                choice: crate::account_route::SpawnAccount::Auto,
+                choice: crate::swap_api::SpawnAccount::Auto,
                 aas: "/opt/aas".into(),
                 profiles: Vec::new(),
             })
@@ -2817,7 +2815,7 @@ options = ["--model", "gpt-5-codex"]
         named.validate().unwrap();
         assert_eq!(
             named.account_route("claude").unwrap().choice,
-            crate::account_route::SpawnAccount::Named("spare@claude".into())
+            crate::swap_api::SpawnAccount::Named("spare@claude".into())
         );
     }
 

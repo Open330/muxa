@@ -17,61 +17,12 @@
 //! Already-running agents are [`crate::account_swap`]'s business.
 
 use crate::account_swap::{find_aas, query_candidates_within, Candidate};
-use serde::{Deserialize, Serialize};
+pub use crate::swap_api::{AccountDecision, AccountRoute, SpawnAccount, PROVIDERS};
 use std::time::Duration;
 
 /// How long `aas candidates` gets before a launch gives up on it. `aas`
 /// answers from its usage cache, so this only trips when it hangs.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The providers accounts are routed for.
-pub const PROVIDERS: &[&str] = &["claude", "codex"];
-
-/// Which account a new agent starts on.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SpawnAccount {
-    /// The first configured account, or `aas`'s best-ranked one with quota
-    /// left.
-    Auto,
-    /// This account, by name (`work`, or `work@claude` as `aas` spells it).
-    Named(String),
-}
-
-impl SpawnAccount {
-    /// Read `[agent.<program>].account`. `None` for a blank value.
-    #[must_use]
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim() {
-            "" => None,
-            "auto" => Some(Self::Auto),
-            name => Some(Self::Named(name.to_owned())),
-        }
-    }
-}
-
-/// A provider's routing policy, resolved from config for one launch.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AccountRoute {
-    /// `claude` or `codex`.
-    pub provider: String,
-    pub choice: SpawnAccount,
-    /// The configured `aas` binary (`[swap].aas`), used when the provider
-    /// lists no [`Self::profiles`].
-    pub aas: String,
-    /// The provider's `[[accounts.<provider>]]`, in config order. When
-    /// present, routing needs no external tool.
-    pub profiles: Vec<crate::accounts::AccountProfile>,
-}
-
-/// What routing decided, reported with the launch result.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AccountDecision {
-    /// The account the agent was started on; `None` when it started bare.
-    pub account: Option<String>,
-    /// Why it started bare, when it did.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub skipped: Option<String>,
-}
 
 /// A decided launch: the words that start the provider CLI on `account`.
 #[derive(Debug, Clone, PartialEq, Eq)]

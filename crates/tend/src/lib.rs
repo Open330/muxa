@@ -44,6 +44,8 @@ pub mod agent_conversation;
 pub mod agent_directory;
 pub mod agent_locator;
 pub mod agent_records;
+#[doc(hidden)]
+pub mod agent_tui;
 pub mod ask;
 pub mod automation;
 pub mod automation_choice;
@@ -71,11 +73,14 @@ pub mod launch_identity;
 pub mod metrics;
 pub mod notify;
 pub mod orchestration;
+#[doc(hidden)]
+pub mod pane_process;
 pub mod paths;
 mod pid_liveness;
 pub mod pipeline;
 pub mod pipeline_run;
-mod process_snapshot;
+#[doc(hidden)]
+pub mod process_snapshot;
 pub mod process_tree;
 mod prompt_headline;
 #[cfg(unix)]
@@ -95,6 +100,8 @@ pub mod shell;
 pub mod sinks;
 pub mod snapshot;
 pub mod state;
+#[doc(hidden)]
+pub mod swap_api;
 pub(crate) mod swap_job;
 #[doc(hidden)]
 pub mod swap_service;
@@ -111,6 +118,7 @@ pub mod listener_inventory;
 pub mod mux_snapshot_control;
 pub mod work_pipeline_spec;
 pub mod work_presets;
+pub mod worker_startup;
 pub mod worker_stop;
 pub mod worktree_change;
 pub mod worktree_inventory;

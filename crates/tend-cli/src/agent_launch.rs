@@ -444,7 +444,7 @@ impl StartRequest {
 pub struct StartResult {
     /// Verified composer state; process creation alone is not readiness.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub input_readiness: Option<tend::account_swap::worker_startup::Report>,
+    pub input_readiness: Option<tend::worker_startup::Report>,
     pub launch_id: Option<String>,
     pub launch_receipt: Option<Box<tend::launch_identity::LaunchReceipt>>,
     pub host: LaunchHost,
@@ -482,7 +482,7 @@ pub struct StartResult {
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct AgentStartOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
-    input_readiness: Option<tend::account_swap::worker_startup::Report>,
+    input_readiness: Option<tend::worker_startup::Report>,
     #[serde(skip_serializing_if = "Option::is_none")]
     launch_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1102,7 +1102,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
     {
         let report =
             crate::worker_startup::prepare(&pane, &cwd, &launch_id, request.bypass_permissions)?;
-        anyhow::ensure!(report.state == tend::account_swap::worker_startup::State::Ready,
+        anyhow::ensure!(report.state == tend::worker_startup::State::Ready,
             "worker pane {pane}, launch {launch_id}, was created but is not input-ready ({:?}): {}; the pane is retained, no task was sent",
             report.state, report.reason.as_deref().unwrap_or("startup did not finish"));
         Some(report)

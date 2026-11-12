@@ -136,16 +136,16 @@ pub(super) enum RequestBody {
     /// job its request key already made.
     SwapJobStart {
         request_key: String,
-        overrides: crate::swap_service::SwapOverrides,
+        overrides: crate::swap_api::SwapOverrides,
     },
     /// `swap_jobs_v1`: a job by id or request key, readable even while the
     /// service is halted.
     SwapJobStatus {
-        job: crate::swap_service::JobRef,
+        job: crate::swap_api::JobRef,
     },
     /// `swap_plan_v1`: what a start would do, doing none of it.
     SwapPlan {
-        overrides: crate::swap_service::SwapOverrides,
+        overrides: crate::swap_api::SwapOverrides,
     },
     /// `swap_health_v1`: how the swap service is, read-only.
     SwapHealth,
@@ -153,15 +153,15 @@ pub(super) enum RequestBody {
     SwapAccounts,
     /// `swap_cancel_v1`: ask a job to start no further target.
     SwapJobCancel {
-        job: crate::swap_service::JobRef,
+        job: crate::swap_api::JobRef,
     },
     /// `swap_retry_v1`: retry an ended job's safely retryable targets as a
     /// new job under `request_key`.
     SwapJobRetry {
         request_key: String,
-        parent: crate::swap_service::JobRef,
+        parent: crate::swap_api::JobRef,
         #[serde(default)]
-        overrides: crate::swap_service::RetryOverrides,
+        overrides: crate::swap_api::RetryOverrides,
     },
     WorkCommand {
         #[serde(default)]

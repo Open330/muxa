@@ -8,31 +8,14 @@
 //! through [`super::effects::Runner`], which records each one before and
 //! after it happens.
 
-use super::{is_agent_process, is_alive, pane_processes, signal_pids, Target};
+use super::Target;
+pub(crate) use crate::agent_tui::Clock;
 use crate::backend::SharedBackend;
+use crate::pane_process::{is_agent_process, is_alive, pane_processes, signal_pids};
 use std::time::{Duration, Instant};
 
 /// An agent process and its arguments (`None`: unreadable).
 pub(crate) type AgentArgv = (u32, Option<Vec<String>>);
-
-/// Time, so a fake can advance it instead of waiting.
-pub(super) trait Clock {
-    fn now(&self) -> Instant;
-    fn sleep(&self, duration: Duration);
-}
-
-/// The wall clock, for tests that drive a probe in real time.
-pub(super) struct RealClock;
-
-impl Clock for RealClock {
-    fn now(&self) -> Instant {
-        Instant::now()
-    }
-
-    fn sleep(&self, duration: Duration) {
-        std::thread::sleep(duration);
-    }
-}
 
 /// One target's pane and processes.
 pub(super) trait SwapIo: Clock {

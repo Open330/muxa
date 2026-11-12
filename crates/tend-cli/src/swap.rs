@@ -2765,7 +2765,9 @@ mod tests {
             "30m",
         ]);
         let request = overrides(&cli.args, None);
-        let resolved = request.resolve(&SwapConfig::default()).unwrap();
+        let resolved =
+            tend::swap_service::ResolveOverrides::resolve(&request, &SwapConfig::default())
+                .unwrap();
         assert_eq!(resolved.to, AccountChoice::Same);
         assert!(resolved.when_idle);
         assert_eq!(resolved.idle_timeout, Duration::from_secs(1800));

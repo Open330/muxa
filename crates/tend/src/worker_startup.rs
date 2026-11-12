@@ -1,11 +1,9 @@
 //! Mechanical preparation of an explicitly launched worker, before any task is sent.
 //! The caller must fence the new process, pane and authorized working directory.
 //! No conversation prompt, login choice or tool permission is answered here.
-use super::{
-    composer_draft,
-    io::{self, Clock},
-    option_rows, pending_dialog, turn_running, type_keys, wait_for_resume_answering_with_probe,
-    Consent, Resume, READY_QUIET, STARTUP_DIALOGS,
+use crate::agent_tui::{
+    self as io, composer_draft, option_rows, pending_dialog, turn_running, type_keys,
+    wait_for_resume_answering_with_probe, Clock, Consent, Resume, READY_QUIET, STARTUP_DIALOGS,
 };
 use crate::event::AgentKind;
 use serde::Serialize;
@@ -82,7 +80,7 @@ fn normalize_capture(screen: String) -> String {
 // Restrict the actual composer to the bottom of the screen, leaving at most
 // three footer lines and rejecting shell/relaunch output underneath it.
 fn claude_composer_visible(screen: &str) -> bool {
-    let tail = super::screen_tail(screen, 12);
+    let tail = crate::agent_tui::screen_tail(screen, 12);
     let lines: Vec<_> = tail.lines().collect();
     let rules: Vec<_> = lines
         .iter()
@@ -202,7 +200,7 @@ fn prepare_with(
         tick,
         &mut answered,
         &|screen| {
-            super::agent_prompt_visible(screen)
+            crate::agent_tui::agent_prompt_visible(screen)
                 || (kind == AgentKind::ClaudeCode && claude_composer_visible(screen))
         },
     );
@@ -250,7 +248,7 @@ fn prepare_with(
 /// and the key-hint footer last. Text that merely mentions it (a transcript
 /// line above a normal composer) is not the menu.
 fn codex_hook_review(screen: &str) -> bool {
-    let tail = super::screen_tail(screen, 20);
+    let tail = crate::agent_tui::screen_tail(screen, 20);
     let lines: Vec<&str> = tail
         .lines()
         .map(str::trim)
@@ -304,7 +302,7 @@ fn codex_hook_review(screen: &str) -> bool {
 /// An empty Codex composer or one showing a placeholder.
 fn is_codex_composer_line(line: &str) -> bool {
     let text = line.trim_start_matches('›').trim();
-    text.is_empty() || super::CODEX_PLACEHOLDERS.contains(&text)
+    text.is_empty() || crate::agent_tui::CODEX_PLACEHOLDERS.contains(&text)
 }
 
 /// A known Codex placeholder cut at a word boundary by a narrow pane
@@ -313,17 +311,19 @@ fn is_codex_composer_line(line: &str) -> bool {
 fn cut_placeholder(text: &str) -> bool {
     let text = text.trim_end_matches('…');
     text.chars().count() >= 8
-        && super::CODEX_PLACEHOLDERS.iter().any(|placeholder| {
-            placeholder
-                .strip_prefix(text)
-                .is_some_and(|rest| rest.starts_with(' '))
-        })
+        && crate::agent_tui::CODEX_PLACEHOLDERS
+            .iter()
+            .any(|placeholder| {
+                placeholder
+                    .strip_prefix(text)
+                    .is_some_and(|rest| rest.starts_with(' '))
+            })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::account_swap::{DOWN, ENTER};
+    use crate::agent_tui::{DOWN, ENTER};
     use std::cell::Cell;
     use std::time::Instant;
     struct FakeClock {
@@ -410,7 +410,7 @@ mod tests {
         }
         // The shared account-swap probe must retain its old policy: a dead
         // composer's frame can remain above a fresh relaunch.
-        assert!(!super::super::agent_prompt_visible(screen));
+        assert!(!crate::agent_tui::agent_prompt_visible(screen));
         let without_header = screen.lines().skip(1).collect::<Vec<_>>().join("\n");
         assert_eq!(
             run(|| Some(without_header.clone()), || true, |_| panic!()).state,
@@ -557,7 +557,7 @@ mod tests {
         assert!(!cut_placeholder("Ask"));
         // Account-swap draft capture keeps such text: it may be typed.
         assert_eq!(
-            crate::account_swap::composer_draft(
+            crate::agent_tui::composer_draft(
                 "› Find and fix\n  100% context left",
                 AgentKind::Codex
             )

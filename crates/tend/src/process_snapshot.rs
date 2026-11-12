@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProcessInfo {
+pub struct ProcessInfo {
     pub pid: u32,
     pub parent_pid: u32,
     pub depth: u8,
@@ -23,14 +23,14 @@ pub(crate) struct ProcessInfo {
 // Suppress dead_code there rather than duplicate the type behind cfgs.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 #[derive(Debug, Clone, Default)]
-pub(crate) struct ProcessTable {
+pub struct ProcessTable {
     by_pid: HashMap<u32, ProcessInfo>,
     children_by_parent: HashMap<u32, Vec<u32>>,
 }
 
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 impl ProcessTable {
-    pub(crate) fn from_processes(processes: impl IntoIterator<Item = ProcessInfo>) -> Self {
+    pub fn from_processes(processes: impl IntoIterator<Item = ProcessInfo>) -> Self {
         let mut table = Self::default();
         for mut process in processes {
             process.depth = 0;
@@ -44,28 +44,23 @@ impl ProcessTable {
         table
     }
 
-    pub(crate) fn children(&self, pid: u32) -> &[u32] {
+    pub fn children(&self, pid: u32) -> &[u32] {
         self.children_by_parent.get(&pid).map_or(&[], Vec::as_slice)
     }
 
-    pub(crate) fn comm(&self, pid: u32) -> Option<&str> {
+    pub fn comm(&self, pid: u32) -> Option<&str> {
         self.by_pid.get(&pid).map(|process| process.comm.as_str())
     }
 
-    pub(crate) fn get(&self, pid: u32) -> Option<&ProcessInfo> {
+    pub fn get(&self, pid: u32) -> Option<&ProcessInfo> {
         self.by_pid.get(&pid)
     }
 
-    pub(crate) fn processes(&self) -> impl Iterator<Item = &ProcessInfo> {
+    pub fn processes(&self) -> impl Iterator<Item = &ProcessInfo> {
         self.by_pid.values()
     }
 
-    pub(crate) fn descendants(
-        &self,
-        root: u32,
-        max_depth: u8,
-        max_nodes: usize,
-    ) -> Vec<ProcessInfo> {
+    pub fn descendants(&self, root: u32, max_depth: u8, max_nodes: usize) -> Vec<ProcessInfo> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
         let mut queue: VecDeque<(u32, u8)> = self
@@ -100,7 +95,7 @@ impl ProcessTable {
 /// One small `ps` snapshot is both cheaper and avoids needlessly reading
 /// command-line arguments that can contain sensitive values.
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
+pub fn read_parent_pid_map() -> HashMap<u32, u32> {
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid="])
         .output()
@@ -127,7 +122,7 @@ fn parse_parent_pid_map(stdout: &str) -> HashMap<u32, u32> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-pub(crate) fn read_current_process_table() -> ProcessTable {
+pub fn read_current_process_table() -> ProcessTable {
     let output = std::process::Command::new("ps")
         .args(["-axo", "pid=,ppid=,args="])
         .output()
@@ -188,7 +183,7 @@ fn system_processes(with_cmd: bool) -> sysinfo::System {
 }
 
 #[cfg(windows)]
-pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
+pub fn read_parent_pid_map() -> HashMap<u32, u32> {
     system_processes(false)
         .processes()
         .values()
@@ -197,7 +192,7 @@ pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
 }
 
 #[cfg(windows)]
-pub(crate) fn read_current_process_table() -> ProcessTable {
+pub fn read_current_process_table() -> ProcessTable {
     let system = system_processes(true);
     let processes = system.processes().values().map(|process| {
         let argv: Vec<String> = process
@@ -230,7 +225,7 @@ pub(crate) fn read_current_process_table() -> ProcessTable {
 /// One process's argv as the process holds it, or `None` once it has
 /// exited or its command line is unreadable.
 #[cfg(target_os = "linux")]
-pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
+pub fn process_argv(pid: u32) -> Option<Vec<String>> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
     // NUL-terminated words; an empty one is an argument too (`-n ""`).
     let raw = raw.strip_suffix(&[0]).unwrap_or(&raw);
@@ -247,7 +242,7 @@ pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
 /// One process's argv (its image name when the command line is unreadable),
 /// or `None` once it has exited.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
+pub fn process_argv(pid: u32) -> Option<Vec<String>> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
@@ -271,7 +266,7 @@ pub(crate) fn process_argv(pid: u32) -> Option<Vec<String>> {
 
 /// When `pid` started, in Unix seconds, or `None` once it has exited.
 #[cfg(windows)]
-pub(crate) fn start_time(pid: u32) -> Option<u64> {
+pub fn start_time(pid: u32) -> Option<u64> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
@@ -285,7 +280,7 @@ pub(crate) fn start_time(pid: u32) -> Option<u64> {
 
 /// Whether `pid` names a live process.
 #[cfg(windows)]
-pub(crate) fn pid_exists(pid: u32) -> bool {
+pub fn pid_exists(pid: u32) -> bool {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
     let pid = Pid::from_u32(pid);
     let mut system = System::new();
@@ -298,13 +293,13 @@ pub(crate) fn pid_exists(pid: u32) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn read_parent_pid_map() -> HashMap<u32, u32> {
+pub fn read_parent_pid_map() -> HashMap<u32, u32> {
     tracing::debug!("parent-pid snapshot unavailable: no process source on this platform");
     HashMap::new()
 }
 
 #[cfg(not(any(unix, windows)))]
-pub(crate) fn read_current_process_table() -> ProcessTable {
+pub fn read_current_process_table() -> ProcessTable {
     tracing::debug!("process-table snapshot unavailable: no process source on this platform");
     ProcessTable::default()
 }

@@ -433,7 +433,10 @@ async fn run() -> Result<()> {
     // health check can still say why.
     let swap_jobs: Arc<dyn tend::swap_service::SwapJobs> = match &opened_swap {
         Ok(swap) => Arc::clone(&swap.service) as Arc<dyn tend::swap_service::SwapJobs>,
-        Err(reason) => Arc::new(tend::swap_service::UnopenedSwap::new(reason.clone())),
+        Err(reason) => Arc::new(tend::swap_service::UnopenedSwap::new(
+            reason.clone(),
+            tend::swap_service::JOB_SCHEMA,
+        )),
     };
     let swap_service = opened_swap.ok();
     // Automation engine. Subscribes to the same transition broadcast the

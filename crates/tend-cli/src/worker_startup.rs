@@ -3,7 +3,7 @@ use crate::mux_control::Control;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use tend::account_swap::worker_startup::{self, Report};
+use tend::worker_startup::{self, Report};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Fence {

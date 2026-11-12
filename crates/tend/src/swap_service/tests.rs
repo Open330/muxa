@@ -1788,7 +1788,10 @@ fn health_reports_ready_draining_and_halted() {
 /// reported by health, with no store schema to claim.
 #[test]
 fn an_unopened_service_reports_why() {
-    let unopened = UnopenedSwap::new("swap jobs are owned by another live manager".into());
+    let unopened = UnopenedSwap::new(
+        "swap jobs are owned by another live manager".into(),
+        JOB_SCHEMA,
+    );
     assert!(!unopened.exists());
     let health = unopened.health();
     assert_eq!(health.readiness, SwapReadiness::Unavailable);

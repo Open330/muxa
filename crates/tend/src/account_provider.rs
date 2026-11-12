@@ -21,6 +21,7 @@
 
 use crate::account_swap::Candidate;
 use crate::accounts::{AccountProfile, AccountsConfig};
+pub use crate::swap_api::ProviderCandidates;
 
 /// The backend that serves one provider's accounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,15 +91,6 @@ pub fn configured(provider: &str, profiles: &[AccountProfile], capped: &[&str]) 
             }
         })
         .collect()
-}
-
-/// Public account metadata only; no environment values or credential paths.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct ProviderCandidates {
-    pub provider: String,
-    pub source: String,
-    pub reason: Option<String>,
-    pub candidates: Vec<Candidate>,
 }
 
 /// Resolve the same backend as launches and swaps, preserving per-provider errors.
