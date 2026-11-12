@@ -117,7 +117,7 @@ Tend는 두 층으로 되어 있습니다. **Attention** 층은 이미 돌리는
 | `tend stats` / `tend stats report` | prompt history, agent 상태 시간, tmux foreground, human thinking 시간 분석. |
 | `tend timeline` | agent 작업/대기/error, human interaction, tmux foreground를 full-screen TUI timeline으로 표시. |
 | `tend stats activity` | stats/report에 들어간 raw duration ledger 조회. |
-| Tend for Mac | Work·Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 작업 공간, libghostty 터미널과 알림. 네이티브 PTY는 `tendd`가 소유. |
+| Tend for Mac | Home(Work 단위를 Your turn·In progress·Finished lane으로 표시)에서 시작해 Explore·Inbox·Ask·Shells·Files를 제공하는 네이티브 앱, libghostty 터미널과 알림. 네이티브 PTY는 `tendd`가 소유. |
 | Dashboard | 선택적 loopback HTTP UI. 실시간 업데이트·timeline·협업 graph를 제공하며 bearer token이 유일한 인증 수단. |
 | Notifications | agent가 attention을 필요로 할 때 desktop alert. |
 
