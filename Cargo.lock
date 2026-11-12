@@ -3094,7 +3094,7 @@ dependencies = [
 
 [[package]]
 name = "tend"
-version = "0.10.12"
+version = "0.10.13"
 dependencies = [
  "axum",
  "base64",
@@ -3132,7 +3132,7 @@ dependencies = [
 
 [[package]]
 name = "tend-aas"
-version = "0.10.12"
+version = "0.10.13"
 dependencies = [
  "rusqlite",
  "serde",
@@ -3152,7 +3152,7 @@ dependencies = [
 
 [[package]]
 name = "tend-cli"
-version = "0.10.12"
+version = "0.10.13"
 dependencies = [
  "ansi-to-tui",
  "anyhow",
@@ -3190,7 +3190,7 @@ dependencies = [
 
 [[package]]
 name = "tendd"
-version = "0.10.12"
+version = "0.10.13"
 dependencies = [
  "anyhow",
  "clap",

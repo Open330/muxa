@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.13] - 2026-11-12
+
 ### Fixed
 
 - The Tend for Mac download has its app icon again. 0.10.12 was built with an
