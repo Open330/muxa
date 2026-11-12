@@ -244,17 +244,49 @@ pub fn extend_automation(plan: &mut Plan, config_path: Option<&Path>) -> Result<
     Ok(())
 }
 
+/// Both plugin files (1.x `tend.ts`, 2.x `tend/tui.ts`; see
+/// `files::opencode`), plus removal of the copy earlier tends misplaced
+/// under macOS's `~/Library/Application Support`, which opencode never read.
 fn plan_opencode(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
-    let Some(path) = files::opencode::default_path() else {
-        return Ok(());
-    };
-    let before = read_to_string_opt(&path)?;
-    let original = before.clone().unwrap_or_default();
-    let (after, outcome) = match direction {
-        Direction::Install => files::opencode::upsert(&original),
-        Direction::Uninstall => files::opencode::remove(&original),
-    };
-    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    type Edit = fn(&str) -> (String, Outcome);
+    let files: [(Option<PathBuf>, Edit, Edit); 2] = [
+        (
+            files::opencode::default_path(),
+            files::opencode::upsert,
+            files::opencode::remove,
+        ),
+        (
+            files::opencode::tui_path(),
+            files::opencode::upsert_tui,
+            files::opencode::remove_tui,
+        ),
+    ];
+    for (path, install, uninstall) in files {
+        let Some(path) = path else { continue };
+        let before = read_to_string_opt(&path)?;
+        let original = before.clone().unwrap_or_default();
+        let (after, outcome) = match direction {
+            Direction::Install => install(&original),
+            Direction::Uninstall => uninstall(&original),
+        };
+        push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    }
+    if let Some(path) = files::opencode::misplaced_path() {
+        if let Some(before) = read_to_string_opt(&path)? {
+            let (after, outcome) = files::opencode::remove(&before);
+            if outcome.changed() {
+                push_edit_or_delete(
+                    Direction::Uninstall,
+                    c,
+                    path,
+                    Some(before),
+                    after,
+                    outcome,
+                    actions,
+                );
+            }
+        }
+    }
     Ok(())
 }
 

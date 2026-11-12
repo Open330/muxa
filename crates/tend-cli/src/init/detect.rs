@@ -55,7 +55,7 @@ impl Detection {
             claude_settings: agent_config(super::files::claude::default_path(), "claude"),
             codex_config: agent_config(super::files::codex::default_path(), "codex"),
             antigravity_home: detect_antigravity(),
-            opencode_config: existing_dir(opencode_config_dir()),
+            opencode_config: detect_opencode(),
             tendd_running: tendd_is_running(),
             systemd_user_available: super::files::systemd::systemd_available(),
             launchctl_available: super::files::launchd::launchctl_available(),
@@ -223,10 +223,12 @@ pub fn antigravity_installed() -> bool {
 
 /// opencode has no single well-known settings file the way the other
 /// agents do — it keeps state under `~/.config/opencode/` (that's also
-/// where its `plugins/` dir lives). Presence of that directory is our
-/// "opencode is installed" signal.
-fn opencode_config_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("opencode"))
+/// where its `plugins/` dir lives). That directory, or `opencode` on PATH
+/// for an install that has not written config yet, is our "opencode is
+/// installed" signal.
+fn detect_opencode() -> Option<PathBuf> {
+    let dir = super::files::opencode::config_dir();
+    existing_dir(dir.clone()).or_else(|| which::which("opencode").ok().and(dir))
 }
 
 fn home_join(rel: &str) -> PathBuf {

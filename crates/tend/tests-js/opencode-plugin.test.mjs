@@ -11,13 +11,48 @@ const here = dirname(fileURLToPath(import.meta.url));
 const source = readFileSync(join(here, "../../tend-cli/src/init/files/opencode.rs"), "utf8");
 const body = source.slice(source.indexOf('const BODY: &str = r#"') + 'const BODY: &str = r#"'.length, source.indexOf('"#;'));
 const file = join(mkdtempSync(join(tmpdir(), "tend-opencode-")), "tend.mjs");
-writeFileSync(file, body);
-const { TendPlugin } = await import(pathToFileURL(file).href);
+// The plugin spawns `tend` itself; the harness stands in for node's spawn
+// and records each payload written to the child's stdin.
+const spawnImport = 'import { spawn } from "node:child_process";';
+assert.ok(body.includes(spawnImport), "the plugin spawns tend through node:child_process");
+writeFileSync(file, body.replace(spawnImport, "const spawn = (...args) => globalThis.__tendSpawn(...args);"));
+const plugin = await import(pathToFileURL(file).href);
+const { TendPlugin } = plugin;
+
+function fakeSpawn(sent) {
+  return (command, args) => {
+    assert.equal(command, "tend");
+    assert.deepEqual(args, ["hook", "opencode", "--event", "event"]);
+    const handlers = {};
+    const child = {
+      on: (name, fn) => {
+        handlers[name] = fn;
+        return child;
+      },
+      stdin: {
+        on: () => {},
+        end: (text) => {
+          sent.push(JSON.parse(text));
+          setTimeout(() => handlers.close && handlers.close(0), 0);
+        },
+      },
+    };
+    return child;
+  };
+}
+
+test("one file loads under both plugin APIs", () => {
+  // 1.x prefers `default.server`; 2.x requires `default.{id, setup}`.
+  assert.equal(plugin.default.server, TendPlugin);
+  assert.equal(plugin.default.id, "tend");
+  assert.equal(typeof plugin.default.setup, "function");
+  assert.equal(plugin.default.setup(), undefined);
+});
 
 async function harness() {
   const sent = [];
-  const $ = () => ({ stdin: (text) => ({ quiet: async () => { sent.push(JSON.parse(text)); } }) });
-  const hooks = await TendPlugin({ $, client: { app: { log: async () => {} } }, directory: "/w" });
+  globalThis.__tendSpawn = fakeSpawn(sent);
+  const hooks = await TendPlugin({ client: { app: { log: async () => {} } }, directory: "/w" });
   const emit = (type, properties) => hooks.event({ event: { type, properties } });
   const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
   return { sent, hooks, emit, settle };

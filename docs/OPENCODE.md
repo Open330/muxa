@@ -10,21 +10,40 @@ on a permission prompt or a question, idle with the turn's response, error.
 tend init --component opencode-hooks
 ```
 
-This writes a managed block into `~/.config/opencode/plugins/tend.ts`
-(`$XDG_CONFIG_HOME/opencode/plugins/tend.ts` when set). opencode loads every
-plugin in that directory at startup, so restart running opencode sessions
-after installing or upgrading. Re-running `tend init` replaces the block, which
-is how an older tend plugin is upgraded. `tend init --uninstall --component
-opencode-hooks` removes it.
+This writes two plugins under `~/.config/opencode/plugins/`
+(`$XDG_CONFIG_HOME/opencode/plugins/` when set, on macOS too):
 
-The plugin runs `tend hook opencode --event event` once per forwarded event,
-so `tend` must be on the `PATH` opencode was started with.
+| File | Loaded by | Runs in |
+| --- | --- | --- |
+| `tend.ts` | opencode 1.x | opencode's process in the pane |
+| `tend/tui.ts` | opencode 2.x | the 2.x TUI in the pane |
+
+opencode 2.x replaced the plugin API and runs sessions in a background server
+that every TUI shares, so a server plugin there has no pane. tend's 2.x plugin
+is a TUI plugin for that reason. Each opencode version loads only its own file
+(2.x also loads `tend.ts`, whose default export is a no-op there), so an
+opencode upgrade needs no new `tend init`. Restart running opencode sessions
+after installing or upgrading the plugins. Re-running `tend init` replaces both
+managed blocks, and `tend init --uninstall --component opencode-hooks` removes
+them.
+
+Earlier tends wrote `tend.ts` to `~/Library/Application Support/opencode/` on
+macOS, which opencode never reads; `tend init` removes that copy.
+
+Each plugin spawns `tend hook opencode --event event` once per forwarded
+event, so `tend` must be on the `PATH` opencode was started with.
+
+Both plugins were run against the real opencode TUIs, 1.19.5 (npm
+`opencode-ai`) and 2.2.7 (Homebrew), through a turn with an approved
+permission, a question, and a rejected permission. What they forwarded is
+replayed in tend's tests (`crates/tend/src/adapters/testdata/`).
 
 ## What tend reads
 
-The plugin forwards a filtered subset of opencode's events; `tend hook
+The 1.x plugin forwards a filtered subset of opencode's events; `tend hook
 opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
-1.19.5, v1 and v2 event shapes) and ignores everything else.
+1.19.5, v1 and v2 event shapes) and ignores everything else. The 2.x plugin
+translates the 2.x stream into the same payloads (second table).
 
 | opencode signal | tend event | State |
 | --- | --- | --- |
@@ -41,6 +60,21 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
 | assistant `message.updated` with `time.completed` | `Heartbeat` (model, cost) | — |
 | `session.deleted` | `SessionEnded` | stopped |
 
+opencode 2.x:
+
+| opencode 2.x event | Forwarded as |
+| --- | --- |
+| `session.inbox.enqueued` (a `user` item, into the session this TUI shows) | `tend.prompt` |
+| `session.tool.called` / `session.tool.success` / `session.tool.failed` | tool part `running` / `completed` / `error` (`shell` carries its command) |
+| `permission.asked` (`action`, `resources`), `permission.replied` | the same types |
+| `form.created`, `form.replied` / `form.cancelled` | `question.asked`, `question.replied` / `question.rejected` |
+| `session.execution.succeeded` | `session.idle` with the last assistant message's text |
+| `session.execution.interrupted` (Esc, a rejected permission) | `session.idle` without a response |
+| `session.execution.failed` | `session.error`, then `session.idle` without a response |
+| `session.retry.scheduled` | `session.status` `retry` |
+| `session.step.ended` | assistant `message.updated` (model, cost) |
+| `session.deleted` | `session.deleted` |
+
 - **Session identity** is opencode's session id (`ses_…`), read only from
   `properties.sessionID`, `properties.info.sessionID` or
   `properties.part.sessionID`.
@@ -53,7 +87,10 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
   keeps one live row. Only the bound session's events are forwarded: other
   sessions in the same directory (another client's, or one the TUI switched
   away from) are not tracked from this pane. A prompt sent by another client
-  through opencode's API rebinds the pane the same way.
+  through opencode's API rebinds the pane the same way. In 2.x the server's
+  stream covers every TUI's sessions, so only a prompt into the session *this
+  TUI is showing* binds the pane; viewing another session moves nothing until
+  it is prompted.
 - **Responses** are reset at each prompt and reported only for a turn that
   ended without `session.error`; a failed or aborted turn's partial output is
   not recorded as its answer, and a failed turn stays in error after idle.
@@ -75,6 +112,6 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
 - **Account routing** is Claude/Codex only.
 - **Modes.** Discovery sees the process name only, so it cannot tell the
   interactive TUI from `opencode serve` or `opencode run`, and registers a
-  pane running either. The plugin runs in opencode's server in every mode,
-  but only the TUI (what `tend agent start --agent opencode` launches) gives
+  pane running either. On 1.x the plugin runs in opencode's server in every
+  mode; on 2.x only the TUI loads tend's plugin. Only the TUI (what `tend agent start --agent opencode` launches) gives
   the pane an input target for typed delivery.

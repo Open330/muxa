@@ -1,0 +1,23 @@
+{"type":"tend.session.active","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs"},"tend":{"directory":"/work"}}
+{"type":"tend.prompt","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","text":"Run the shell command 'ls' and tell me the file names."},"tend":{"directory":"/work"}}
+{"type":"message.part.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","part":{"type":"tool","tool":"shell","callID":"call_72e87c167dda482e98548fa9","state":{"status":"running","command":"ls"}}},"tend":{"directory":"/work"}}
+{"type":"permission.asked","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","id":"per_1d03b8463001TS67WqjXYn7Q7e","action":"shell","resources":["ls"]},"tend":{"directory":"/work"}}
+{"type":"permission.replied","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","requestID":"per_1d03b8463001TS67WqjXYn7Q7e","reply":"once"},"tend":{"directory":"/work"}}
+{"type":"message.part.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","part":{"type":"tool","tool":"shell","callID":"call_72e87c167dda482e98548fa9","state":{"status":"completed"}}},"tend":{"directory":"/work"}}
+{"type":"message.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","info":{"id":"msg_1d03b7b29001D50DRUku23FPgW","role":"assistant","modelID":"deepseek-v4.1-flash-free","providerID":"opencode","cost":0}},"tend":{"directory":"/work"}}
+{"type":"message.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","info":{"id":"msg_1d03bb5a4001buiEH6X554m2Gw","role":"assistant","modelID":"deepseek-v4.1-flash-free","providerID":"opencode","cost":0}},"tend":{"directory":"/work"}}
+{"type":"session.idle","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs"},"tend":{"directory":"/work","response":"The directory contains one file: `a.txt`."}}
+{"type":"tend.prompt","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","text":"Use the question tool to ask me whether I prefer red or blue, then answer with my choice."},"tend":{"directory":"/work"}}
+{"type":"message.part.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","part":{"type":"tool","tool":"question","callID":"call_e75ec86d0b9f4ce198267d93","state":{"status":"running"}}},"tend":{"directory":"/work"}}
+{"type":"question.asked","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","id":"frm_1d03c05b1001LG0SrITGc2AxId","questions":[{"question":"Which color do you prefer?","header":"Color preference"}]},"tend":{"directory":"/work"}}
+{"type":"question.replied","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","requestID":"frm_1d03c05b1001LG0SrITGc2AxId"},"tend":{"directory":"/work"}}
+{"type":"message.part.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","part":{"type":"tool","tool":"question","callID":"call_e75ec86d0b9f4ce198267d93","state":{"status":"completed"}}},"tend":{"directory":"/work"}}
+{"type":"message.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","info":{"id":"msg_1d03bf432001HbcDrrTfHvTR9H","role":"assistant","modelID":"deepseek-v4.1-flash-free","providerID":"opencode","cost":0}},"tend":{"directory":"/work"}}
+{"type":"message.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","info":{"id":"msg_1d03c3a7f0011vrZfS8iM3HHcd","role":"assistant","modelID":"deepseek-v4.1-flash-free","providerID":"opencode","cost":0}},"tend":{"directory":"/work"}}
+{"type":"session.idle","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs"},"tend":{"directory":"/work","response":"You chose **red**."}}
+{"type":"tend.prompt","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","text":"Run the shell command 'sleep 30; echo done'."},"tend":{"directory":"/work"}}
+{"type":"message.part.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","part":{"type":"tool","tool":"shell","callID":"call_d90e78e1177d465bbb1cfabe","state":{"status":"running","command":"sleep 30; echo done"}}},"tend":{"directory":"/work"}}
+{"type":"permission.asked","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","id":"per_1d03c8267001OMgvy9QzJypTpy","action":"shell","resources":["sleep 30","echo done"]},"tend":{"directory":"/work"}}
+{"type":"permission.replied","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","requestID":"per_1d03c8267001OMgvy9QzJypTpy","reply":"reject"},"tend":{"directory":"/work"}}
+{"type":"message.part.updated","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs","part":{"type":"tool","tool":"shell","callID":"call_d90e78e1177d465bbb1cfabe","state":{"status":"error"}}},"tend":{"directory":"/work"}}
+{"type":"session.idle","properties":{"sessionID":"ses_e2fc4859bffel45l3n29CzzdAs"},"tend":{"directory":"/work"}}

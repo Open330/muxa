@@ -1,10 +1,25 @@
 //! opencode adapter.
 //!
 //! opencode has no shell hooks; it has an in-process plugin API. `tend init`
-//! installs a small plugin (`~/.config/opencode/plugins/tend.ts`, see
-//! `tend-cli/src/init/files/opencode.rs`) that forwards a filtered subset of
-//! opencode's own events, one JSON object per `tend hook opencode --event
-//! event` call. This module maps those objects to [`AgentEvent`]s.
+//! installs a small plugin (see `tend-cli/src/init/files/opencode.rs`) that
+//! forwards a filtered subset of opencode's own events, one JSON object per
+//! `tend hook opencode --event event` call. This module maps those objects
+//! to [`AgentEvent`]s.
+//!
+//! There are two plugins and one vocabulary. opencode 1.x runs
+//! `~/.config/opencode/plugins/tend.ts`, which forwards 1.x events in the
+//! shapes below. opencode 2.x replaced the plugin API and runs sessions in
+//! a background server shared by every TUI, so tend's 2.x plugin is a TUI
+//! plugin (`plugins/tend/tui.ts`, running in the pane's own process) that
+//! translates the 2.x stream into the same payloads: `session.inbox.enqueued`
+//! into `tend.prompt`, `session.execution.{succeeded,interrupted,failed}`
+//! into `session.idle` (plus `session.error` for a failure),
+//! `session.tool.{called,success,failed}` into a tool part's status,
+//! `form.*` into `question.*`, and `permission.asked` as 2.x sends it
+//! (`action`, `resources`). `testdata/opencode-{1.19.5,2.2.7}-tui.jsonl`
+//! are what the two plugins forwarded from the real opencode TUIs. In 2.x the pane is
+//! bound to the session last prompted *while this TUI showed it*, since the
+//! server's stream covers every TUI's sessions.
 //!
 //! Every field read here is one opencode documents in `@opencode-ai/sdk`'s
 //! event types (checked against 1.19.5, both the v1 and v2 shapes): the
@@ -242,7 +257,8 @@ fn tool_event(p: &Value, id: AgentId, at: OffsetDateTime) -> Option<AgentEvent> 
     match str_at(p, "/part/state/status")? {
         "running" => Some(AgentEvent::ToolStarted {
             id,
-            command: (tool == "bash")
+            // 1.x calls its shell tool `bash`, 2.x `shell`.
+            command: matches!(tool.as_str(), "bash" | "shell")
                 .then(|| str_at(p, "/part/state/command").map(str::to_string))
                 .flatten(),
             tool,
@@ -550,6 +566,81 @@ mod tests {
             .map(|agent| agent.session_id)
             .collect();
         assert_eq!(live, ["A"]);
+    }
+
+    /// Everything tend's plugins forwarded from the real opencode TUIs
+    /// (1.19.5 through `tend.ts`, 2.2.7 through `tend/tui.ts`) over the same
+    /// three turns: a shell call behind an approved permission, a question
+    /// answered, and a shell call whose permission was rejected. Each
+    /// checkpoint is the state the pane's row must show.
+    #[tokio::test]
+    async fn the_1x_plugin_payloads_drive_the_row_through_a_real_session() {
+        real_session(
+            include_str!("testdata/opencode-1.19.5-tui.jsonl"),
+            "You chose red.",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_2x_tui_plugin_payloads_drive_the_row_through_a_real_session() {
+        real_session(
+            include_str!("testdata/opencode-2.2.7-tui.jsonl"),
+            "You chose **red**.",
+        )
+        .await;
+    }
+
+    async fn real_session(recorded: &str, last_response: &str) {
+        use crate::event::AgentState::{Idle, WaitingChoice, WaitingInput, Working};
+        let store = crate::state::Store::shared();
+        let mut seen = Vec::new();
+        for line in recorded.lines() {
+            let payload: Value = serde_json::from_str(line).unwrap();
+            let ty = payload["type"].as_str().unwrap().to_string();
+            if let Some(event) = ev(payload) {
+                store.apply(&event).await;
+            }
+            let snapshot = store.snapshot().await;
+            assert_eq!(snapshot.len(), 1, "one row for the pane: {snapshot:?}");
+            seen.push((ty, snapshot[0].state));
+        }
+        let at = |ty: &str, nth: usize| {
+            seen.iter()
+                .filter(|(t, _)| t == ty)
+                .nth(nth)
+                .map(|(_, state)| *state)
+                .unwrap()
+        };
+        assert_eq!(at("tend.prompt", 0), Working);
+        assert_eq!(at("permission.asked", 0), WaitingInput);
+        assert_eq!(at("permission.replied", 0), Working);
+        assert_eq!(at("session.idle", 0), Idle);
+        assert_eq!(at("question.asked", 0), WaitingChoice);
+        assert_eq!(at("question.replied", 0), Working);
+        assert_eq!(at("session.idle", 1), Idle);
+        assert_eq!(at("permission.asked", 1), WaitingInput);
+        // The rejected call ends the turn without an answer: idle, not error.
+        assert_eq!(at("session.idle", 2), Idle);
+
+        let row = &store.snapshot().await[0];
+        assert_eq!(row.pane.as_deref(), Some("%7"));
+        assert_eq!(row.model.as_deref(), Some("deepseek-v4.1-flash-free"));
+        // The rejected turn reported no response, so the last one stands.
+        assert_eq!(row.last_response.as_deref(), Some(last_response));
+    }
+
+    #[test]
+    fn a_2x_shell_tool_reports_its_command() {
+        let out = ev(
+            json!({ "type": "message.part.updated", "properties": { "sessionID": "s",
+            "part": { "type": "tool", "tool": "shell", "callID": "c",
+                "state": { "status": "running", "command": "ls" } } } }),
+        );
+        assert!(matches!(
+            out,
+            Some(AgentEvent::ToolStarted { command: Some(ref command), .. }) if command == "ls"
+        ));
     }
 
     /// The previous adapter searched every nested object for keys such as
