@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tend_room_context`) are no longer listed but keep working, and their results
   name the replacement. `tools/list` drops from 52,864 to 50,149 bytes.
 
+### Fixed
+
+- Dashboard OIDC sign-in, viewer accounts and pane/window sharing are back.
+  0.10.12 removed them on the belief that no live config used them. One
+  did: a dashboard published through a tunnel with `[dashboard.login]` and
+  `[dashboard.sharing]`, which answered 403 after the upgrade. The code is
+  restored as it was in 0.10.11, behind the `dashboard` cargo feature that
+  only `tendd` builds with. Existing `[dashboard.login]` and
+  `[dashboard.sharing]` sections, enrolled operators
+  (`dashboard-operators/`) and share databases (`dashboard-sharing/`) work
+  again unchanged. The 0.10.12 warning that called these sections ignored is
+  gone.
+
 ## [0.10.13] - 2026-11-12
 
 ### Fixed
