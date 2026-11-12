@@ -11,6 +11,9 @@ description = "tend Work model, agent launch and `work up`, shared by the CLI an
 [features]
 # The optional account module; see tend-cli's `aas` feature.
 aas = ["dep:tend-aas"]
+# For dependents' test builds only (from `[dev-dependencies]`): never write
+# worktree receipts, which would land in the user's tend data directory.
+test-no-receipts = []
 
 [dependencies]
 tend = { workspace = true }
