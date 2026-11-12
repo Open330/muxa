@@ -1264,7 +1264,10 @@ async fn restart_preflight_refusal_does_not_signal_shutdown_and_success_pins_tar
     std::fs::write(&target, "#!/bin/sh\nexit 0\n").unwrap();
     assert!(controller.request_checked_restart().await.unwrap());
     assert!(rx.try_recv().is_ok());
-    assert_eq!(controller.validated_launch().await.unwrap().target, target);
+    assert_eq!(
+        controller.validated_launch().await.unwrap().target,
+        std::fs::canonicalize(&target).unwrap()
+    );
     controller.stop();
     assert!(!controller.request_checked_restart().await.unwrap());
 }

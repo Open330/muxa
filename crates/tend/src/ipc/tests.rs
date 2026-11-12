@@ -406,11 +406,20 @@ fn pane_origin(pane: &str) -> CollaborationOrigin {
     }
 }
 
+/// Wait until the server accepts a connection. A socket file can exist
+/// before the listener is accepting, and returning early on a slow machine
+/// makes the test's first call fail.
 async fn wait_for_socket(sock: &Path) {
-    for _ in 0..50 {
-        if sock.exists() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if Stream::connect(sock).await.is_ok() {
             return;
         }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "IPC server at {} never accepted a connection",
+            sock.display()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
 }
