@@ -210,6 +210,15 @@ async fn wake_idle_collaboration_peers_with_inflight(
         if !request.bypasses_primary_protection() && !recipient.accepts_peer_work() {
             continue;
         }
+        // Hook transport: the recipient's own turn-boundary hook is carrying
+        // this request; type a wake only once that offer is a backoff old.
+        if request
+            .turn_offer
+            .as_ref()
+            .is_some_and(|offer| offer.offered_recently(time::OffsetDateTime::now_utc()))
+        {
+            continue;
+        }
         // Never write into a human primary's terminal for agent work, even
         // user-authorized: its provider hook hands the request over at the
         // next turn boundary instead (`tend hook … --event stop`).

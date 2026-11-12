@@ -1004,6 +1004,57 @@ async fn operator_full_wake_keeps_agent_requests_in_the_mailbox() {
     assert_eq!(stored.status, RequestStatus::Queued);
 }
 
+/// `hook_transport = "primary"`: a request the worker's own Stop hook was
+/// offered is not also typed into its pane while the offer is fresh; with
+/// the transport off the same request gets the ordinary typed wake.
+#[tokio::test]
+async fn a_request_offered_at_the_turn_boundary_is_not_also_typed() {
+    let store = tend::Store::shared();
+    add_agent(&store, "%1", "sender", AgentKind::Codex).await;
+    add_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
+    let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+    let participants = worker_participants(&store.snapshot().await, &panes);
+    let find = |pane: &str| {
+        participants
+            .iter()
+            .find(|participant| participant.pane == pane)
+            .unwrap()
+            .clone()
+    };
+    let (sender, recipient) = (find("%1"), find("%2"));
+    let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+    authorize_test_workers(&mailbox, &participants).await;
+    mailbox.set_hook_transport(true);
+    let request = mailbox
+        .create(
+            sender,
+            recipient.clone(),
+            NewRequest {
+                body: "review".into(),
+                ..NewRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let offers = mailbox
+        .offer_turn_boundary(
+            &recipient,
+            tend::collaboration::turn_offer::TurnBoundaryEvent::Stop,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(offers[0]["request_id"], request.id.as_str());
+    let sends = Arc::new(Mutex::new(Vec::new()));
+    let backend: tend::SharedBackend = Arc::new(CollaborationWakeBackend {
+        panes,
+        sends: sends.clone(),
+    });
+    wake_idle_collaboration_peers(&mailbox, &store, std::slice::from_ref(&backend)).await;
+    assert!(sends.lock().unwrap().is_empty(), "the hook is carrying it");
+}
+
 #[tokio::test]
 async fn full_wake_submits_only_one_request_per_idle_generation() {
     let store = tend::Store::shared();

@@ -471,6 +471,7 @@ scope = "window"   # window | host
 max_message_bytes = 16384
 # path = "$XDG_DATA_HOME/tend/collaboration.json"
 retention_days = 90 # default; 0 retains indefinitely
+hook_transport = "off" # off | primary (per host; never synced)
 ```
 
 `auto_spawn_workers` lets high-level peer calls reuse a worker or create one
@@ -494,6 +495,15 @@ from operator surfaces such as watch and dashboard, while agent-originated MCP
 and CLI requests remain mailbox notices. `notice` keeps every body in the
 mailbox; `full` atomically claims and directly delivers every request. Reply
 wakes remain body-free notifications in every mode.
+`hook_transport = "primary"` makes the session's own turn-boundary hooks the
+first transport: a worker's queued requests are offered at its `Stop` (the
+turn continues with them) or with its next submitted prompt, and a sender is
+told at its turn boundary which of its requests have replies ready. A typed
+wake is then used only for an agent that is Idle with nothing offered in the
+last five minutes, so requests to a busy worker no longer wait for it to go
+Idle and be typed into. Offers claim nothing and follow the same caps and
+backoff as primary offers; `wake = "never"` still disables Stop continuation.
+It is per host and not copied by `tend config export`.
 `scope = "host"` lets watch address the selected tracked agent in another
 tmux window or session by its exact pane id.
 See [COLLABORATION.md](COLLABORATION.md).

@@ -884,6 +884,10 @@ async fn build_collaboration(cfg: &Config) -> Result<Arc<CollaborationStore>> {
                 );
             }
             store.set_turn_continuation(cfg.collaboration.wake != CollaborationWake::Never);
+            store.set_hook_transport(
+                cfg.collaboration.hook_transport
+                    == tend::config::CollaborationHookTransport::Primary,
+            );
             Ok(store)
         }
         Err(error @ tend::collaboration::CollaborationError::UnsupportedSchema(_)) => {

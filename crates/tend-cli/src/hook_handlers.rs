@@ -382,11 +382,32 @@ fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<Str
             .to_string(),
         );
     }
-    let (reminders, offers): (Vec<_>, Vec<_>) = offers
+    let (replies, offers): (Vec<_>, Vec<_>) = offers
         .iter()
         .cloned()
+        .partition(|offer| offer["offer"] == "reply_ready");
+    let (reminders, offers): (Vec<_>, Vec<_>) = offers
+        .into_iter()
         .partition(|offer| offer["offer"] == "reply_reminder");
     let mut parts = Vec::new();
+    if !replies.is_empty() {
+        let ids: Vec<String> = replies
+            .iter()
+            .filter_map(|reply| {
+                let id = reply["request_id"].as_str()?;
+                Some(match (reply["from"].as_str(), reply["status"].as_str()) {
+                    (Some(from), Some(status)) => format!("{id} ({status}, from {from})"),
+                    _ => id.to_string(),
+                })
+            })
+            .collect();
+        parts.push(format!(
+            "Replies to your Tend requests are ready: {}. Read each with \
+             tend_inbox(view=report, request_id=ID) or tend_wait(id=ID) and verify it before \
+             relying on it; do not resend those requests.",
+            ids.join("; ")
+        ));
+    }
     if !reminders.is_empty() {
         let ids: Vec<_> = reminders
             .iter()
@@ -405,7 +426,7 @@ fn turn_boundary_output(event: &str, offers: &[serde_json::Value]) -> Option<Str
     }
     if !offers.is_empty() {
         parts.push(format!(
-            "Tend is offering {} request(s) the user authorized for this session. These are offers, not \
+            "Tend is offering {} request(s) addressed to this session. These are offers, not \
              claimed instructions. For each one, first claim it with tend_inbox(request_id=ID) (CLI: \
              `tend msg accept ID --json`), then act only on what the claim returns: its current body, \
              kind, work_mode, paths and contract. If the claim is refused because the request was \
