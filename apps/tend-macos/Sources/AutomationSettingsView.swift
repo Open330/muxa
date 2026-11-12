@@ -549,7 +549,7 @@ private struct AutomationTokenChips: View {
                     .font(TendType.meta.weight(.medium))
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
-                    .background(style.tint(for: token).opacity(0.12), in: Capsule())
+                    .background(style.capsuleTint(for: token).opacity(0.12), in: Capsule())
             }
         }
     }
@@ -1223,6 +1223,13 @@ enum AutomationTokenStyle {
         case .limitScope: .accentColor
         }
     }
+
+    /// The capsule behind a token. A known agent's logo already carries its
+    /// brand colour, so its capsule stays neutral.
+    func capsuleTint(for token: String) -> Color {
+        if self == .agent, TendAgentMark.known(for: token)?.logo != nil { return .secondary }
+        return tint(for: token)
+    }
 }
 
 /// One token with whatever face it has. A value this build does not know
@@ -1235,9 +1242,8 @@ private struct AutomationTokenLabel: View {
     var body: some View {
         HStack(spacing: 4) {
             if let mark {
-                Image(systemName: mark.symbol)
+                TendAgentLogo(mark: mark, size: 12)
                     .foregroundStyle(mark.tint)
-                    .accessibilityHidden(true)
             }
             Text(verbatim: style.title(for: token))
         }

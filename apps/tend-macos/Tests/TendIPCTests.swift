@@ -5887,7 +5887,7 @@ func agentMarksAndLimitWindowsSayWhatTheWireValueMeans() {
     // The retired Gemini CLI kind is no longer one this build puts a face on.
     #expect(TendAgentMark.known(for: "gemini_cli") == nil)
     #expect(TendAgentMark.title(for: "antigravity") == "Antigravity")
-    #expect(TendAgentMark.title(for: "opencode") == "opencode")
+    #expect(TendAgentMark.title(for: "opencode") == "OpenCode")
 
     // Every kind the editor offers has a mark.
     for kind in TendAutomationRuleDraft.agentKinds {

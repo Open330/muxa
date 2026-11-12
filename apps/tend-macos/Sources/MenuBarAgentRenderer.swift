@@ -192,9 +192,18 @@ final class TendMenuBarGlyphCache {
                       height: Int((size.height * 4).rounded()), scales: scales)
         guard key.width > 0, key.height > 0 else { return nil }
         if let image = images[key] { return image }
+        let size = NSSize(width: CGFloat(key.width) / 4, height: CGFloat(key.height) / 4)
+        // A logo or a text face is not an SF Symbol; TendGlyph draws it.
+        guard case .symbol = TendGlyph.kind(name) else {
+            let image = TendMenuBarAgentRenderer.rasterized(size: size, scales: scales) {
+                TendGlyph.draw(name, in: NSRect(origin: .zero, size: size), color: .white)
+            }
+            if images.count >= Self.limit { images.removeAll(keepingCapacity: true) }
+            images[key] = image
+            return image
+        }
         guard let symbol = NSImage(systemSymbolName: name, accessibilityDescription: nil)?
             .withSymbolConfiguration(.init(pointSize: 11, weight: .semibold)) else { return nil }
-        let size = NSSize(width: CGFloat(key.width) / 4, height: CGFloat(key.height) / 4)
         let ratio = min(size.width / symbol.size.width, size.height / symbol.size.height)
         let fitted = NSSize(width: symbol.size.width * ratio, height: symbol.size.height * ratio)
         let bounds = NSRect(x: (size.width - fitted.width) / 2, y: (size.height - fitted.height) / 2,

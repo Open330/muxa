@@ -13,12 +13,12 @@ struct TendMenuBarAgentAppearance: Equatable {
         let hash = identity.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 }
         paletteIndex = Int(hash % UInt64(Self.palette.count))
         let program = TendAgentProgram(configValue: kind)
-        switch program {
-        case .claude: symbol = TendGlyph.claude; provider = "Claude"
-        case .codex: symbol = TendGlyph.codex; provider = "Codex"
-        case .agy: symbol = "arrow.up"; provider = "Antigravity"
-        case .opencode: symbol = "terminal"; provider = "OpenCode"
-        case nil: symbol = "terminal"; provider = kind.replacingOccurrences(of: "_", with: " ")
+        if let program {
+            symbol = TendGlyph.logo(for: program)
+            provider = program.displayName
+        } else {
+            symbol = "terminal"
+            provider = kind.replacingOccurrences(of: "_", with: " ")
         }
     }
 

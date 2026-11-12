@@ -59,12 +59,7 @@ struct PipelineAgentChip: View {
                 Text(verbatim: "@\(agent.alias)")
                     .font(compact ? TendType.meta.weight(.semibold) : TendType.detail.weight(.semibold))
                     .lineLimit(1)
-                Text(agent.program)
-                    .font(TendType.meta.weight(.medium))
-                    .foregroundStyle(agentProgramTint(agent.program))
-                    .padding(.horizontal, 5)
-                    .padding(.vertical, 1)
-                    .background(agentProgramTint(agent.program).opacity(0.12), in: Capsule())
+                TendAgentProgramChip(program: agent.program)
             }
             if !compact, let subtitle {
                 Text(subtitle)

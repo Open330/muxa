@@ -282,6 +282,10 @@ final class AskProviderStore: ObservableObject {
         provider(id: id)?.symbolName ?? TendAskProvider(rawValue: id)?.symbolName ?? "sparkles"
     }
 
+    func logo(for id: String) -> TendAgentLogoAsset? {
+        provider(id: id)?.logo ?? TendAskProvider(rawValue: id)?.logo
+    }
+
     func hasKey(_ provider: TendAskProvider) -> Bool {
         keyPresence[provider.id] ?? false
     }

@@ -139,6 +139,7 @@ struct FleetQuickLookView: View {
                 if let hosted {
                     HStack(spacing: 6) {
                         AgentStatusTag(status: hosted.agent.status)
+                        TendAgentLogo(kind: hosted.agent.kind, size: 13)
                         Text(FleetBoard.owner(hosted))
                             .foregroundStyle(.secondary)
                         if let repo = work?.repo {

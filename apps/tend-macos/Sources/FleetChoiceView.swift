@@ -350,6 +350,7 @@ struct FleetWaitingAgent<Answer: View>: View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
                 AgentStatusTag(status: hosted.agent.status, showsLabel: false)
+                TendAgentLogo(kind: hosted.agent.kind, size: 15)
                 Text(FleetBoard.owner(hosted))
                     .font(TendType.body.weight(.medium))
                 Spacer(minLength: 4)

@@ -1201,6 +1201,7 @@ private struct InboxAgentRow: View {
                 .padding(.top, 5)
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
+                    TendAgentLogo(kind: participant.agent.kind, size: 13)
                     Text(title)
                         .fontWeight(.medium)
                         .lineLimit(1)
@@ -1348,6 +1349,7 @@ private struct FleetAgentRow: View {
                     Circle()
                         .fill(participant.agent.status.color)
                         .frame(width: 7, height: 7)
+                    TendAgentLogo(kind: participant.agent.kind, size: 13)
                     Text(title)
                         .lineLimit(1)
                 }

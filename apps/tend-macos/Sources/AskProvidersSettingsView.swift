@@ -336,10 +336,9 @@ struct AskProviderRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: provider.symbolName)
+            TendAgentLogo(asset: provider.logo, fallbackSymbol: provider.symbolName, size: 16)
                 .foregroundStyle(.tint)
                 .frame(width: 20)
-                .accessibilityHidden(true)
             Text(provider.title)
                 .lineLimit(1)
             AskProviderKindBadge(kind: provider.kind)
@@ -379,10 +378,9 @@ struct AskProviderDetectedRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: provider.symbolName)
+            TendAgentLogo(asset: provider.logo, fallbackSymbol: provider.symbolName, size: 16)
                 .foregroundStyle(.tint)
                 .frame(width: 20)
-                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(provider.title)
@@ -568,7 +566,7 @@ struct AskProviderEditSheet: View {
                     Label {
                         Text(provider.title)
                     } icon: {
-                        Image(systemName: provider.symbolName).accessibilityHidden(true)
+                        TendAgentLogo(asset: provider.logo, fallbackSymbol: provider.symbolName, size: 14)
                     }
                 }
 

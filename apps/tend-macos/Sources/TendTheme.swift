@@ -279,6 +279,8 @@ struct TendSegmented<Value: Hashable>: View {
     @Binding var selection: Value
     let options: [Value]
     let label: (Value) -> Text
+    /// A product logo before an option's label, for an agent picker.
+    var logo: ((Value) -> TendAgentLogoAsset?)? = nil
     @Environment(\.colorScheme) private var colorScheme
     @Namespace private var namespace
 
@@ -289,7 +291,12 @@ struct TendSegmented<Value: Hashable>: View {
                 Button {
                     withAnimation(.easeOut(duration: 0.15)) { selection = option }
                 } label: {
-                    label(option)
+                    HStack(spacing: 4) {
+                        if let asset = logo?(option) {
+                            TendAgentLogo(asset: asset, fallbackSymbol: "terminal", size: 13)
+                        }
+                        label(option)
+                    }
                         .font(.system(size: 12, weight: active ? .semibold : .medium))
                         .lineLimit(1)
                         .foregroundStyle(active ? Color.primary : Color.secondary)

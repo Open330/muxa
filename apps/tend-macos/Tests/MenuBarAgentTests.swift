@@ -291,7 +291,7 @@ private func menuBarSnapshot(_ agents: [(String, String, String)], host: String 
     let styles = programs.map { TendMenuBarAgentAppearance(identity: "host:session-1", kind: $0) }
     #expect(Set(styles.map(\.symbol)).count >= 4)
     for style in styles {
-        // Claude and Codex draw tend's own marks; every other face is an SF Symbol.
+        // Known agents draw their logo; every other face is an SF Symbol.
         if case .symbol(let name) = TendGlyph.kind(style.symbol) {
             #expect(NSImage(systemSymbolName: name, accessibilityDescription: nil) != nil)
         }

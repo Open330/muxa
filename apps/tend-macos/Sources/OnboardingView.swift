@@ -905,7 +905,8 @@ private struct OnboardingFirstAgentPage: View {
                         TendSegmented(
                             selection: Binding(get: { selectedProgram }, set: { program = $0 }),
                             options: installed,
-                            label: { Text(verbatim: $0.displayName) }
+                            label: { Text(verbatim: $0.displayName) },
+                            logo: { $0.logo }
                         )
                     } else if installed == nil {
                         HStack(spacing: 6) {

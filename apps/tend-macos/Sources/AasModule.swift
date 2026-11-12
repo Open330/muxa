@@ -727,9 +727,14 @@ private struct AasAccountTable: View {
             .accessibilityHidden(true)
             ForEach(groups) { group in
                 Divider()
-                Text(verbatim: group.title)
-                    .font(TendType.detail.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 5) {
+                    if let logo = TendAgentLogoAsset(kind: group.provider) {
+                        TendAgentLogo(asset: logo, fallbackSymbol: "terminal", size: 13)
+                    }
+                    Text(verbatim: group.title)
+                }
+                .font(TendType.detail.weight(.semibold))
+                .foregroundStyle(.secondary)
                 ForEach(group.accounts) { account in
                     AasAccountRow(account: account, module: module, model: model)
                 }

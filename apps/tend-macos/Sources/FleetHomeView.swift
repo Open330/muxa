@@ -635,6 +635,9 @@ private struct FleetWorkCard: View {
                     .foregroundStyle(.orange)
             }
             HStack(spacing: 6) {
+                if !work.agentKinds.isEmpty {
+                    TendAgentLogoStack(kinds: work.agentKinds, size: 12)
+                }
                 if let repo = work.repo {
                     Text(repo)
                 }
@@ -884,6 +887,7 @@ private struct FleetWorkInspector: View {
     private func agentRow(_ hosted: TendHostedAgent) -> some View {
         HStack(spacing: 8) {
             AgentStatusTag(status: hosted.agent.status, showsLabel: false)
+            TendAgentLogo(kind: hosted.agent.kind, size: 18)
             VStack(alignment: .leading, spacing: 1) {
                 Text(FleetBoard.owner(hosted))
                     .font(TendType.body.weight(.medium))
@@ -1033,9 +1037,14 @@ private struct FleetStageRow: View {
             .frame(width: 12)
             VStack(alignment: .leading, spacing: 1) {
                 Text(stage.name).fontWeight(.semibold)
-                Text(stage.owner)
-                    .font(TendType.meta)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    if let kind = stage.kind {
+                        TendAgentLogo(kind: kind, size: 12)
+                    }
+                    Text(stage.owner)
+                }
+                .font(TendType.meta)
+                .foregroundStyle(.secondary)
             }
             .padding(.bottom, isLast ? 0 : 10)
             Spacer(minLength: 4)

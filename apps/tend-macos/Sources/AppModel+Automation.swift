@@ -524,9 +524,11 @@ struct TendAutomationWaitDraft: Hashable, Sendable {
 
 // MARK: - Wire values with a face
 
-/// How an agent kind is drawn: the product's own name and a tinted SF
-/// Symbol. tend ships no third-party logos, so the mark is the symbol plus
-/// the name — never a vendor image.
+/// How an agent kind is drawn: the product's own name and its official
+/// logo (`logo`, drawn by `TendAgentLogo`). The logos are the vendors' own
+/// marks, used only to identify the product next to its name; their sources
+/// are in `Resources/AgentLogos-NOTICE.md`. The SF Symbol and tint remain
+/// for a kind with no logo and for places that need a colour, not a mark.
 ///
 /// The symbol comes from `AskProviderEngine` and the tint from
 /// `agentProgramTint` wherever those already know the product, so there is
@@ -547,6 +549,8 @@ struct TendAgentMark: Hashable, Sendable {
 
     var symbol: String { engine?.symbolName ?? ownSymbol ?? "terminal" }
     var tint: Color { agentProgramTint(program) }
+    /// The product's logo; `logo?.colorName` is its asset name.
+    var logo: TendAgentLogoAsset? { TendAgentLogoAsset(kind: program) }
 
     /// Every agent kind this build can put a face on. A rule may name one
     /// that is not here — the daemon knows agents this build does not — and
@@ -565,7 +569,7 @@ struct TendAgentMark: Hashable, Sendable {
             engine: nil, program: "agy", ownSymbol: "arrow.up.circle"
         ),
         TendAgentMark(
-            wire: "opencode", name: "opencode",
+            wire: "opencode", name: "OpenCode",
             engine: nil, program: "opencode", ownSymbol: "terminal"
         ),
     ]
@@ -579,6 +583,14 @@ struct TendAgentMark: Hashable, Sendable {
     /// it arrived.
     static func title(for wire: String) -> String {
         known(for: wire)?.name ?? wire
+    }
+
+    /// The product's name for an agent kind or program in any spelling
+    /// (`claude_code`, `claude`, `agy`), or the kind made readable.
+    static func productName(forKind kind: String) -> String {
+        known(for: kind)?.name
+            ?? TendAgentProgram(configValue: kind)?.displayName
+            ?? kind.replacingOccurrences(of: "_", with: " ")
     }
 }
 

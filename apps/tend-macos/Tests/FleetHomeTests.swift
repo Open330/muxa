@@ -592,8 +592,8 @@ private func claimed(from session: String, label: String = "claude@%1") -> Strin
 @Test func menuBarGlyphsNameProvidersAndCustomHostIcons() throws {
     #expect(TendMenuBarAgentAppearance(identity: "a", kind: "claude_code").symbol == TendGlyph.claude)
     #expect(TendMenuBarAgentAppearance(identity: "a", kind: "codex").symbol == TendGlyph.codex)
-    #expect(TendGlyph.kind(TendGlyph.claude) == .claude)
-    #expect(TendGlyph.kind(TendGlyph.codex) == .codex)
+    #expect(TendGlyph.kind(TendGlyph.claude) == .logo(.claude))
+    #expect(TendGlyph.kind(TendGlyph.codex) == .logo(.openai))
     #expect(TendGlyph.kind("text:🚀") == .text("🚀"))
     #expect(TendGlyph.kind("server.rack") == .symbol("server.rack"))
     #expect(TendGlyph.cleanedText("  mini host ") == "mi")
