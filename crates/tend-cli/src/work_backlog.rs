@@ -299,15 +299,11 @@ pub(crate) fn render_show(show: &WorkShow, now: OffsetDateTime) -> String {
 }
 
 /// Fill `tend work up` arguments the caller left out from the Work's plan,
-/// if one exists. Explicit arguments always win, `--no-ticket` keeps the
-/// saved issue out, and the saved prompt is used only for the first start
-/// (`initial`): on a re-run it would read as a steering body and restart
-/// every agent instead of converging.
-pub(crate) fn fill_from_plan(
-    args: &mut crate::work_up::UpArgs,
-    record: &WorkRecord,
-    initial: bool,
-) {
+/// if one exists. Explicit arguments always win and `--no-ticket` keeps the
+/// saved issue out. The saved prompt is marked as the plan's
+/// (`body_from_plan`): it is part of every launch prompt on every run, so a
+/// re-run converges, and it never restarts or steers running agents.
+pub(crate) fn fill_from_plan(args: &mut crate::work_up::UpArgs, record: &WorkRecord) {
     let Some(plan) = &record.plan else {
         return;
     };
@@ -320,8 +316,9 @@ pub(crate) fn fill_from_plan(
     if args.pipeline.is_none() {
         args.pipeline.clone_from(&plan.pipeline);
     }
-    if initial && args.body.is_none() && args.skill.is_none() {
+    if args.body.is_none() && args.skill.is_none() && plan.prompt.is_some() {
         args.body.clone_from(&plan.prompt);
+        args.body_from_plan = true;
     }
     if args.external.is_none() && !args.no_ticket {
         args.external.clone_from(&plan.external);
@@ -437,7 +434,7 @@ mod tests {
             clap::Parser::try_parse_from(["up", "ENG-1", "--pipeline", "solo"])
                 .map(|wrapper: UpWrapper| wrapper.args)
                 .unwrap();
-        fill_from_plan(&mut args, planned, true);
+        fill_from_plan(&mut args, planned);
         assert_eq!(args.workspace.as_deref(), Some("web"));
         assert!(args.cwd.is_none(), "a plan's cwd is not an explicit --cwd");
         assert_eq!(args.planned_cwd.as_deref(), Some(Path::new("/src/web")));
@@ -452,12 +449,15 @@ mod tests {
         assert!(find_record(&records, "ENG-1", Some("api"), true)
             .unwrap()
             .is_none());
-        // A re-run converges: the saved prompt is not a steering body.
-        let mut rerun: crate::work_up::UpArgs = clap::Parser::try_parse_from(["up", "ENG-1"])
-            .map(|w: UpWrapper| w.args)
-            .unwrap();
-        fill_from_plan(&mut rerun, planned, false);
-        assert!(rerun.body.is_none());
+        assert!(args.body_from_plan, "the saved task never steers");
+        // An explicit body is the caller's steering request.
+        let mut steer: crate::work_up::UpArgs =
+            clap::Parser::try_parse_from(["up", "ENG-1", "--body", "now do X"])
+                .map(|w: UpWrapper| w.args)
+                .unwrap();
+        fill_from_plan(&mut steer, planned);
+        assert_eq!(steer.body.as_deref(), Some("now do X"));
+        assert!(!steer.body_from_plan);
         // --no-ticket keeps a saved issue out.
         let mut with_issue = planned.clone();
         with_issue.plan.as_mut().unwrap().external = Some("ENG-123".into());
@@ -465,7 +465,7 @@ mod tests {
             clap::Parser::try_parse_from(["up", "ENG-1", "--no-ticket"])
                 .map(|w: UpWrapper| w.args)
                 .unwrap();
-        fill_from_plan(&mut offline, &with_issue, true);
+        fill_from_plan(&mut offline, &with_issue);
         assert!(offline.external.is_none());
         // The same id in two workspaces needs --workspace.
         let twice = vec![
@@ -488,6 +488,68 @@ mod tests {
     struct UpWrapper {
         #[command(flatten)]
         args: crate::work_up::UpArgs,
+    }
+
+    /// The saved task renders into the launch prompts on every run, so a
+    /// re-run registers the same desired pipeline and keeps the Run's
+    /// generation and completions. Dropping it on a re-run (or treating it
+    /// as a steering body) would restart every agent.
+    #[tokio::test]
+    async fn a_rerun_from_the_plan_keeps_the_run_and_its_completions() {
+        let pipeline: tend::config::PipelineConfig = toml::from_str(
+            r#"
+            [[agent]]
+            alias = "impl"
+            program = "claude"
+            prompt = "pipeline instruction"
+            "#,
+        )
+        .unwrap();
+        let render = |task: Option<&str>| {
+            let mut vars = tend::pipeline::Vars::new();
+            vars.set_opt(tend::pipeline::REQUEST_KEY, task);
+            tend::pipeline::desired_agents("solo", &pipeline, &vars).unwrap()
+        };
+        let store = tend::pipeline_run::PipelineRunStore::in_memory();
+        let identity = WorkIdentity::new("web", "ENG-1");
+        let register = |desired| tend::pipeline_run::PipelineRunRegistration {
+            identity: identity.clone(),
+            pipeline: "solo".into(),
+            desired,
+            cwd: "/src/web".into(),
+            window_id: None,
+            observed: Vec::new(),
+            invalidate: Vec::new(),
+        };
+        let first = store
+            .register(register(render(Some("saved task"))))
+            .await
+            .unwrap();
+        assert!(first.desired[0]
+            .prompt
+            .as_deref()
+            .is_some_and(|prompt| prompt.contains("saved task")));
+        store
+            .claim_ready(&identity, first.generation)
+            .await
+            .unwrap();
+        store
+            .done(&identity, "impl", first.generation)
+            .await
+            .unwrap();
+        let rerun = store
+            .register(register(render(Some("saved task"))))
+            .await
+            .unwrap();
+        assert_eq!(rerun.generation, first.generation);
+        assert_eq!(
+            rerun.aliases["impl"].status,
+            tend::pipeline_run::PipelineAliasStatus::Done
+        );
+        // What the earlier fix did instead: no task on the re-run changes
+        // the desired prompt, and the store restarts the alias.
+        let dropped = store.register(register(render(None))).await.unwrap();
+        assert_ne!(dropped.generation, first.generation);
     }
 
     #[test]

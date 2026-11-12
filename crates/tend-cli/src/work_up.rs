@@ -92,6 +92,12 @@ pub struct UpArgs {
     /// treated as an explicit `--cwd`.
     #[arg(skip)]
     pub planned_cwd: Option<PathBuf>,
+    /// `body` is the planned Work's saved task, not a steering request: it
+    /// renders into every agent's launch prompt on every run, so the
+    /// desired pipeline stays the same across re-runs, but it never
+    /// restarts or re-prompts agents that are already running.
+    #[arg(skip)]
+    pub body_from_plan: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -171,6 +177,8 @@ pub(crate) struct Resolved {
     cwd_pinned: bool,
     layout: Option<String>,
     request: Option<ComposedRequest>,
+    /// `request` is a planned Work's saved task ([`UpArgs::body_from_plan`]).
+    request_from_plan: bool,
     desired: Vec<DesiredAgent>,
     /// Existing daemon-owned state, used by dry-run rendering. A real apply
     /// performs an atomic register and reads the returned Run instead.
@@ -202,17 +210,8 @@ pub async fn run(
         }
         _ => None,
     };
-    if let (Some(record), Some(client)) = (&planned, client) {
-        // The first start of a queued plan with no durable Run yet: only
-        // then is the saved prompt the launch instruction.
-        let initial = record.metadata.stage == tend::work::WorkStage::Queued
-            && client
-                .pipeline_runs()
-                .await
-                .context("reading durable pipeline Runs")?
-                .iter()
-                .all(|run| run.identity != record.identity);
-        crate::work_backlog::fill_from_plan(&mut args, record, initial);
+    if let Some(record) = &planned {
+        crate::work_backlog::fill_from_plan(&mut args, record);
     }
     let json = args.json;
     let dry_run = args.dry_run;
@@ -267,10 +266,7 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
             .map(|state| state.alias.clone())
             .collect()
     });
-    let broadcast = resolved
-        .request
-        .as_ref()
-        .map(|request| request.text.as_str());
+    let broadcast = steering(&resolved);
     let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
 
     Ok(finish(
@@ -317,7 +313,7 @@ pub(crate) async fn apply_durable(
     // `--body`/`--prompt` is a real restart of every existing pipeline
     // participant. The store expands these roots transitively and advances
     // the Run generation before any prompt can be delivered.
-    let mut invalidate = resolved.request.as_ref().map_or_else(Vec::new, |_| {
+    let mut invalidate = steering(&resolved).map_or_else(Vec::new, |_| {
         existing
             .iter()
             .filter_map(|agent| agent.alias.clone())
@@ -375,10 +371,7 @@ pub(crate) async fn apply_durable(
         .filter(|state| state.status == PipelineAliasStatus::Done)
         .map(|state| state.alias.clone())
         .collect::<Vec<_>>();
-    let broadcast = resolved
-        .request
-        .as_ref()
-        .map(|request| request.text.as_str());
+    let broadcast = steering(&resolved);
     let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
     let claims = client
         .pipeline_claim(&identity, run.generation)
@@ -801,11 +794,23 @@ pub(crate) async fn resolve(
         cwd_pinned: cwd_is_pinned(args, route),
         layout: spec.layout.clone(),
         request,
+        request_from_plan: args.body_from_plan,
         desired,
         durable_run,
         states,
         accounts: account_routes(config),
     })
+}
+
+/// The request text to steer running agents with: the caller's own
+/// `--body`, never a planned Work's saved task (which only shapes launch
+/// prompts).
+fn steering(resolved: &Resolved) -> Option<&str> {
+    resolved
+        .request
+        .as_ref()
+        .filter(|_| !resolved.request_from_plan)
+        .map(|request| request.text.as_str())
 }
 
 fn account_routes(config: &Config) -> Vec<tend::swap_api::AccountRoute> {
@@ -1927,6 +1932,7 @@ mod tests {
 
     fn up_args(cwd: Option<&str>) -> UpArgs {
         UpArgs {
+            body_from_plan: false,
             planned_cwd: None,
             work: "eng-1".into(),
             external: None,
