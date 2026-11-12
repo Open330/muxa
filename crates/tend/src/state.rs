@@ -2058,6 +2058,11 @@ impl Store {
         }
     }
 
+    /// Launch claims remain protected even if their receipt no longer matches a row.
+    pub fn protected_launch_archives(&self) -> std::collections::BTreeSet<String> {
+        self.launch_identities.lock().unwrap().protected_launches()
+    }
+
     pub async fn launch_identity_snapshot(
         &self,
         agents: &[Agent],

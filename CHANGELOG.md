@@ -18,6 +18,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that still carry `air_artifacts` load normally; the field is ignored. A peer
   on an older version can keep sending it, and this version ignores it.
 
+### Fixed
+
+- The daemon removes terminal launch archives after 30 days, retaining live
+  agents’ launch records and unfinished launch tickets.
+
 ## [0.10.8] - 2026-11-12
 
 ### Fixed

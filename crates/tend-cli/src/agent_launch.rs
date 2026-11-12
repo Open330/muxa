@@ -1931,6 +1931,146 @@ mod tests {
         }
     }
 
+    /// Run real `start()` calls in a child so `HOME`/`PATH`/socket isolation cannot
+    /// race other unit tests. All tmux commands target a disposable server.
+    #[cfg(unix)]
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::unnecessary_debug_formatting)]
+    fn duplicate_launch_ticket_refuses_a_second_physical_create() {
+        use std::io::{BufRead, Write};
+        use std::os::unix::{fs::PermissionsExt, net::UnixListener};
+        use std::process::Command;
+        const PROBE: &str = "TEND_TEST_DUPLICATE_LAUNCH";
+        if let Some(root) = std::env::var_os(PROBE) {
+            let root = PathBuf::from(root);
+            let socket = root.join("daemon.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            // Only coordination responses are stubbed; physical creation,
+            // archive preparation and duplicate refusal all run for real.
+            std::thread::spawn(move || {
+                for stream in listener.incoming() {
+                    let mut stream = stream.unwrap();
+                    let mut line = String::new();
+                    std::io::BufReader::new(&stream)
+                        .read_line(&mut line)
+                        .unwrap();
+                    let response = serde_json::json!({
+                        "ok": true,
+                        "capabilities": [tend::collaboration::HUMAN_PRIORITY_CAPABILITY],
+                    });
+                    writeln!(stream, "{response}").unwrap();
+                }
+            });
+            let launch_id = uuid::Uuid::new_v4().to_string();
+            let mut request = request(AgentProgram::Claude, Placement::Session);
+            request.purpose = tend::collaboration::LaunchPurpose::Worker;
+            request.socket = socket;
+            request.target = None;
+            request.cwd = Some(root.clone());
+            request.name = Some("duplicate-launch".into());
+            request.worker_spawn = Some(tend::collaboration::WorkerSpawnTicket {
+                launch_id: launch_id.clone(),
+                origin: tend::collaboration::CollaborationOrigin {
+                    pane: "%1".into(),
+                    socket: None,
+                    console: false,
+                    agent_session_id: Some("requester".into()),
+                    exact_session: true,
+                },
+            });
+            let first = start(request.clone()).expect("first physical launch");
+            assert_eq!(first.launch_id.as_deref(), Some(launch_id.as_str()));
+            let error = start(request).expect_err("same ticket must never create twice");
+            assert!(
+                error.to_string().contains("refusing duplicate create"),
+                "{error:#}"
+            );
+            let creates = std::fs::read_to_string(root.join("creates")).unwrap();
+            assert_eq!(creates.lines().count(), 1, "{creates}");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let real_tmux = tend::tmux::tmux_binary();
+        assert!(Command::new(real_tmux)
+            .arg("-V")
+            .output()
+            .unwrap()
+            .status
+            .success());
+        let wrapper = bin.join("tmux");
+        std::fs::write(
+            &wrapper,
+            format!(
+                r"#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+if any(arg in ('new-session', 'new-window', 'split-window') for arg in args):
+    with open({count:?}, 'a') as file: file.write('create\n')
+os.execv({real:?}, [{real:?}] + args)
+",
+                count = root.path().join("creates"),
+                real = real_tmux
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let claude = bin.join("claude");
+        std::fs::write(&claude, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let private_socket = root.path().join("tmux.sock");
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "agent_launch::tests::duplicate_launch_ticket_refuses_a_second_physical_create",
+                "--nocapture",
+            ])
+            .env(PROBE, root.path())
+            .env("HOME", root.path())
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("TEND_CONFIG", root.path().join("config.toml"))
+            .env("TEND_TMUX_SOCKET", &private_socket)
+            .env("SHELL", "/bin/sh")
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            );
+        for key in [
+            "RMUX",
+            "RMUX_PANE",
+            "TMUX",
+            "TMUX_PANE",
+            "CODEX_THREAD_ID",
+            "TEND_HOST",
+            "TEND_HOSTS",
+            "TEND_SESSION_ID",
+            "TEND_SESSION_BACKEND",
+        ] {
+            child.env_remove(key);
+        }
+        let output = child.output().unwrap();
+        // Cleanup runs before assertions, including when the child failed.
+        let _ = Command::new(real_tmux)
+            .arg("-S")
+            .arg(&private_socket)
+            .arg("kill-server")
+            .output();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
     #[test]
     fn a_routed_launch_runs_the_finished_argv_through_aas() {
         let build = || {
