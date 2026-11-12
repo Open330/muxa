@@ -3397,6 +3397,7 @@ private final class OneShotSubscriptionServer: @unchecked Sendable {
         self.path = path
         unlink(path)
         listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        let socketFD = listener
         var address = sockaddr_un()
         address.sun_family = sa_family_t(AF_UNIX)
         withUnsafeMutableBytes(of: &address.sun_path) { buffer in
@@ -3404,16 +3405,15 @@ private final class OneShotSubscriptionServer: @unchecked Sendable {
         }
         let bound = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                bind(socketFD, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
             }
         }
-        guard bound == 0, listen(listener, 1) == 0 else {
+        guard bound == 0, listen(socketFD, 1) == 0 else {
             throw TendIPCError.posix(operation: "bind", code: errno)
         }
         let hello = try JSONSerialization.data(withJSONObject: helloReply) + Data("\n".utf8)
-        let listener = listener
         Thread.detachNewThread { [self] in
-            let peer = accept(listener, nil, nil)
+            let peer = accept(socketFD, nil, nil)
             guard peer >= 0 else { return }
             lock.withLock { connection = peer }
             for reply in [hello, Data("{\"ok\":true}\n".utf8)] {
