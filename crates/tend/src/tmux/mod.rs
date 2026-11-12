@@ -72,7 +72,23 @@ pub fn tmux_command() -> Command {
     if rmux_endpoint.is_some() && rmux_endpoint == tmux_endpoint {
         cmd.env_remove("TMUX").env_remove("TMUX_PANE");
     }
+    if inherited_tmux_is_foreign(
+        scanner::own_tmux_dir_only(),
+        std::env::var_os("TMUX_TMPDIR").is_some_and(|dir| !dir.is_empty()),
+    ) {
+        // A private daemon keeps to its own `TMUX_TMPDIR`: a `$TMUX`
+        // inherited from the terminal it was started in names the user's
+        // server, which every bare tmux call would otherwise reach.
+        cmd.env_remove("TMUX").env_remove("TMUX_PANE");
+    }
     cmd
+}
+
+/// Whether an inherited `$TMUX` must be dropped from tmux invocations: only
+/// for a daemon restricted to its own tmux directory, and only when it has
+/// one.
+fn inherited_tmux_is_foreign(own_dir_only: bool, has_tmux_tmpdir: bool) -> bool {
+    own_dir_only && has_tmux_tmpdir
 }
 
 pub fn tmux_binary() -> &'static Path {
@@ -1910,5 +1926,75 @@ mod tests {
         assert_eq!(clients.len(), 1);
         assert_eq!(clients[0].session, "main");
         assert_eq!(clients[0].last_activity, 1_700_000_100);
+    }
+
+    #[test]
+    fn a_private_daemon_drops_an_inherited_tmux_only_with_its_own_dir() {
+        assert!(inherited_tmux_is_foreign(true, true));
+        assert!(!inherited_tmux_is_foreign(true, false));
+        assert!(!inherited_tmux_is_foreign(false, true));
+    }
+
+    /// Codex review of #492: with an empty private `TMUX_TMPDIR`, the bare
+    /// fallback used to follow an inherited `$TMUX` to an outside server.
+    /// Exercised against two scratch servers, never the user's.
+    #[cfg(unix)]
+    #[test]
+    fn without_inherited_tmux_a_bare_call_cannot_reach_an_outside_server() {
+        struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new(tmux_binary())
+                    .args(["-S", self.0.to_str().unwrap(), "kill-server"])
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        if std::process::Command::new(tmux_binary())
+            .arg("-V")
+            .output()
+            .map_or(true, |out| !out.status.success())
+        {
+            return;
+        }
+        let root =
+            std::path::PathBuf::from(format!("/private/tmp/tend-tmux-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let private = root.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        let outside = root.join("outside.sock");
+        let _cleanup = Cleanup(outside.clone(), root.clone());
+        assert!(std::process::Command::new(tmux_binary())
+            .args([
+                "-S",
+                outside.to_str().unwrap(),
+                "new-session",
+                "-d",
+                "-s",
+                "outer"
+            ])
+            .env_remove("TMUX")
+            .status()
+            .unwrap()
+            .success());
+        let list = |inherit: bool| {
+            let mut cmd = std::process::Command::new(tmux_binary());
+            cmd.args(["list-sessions", "-F", "#{session_name}"])
+                .env("TMUX_TMPDIR", &private);
+            if inherit {
+                cmd.env("TMUX", format!("{},1,0", outside.display()));
+            } else {
+                cmd.env_remove("TMUX");
+            }
+            String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned()
+        };
+        assert!(
+            list(true).contains("outer"),
+            "precondition: $TMUX reaches it"
+        );
+        assert!(
+            !list(false).contains("outer"),
+            "without it, only the private dir"
+        );
     }
 }

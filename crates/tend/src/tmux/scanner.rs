@@ -281,9 +281,14 @@ pub(crate) fn default_socket_dirs() -> Vec<PathBuf> {
 static OWN_TMUX_DIR_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// Restrict this process's tmux server discovery to `$TMUX_TMPDIR` when it
-/// is set. See [`OWN_TMUX_DIR_ONLY`].
+/// is set, and stop its tmux calls following an inherited `$TMUX`. See
+/// [`OWN_TMUX_DIR_ONLY`].
 pub fn restrict_to_own_tmux_dir() {
     OWN_TMUX_DIR_ONLY.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn own_tmux_dir_only() -> bool {
+    OWN_TMUX_DIR_ONLY.load(Ordering::Relaxed)
 }
 
 fn socket_dirs(
