@@ -100,6 +100,7 @@ pub const FLEET_CAPABILITIES: &[&str] = &[
     "capture",
     "window_capture",
     "send_prompt",
+    crate::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY,
     "collaboration",
     "collaboration_get",
     "collaboration_dispatch_v1",
@@ -554,6 +555,10 @@ pub enum RelayRequest {
         /// Who asked for it; absent from older controllers.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<crate::PromptOrigin>,
+        /// `send_prompt_state_gate_v1`: `Some(false)` refuses unless the
+        /// pane's agent is Idle; absent from older controllers (no gate).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force: Option<bool>,
     },
     /// Navigation keys for a choice dialog, sent as raw key bytes.
     SendKeys {
@@ -772,6 +777,10 @@ pub enum FleetOperation {
         /// or automation. Anything else is recorded as tend.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin: Option<crate::PromptOrigin>,
+        /// `send_prompt_state_gate_v1` (see the relay request). Only sent to
+        /// a host that advertises it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        force: Option<bool>,
     },
     /// `fleet_keys_v1`: press navigation keys in a pane, so a choice dialog
     /// can be answered by moving to an option and confirming it. Only the
@@ -1821,6 +1830,52 @@ mod tests {
             .collaboration_incoming
             .iter()
             .all(|r| r.id != "agent-00"));
+    }
+
+    /// `force` is additive: an older relay frame decodes as ungated, and an
+    /// ungated request is encoded exactly as before.
+    #[test]
+    fn send_prompt_force_is_additive_on_the_wire() {
+        let pane = PaneKey {
+            window: WindowKey {
+                session: SessionKey {
+                    endpoint: crate::BackendEndpoint {
+                        host: HostKind::Tmux,
+                        socket: "default".into(),
+                    },
+                    session_id: "$1".into(),
+                },
+                window_id: "@1".into(),
+            },
+            pane_id: "%1".into(),
+        };
+        let legacy = RelayRequest::SendPrompt {
+            request_id: "r".into(),
+            pane: pane.clone(),
+            text: "hi".into(),
+            submit: true,
+            origin: None,
+            force: None,
+        };
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("force").is_none());
+        let decoded: RelayRequest = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            decoded,
+            RelayRequest::SendPrompt { force: None, .. }
+        ));
+        let gated = RelayRequest::SendPrompt {
+            request_id: "r".into(),
+            pane,
+            text: "hi".into(),
+            submit: true,
+            origin: None,
+            force: Some(false),
+        };
+        assert_eq!(serde_json::to_value(&gated).unwrap()["force"], false);
+        assert!(
+            FLEET_CAPABILITIES.contains(&crate::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY)
+        );
     }
 
     #[test]

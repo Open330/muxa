@@ -1361,6 +1361,8 @@ fn handle_key(
                                 submit: true,
                                 // Typed by the person driving fleet watch.
                                 origin: Some(tend::PromptOrigin::PersonViaTend),
+                                // A person's explicit action: not gated.
+                                force: None,
                             },
                         );
                         app.message_targets.clear();

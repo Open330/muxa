@@ -380,6 +380,7 @@ async fn handle_request(
             text,
             submit,
             origin,
+            force,
         } => {
             let backend = exact_backend(&backends, &pane).await?;
             if !backend.caps().send_text {
@@ -387,6 +388,22 @@ async fn handle_request(
             }
             let socket = pane.window.session.endpoint.socket.clone();
             let pane_id = pane.pane_id.clone();
+            // The relay types itself (no daemon input guard), so the gate is
+            // judged on this host's registry just before typing.
+            if force == Some(false) {
+                let rows: Vec<_> = client
+                    .snapshot()
+                    .await
+                    .context("read this host's agents for the idle gate")?
+                    .into_iter()
+                    .filter(|agent| agent.pane.as_deref() == Some(pane_id.as_str()))
+                    .collect();
+                if let Err(refusal) =
+                    tend::prompt_delivery::idle_gate(&pane_id, &rows, Some(&socket), None)
+                {
+                    bail!("{refusal}");
+                }
+            }
             // Register with this host's daemon before typing, so the hook
             // reporting the prompt carries its origin. A daemon without
             // prompt_origin_v1 refuses; the prompt then stays unknown.

@@ -1694,6 +1694,16 @@ async fn call_tool_inner(
                 return Ok(error_result("fleet_send_prompt requires a `text` argument"));
             };
             let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(true);
+            if args.get("force").is_some_and(|value| !value.is_boolean()) {
+                return Ok(error_result("fleet_send_prompt `force` must be a boolean"));
+            }
+            // Agents are gated as locally: only an Idle pane, unless forced.
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
+            if !force {
+                if let Err(error) = ensure_fleet_send_gate(client, host).await {
+                    return Ok(error_result(&error));
+                }
+            }
             let target = match crate::fleet_cli::resolve_pane(client, host, pane).await {
                 Ok(target) => target,
                 Err(error) => {
@@ -1710,6 +1720,7 @@ async fn call_tool_inner(
                             submit,
                             // MCP tools are called by agents.
                             origin: Some(tend::PromptOrigin::Peer),
+                            force: Some(force),
                         },
                     )
                     .await
@@ -3524,6 +3535,36 @@ async fn fleet_wait_reply(client: &Client, args: &Value) -> Value {
             "delivery_state": current.as_ref().map(|request| crate::collaboration_output::receipt(request)["delivery_state"].clone()),
         })),
         Err(error) => error_result(&format!("fleet_wait_reply failed: {error}")),
+    }
+}
+
+/// A gated Fleet prompt needs the host (its relay, or the local daemon) to
+/// enforce `send_prompt_state_gate_v1`; an older one would type regardless.
+async fn ensure_fleet_send_gate(
+    client: &Client,
+    host_alias: &str,
+) -> std::result::Result<(), String> {
+    let snapshot = client
+        .fleet_snapshot(None)
+        .await
+        .map_err(|error| format!("could not read Fleet status: {error}"))?;
+    let host = snapshot
+        .hosts
+        .into_iter()
+        .find(|host| host.alias == host_alias)
+        .ok_or_else(|| format!("Fleet host '{host_alias}' is not known"))?;
+    let gate = tend::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY;
+    if host
+        .capabilities
+        .iter()
+        .any(|capability| capability == gate)
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "{}: host '{host_alias}' cannot check that the target is idle (no {gate}); nothing was sent. Upgrade tend there, or pass force=true to type regardless.",
+            tend::prompt_delivery::TARGET_NOT_IDLE
+        ))
     }
 }
 

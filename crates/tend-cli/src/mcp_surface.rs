@@ -227,7 +227,7 @@ fn route_fleet_prompt(args: &Value) -> Result<Routed, String> {
     }
     Ok(plain(
         "tend_fleet_send_prompt",
-        copy(args, &["host", "pane", "text", "submit"]),
+        copy(args, &["host", "pane", "text", "submit", "force"]),
     ))
 }
 
@@ -563,7 +563,7 @@ fn schema_extension(name: &str) -> Option<(Value, &'static str)> {
         "",
     ),
     "tend_send_prompt" => (
-        json!({"host": {"type": "string", "description": "Control-mode Fleet host (not gated on Idle yet)."}}),
+        json!({"host": {"type": "string", "description": "Control-mode Fleet host; gated on Idle the same way."}}),
         "",
     ),
     "tend_start_work" => (

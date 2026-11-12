@@ -54,6 +54,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   about 3,000. Sending work is documented as returning at once, with the
   reply arriving as a wake. The collaboration guide's next steps name the
   listed tools.
+- `tend_send_prompt` to a Fleet host (and the retired
+  `tend_fleet_send_prompt`) is gated like a local send: only an Idle agent
+  is typed into unless `force=true`, checked on that host. A host whose tend
+  does not advertise `send_prompt_state_gate_v1` refuses a non-forced send.
+  `tend fleet watch` and `tend fleet send` are unchanged.
 
 ### Fixed
 
