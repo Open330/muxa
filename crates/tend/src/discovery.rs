@@ -198,9 +198,9 @@ fn discover_from_panes_cached(
 ///   [`WRAPPER_FOUND_MAX_AGE`]. Once that process exits — the wrapper went
 ///   on to start something else — the pane is walked again.
 /// * "No agent" is reused for [`WRAPPER_MISS_TTL`], but only once the key
-///   has existed for [`WRAPPER_NEW_KEY_GRACE`]: a freshly started wrapper
-///   is usually still starting its agent, and the startup gate must be
-///   seen promptly.
+///   has gone [`WRAPPER_NEW_KEY_GRACE`] without an agent: a freshly started
+///   wrapper, or one whose agent just exited, is usually starting the next
+///   agent, and its startup gate must be seen promptly.
 #[cfg(not(target_os = "linux"))]
 #[derive(Debug, Default)]
 struct WrapperCache {
@@ -254,7 +254,13 @@ impl WrapperCache {
         now: std::time::Instant,
     ) {
         let key = (pane_pid, command.to_owned());
-        let first_seen = self.entries.get(&key).map_or(now, |entry| entry.first_seen);
+        // A wrapper whose agent just went away is likely starting the next
+        // one: losing a found agent opens a fresh startup grace.
+        let first_seen = self
+            .entries
+            .get(&key)
+            .filter(|entry| entry.found.is_none() || found.is_some())
+            .map_or(now, |entry| entry.first_seen);
         self.entries.insert(
             key,
             WrapperEntry {
@@ -820,6 +826,39 @@ mod tests {
         }
         assert_eq!(reads.get(), 2, "misses are cached after the grace window");
         discover_from_panes_cached(&panes, &cache, at(62), &|_| true, &read);
+        assert_eq!(reads.get(), 3);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn losing_a_found_agent_reopens_the_startup_grace() {
+        use std::cell::Cell;
+        use std::time::{Duration, Instant};
+        let cache = std::sync::Mutex::new(WrapperCache::default());
+        let reads = Cell::new(0);
+        let has_agent = Cell::new(true);
+        let read = || {
+            reads.set(reads.get() + 1);
+            wrapper_table(has_agent.get())
+        };
+        let alive = |_: u32| has_agent.get();
+        let start = Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let panes = [wrapper_pane()];
+        // A long-lived wrapper with an agent.
+        assert_eq!(
+            discover_from_panes_cached(&panes, &cache, at(0), &alive, &read).len(),
+            1
+        );
+        // The agent exits; the wrapper is between agents for a tick.
+        has_agent.set(false);
+        assert!(discover_from_panes_cached(&panes, &cache, at(60), &alive, &read).is_empty());
+        // The next agent is found at once, not after a cached 30 s miss.
+        has_agent.set(true);
+        assert_eq!(
+            discover_from_panes_cached(&panes, &cache, at(63), &alive, &read).len(),
+            1
+        );
         assert_eq!(reads.get(), 3);
     }
 

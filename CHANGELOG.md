@@ -88,8 +88,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of taking a full `ps` table every 3 s; a Working hook-owned pane is
   re-captured every 15 s instead of every tick; the reconciler takes one
   process table per tick instead of two; each IPC connection no longer spawns
-  `ps -o comm=` for its caller (the executable is looked up in-process, and
-  only when collaboration provenance is recorded); and a Codex hook checks its
+  `ps -o comm=` for its caller (the executable is looked up in-process); and a Codex hook checks its
   ancestry with per-process queries once, instead of two full `ps` passes.
 
 ### Fixed

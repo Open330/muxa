@@ -109,9 +109,7 @@ pub(super) struct CollaborationConnectionActor {
     pub(super) caller_pid: Option<u32>,
     pub(super) caller_uid: Option<u32>,
     pub(super) caller_gid: Option<u32>,
-    /// The caller's executable, looked up the first time provenance is
-    /// recorded: most connections (hook ingest, status reads) never need it.
-    pub(super) executable: std::sync::OnceLock<Option<String>>,
+    pub(super) executable: Option<String>,
     pub(super) observed_pane: Option<String>,
     pub(super) pane_evidence: Option<CollaborationPaneEvidence>,
     pub(super) pane_observed: bool,
@@ -162,10 +160,7 @@ impl CollaborationConnectionActor {
             caller_pid: self.caller_pid,
             caller_uid: self.caller_uid,
             caller_gid: self.caller_gid,
-            executable: self
-                .executable
-                .get_or_init(|| self.caller_pid.and_then(process_executable))
-                .clone(),
+            executable: self.executable.clone(),
             observed_pane: self.observed_pane.clone(),
             pane_evidence: self.pane_evidence,
             origin_match,
@@ -179,10 +174,8 @@ pub(super) fn observe_collaboration_actor(stream: &Stream) -> CollaborationConne
     let caller_pid = peer.pid;
     let caller_uid = peer.uid;
     let caller_gid = peer.gid;
-    let (executable, process_kind) = caller_pid.map_or(
-        (std::sync::OnceLock::new(), CollaborationClientKind::Unknown),
-        process_identity,
-    );
+    let (executable, process_kind) =
+        caller_pid.map_or((None, CollaborationClientKind::Unknown), process_identity);
     CollaborationConnectionActor {
         client_kind: process_kind,
         caller_pid,
@@ -351,36 +344,29 @@ pub(super) fn process_environment_pane(_pid: u32) -> Option<String> {
     None
 }
 
-/// The caller's executable (pre-filled on Linux, where `/proc` is cheap and
-/// also yields the client kind) and its client kind. Elsewhere the
-/// executable is left for [`process_executable`] to fill on first use.
-pub(super) fn process_identity(
-    pid: u32,
-) -> (std::sync::OnceLock<Option<String>>, CollaborationClientKind) {
+/// The caller's executable and client kind, read once when the connection
+/// is accepted, so the provenance names the process that connected even if
+/// it exits (and its pid is reused) during a long request.
+pub(super) fn process_identity(pid: u32) -> (Option<String>, CollaborationClientKind) {
     #[cfg(target_os = "linux")]
-    {
-        let kind = std::fs::read(format!("/proc/{pid}/cmdline")).ok().map_or(
-            CollaborationClientKind::Unknown,
-            |bytes| {
-                bytes
-                    .split(|byte| *byte == 0)
-                    .filter_map(|arg| std::str::from_utf8(arg).ok())
-                    .find_map(client_kind_from_arg)
-                    .unwrap_or(CollaborationClientKind::Unknown)
-            },
-        );
-        (std::sync::OnceLock::from(process_executable(pid)), kind)
-    }
+    let kind = std::fs::read(format!("/proc/{pid}/cmdline")).ok().map_or(
+        CollaborationClientKind::Unknown,
+        |bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter_map(|arg| std::str::from_utf8(arg).ok())
+                .find_map(client_kind_from_arg)
+                .unwrap_or(CollaborationClientKind::Unknown)
+        },
+    );
     #[cfg(not(target_os = "linux"))]
-    {
-        let _ = pid;
-        (std::sync::OnceLock::new(), CollaborationClientKind::Unknown)
-    }
+    let kind = CollaborationClientKind::Unknown;
+    (process_executable(pid), kind)
 }
 
 /// The executable of `pid`, without spawning a process: `/proc/<pid>/exe` on
-/// Linux, a single-process query elsewhere. This used to be a `ps -o comm=`
-/// spawn on every IPC connection on macOS.
+/// Linux, a single-process query elsewhere. On macOS this used to be a
+/// `ps -o comm=` spawn on every IPC connection.
 pub(super) fn process_executable(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
     {
