@@ -476,7 +476,7 @@ extension AppModel {
         TendDaemonIdentity(
             bootID: localDaemonBootID,
             lacksBootID: localDaemonLacksBootID,
-            generation: fleetHosts.first(where: \.local)?.daemonGeneration,
+            generation: localDaemonGeneration,
             pid: localDaemonPID,
             replacements: daemonReplacements
         )

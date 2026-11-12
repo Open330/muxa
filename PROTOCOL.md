@@ -411,7 +411,9 @@ Response:
   characters, drawn once per daemon process image. It is the start identity
   `generation` is not: an external stop/start gets a new one even though
   `generation` is zero again. A self-reexec also draws a new one (alongside the
-  new `generation`). Clients compare it only for equality and MUST treat its
+  new `generation`). Successful `config_read` / `config_write` /
+  `config_launch_read` / `config_launch_write` responses carry the same
+  `boot_id`, naming the process that served the write. Clients compare it only for equality and MUST treat its
   absence as "unknown", since older daemons omit it.
 
 Capability tags currently advertised:

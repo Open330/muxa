@@ -197,12 +197,18 @@ final class AppModel: ObservableObject {
     @Published private(set) var askAgent = "claude"
     @Published private(set) var askEnabled: Bool?
     @Published private(set) var askConfigurationPendingReload = false
-    /// The boot id from the last successful `hello` — every refresh, so the
-    /// reconciliation loop and reconnects keep it current. Part of
-    /// `localDaemonIdentity`.
+    /// The boot id from the last successful `hello` — every refresh and
+    /// every Fleet stream (re)connect — or from the daemon that served the
+    /// last config write. Part of `localDaemonIdentity`.
     @Published private(set) var localDaemonBootID: String?
     /// The last successful `hello` carried no boot id (an older tendd).
     @Published private(set) var localDaemonLacksBootID = false
+    /// The generation from the same `hello` as `localDaemonBootID`.
+    @Published private(set) var localDaemonGeneration: UInt64?
+    /// Bumped whenever earlier identity evidence stops counting (a new
+    /// connection, a config write). A hello or pid lookup that began under an
+    /// older epoch is dropped: it may describe the daemon from before.
+    private var daemonIdentityEpoch: UInt64 = 0
     /// The pid of the process that owns tendd's socket; nil until known.
     /// Looked up only for a daemon without a boot id, after a connection or
     /// an observed disconnect. Part of `localDaemonIdentity`.
@@ -364,7 +370,9 @@ final class AppModel: ObservableObject {
         connectionState = .connecting
         localDaemonBootID = nil
         localDaemonLacksBootID = false
+        localDaemonGeneration = nil
         localDaemonPID = nil
+        daemonIdentityEpoch &+= 1
         daemonPIDLookupDue = true
         refreshTask = Task { [weak self] in
             guard let self else { return }
@@ -424,6 +432,7 @@ final class AppModel: ObservableObject {
     /// the process outright; without one the socket owner's pid stands in,
     /// looked up only when a connection or disconnect makes it stale.
     private func adoptDaemonHello(_ hello: TendDaemonHello) {
+        if localDaemonGeneration != hello.generation { localDaemonGeneration = hello.generation }
         if let bootID = hello.bootID {
             if localDaemonBootID != bootID { localDaemonBootID = bootID }
             if localDaemonLacksBootID { localDaemonLacksBootID = false }
@@ -453,9 +462,9 @@ final class AppModel: ObservableObject {
             guard let self else { return }
             repeat {
                 daemonPIDLookupAgain = false
-                let generation = connectionGeneration
+                let epoch = daemonIdentityEpoch
                 let owner = try? await DaemonSocketOwner.find(socketPath: client.socketPath)
-                if connectionGeneration == generation, localDaemonLacksBootID,
+                if daemonIdentityEpoch == epoch, localDaemonLacksBootID,
                    localDaemonPID != owner?.pid {
                     localDaemonPID = owner?.pid
                     TendConfigStore.shared.observeDaemon(localDaemonIdentity)
@@ -463,6 +472,36 @@ final class AppModel: ObservableObject {
             } while daemonPIDLookupAgain
             daemonPIDLookupTask = nil
         }
+    }
+
+    /// The daemon a just-finished config write must be anchored to — the
+    /// one whose restart applies it. Never the cached identity from before
+    /// the write: tendd may have been replaced since the last hello.
+    ///
+    /// A write answered with a boot id names its daemon outright. Without
+    /// one (an older tendd) a fresh hello and a fresh pid lookup stand in;
+    /// a restart racing them only anchors to the newer daemon, which keeps
+    /// the bar for one extra restart and never dismisses an unapplied save.
+    func daemonIdentityAfterWrite(servedBy bootID: String?) async -> TendDaemonIdentity {
+        daemonIdentityEpoch &+= 1
+        if let bootID {
+            let sameDaemon = localDaemonBootID == bootID
+            adoptDaemonHello(TendDaemonHello(
+                bootID: bootID,
+                generation: sameDaemon ? localDaemonGeneration : nil
+            ))
+            return localDaemonIdentity
+        }
+        let epoch = daemonIdentityEpoch
+        localDaemonBootID = nil
+        localDaemonLacksBootID = false
+        localDaemonGeneration = nil
+        localDaemonPID = nil
+        daemonPIDLookupDue = true
+        if let hello = try? await client.hello(), daemonIdentityEpoch == epoch {
+            adoptDaemonHello(hello)
+        }
+        return localDaemonIdentity
     }
 
     func refresh() async {
@@ -474,8 +513,9 @@ final class AppModel: ObservableObject {
         refreshInFlight = true
         defer { refreshInFlight = false }
         do {
+            let epoch = daemonIdentityEpoch
             let hello = try await client.hello()
-            if generation == nil || connectionGeneration == generation {
+            if daemonIdentityEpoch == epoch, generation == nil || connectionGeneration == generation {
                 adoptDaemonHello(hello)
             }
             async let sessionsRequest = client.listSessions()
@@ -577,19 +617,21 @@ final class AppModel: ObservableObject {
     /// gaps without returning to a high-frequency poll.
     private func runFleetSubscription(ifGeneration generation: UInt64) async {
         guard await client.supports(TendIPCClient.fleetSubscribeCapability) else { return }
-        var reconnecting = false
         while !Task.isCancelled, connectionGeneration == generation {
             do {
-                let updates = try await client.fleetUpdates()
+                // The stream's own hello says which daemon serves the socket
+                // as soon as each (re)connect is acknowledged, even when
+                // that daemon then stays quiet.
+                let epoch = daemonIdentityEpoch
+                let updates = try await client.fleetUpdates(onReady: { [weak self] hello in
+                    Task { @MainActor [weak self] in
+                        guard let self, connectionGeneration == generation,
+                              daemonIdentityEpoch == epoch else { return }
+                        adoptDaemonHello(hello)
+                    }
+                })
                 for try await update in updates {
                     guard !Task.isCancelled, connectionGeneration == generation else { return }
-                    if reconnecting {
-                        // The stream is back, possibly on a different
-                        // daemon: hello again now rather than at the next
-                        // reconciliation tick, so its boot id is current.
-                        reconnecting = false
-                        Task { [weak self] in await self?.refresh(ifGeneration: generation) }
-                    }
                     if update.mailboxRevision != nil {
                         if mailboxRevisions[update.host] != update.mailboxRevision {
                             mailboxRevisions[update.host] = update.mailboxRevision
@@ -606,7 +648,6 @@ final class AppModel: ObservableObject {
                 // The stream broke: the daemon may have been replaced
                 // without a refresh ever failing.
                 daemonPIDLookupDue = true
-                reconnecting = true
                 TendLog.app.warning(
                     "Fleet invalidation stream reconnecting: \(error.localizedDescription, privacy: .public)"
                 )

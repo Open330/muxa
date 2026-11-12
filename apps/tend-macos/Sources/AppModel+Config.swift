@@ -488,6 +488,8 @@ final class TendConfigStore: ObservableObject {
     /// A saved change that waits for tendd to restart; drives the Settings
     /// window's restart bar.
     @Published private(set) var restartNotice = TendRestartNotice()
+    /// The boot id of the daemon that served the last successful write.
+    private var lastWriteServedBy: String?
 
     /// Lets the restart bar learn what was unknown when a change was saved.
     func observeDaemon(_ current: TendDaemonIdentity) {
@@ -566,8 +568,14 @@ final class TendConfigStore: ObservableObject {
     @discardableResult
     func save(model: AppModel) async -> Bool {
         let saved = await save(client: model.client.makeConfigClient())
-        if saved { restartNotice.noteSaved(under: model.localDaemonIdentity) }
+        if saved { await noteSaved(model: model) }
         return saved
+    }
+
+    /// Anchors the pending restart to the daemon that served the last write.
+    private func noteSaved(model: AppModel) async {
+        let servedBy = lastWriteServedBy
+        restartNotice.noteSaved(under: await model.daemonIdentityAfterWrite(servedBy: servedBy))
     }
 
     @discardableResult
@@ -596,7 +604,7 @@ final class TendConfigStore: ObservableObject {
         // A conflict leaves `document` holding the file as it now stands, so
         // the same edits re-applied land on top of whatever changed.
         retryEdits = wrote || conflictMessage == nil ? [] : edits
-        if wrote { restartNotice.noteSaved(under: model.localDaemonIdentity) }
+        if wrote { await noteSaved(model: model) }
         return wrote
     }
 
@@ -625,11 +633,14 @@ final class TendConfigStore: ObservableObject {
         saveError = nil
         conflictMessage = nil
         status = nil
+        lastWriteServedBy = nil
         do {
-            let saved = try await client.write(
+            let written = try await client.writeServed(
                 text: text,
                 expectedText: loaded.text
             )
+            let saved = written.document
+            lastWriteServedBy = written.servedBy
             document = saved
             if draft == startingDraft { draft = saved.text }
             launchNeedsReload = true

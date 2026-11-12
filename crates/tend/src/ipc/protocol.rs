@@ -1039,9 +1039,10 @@ pub(super) const CAPABILITIES: &[&str] = &[
     DAEMON_BOOT_ID_CAPABILITY,
 ];
 
-/// Advertised by a daemon whose `hello` carries [`daemon_boot_id`]. A client
-/// that sees it may treat a changed `boot_id` as proof of a different daemon
-/// process; without it, the client must fall back to weaker evidence.
+/// Advertised by a daemon whose `hello` and successful config read/write
+/// responses carry [`daemon_boot_id`]. A client that sees it may treat a
+/// changed `boot_id` as proof of a different daemon process; without it, the
+/// client must fall back to weaker evidence.
 pub const DAEMON_BOOT_ID_CAPABILITY: &str = "daemon_boot_id_v1";
 
 /// A random identity drawn once per daemon process image.
@@ -1121,8 +1122,9 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     /// Per-process daemon identity from [`daemon_boot_id`], present on every
-    /// `hello` from a daemon advertising [`DAEMON_BOOT_ID_CAPABILITY`]. Unlike
-    /// `generation` it differs across an external stop/start.
+    /// `hello` and successful config read/write from a daemon advertising
+    /// [`DAEMON_BOOT_ID_CAPABILITY`]. Unlike `generation` it differs across an
+    /// external stop/start.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_id: Option<&'static str>,
     /// With `turn_evidence`.
@@ -1598,9 +1600,13 @@ impl Response {
         response.ask_conversation = Some(conversation);
         response
     }
+    /// Every successful config read or write names the daemon process that
+    /// served it, so a client can anchor "saved, applies on restart" to the
+    /// daemon that actually took the write rather than to a cached hello.
     pub(super) fn with_config(document: crate::config_file::ConfigDocument) -> Self {
         let mut response = Self::ok();
         response.config = Some(document);
+        response.boot_id = Some(daemon_boot_id());
         response
     }
 

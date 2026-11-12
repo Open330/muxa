@@ -193,72 +193,156 @@ struct DaemonSocketOwner: Equatable, Sendable {
     }
 }
 
-/// One subprocess run with a deadline: on timeout or cancellation the child
-/// is terminated rather than left to hold the caller (and its pipe) forever.
+/// One subprocess run with a deadline. On timeout or cancellation the child's
+/// process group gets SIGTERM, then SIGKILL after a short grace, and `run`
+/// returns only once the child has been reaped (or the reap timeout passed)
+/// and the stdout reader has stopped — a child that ignores SIGTERM can hold
+/// neither the caller nor a reader thread.
 final class TendBoundedSubprocess: @unchecked Sendable {
     struct TimedOut: LocalizedError {
         let timeout: TimeInterval
         var errorDescription: String? { "subprocess did not finish within \(timeout)s" }
     }
 
+    /// How long a signalled child has to exit before SIGKILL.
+    static let terminationGrace: TimeInterval = 0.3
+    /// How long to wait for the reap after SIGKILL.
+    static let reapTimeout: TimeInterval = 2
+
     private let lock = NSLock()
     private let process: Process
+    /// Signalled on exit and on cancellation; waiters re-check the flags.
+    private let wake = DispatchSemaphore(value: 0)
     private var cancelled = false
+    private var exited = false
     private var output = Data()
+    private var readerStopped = false
 
     init(_ process: Process) {
         self.process = process
     }
 
-    /// Terminates the child if it is running; a later `run` refuses.
+    /// Stops the child (if running) and makes `run` throw
+    /// `CancellationError`; a later `run` refuses to start.
     func cancel() {
-        lock.lock()
-        cancelled = true
-        lock.unlock()
-        if process.isRunning { process.terminate() }
+        lock.withLock { cancelled = true }
+        wake.signal()
     }
 
+    /// Whether the child has been reaped.
+    var hasExited: Bool { lock.withLock { exited } }
+    /// Whether the stdout reader has stopped for good.
+    var readerFinished: Bool { lock.withLock { readerStopped } }
+
     /// Runs the child to exit and returns its stdout. Blocks the calling
-    /// thread for at most `timeout` (plus a short drain after a kill).
+    /// thread for at most `timeout` plus the grace and reap bounds.
     func run(timeout: TimeInterval) throws -> Data {
         let pipe = Pipe()
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         process.standardInput = FileHandle.nullDevice
-        let exited = DispatchSemaphore(value: 0)
-        process.terminationHandler = { _ in exited.signal() }
-        lock.lock()
-        if cancelled {
-            lock.unlock()
-            throw CancellationError()
+        process.terminationHandler = { [self] _ in
+            lock.withLock { exited = true }
+            wake.signal()
         }
-        do {
+        try lock.withLock {
+            if cancelled { throw CancellationError() }
             try process.run()
-        } catch {
-            lock.unlock()
-            throw error
         }
-        lock.unlock()
-        // Drain concurrently: a child blocked on a full pipe never exits.
-        let drained = DispatchSemaphore(value: 0)
-        let reader = pipe.fileHandleForReading
-        DispatchQueue.global(qos: .userInitiated).async { [self] in
-            let data = reader.readDataToEndOfFile()
-            lock.lock()
-            output = data
-            lock.unlock()
-            drained.signal()
+        // Foundation starts the child as its own process-group leader, so
+        // signalling the group also reaches anything it spawned.
+        let pid = process.processIdentifier
+        let ownsGroup = getpgid(pid) == pid
+        let reader = startReading(pipe.fileHandleForReading)
+
+        let deadline = DispatchTime.now() + timeout
+        var failure: Error?
+        while failure == nil, !hasExited {
+            if lock.withLock({ cancelled }) {
+                failure = CancellationError()
+            } else if wake.wait(timeout: deadline) == .timedOut, !hasExited {
+                failure = TimedOut(timeout: timeout)
+            }
         }
-        if exited.wait(timeout: .now() + timeout) == .timedOut {
-            process.terminate()
-            _ = drained.wait(timeout: .now() + 1)
-            throw TimedOut(timeout: timeout)
+        if let failure {
+            stop(pid: pid, ownsGroup: ownsGroup)
+            reader.finish()
+            throw failure
         }
-        _ = drained.wait(timeout: .now() + 1)
-        lock.lock()
-        defer { lock.unlock() }
-        if cancelled { throw CancellationError() }
-        return output
+        // Exited: take what is buffered, but never wait on a straggler that
+        // inherited the pipe.
+        _ = reader.endOfFile.wait(timeout: .now() + 1)
+        reader.finish()
+        if lock.withLock({ cancelled }) { throw CancellationError() }
+        return lock.withLock { output }
+    }
+
+    private func stop(pid: pid_t, ownsGroup: Bool) {
+        func send(_ signal: Int32) {
+            if ownsGroup {
+                Darwin.kill(-pid, signal)
+            } else if !hasExited {
+                Darwin.kill(pid, signal)
+            }
+        }
+        send(SIGTERM)
+        let exitedGracefully = waitForExit(Self.terminationGrace)
+        // Even after a graceful exit, a group member may be ignoring SIGTERM.
+        if !exitedGracefully || ownsGroup { send(SIGKILL) }
+        if !exitedGracefully { _ = waitForExit(Self.reapTimeout) }
+    }
+
+    private func waitForExit(_ timeout: TimeInterval) -> Bool {
+        let deadline = DispatchTime.now() + timeout
+        while !hasExited {
+            if wake.wait(timeout: deadline) == .timedOut { return hasExited }
+        }
+        return true
+    }
+
+    private final class Reader: @unchecked Sendable {
+        let source: DispatchSourceRead
+        let handle: FileHandle
+        let endOfFile = DispatchSemaphore(value: 0)
+        let cancelled = DispatchSemaphore(value: 0)
+        init(source: DispatchSourceRead, handle: FileHandle) {
+            self.source = source
+            self.handle = handle
+        }
+        /// Cancels the source, waits until no event handler can still be
+        /// running, then closes the descriptor.
+        func finish() {
+            source.cancel()
+            cancelled.wait()
+            try? handle.close()
+        }
+    }
+
+    /// Reads without ever blocking: a dispatch source fires only when data
+    /// or end-of-file is ready, so stopping it never waits on the child.
+    private func startReading(_ handle: FileHandle) -> Reader {
+        let descriptor = handle.fileDescriptor
+        let source = DispatchSource.makeReadSource(
+            fileDescriptor: descriptor,
+            queue: DispatchQueue(label: "dev.tend.mac.bounded-subprocess", qos: .userInitiated)
+        )
+        let reader = Reader(source: source, handle: handle)
+        source.setEventHandler { [self, weak source] in
+            var buffer = [UInt8](repeating: 0, count: 16_384)
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                lock.withLock { output.append(contentsOf: buffer[0..<count]) }
+            } else if count == 0 || (errno != EAGAIN && errno != EINTR) {
+                reader.endOfFile.signal()
+                source?.cancel()
+            }
+        }
+        source.setCancelHandler { [self] in
+            lock.withLock { readerStopped = true }
+            reader.cancelled.signal()
+        }
+        source.resume()
+        return reader
     }
 }
 

@@ -981,6 +981,8 @@ private struct TendIPCResponse: Decodable, Sendable {
     /// `hello`'s per-process daemon identity (`daemon_boot_id_v1`); absent
     /// from an older tendd.
     let bootID: String?
+    /// `hello`'s self-reexec count, present with the `restart` capability.
+    let generation: UInt64?
     let agents: [TendAgent]?
     let sessions: [TendSession]?
     let session: TendSession?
@@ -1008,7 +1010,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     let swapAccounts: [TendProviderCandidates]?
 
     enum CodingKeys: String, CodingKey {
-        case ok, error, capabilities, agents, sessions, session, output, capture, fleet, swap
+        case ok, error, capabilities, agents, sessions, session, output, capture, fleet, swap, generation
         case minProtocol = "min_protocol"
         case maxProtocol = "max_protocol"
         case bootID = "boot_id"
@@ -1151,6 +1153,17 @@ struct TendDaemonHello: Equatable, Sendable {
     /// Random per-process id; nil from a tendd older than
     /// `daemon_boot_id_v1`, which the app then tells apart by socket owner pid.
     var bootID: String?
+    /// Self-reexec count; nil from a daemon without the `restart` capability.
+    var generation: UInt64?
+
+    init(bootID: String?, generation: UInt64?) {
+        self.bootID = bootID.flatMap { $0.isEmpty ? nil : $0 }
+        self.generation = generation
+    }
+
+    fileprivate init(_ response: TendIPCResponse) {
+        self.init(bootID: response.bootID, generation: response.generation)
+    }
 }
 
 actor TendIPCClient {
@@ -1240,14 +1253,15 @@ actor TendIPCClient {
             )
         }
         capabilities = Set(response.capabilities ?? [])
-        daemonBootID = response.bootID.flatMap { $0.isEmpty ? nil : $0 }
+        let identity = TendDaemonHello(response)
+        daemonBootID = identity.bootID
         try requireNativeSessionCapabilities()
         guard capabilities.contains(Self.workControlCapability) else {
             throw TendIPCError.server(
                 "tendd does not support native Work control; update tend or choose Use Bundled tendd"
             )
         }
-        return TendDaemonHello(bootID: daemonBootID)
+        return identity
     }
 
     func listSessions() async throws -> [TendSession] {
@@ -2013,7 +2027,12 @@ actor TendIPCClient {
         return output
     }
 
-    func fleetUpdates() throws -> AsyncThrowingStream<TendFleetUpdate, Error> {
+    /// `onReady` receives the stream connection's own `hello` once the
+    /// subscription is acknowledged — on every (re)connect, so a quiet daemon
+    /// still reports which process now serves the socket.
+    func fleetUpdates(
+        onReady: (@Sendable (TendDaemonHello) -> Void)? = nil
+    ) throws -> AsyncThrowingStream<TendFleetUpdate, Error> {
         guard capabilities.contains(Self.fleetSubscribeCapability) else {
             throw TendIPCError.server(
                 "tendd does not support host invalidation subscriptions; update tend and restart tendd"
@@ -2034,6 +2053,7 @@ actor TendIPCClient {
                 path: path,
                 hello: hello,
                 request: subscribe,
+                onReady: onReady,
                 onLine: { data in
                     continuation.yield(try JSONDecoder().decode(TendFleetUpdate.self, from: data))
                 },
@@ -2314,6 +2334,7 @@ enum UnixSocket {
         path: String,
         hello: Data,
         request: Data,
+        onReady: (@Sendable (TendDaemonHello) -> Void)? = nil,
         onLine: @escaping @Sendable (Data) throws -> Void,
         onFinish: @escaping @Sendable (Error?) -> Void
     ) -> UnixSocketSubscription {
@@ -2321,6 +2342,7 @@ enum UnixSocket {
             path: path,
             hello: hello,
             request: request,
+            onReady: onReady,
             onLine: onLine,
             onFinish: onFinish
         )
@@ -2435,6 +2457,7 @@ final class UnixSocketSubscription: @unchecked Sendable {
     private let path: String
     private let hello: Data
     private let request: Data
+    private let onReady: (@Sendable (TendDaemonHello) -> Void)?
     private let onLine: @Sendable (Data) throws -> Void
     private let onFinish: @Sendable (Error?) -> Void
     private let queue = DispatchQueue(label: "dev.tend.mac.ipc-fleet-stream", qos: .utility)
@@ -2446,12 +2469,14 @@ final class UnixSocketSubscription: @unchecked Sendable {
         path: String,
         hello: Data,
         request: Data,
+        onReady: (@Sendable (TendDaemonHello) -> Void)? = nil,
         onLine: @escaping @Sendable (Data) throws -> Void,
         onFinish: @escaping @Sendable (Error?) -> Void
     ) {
         self.path = path
         self.hello = hello
         self.request = request
+        self.onReady = onReady
         self.onLine = onLine
         self.onFinish = onFinish
     }
@@ -2491,9 +2516,10 @@ final class UnixSocketSubscription: @unchecked Sendable {
 
             var buffered = Data()
             try UnixSocket.writeLine(descriptor: socket, payload: hello)
-            try validateAck(UnixSocket.readLine(descriptor: socket, buffered: &buffered))
+            let helloAck = try validateAck(UnixSocket.readLine(descriptor: socket, buffered: &buffered))
             try UnixSocket.writeLine(descriptor: socket, payload: request)
             try validateAck(UnixSocket.readLine(descriptor: socket, buffered: &buffered))
+            onReady?(TendDaemonHello(helloAck))
 
             while !isCancelled {
                 let line = try UnixSocket.readLine(descriptor: socket, buffered: &buffered)
@@ -2512,11 +2538,13 @@ final class UnixSocketSubscription: @unchecked Sendable {
         return cancelled
     }
 
-    private func validateAck(_ data: Data) throws {
+    @discardableResult
+    private func validateAck(_ data: Data) throws -> TendIPCResponse {
         let response = try JSONDecoder().decode(TendIPCResponse.self, from: data)
         guard response.ok else {
             throw TendIPCError.server(response.error ?? "tendd rejected the subscription")
         }
+        return response
     }
 }
 

@@ -1996,6 +1996,19 @@ async fn config_launch_requests_roundtrip_and_reject_stale_writes() {
         .as_str()
         .unwrap()
         .contains("# preserve"));
+    // The write names the process that served it (`daemon_boot_id_v1`).
+    assert_eq!(read["boot_id"], daemon_boot_id());
+    assert_eq!(written["boot_id"], daemon_boot_id());
+    let text = written["config"]["text"].clone();
+    let raw = client
+        .call(&serde_json::json!({
+            "protocol": PROTOCOL_VERSION, "kind": "config_write",
+            "text": text, "expected_text": text,
+        }))
+        .await
+        .unwrap();
+    assert_eq!(raw["ok"], true);
+    assert_eq!(raw["boot_id"], daemon_boot_id());
     let stale = client.call(&request).await.unwrap();
     assert_eq!(stale["ok"], false);
     assert!(stale["error"].as_str().unwrap().contains("changed"));
