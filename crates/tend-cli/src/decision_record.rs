@@ -244,8 +244,10 @@ pub(crate) async fn call(client: &tend::ipc::Client, args: Value) -> Result<Valu
         .into_iter()
         .map(|sha| Value::String(format!("commit:{}", sha.trim())))
         .collect::<Vec<_>>();
-    if let Some(Value::Array(rest)) = args.remove("evidence") {
-        evidence.extend(rest);
+    match args.remove("evidence") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(rest)) => evidence.extend(rest),
+        Some(_) => return Err("evidence must be an array".into()),
     }
     if !evidence.is_empty() {
         args.insert("evidence".into(), Value::Array(evidence));
@@ -281,20 +283,35 @@ pub(crate) async fn call(client: &tend::ipc::Client, args: Value) -> Result<Valu
     }))
 }
 
-/// The caller's managed Work alias when its tmux pane carries the marks
-/// `tend work up` sets, else its session.
+/// The multiplexer server and bare pane id the daemon resolved for the
+/// caller. `None` when either is unknown: the marks are then never read
+/// from whatever server happens to be ambient, where the same `%N` can
+/// name another pane.
+fn caller_pane(me: &tend::collaboration::Participant) -> Option<(tend::BackendEndpoint, String)> {
+    let host = tend::backend::pane_id_host_kind(&me.pane)
+        .filter(|host| crate::mux_control::supported(*host))?;
+    let socket = me
+        .socket
+        .clone()
+        .filter(|socket| !socket.trim().is_empty())?;
+    let pane = me.pane.strip_prefix("rmux:").unwrap_or(&me.pane).to_owned();
+    Some((tend::BackendEndpoint { host, socket }, pane))
+}
+
+/// The caller's managed Work alias when its pane, on its own server,
+/// carries the marks `tend work up` sets, else its session.
 async fn own_target(me: &tend::collaboration::Participant) -> tend::review::ReviewTarget {
     let session = tend::review::ReviewTarget::Session {
         provider: Some(me.agent_kind.to_string()),
         session_id: me.agent_session_id.clone(),
     };
-    let tmux = me.room.host == "tmux" && me.pane.starts_with('%');
-    if !tmux {
+    let Some((endpoint, pane)) = caller_pane(me) else {
         return session;
-    }
-    let pane = me.pane.clone();
+    };
     let pipeline = tokio::task::spawn_blocking(move || {
-        crate::tmux_work::pane_pipeline(&pane, None, None).ok()
+        crate::mux_control::with_endpoint(Some(endpoint), || {
+            crate::tmux_work::pane_pipeline(&pane, None, None).ok()
+        })
     })
     .await
     .ok()
@@ -368,6 +385,28 @@ mod tests {
         assert!(!has_decision_fields(&object(
             json!({"body": "x", "options": null})
         )));
+    }
+
+    fn participant(pane: &str, socket: Option<&str>) -> tend::collaboration::Participant {
+        serde_json::from_value(json!({
+            "agent_kind": "codex", "agent_session_id": "s", "pane": pane, "socket": socket,
+            "room": {"host": "tmux", "socket": socket, "window_id": "@1"},
+            "state": "idle", "launch_purpose": "worker"
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn work_marks_are_read_only_from_the_callers_own_server() {
+        let (endpoint, pane) = caller_pane(&participant("%7", Some("/tmp/b.sock"))).unwrap();
+        assert_eq!(endpoint.host, tend::HostKind::Tmux);
+        assert_eq!(endpoint.socket, "/tmp/b.sock");
+        assert_eq!(pane, "%7");
+        let (endpoint, pane) = caller_pane(&participant("rmux:%7", Some("/tmp/r.sock"))).unwrap();
+        assert_eq!(endpoint.host, tend::HostKind::Rmux);
+        assert_eq!(pane, "%7");
+        // No recorded server: never fall back to the ambient one.
+        assert!(caller_pane(&participant("%7", None)).is_none());
     }
 
     #[tokio::test]

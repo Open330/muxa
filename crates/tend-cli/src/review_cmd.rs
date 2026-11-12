@@ -162,10 +162,12 @@ impl ResultRecordArgs {
             },
             summary,
             anchor: None,
-            idempotency_key: Some(result_key(&format!(
-                "{}/{}/{alias}/{generation}",
-                identity.workspace_id, identity.work_id
-            ))),
+            idempotency_key: Some(result_key(
+                &identity.workspace_id,
+                &identity.work_id,
+                alias,
+                generation,
+            )),
             requested_by: ReviewActor {
                 kind: ActorKind::Agent,
                 label: Some(alias.to_owned()),
@@ -176,10 +178,12 @@ impl ResultRecordArgs {
 }
 
 /// A bounded idempotency key for a completion: `work-done:` and a digest
-/// of the name, since Work names have no length limit of their own.
-fn result_key(name: &str) -> String {
+/// of the JSON tuple, so no component can shift into another (names may
+/// contain `/`) and long Work names stay within the key limit.
+fn result_key(workspace: &str, work: &str, alias: &str, generation: u64) -> String {
     use sha2::Digest as _;
-    let digest = sha2::Sha256::digest(name.as_bytes());
+    let tuple = serde_json::to_string(&(workspace, work, alias, generation)).unwrap_or_default();
+    let digest = sha2::Sha256::digest(tuple.as_bytes());
     let mut key = String::from("work-done:");
     for byte in &digest[..16] {
         let _ = write!(key, "{byte:02x}");
@@ -693,6 +697,11 @@ mod tests {
         assert_eq!(
             describe_target(&first.target),
             "work tend/storage @impl gen 3"
+        );
+        assert_ne!(
+            result_key("tend", "STORAGE/1", "impl", 3),
+            result_key("tend", "STORAGE", "1/impl", 3),
+            "components cannot shift into each other"
         );
         let decision = first.decision.unwrap();
         assert!(matches!(&decision.evidence[0], Evidence::Commit { sha, .. } if sha == "abc123"));

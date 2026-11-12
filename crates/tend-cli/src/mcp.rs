@@ -7287,16 +7287,16 @@ mod tests {
             filed["record"]["decision"]["evidence"][0],
             json!({"kind":"commit","sha":"abc123"})
         );
-        let refused = dispatch(
-            &client,
-            &tool(
-                "tend_file_result",
-                json!({"summary":"x", "target":"someone"}),
-            ),
-        )
-        .await
-        .unwrap();
-        assert_eq!(refused["result"]["isError"], true);
+        for bad in [
+            json!({"summary":"x", "target":"someone"}),
+            json!({"summary":"x", "evidence":"test-fail:cargo test"}),
+            json!({"summary":"x", "evidence":{"kind":"path","path":"a"}}),
+        ] {
+            let refused = dispatch(&client, &tool("tend_file_result", bad.clone()))
+                .await
+                .unwrap();
+            assert_eq!(refused["result"]["isError"], true, "{bad}");
+        }
 
         shutdown.send(()).unwrap();
         daemon.await.unwrap();
