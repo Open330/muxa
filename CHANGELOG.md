@@ -135,6 +135,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without replying, the request is marked `peer_interrupted` with reason
   `reply_overdue`, the sender's wait returns, and a recovery item reaches you
   if the sender does not act.
+- A peer wake that was typed into an idle agent but never submitted (an
+  unsent draft, a swallowed Enter) is no longer assumed delivered. After two
+  minutes with no claim and nothing recorded on the agent since the paste (no
+  prompt, state change or response), tendd re-delivers it once;
+  if that is not submitted either, the request is marked `peer_interrupted`
+  with reason `wake_unsubmitted` and a recovery item asks you to check the
+  pane.
 
 - A prompt sent from the dashboard or through Fleet while a peer's wake
   message was being typed into the same agent no longer merges with it. Both

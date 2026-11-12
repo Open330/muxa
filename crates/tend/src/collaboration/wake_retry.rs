@@ -1,0 +1,591 @@
+//! Re-delivery of a mailbox wake that was typed but never acted on.
+//!
+//! The waker marks a request notified once the host accepted the paste and the
+//! separate Enter. That proves transport, not that the agent ever took a turn:
+//! a draft in the composer or an Enter the terminal swallowed leaves the
+//! request `Queued` with `notified_at` set, and nothing wakes the recipient
+//! again.
+//!
+//! The waker only types into an Idle recipient, so a wake that started a turn
+//! moves the recipient's registry row: a prompt (`last_prompt_at`), a state
+//! change (`state_entered_at`, e.g. Working from a tool hook) or a turn's
+//! response (`last_response_at`). Each attempt records when it *began*, before
+//! anything was typed. A request still unclaimed [`WAKE_SUBMIT_GRACE`] later,
+//! whose recipient's row is Idle and shows none of those three after that
+//! instant, never started a turn: the row has been Idle and untouched since
+//! before the paste. Any recorded movement, including an Idle that a timeout
+//! inferred, counts as "something happened" and suppresses the retry, so a
+//! lost `PromptSubmitted` hook alone cannot cause a second paste.
+//!
+//! Such a request gets exactly one more delivery. If that one also leaves the
+//! row untouched, nothing is typed again: reconciliation raises the
+//! `wake_unsubmitted` interruption (`recovery.rs`). `notified_at` is never
+//! cleared, so the request keeps its delivery history for missing-binding
+//! recovery and is never treated as undelivered work to hand to a successor.
+use super::RequestStatus;
+use super::{recovery::exact_agent, CollaborationError, CollaborationRequest, CollaborationStore};
+use crate::{Agent, AgentState};
+use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
+
+/// How long a delivered wake may leave its recipient untouched before it is
+/// treated as unsubmitted. A submitted wake moves the row within seconds.
+pub const WAKE_SUBMIT_GRACE: time::Duration = time::Duration::minutes(2);
+/// Mailbox wakes typed for one request: the first and one re-delivery.
+pub const MAX_WAKE_ATTEMPTS: u32 = 2;
+
+/// Mailbox wake attempts for one request, kept for the unsubmitted check.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WakeRetry {
+    /// When the latest attempt began, before anything was typed.
+    #[serde(with = "time::serde::rfc3339")]
+    pub attempt_started_at: OffsetDateTime,
+    /// Attempts typed so far.
+    pub attempts: u32,
+    /// The previous attempt left the recipient untouched; the next waker
+    /// pass types it once more.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub redeliver: bool,
+}
+
+/// The latest wake attempt for `request` is [`WAKE_SUBMIT_GRACE`] old, the
+/// request is still unclaimed, and the recipient's exact row is Idle and has
+/// recorded no prompt, state change or response since the attempt began.
+pub(super) fn wake_unsubmitted(
+    request: &CollaborationRequest,
+    agent: Option<&Agent>,
+    now: OffsetDateTime,
+) -> bool {
+    let (Some(retry), Some(agent)) = (request.wake_retry.as_ref(), agent) else {
+        return false;
+    };
+    let started = retry.attempt_started_at;
+    still_unclaimed(request)
+        && !retry.redeliver
+        && now - started >= WAKE_SUBMIT_GRACE
+        && untouched_since(agent, started)
+}
+
+fn still_unclaimed(request: &CollaborationRequest) -> bool {
+    request.status == RequestStatus::Queued
+        && request.claimed_at.is_none()
+        && request.wake_delivery.is_none()
+        && request.notified_at.is_some()
+        && !request.to.console
+}
+
+/// The row is Idle and recorded nothing since `started`: no prompt, no state
+/// change, no response, and no activity-bearing hook at all
+/// (`last_activity_at` covers a response-less `Stop`, tool and notification
+/// hooks, and daemon observations such as a timeout-inferred Idle; status
+/// line heartbeats do not move it).
+fn untouched_since(agent: &Agent, started: OffsetDateTime) -> bool {
+    let untouched = |at: Option<OffsetDateTime>| at.is_none_or(|at| at <= started);
+    agent.state == AgentState::Idle
+        && agent.state_entered_at <= started
+        && agent.last_activity_at <= started
+        && untouched(agent.last_prompt_at)
+        && untouched(agent.last_response_at)
+}
+
+/// The final attempt was typed and also left the recipient untouched.
+pub(super) fn wake_exhausted_unsubmitted(
+    request: &CollaborationRequest,
+    agent: Option<&Agent>,
+    now: OffsetDateTime,
+) -> bool {
+    request
+        .wake_retry
+        .as_ref()
+        .is_some_and(|retry| retry.attempts >= MAX_WAKE_ATTEMPTS)
+        && wake_unsubmitted(request, agent, now)
+}
+
+impl CollaborationStore {
+    /// Record a mailbox wake typed for `request_id`, whose attempt began at
+    /// `started_at` (before the paste). The first attempt also sets
+    /// `notified_at`, as [`Self::mark_notified`] does; a re-delivery keeps it.
+    pub async fn mark_wake_notified(
+        &self,
+        request_id: &str,
+        started_at: OffsetDateTime,
+    ) -> Result<(), CollaborationError> {
+        {
+            let _transaction = self.transaction_lock.lock().await;
+            let redelivery = {
+                let mut requests = self.requests.write().await;
+                requests.get_mut(request_id).and_then(|request| {
+                    request.notified_at?;
+                    let retry = request.wake_retry.as_mut()?;
+                    if !retry.redeliver {
+                        return None;
+                    }
+                    retry.redeliver = false;
+                    retry.attempts += 1;
+                    retry.attempt_started_at = started_at;
+                    Some(request.clone())
+                })
+            };
+            if let Some(row) = redelivery {
+                // Persisted under the transaction lock, so no newer claim or
+                // reply can be overwritten by this row.
+                let result = self.persist_requests(std::slice::from_ref(&row));
+                self.publish_change();
+                return result;
+            }
+        }
+        self.mark_notified(request_id).await?;
+        let _transaction = self.transaction_lock.lock().await;
+        let row = {
+            let mut requests = self.requests.write().await;
+            requests.get_mut(request_id).and_then(|request| {
+                (request.status == RequestStatus::Queued && request.wake_retry.is_none()).then(
+                    || {
+                        request.wake_retry = Some(WakeRetry {
+                            attempt_started_at: started_at,
+                            attempts: 1,
+                            redeliver: false,
+                        });
+                        request.clone()
+                    },
+                )
+            })
+        };
+        if let Some(row) = row {
+            self.persist_requests(std::slice::from_ref(&row))?;
+        }
+        Ok(())
+    }
+
+    /// Re-check a scheduled re-delivery against the recipient's row read just
+    /// before typing. Anything recorded since the original attempt began, or
+    /// a claim, cancels it (persisted), and the caller types nothing.
+    pub async fn confirm_redelivery(
+        &self,
+        request_id: &str,
+        agent: Option<&Agent>,
+    ) -> Result<bool, CollaborationError> {
+        let _transaction = self.transaction_lock.lock().await;
+        let mut requests = self.requests.write().await;
+        let Some(request) = requests.get_mut(request_id) else {
+            return Ok(false);
+        };
+        let Some(retry) = request.wake_retry.as_ref() else {
+            return Ok(false);
+        };
+        if !retry.redeliver {
+            return Ok(false);
+        }
+        let started = retry.attempt_started_at;
+        if still_unclaimed(request) && agent.is_some_and(|agent| untouched_since(agent, started)) {
+            return Ok(true);
+        }
+        if let Some(retry) = request.wake_retry.as_mut() {
+            retry.redeliver = false;
+        }
+        let row = request.clone();
+        drop(requests);
+        self.persist_requests(std::slice::from_ref(&row))?;
+        tracing::info!(
+            request_id,
+            "recipient moved after an unsubmitted wake was scheduled; not re-delivering",
+        );
+        Ok(false)
+    }
+
+    /// Schedule the one re-delivery of each wake that left its recipient
+    /// untouched (see the module docs). Returns how many were scheduled.
+    pub async fn rearm_unsubmitted_wakes(
+        &self,
+        agents: &[Agent],
+    ) -> Result<usize, CollaborationError> {
+        self.ensure_enabled()?;
+        let _transaction = self.transaction_lock.lock().await;
+        let now = OffsetDateTime::now_utc();
+        let rows: Vec<_> = {
+            let requests = self.requests.read().await;
+            requests
+                .values()
+                .filter(|request| {
+                    request
+                        .wake_retry
+                        .as_ref()
+                        .is_some_and(|retry| retry.attempts < MAX_WAKE_ATTEMPTS)
+                        && wake_unsubmitted(request, exact_agent(&request.to, agents), now)
+                })
+                .map(|request| {
+                    let mut row = request.clone();
+                    if let Some(retry) = row.wake_retry.as_mut() {
+                        retry.redeliver = true;
+                    }
+                    row
+                })
+                .collect()
+        };
+        if !rows.is_empty() {
+            for row in &rows {
+                tracing::info!(
+                    request_id = row.id,
+                    pane = row.to.pane,
+                    "collaboration wake left its idle recipient untouched; re-delivering once",
+                );
+            }
+            self.commit_request_rows(&rows).await?;
+            self.publish_change();
+        }
+        Ok(rows.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::collaboration::turn_offer::TurnBoundaryEvent;
+    use crate::collaboration::{CollaborationOptions, NewRequest, Participant};
+    use crate::event::{AgentEvent, AgentId};
+    use crate::AgentKind;
+
+    async fn actor(pane: &str, session: &str) -> (Participant, Agent) {
+        let store = crate::state::Store::shared();
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    kind: AgentKind::Codex,
+                    session_id: session.into(),
+                    surface: None,
+                    pane: Some(pane.into()),
+                    tmux_socket: Some("default".into()),
+                    cwd: None,
+                },
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        let mut agent = store.snapshot().await.remove(0);
+        agent.state = AgentState::Idle;
+        agent.last_prompt_at = None;
+        agent.last_response_at = None;
+        agent.state_entered_at = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        agent.last_activity_at = agent.state_entered_at;
+        let participant = serde_json::from_value(serde_json::json!({
+            "launch_purpose":"worker", "agent_kind":"codex", "agent_session_id":session,
+            "pane":pane, "socket":"default",
+            "room":{"host":"tmux","socket":"default","window_id":"@1"}, "state":"idle"
+        }))
+        .unwrap();
+        (participant, agent)
+    }
+
+    /// Move the latest attempt `by` into the past.
+    async fn age_attempt(store: &CollaborationStore, id: &str, by: time::Duration) {
+        let mut requests = store.requests.write().await;
+        let retry = requests.get_mut(id).unwrap().wake_retry.as_mut().unwrap();
+        retry.attempt_started_at -= by;
+    }
+
+    async fn row(store: &CollaborationStore, id: &str) -> CollaborationRequest {
+        store.requests.read().await[id].clone()
+    }
+
+    fn ids(requests: &[CollaborationRequest]) -> Vec<String> {
+        requests.iter().map(|request| request.id.clone()).collect()
+    }
+
+    struct Delivered {
+        id: String,
+        recipient: Participant,
+        coordinator: Agent,
+        peer: Agent,
+    }
+
+    async fn delivered(store: &CollaborationStore) -> Delivered {
+        let (sender, coordinator) = actor("%1", "sender").await;
+        let (recipient, peer) = actor("%2", "peer").await;
+        let request = store
+            .create(
+                sender,
+                recipient.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        // The waker began the attempt, pasted the notice and pressed Enter.
+        store
+            .mark_wake_notified(&request.id, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        Delivered {
+            id: request.id,
+            recipient,
+            coordinator,
+            peer,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_wake_that_left_its_recipient_untouched_is_redelivered_once_then_interrupted() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let Delivered {
+            id,
+            recipient,
+            coordinator,
+            peer,
+        } = delivered(&store).await;
+        let agents = [coordinator, peer];
+        // Within the grace nothing is judged.
+        assert_eq!(store.rearm_unsubmitted_wakes(&agents).await.unwrap(), 0);
+        // The stall: unclaimed, recipient Idle and untouched since the paste.
+        age_attempt(&store, &id, WAKE_SUBMIT_GRACE).await;
+        assert_eq!(store.rearm_unsubmitted_wakes(&agents).await.unwrap(), 1);
+        let pending = store.pending_unnotified().await;
+        assert_eq!(ids(&pending), vec![id.clone()], "the waker types it again");
+        assert!(
+            row(&store, &id).await.notified_at.is_some(),
+            "delivery history is kept"
+        );
+        // Whatever prompt is submitted next carries it as a structured offer.
+        let offered = store
+            .offer_turn_boundary(&recipient, TurnBoundaryEvent::PromptSubmit, None, None)
+            .await
+            .unwrap();
+        assert_eq!(offered[0]["request_id"], id.as_str());
+        // The re-delivery is typed and also leaves the row untouched.
+        store
+            .mark_wake_notified(&id, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        assert!(store.pending_unnotified().await.is_empty());
+        assert_eq!(row(&store, &id).await.wake_retry.unwrap().attempts, 2);
+        age_attempt(&store, &id, WAKE_SUBMIT_GRACE).await;
+        assert_eq!(
+            store.rearm_unsubmitted_wakes(&agents).await.unwrap(),
+            0,
+            "only one re-delivery is typed"
+        );
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        let held = row(&store, &id).await;
+        assert!(held.peer_interrupted());
+        assert_eq!(held.interruption.unwrap().reason, "wake_unsubmitted");
+        assert_eq!(held.status, RequestStatus::Queued, "nothing is consumed");
+    }
+
+    #[tokio::test]
+    async fn any_recorded_movement_after_the_attempt_suppresses_a_retry() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let Delivered {
+            id,
+            coordinator,
+            peer,
+            ..
+        } = delivered(&store).await;
+        age_attempt(&store, &id, WAKE_SUBMIT_GRACE).await;
+        let started = row(&store, &id)
+            .await
+            .wake_retry
+            .unwrap()
+            .attempt_started_at;
+        let after = started + time::Duration::seconds(1);
+        // A lost PromptSubmitted hook, but the turn's Stop recorded a response.
+        let mut answered = peer.clone();
+        answered.last_response_at = Some(after);
+        // A tool hook moved it (then Idle again, possibly timeout-inferred).
+        let mut moved = peer.clone();
+        moved.state_entered_at = after;
+        let mut prompted = peer.clone();
+        prompted.last_prompt_at = Some(after);
+        let mut busy = peer.clone();
+        busy.state = AgentState::Working;
+        for agent in [answered, moved, prompted, busy] {
+            let agents = [coordinator.clone(), agent];
+            assert_eq!(store.rearm_unsubmitted_wakes(&agents).await.unwrap(), 0);
+        }
+        // An unrelated prompt that ran shortly *before* the attempt is not
+        // evidence for this wake: the retry still happens.
+        let mut earlier = peer.clone();
+        earlier.last_prompt_at = Some(started - time::Duration::seconds(10));
+        earlier.last_response_at = Some(started - time::Duration::seconds(5));
+        earlier.state_entered_at = started - time::Duration::seconds(5);
+        assert_eq!(
+            store
+                .rearm_unsubmitted_wakes(&[coordinator, earlier])
+                .await
+                .unwrap(),
+            1
+        );
+        // A claim settles it.
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let delivered = delivered(&store).await;
+        age_attempt(&store, &delivered.id, WAKE_SUBMIT_GRACE).await;
+        store
+            .claim_by_id(&delivered.recipient, &delivered.id)
+            .await
+            .unwrap();
+        let agents = [delivered.coordinator, delivered.peer];
+        assert_eq!(store.rearm_unsubmitted_wakes(&agents).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_redelivery_keeps_missing_binding_recovery_and_is_never_rebound() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let Delivered {
+            id,
+            recipient,
+            coordinator,
+            peer,
+        } = delivered(&store).await;
+        age_attempt(&store, &id, WAKE_SUBMIT_GRACE).await;
+        store
+            .rearm_unsubmitted_wakes(&[coordinator.clone(), peer])
+            .await
+            .unwrap();
+        // Before the re-delivery the recipient disappears.
+        assert!(
+            store.undelivered_requests().await.is_empty(),
+            "already-transported work is not handed to a slot successor"
+        );
+        let mut other = recipient.clone();
+        other.agent_session_id = "successor".into();
+        assert!(store
+            .rebind_recipient(&id, &recipient, other)
+            .await
+            .unwrap()
+            .is_none());
+        store
+            .reconcile_peer_interruptions(std::slice::from_ref(&coordinator))
+            .await
+            .unwrap();
+        {
+            let mut missing = store.missing_recipients.lock().await;
+            *missing.get_mut(&id).unwrap() -= time::Duration::minutes(2);
+        }
+        store
+            .reconcile_peer_interruptions(&[coordinator])
+            .await
+            .unwrap();
+        let held = row(&store, &id).await;
+        assert!(held.peer_interrupted());
+        assert_eq!(held.interruption.unwrap().reason, "binding_unavailable");
+    }
+
+    #[tokio::test]
+    async fn the_interruption_clears_once_the_recipient_takes_a_turn() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let Delivered {
+            id,
+            coordinator,
+            mut peer,
+            ..
+        } = delivered(&store).await;
+        age_attempt(&store, &id, WAKE_SUBMIT_GRACE).await;
+        let agents = [coordinator.clone(), peer.clone()];
+        store.rearm_unsubmitted_wakes(&agents).await.unwrap();
+        store
+            .mark_wake_notified(&id, OffsetDateTime::now_utc())
+            .await
+            .unwrap();
+        age_attempt(&store, &id, WAKE_SUBMIT_GRACE).await;
+        store.reconcile_peer_interruptions(&agents).await.unwrap();
+        assert!(row(&store, &id).await.peer_interrupted());
+        // A person clears the draft and submits; the hook records the prompt.
+        peer.last_prompt_at = Some(OffsetDateTime::now_utc());
+        store
+            .reconcile_peer_interruptions(&[coordinator, peer])
+            .await
+            .unwrap();
+        assert!(!row(&store, &id).await.peer_interrupted());
+    }
+
+    /// A lost `PromptSubmitted` hook followed by a real response-less `Stop`
+    /// (no state change Idle → Idle, no response text) still counts as the
+    /// recipient having taken a turn.
+    #[tokio::test]
+    async fn a_response_less_stop_after_the_attempt_suppresses_a_retry() {
+        let registry = crate::state::Store::shared();
+        let id = AgentId {
+            kind: AgentKind::Codex,
+            session_id: "peer".into(),
+            surface: None,
+            pane: Some("%2".into()),
+            tmux_socket: Some("default".into()),
+            cwd: None,
+        };
+        let long_ago = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let stop = |at| AgentEvent::TurnStopped {
+            id: id.clone(),
+            response: None,
+            recap: None,
+            ai_title: None,
+            idle_confirmed: false,
+            at,
+        };
+        registry
+            .apply(&AgentEvent::Started {
+                id: id.clone(),
+                at: long_ago,
+            })
+            .await;
+        registry.apply(&stop(long_ago)).await;
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let Delivered { id: request, .. } = delivered(&store).await;
+        age_attempt(&store, &request, WAKE_SUBMIT_GRACE * 2).await;
+        let untouched = registry.snapshot().await;
+        assert_eq!(untouched[0].state, AgentState::Idle);
+        let (_, coordinator) = actor("%1", "sender").await;
+        // Without the Stop, this is a stall.
+        let probe = CollaborationStore::in_memory(CollaborationOptions::default());
+        let Delivered { id: probe_id, .. } = delivered(&probe).await;
+        age_attempt(&probe, &probe_id, WAKE_SUBMIT_GRACE * 2).await;
+        assert_eq!(
+            probe
+                .rearm_unsubmitted_wakes(&[coordinator.clone(), untouched[0].clone()])
+                .await
+                .unwrap(),
+            1
+        );
+        // The turn the wake started ends with a response-less Stop.
+        registry
+            .apply(&stop(
+                OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            ))
+            .await;
+        let after = registry.snapshot().await;
+        assert_eq!(after[0].state, AgentState::Idle);
+        assert_eq!(after[0].state_entered_at, untouched[0].state_entered_at);
+        assert!(after[0].last_response_at.is_none());
+        assert_eq!(
+            store
+                .rearm_unsubmitted_wakes(&[coordinator, after[0].clone()])
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    /// Movement after the re-delivery was scheduled (a delayed hook, a turn
+    /// while the backend was unavailable) cancels it before anything is typed.
+    #[tokio::test]
+    async fn a_scheduled_redelivery_is_cancelled_by_later_movement() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let Delivered {
+            id,
+            coordinator,
+            mut peer,
+            ..
+        } = delivered(&store).await;
+        age_attempt(&store, &id, WAKE_SUBMIT_GRACE).await;
+        store
+            .rearm_unsubmitted_wakes(&[coordinator, peer.clone()])
+            .await
+            .unwrap();
+        assert!(store.confirm_redelivery(&id, Some(&peer)).await.unwrap());
+        peer.last_activity_at = OffsetDateTime::now_utc();
+        assert!(!store.confirm_redelivery(&id, Some(&peer)).await.unwrap());
+        assert!(
+            store.pending_unnotified().await.is_empty(),
+            "the cancelled re-delivery is no longer pending"
+        );
+        assert!(!store.confirm_redelivery(&id, None).await.unwrap());
+    }
+}

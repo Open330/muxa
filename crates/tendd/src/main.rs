@@ -2388,6 +2388,7 @@ fn spawn_collaboration_waker_task(
         }
         retire_gone_sender_items(&collaboration).await;
         if wake_enabled {
+            rearm_unsubmitted_wakes(&collaboration, &store).await;
             wake_idle_collaboration_peers_with_inflight(
                 &collaboration,
                 &store,
@@ -2451,6 +2452,7 @@ fn spawn_collaboration_waker_task(
                 }
                 retire_gone_sender_items(&collaboration).await;
                 if wake_enabled {
+                    rearm_unsubmitted_wakes(&collaboration, &store).await;
                     wake_idle_collaboration_peers_with_inflight(
                         &collaboration,
                         &store,
@@ -2463,6 +2465,18 @@ fn spawn_collaboration_waker_task(
             }
         }
     }))
+}
+
+/// Re-arm wakes the recipient never submitted, so the pass that follows
+/// delivers each of them once more. Re-arming publishes a mailbox change, so
+/// the loop also rescans on its own.
+async fn rearm_unsubmitted_wakes(collaboration: &CollaborationStore, store: &tend::Store) {
+    if let Err(error) = collaboration
+        .rearm_unsubmitted_wakes(&store.snapshot().await)
+        .await
+    {
+        tracing::warn!(%error, "failed to re-arm unsubmitted collaboration wakes");
+    }
 }
 
 #[cfg(test)]
@@ -2561,8 +2575,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
             continue;
         }
         let quiet = collaboration.quiet_notices_waiting(recipient).await;
-        let direct_wake = request.wake_delivery.is_some()
-            || collaboration_wake_includes_body(wake_payload, &request);
+        let direct_wake = direct_collaboration_wake(wake_payload, &request);
         if direct_wake && direct_wake_body_is_terminal_safe(&request.body) {
             if deliver_full_collaboration_request(
                 collaboration,
@@ -2585,21 +2598,8 @@ async fn wake_idle_collaboration_peers_with_inflight(
             );
         }
         let prompt = with_quiet_notices(mailbox_collaboration_request_prompt(&request), quiet);
-        let (sent, submitted) =
-            send_collaboration_wake(collaboration, recipient, &prompt, backends, store).await;
-        if submitted {
+        if send_mailbox_wake(collaboration, recipient, &request, &prompt, backends, store).await {
             wake_inflight.insert(wake_key);
-        }
-        if sent {
-            if let Err(error) = collaboration.mark_notified(&request.id).await {
-                tracing::warn!(request_id = request.id, %error, "failed to persist wake marker");
-            }
-            tracing::debug!(
-                request_id = request.id,
-                pane = recipient.pane,
-                submitted,
-                "collaboration wake delivered",
-            );
         }
     }
 
@@ -3083,6 +3083,96 @@ fn direct_wake_body_is_terminal_safe(body: &str) -> bool {
     tend::collaboration::instruction::terminal_safe(body)
 }
 
+/// Type a mailbox notice for `request` and record the attempt. Returns
+/// whether Enter was delivered.
+async fn send_mailbox_wake(
+    collaboration: &CollaborationStore,
+    recipient: &tend::collaboration::Participant,
+    request: &CollaborationRequest,
+    prompt: &str,
+    backends: &[tend::SharedBackend],
+    store: &tend::Store,
+) -> bool {
+    // The guard first, then the last evidence check and the attempt clock:
+    // no other Tend input to this pane can land between them and the paste.
+    let guard = tend::prompt_delivery::lock_pane(collaboration, &recipient.pane).await;
+    let agents = store.by_pane(&recipient.pane).await;
+    if !redelivery_still_due(collaboration, &agents, recipient, request).await {
+        return false;
+    }
+    // The unsubmitted-wake check judges the recipient's row against this
+    // instant, taken before anything is typed.
+    let attempt_started_at = time::OffsetDateTime::now_utc();
+    let (sent, submitted) = send_collaboration_wake_holding(
+        guard,
+        &agents,
+        collaboration,
+        recipient,
+        prompt,
+        backends,
+        store,
+    )
+    .await;
+    if sent {
+        if let Err(error) = collaboration
+            .mark_wake_notified(&request.id, attempt_started_at)
+            .await
+        {
+            tracing::warn!(request_id = request.id, %error, "failed to persist wake marker");
+        }
+        tracing::debug!(
+            request_id = request.id,
+            pane = recipient.pane,
+            submitted,
+            "collaboration wake delivered",
+        );
+    }
+    submitted
+}
+
+/// False when `request` is a scheduled re-delivery whose recipient has moved
+/// since the unsubmitted attempt (`agents` read under the pane guard); that
+/// re-delivery is cancelled. True for every ordinary wake.
+async fn redelivery_still_due(
+    collaboration: &CollaborationStore,
+    agents: &[tend::state::Agent],
+    recipient: &tend::collaboration::Participant,
+    request: &CollaborationRequest,
+) -> bool {
+    if !request
+        .wake_retry
+        .as_ref()
+        .is_some_and(|retry| retry.redeliver)
+    {
+        return true;
+    }
+    let agent = agents
+        .iter()
+        .find(|agent| agent.session_id == recipient.agent_session_id);
+    collaboration
+        .confirm_redelivery(&request.id, agent)
+        .await
+        .unwrap_or_else(|error| {
+            tracing::warn!(request_id = request.id, %error, "failed to confirm re-delivery");
+            false
+        })
+}
+
+/// Whether this wake types the request itself rather than a mailbox notice.
+/// A re-delivery of an unsubmitted wake always repeats the notice.
+fn direct_collaboration_wake(
+    wake_payload: CollaborationWakePayload,
+    request: &CollaborationRequest,
+) -> bool {
+    let redelivery = request
+        .wake_retry
+        .as_ref()
+        .is_some_and(|retry| retry.redeliver);
+    !redelivery
+        && (request.wake_delivery.is_some()
+            || collaboration_wake_includes_body(wake_payload, request))
+}
+
 fn collaboration_wake_includes_body(
     wake_payload: CollaborationWakePayload,
     request: &CollaborationRequest,
@@ -3226,15 +3316,42 @@ async fn send_collaboration_wake(
     backends: &[tend::SharedBackend],
     store: &tend::Store,
 ) -> (bool, bool) {
+    let guard = tend::prompt_delivery::lock_pane(collaboration, &participant.pane).await;
+    let agents = store.by_pane(&participant.pane).await;
+    send_collaboration_wake_holding(
+        guard,
+        &agents,
+        collaboration,
+        participant,
+        prompt,
+        backends,
+        store,
+    )
+    .await
+}
+
+/// [`send_collaboration_wake`] with the pane's input guard already held and
+/// `agents` read after it was taken.
+async fn send_collaboration_wake_holding(
+    guard: tend::prompt_delivery::PaneInputGuard,
+    agents: &[tend::state::Agent],
+    collaboration: &CollaborationStore,
+    participant: &tend::collaboration::Participant,
+    prompt: &str,
+    backends: &[tend::SharedBackend],
+    store: &tend::Store,
+) -> (bool, bool) {
     let Some(backend) = text_backend(backends, &participant.pane) else {
         return (false, false);
     };
     // A peer delivery: the shared path holds the pane guard from the drain
     // check through Enter, and registers the prompt before typing so the
     // hook reporting it is stamped as from a peer rather than a person.
-    let delivered = tend::prompt_delivery::deliver_prompt(
+    let delivered = tend::prompt_delivery::deliver_prompt_holding(
+        guard,
         collaboration,
         store,
+        agents,
         backend,
         tend::prompt_delivery::PromptDelivery {
             pane: &participant.pane,
@@ -6325,6 +6442,114 @@ mod tests {
         assert!(prompt.contains("req_b: Completed reply from"), "{prompt}");
         assert!(prompt.contains("(requested 9h ago)"), "{prompt}");
         assert!(prompt.contains("3 more will follow."), "{prompt}");
+    }
+
+    /// A re-delivery waiting for the pane guard behind another Tend input
+    /// re-checks the recipient after it gets the guard: a prompt that input
+    /// submitted meanwhile cancels the re-delivery, and nothing is typed.
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // the guard-wait scenario is kept in one place
+    async fn a_redelivery_rechecks_the_recipient_after_taking_the_pane_guard() {
+        let store = tend::Store::shared();
+        let long_ago = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let id = |session: &str, pane: &str| AgentId {
+            kind: AgentKind::Codex,
+            session_id: session.into(),
+            surface: None,
+            pane: Some(pane.into()),
+            tmux_socket: Some("default".into()),
+            cwd: Some("/repo".into()),
+        };
+        for (session, pane) in [("sender", "%1"), ("recipient", "%2")] {
+            store
+                .apply(&AgentEvent::Started {
+                    id: id(session, pane),
+                    at: long_ago,
+                })
+                .await;
+            store
+                .apply(&AgentEvent::TurnStopped {
+                    id: id(session, pane),
+                    response: None,
+                    recap: None,
+                    ai_title: None,
+                    idle_confirmed: false,
+                    at: long_ago,
+                })
+                .await;
+        }
+        let panes = vec![collaboration_pane("%1", "0"), collaboration_pane("%2", "1")];
+        let agents = store.snapshot().await;
+        let participants = worker_participants(&agents, &panes);
+        let find = |pane: &str| {
+            participants
+                .iter()
+                .find(|participant| participant.pane == pane)
+                .unwrap()
+                .clone()
+        };
+        let (sender, recipient) = (find("%1"), find("%2"));
+        let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+        authorize_test_workers(&mailbox, &participants).await;
+        let request = mailbox
+            .create(
+                sender,
+                recipient.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+            )
+            .await
+            .unwrap();
+        // The first wake, three minutes ago, left the recipient untouched.
+        mailbox
+            .mark_wake_notified(
+                &request.id,
+                OffsetDateTime::now_utc() - time::Duration::minutes(3),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            mailbox
+                .rearm_unsubmitted_wakes(&store.snapshot().await)
+                .await
+                .unwrap(),
+            1
+        );
+        let request = mailbox.pending_unnotified().await.remove(0);
+        let sends = Arc::new(Mutex::new(Vec::new()));
+        let backend: tend::SharedBackend = Arc::new(CollaborationWakeBackend {
+            panes,
+            sends: sends.clone(),
+        });
+        // Another Tend input holds the pane.
+        let held = tend::prompt_delivery::lock_pane(&mailbox, "%2").await;
+        let retry = {
+            let (mailbox, store, recipient, request, backend) = (
+                mailbox.clone(),
+                store.clone(),
+                recipient.clone(),
+                request.clone(),
+                backend.clone(),
+            );
+            tokio::spawn(async move {
+                send_mailbox_wake(&mailbox, &recipient, &request, "wake", &[backend], &store).await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // That input is submitted while the re-delivery waits.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("recipient", "%2"),
+                prompt: "someone else's prompt".into(),
+                at: OffsetDateTime::now_utc(),
+            })
+            .await;
+        drop(held);
+        assert!(!retry.await.unwrap());
+        assert!(sends.lock().unwrap().is_empty(), "nothing typed");
+        assert!(mailbox.pending_unnotified().await.is_empty(), "cancelled");
     }
 
     #[tokio::test]

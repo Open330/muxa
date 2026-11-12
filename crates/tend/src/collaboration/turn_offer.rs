@@ -178,7 +178,15 @@ impl CollaborationStore {
                     request.status == RequestStatus::Queued
                         && addresses(&request.to, caller)
                         // Judged against the session as it is now.
-                        && request.awaits_turn_boundary(caller)
+                        && (request.awaits_turn_boundary(caller)
+                            // A wake that was typed but never submitted also
+                            // rides along with whatever prompt is submitted
+                            // next, as a structured offer.
+                            || (event == TurnBoundaryEvent::PromptSubmit
+                                && request.wake_retry.as_ref().is_some_and(|retry| {
+                                    retry.redeliver
+                                        || retry.attempts >= super::wake_retry::MAX_WAKE_ATTEMPTS
+                                })))
                         && (event == TurnBoundaryEvent::PromptSubmit || request.should_notify())
                         && request
                             .turn_offer
