@@ -189,8 +189,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintainer's Mac, test daemons deleted 42 of 46 real install backups. Now
   only the default daemon (canonical socket, default config) sweeps
   `backups/` and `spawns/` and drains the hook spool, and other daemons log
-  that they skipped it. Backups are ordered by creation time, so concurrent
-  pruners agree on which to keep, and the e2e and CLI integration tests run
+  that they skipped it. Backups are ordered by creation time, a pass holds
+  `backups/.prune.lock` and hides each victim before deleting it, so
+  concurrent pruners cannot delete a backup they should keep; and the e2e and CLI integration tests run
   with private `XDG_DATA_HOME`/`XDG_STATE_HOME`.
 
 - A reply no longer goes unannounced when the agent that asked has been

@@ -13,7 +13,14 @@ use std::time::SystemTime;
 /// contents updates its modification time, so with mtime one pruner
 /// halfway through removing an old entry made it look newest to another
 /// running at the same moment, and that one deleted a backup it should have
-/// kept. Entries that vanish under a concurrent pruner are skipped.
+/// kept.
+///
+/// Safety does not rest on that key alone: selection through deletion holds
+/// an exclusive lock on `<directory>/.prune.lock` (a pruner that finds it
+/// held skips this pass), and each victim is first renamed to a hidden
+/// `.removing-<name>` so no other reader can mistake a half-deleted entry
+/// for a live backup. A `.removing-*` left by an interrupted pass is
+/// finished on the next one. Entries that vanish meanwhile are skipped.
 /// Hidden entries (`.name`) are left alone, symlinks are
 /// removed as links and never followed. `keep == 0` disables pruning, and
 /// so does a `directory` that is itself a symlink or not a directory: the
@@ -32,6 +39,19 @@ pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathB
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
     }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(directory.join(PRUNE_LOCK))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            tracing::debug!(path = %directory.display(), "backup retention skipped: another pruner is running");
+            return Ok(Vec::new());
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
     let entries = match std::fs::read_dir(directory) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -40,7 +60,13 @@ pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathB
     let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry?;
-        if entry.file_name().to_string_lossy().starts_with('.') {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with(QUARANTINE_PREFIX) {
+            // An earlier pass chose it and was interrupted.
+            remove_entry(&entry.path());
+            continue;
+        }
+        if name.starts_with('.') {
             continue;
         }
         let metadata = match std::fs::symlink_metadata(entry.path()) {
@@ -62,23 +88,40 @@ pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathB
     // Newest first; the name breaks ties so the order is deterministic.
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     let mut removed = Vec::new();
-    for (_, _, path, metadata) in candidates.into_iter().skip(keep) {
-        let result = if metadata.is_dir() {
-            std::fs::remove_dir_all(&path)
-        } else {
-            std::fs::remove_file(&path)
-        };
-        match result {
-            Ok(()) => removed.push(path),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            // A concurrent pruner emptied it out from under this one.
-            Err(_) if std::fs::symlink_metadata(&path).is_err() => {}
+    for (_, name, path, _) in candidates.into_iter().skip(keep) {
+        let mut hidden = std::ffi::OsString::from(QUARANTINE_PREFIX);
+        hidden.push(&name);
+        let quarantined = directory.join(hidden);
+        match std::fs::rename(&path, &quarantined) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 tracing::warn!(%error, path = %path.display(), "backup retention could not remove an entry");
+                continue;
             }
         }
+        remove_entry(&quarantined);
+        removed.push(path);
     }
+    drop(lock);
     Ok(removed)
+}
+
+const PRUNE_LOCK: &str = ".prune.lock";
+const QUARANTINE_PREFIX: &str = ".removing-";
+
+/// Remove a quarantined entry; a link is removed as a link.
+fn remove_entry(path: &Path) {
+    let result = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(path),
+        Ok(_) => std::fs::remove_file(path),
+        Err(_) => return,
+    };
+    if let Err(error) = result {
+        if std::fs::symlink_metadata(path).is_ok() {
+            tracing::warn!(%error, path = %path.display(), "backup retention could not finish removing an entry");
+        }
+    }
 }
 
 /// When an entry was made: its creation time, else its modification time.
@@ -173,6 +216,7 @@ mod tests {
         let mut left: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| !name.starts_with('.'))
             .collect();
         left.sort();
         assert_eq!(left, refs[7..]);
@@ -187,6 +231,36 @@ mod tests {
         assert!(prune_backups(&dir.path().join("missing"), 1)
             .unwrap()
             .is_empty());
+    }
+
+    #[test]
+    fn a_held_prune_lock_skips_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        create_in_order(dir.path(), &["a", "b", "c"]);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.path().join(PRUNE_LOCK))
+            .unwrap();
+        lock.lock().unwrap();
+        assert!(prune_backups(dir.path(), 1).unwrap().is_empty());
+        drop(lock);
+        assert_eq!(names(&prune_backups(dir.path(), 1).unwrap()), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_half_deleted_entry_is_hidden_and_finished_by_the_next_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        create_in_order(dir.path(), &["mid", "new"]);
+        // An interrupted pass left its quarantined victim, half-emptied and
+        // with a fresh mtime: it is neither counted nor kept.
+        let leftover = dir.path().join(format!("{QUARANTINE_PREFIX}old"));
+        std::fs::create_dir(&leftover).unwrap();
+        std::fs::write(leftover.join("rest"), b"x").unwrap();
+        assert!(prune_backups(dir.path(), 2).unwrap().is_empty());
+        assert!(!leftover.exists());
+        assert!(dir.path().join("mid").exists() && dir.path().join("new").exists());
     }
 
     #[cfg(unix)]
