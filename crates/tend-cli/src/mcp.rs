@@ -1134,6 +1134,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
     tools.extend(crate::agent_records::definitions());
     tools.extend(crate::decision_record::definitions());
     tools.extend(crate::mcp_surface::definitions());
+    crate::mcp_surface::extend_schemas(&mut tools);
     tools.retain(|tool| {
         tool["name"]
             .as_str()
@@ -7544,19 +7545,12 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "tend_agent_find",
                 "tend_status",
-                "tend_recent_prompts",
                 "tend_start_agent",
                 "tend_start_work",
                 "tend_swap_account",
                 "tend_manage_tmux",
                 "tend_send_prompt",
-                "tend_capture_pane",
-                "tend_fleet_status",
-                "tend_fleet_capture",
-                "tend_fleet_send_prompt",
-                "tend_dispatch_work",
                 "tend_fleet_call_peer",
                 "tend_update_request",
                 "tend_fleet_update_request",
@@ -7571,7 +7565,6 @@ mod tests {
                 "tend_withdraw_reply_wake",
                 "tend_cancel_message",
                 "tend_agent_search",
-                "tend_agent_read",
                 "tend_file_result",
                 "tend_guide",
                 "tend_wait",
@@ -7612,17 +7605,13 @@ mod tests {
     #[test]
     fn status_and_wait_tool_definitions_bound_context() {
         let tools = tool_definitions(&tend::config::Config::default());
-        let find = tools
-            .iter()
-            .find(|tool| tool["name"] == "tend_agent_find")
-            .unwrap();
-        assert_eq!(find["inputSchema"]["required"], json!(["query"]));
-        assert_eq!(find["inputSchema"]["properties"]["limit"]["maximum"], 50);
         let status = tools
             .iter()
             .find(|tool| tool["name"] == "tend_status")
             .unwrap();
         assert!(status["inputSchema"]["properties"]["full"].is_object());
+        assert!(status["inputSchema"]["properties"]["query"].is_object());
+        assert_eq!(status["inputSchema"]["properties"]["limit"]["maximum"], 50);
         let wait = tools
             .iter()
             .find(|tool| tool["name"] == "tend_wait")
