@@ -7,12 +7,6 @@
 //! sent in `Authorization`, never cookies, so cross-site forms cannot trigger
 //! a control action and browser clients can treat the token like a PAT.
 //!
-//! The one cookie that authorizes operator APIs is the optional OIDC operator
-//! session (`[dashboard.login]`, see [`super::operator`]). Because a browser
-//! attaches it ambiently, a cookie-authorized request that changes state must
-//! also carry `Origin: <public_url>` and `X-Tend-Operator: 1`; reads and SSE
-//! need no extra proof. Bearer-authorized requests are unaffected.
-//!
 //! [`serve`] composes the router with the lifecycle plumbing the daemon
 //! needs: TCP bind, graceful shutdown wired to the daemon's existing
 //! shutdown channel, structured logging on bind failure.
@@ -120,10 +114,6 @@ pub struct AppState {
     pub config: Arc<DashboardConfig>,
     pub pane_cache: Arc<PaneCache>,
     pub sessions: SharedSessionBackend,
-    pub(super) sharing: Arc<super::sharing::Sharing>,
-    /// OIDC operator sessions. Separate from `sharing` so a recipient
-    /// session can never be mistaken for operator access.
-    pub(super) operator: Arc<super::operator::OperatorLogin>,
     /// Primary pane backend retained for compatibility with callers that
     /// inspect it directly. Pane scans use `backends` below so every active
     /// host contributes to one dashboard inventory.
@@ -193,8 +183,6 @@ impl AppState {
         Self {
             store,
             collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
-            sharing: super::sharing::Sharing::new(config.sharing.clone()),
-            operator: super::operator::OperatorLogin::new(config.login.clone()),
             config,
             pane_cache,
             sessions,
@@ -428,8 +416,7 @@ pub fn router(state: AppState) -> Router {
     } else {
         read_api
     };
-    let write_api = super::sharing::admin_routes()
-        .merge(super::operator::admin_routes())
+    let write_api = Router::new()
         .route("/api/panes/{pane}/prompt", post(pane_prompt_handler))
         .route("/api/fleet/{host}/command", post(fleet_command_handler))
         .route("/api/panes/{pane}/abort", post(pane_abort_handler))
@@ -449,8 +436,7 @@ pub fn router(state: AppState) -> Router {
         .layer(write_auth_layer);
     // Operator-only reads. Pane output can hold secrets the redacted read
     // views never expose, so it sits behind the control gate even though it
-    // is a GET: a viewer session gets 403, and in `public_read` an anonymous
-    // visitor needs the token (401). Being a GET it needs no CSRF proof.
+    // is a GET: in `public_read` an anonymous visitor needs the token (401). Being a GET it needs no CSRF proof.
     let operator_read_api = Router::new()
         .route("/api/panes/{pane}/output", get(pane_output_handler))
         .route(
@@ -465,8 +451,6 @@ pub fn router(state: AppState) -> Router {
     let api = read_api
         .merge(write_api)
         .merge(operator_read_api)
-        .merge(super::sharing::recipient_routes(state.clone()))
-        .merge(super::operator::routes())
         .with_state(state.clone());
     // Static assets sit OUTSIDE the auth layer — see assets.rs for the
     // rationale (token bootstrap in the browser). The DNS-rebinding host
@@ -492,8 +476,8 @@ fn make_request_span<B>(req: &Request<B>) -> tracing::Span {
     )
 }
 
-/// Render `uri` with operator tokens and OIDC code/state query values
-/// replaced by `REDACTED`. Other parameters are preserved verbatim.
+/// Render `uri` with operator tokens (and, defensively, any OAuth-style
+/// `code`/`state` query values) replaced by `REDACTED`. Other parameters are preserved verbatim.
 fn scrub_token_from_uri(uri: &axum::http::Uri) -> String {
     let path = uri.path();
     match uri.query() {
@@ -537,9 +521,7 @@ pub async fn serve(
             ..CollaborationOptions::default()
         })
     });
-    let sharing = super::sharing::Sharing::open(config.sharing.clone()).await?;
-    let operator = super::operator::OperatorLogin::open(config.login.clone(), None).await?;
-    let mut state = AppState::new(store, config.clone(), pane_cache, sessions)
+    let state = AppState::new(store, config.clone(), pane_cache, sessions)
         .with_collaboration(collaboration)
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
@@ -547,8 +529,6 @@ pub async fn serve(
         .with_stats_config(runtime.stats_config)
         .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
-    state.sharing = sharing;
-    state.operator = operator;
     let app = router(state);
     let listener = TcpListener::bind(config.bind).await?;
     let local = listener.local_addr()?;
@@ -585,26 +565,11 @@ async fn host_guard_middleware(
             .headers()
             .get(header::HOST)
             .and_then(|h| h.to_str().ok());
-        if !host_is_loopback(host, state.config.bind.ip())
-            && !host.is_some_and(|host| public_host(&state.config, host))
-        {
+        if !host_is_loopback(host, state.config.bind.ip()) {
             return Err(StatusCode::FORBIDDEN);
         }
     }
     Ok(next.run(req).await)
-}
-
-/// Does `host` name a configured public origin? A reverse proxy or tunnel
-/// that forwards the browser's `Host` reaches a loopback bind with it.
-fn public_host(config: &DashboardConfig, host: &str) -> bool {
-    config
-        .sharing
-        .as_ref()
-        .is_some_and(|sharing| sharing.matches_host(host))
-        || config
-            .login
-            .as_ref()
-            .is_some_and(|login| login.matches_host(host))
 }
 
 /// Is `host` (a raw `Host` header value, optionally `host:port` or
@@ -667,28 +632,16 @@ fn log_access_url(config: &DashboardConfig, local: SocketAddr) {
     }
 }
 
-/// Authenticate an operator request: the bearer token, or else an OIDC
-/// operator session. Every operator gate goes through this one function so
-/// reads, writes, `/api/access` and detail redaction cannot disagree.
-fn operator_auth(state: &AppState, headers: &HeaderMap) -> Option<super::operator::OperatorAuth> {
-    super::operator::authenticate(state.config.token.as_deref(), &state.operator, headers)
-}
-
-/// Is this request authorized to act as the operator? Session-authorized
-/// state changes additionally need the CSRF proof described at the top of
-/// this module.
-fn operator_authorized(state: &AppState, req: &Request<Body>) -> Result<(), StatusCode> {
-    match operator_auth(state, req.headers()) {
-        Some(super::operator::OperatorAuth::Bearer) => Ok(()),
-        Some(super::operator::OperatorAuth::Session) => {
-            if state.operator.csrf_ok(req.method(), req.headers()) {
-                Ok(())
-            } else {
-                Err(StatusCode::FORBIDDEN)
-            }
-        }
-        None => Err(StatusCode::UNAUTHORIZED),
-    }
+/// Is this request authorized to act as the operator? Only the bearer token
+/// grants that. Every operator gate goes through this one function so reads,
+/// writes, `/api/access` and detail redaction cannot disagree.
+fn operator_auth(state: &AppState, headers: &HeaderMap) -> bool {
+    state.config.token.as_deref().is_some_and(|expected| {
+        let bearer = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok());
+        super::auth::check_bearer(bearer, expected)
+    })
 }
 
 /// Read authentication for `auth = "token"`. Public-read and none modes do
@@ -698,14 +651,8 @@ async fn read_auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    if state.config.token.is_none() {
-        return Ok(next.run(req).await);
-    }
-    match operator_authorized(&state, &req) {
-        // A signed-in viewer reads what a `public_read` visitor would; the
-        // handlers redact details for anyone who is not an operator.
-        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {}
-        result => result?,
+    if state.config.token.is_some() && !operator_auth(&state, req.headers()) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
 }
@@ -721,12 +668,8 @@ async fn write_auth_middleware(
     if state.config.token.is_none() {
         return Err(StatusCode::FORBIDDEN);
     }
-    match operator_authorized(&state, &req) {
-        // Signed in, but only as a viewer: authenticated, not allowed.
-        Err(StatusCode::UNAUTHORIZED) if state.operator.viewer(req.headers()) => {
-            return Err(StatusCode::FORBIDDEN);
-        }
-        result => result?,
+    if !operator_auth(&state, req.headers()) {
+        return Err(StatusCode::UNAUTHORIZED);
     }
     Ok(next.run(req).await)
 }
@@ -745,59 +688,15 @@ struct AccessResponse {
     write_available: bool,
     write_authorized: bool,
     capabilities: AccessCapabilities,
-    login: LoginStatus,
-}
-
-/// Operator sign-in state, also served unauthenticated at `/auth/session` so
-/// a signed-out browser can offer "Sign in" instead of a token prompt.
-#[derive(Debug, Serialize)]
-pub(super) struct LoginStatus {
-    available: bool,
-    signed_in: bool,
-    email: Option<String>,
-    /// What this request may do: `none`, `viewer` or `operator` (the
-    /// bearer token counts as `operator`).
-    role: super::operator::Role,
-    /// Why the signed-in account has its role: `group`, `enrollment`,
-    /// `viewer_group` or `viewer_rule`.
-    via: Option<super::operator::Via>,
-    /// Whether a token holder may enroll accounts outside `required_group`.
-    enrollment: bool,
-    /// Absolute, so a browser on another origin (e.g. `localhost`) starts
-    /// the flow on the public origin its callback and cookie belong to.
-    login_url: Option<String>,
-}
-
-pub(super) fn login_status(state: &AppState, headers: &HeaderMap) -> LoginStatus {
-    let config = state.operator.config();
-    let (signed_in, email, via) = state
-        .operator
-        .signed_in(headers)
-        .map_or((false, None, None), |(email, via)| (true, email, Some(via)));
-    let role = if operator_auth(state, headers).is_some() {
-        super::operator::Role::Operator
-    } else {
-        via.map_or(super::operator::Role::None, super::operator::Via::role)
-    };
-    LoginStatus {
-        available: config.is_some(),
-        signed_in,
-        role,
-        email,
-        via,
-        enrollment: config.is_some_and(super::operator::LoginConfig::enrollment_enabled),
-        login_url: config.map(|config| format!("{}/auth/login", config.origin())),
-    }
 }
 
 #[derive(Debug, Serialize)]
 struct AccessCapabilities {
     work_start: bool,
-    pane_sharing: bool,
 }
 
 async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    let write_authorized = operator_auth(&state, &headers).is_some();
+    let write_authorized = operator_auth(&state, &headers);
     let mode = match state.config.auth {
         DashboardAuthMode::Token => "token",
         DashboardAuthMode::PublicRead => "public_read",
@@ -810,9 +709,7 @@ async fn access_handler(State(state): State<AppState>, headers: HeaderMap) -> im
         write_authorized,
         capabilities: AccessCapabilities {
             work_start: state.config.allow_work_start,
-            pane_sharing: state.config.sharing.is_some(),
         },
-        login: login_status(&state, &headers),
     })
 }
 
@@ -1118,7 +1015,7 @@ fn dashboard_details_authorized(state: &AppState, headers: &HeaderMap) -> bool {
     matches!(
         state.config.auth,
         DashboardAuthMode::Token | DashboardAuthMode::PublicRead
-    ) && operator_auth(state, headers).is_some()
+    ) && operator_auth(state, headers)
 }
 
 fn redact_collaboration_details(request: &mut serde_json::Value) {
@@ -4960,7 +4857,7 @@ mod tests {
 
         // No query → untouched path.
         let encoded: axum::http::Uri =
-            "/share/auth/callback?co%64e=secret&sta%74e=secret&to%6ben=secret"
+            "/api/agents?co%64e=secret&sta%74e=secret&to%6ben=secret"
                 .parse()
                 .unwrap();
         assert!(!scrub_token_from_uri(&encoded).contains("secret"));

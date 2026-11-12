@@ -125,7 +125,7 @@ See [Direction](docs/DIRECTION.md).
 | `tend automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
 | `tend swap` | Restart agents on their own accounts with `--all --to same --when-idle`, or move agents onto another account (configured accounts, or the optional `aas` provider) and resume them in place — the rate-limited ones, named panes, or all. See [docs/ACCOUNT_SWAP.md](docs/ACCOUNT_SWAP.md). |
 | Tend for Mac | Native workbench for Work, Explore, Inbox, Ask, Shells, and Files, with a libghostty terminal and notifications; native PTYs remain owned by `tendd`. |
-| Dashboard | Optional loopback HTTP UI with live updates, timeline, collaboration graphs, and [OIDC pane/window sharing](docs/DASHBOARD.md#invite-someone-to-a-pane) with view or prompt permissions. |
+| Dashboard | Optional loopback HTTP UI with live updates, timeline, and collaboration graphs; the bearer token is its only credential. |
 | Notifications | Optional desktop alerts when agents need attention. |
 
 ## More install options

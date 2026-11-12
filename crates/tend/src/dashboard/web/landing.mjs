@@ -1,8 +1,7 @@
-// Landing view for visitors who can read nothing here: no operator session
-// and no dashboard token. It explains tend up front (a problem-first hero,
-// a short film of the product, how it works, real screens from a demo
-// fleet) and keeps the ways in close by: Sign in when the daemon has a
-// login provider, and the dashboard token.
+// Landing view for visitors who can read nothing here: no working dashboard
+// token. It explains tend up front (a problem-first hero, a short film of
+// the product, how it works, real screens from a demo fleet) and points at
+// the way in: the dashboard link `tend init` printed.
 //
 // Everything is local: a self-hosted daemon should not load fonts, images
 // or scripts from elsewhere. Screens are regenerated with
@@ -22,12 +21,8 @@ const COPY = {
     lead: "See which coding agent needs you, connect to its pane, and ask a peer to review the work. Start with the agents and tmux sessions you already use.",
     how: "How it works",
     private: "<b>{host}</b> is a private tend dashboard.",
-    privateSignIn: "Sign in to open it.",
     privateLink: "Open it with the dashboard link <code>tend init</code> printed on that machine.",
-    signedInNoAccess: "Signed in as <b>{email}</b>, but this account has no access here.",
     tokenRejected: "The saved access token was not accepted. Open the dashboard link from <code>tend init</code> again.",
-    signIn: "Sign in",
-    signOut: "Sign out",
     film: {
       steps: ["Working", "Someone waits", "Jump there", "Peek", "See it all"],
       captions: [
@@ -76,7 +71,7 @@ const COPY = {
     principles: [
       ["Your setup, unchanged", "No wrapper, no new terminal, no new multiplexer. tmux, rmux, and herdr can be watched at the same time."],
       ["Local first", "State lives in a daemon on your machine. The dashboard is served by that daemon and loads nothing from elsewhere."],
-      ["Control stays explicit", "Prompting or aborting an agent takes an operator token or sign-in; automation rules run inside guards they can't opt out of."],
+      ["Control stays explicit", "Prompting or aborting an agent takes the dashboard token; automation rules run inside guards they can't opt out of."],
     ],
     surfacesTitle: "One state, everywhere",
     surfaces: [
@@ -123,12 +118,8 @@ const COPY = {
     lead: "나를 기다리는 코딩 에이전트를 찾고, 그 pane에 연결하고, 동료에게 리뷰를 요청하세요. 지금 쓰는 tmux와 에이전트에서 시작합니다.",
     how: "어떻게 동작하나",
     private: "<b>{host}</b>는 비공개 tend 대시보드입니다.",
-    privateSignIn: "로그인하면 열 수 있습니다.",
     privateLink: "해당 머신에서 <code>tend init</code>이 출력한 대시보드 링크로 열 수 있습니다.",
-    signedInNoAccess: "<b>{email}</b>(으)로 로그인했지만 이 계정에는 접근 권한이 없습니다.",
     tokenRejected: "저장된 접근 토큰이 거부되었습니다. <code>tend init</code>의 대시보드 링크로 다시 여세요.",
-    signIn: "로그인",
-    signOut: "로그아웃",
     film: {
       steps: ["작업 중", "누군가 멈춤", "바로 이동", "훑어보기", "한눈에 보기"],
       captions: [
@@ -177,7 +168,7 @@ const COPY = {
     principles: [
       ["지금 환경 그대로", "래퍼도, 새 터미널도, 새 멀티플렉서도 없습니다. tmux, rmux, herdr를 동시에 볼 수 있습니다."],
       ["로컬 우선", "상태는 내 머신의 데몬에 있습니다. 대시보드도 그 데몬이 제공하고, 외부에서 아무것도 불러오지 않습니다."],
-      ["제어는 명시적으로", "에이전트에게 프롬프트를 보내거나 중단하려면 운영자 토큰이나 로그인이 필요하고, 자동화 규칙은 끌 수 없는 안전장치 안에서 돕니다."],
+      ["제어는 명시적으로", "에이전트에게 프롬프트를 보내거나 중단하려면 대시보드 토큰이 필요하고, 자동화 규칙은 끌 수 없는 안전장치 안에서 돕니다."],
     ],
     surfacesTitle: "어디서 보든 같은 상태",
     surfaces: [
@@ -224,22 +215,13 @@ const AGENTS = ["Claude Code", "Codex", "Gemini CLI", "Antigravity", "opencode"]
 const HOSTS = ["tmux", "rmux", "herdr"];
 
 /**
- * Which ways in to offer. `login` is the dashboard's normalized login state;
- * `tokenRejected` is true when a stored token was sent and refused.
- *
- * The page offers sign-in only. The token still works, but through the
- * dashboard link `tend init` prints (`#token=…`), not a field on a public
- * page; without a login provider the page just points at that link.
+ * What the private-dashboard landing says. `tokenRejected` is true when a
+ * stored token was sent and refused. The token works through the dashboard
+ * link `tend init` prints (`#token=…`), never a field on a public page, so
+ * the page only points at that link.
  */
-export function landingAccess(login, { tokenRejected = false } = {}) {
-  const signedIn = Boolean(login?.signedIn);
-  return {
-    signIn: Boolean(login?.available) && !signedIn,
-    signOut: signedIn,
-    linkHint: !login?.available && !signedIn,
-    signedInNoAccess: signedIn && login?.role === "none",
-    tokenRejected,
-  };
+export function landingAccess({ tokenRejected = false } = {}) {
+  return { linkHint: true, tokenRejected };
 }
 
 function escapeText(value) {
@@ -258,16 +240,9 @@ const LOCK_ICON = `<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4 7V5a4
 // Backticks in film captions mark inline code.
 const codeSpans = (text) => escapeText(text).replace(/`([^`]+)`/g, "<code>$1</code>");
 
-function accessButtons(t, access, size = "") {
-  return [
-    access.signIn ? `<button class="l-btn primary ${size}" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>` : "",
-    access.signOut ? `<button class="l-btn ghost ${size}" type="button" data-landing-action="sign-out">${escapeText(t.signOut)}</button>` : "",
-  ].join("");
-}
-
 /** The line under the hero and in the closing section of the dashboard page. */
 const privateLine = (t, access, host) =>
-  `${fill(t.private, { host })} ${access.signIn ? escapeText(t.privateSignIn) : access.linkHint ? t.privateLink : ""}`;
+  `${fill(t.private, { host })} ${access.linkHint ? t.privateLink : ""}`;
 
 // Where icon.svg, landing/*.webp and demo.gif live: the daemon serves them
 // under /static/, the GitHub Pages site next to its index.html.
@@ -302,11 +277,8 @@ function learningEntry(lang,base) {
   return `<section class="l-section l-wrap l-learn-entry" id="learn"><div><p class="l-eyebrow">${ko?"브라우저 온보딩":"Browser onboarding"}</p><h2>${ko?"설치 전에 직접 익혀보세요":"Learn it before you install"}</h2><p class="l-lede">${ko?"실제 키 입력으로 한 단계씩 진행합니다. 작업공간 이동·검색, 미리보기, 자유 탐색까지 같은 터미널에서 이어집니다.":"Learn one key at a time. Continue through workspace search, inspection and free play in the same terminal."}</p><p class="l-fineprint">${ko?"브라우저 안의 데모 환경이며, 실제 셸이나 에이전트에 연결하지 않습니다.":"A browser-local demo, without a connection to a real shell or agent."}</p></div><div class="l-learning-paths">${paths.map(([label,title,body,track,cta])=>`<a class="l-learning-path" href="${base}learn/?track=${track}"><span class="l-eyebrow">${label}</span><h3>${title}</h3><p>${body}</p><span class="l-path-cta">${cta} <span aria-hidden="true">→</span></span></a>`).join("")}</div></section>`;
 }
 
-function markup(t, access, { host, email, shot }) {
-  const notices = [
-    access.signedInNoAccess ? `<p class="l-notice">${fill(t.signedInNoAccess, { email: email || "" })}</p>` : "",
-    access.tokenRejected ? `<p class="l-notice">${t.tokenRejected}</p>` : "",
-  ].join("");
+function markup(t, access, { host, shot }) {
+  const notices = access.tokenRejected ? `<p class="l-notice">${t.tokenRejected}</p>` : "";
   const flow = t.flow.map(([heading, body], i) =>
     `<li class="l-step" style="--i:${i}"><b><span>${i + 1}</span>${escapeText(heading)}</b><p>${body}</p></li>`
   ).join("");
@@ -325,7 +297,7 @@ function markup(t, access, { host, email, shot }) {
   const chips = (items) => items.map((item) => `<span class="l-chip">${escapeText(item)}</span>`).join("");
 
   return `
-    ${publicHeader({lang:view.lang,homeHref:site?"./":"/",iconSrc:asset("icon.svg"),context:site?"":`<span class="l-host" title="${escapeText(host)}">${LOCK_ICON}${escapeText(host)}</span>`,links:`<a class="l-nav-link l-hide-sm" href="${GITHUB}" rel="noopener">GitHub</a>${site?`<a class="l-nav-link" href="#install">${escapeText(t.site.install)}</a><a class="l-btn dark sm" href="${view.base}learn/">${view.lang==="ko"?"미리 써보기":"Try tend"}</a>`:access.signIn?`<button class="l-btn dark sm" type="button" data-landing-action="sign-in">${escapeText(t.signIn)}</button>`:""}`})}
+    ${publicHeader({lang:view.lang,homeHref:site?"./":"/",iconSrc:asset("icon.svg"),context:site?"":`<span class="l-host" title="${escapeText(host)}">${LOCK_ICON}${escapeText(host)}</span>`,links:`<a class="l-nav-link l-hide-sm" href="${GITHUB}" rel="noopener">GitHub</a>${site?`<a class="l-nav-link" href="#install">${escapeText(t.site.install)}</a><a class="l-btn dark sm" href="${view.base}learn/">${view.lang==="ko"?"미리 써보기":"Try tend"}</a>`:""}`})}
 
     <main>
       <section class="l-hero l-wrap">
@@ -338,8 +310,8 @@ function markup(t, access, { host, email, shot }) {
               ? `<a class="l-btn primary lg" href="${view.base}learn/">${view.lang === "ko" ? "미리 써보기" : "Try tend"}</a>
                  <a class="l-btn ghost lg" href="#install">${escapeText(t.site.install)}</a>
                  <span class="l-action-note">${view.lang==="ko"?"설치 없이 · tmux 기본부터":"No installation · tmux basics included"}</span>`
-              : accessButtons(t, access, "lg")}
-            ${site?"":`<a class="l-btn ${access.signIn?"ghost":"primary"} lg" href="#how">${escapeText(t.how)} ↓</a>`}
+              : ""}
+            ${site?"":`<a class="l-btn primary lg" href="#how">${escapeText(t.how)} ↓</a>`}
           </div>
           ${site ? "" : `<div class="l-private">
             ${LOCK_ICON}
@@ -432,8 +404,7 @@ function markup(t, access, { host, email, shot }) {
         </div>` : `<div>
           <h2>${escapeText(t.ctaTitle)}</h2>
           <p>${privateLine(t, access, host)}</p>
-        </div>
-        <div class="l-actions">${accessButtons(t, access)}</div>`}
+        </div>`}
       </section>
     </main>
 
@@ -444,8 +415,8 @@ function markup(t, access, { host, email, shot }) {
 }
 
 // One landing per page; the click handler reads whatever the latest render
-// set, so re-rendering with new login state never leaves stale callbacks.
-const view = { root: null, mode: "dashboard", base: "/static/", lang: "en", shot: 0, access: null, host: "", email: null, actions: null, film: null, reveal: null };
+// set.
+const view = { root: null, mode: "dashboard", base: "/static/", lang: "en", shot: 0, access: null, host: "", film: null, reveal: null };
 
 function revealOnScroll(root) {
   const items = [...root.querySelectorAll("[data-reveal]")];
@@ -469,7 +440,7 @@ function draw() {
   view.film?.destroy();
   view.reveal?.disconnect();
   document.documentElement.lang = view.lang;
-  view.root.innerHTML = markup(t, view.access, { host: view.host, email: view.email, shot: view.shot });
+  view.root.innerHTML = markup(t, view.access, { host: view.host, shot: view.shot });
   const dark = window.matchMedia("(prefers-color-scheme: dark)").matches;
   view.film = mountFilm(view.root.querySelector("[data-landing-film]"), {
     ...t.film,
@@ -503,20 +474,15 @@ function onLandingClick(event) {
   const shotTab = event.target.closest("[data-landing-shot]");
   if (shotTab) {
     showShot(Number(shotTab.dataset.landingShot));
-    return;
   }
-  const action = event.target.closest("[data-landing-action]")?.getAttribute("data-landing-action");
-  if (action === "sign-in") view.actions.signIn();
-  else if (action === "sign-out") view.actions.signOut();
 }
 
 /**
- * Render the landing view into `root` and wire its buttons. `actions` holds
- * `signIn` and `signOut` callbacks owned by the dashboard.
+ * Render the landing view into `root` and wire its buttons.
  * `mode: "site"` is the public project page (site/index.html): no access
  * prompts, install and GitHub instead; `assetBase` is where its files live.
  */
-export function renderLanding(root, { login, tokenRejected = false, actions, mode = "dashboard", assetBase = "/static/" } = {}) {
+export function renderLanding(root, { tokenRejected = false, mode = "dashboard", assetBase = "/static/" } = {}) {
   view.mode = mode;
   view.base = assetBase;
   let saved = null;
@@ -526,10 +492,8 @@ export function renderLanding(root, { login, tokenRejected = false, actions, mod
     view.lang = pickLanguage(saved, navigator.languages || [navigator.language]);
     root.addEventListener("click", onLandingClick);
   }
-  view.access = landingAccess(login, { tokenRejected });
+  view.access = landingAccess({ tokenRejected });
   view.host = window.location.host;
-  view.email = login?.email || null;
-  view.actions = actions;
   root.hidden = false;
   draw();
 }

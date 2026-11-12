@@ -760,94 +760,9 @@ allowed. Use `auth = "public_read"` with a token to expose anonymous reads
 while keeping browser control actions PAT-gated. `auth = "none"` exposes reads
 and disables control actions entirely. See [DASHBOARD.md](DASHBOARD.md).
 
-### Operator sign-in with OIDC
-
-Optional `[dashboard.login]` lets the dashboard owner sign in through a generic
-OpenID Connect provider instead of pasting the bearer token. Sign-in is deny by
-default. An account is an **operator** when the ID token's group claim contains
-`required_group`, or when a holder of the dashboard token enrolled it. It is a
-read-only **viewer** when its groups contain `viewer_group` or it matches a
-viewer rule. Any other account gets no access. It requires `auth = "token"` with
-a token, which keeps working for API clients and as the fallback when the
-provider is unreachable.
-
-```toml
-[dashboard.login]
-public_url = "https://tend.example.com"
-issuer_url = "https://login.example.com"
-client_id = "tend-dashboard"
-# Optional while enrollment is on; required when enrollment = false.
-required_group = "tend-operators"
-# Optional: let a token holder enroll accounts outside the group (default true).
-# enrollment = true
-# Optional: provider group whose members may view the dashboard read-only.
-# viewer_group = "tend-viewers"
-# Optional: viewer rules, shown read-only next to the ones operators add in
-# the dashboard: "email:<address>", "email:*@<domain>" or "sub:<subject>".
-# viewer_rules = ["email:*@example.com"]
-# Optional: claim holding group names (default "groups").
-# groups_claim = "groups"
-# Optional: scopes requested in addition to "openid email".
-# scopes = ["groups"]
-# Optional: environment variable NAME for a confidential client's secret.
-# client_secret_env = "TEND_LOGIN_CLIENT_SECRET"
-```
-
-Register `https://tend.example.com/auth/callback` with the provider and enable
-authorization code flow with PKCE S256. If `[dashboard.sharing]` is also
-configured, both must use the same `public_url`. Unknown keys are rejected.
-
-With `enrollment` on, a verified account outside `required_group` (or any
-account when `required_group` is omitted) is sent to an enrollment page that
-asks for the dashboard token; entering it registers that account by issuer and
-subject in `$XDG_DATA_HOME/tend/dashboard-operators/operators.sqlite3`. Remove
-accounts from the dashboard's **access** dialog. `enrollment = false` restores
-group-only operator sign-in and stops honoring enrolled accounts.
-
-Viewer rules match an exact email address or every address at one domain
-(`*@example.com` matches `ann@example.com`, not `ann@sub.example.com`),
-case-insensitively and only when the provider sets `email_verified: true`, or an
-exact subject. Every rule is pinned to `issuer_url`. Operators add and remove
-rules in the **access** dialog; those are stored in the same SQLite file.
-See [operator sign-in](DASHBOARD.md#operator-sign-in-with-oidc) for the cookie,
-CSRF, enrollment and reverse-proxy contract.
-
-### Authenticated pane and window sharing
-
-Optional `[dashboard.sharing]` configuration enables email invitations to local
-tmux/rmux panes or the current panes in a window. It requires dashboard
-`auth = "token"` and an operator token. Recipients use OIDC login, with view-only
-or prompt permission, expiry and revocation; do not give them the operator token.
-
-```toml
-[dashboard.sharing]
-public_url = "https://tend.example.com"
-issuer_url = "https://login.example.com"
-client_id = "tend-dashboard"
-# Optional: environment variable NAME, supplied to the daemon service.
-client_secret_env = "TEND_SHARING_CLIENT_SECRET"
-# Optional: absolute path on a private local filesystem.
-# storage_path = "/absolute/path/to/shares.sqlite3"
-```
-
-`public_url` must be an origin without a path, query or fragment. Register
-`https://tend.example.com/share/auth/callback` with the OIDC provider and enable
-verified email claims in ID tokens. Use an HTTPS reverse proxy for external
-access; HTTP is allowed only on loopback. Restart after configuration changes.
-
-Window invitations pin up to 16 existing pane processes; new panes are not
-included. Prompt permission can execute shell commands when the pane runs a shell.
-Invitations survive daemon restarts, but recipients must sign in again and the
-original pane process must still exist. Private SQLite storage defaults to
-`tend/dashboard-sharing/shares.sqlite3` under the platform data directory. Only
-one daemon may use a given database. Browser command request IDs prevent duplicate
-delivery when checking a lost response.
-
-**Shares → Check login setup** checks provider discovery and signing keys; it
-does not validate the client secret or an actual account's claims. Test the real
-HTTPS address and recipient login before distributing links, and omit callback
-query strings from proxy access logs. See [sharing and deployment](DASHBOARD.md#invite-someone-to-a-pane)
-for limits, API details, recovery and the browser smoke test.
+The dashboard is single-user: the bearer token is its only credential. Older
+configs that still carry `[dashboard.login]` or `[dashboard.sharing]` load with
+a warning and the sections are ignored; delete them.
 
 ## External Sinks
 

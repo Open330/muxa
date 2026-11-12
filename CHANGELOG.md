@@ -21,6 +21,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The `tend-zellij-plugin` crate. It was a WASM stub the zellij backend never
   received data from. zellij support stays at the CLI baseline it already had
   (adopt-only: observe hooked panes and jump to them, no capture or send).
+- Dashboard OIDC sign-in, viewer accounts and pane/window sharing
+  (`[dashboard.login]`, `[dashboard.sharing]`, the `/auth/*`, `/share/*`,
+  `/api/operators`, `/api/viewers` and share-admin routes, the access and
+  shares dialogs, and the `openidconnect` dependency with the two advisory
+  exceptions it needed). They were multi-user features in a single-user
+  tool whose dashboard is off by default, and nothing in use depended on
+  them. The loopback dashboard and its bearer token are unchanged; the token
+  is now the only credential. A config that still has either section loads
+  with a warning and the section is ignored. `/api/access` no longer reports
+  `login` or `capabilities.pane_sharing`. Enrolled accounts and share
+  databases under the data directory (`dashboard-operators/`,
+  `dashboard-sharing/`) are no longer read and can be deleted.
 
 ### Fixed
 
