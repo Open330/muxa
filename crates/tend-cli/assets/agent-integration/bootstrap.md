@@ -30,6 +30,12 @@ For a required human approval, choice or missing information, use
 clients receive it. Read the actual reply before acting; do not request already
 authorized routine actions or send duplicate questions.
 
+When you finish a result someone must look at, file one record: in a managed
+pipeline `tend work done --summary "..." [--commit SHA] [--decision-needed
+"..." --option A --option B --recommend "..."] [--evidence test-pass:CMD]`,
+otherwise `tend_file_result` with the same fields. That record, not your final
+message, is what the person decides from.
+
 For interrupted peers or real human decisions, read the recovery workflow in
 the collaboration guide (workflows=true). Reuse request IDs; an interruption
 keeps work open, and an answer is not automatic approval.

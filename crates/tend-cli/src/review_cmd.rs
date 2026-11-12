@@ -108,9 +108,108 @@ impl DecisionArgs {
     }
 }
 
+/// The result record `tend work done` files: what was done, and what the
+/// person needs to decide about it.
+#[derive(Debug, Default, clap::Args)]
+pub(crate) struct ResultRecordArgs {
+    /// One paragraph on what you finished. Files a review item for the
+    /// person; every other record flag needs it.
+    #[arg(long, value_name = "TEXT")]
+    pub summary: Option<String>,
+    /// A commit that holds the result (same as --evidence commit:SHA).
+    #[arg(long = "commit", value_name = "SHA")]
+    pub commits: Vec<String>,
+    #[command(flatten)]
+    pub decision: DecisionArgs,
+}
+
+impl ResultRecordArgs {
+    fn is_empty(&self) -> bool {
+        let d = &self.decision;
+        self.summary.is_none()
+            && self.commits.is_empty()
+            && d.decision_needed.is_none()
+            && d.options.is_empty()
+            && d.recommend.is_none()
+            && d.evidence.is_empty()
+            && d.repo.is_none()
+    }
+
+    /// The review item for one completed pipeline alias, or `None` when no
+    /// record flag was given. Keyed by alias and generation, so reporting
+    /// the same completion again returns the same item.
+    pub(crate) fn into_review(
+        self,
+        identity: &tend::work::WorkIdentity,
+        alias: &str,
+        generation: u64,
+    ) -> Result<Option<NewReview>> {
+        if self.is_empty() {
+            return Ok(None);
+        }
+        let Some(summary) = self.summary else {
+            bail!("a result record needs --summary");
+        };
+        let mut decision = self.decision;
+        let commits = self.commits.into_iter().map(|sha| format!("commit:{sha}"));
+        decision.evidence.splice(0..0, commits);
+        Ok(Some(NewReview {
+            target: ReviewTarget::Work {
+                workspace: identity.workspace_id.clone(),
+                work: identity.work_id.clone(),
+                alias: Some(alias.to_owned()),
+                pipeline_generation: Some(generation),
+            },
+            summary,
+            anchor: None,
+            idempotency_key: Some(result_key(
+                &identity.workspace_id,
+                &identity.work_id,
+                alias,
+                generation,
+            )),
+            requested_by: ReviewActor {
+                kind: ActorKind::Agent,
+                label: Some(alias.to_owned()),
+            },
+            decision: decision.build()?,
+        }))
+    }
+}
+
+/// A bounded idempotency key for a completion: `work-done:` and a digest
+/// of the JSON tuple, so no component can shift into another (names may
+/// contain `/`) and long Work names stay within the key limit.
+fn result_key(workspace: &str, work: &str, alias: &str, generation: u64) -> String {
+    use sha2::Digest as _;
+    let tuple = serde_json::to_string(&(workspace, work, alias, generation)).unwrap_or_default();
+    let digest = sha2::Sha256::digest(tuple.as_bytes());
+    let mut key = String::from("work-done:");
+    for byte in &digest[..16] {
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+/// File `review` after checking the daemon serves what it carries.
+pub(crate) async fn file(client: &Client, review: &NewReview) -> Result<ReviewItem> {
+    require_capability(client).await?;
+    if review.decision.is_some() {
+        require_decision_capability(client).await?;
+    }
+    Ok(client.review_create(review).await?)
+}
+
 /// Top of the git checkout holding the current directory, if any.
 fn current_checkout() -> Option<std::path::PathBuf> {
+    checkout_of(std::path::Path::new("."))
+}
+
+/// Top of the git checkout holding `dir`, if any.
+pub(crate) fn checkout_of(dir: &std::path::Path) -> Option<std::path::PathBuf> {
     let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
         .args(["rev-parse", "--show-toplevel"])
         .stderr(std::process::Stdio::null())
         .output()
@@ -563,6 +662,50 @@ mod tests {
             ..DecisionArgs::default()
         };
         assert!(bad.build().is_err());
+    }
+
+    #[test]
+    fn work_done_files_a_keyed_record_only_with_a_summary() {
+        let identity = tend::work::WorkIdentity::new("tend", "storage");
+        assert!(ResultRecordArgs::default()
+            .into_review(&identity, "impl", 3)
+            .unwrap()
+            .is_none());
+        let without_summary = ResultRecordArgs {
+            commits: vec!["abc123".into()],
+            ..ResultRecordArgs::default()
+        };
+        assert!(without_summary.into_review(&identity, "impl", 3).is_err());
+        let record = |generation| {
+            ResultRecordArgs {
+                summary: Some("done".into()),
+                commits: vec!["abc123".into()],
+                decision: DecisionArgs {
+                    repo: Some("/src/tend".into()),
+                    evidence: vec!["test-pass:cargo test".into()],
+                    ..DecisionArgs::default()
+                },
+            }
+            .into_review(&identity, "impl", generation)
+            .unwrap()
+            .unwrap()
+        };
+        let first = record(3);
+        assert_eq!(first.idempotency_key, record(3).idempotency_key);
+        assert_ne!(first.idempotency_key, record(4).idempotency_key);
+        assert!(first.idempotency_key.as_ref().unwrap().len() <= 128);
+        assert_eq!(
+            describe_target(&first.target),
+            "work tend/storage @impl gen 3"
+        );
+        assert_ne!(
+            result_key("tend", "STORAGE/1", "impl", 3),
+            result_key("tend", "STORAGE", "1/impl", 3),
+            "components cannot shift into each other"
+        );
+        let decision = first.decision.unwrap();
+        assert!(matches!(&decision.evidence[0], Evidence::Commit { sha, .. } if sha == "abc123"));
+        assert_eq!(decision.evidence.len(), 2);
     }
 
     #[test]
