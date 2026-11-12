@@ -22,3 +22,11 @@ With no agents at all every room is dimmed.
 
 On macOS, the calm state (no waiting, no error) can use `menubar-template.svg` as a template image so
 the system tints it; any state that shows colour must use a non-template image from `states/`.
+
+## App icon
+
+The app icon (`assets/icon.svg`, copied to `appicon-states.svg`) shows all four rooms lit in their
+state colours on the graphite ground, so the icon itself teaches the rule: coral top left, amber top
+right, green bottom left, paper bottom right. `apps/tend-macos/Scripts/generate-app-icon.sh` renders
+the AppIcon set from it. `appicon-calm.svg` and `appicon-call.svg` are the earlier white and
+single-amber versions, kept for reference.
