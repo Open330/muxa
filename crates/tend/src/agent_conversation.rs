@@ -329,10 +329,27 @@ pub fn codex_conversation(pid: u32) -> Conversation {
         }
         other => other,
     };
-    if process_start(pid) != before {
+    // A `/new` or `/resume` in this same process swaps its rollout without
+    // changing its start: listed again after the record was read, the
+    // rollouts it has open must be the ones the answer came from.
+    let again = open_files(pid);
+    if process_start(pid) != before
+        || open_rollouts(open.as_deref()) != open_rollouts(again.as_deref())
+    {
         return Conversation::Unstable("the process changed while it was being read".into());
     }
     answer
+}
+
+/// The rollouts among `open`, sorted, for comparing two listings.
+fn open_rollouts(open: Option<&[PathBuf]>) -> Option<Vec<&PathBuf>> {
+    let mut rollouts: Vec<&PathBuf> = open?
+        .iter()
+        .filter(|path| rollout_thread_id(path).is_some())
+        .collect();
+    rollouts.sort();
+    rollouts.dedup();
+    Some(rollouts)
 }
 
 /// The thread id a rollout's first record (`session_meta`) names. That
@@ -340,7 +357,7 @@ pub fn codex_conversation(pid: u32) -> Conversation {
 fn rollout_meta_id(path: &Path) -> Option<String> {
     use std::io::{BufRead, Read};
     const MAX_META: u64 = 1024 * 1024;
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_regular(path)?;
     let mut line = String::new();
     std::io::BufReader::new(file.take(MAX_META))
         .read_line(&mut line)
@@ -357,6 +374,21 @@ fn rollout_meta_id(path: &Path) -> Option<String> {
     Some(id.to_owned())
 }
 
+/// `path` opened for reading only if it is a regular file. Opened without
+/// following a final symlink and without blocking, so a FIFO or device put
+/// at a rollout's name is refused instead of waited on.
+fn open_regular(path: &Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 /// The paths of the regular files `pid` has open, or `None` when they
 /// cannot be listed.
 #[cfg(target_os = "linux")]
@@ -365,6 +397,8 @@ fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
     Some(
         entries
             .flatten()
+            // `stat` through the descriptor: never blocks, whatever it is.
+            .filter(|entry| std::fs::metadata(entry.path()).is_ok_and(|meta| meta.is_file()))
             .filter_map(|entry| std::fs::read_link(entry.path()).ok())
             .filter(|path| path.is_absolute())
             .collect(),
@@ -379,7 +413,7 @@ fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
     const LSOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
     let mut child = Command::new("lsof")
         // -b/-w: never block on a kernel call or warn; -a: AND the
-        // selections; -Fn: one `n<path>` line per file.
+        // selections; -Ftn: each file's type (`t`) and path (`n`).
         .args([
             "-b",
             "-w",
@@ -390,7 +424,7 @@ fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
             &pid.to_string(),
             "-d",
             "^txt",
-            "-Fn",
+            "-Ftn",
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -427,14 +461,23 @@ fn open_files(_pid: u32) -> Option<Vec<PathBuf>> {
     None
 }
 
-/// The `n<path>` lines of `lsof -Fn` output.
+/// The regular files in `lsof -Ftn` output: per descriptor (`f`), its type
+/// (`t`) and path (`n`); only `tREG` paths are kept.
 #[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(dead_code))]
 fn parse_lsof_names(text: &str) -> Vec<PathBuf> {
-    text.lines()
-        .filter_map(|line| line.strip_prefix('n'))
-        .filter(|path| path.starts_with('/'))
-        .map(PathBuf::from)
-        .collect()
+    let mut paths = Vec::new();
+    let mut regular = false;
+    for line in text.lines() {
+        match line.split_at_checked(1) {
+            Some(("f" | "p", _)) => regular = false,
+            Some(("t", kind)) => regular = kind == "REG",
+            Some(("n", path)) if regular && path.starts_with('/') => {
+                paths.push(PathBuf::from(path));
+            }
+            _ => {}
+        }
+    }
+    paths
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
@@ -657,7 +700,7 @@ mod tests {
 
     #[test]
     fn lsof_name_lines_are_paths() {
-        let out = "p42\nf3\nn/h/.codex/log/codex-tui.log\nf42\nn/h/x y.jsonl\nf7\nn[kqueue]\n";
+        let out = "p42\nf3\ntREG\nn/h/.codex/log/codex-tui.log\nf42\ntREG\nn/h/x y.jsonl\nf7\ntKQUEUE\nn[kqueue]\nf9\ntFIFO\nn/h/fifo.jsonl\nf10\nn/h/untyped\n";
         assert_eq!(
             parse_lsof_names(out),
             vec![
@@ -716,5 +759,50 @@ mod tests {
         assert_eq!(rollout_meta_id(&path), None);
         std::fs::write(&path, "{\"type\":\"response_item\",\"payload\":{}}\n").unwrap();
         assert_eq!(rollout_meta_id(&path), None);
+    }
+
+    /// A FIFO at a rollout's name is refused, never waited on, and a
+    /// symlink to a real rollout is not followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_or_symlink_at_a_rollout_name_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("r.jsonl");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let started = std::time::Instant::now();
+        assert_eq!(rollout_meta_id(&fifo), None);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        let real = dir.path().join("real.jsonl");
+        std::fs::write(
+            &real,
+            format!("{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{B}\"}}}}\n"),
+        )
+        .unwrap();
+        let link = dir.path().join("link.jsonl");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(rollout_meta_id(&real).as_deref(), Some(B));
+        assert_eq!(rollout_meta_id(&link), None);
+    }
+
+    /// The same process switching rollouts between two listings (a `/new`)
+    /// is not an answer.
+    #[test]
+    fn a_rollout_switch_between_listings_is_unstable() {
+        let path = |id: &str| {
+            PathBuf::from(format!(
+                "/h/.codex/sessions/2026/11/10/rollout-2026-11-10T16-39-46-{id}.jsonl"
+            ))
+        };
+        let log = PathBuf::from("/h/.codex/log/codex-tui.log");
+        let a = [path(A), log.clone()];
+        let a_again = [log.clone(), path(A), path(A)];
+        let b = [path(B)];
+        assert_eq!(open_rollouts(Some(&a)), open_rollouts(Some(&a_again)));
+        assert_ne!(open_rollouts(Some(&a)), open_rollouts(Some(&b)));
+        assert_ne!(open_rollouts(Some(&a)), open_rollouts(None));
     }
 }

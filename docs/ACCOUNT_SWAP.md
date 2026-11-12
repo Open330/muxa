@@ -251,9 +251,11 @@ process (`conversation_verified: true`):
   `~/Library/Application Support/asx/profiles` on macOS).
 - Codex: the rollout the process has open
   (`sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl`, through
-  `/proc/<pid>/fd` or `lsof`), whose first `session_meta` record must name
-  the same thread (`session_id_source: "codex_rollout"` when nothing else
-  named it).
+  `/proc/<pid>/fd` or `lsof`, regular files only), whose first
+  `session_meta` record must name the same thread, listed again after that
+  record is read so a `/new` in between is not taken for an answer. It
+  verifies the registry or the command line; with neither, the agent is
+  still left alone.
 
 A conversation tend can verify this way can be swapped even without a
 hook-registered id. One that disagrees with the registry or the command line

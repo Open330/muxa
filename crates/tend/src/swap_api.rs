@@ -220,8 +220,6 @@ pub enum SessionIdSource {
     Argv,
     /// Claude's `sessions/<pid>.json` for this exact process.
     ClaudeSessionFile,
-    /// The Codex rollout this exact process has open.
-    CodexRollout,
 }
 
 /// Why a swapped agent is due a follow-up. When more than one applies, the

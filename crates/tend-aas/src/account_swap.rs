@@ -2241,11 +2241,14 @@ fn runtime_conversation(kind: AgentKind, pid: u32) -> tend::agent_conversation::
     }
 }
 
-/// The source a conversation read by [`runtime_conversation`] is reported as.
-fn record_source(kind: AgentKind) -> SessionIdSource {
+/// The source a conversation read by [`runtime_conversation`] is reported
+/// as when nothing else names it. A Codex rollout has none on the wire yet
+/// (older clients could not decode a new one), so for Codex it verifies or
+/// vetoes the registry and the command line but does not stand alone.
+fn record_source(kind: AgentKind) -> Option<SessionIdSource> {
     match kind {
-        AgentKind::Codex => SessionIdSource::CodexRollout,
-        _ => SessionIdSource::ClaudeSessionFile,
+        AgentKind::ClaudeCode => Some(SessionIdSource::ClaudeSessionFile),
+        _ => None,
     }
 }
 
@@ -2253,7 +2256,7 @@ fn conversation_for(
     registry: Option<&str>,
     argv: Option<&str>,
     runtime: &tend::agent_conversation::Conversation,
-    record: SessionIdSource,
+    record: Option<SessionIdSource>,
 ) -> Result<(String, SessionIdSource), String> {
     use tend::agent_conversation::Conversation;
     match runtime {
@@ -2276,7 +2279,11 @@ fn conversation_for(
                     "identity conflict: launched with {launched} but the running process is on {id}; left alone"
                 ));
             }
-            Ok((id.clone(), record))
+            match (record, argv) {
+                (Some(record), _) => Ok((id.clone(), record)),
+                (None, Some(_)) => Ok((id.clone(), SessionIdSource::Argv)),
+                (None, None) => Err("no provider session id to resume".into()),
+            }
         }
         Conversation::Unknown(_) => match (registry, argv) {
             (Some(id), _) => Ok((id.to_owned(), SessionIdSource::Registry)),
@@ -3847,7 +3854,7 @@ mod tests {
         use tend::agent_conversation::Conversation;
         const A: &str = "96f5e88c-62df-42a7-914e-e206355969fb";
         const B: &str = "01a18182-0bf0-7801-97bf-c91154132258";
-        const CLAUDE: SessionIdSource = SessionIdSource::ClaudeSessionFile;
+        const CLAUDE: Option<SessionIdSource> = Some(SessionIdSource::ClaudeSessionFile);
         let verified = Conversation::Verified(A.into());
         let unknown = Conversation::Unknown("unreadable".into());
 
@@ -3899,11 +3906,15 @@ mod tests {
             (B.to_owned(), SessionIdSource::Argv)
         );
         assert!(conversation_for(None, None, &unknown, CLAUDE).is_err());
-        // A Codex thread read from its open rollout is reported as such.
+        // A Codex rollout verifies the command line but does not stand alone.
         assert_eq!(
-            conversation_for(None, None, &verified, SessionIdSource::CodexRollout).unwrap(),
-            (A.to_owned(), SessionIdSource::CodexRollout)
+            conversation_for(None, Some(A), &verified, None).unwrap(),
+            (A.to_owned(), SessionIdSource::Argv)
         );
+        assert!(conversation_for(None, None, &verified, None).is_err());
+        assert!(conversation_for(None, Some(B), &verified, None)
+            .unwrap_err()
+            .contains("identity conflict"));
     }
 
     /// A bare `%N` means the one live pane it names; the same `%N` on two
