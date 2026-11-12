@@ -35,6 +35,7 @@ pub(super) struct ServerCtx {
     pub(super) fleet: Option<FleetRuntime>,
     pub(super) pipeline_runs: Arc<PipelineRunStore>,
     pub(super) reviews: crate::review::ReviewStore,
+    pub(super) work_store: crate::dashboard::work_store::SharedWorkStore,
     pub(super) work_up: Arc<WorkUpManager>,
     pub(super) mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>,
     pub(super) config_path: Option<PathBuf>,
@@ -289,6 +290,19 @@ async fn route(
         | RequestBody::DecisionQueue { .. }
         | RequestBody::DecisionHistory { .. }) => {
             Box::pin(decisions::handle(ctx, conn, turn, body)).await
+        }
+        body @ (RequestBody::WorkBacklog { .. }
+        | RequestBody::WorkEdit { .. }
+        | RequestBody::WorkRecordShow { .. }) => {
+            let (name, response) = Box::pin(super::work_backlog::response(
+                &ctx.work_store,
+                &ctx.reviews,
+                &ctx.pipeline_runs,
+                body,
+            ))
+            .await;
+            turn.kind = name;
+            Ok(Flow::Respond(response))
         }
         body @ (RequestBody::PipelineRuns
         | RequestBody::PipelineRegister { .. }

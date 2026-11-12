@@ -171,6 +171,7 @@ mod lifecycle;
 pub use lifecycle::*;
 
 mod work;
+mod work_backlog;
 pub use work::*;
 
 mod server;

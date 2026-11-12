@@ -33,6 +33,34 @@ Workspace
 - Unmanaged windows remain `Unlinked executions` and are inspected through
   execution-focused surfaces such as `tend watch`.
 
+## Backlog
+
+A Work can be planned before anything runs, and its record stays after its
+window closes:
+
+```sh
+tend work plan web/ENG-1 --title "Fix login" --goal "users land on /home" \
+  --prompt "Fix the login redirect" --pipeline pair --priority 1
+tend work list --stage queued      # the backlog, priority then age
+tend work up ENG-1                 # starts it from the plan; stage → in_progress
+tend work show ENG-1               # asked, done (durable Run), decided (result records)
+```
+
+`plan` creates a queued record (cwd defaults to the current directory) or
+edits only the fields given; an empty value clears a field and
+`--no-priority` clears the order. `work up` fills `--workspace`,
+`--pipeline`, `--body` and `--external` from the plan when they are not
+given, and uses the plan's directory where it would otherwise use the
+current one (a route's `cwd` or worktree still wins). `work show` works
+without a window: it prints the record, the durable Run's aliases, and every
+review item filed on the Work (`tend work done --summary`,
+`tend_file_result`) with its disposition.
+
+The records live in tendd (`dashboard-work.json`, shared with the
+dashboard's editor, which keeps the plan when it saves metadata) and are
+served over IPC as `work_backlog`, `work_edit` and `work_record_show`
+(`work_backlog_v1`).
+
 ## Current tmux compatibility
 
 Managed tmux currently binds one workspace to a session, one active Work run to

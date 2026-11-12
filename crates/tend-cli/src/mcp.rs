@@ -3679,6 +3679,7 @@ async fn start_work(client: &Client, args: &Value, config: &tend::config::Config
         return error_result("tend_start_work requires a work argument");
     };
     let up = crate::work_up::UpArgs {
+        planned_cwd: None,
         work,
         external: text("external"),
         pipeline: text("pipeline"),

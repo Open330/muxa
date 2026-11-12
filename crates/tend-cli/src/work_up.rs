@@ -87,6 +87,11 @@ pub struct UpArgs {
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
+    /// The planned Work's directory, used where the current directory
+    /// would be: a route's `cwd` or worktree still wins, and it is never
+    /// treated as an explicit `--cwd`.
+    #[arg(skip)]
+    pub planned_cwd: Option<PathBuf>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -179,11 +184,24 @@ pub(crate) struct Resolved {
 }
 
 pub async fn run(
-    args: UpArgs,
+    mut args: UpArgs,
     config: &Config,
     config_path: Option<PathBuf>,
     client: Option<&tend::ipc::Client>,
 ) -> Result<()> {
+    // A planned Work starts from its plan: arguments left out come from
+    // the backlog record, and starting it moves it to in progress.
+    let planned = match client {
+        Some(client) if crate::work_backlog::backlog_supported(client).await => {
+            let records = client.work_backlog(None).await.unwrap_or_default();
+            crate::work_backlog::planned_record(&records, &args.work, args.workspace.as_deref())
+                .cloned()
+        }
+        _ => None,
+    };
+    if let Some(record) = &planned {
+        crate::work_backlog::fill_from_plan(&mut args, record);
+    }
     let json = args.json;
     let dry_run = args.dry_run;
     let show_prompts = args.show_prompts;
@@ -197,7 +215,20 @@ pub async fn run(
         let client = client.ok_or_else(|| {
             anyhow::anyhow!("tend work up requires tendd for durable pipeline state")
         })?;
-        apply_durable(resolved, client).await?
+        let result = apply_durable(resolved, client).await?;
+        if let Some(record) = planned
+            .as_ref()
+            .filter(|record| record.metadata.stage == tend::work::WorkStage::Queued)
+        {
+            let started = tend::work::WorkEdit {
+                stage: Some(tend::work::WorkStage::InProgress),
+                ..tend::work::WorkEdit::default()
+            };
+            if let Err(error) = client.work_edit(&record.identity, &started).await {
+                eprintln!("note: started, but the backlog record stays queued: {error}");
+            }
+        }
+        result
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -812,9 +843,10 @@ fn resolve_cwd(
         (None, Some(template)) => PathBuf::from(expand_tilde(&vars.render(template))),
         // Unpinned: the work window's own directory if it has one, so a
         // re-run from anywhere converges instead of arguing about cwd.
-        (None, None) => match existing {
-            Some(existing) => existing.cwd.clone(),
-            None => std::env::current_dir().context("resolve current directory")?,
+        (None, None) => match (existing, &args.planned_cwd) {
+            (Some(existing), _) => existing.cwd.clone(),
+            (None, Some(planned)) => planned.clone(),
+            (None, None) => std::env::current_dir().context("resolve current directory")?,
         },
     };
     let cwd = tend::paths::canonicalize(&source)
@@ -1883,6 +1915,7 @@ mod tests {
 
     fn up_args(cwd: Option<&str>) -> UpArgs {
         UpArgs {
+            planned_cwd: None,
             work: "eng-1".into(),
             external: None,
             pipeline: None,

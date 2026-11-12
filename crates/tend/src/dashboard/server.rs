@@ -178,6 +178,9 @@ pub struct DashboardRuntimeConfig {
     pub activity_path: Option<PathBuf>,
     pub session_activity_path: Option<PathBuf>,
     pub work_store_path: Option<PathBuf>,
+    /// The daemon's shared Work store; when set, `work_store_path` is not
+    /// loaded a second time.
+    pub work_store: Option<crate::dashboard::work_store::SharedWorkStore>,
     pub stats_config: StatsConfig,
     pub fleet: Option<FleetRuntime>,
 }
@@ -268,8 +271,13 @@ impl AppState {
     }
 
     #[must_use]
-    pub fn with_work_store_path(mut self, path: Option<PathBuf>) -> Self {
-        self.work_store = Arc::new(tokio::sync::Mutex::new(WorkStore::load(path)));
+    pub fn with_work_store_path(
+        mut self,
+        path: Option<PathBuf>,
+        shared: Option<crate::dashboard::work_store::SharedWorkStore>,
+    ) -> Self {
+        self.work_store =
+            shared.unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(WorkStore::load(path))));
         self
     }
 
@@ -445,7 +453,7 @@ pub async fn serve(
         .with_collaboration(collaboration)
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
-        .with_work_store_path(runtime.work_store_path)
+        .with_work_store_path(runtime.work_store_path, runtime.work_store)
         .with_stats_config(runtime.stats_config)
         .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
@@ -4325,7 +4333,7 @@ mod tests {
         });
         let state = public_read_state("edit-pat")
             .with_backend(backend)
-            .with_work_store_path(Some(path.clone()));
+            .with_work_store_path(Some(path.clone()), None);
         let app = router(state);
         let body = r#"{
             "key":{"host":"herdr","socket":"herdr","session_id":"session-1","window_id":"window-1"},

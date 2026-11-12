@@ -22,6 +22,8 @@ pub struct Server {
     pub(super) fleet: Option<FleetRuntime>,
     pub(super) pipeline_runs: Arc<PipelineRunStore>,
     pub(super) reviews: crate::review::ReviewStore,
+    /// Durable Work records (the backlog), shared with the dashboard.
+    pub(super) work_store: crate::dashboard::work_store::SharedWorkStore,
     pub(super) work_up: Arc<WorkUpManager>,
     pub(super) mux_snapshots: Arc<crate::mux_snapshot_control::MuxSnapshotControl>, // WS-F: snapshot
     /// The daemon's `config.toml`, for the requests that read and replace it
@@ -51,6 +53,7 @@ impl Server {
             fleet: self.fleet.clone(),
             pipeline_runs: self.pipeline_runs.clone(),
             reviews: self.reviews.clone(),
+            work_store: self.work_store.clone(),
             work_up: self.work_up.clone(),
             mux_snapshots: self.mux_snapshots.clone(),
             config_path: self.config_path.clone(),
@@ -80,6 +83,9 @@ impl Server {
             fleet: None,
             pipeline_runs: PipelineRunStore::in_memory(),
             reviews: crate::review::ReviewStore::in_memory(),
+            work_store: std::sync::Arc::new(tokio::sync::Mutex::new(
+                crate::dashboard::work_store::WorkStore::memory(),
+            )),
             work_up,
             mux_snapshots,
             config_path: None,
@@ -216,6 +222,17 @@ impl Server {
     #[must_use]
     pub fn with_pipeline_runs(mut self, pipeline_runs: Arc<PipelineRunStore>) -> Self {
         self.pipeline_runs = pipeline_runs;
+        self
+    }
+
+    /// Serve the Work backlog from `work_store`, the same store the
+    /// dashboard edits.
+    #[must_use]
+    pub fn with_work_store(
+        mut self,
+        work_store: crate::dashboard::work_store::SharedWorkStore,
+    ) -> Self {
+        self.work_store = work_store;
         self
     }
 

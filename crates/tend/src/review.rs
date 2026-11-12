@@ -485,6 +485,40 @@ impl ReviewStore {
         .await
     }
 
+    /// Every item filed on one Work, any alias, oldest first: the result
+    /// records and their dispositions, for `tend work show`.
+    pub async fn for_work(
+        &self,
+        workspace: String,
+        work: String,
+        limit: usize,
+    ) -> Result<ReviewPage, ReviewError> {
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
+        self.with(move |connection| {
+            // Target keys are JSON tuples ("work", workspace, work, alias);
+            // matching the encoded prefix selects every alias of this Work
+            // and nothing else (a quote inside a name stays escaped).
+            let mut prefix = serde_json::to_string(&("work", &workspace, &work))?;
+            prefix.pop();
+            prefix.push(',');
+            let mut statement = connection.prepare(
+                "SELECT body FROM review_items
+                 WHERE substr(target_key, 1, length(?1)) = ?1
+                 ORDER BY requested_at_ns ASC, rowid ASC LIMIT ?2",
+            )?;
+            let fetch = i64::try_from(limit + 1).unwrap_or(i64::MAX);
+            let rows =
+                statement.query_map(params![prefix, fetch], |row| row.get::<_, String>(0))?;
+            let mut items = rows
+                .map(|body| Ok(serde_json::from_str(&body?)?))
+                .collect::<Result<Vec<ReviewItem>, ReviewError>>()?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            Ok(ReviewPage { items, has_more })
+        })
+        .await
+    }
+
     /// Decided items, most recently decided first: the review half of
     /// "what did I decide". `has_more` as in [`Self::list`].
     pub async fn decided(&self, limit: usize) -> Result<ReviewPage, ReviewError> {
@@ -942,6 +976,33 @@ mod tests {
         assert_eq!(decided.id, open.id);
         assert_eq!(decided.disposition.unwrap().kind, DispositionKind::Returned);
         assert_eq!(store.summary().await.unwrap().open, 0);
+    }
+
+    #[tokio::test]
+    async fn for_work_selects_every_alias_of_one_work_only() {
+        let store = ReviewStore::in_memory();
+        let work = |workspace: &str, name: &str, alias: Option<&str>| ReviewTarget::Work {
+            workspace: workspace.into(),
+            work: name.into(),
+            alias: alias.map(Into::into),
+            pipeline_generation: None,
+        };
+        for target in [
+            work("web", "ENG-1", Some("impl")),
+            work("web", "ENG-1", None),
+            work("web", "ENG-10", Some("impl")),
+            work("web", "ENG-1\",\"x", Some("impl")),
+            work("api", "ENG-1", Some("impl")),
+            session("s"),
+        ] {
+            store.create(claim(target, None)).await.unwrap();
+        }
+        let page = store
+            .for_work("web".into(), "ENG-1".into(), 10)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 2, "{:?}", page.items);
+        assert!(!page.has_more);
     }
 
     #[tokio::test]

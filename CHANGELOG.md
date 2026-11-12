@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- A Work backlog. `tend work plan WORKSPACE/WORK --title … --prompt …
+  [--pipeline …] [--priority N]` records a Work without launching it,
+  `tend work list --stage queued` lists the backlog in priority order,
+  `tend work up WORK` starts a planned Work from its plan and moves it to
+  in progress, and `tend work show WORK` prints what was asked, done and
+  decided (the result records and their dispositions) even after the window
+  closed. tendd now owns the Work store for IPC and the dashboard together
+  (`work_backlog_v1`).
 - Every agent row records where its current state came from:
   `state_source` in `tend status --json`, the IPC agent rows and
   `state.json` carries the kind of signal (`hook`, `provider_record`,
