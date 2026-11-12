@@ -437,32 +437,22 @@ extension AppModel {
         }
         let resolvedEnvironment = environment
         return try await Task.detached {
-            let process = Process()
-            process.executableURL = executable
-            process.arguments = arguments
-            process.environment = resolvedEnvironment
-            let output = Pipe()
-            let errors = Pipe()
-            process.standardOutput = output
-            process.standardError = errors
-            let stdin = Pipe()
-            process.standardInput = input == nil ? FileHandle.nullDevice : stdin
-            try process.run()
-            if let input {
-                stdin.fileHandleForWriting.write(Data(input.utf8))
-                try? stdin.fileHandleForWriting.close()
-            }
-            let standardOutput = output.fileHandleForReading.readDataToEndOfFile()
-            let standardError = errors.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
+            let result = try TendCLIProcess.run(
+                executable: executable,
+                arguments: arguments,
+                environment: resolvedEnvironment,
+                input: input.map { Data($0.utf8) }
+            )
+            let standardOutput = result.standardOutput
+            let standardError = result.standardError
+            guard result.terminationStatus == 0 else {
                 let reason = String(decoding: standardError, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let fallback = String(decoding: standardOutput, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 let detail = reason.isEmpty ? fallback : reason
                 throw TendIPCError.server(
-                    detail.isEmpty ? "tend work compose exited with \(process.terminationStatus)" : detail
+                    detail.isEmpty ? "tend work compose exited with \(result.terminationStatus)" : detail
                 )
             }
             return try TendWorkComposeResult.decode(standardOutput)

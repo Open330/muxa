@@ -1123,7 +1123,8 @@ extension TendIPCClient {
     }
 
     nonisolated func makeAutomationClient() -> TendAutomationClient {
-        TendAutomationClient(socketPath: socketPath)
+        let socketPath = socketPath
+        return automationClientCache.value { TendAutomationClient(socketPath: socketPath) }
     }
 
     /// Throws rather than returning an empty list when the daemon predates

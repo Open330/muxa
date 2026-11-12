@@ -144,16 +144,12 @@ struct DaemonSocketOwner: Equatable, Sendable {
 
     private static func stopHomebrewService(brew: String) async throws {
         try await Task.detached(priority: .userInitiated) {
-            let process = Process()
-            let errors = Pipe()
-            process.executableURL = URL(fileURLWithPath: brew)
-            process.arguments = ["services", "stop", "open330/tap/tend"]
-            process.standardOutput = FileHandle.nullDevice
-            process.standardError = errors
-            try process.run()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
-                let data = errors.fileHandleForReading.readDataToEndOfFile()
+            let result = try TendCLIProcess.run(
+                executable: URL(fileURLWithPath: brew),
+                arguments: ["services", "stop", "open330/tap/tend"]
+            )
+            guard result.terminationStatus == 0 else {
+                let data = result.standardError
                 let detail = String(decoding: data, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 throw TendIPCError.server(

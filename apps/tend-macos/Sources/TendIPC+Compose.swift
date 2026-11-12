@@ -233,7 +233,8 @@ extension TendIPCClient {
 
     /// A compose client bound to this daemon's socket.
     nonisolated func makeWorkComposeClient() -> TendWorkComposeClient {
-        TendWorkComposeClient(socketPath: socketPath)
+        let socketPath = socketPath
+        return workComposeClientCache.value { TendWorkComposeClient(socketPath: socketPath) }
     }
 
     /// Drafts (or refines, when `current` is given) a pipeline through the

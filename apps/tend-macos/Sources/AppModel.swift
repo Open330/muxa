@@ -264,7 +264,11 @@ final class AppModel: ObservableObject {
     private let workspaceProjector = TendCoalescedProjection<TendWorkspaceProjection>()
     private var projectionBuiltAt = Date.distantPast
     private var coverageSubscription: AnyCancellable?
+    /// Held by whichever full or Fleet-event refresh is running.
     private var refreshInFlight = false
+    /// A full refresh asked for while the slot was held. It runs once, right
+    /// after the slot frees, and resumes everyone who asked meanwhile.
+    private var pendingFullRefresh: PendingFullRefresh?
     private var fleetRefreshPending = false
     private var askRefreshPending = false
     private var pipelineRefreshPending = false
@@ -508,10 +512,43 @@ final class AppModel: ObservableObject {
         await refresh(ifGeneration: nil)
     }
 
+    /// Callers always observe a refresh that started after they asked: one
+    /// that finds another refresh running waits for the single follow-up
+    /// refresh rather than returning with stale state.
     private func refresh(ifGeneration generation: UInt64?) async {
-        guard !refreshInFlight else { return }
+        guard !refreshInFlight else {
+            await withCheckedContinuation { continuation in
+                var pending = pendingFullRefresh ?? PendingFullRefresh(generation: generation)
+                pending.merge(generation: generation)
+                pending.waiters.append(continuation)
+                pendingFullRefresh = pending
+            }
+            return
+        }
         refreshInFlight = true
-        defer { refreshInFlight = false }
+        await performFullRefresh(ifGeneration: generation)
+        releaseRefreshSlot()
+    }
+
+    /// Frees the refresh slot, or hands it straight to the coalesced follow-up
+    /// refresh when one was requested while it was held.
+    private func releaseRefreshSlot() {
+        guard let pending = pendingFullRefresh else {
+            refreshInFlight = false
+            return
+        }
+        pendingFullRefresh = nil
+        // The slot stays held, so nothing can slip in between.
+        Task { [weak self] in
+            if let self {
+                await performFullRefresh(ifGeneration: pending.generation)
+                releaseRefreshSlot()
+            }
+            for waiter in pending.waiters { waiter.resume() }
+        }
+    }
+
+    private func performFullRefresh(ifGeneration generation: UInt64?) async {
         do {
             let epoch = daemonIdentityEpoch
             let hello = try await client.hello()
@@ -625,9 +662,9 @@ final class AppModel: ObservableObject {
                 let epoch = daemonIdentityEpoch
                 let updates = try await client.fleetUpdates(onReady: { [weak self] hello in
                     Task { @MainActor [weak self] in
-                        guard let self, connectionGeneration == generation,
-                              daemonIdentityEpoch == epoch else { return }
-                        adoptDaemonHello(hello)
+                        guard let self, self.connectionGeneration == generation,
+                              self.daemonIdentityEpoch == epoch else { return }
+                        self.adoptDaemonHello(hello)
                     }
                 })
                 for try await update in updates {
@@ -866,8 +903,8 @@ final class AppModel: ObservableObject {
         }
         refreshInFlight = true
         defer {
-            refreshInFlight = false
             lastFleetRefresh = Date()
+            releaseRefreshSlot()
         }
         do {
             async let sessionsRequest = client.listSessions()
@@ -1900,29 +1937,19 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("tend")
         let hasBundledCLI = FileManager.default.isExecutableFile(atPath: bundled.path)
         return try await Task.detached {
-            let process = Process()
-            process.executableURL = hasBundledCLI ? bundled : URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = hasBundledCLI ? arguments : ["tend"] + arguments
             var environment = ProcessInfo.processInfo.environment
             environment["TEND_SOCKET"] = socketPath
-            process.environment = environment
-            let output = Pipe()
-            let errors = Pipe()
-            process.standardOutput = output
-            process.standardError = errors
-            let stdin = Pipe()
-            process.standardInput = input == nil ? FileHandle.nullDevice : stdin
-            try process.run()
-            if let input {
-                stdin.fileHandleForWriting.write(Data(input.utf8))
-                try? stdin.fileHandleForWriting.close()
-            }
-            process.waitUntilExit()
-            let standardOutput = output.fileHandleForReading.readDataToEndOfFile()
-            let standardError = errors.fileHandleForReading.readDataToEndOfFile()
+            let result = try TendCLIProcess.run(
+                executable: hasBundledCLI ? bundled : URL(fileURLWithPath: "/usr/bin/env"),
+                arguments: hasBundledCLI ? arguments : ["tend"] + arguments,
+                environment: environment,
+                input: input.map { Data($0.utf8) }
+            )
+            let standardOutput = result.standardOutput
+            let standardError = result.standardError
             let message = String(data: standardOutput, encoding: .utf8) ?? ""
             let errorMessage = String(data: standardError, encoding: .utf8) ?? ""
-            guard process.terminationStatus == 0 else {
+            guard result.terminationStatus == 0 else {
                 let reason = errorMessage.isEmpty ? message : errorMessage
                 let command = arguments.prefix(2).joined(separator: " ")
                 throw TendIPCError.server(
@@ -1983,6 +2010,9 @@ final class AppModel: ObservableObject {
                 select(.shell(session.id))
             }
             return session
+        } catch is CancellationError {
+            // The caller gave up (a Live Pane closed mid-attach); nothing to report.
+            return nil
         } catch {
             TendLog.app.error("pane attach failed: \(error.localizedDescription, privacy: .public)")
             attachError = error.localizedDescription
@@ -2181,4 +2211,20 @@ final class AppModel: ObservableObject {
 struct TendTemplateChoice: Equatable {
     let id = UUID()
     let pipeline: String?
+}
+
+/// Full refresh requests that arrived while another refresh held the slot.
+private struct PendingFullRefresh {
+    /// `nil` applies the result whatever the connection generation; a
+    /// generation-scoped request is dropped if the connection moved on.
+    var generation: UInt64?
+    var waiters: [CheckedContinuation<Void, Never>] = []
+
+    mutating func merge(generation other: UInt64?) {
+        guard let current = generation, let other else {
+            generation = nil
+            return
+        }
+        generation = max(current, other)
+    }
 }

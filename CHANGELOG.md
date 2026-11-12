@@ -56,6 +56,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On macOS, tendd no longer marks a tracked task as stopped when its process
   is still running under another user, and no longer starts a `kill` process
   for every pid-tracked row while holding the agent registry.
+- The macOS app no longer freezes an action that runs the bundled `tend`
+  command (registering a host, drafting a pipeline, starting an agent) when
+  that command prints a lot of output or errors.
+- Quick repeated changes in the macOS app, such as double-clicking an
+  automation's on/off switch, now reach tendd in the order you made them.
+- Closing a Live Pane while it is still attaching no longer leaves the
+  attach session running in tendd; a failure to end a pane's session is now
+  logged instead of ignored.
+- Refreshing in the macOS app right after an action, while a background
+  update is already running, now shows the new state instead of waiting up
+  to 15 seconds for the next update.
 
 ## [0.10.11] - 2026-11-12
 

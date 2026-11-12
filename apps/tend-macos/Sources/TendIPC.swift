@@ -1148,6 +1148,25 @@ final class SerializedIPCTransport: @unchecked Sendable {
     }
 }
 
+/// One lazily built value, shared by every caller.
+///
+/// The feature clients below each own a `SerializedIPCTransport`; building a
+/// fresh one per call would give every request its own queue and lose the
+/// one-at-a-time wire order that transport exists for.
+final class IPCLazyClient<Client: Sendable>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var client: Client?
+
+    func value(_ make: () -> Client) -> Client {
+        lock.lock()
+        defer { lock.unlock() }
+        if let client { return client }
+        let made = make()
+        client = made
+        return made
+    }
+}
+
 /// What a successful `hello` says about which daemon answered.
 struct TendDaemonHello: Equatable, Sendable {
     /// Random per-process id; nil from a tendd older than
@@ -1196,6 +1215,13 @@ actor TendIPCClient {
     private var terminalReadTransports: [String: SerializedIPCTransport] = [:]
     private let fleetReadTransports: [SerializedIPCTransport]
     private let attachmentClientID: String
+    // Feature clients, built once on first use. `socketPath` is immutable, so
+    // the cache never goes stale: pointing the app at another socket builds a
+    // new `TendIPCClient`, and with it empty caches.
+    let automationClientCache = IPCLazyClient<TendAutomationClient>()
+    let configClientCache = IPCLazyClient<TendConfigClient>()
+    let workComposeClientCache = IPCLazyClient<TendWorkComposeClient>()
+    let agentStartClientCache = IPCLazyClient<TendAgentStartClient>()
 
     init(socketPath: String = TendIPCClient.defaultSocketPath()) {
         self.socketPath = socketPath

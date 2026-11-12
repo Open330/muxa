@@ -530,6 +530,8 @@ private struct FleetPaneWorkspace: View {
     let pane: TendWatchPane
     @ObservedObject var model: AppModel
     @State private var attachedSessionID: String?
+    /// The in-flight panel attach, so closing the panel can cancel it.
+    @State private var attachTask: Task<Void, Never>?
     @State private var module: PaneModule = .overview
     @ObservedObject private var reviewDrafts = ReviewDraftStore.shared // WS-D: Changes tab badge
 
@@ -629,9 +631,18 @@ private struct FleetPaneWorkspace: View {
     }
 
     private func attachInPanel() {
-        guard attachedSessionID == nil, !model.isAttachingPane else { return }
-        Task {
-            guard let session = await model.attach(pane: pane, selectShell: false) else { return }
+        guard attachedSessionID == nil, attachTask == nil, !model.isAttachingPane else { return }
+        let model = model
+        attachTask = Task {
+            let session = await model.attach(pane: pane, selectShell: false)
+            // The panel closed mid-attach: `stopPanelAttach` had no session
+            // id to end yet, so the one tendd just created is ours to end.
+            if Task.isCancelled {
+                if let session { Self.terminatePanelSession(session.id, model: model) }
+                return
+            }
+            attachTask = nil
+            guard let session else { return }
             attachedSessionID = session.id
         }
     }
@@ -646,10 +657,22 @@ private struct FleetPaneWorkspace: View {
     }
 
     private func stopPanelAttach() {
+        attachTask?.cancel()
+        attachTask = nil
         guard let sessionID = attachedSessionID else { return }
         attachedSessionID = nil
+        Self.terminatePanelSession(sessionID, model: model)
+    }
+
+    private static func terminatePanelSession(_ sessionID: String, model: AppModel) {
         Task {
-            try? await model.client.terminateSession(id: sessionID)
+            do {
+                try await model.client.terminateSession(id: sessionID)
+            } catch {
+                TendLog.app.error(
+                    "ending Live Pane session \(sessionID, privacy: .public) failed: \(error.localizedDescription, privacy: .public)"
+                )
+            }
             await model.refresh()
         }
     }

@@ -276,7 +276,8 @@ extension TendIPCClient {
     static let configLaunchCapability = "config_launch_v1"
 
     nonisolated func makeConfigClient() -> TendConfigClient {
-        TendConfigClient(socketPath: socketPath)
+        let socketPath = socketPath
+        return configClientCache.value { TendConfigClient(socketPath: socketPath) }
     }
 
     private func requireConfigEdit() throws -> TendConfigClient {
