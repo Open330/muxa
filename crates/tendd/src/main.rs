@@ -312,6 +312,11 @@ async fn run() -> Result<()> {
     let automation = build_automation(&cfg, config_path.clone());
     let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
         .context("loading durable pipeline Runs")?;
+    // One Work store for IPC (the backlog) and the dashboard, so a save
+    // from either never drops the other's records.
+    let work_store = Arc::new(tokio::sync::Mutex::new(
+        tend::dashboard::work_store::WorkStore::load(paths::default_dashboard_work_file()),
+    ));
 
     // The set of backends this daemon observes simultaneously — tmux + herdr
     // during a migration (see `docs/MULTI_HOST.md`). Resolution honors
@@ -565,6 +570,7 @@ async fn run() -> Result<()> {
             activity_path: dashboard_activity_path,
             session_activity_path: dashboard_session_activity_path,
             work_store_path: paths::default_dashboard_work_file(),
+            work_store: Some(work_store.clone()),
             stats_config: dashboard_stats_config,
             fleet: Some(fleet_runtime.clone()),
         };
@@ -622,6 +628,7 @@ async fn run() -> Result<()> {
         .with_fleet(fleet_runtime)
         .with_pipeline_runs(pipeline_runs.clone())
         .with_reviews(build_reviews())
+        .with_work_store(work_store)
         .with_mux_snapshots(mux_snapshots) // WS-F: snapshot
         .with_swap(Some(swap_jobs))
         .with_restart_controller(Arc::clone(&restart));

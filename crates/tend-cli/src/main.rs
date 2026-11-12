@@ -58,6 +58,7 @@ mod upgrade;
 mod watch;
 #[cfg(windows)]
 mod windows_detach;
+mod work_backlog;
 mod work_compose;
 mod work_init;
 mod work_options;
@@ -987,6 +988,9 @@ enum WorkCmd {
     /// external issue, route the Work, and create missing agent sessions.
     /// Re-running converges instead of duplicating.
     Up(work_up::UpArgs),
+    /// Add or edit a planned Work in the backlog without launching it.
+    /// `tend work up WORK` later starts it from the plan.
+    Plan(work_backlog::PlanArgs),
     /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
     /// List tend-managed work windows.

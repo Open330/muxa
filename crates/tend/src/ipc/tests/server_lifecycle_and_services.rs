@@ -424,6 +424,9 @@ async fn client_disconnect_before_response_is_clean_handler_exit() {
         fleet: None,
         pipeline_runs: PipelineRunStore::in_memory(),
         reviews: crate::review::ReviewStore::in_memory(),
+        work_store: Arc::new(tokio::sync::Mutex::new(
+            crate::dashboard::work_store::WorkStore::memory(),
+        )),
         work_up: WorkUpManager::new(PathBuf::from("/tmp/tend-disconnect-test.sock")),
         mux_snapshots: crate::mux_snapshot_control::MuxSnapshotControl::new(PathBuf::from(
             "/tmp/tend-disconnect-test.sock",
@@ -2571,6 +2574,86 @@ async fn swap_accounts_returns_configured_metadata_even_when_jobs_are_halted() {
     assert!(!serde_json::to_string(&accounts)
         .unwrap()
         .contains("private"));
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_planned_work_round_trips_over_ipc_with_its_result_records() {
+    use crate::review::{ActorKind, NewReview, ReviewActor, ReviewTarget};
+    use crate::work::{WorkEdit, WorkIdentity, WorkStage};
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("tend-backlog.sock");
+    let work_store = Arc::new(tokio::sync::Mutex::new(
+        crate::dashboard::work_store::WorkStore::load(Some(dir.path().join("work.json"))),
+    ));
+    let server = Server::new(sock.clone(), Store::shared()).with_work_store(work_store.clone());
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+    assert!(client
+        .hello(Duration::from_secs(3))
+        .await
+        .unwrap()
+        .capabilities
+        .iter()
+        .any(|c| c == crate::work::WORK_BACKLOG_CAPABILITY));
+
+    let id = WorkIdentity::new("web", "ENG-1");
+    let planned = client
+        .work_edit(
+            &id,
+            &WorkEdit {
+                title: Some("Fix login".into()),
+                prompt: Some("fix the redirect".into()),
+                ..WorkEdit::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(planned.metadata.stage, WorkStage::Queued);
+    assert!(client
+        .work_edit(&WorkIdentity::new("web", "EMPTY"), &WorkEdit::default())
+        .await
+        .is_err());
+    let queued = client.work_backlog(Some(WorkStage::Queued)).await.unwrap();
+    assert_eq!(queued, vec![planned.clone()]);
+    assert!(client
+        .work_backlog(Some(WorkStage::Done))
+        .await
+        .unwrap()
+        .is_empty());
+    // The dashboard's copy is the same store.
+    assert_eq!(work_store.lock().await.get(&id), Some(planned.clone()));
+
+    client
+        .review_create(&NewReview {
+            target: ReviewTarget::Work {
+                workspace: "web".into(),
+                work: "ENG-1".into(),
+                alias: Some("impl".into()),
+                pipeline_generation: Some(1),
+            },
+            summary: "Redirect fixed".into(),
+            anchor: None,
+            idempotency_key: None,
+            requested_by: ReviewActor {
+                kind: ActorKind::Agent,
+                label: None,
+            },
+            decision: None,
+        })
+        .await
+        .unwrap();
+    let show = client.work_record_show(&id).await.unwrap();
+    assert_eq!(show.record, Some(planned));
+    assert_eq!(show.reviews.len(), 1);
+    assert!(show.run.is_none());
+    assert!(client
+        .work_record_show(&WorkIdentity::new("web", "NOPE"))
+        .await
+        .is_err());
     tx.send(()).unwrap();
     handle.await.unwrap();
 }

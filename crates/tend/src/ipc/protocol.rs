@@ -137,6 +137,22 @@ pub(super) enum RequestBody {
         #[serde(default)]
         origin: Option<collaboration::CollaborationOrigin>,
     },
+    /// Durable Work records, backlog order (`work_backlog_v1`). With
+    /// `stage`, only records at that stage.
+    WorkBacklog {
+        #[serde(default)]
+        stage: Option<crate::work::WorkStage>,
+    },
+    /// Create or partially edit one Work record without launching it.
+    WorkEdit {
+        identity: crate::work::WorkIdentity,
+        edit: crate::work::WorkEdit,
+    },
+    /// One Work's record, its result records and its durable Run: what was
+    /// asked, done and decided, whether or not a window is open.
+    WorkRecordShow {
+        identity: crate::work::WorkIdentity,
+    },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
     PipelineSubscribe,
@@ -1034,6 +1050,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::decision::REVIEW_DECISION_CAPABILITY,
     crate::decision::HUMAN_DECISION_CAPABILITY,
     crate::decision_queue::DECISION_QUEUE_CAPABILITY,
+    crate::work::WORK_BACKLOG_CAPABILITY,
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
@@ -1275,6 +1292,12 @@ pub struct Response {
     pub review_has_more: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_summary: Option<crate::review::ReviewSummary>,
+    /// `work_backlog_v1`: Work records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_records: Option<Vec<crate::work::WorkRecord>>,
+    /// `work_backlog_v1`: one Work record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_record: Option<Box<crate::work::WorkRecord>>,
     /// `decision_queue_v1`: everything pending on the person.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision_queue: Option<Box<crate::decision_queue::PendingQueue>>,
@@ -1400,6 +1423,8 @@ impl Response {
             review_summary: None,
             decision_queue: None,
             decision_history: None,
+            work_records: None,
+            work_record: None,
             pipeline_claims: None,
             work_operation: None,
             work_command: None,

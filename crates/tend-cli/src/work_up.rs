@@ -87,6 +87,17 @@ pub struct UpArgs {
     /// Emit the structured result as JSON.
     #[arg(long)]
     pub json: bool,
+    /// The planned Work's directory, used where the current directory
+    /// would be: a route's `cwd` or worktree still wins, and it is never
+    /// treated as an explicit `--cwd`.
+    #[arg(skip)]
+    pub planned_cwd: Option<PathBuf>,
+    /// `body` is the planned Work's saved task, not a steering request: it
+    /// renders into every agent's launch prompt on every run, so the
+    /// desired pipeline stays the same across re-runs, but it never
+    /// restarts or re-prompts agents that are already running.
+    #[arg(skip)]
+    pub body_from_plan: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -166,6 +177,8 @@ pub(crate) struct Resolved {
     cwd_pinned: bool,
     layout: Option<String>,
     request: Option<ComposedRequest>,
+    /// `request` is a planned Work's saved task ([`UpArgs::body_from_plan`]).
+    request_from_plan: bool,
     desired: Vec<DesiredAgent>,
     /// Existing daemon-owned state, used by dry-run rendering. A real apply
     /// performs an atomic register and reads the returned Run instead.
@@ -179,11 +192,27 @@ pub(crate) struct Resolved {
 }
 
 pub async fn run(
-    args: UpArgs,
+    mut args: UpArgs,
     config: &Config,
     config_path: Option<PathBuf>,
     client: Option<&tend::ipc::Client>,
 ) -> Result<()> {
+    // A planned Work starts from its plan: arguments left out come from
+    // the backlog record, and starting it moves it to in progress.
+    let planned = match client {
+        Some(client) if crate::work_backlog::backlog_supported(client).await => {
+            let records = client
+                .work_backlog(None)
+                .await
+                .context("reading the Work backlog")?;
+            crate::work_backlog::find_record(&records, &args.work, args.workspace.as_deref(), true)?
+                .cloned()
+        }
+        _ => None,
+    };
+    if let Some(record) = &planned {
+        crate::work_backlog::fill_from_plan(&mut args, record);
+    }
     let json = args.json;
     let dry_run = args.dry_run;
     let show_prompts = args.show_prompts;
@@ -197,7 +226,20 @@ pub async fn run(
         let client = client.ok_or_else(|| {
             anyhow::anyhow!("tend work up requires tendd for durable pipeline state")
         })?;
-        apply_durable(resolved, client).await?
+        let result = apply_durable(resolved, client).await?;
+        if let Some(record) = planned
+            .as_ref()
+            .filter(|record| record.metadata.stage == tend::work::WorkStage::Queued)
+        {
+            let started = tend::work::WorkEdit {
+                stage: Some(tend::work::WorkStage::InProgress),
+                ..tend::work::WorkEdit::default()
+            };
+            if let Err(error) = client.work_edit(&record.identity, &started).await {
+                eprintln!("note: started, but the backlog record stays queued: {error}");
+            }
+        }
+        result
     };
     if json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -224,10 +266,7 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
             .map(|state| state.alias.clone())
             .collect()
     });
-    let broadcast = resolved
-        .request
-        .as_ref()
-        .map(|request| request.text.as_str());
+    let broadcast = steering(&resolved);
     let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
 
     Ok(finish(
@@ -274,7 +313,7 @@ pub(crate) async fn apply_durable(
     // `--body`/`--prompt` is a real restart of every existing pipeline
     // participant. The store expands these roots transitively and advances
     // the Run generation before any prompt can be delivered.
-    let mut invalidate = resolved.request.as_ref().map_or_else(Vec::new, |_| {
+    let mut invalidate = steering(&resolved).map_or_else(Vec::new, |_| {
         existing
             .iter()
             .filter_map(|agent| agent.alias.clone())
@@ -332,10 +371,7 @@ pub(crate) async fn apply_durable(
         .filter(|state| state.status == PipelineAliasStatus::Done)
         .map(|state| state.alias.clone())
         .collect::<Vec<_>>();
-    let broadcast = resolved
-        .request
-        .as_ref()
-        .map(|request| request.text.as_str());
+    let broadcast = steering(&resolved);
     let plan = pipeline::plan(&resolved.desired, &existing, broadcast, &done);
     let claims = client
         .pipeline_claim(&identity, run.generation)
@@ -758,11 +794,23 @@ pub(crate) async fn resolve(
         cwd_pinned: cwd_is_pinned(args, route),
         layout: spec.layout.clone(),
         request,
+        request_from_plan: args.body_from_plan,
         desired,
         durable_run,
         states,
         accounts: account_routes(config),
     })
+}
+
+/// The request text to steer running agents with: the caller's own
+/// `--body`, never a planned Work's saved task (which only shapes launch
+/// prompts).
+fn steering(resolved: &Resolved) -> Option<&str> {
+    resolved
+        .request
+        .as_ref()
+        .filter(|_| !resolved.request_from_plan)
+        .map(|request| request.text.as_str())
 }
 
 fn account_routes(config: &Config) -> Vec<tend::swap_api::AccountRoute> {
@@ -812,9 +860,10 @@ fn resolve_cwd(
         (None, Some(template)) => PathBuf::from(expand_tilde(&vars.render(template))),
         // Unpinned: the work window's own directory if it has one, so a
         // re-run from anywhere converges instead of arguing about cwd.
-        (None, None) => match existing {
-            Some(existing) => existing.cwd.clone(),
-            None => std::env::current_dir().context("resolve current directory")?,
+        (None, None) => match (existing, &args.planned_cwd) {
+            (Some(existing), _) => existing.cwd.clone(),
+            (None, Some(planned)) => planned.clone(),
+            (None, None) => std::env::current_dir().context("resolve current directory")?,
         },
     };
     let cwd = tend::paths::canonicalize(&source)
@@ -1883,6 +1932,8 @@ mod tests {
 
     fn up_args(cwd: Option<&str>) -> UpArgs {
         UpArgs {
+            body_from_plan: false,
+            planned_cwd: None,
             work: "eng-1".into(),
             external: None,
             pipeline: None,

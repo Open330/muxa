@@ -206,8 +206,198 @@ pub struct WorkRecord {
     pub external_items: Vec<ExternalItemRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_binding: Option<ExecutionIdentity>,
+    /// How to start this Work later, and where it sits in the backlog
+    /// (`work_backlog_v1`). Kept apart from `metadata`, which the web
+    /// editor replaces whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<WorkPlan>,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+/// Daemons that serve the Work backlog (`work_backlog`, `work_edit`,
+/// `work_record_show`).
+pub const WORK_BACKLOG_CAPABILITY: &str = "work_backlog_v1";
+
+/// What `tend work up` needs to start a planned Work, plus its backlog
+/// position. Every field is optional; `work up` arguments win over it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkPlan {
+    /// Working directory to start in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// `[pipeline.<name>]` to staff the window with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    /// The instruction the agents start from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// External issue key to link on start (`ENG-123`, `#79`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<String>,
+    /// Backlog order: lower first; unset sorts after every set value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+}
+
+impl WorkPlan {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
+
+/// A partial edit of a Work record: only the fields given change. A string
+/// field set to the empty string clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkEdit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_action: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<WorkStage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pipeline: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external: Option<String>,
+    /// `Some(None)` is not expressible in JSON with `Option<Option>` here;
+    /// clear a priority with [`WorkEdit::clear_priority`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<i32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub clear_priority: bool,
+}
+
+/// One edited text field: `None` keeps the old value, an empty string
+/// clears it, anything else replaces it after validation.
+fn edit_text(
+    old: Option<String>,
+    new: Option<String>,
+    max: usize,
+    label: &str,
+) -> Result<Option<String>, String> {
+    match new {
+        None => Ok(old),
+        Some(value) => {
+            if value
+                .chars()
+                .any(|ch| ch.is_control() && ch != '\n' && ch != '\t')
+            {
+                return Err(format!("{label} cannot contain control characters"));
+            }
+            clean(Some(value), max, label)
+        }
+    }
+}
+
+impl WorkEdit {
+    /// Apply to `record` (or a fresh queued one) at `now`. Validates every
+    /// given field; nothing is changed on error.
+    pub fn apply(
+        self,
+        identity: &WorkIdentity,
+        record: Option<WorkRecord>,
+        now: OffsetDateTime,
+    ) -> Result<WorkRecord, String> {
+        validate_identity(identity)?;
+        let created = record.is_none();
+        let mut record = record.unwrap_or_else(|| WorkRecord {
+            identity: identity.clone(),
+            metadata: WorkMetadata {
+                title: None,
+                goal: None,
+                next_action: None,
+                // A Work planned without a window is waiting to start.
+                stage: WorkStage::Queued,
+                updated_at: now,
+            },
+            external_items: Vec::new(),
+            legacy_binding: None,
+            plan: None,
+            created_at: now,
+        });
+        let metadata = &mut record.metadata;
+        metadata.title = edit_text(metadata.title.take(), self.title, 160, "title")?;
+        metadata.goal = edit_text(metadata.goal.take(), self.goal, 4_000, "goal")?;
+        metadata.next_action = edit_text(
+            metadata.next_action.take(),
+            self.next_action,
+            1_000,
+            "next action",
+        )?;
+        if let Some(stage) = self.stage {
+            metadata.stage = stage;
+        }
+        metadata.updated_at = now;
+        let mut plan = record.plan.take().unwrap_or_default();
+        plan.cwd = edit_text(plan.cwd, self.cwd, 4_096, "cwd")?;
+        if let Some(cwd) = &plan.cwd {
+            if !std::path::Path::new(cwd).is_absolute() {
+                return Err(format!("cwd {cwd:?} must be an absolute path"));
+            }
+        }
+        plan.pipeline = edit_text(plan.pipeline, self.pipeline, 128, "pipeline")?;
+        plan.prompt = edit_text(plan.prompt, self.prompt, 16_000, "prompt")?;
+        plan.external = edit_text(plan.external, self.external, 256, "external")?;
+        if self.clear_priority {
+            plan.priority = None;
+        }
+        if let Some(priority) = self.priority {
+            plan.priority = Some(priority);
+        }
+        record.plan = (!plan.is_empty()).then_some(plan);
+        if created
+            && record.metadata.title.is_none()
+            && record.metadata.goal.is_none()
+            && record.plan.is_none()
+        {
+            return Err("a planned Work needs at least a title, goal or prompt".into());
+        }
+        Ok(record)
+    }
+}
+
+/// Workspace and Work ids are printed and used as tmux names: bounded, no
+/// control characters, no `/` in the workspace.
+pub fn validate_identity(identity: &WorkIdentity) -> Result<(), String> {
+    for (label, value) in [
+        ("workspace", identity.workspace_id.as_str()),
+        ("work", identity.work_id.as_str()),
+    ] {
+        if value.trim().is_empty() || value.len() > 128 {
+            return Err(format!("{label} id must be 1-128 bytes"));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(format!("{label} id cannot contain control characters"));
+        }
+    }
+    if identity.workspace_id.contains('/') {
+        return Err("workspace id cannot contain '/'".into());
+    }
+    Ok(())
+}
+
+/// Backlog order: priority ascending (unset last), then oldest first.
+pub fn sort_backlog(records: &mut [WorkRecord]) {
+    records.sort_by(|a, b| {
+        let priority = |r: &WorkRecord| r.plan.as_ref().and_then(|p| p.priority);
+        match (priority(a), priority(b)) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then(a.created_at.cmp(&b.created_at))
+        .then(a.identity.cmp(&b.identity))
+    });
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -832,6 +1022,51 @@ impl<'a> AgentIndex<'a> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn backlog_sorts_by_priority_then_age() {
+        let at = |minute: u8| {
+            time::macros::datetime!(2026-11-12 10:00 UTC) + time::Duration::minutes(minute.into())
+        };
+        let record = |work: &str, priority: Option<i32>, minute: u8| {
+            WorkEdit {
+                title: Some(work.into()),
+                priority,
+                ..WorkEdit::default()
+            }
+            .apply(&WorkIdentity::new("w", work), None, at(minute))
+            .unwrap()
+        };
+        let mut records = vec![
+            record("LATE", None, 1),
+            record("P2", Some(2), 2),
+            record("EARLY", None, 0),
+            record("P1", Some(1), 3),
+        ];
+        sort_backlog(&mut records);
+        let order: Vec<&str> = records
+            .iter()
+            .map(|r| r.identity.work_id.as_str())
+            .collect();
+        assert_eq!(order, ["P1", "P2", "EARLY", "LATE"]);
+        assert!(
+            WorkEdit {
+                goal: Some("users land on /home".into()),
+                ..WorkEdit::default()
+            }
+            .apply(&WorkIdentity::new("w", "GOAL"), None, at(0))
+            .is_ok(),
+            "a goal alone is a plan"
+        );
+        assert!(validate_identity(&WorkIdentity::new("a/b", "X")).is_err());
+        assert!(validate_identity(&WorkIdentity::new("a", "X\u{1b}")).is_err());
+        assert!(WorkEdit {
+            title: Some("x\u{1b}[2J".into()),
+            ..WorkEdit::default()
+        }
+        .apply(&WorkIdentity::new("w", "X"), None, at(0))
+        .is_err());
+    }
+
     use super::*;
     use std::path::PathBuf;
 

@@ -303,6 +303,10 @@ pub struct WorkListArgs {
     /// Limit work windows to one managed workspace.
     #[arg(long)]
     pub workspace: Option<String>,
+    /// List Work records at this stage instead of live windows: `queued` is
+    /// the backlog of planned Work; also `in_progress`, `review`, `done`, `auto`.
+    #[arg(long, value_parser = crate::work_backlog::parse_stage)]
+    pub stage: Option<tend::work::WorkStage>,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -1402,10 +1406,65 @@ fn shorten_home(path: &Path) -> String {
     )
 }
 
-pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
-    let work = find_work_in(&args.work, args.workspace.as_deref())?
-        .ok_or_else(|| anyhow::anyhow!("managed work {:?} not found", args.work))?;
-    if args.json {
+fn show_json(work: Option<&WorkInfo>, show: &tend::ipc::WorkShow) -> serde_json::Value {
+    serde_json::json!({
+        "window": work,
+        "record": show.record,
+        "pipeline_run": show.run,
+        "review_items": show.reviews,
+        "review_has_more": show.reviews_more,
+        "review_error": show.reviews_error,
+    })
+}
+
+/// One Work: its live window when there is one, then its durable record
+/// (what was asked, done and decided), which outlives the window.
+pub async fn run_work_show(args: WorkShowArgs, client: &tend::ipc::Client) -> Result<()> {
+    let work = find_work_in(&args.work, args.workspace.as_deref())?;
+    let supported = crate::work_backlog::backlog_supported(client).await;
+    let identity = if let Some(work) = &work {
+        Some(tend::work::WorkIdentity::new(&work.workspace, &work.work))
+    } else if supported {
+        // No window: resolve from the durable records, the way `work up`
+        // starts a plan, not from whatever directory this runs in.
+        let records = client
+            .work_backlog(None)
+            .await
+            .context("reading the Work backlog")?;
+        let here = std::env::current_dir()?;
+        crate::work_backlog::closed_work_identity(
+            &records,
+            &args.work,
+            args.workspace.as_deref(),
+            &here,
+        )?
+    } else {
+        None
+    };
+    let show = match identity {
+        Some(identity) if supported => client.work_record_show(&identity).await.ok(),
+        _ => None,
+    };
+    let Some(work) = work else {
+        let Some(show) = show else {
+            bail!("managed work {:?} not found", args.work);
+        };
+        if args.json {
+            println!("{}", serde_json::to_string_pretty(&show_json(None, &show))?);
+        } else {
+            print!(
+                "{}",
+                crate::work_backlog::render_show(&show, time::OffsetDateTime::now_utc())
+            );
+        }
+        return Ok(());
+    };
+    if let (true, Some(show)) = (args.json, show.as_ref()) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&show_json(Some(&work), show))?
+        );
+    } else if args.json {
         println!("{}", serde_json::to_string_pretty(&work)?);
     } else {
         let records = work_annotations();
@@ -1436,6 +1495,14 @@ pub fn run_work_show(args: WorkShowArgs) -> Result<()> {
                     .as_deref()
                     .map_or_else(String::new, |task| format!(" task={task}"))
             );
+        }
+    }
+    if !args.json {
+        if let Some(show) = &show {
+            let record = crate::work_backlog::render_show(show, time::OffsetDateTime::now_utc());
+            if !record.is_empty() {
+                print!("\n{record}");
+            }
         }
     }
     Ok(())
@@ -3182,6 +3249,7 @@ mod tests {
 
     fn record_at(workspace: &str, work: &str, stage: WorkStage) -> WorkRecord {
         WorkRecord {
+            plan: None,
             identity: tend::work::WorkIdentity::new(workspace, work),
             metadata: tend::work::WorkMetadata {
                 title: None,

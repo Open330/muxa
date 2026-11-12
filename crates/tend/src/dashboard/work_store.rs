@@ -48,6 +48,10 @@ struct LegacyWorkStoreFile {
     works: Vec<LegacyWorkRecord>,
 }
 
+/// One store shared by tendd's IPC server and the dashboard, so neither
+/// overwrites the other's records when it saves the whole file.
+pub type SharedWorkStore = std::sync::Arc<tokio::sync::Mutex<WorkStore>>;
+
 #[derive(Debug)]
 pub struct WorkStore {
     path: Option<PathBuf>,
@@ -91,6 +95,7 @@ impl WorkStore {
         let now = OffsetDateTime::now_utc();
         let previous = self.works.get(&identity).cloned();
         let record = WorkRecord {
+            plan: previous.as_ref().and_then(|record| record.plan.clone()),
             identity: identity.clone(),
             metadata: patch.into_metadata(now),
             external_items: previous
@@ -121,6 +126,7 @@ impl WorkStore {
         );
         let now = OffsetDateTime::now_utc();
         let record = WorkRecord {
+            plan: existing.as_ref().and_then(|record| record.plan.clone()),
             identity: identity.clone(),
             metadata: patch.into_metadata(now),
             external_items: existing
@@ -133,6 +139,26 @@ impl WorkStore {
         self.persist_change(identity, record, existing).await
     }
 
+    /// Apply a partial edit, creating a queued record when none exists.
+    pub async fn edit(
+        &mut self,
+        identity: WorkIdentity,
+        edit: crate::work::WorkEdit,
+    ) -> Result<WorkRecord, String> {
+        let previous = self.works.get(&identity).cloned();
+        let record = edit.apply(&identity, previous.clone(), OffsetDateTime::now_utc())?;
+        if previous.as_ref() == Some(&record) {
+            return Ok(record);
+        }
+        self.persist_change(identity, record, previous)
+            .await
+            .map_err(|error| format!("saving the Work record: {error}"))
+    }
+
+    pub fn get(&self, identity: &WorkIdentity) -> Option<WorkRecord> {
+        self.works.get(identity).cloned()
+    }
+
     pub async fn upsert_external_item(
         &mut self,
         identity: WorkIdentity,
@@ -141,6 +167,7 @@ impl WorkStore {
         let now = OffsetDateTime::now_utc();
         let previous = self.works.get(&identity).cloned();
         let mut record = previous.clone().unwrap_or_else(|| WorkRecord {
+            plan: None,
             identity: identity.clone(),
             metadata: WorkMetadata {
                 // External title is a reference field. Keeping local title
@@ -240,6 +267,7 @@ fn migrate_v1(file: LegacyWorkStoreFile) -> Vec<WorkRecord> {
             };
             let identity = legacy_identity(&binding);
             WorkRecord {
+                plan: None,
                 identity,
                 created_at: legacy.metadata.updated_at,
                 metadata: legacy.metadata,
@@ -307,6 +335,76 @@ async fn save(path: &Path, works: Vec<WorkRecord>) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::work::WorkStage;
+
+    #[tokio::test]
+    async fn a_planned_work_survives_a_web_metadata_save_and_a_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dashboard-work.json");
+        let mut store = WorkStore::load(Some(path.clone()));
+        let id = WorkIdentity::new("web", "ENG-1");
+        assert!(
+            store
+                .edit(id.clone(), crate::work::WorkEdit::default())
+                .await
+                .is_err(),
+            "a plan with nothing in it is refused"
+        );
+        let planned = store
+            .edit(
+                id.clone(),
+                crate::work::WorkEdit {
+                    title: Some("Fix login".into()),
+                    prompt: Some("fix the redirect".into()),
+                    cwd: Some("/src/web".into()),
+                    priority: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(planned.metadata.stage, WorkStage::Queued);
+        // The web editor replaces metadata whole; the plan stays.
+        store
+            .upsert_metadata(
+                id.clone(),
+                WorkMetadataPatch {
+                    title: Some("Fix login flow".into()),
+                    stage: WorkStage::InProgress,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let edited = store
+            .edit(
+                id.clone(),
+                crate::work::WorkEdit {
+                    goal: Some("users land on /home".into()),
+                    pipeline: Some(String::new()),
+                    clear_priority: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(edited.metadata.title.as_deref(), Some("Fix login flow"));
+        assert_eq!(edited.metadata.stage, WorkStage::InProgress);
+        let plan = edited.plan.clone().unwrap();
+        assert_eq!(plan.prompt.as_deref(), Some("fix the redirect"));
+        assert_eq!(plan.priority, None);
+        assert!(store
+            .edit(
+                id.clone(),
+                crate::work::WorkEdit {
+                    cwd: Some("relative".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .is_err());
+        let reloaded = WorkStore::load(Some(path));
+        assert_eq!(reloaded.get(&id), Some(edited));
+    }
 
     fn identity() -> WorkIdentity {
         WorkIdentity::new("tend", "ENG-1")
