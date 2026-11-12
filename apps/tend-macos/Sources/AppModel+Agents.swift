@@ -322,25 +322,19 @@ extension AppModel {
         environment.merge(extra) { _, new in new }
         let resolvedEnvironment = environment
         let data = try await Task.detached { () throws -> Data in
-            let process = Process()
-            process.executableURL = executable ?? URL(fileURLWithPath: "/usr/bin/env")
-            process.arguments = executable == nil ? ["tend"] + arguments : arguments
-            process.environment = resolvedEnvironment
-            let output = Pipe()
-            let errors = Pipe()
-            process.standardOutput = output
-            process.standardError = errors
-            process.standardInput = FileHandle.nullDevice
-            try process.run()
-            let standardOutput = output.fileHandleForReading.readDataToEndOfFile()
-            let standardError = errors.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-            guard process.terminationStatus == 0 else {
+            let result = try TendCLIProcess.run(
+                executable: executable ?? URL(fileURLWithPath: "/usr/bin/env"),
+                arguments: executable == nil ? ["tend"] + arguments : arguments,
+                environment: resolvedEnvironment
+            )
+            let standardOutput = result.standardOutput
+            let standardError = result.standardError
+            guard result.terminationStatus == 0 else {
                 let reason = String(decoding: standardError, as: UTF8.self)
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .components(separatedBy: .newlines).last ?? ""
                 throw TendIPCError.server(
-                    reason.isEmpty ? "tend agent start exited with \(process.terminationStatus)" : reason
+                    reason.isEmpty ? "tend agent start exited with \(result.terminationStatus)" : reason
                 )
             }
             return standardOutput

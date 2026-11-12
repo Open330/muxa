@@ -60,6 +60,7 @@ extension TendIPCClient {
     static let agentStartCapability = "agent_start_v1"
 
     nonisolated func makeAgentStartClient() -> TendAgentStartClient {
-        TendAgentStartClient(socketPath: socketPath)
+        let socketPath = socketPath
+        return agentStartClientCache.value { TendAgentStartClient(socketPath: socketPath) }
     }
 }
