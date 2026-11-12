@@ -190,12 +190,14 @@ impl WorkStore {
             .iter_mut()
             .find(|row| same_identity(row))
         {
-            if same_external_snapshot(existing, &item) {
-                return Ok(record);
-            }
             // A snapshot read from the tracker outranks one copied from a
             // pane's launch marks, however recent the pane scan.
             if existing.fetched_at.is_some() && item.fetched_at.is_none() {
+                return Ok(record);
+            }
+            // An unchanged pane copy writes nothing; a tracker read always
+            // records itself, so an identical answer still takes precedence.
+            if item.fetched_at.is_none() && same_external_snapshot(existing, &item) {
                 return Ok(record);
             }
             *existing = item;
