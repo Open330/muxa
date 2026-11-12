@@ -270,6 +270,9 @@ async fn run() -> Result<()> {
             config = ?args.config,
             "socket or config override: skipping data-directory retention and the hook-spool drain, which belong to the default daemon"
         );
+        // Nor does it watch the user's own tmux servers when it was given
+        // its own `TMUX_TMPDIR`.
+        tend::tmux::scanner::restrict_to_own_tmux_dir();
     }
     // A second daemon used to load the registry, start its snapshotter and
     // notifiers and heal tmux before its bind failed — and a KeepAlive

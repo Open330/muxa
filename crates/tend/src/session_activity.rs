@@ -554,15 +554,9 @@ fn sample_activity() -> Result<ActivitySample, String> {
         sessions: Vec::new(),
         client_inputs: Vec::new(),
     };
-    let mut sessions = match tmux::list_sessions() {
-        Ok(sessions) => sessions,
-        Err(TmuxError::NonZero(msg)) if msg.trim_start().starts_with("no server running") => {
-            return Ok(empty());
-        }
-        Err(e) => return Err(e.to_string()),
-    };
-    let clients = match tmux::list_clients() {
-        Ok(clients) => clients,
+    // One tmux call for both listings, every sample.
+    let (mut sessions, clients) = match tmux::list_sessions_and_clients() {
+        Ok(listings) => listings,
         Err(TmuxError::NonZero(msg)) if msg.trim_start().starts_with("no server running") => {
             return Ok(empty());
         }

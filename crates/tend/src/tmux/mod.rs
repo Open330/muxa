@@ -72,7 +72,23 @@ pub fn tmux_command() -> Command {
     if rmux_endpoint.is_some() && rmux_endpoint == tmux_endpoint {
         cmd.env_remove("TMUX").env_remove("TMUX_PANE");
     }
+    if inherited_tmux_is_foreign(
+        scanner::own_tmux_dir_only(),
+        std::env::var_os("TMUX_TMPDIR").is_some_and(|dir| !dir.is_empty()),
+    ) {
+        // A private daemon keeps to its own `TMUX_TMPDIR`: a `$TMUX`
+        // inherited from the terminal it was started in names the user's
+        // server, which every bare tmux call would otherwise reach.
+        cmd.env_remove("TMUX").env_remove("TMUX_PANE");
+    }
     cmd
+}
+
+/// Whether an inherited `$TMUX` must be dropped from tmux invocations: only
+/// for a daemon restricted to its own tmux directory, and only when it has
+/// one.
+fn inherited_tmux_is_foreign(own_dir_only: bool, has_tmux_tmpdir: bool) -> bool {
+    own_dir_only && has_tmux_tmpdir
 }
 
 pub fn tmux_binary() -> &'static Path {
@@ -1011,6 +1027,49 @@ pub fn list_clients() -> Result<Vec<ClientInfo>, TmuxError> {
     Ok(parse_client_lines(&stdout))
 }
 
+/// Sessions and clients from one `tmux` invocation instead of two: the
+/// session-activity sampler needs both every few seconds. Each row is
+/// tagged with the command that printed it so the two listings can be told
+/// apart.
+pub fn list_sessions_and_clients() -> Result<(Vec<SessionInfo>, Vec<ClientInfo>), TmuxError> {
+    let sessions_fmt = format!("{SESSION_ROW_TAG}{SESSION_FMT}");
+    let clients_fmt = format!("{CLIENT_ROW_TAG}{CLIENT_FMT}");
+    let out = tmux_output(&[
+        "list-sessions",
+        "-F",
+        &sessions_fmt,
+        ";",
+        "list-clients",
+        "-F",
+        &clients_fmt,
+    ])?;
+    if !out.status.success() {
+        return Err(TmuxError::NonZero(
+            String::from_utf8_lossy(&out.stderr).into(),
+        ));
+    }
+    let stdout = String::from_utf8(out.stdout).map_err(|e| TmuxError::BadOutput(e.to_string()))?;
+    Ok(parse_sessions_and_clients(&stdout))
+}
+
+const SESSION_ROW_TAG: &str = "S\t";
+const CLIENT_ROW_TAG: &str = "C\t";
+
+fn parse_sessions_and_clients(stdout: &str) -> (Vec<SessionInfo>, Vec<ClientInfo>) {
+    let mut sessions = String::new();
+    let mut clients = String::new();
+    for line in stdout.lines() {
+        if let Some(row) = line.strip_prefix(SESSION_ROW_TAG) {
+            sessions.push_str(row);
+            sessions.push('\n');
+        } else if let Some(row) = line.strip_prefix(CLIENT_ROW_TAG) {
+            clients.push_str(row);
+            clients.push('\n');
+        }
+    }
+    (parse_session_lines(&sessions), parse_client_lines(&clients))
+}
+
 pub fn inside_tmux() -> bool {
     std::env::var_os("TMUX").is_some()
 }
@@ -1849,5 +1908,97 @@ mod tests {
         assert_eq!(parse_tmux_session_target(""), None);
         assert_eq!(parse_tmux_session_target("/tmp/sock,82477,abc"), None);
         assert_eq!(parse_tmux_session_target("/tmp/sock,82477,"), None);
+    }
+
+    #[test]
+    fn one_invocation_lists_sessions_and_clients_apart() {
+        let stdout = concat!(
+            "S\t$1\tmain\t1\t\n",
+            "C\t/dev/ttys001\tmain\t0\t1700000100\t1700000000\t0\n",
+            "S\t$2\tside\t0\t\n",
+        );
+        let (sessions, clients) = parse_sessions_and_clients(stdout);
+        assert_eq!(
+            sessions.iter().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["main", "side"]
+        );
+        assert_eq!(sessions[0].attached_clients, 1);
+        assert_eq!(clients.len(), 1);
+        assert_eq!(clients[0].session, "main");
+        assert_eq!(clients[0].last_activity, 1_700_000_100);
+    }
+
+    #[test]
+    fn a_private_daemon_drops_an_inherited_tmux_only_with_its_own_dir() {
+        assert!(inherited_tmux_is_foreign(true, true));
+        assert!(!inherited_tmux_is_foreign(true, false));
+        assert!(!inherited_tmux_is_foreign(false, true));
+    }
+
+    /// Codex review of #492: with an empty private `TMUX_TMPDIR`, the bare
+    /// fallback used to follow an inherited `$TMUX` to an outside server.
+    /// Exercised against two scratch servers, never the user's.
+    #[cfg(unix)]
+    #[test]
+    fn without_inherited_tmux_a_bare_call_cannot_reach_an_outside_server() {
+        struct Cleanup(std::path::PathBuf, std::path::PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new(tmux_binary())
+                    .args(["-S", self.0.to_str().unwrap(), "kill-server"])
+                    .status();
+                let _ = std::fs::remove_dir_all(&self.1);
+            }
+        }
+        if std::process::Command::new(tmux_binary())
+            .arg("-V")
+            .output()
+            .map_or(true, |out| !out.status.success())
+        {
+            return;
+        }
+        // A short, uniquely allocated scratch root: a socket path must fit
+        // in `sun_path`, so the platform temp dir can be too deep.
+        let base = tempfile::Builder::new()
+            .prefix("tend-tmux-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = base.path().to_path_buf();
+        let private = root.join("private");
+        std::fs::create_dir_all(&private).unwrap();
+        let outside = root.join("outside.sock");
+        let _cleanup = Cleanup(outside.clone(), root.clone());
+        assert!(std::process::Command::new(tmux_binary())
+            .args([
+                "-S",
+                outside.to_str().unwrap(),
+                "new-session",
+                "-d",
+                "-s",
+                "outer"
+            ])
+            .env_remove("TMUX")
+            .status()
+            .unwrap()
+            .success());
+        let list = |inherit: bool| {
+            let mut cmd = std::process::Command::new(tmux_binary());
+            cmd.args(["list-sessions", "-F", "#{session_name}"])
+                .env("TMUX_TMPDIR", &private);
+            if inherit {
+                cmd.env("TMUX", format!("{},1,0", outside.display()));
+            } else {
+                cmd.env_remove("TMUX");
+            }
+            String::from_utf8_lossy(&cmd.output().unwrap().stdout).into_owned()
+        };
+        assert!(
+            list(true).contains("outer"),
+            "precondition: $TMUX reaches it"
+        );
+        assert!(
+            !list(false).contains("outer"),
+            "without it, only the private dir"
+        );
     }
 }

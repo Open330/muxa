@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A tendd started on its own socket or config with its own `TMUX_TMPDIR` (a
+  test, a demo) no longer discovers and tracks the user's real tmux agents
+  in `/tmp/tmux-<uid>`; it watches only the tmux servers in its own
+  directory.
+
+### Changed
+
+- Session-activity sampling lists tmux sessions and clients in one `tmux`
+  call instead of two, every 5 seconds.
+
 ## [0.10.14] - 2026-11-12
 
 ### Added

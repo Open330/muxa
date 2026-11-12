@@ -25,6 +25,7 @@
 use crate::backend::HostKind;
 use crate::tmux::{PaneInfo, PANE_FMT};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 // Only the Unix socket-directory walk dedupes by canonical path.
 #[cfg(unix)]
 use std::collections::HashSet;
@@ -266,12 +267,40 @@ fn classify_socket_connect(result: std::io::Result<()>) -> bool {
 }
 
 pub(crate) fn default_socket_dirs() -> Vec<PathBuf> {
-    let uid = current_uid();
+    socket_dirs(
+        std::env::var("TMUX_TMPDIR").ok().as_deref(),
+        OWN_TMUX_DIR_ONLY.load(Ordering::Relaxed),
+        current_uid(),
+    )
+}
+
+/// Set by a daemon that is not the user's default one (its own `--socket`
+/// or `--config`): with `TMUX_TMPDIR` set it then watches only the tmux
+/// servers in that directory, never the user's `/tmp/tmux-<uid>` ones. A
+/// test or demo daemon otherwise discovered and tracked every real agent.
+static OWN_TMUX_DIR_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// Restrict this process's tmux server discovery to `$TMUX_TMPDIR` when it
+/// is set, and stop its tmux calls following an inherited `$TMUX`. See
+/// [`OWN_TMUX_DIR_ONLY`].
+pub fn restrict_to_own_tmux_dir() {
+    OWN_TMUX_DIR_ONLY.store(true, Ordering::Relaxed);
+}
+
+pub(crate) fn own_tmux_dir_only() -> bool {
+    OWN_TMUX_DIR_ONLY.load(Ordering::Relaxed)
+}
+
+fn socket_dirs(
+    tmux_tmpdir: Option<&str>,
+    own_dir_only: bool,
+    uid: impl std::fmt::Display,
+) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(d) = std::env::var("TMUX_TMPDIR") {
-        let trimmed = d.trim();
-        if !trimmed.is_empty() {
-            dirs.push(PathBuf::from(trimmed).join(format!("tmux-{uid}")));
+    if let Some(trimmed) = tmux_tmpdir.map(str::trim).filter(|d| !d.is_empty()) {
+        dirs.push(PathBuf::from(trimmed).join(format!("tmux-{uid}")));
+        if own_dir_only {
+            return dirs;
         }
     }
     dirs.push(PathBuf::from(format!("/tmp/tmux-{uid}")));
@@ -1014,5 +1043,24 @@ mod tests {
             shell_quote(Path::new("/tmp/it's/weird")),
             "'/tmp/it'\\''s/weird'"
         );
+    }
+
+    #[test]
+    fn a_private_daemon_with_its_own_tmux_dir_never_scans_the_users() {
+        assert_eq!(
+            socket_dirs(Some("/x/tmp"), false, 501),
+            [
+                PathBuf::from("/x/tmp/tmux-501"),
+                PathBuf::from("/tmp/tmux-501"),
+                PathBuf::from("/private/tmp/tmux-501")
+            ]
+        );
+        assert_eq!(
+            socket_dirs(Some("/x/tmp"), true, 501),
+            [PathBuf::from("/x/tmp/tmux-501")]
+        );
+        // Without its own dir, the user's default dir is the only one tmux
+        // itself would use, so there is nothing narrower to keep to.
+        assert_eq!(socket_dirs(None, true, 501).len(), 2);
     }
 }
