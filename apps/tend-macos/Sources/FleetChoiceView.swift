@@ -329,6 +329,12 @@ struct FleetChoicePanel<Fallback: View>: View {
                 } else if let option {
                     message = String(localized: "Chose \(option.number). \(option.label)")
                 } else { message = "" }
+                // tendd records what was chosen (and any own words).
+                let typed = words?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                let chosen = selection.map { numbers in
+                    shown.options.filter { numbers.contains($0.number) }.map { "\($0.number). \($0.label)" }.joined(separator: "\n")
+                } ?? message
+                model.recordHomeAnswer(hosted, question: shown.question, answer: typed.isEmpty ? chosen : "\(chosen)\n\(typed)")
                 sends.finish(agentID, .init(succeeded: true, message: message))
             } catch {
                 sends.finish(agentID, Self.isCancellation(error) ? nil : .init(succeeded: false, message: error.localizedDescription))

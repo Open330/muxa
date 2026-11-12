@@ -22,11 +22,28 @@ final class FleetDecisionFeed: ObservableObject {
     /// The one decision whose answer is open, and the text typed so far.
     @Published private var composingID: String?
     @Published private var drafts: [String: String] = [:]
+    /// Past decisions on this Mac's daemon, for the history view.
+    @Published private(set) var history: TendDecisionHistory?
+    /// Results marked Looks Good in Home that tendd holds a record of; nil
+    /// while the daemon cannot record or report them, when Home keeps its
+    /// own marks instead.
+    @Published private(set) var reviewedKeys: Set<String>?
+    /// Looks Good sent and not yet seen in the history.
+    var pendingKeys: Set<String> = []
+    var lastHistoryLoad = Date.distantPast
+    var lastReviewedLoad = Date.distantPast
+    /// Bumped by every read of the review records and every record, so a
+    /// read that started earlier never overwrites a later answer.
+    var reviewedGeneration = 0
+    /// Where an unfinished read of the review records stopped, and what it
+    /// found so far.
+    private var scan: (offset: Int, keys: Set<String>)?
+    static let historyEvery: TimeInterval = 30
     private var loading = false
 
     static let refreshEvery: Duration = .seconds(5)
 
-    func load(_ client: TendIPCClient) async {
+    func load(_ client: TendIPCClient, works: [FleetWork] = []) async {
         guard !loading else { return }
         loading = true
         defer { loading = false }
@@ -46,6 +63,127 @@ final class FleetDecisionFeed: ObservableObject {
         } catch {
             problem = String(localized: "Could not read decisions: \(error.localizedDescription)")
         }
+        // Without the board there is nothing to decide what to hide for.
+        if !works.isEmpty { await loadReviewed(client, works: works, force: false) }
+    }
+
+    /// Reads the history (for the history view) at most every
+    /// `historyEvery` seconds, or now.
+    func loadHistory(_ client: TendIPCClient, force: Bool) async {
+        guard await client.supports(tendDecisionQueueCapability) else {
+            history = nil
+            return
+        }
+        guard force || Date().timeIntervalSince(lastHistoryLoad) >= Self.historyEvery else { return }
+        lastHistoryLoad = Date()
+        do {
+            guard let history = try await client.decisionHistory() else { return }
+            if self.history != history { self.history = history }
+        } catch {
+            TendLog.app.warning("reading the decision history failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Which of the board's finished results tendd recorded as Looks Good.
+    /// Reads every review item newest first, page by page, back to the
+    /// oldest finished result on the board (a review of it cannot be older
+    /// than its finish), so nothing that still matters falls out of a
+    /// window. An overlapping older read never replaces a newer one.
+    func loadReviewed(_ client: TendIPCClient, works: [FleetWork], force: Bool) async {
+        guard await client.supports("review_record_v1"), await client.supports("review_items_v1") else {
+            reviewedKeys = nil
+            return
+        }
+        guard force || Date().timeIntervalSince(lastReviewedLoad) >= Self.historyEvery else { return }
+        lastReviewedLoad = Date()
+        reviewedGeneration += 1
+        let generation = reviewedGeneration
+        let cutoff = FleetDecisionRecord.cutoff(for: works)
+        // A scan that ran out of pages last time goes on where it stopped:
+        // newer records only push older ones further down, so nothing is
+        // skipped, at worst read twice.
+        var recorded = scan?.keys ?? []
+        var offset = scan?.offset ?? 0
+        var complete = false
+        do {
+            for _ in 0..<FleetDecisionRecord.maxReviewPages {
+                let page = try await client.reviewPage(offset: offset, limit: FleetDecisionRecord.reviewPageSize)
+                recorded.formUnion(FleetDecisionRecord.reviewedKeys(in: page.items))
+                offset += page.items.count
+                let oldest = page.items.last?.requestedAt.flatMap(TendUsageTimestamp.parse)
+                if !page.hasMore || page.items.isEmpty { complete = true; break }
+                if let cutoff, let oldest, oldest < cutoff { complete = true; break }
+            }
+        } catch {
+            TendLog.app.warning("reading review records failed: \(error.localizedDescription, privacy: .public)")
+            return
+        }
+        guard generation == reviewedGeneration else { return }
+        pendingKeys.subtract(recorded)
+        let keys: Set<String>
+        if complete {
+            scan = nil
+            keys = recorded.union(pendingKeys)
+        } else {
+            // Unread records may still hold a review: what is known stays
+            // hidden, and nothing is unhidden until the scan completes.
+            scan = (offset, recorded)
+            // Go on at the next refresh (seconds away), not in 30 s.
+            lastReviewedLoad = .distantPast
+            keys = recorded.union(pendingKeys).union(reviewedKeys ?? [])
+        }
+        if reviewedKeys != keys { reviewedKeys = keys }
+    }
+
+    /// Whether the last read of the review records reached every one that
+    /// could matter.
+    var reviewedIsComplete: Bool { scan == nil }
+
+    /// Looks Good, recorded by tendd. Hidden at once; shown again with the
+    /// reason if the record fails.
+    func recordLooksGood(_ work: FleetWork, client: TendIPCClient, works: [FleetWork]) async {
+        guard let target = FleetBoard.reviewTarget(work) else { return }
+        let key = FleetBoard.reviewKey(work)
+        pendingKeys.insert(key)
+        reviewedKeys?.insert(key)
+        // A read already under way predates this record.
+        reviewedGeneration += 1
+        do {
+            let recorded = try await client.recordDecision(
+                target: target, key: key, summary: FleetDecisionRecord.summary(work), disposition: .accepted, note: nil
+            )
+            if !recorded { throw TendIPCError.server(String(localized: "tendd cannot record reviews; update tend and restart tendd")) }
+        } catch {
+            pendingKeys.remove(key)
+            reviewedKeys?.remove(key)
+            problem = String(localized: "Could not record Looks Good: \(error.localizedDescription)")
+        }
+        await loadReviewed(client, works: works, force: true)
+    }
+
+    /// Records the results the person marked reviewed in this Mac's
+    /// settings before tendd kept the record, once. Only marks that still
+    /// hide a unit on the board mean anything; the rest are dropped. True
+    /// only when every mark that mattered was recorded.
+    func migrate(_ marks: FleetReviewMarks, works: [FleetWork], client: TendIPCClient) async -> Bool {
+        var succeeded = true
+        for work in works where marks.marks[work.id] == work.revision && work.lane == .finished {
+            guard let target = FleetBoard.reviewTarget(work) else { continue }
+            do {
+                let recorded = try await client.recordDecision(
+                    target: target, key: FleetBoard.reviewKey(work), summary: FleetDecisionRecord.summary(work),
+                    disposition: .accepted, note: nil
+                )
+                // The daemon stopped recording (a reconnect to an older one):
+                // keep the marks for the next try.
+                if !recorded { succeeded = false }
+            } catch {
+                succeeded = false
+                TendLog.app.warning("moving a review mark to tendd failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        await loadReviewed(client, works: works, force: true)
+        return succeeded
     }
 
     /// What Home shows, oldest-blocked first, each with the asking agent's

@@ -1007,6 +1007,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     let reviewHasMore: Bool?
     let reviewItem: TendReviewItem?
     let decisionQueue: TendLenient<TendPendingQueue>?
+    let decisionHistory: TendLenient<TendDecisionHistory>?
     /// `swap_health`'s answer. Swap job requests also answer in `swap`,
     /// with another shape: that reads as nil rather than failing the reply.
     let swap: TendLenient<TendSwapHealth>?
@@ -1025,6 +1026,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case reviewHasMore = "review_has_more"
         case reviewItem = "review_item"
         case decisionQueue = "decision_queue"
+        case decisionHistory = "decision_history"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
@@ -1520,6 +1522,22 @@ actor TendIPCClient {
         return (response.reviewItems ?? [], response.reviewHasMore ?? false)
     }
 
+    /// One page of every review item, decided ones included, newest first
+    /// (`review_items_v1`): what Home reads to know which results tendd
+    /// recorded as reviewed.
+    func reviewPage(offset: Int, limit: Int) async throws -> (items: [TendReviewItem], hasMore: Bool) {
+        guard capabilities.contains("review_items_v1") else { return ([], false) }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "review_list",
+            "open_only": false,
+            "oldest_first": false,
+            "limit": limit,
+            "offset": offset,
+        ], timeout: 10)
+        return (response.reviewItems ?? [], response.reviewHasMore ?? false)
+    }
+
     /// Everything pending on the person on this Mac's daemon, in its order
     /// (`decision_queue_v1`), read as the operator console so human
     /// requests are included. nil from a daemon without the queue: the
@@ -1556,19 +1574,57 @@ actor TendIPCClient {
     /// this Mac. Idempotent per `key`. False when the daemon cannot record.
     @discardableResult
     func recordReviewed(target: TendReviewTargetRef, key: String, summary: String) async throws -> Bool {
+        try await recordDecision(target: target, key: key, summary: summary, disposition: .accepted, note: nil)
+    }
+
+    /// Records a decision the person made from Home, claimed and disposed
+    /// in one step (`review_record_v1`): Looks Good is `accepted`; Send Back
+    /// and an answer typed to a waiting agent are `returned` with what they
+    /// said as the note. Idempotent per `key`. False when the daemon cannot
+    /// record. Text is cleaned and cut to the store's limits.
+    @discardableResult
+    func recordDecision(
+        target: TendReviewTargetRef,
+        key: String,
+        summary: String,
+        disposition: TendReviewDisposition,
+        note: String?
+    ) async throws -> Bool {
         guard capabilities.contains("review_record_v1") else { return false }
-        _ = try await call([
+        let summary = TendRecordText.bounded(summary, maxBytes: 1024)
+        var request: [String: Any] = [
             "protocol": Self.protocolVersion,
             "kind": "review_record",
             "review": [
                 "target": target.json,
-                "summary": summary,
+                "summary": summary.isEmpty ? String(localized: "Reviewed in Home") : summary,
                 "idempotency_key": key,
                 "requested_by": ["kind": "user", "label": "Tend.app"],
             ],
-            "disposition": TendReviewDisposition.accepted.rawValue,
-        ])
+            "disposition": disposition.rawValue,
+        ]
+        if let note = note.map({ TendRecordText.bounded($0, maxBytes: 1024) }), !note.isEmpty {
+            request["note"] = note
+        }
+        _ = try await call(request)
         return true
+    }
+
+    /// Past decisions on this Mac's daemon, newest first
+    /// (`decision_queue_v1`), read as the operator console so answered
+    /// human requests are included. nil from a daemon without it.
+    func decisionHistory(limit: Int = 500) async throws -> TendDecisionHistory? {
+        guard capabilities.contains(tendDecisionQueueCapability) else { return nil }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "decision_history",
+            "limit": limit,
+            "origin": ["pane": "", "console": true],
+        ], timeout: 10)
+        guard let history = response.decisionHistory?.value else {
+            throw TendIPCError.server(String(localized: "tendd sent a decision history this app cannot read"))
+        }
+        return history
     }
 
     /// The calls a local agent session made since `since` and their

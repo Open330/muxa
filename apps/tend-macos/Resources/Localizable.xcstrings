@@ -23392,6 +23392,56 @@
           }
         }
       }
+    },
+    "tendd sent a decision history this app cannot read" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tendd가 이 앱이 읽을 수 없는 결정 기록을 보냈습니다"
+          }
+        }
+      }
+    },
+    "Could not record Looks Good: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "좋아요를 기록하지 못했습니다: %@"
+          }
+        }
+      }
+    },
+    "Answered in Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "홈에서 답함"
+          }
+        }
+      }
+    },
+    "Sent back from Home" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "홈에서 되돌려 보냄"
+          }
+        }
+      }
+    },
+    "tendd cannot record reviews; update tend and restart tendd" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "tendd가 검토를 기록할 수 없습니다. tend를 업데이트하고 tendd를 다시 시작하세요"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
