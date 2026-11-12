@@ -375,7 +375,7 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 
 | Command | Purpose |
 | --- | --- |
-| `tend status [--flat\|--json]` | Agents as a session / window / pane tree (`--flat`: one row per agent), or a versioned JSON snapshot for desktop integrations. |
+| `tend status [--flat\|--json] [-v]` | Agents as a session / window / pane tree (`--flat`: one row per agent), or a versioned JSON snapshot for desktop integrations. `-v` also lists where each row's state came from (`hook`, `provider_record`, `~screen`, `~timing`, …; `~` marks a heuristic). |
 | `tend watch [--view session\|window\|pane]` | Live workspace → work → agent TUI picker/dashboard. |
 | `tend dashboard [--since today]` | The watch Work board: per-agent and Work-wide prompt/interrupt, messages and mailbox as an agent, collaboration counts, and an ACT/WACT summary. |
 | `tend attend [--cycle] [--list]` | Focus or list agents needing attention. |

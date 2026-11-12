@@ -12,6 +12,7 @@ pub(super) async fn cmd_status(
     theme: Option<ThemeArg>,
     flat: bool,
     json: bool,
+    verbose: bool,
 ) -> Result<()> {
     let agents = client.snapshot().await?;
     if json {
@@ -34,8 +35,13 @@ pub(super) async fn cmd_status(
     let panes = all_panes().await;
     let theme = theme::for_config(cfg, theme, use_colors());
     let now = OffsetDateTime::now_utc();
+    let sources =
+        verbose.then(|| render_state_sources(&agents, &tend::tmux::canonical_panes(&panes), now));
     if flat {
         print_table(&agents, &tend::tmux::canonical_panes(&panes), now, theme);
+        if let Some(sources) = sources {
+            println!("{sources}");
+        }
         return Ok(());
     }
     // The same session / window / pane tree `status --json` and `watch`
@@ -62,7 +68,61 @@ pub(super) async fn cmd_status(
         "{}",
         render_status_tree(&topology, now, theme, terminal_width())
     );
+    if let Some(sources) = sources {
+        println!("{sources}");
+    }
     Ok(())
+}
+
+/// `tend status -v`: where each row's current state came from. A heuristic
+/// source is marked `~` so a guess reads differently from a fact.
+pub(super) fn render_state_sources(
+    agents: &[Agent],
+    panes: &[tend::tmux::PaneInfo],
+    now: OffsetDateTime,
+) -> String {
+    let mut lines = vec!["State sources:".to_string()];
+    for agent in agents {
+        let source = state_source_label(agent, now);
+        // The pane label, or the session id when there is no pane to name
+        // the row by (paneless threads behind a shared app-server).
+        let pane = pane_display(agent, panes);
+        let label = if pane == "-" {
+            short_session(&agent.session_id)
+        } else {
+            pane
+        };
+        lines.push(format!(
+            "  {:<24} {:<14} {source}",
+            truncate_cell(&label, 24),
+            agent.state.to_string(),
+        ));
+    }
+    lines.join("\n")
+}
+
+/// A session id short enough for a column (its first 13 characters).
+fn short_session(session: &str) -> String {
+    let short: String = session.chars().take(13).collect();
+    format!("session {short}")
+}
+
+/// `hook, 2m ago` or `~screen, 5s ago`; `unknown` for a row restored from a
+/// snapshot written before sources were recorded.
+pub(super) fn state_source_label(agent: &Agent, now: OffsetDateTime) -> String {
+    match agent.state_source {
+        Some(provenance) => format!(
+            "{}{}, {}",
+            if provenance.source.is_deterministic() {
+                ""
+            } else {
+                "~"
+            },
+            provenance.source,
+            relative_time(now, provenance.at)
+        ),
+        None => "unknown".to_string(),
+    }
 }
 
 /// `tend status` as a tree: each session, its windows, and the agents in

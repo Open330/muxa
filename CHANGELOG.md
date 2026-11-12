@@ -25,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pane_inventory`, `screen`, `timing`, …) and when it was observed
   (capability `agent_state_source_v1`). Hooks, the Codex rollout poll, screen
   detection, the herdr bridge, discovery and each reconciler sweep stamp it.
+- `tend status -v` lists each agent's state source and when it was observed
+  (`~` marks a heuristic such as `~screen` or `~timing`), and `tend doctor`
+  counts the live rows by source (`tend doctor -v` names the inferred ones).
 
 ### Changed
 
