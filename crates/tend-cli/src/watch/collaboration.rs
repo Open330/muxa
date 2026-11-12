@@ -1324,6 +1324,7 @@ async fn run_watch_collaboration_broadcast(
     for (pane, label) in recipients {
         let pane = pane.clone();
         let request = NewRequest {
+            allow_path_overlap: false,
             decision: None,
             user_authorized: false,
             task_contract: None,
@@ -1399,6 +1400,7 @@ async fn run_watch_collaboration_single(
                 }
             };
             let request = NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,

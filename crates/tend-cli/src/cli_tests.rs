@@ -878,6 +878,8 @@ fn collaboration_request(
     status: RequestStatus,
 ) -> CollaborationRequest {
     CollaborationRequest {
+        execute_scope: None,
+        allow_path_overlap: false,
         decision: None,
         turn_offer: None,
         sender_follow: None,

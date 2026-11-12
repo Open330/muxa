@@ -3147,6 +3147,7 @@ mod tests {
                         from.clone(),
                         to.clone(),
                         NewRequest {
+                            allow_path_overlap: false,
                             decision: None,
                             user_authorized: false,
                             task_contract: None,
@@ -3183,6 +3184,7 @@ mod tests {
                     from,
                     to,
                     NewRequest {
+                        allow_path_overlap: false,
                         decision: None,
                         user_authorized: false,
                         task_contract: None,

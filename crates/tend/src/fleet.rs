@@ -1900,6 +1900,7 @@ mod tests {
             request_id: "relay-1".into(),
             pane: pane.clone(),
             request: Box::new(NewRequest {
+                allow_path_overlap: false,
                 decision: None,
                 user_authorized: false,
                 task_contract: None,
