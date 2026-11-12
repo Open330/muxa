@@ -315,6 +315,8 @@ async fn run() -> Result<()> {
     let automation = build_automation(&cfg, config_path.clone());
     let pipeline_runs = PipelineRunStore::load(paths::default_pipeline_run_file())
         .context("loading durable pipeline Runs")?;
+    // One review store for IPC and the dashboard's decision queue.
+    let reviews = build_reviews();
     // One Work store for IPC (the backlog) and the dashboard, so a save
     // from either never drops the other's records.
     let work_store = Arc::new(tokio::sync::Mutex::new(
@@ -579,6 +581,7 @@ async fn run() -> Result<()> {
             session_activity_path: dashboard_session_activity_path,
             work_store_path: paths::default_dashboard_work_file(),
             work_store: Some(work_store.clone()),
+            reviews: Some(reviews.clone()),
             stats_config: dashboard_stats_config,
             fleet: Some(fleet_runtime.clone()),
         };
@@ -635,7 +638,7 @@ async fn run() -> Result<()> {
         .with_config_path(config_path.clone())
         .with_fleet(fleet_runtime)
         .with_pipeline_runs(pipeline_runs.clone())
-        .with_reviews(build_reviews())
+        .with_reviews(reviews)
         .with_work_store(work_store)
         .with_mux_snapshots(mux_snapshots) // WS-F: snapshot
         .with_swap(Some(swap_jobs))

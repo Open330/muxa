@@ -1886,6 +1886,8 @@ async fn rule_viewer_reads_cannot_write_and_is_revoked_with_its_rule() {
         ("POST", "/api/work-control/up"),
         ("POST", "/api/work-control/prompt"),
         ("POST", "/api/terminal-sessions/x/input"),
+        ("GET", "/api/decisions"),
+        ("GET", "/api/decisions/history"),
     ] {
         for proof in [false, true] {
             let response = call(

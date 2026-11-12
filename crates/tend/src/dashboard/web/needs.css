@@ -1,0 +1,31 @@
+:root { color-scheme: dark light; --bg: #0f1115; --fg: #e8e6e3; --muted: #9aa0a6; --card: #181b21; --line: #2a2f38; --accent: #7cc4ff; --warn: #f0b35a; --bad: #ef6b6b; --good: #6bcf8d; }
+@media (prefers-color-scheme: light) { :root { --bg: #f7f7f5; --fg: #1d1f23; --muted: #5f6368; --card: #fff; --line: #e2e2de; --accent: #0b63c5; } }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+.bar { position: sticky; top: 0; display: flex; gap: .75rem; align-items: baseline; padding: .75rem 1rem; background: var(--bg); border-bottom: 1px solid var(--line); }
+.bar h1 { font-size: 1.1rem; margin: 0; }
+.home { color: var(--muted); text-decoration: none; }
+.count { margin-left: auto; color: var(--muted); }
+.tabs { display: flex; gap: .5rem; padding: .5rem 1rem; }
+.tabs button { flex: 1; padding: .55rem; border: 1px solid var(--line); background: var(--card); color: var(--fg); border-radius: .5rem; font: inherit; }
+.tabs button[aria-selected="true"] { border-color: var(--accent); }
+main { padding: 0 1rem 2rem; max-width: 46rem; margin: 0 auto; }
+.cards { list-style: none; padding: 0; margin: 0; display: grid; gap: .75rem; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: .75rem; padding: .85rem 1rem; }
+.card .kind { font-size: .8rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.card .kind.ask { color: var(--warn); }
+.card .kind.agent { color: var(--accent); }
+.card h2 { font-size: 1rem; margin: .25rem 0 .35rem; white-space: pre-wrap; overflow-wrap: anywhere; }
+.card .meta { color: var(--muted); font-size: .85rem; overflow-wrap: anywhere; }
+.card .needed { margin: .5rem 0 .25rem; font-weight: 600; white-space: pre-wrap; }
+.card .options { margin: .25rem 0; padding-left: 1.2rem; }
+.card .rec { margin: .35rem 0; white-space: pre-wrap; }
+.card .rec::before { content: "Recommended: "; color: var(--muted); }
+.card .evidence { margin: .4rem 0 0; padding-left: 1.2rem; font-size: .9rem; overflow-wrap: anywhere; }
+.card .evidence .fail { color: var(--bad); }
+.card .evidence .pass { color: var(--good); }
+.card pre { margin: .25rem 0 0; padding: .5rem; background: var(--bg); border-radius: .4rem; font-size: .8rem; max-height: 12rem; overflow: auto; white-space: pre-wrap; }
+.card .outcome { margin-top: .4rem; font-weight: 600; }
+.status, #status { color: var(--muted); }
+.login { display: inline-block; margin: 1rem 0; color: var(--accent); }
+.covers { color: var(--muted); font-size: .85rem; margin-top: 1rem; }

@@ -31,6 +31,8 @@ pub mod assets;
 pub mod auth;
 pub mod config;
 #[cfg(feature = "dashboard")]
+mod decisions;
+#[cfg(feature = "dashboard")]
 mod oidc;
 #[cfg(feature = "dashboard")]
 pub mod operator;

@@ -167,6 +167,8 @@ pub struct AppState {
     message_skills: Arc<BTreeMap<String, String>>,
     /// Shared capture loops behind `/api/panes/{pane}/output/stream`.
     pane_streams: Arc<super::pane_stream::PaneStreamHub>,
+    /// The daemon's review items, for the "Needs you" decision queue.
+    pub(in crate::dashboard) reviews: crate::review::ReviewStore,
 }
 
 #[derive(Clone, Default)]
@@ -181,6 +183,8 @@ pub struct DashboardRuntimeConfig {
     /// The daemon's shared Work store; when set, `work_store_path` is not
     /// loaded a second time.
     pub work_store: Option<crate::dashboard::work_store::SharedWorkStore>,
+    /// The daemon's review store, shared with IPC.
+    pub reviews: Option<crate::review::ReviewStore>,
     pub stats_config: StatsConfig,
     pub fleet: Option<FleetRuntime>,
 }
@@ -209,6 +213,7 @@ impl AppState {
             session_activity_path: None,
             stats_config: StatsConfig::default(),
             fleet: None,
+            reviews: crate::review::ReviewStore::unavailable("review items are served by tendd"),
             work_store: Arc::new(tokio::sync::Mutex::new(WorkStore::memory())),
             agents_by_state_cache: Arc::new(tokio::sync::Mutex::new(AgentsByStateCache::default())),
             activity_ledger_cache: Arc::new(tokio::sync::Mutex::new(
@@ -232,6 +237,12 @@ impl AppState {
         limits: super::pane_stream::PaneStreamLimits,
     ) -> Self {
         self.pane_streams = Arc::new(super::pane_stream::PaneStreamHub::new(limits));
+        self
+    }
+
+    #[must_use]
+    pub fn with_reviews(mut self, reviews: crate::review::ReviewStore) -> Self {
+        self.reviews = reviews;
         self
     }
 
@@ -362,6 +373,11 @@ pub fn router(state: AppState) -> Router {
     // is a GET: a viewer session gets 403, and in `public_read` an anonymous
     // visitor needs the token (401). Being a GET it needs no CSRF proof.
     let operator_read_api = Router::new()
+        .route("/api/decisions", get(super::decisions::queue_handler))
+        .route(
+            "/api/decisions/history",
+            get(super::decisions::history_handler),
+        )
         .route("/api/panes/{pane}/output", get(pane_output_handler))
         .route(
             "/api/panes/{pane}/output/stream",
@@ -384,6 +400,7 @@ pub fn router(state: AppState) -> Router {
     // `TraceLayer` sits outermost so even rejected requests are traced —
     // with a token-scrubbed URI (see `make_request_span`).
     api.merge(assets::router::<()>())
+        .route("/needs", get(super::decisions::page_handler))
         .layer(host_layer)
         .layer(TraceLayer::new_for_http().make_span_with(make_request_span::<Body>))
 }
@@ -454,6 +471,9 @@ pub async fn serve(
         .with_backends(backends)
         .with_activity_paths(runtime.activity_path, runtime.session_activity_path)
         .with_work_store_path(runtime.work_store_path, runtime.work_store)
+        .with_reviews(runtime.reviews.unwrap_or_else(|| {
+            crate::review::ReviewStore::unavailable("review items are served by tendd")
+        }))
         .with_stats_config(runtime.stats_config)
         .with_message_skills(runtime.message_skills)
         .with_fleet(runtime.fleet);
@@ -3970,6 +3990,85 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(reversed.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn the_decision_queue_is_operator_only_in_every_mode() {
+        use crate::review::{ActorKind, NewReview, ReviewActor, ReviewStore, ReviewTarget};
+        let reviews = ReviewStore::in_memory();
+        reviews
+            .create(NewReview {
+                target: ReviewTarget::Session {
+                    provider: None,
+                    session_id: "s".into(),
+                },
+                summary: "check the migration".into(),
+                anchor: None,
+                idempotency_key: None,
+                requested_by: ReviewActor {
+                    kind: ActorKind::Agent,
+                    label: None,
+                },
+                decision: None,
+            })
+            .await
+            .unwrap();
+        let get = |app: Router, uri: &'static str, bearer: Option<&'static str>| async move {
+            let mut request = Request::builder().uri(uri);
+            if let Some(token) = bearer {
+                request = request.header(header::AUTHORIZATION, format!("Bearer {token}"));
+            }
+            app.oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        };
+        let mut none = DashboardConfig::loopback_default();
+        none.auth = DashboardAuthMode::None;
+        for (app, bearer, status) in [
+            // Token mode: anonymous is 401, the token reads.
+            (
+                router(state_with_token("s3cret").with_reviews(reviews.clone())),
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            // public_read lets anyone read the redacted views, not this one.
+            (
+                router(public_read_state("s3cret").with_reviews(reviews.clone())),
+                None,
+                StatusCode::UNAUTHORIZED,
+            ),
+            // No token configured: nobody is an operator.
+            (
+                router(state_from(none).with_reviews(reviews.clone())),
+                None,
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                router(state_with_token("s3cret").with_reviews(reviews.clone())),
+                Some("wrong"),
+                StatusCode::UNAUTHORIZED,
+            ),
+        ] {
+            for uri in ["/api/decisions", "/api/decisions/history"] {
+                assert_eq!(
+                    get(app.clone(), uri, bearer).await.status(),
+                    status,
+                    "{uri}"
+                );
+            }
+        }
+        let app = router(public_read_state("s3cret").with_reviews(reviews));
+        let response = get(app.clone(), "/api/decisions", Some("s3cret")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["covers"], "this host");
+        assert_eq!(body["queue"]["items"][0]["kind"], "review");
+        assert_eq!(body["queue"]["items"][0]["summary"], "check the migration");
+        let response = get(app.clone(), "/api/decisions/history", Some("s3cret")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        // The page itself is a static asset, like `/`.
+        let page = get(app, "/needs", None).await;
+        assert_eq!(page.status(), StatusCode::OK);
     }
 
     #[tokio::test]

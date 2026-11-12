@@ -244,6 +244,100 @@ fn agent_entry(agent: &Agent) -> AgentWaitingEntry {
     }
 }
 
+fn human_source<T>(
+    result: Result<(Vec<T>, bool), crate::collaboration::CollaborationError>,
+    truncated: &mut bool,
+    unavailable: &mut Vec<String>,
+) -> Vec<T> {
+    match result {
+        Ok((requests, more)) => {
+            *truncated |= more;
+            requests
+        }
+        Err(crate::collaboration::CollaborationError::Disabled) => Vec::new(),
+        Err(error) => {
+            unavailable.push(format!("human requests: {error}"));
+            Vec::new()
+        }
+    }
+}
+
+/// Read the queue from the daemon's stores. Human requests from every room
+/// are an operator read: without `operator` they are left out and named
+/// as unavailable. A source that cannot be read is named in `unavailable`
+/// instead of failing the read.
+pub async fn read_pending(
+    reviews: &crate::review::ReviewStore,
+    collaboration: &crate::collaboration::CollaborationStore,
+    agents: &[Agent],
+    limit: usize,
+    operator: bool,
+) -> PendingQueue {
+    let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
+    let mut unavailable = Vec::new();
+    let mut truncated = false;
+    let human = if operator {
+        collaboration.open_human_requests(limit).await
+    } else {
+        Err(crate::collaboration::CollaborationError::ScopeDenied)
+    };
+    let human = human_source(human, &mut truncated, &mut unavailable);
+    let page = reviews
+        .list(crate::review::ReviewQuery {
+            open_only: true,
+            oldest_first: true,
+            limit,
+            offset: 0,
+        })
+        .await;
+    let reviews = match page {
+        Ok(page) => {
+            truncated |= page.has_more;
+            page.items
+        }
+        Err(error) => {
+            unavailable.push(format!("review items: {error}"));
+            Vec::new()
+        }
+    };
+    let mut queue = assemble_queue(&human, agents, reviews, limit);
+    queue.truncated |= truncated;
+    queue.unavailable = unavailable;
+    queue
+}
+
+/// Read the decision history; the same operator rule as [`read_pending`].
+pub async fn read_history(
+    reviews: &crate::review::ReviewStore,
+    collaboration: &crate::collaboration::CollaborationStore,
+    limit: usize,
+    operator: bool,
+) -> DecisionHistory {
+    let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
+    let mut unavailable = Vec::new();
+    let mut truncated = false;
+    let answered = if operator {
+        collaboration.answered_human_requests(limit).await
+    } else {
+        Err(crate::collaboration::CollaborationError::ScopeDenied)
+    };
+    let answered = human_source(answered, &mut truncated, &mut unavailable);
+    let decided = match reviews.decided(limit).await {
+        Ok(page) => {
+            truncated |= page.has_more;
+            page.items
+        }
+        Err(error) => {
+            unavailable.push(format!("review items: {error}"));
+            Vec::new()
+        }
+    };
+    let mut history = assemble_history(decided, &answered, limit);
+    history.truncated |= truncated;
+    history.unavailable = unavailable;
+    history
+}
+
 /// Join the three sources into one ordered, bounded queue. Inputs need not
 /// be sorted; `human` and `reviews` should already be open-only.
 #[must_use]

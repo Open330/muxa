@@ -346,6 +346,24 @@ in `unlinked_executions`; they are never guessed into Work from their names.
 Their sessions still appear as workspaces in the rail (see
 [Workspace rail](#workspace-rail)), but Work only comes from managed runs.
 
+## Needs you
+
+`/needs` is a phone-first page with everything waiting on you, in the order
+`tend review queue` uses: questions agents asked you
+(`tend_request_attention`), agents waiting in their pane, then results filed
+for review. Each card shows the summary, the decision asked for, the options,
+the agent's recommendation and its evidence (commit, PR link, diff, test
+result with its output tail, path). The **Decided** tab lists past decisions
+with their notes and answers. The page reads `GET /api/decisions` and
+`GET /api/decisions/history` (both take `?limit=`, at most 500), the same
+daemon reads as the Mac app (`decision_queue`, `decision_history`).
+
+Authorization: both reads are **operator-only**, like pane output. They need
+the dashboard token or a live operator sign-in; a viewer session gets 403,
+an anonymous visitor 401, and `public_read` or `auth = "none"` never expose
+them. They are GETs, so they need no CSRF proof. The queue covers the host
+whose tendd serves the dashboard; the response says so (`covers`).
+
 ## Collaboration graph and history API
 
 The collaboration panel projects retained requests into two linked views. The
