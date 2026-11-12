@@ -23,7 +23,7 @@ export const TendPlugin = async ({ $, client, directory }) => {
   const replies = new Map(); // sessionID -> { messageID, parts: Map<partID, text> }
   const tools = new Map(); // sessionID:messageID:callID -> last forwarded status
   const completed = new Map(); // assistant messageIDs already reported
-  let owner = null; // the session the pane's user last prompted (or created)
+  let owner = null; // the session the pane's user last prompted
   const incomplete = new Set(); // sessionIDs whose current turn failed or was aborted
 
   const remember = (map, key, value, cap = 512) => {
@@ -57,14 +57,16 @@ export const TendPlugin = async ({ $, client, directory }) => {
   const send = (type, properties, extra) => {
     const sessionID = properties && properties.sessionID;
     if (sessionID && children.has(sessionID)) return;
-    // A prompt is the one event that says this pane's user is driving a
-    // session. A prompt into a session other than the pane's current owner
-    // rebinds the pane to it (so A→B→A leaves one live row); any other event
-    // only updates that session's own row.
+    // opencode hands the plugin every session's events in its directory,
+    // and every hook call carries this pane. A prompt is the one event that
+    // says the pane's user is driving a session, so only a prompt binds the
+    // pane, and only the bound session's events are forwarded; another
+    // session's late idle or tool event must not revive its row here.
     if (type === "tend.prompt" && sessionID && sessionID !== owner) {
       owner = sessionID;
       queue.push({ type: "tend.session.active", properties: { sessionID }, tend: { directory } });
     }
+    if (!sessionID || sessionID !== owner) return;
     queue.push({ type, properties, tend: { directory, ...extra } });
     if (queue.length > 256) queue.shift();
     setTimeout(flush, 0);
@@ -107,14 +109,12 @@ export const TendPlugin = async ({ $, client, directory }) => {
             children.add(p.info.id);
             return;
           }
-          if (event.type === "session.created") {
-            owner = p.info.id;
-            send(event.type, { sessionID, info: { id: p.info.id, directory: p.info.directory } });
-          }
+          // A top-level session is bound by its first prompt, not by its
+          // creation: another client in this directory can create one too.
           return;
         case "session.deleted":
-          if (sessionID === owner) owner = null;
           send(event.type, { sessionID });
+          if (sessionID === owner) owner = null;
           return;
         case "session.idle":
           send(event.type, { sessionID }, { response: replyText(sessionID) });
@@ -229,7 +229,6 @@ mod tests {
         for ty in [
             "tend.session.active",
             "tend.prompt",
-            "session.created",
             "session.deleted",
             "session.idle",
             "session.status",

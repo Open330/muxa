@@ -30,10 +30,13 @@
 //!   (a failed or aborted turn's partial output is not its answer).
 //! - **A pane is bound by a prompt, not by event arrival.** opencode delivers
 //!   every session's events in the directory to the plugin, so an event says
-//!   nothing about which session the TUI shows. `session.created`, and a
-//!   prompt into a session other than the one the pane last prompted, become
-//!   `Started` (which reconciles the pane to that one row); everything else
-//!   only updates that session's own row.
+//!   nothing about which session the TUI shows, while every hook call carries
+//!   this pane. A prompt into a session other than the one the pane last
+//!   prompted becomes `Started` (which reconciles the pane to that one row),
+//!   and only the bound session's events are forwarded at all, so another
+//!   session's late idle or tool event cannot revive its row on this pane.
+//!   (`session.created` is still mapped, for a plugin that forwards it, but
+//!   the bundled one does not: another client may have created the session.)
 //!
 //! `session.idle` is opencode's explicit `status = idle`, so it is sent with
 //! `idle_confirmed`: it clears a pending wait, keeps an error, and never

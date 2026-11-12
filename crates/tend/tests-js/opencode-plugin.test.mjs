@@ -23,11 +23,14 @@ async function harness() {
   return { sent, hooks, emit, settle };
 }
 
+const bind = (hooks, sessionID) =>
+  hooks["chat.message"]({ sessionID }, { message: {}, parts: [{ type: "text", text: "go" }] });
+
 const tool = (sessionID, callID, status) => ({
   part: { id: callID, sessionID, messageID: "m", type: "tool", tool: "bash", callID, state: { status, input: { command: "ls" } } },
 });
 
-test("a created session sends its prompt without synthetic parts", async () => {
+test("a prompt binds its session and drops synthetic parts", async () => {
   const { sent, hooks, emit, settle } = await harness();
   await emit("session.created", { info: { id: "ses_1", directory: "/w" } });
   await hooks["chat.message"]({ sessionID: "ses_1" }, { message: {}, parts: [
@@ -35,14 +38,15 @@ test("a created session sends its prompt without synthetic parts", async () => {
     { type: "text", text: "<file contents>", synthetic: true },
   ] });
   await settle();
-  // Created sessions are already bound; the prompt adds no second start.
-  assert.deepEqual(sent.map((p) => p.type), ["session.created", "tend.prompt"]);
+  // Creation alone binds nothing: another client may have created it.
+  assert.deepEqual(sent.map((p) => p.type), ["tend.session.active", "tend.prompt"]);
   assert.equal(sent[1].properties.text, "fix it");
 });
 
 test("child sessions never reach tend", async () => {
-  const { sent, emit, settle } = await harness();
+  const { sent, hooks, emit, settle } = await harness();
   await emit("session.created", { info: { id: "ses_1" } });
+  await bind(hooks, "ses_1");
   await emit("session.created", { info: { id: "ses_kid", parentID: "ses_1" } });
   await emit("message.part.updated", tool("ses_kid", "c9", "running"));
   await emit("session.idle", { sessionID: "ses_kid" });
@@ -51,7 +55,8 @@ test("child sessions never reach tend", async () => {
 });
 
 test("tool parts are forwarded once per status change, never pending", async () => {
-  const { sent, emit, settle } = await harness();
+  const { sent, hooks, emit, settle } = await harness();
+  await bind(hooks, "ses_1");
   for (const status of ["pending", "running", "running", "completed"]) {
     await emit("message.part.updated", tool("ses_1", "c1", status));
   }
@@ -62,7 +67,8 @@ test("tool parts are forwarded once per status change, never pending", async () 
 });
 
 test("idle carries the last assistant message's text", async () => {
-  const { sent, emit, settle } = await harness();
+  const { sent, hooks, emit, settle } = await harness();
+  await bind(hooks, "ses_1");
   await emit("message.updated", { info: { id: "m1", sessionID: "ses_1", role: "assistant", time: { created: 1 } } });
   await emit("message.part.updated", { part: { id: "p1", sessionID: "ses_1", messageID: "m1", type: "text", text: "Done." } });
   await emit("message.updated", { info: { id: "m1", sessionID: "ses_1", role: "assistant", time: { created: 1, completed: 2 }, modelID: "x", cost: 0.1 } });
@@ -75,11 +81,12 @@ test("idle carries the last assistant message's text", async () => {
 });
 
 test("busy and idle statuses are left to prompts and session.idle", async () => {
-  const { sent, emit, settle } = await harness();
+  const { sent, hooks, emit, settle } = await harness();
+  await bind(hooks, "ses_1");
   await emit("session.status", { sessionID: "ses_1", status: { type: "busy" } });
   await emit("session.status", { sessionID: "ses_1", status: { type: "retry", attempt: 1, message: "rate limited", next: 1 } });
   await settle();
-  assert.deepEqual(sent.map((p) => p.type), ["session.status"]);
+  assert.deepEqual(sent.map((p) => p.type).slice(2), ["session.status"]);
 });
 
 const prompt = (hooks, sessionID, text) =>
@@ -128,4 +135,23 @@ test("a failed or aborted turn's partial text is not reported", async () => {
   await settle();
   const idles = sent.filter((p) => p.type === "session.idle").map((p) => p.tend.response);
   assert.deepEqual(idles, [undefined, undefined, "FULL"]);
+});
+
+test("a session the pane no longer drives cannot revive its row", async () => {
+  const { sent, hooks, emit, settle } = await harness();
+  await prompt(hooks, "A", "one");
+  await prompt(hooks, "B", "two");
+  await prompt(hooks, "A", "three");
+  await settle();
+  const before = sent.length;
+  await emit("session.idle", { sessionID: "B" });
+  await emit("message.part.updated", tool("B", "cB", "running"));
+  await emit("permission.asked", { id: "p", sessionID: "B", permission: "bash", patterns: [] });
+  await emit("session.error", { sessionID: "B", error: { name: "APIError", data: { message: "x" } } });
+  // Nothing about an unbound session reaches tend either.
+  await emit("session.idle", { sessionID: "C" });
+  await emit("session.idle", { sessionID: "A" });
+  await settle();
+  const after = sent.slice(before);
+  assert.deepEqual(after.map((p) => [p.type, p.properties.sessionID]), [["session.idle", "A"]]);
 });

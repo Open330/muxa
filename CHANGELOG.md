@@ -103,10 +103,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tend hook opencode` maps only their documented shapes: an opencode pane
   goes working on a prompt, waiting on a permission prompt or a question,
   idle with the turn's response, and error on a failed request (not on Esc).
-  Subagent sessions no longer register as extra agents, and switching
-  sessions in the TUI moves the pane's row. `opencode` panes are discovered
-  by process name like `claude`, `codex` and `agy`, so an MCP-spawned opencode
-  worker is recognised before its first event. Re-run
+  Subagent sessions no longer register as extra agents, prompting another
+  session in the TUI moves the pane's row, and other sessions in the same
+  directory no longer write to it. `opencode` panes are discovered by process
+  name like `claude`, `codex` and `agy`, so an MCP-spawned opencode worker is
+  recognised before its first event. Re-run
   `tend init --component opencode-hooks` and restart opencode to pick up the
   new plugin. See [docs/OPENCODE.md](docs/OPENCODE.md).
 - tendd now bounds the files it used to grow forever. The collaboration audit

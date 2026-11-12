@@ -28,7 +28,7 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
 
 | opencode signal | tend event | State |
 | --- | --- | --- |
-| `session.created`, or a prompt into a session other than the pane's current one | `Started` | idle |
+| a prompt into a session other than the pane's current one | `Started` | idle |
 | `chat.message` (non-synthetic text parts of the user message) | `PromptSubmitted` | working |
 | tool part `state.status` → `running` | `ToolStarted` (`bash` carries its command) | working |
 | tool part `state.status` → `completed` / `error` | `ToolCompleted` | — |
@@ -48,10 +48,12 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
   the plugin, so one pane is one conversation.
 - **Pane binding comes from prompts, not from event arrival.** opencode hands
   the plugin every session's events in its directory, so an event does not
-  say which session the TUI is showing. The pane is bound to a session when
-  it is created, and rebound whenever a prompt goes into a different session
-  than the last one, so the pane keeps one live row. Events from other
-  sessions update only their own rows.
+  say which session the TUI is showing. A prompt binds the pane to its
+  session, and a prompt into a different session rebinds it, so the pane
+  keeps one live row. Only the bound session's events are forwarded: other
+  sessions in the same directory (another client's, or one the TUI switched
+  away from) are not tracked from this pane. A prompt sent by another client
+  through opencode's API rebinds the pane the same way.
 - **Responses** are reset at each prompt and reported only for a turn that
   ended without `session.error`; a failed or aborted turn's partial output is
   not recorded as its answer, and a failed turn stays in error after idle.
