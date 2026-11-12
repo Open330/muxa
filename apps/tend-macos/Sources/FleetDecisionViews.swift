@@ -67,8 +67,11 @@ final class FleetDecisionFeed: ObservableObject {
             set: { [weak self] value in
                 guard let self else { return }
                 if let value {
+                    // Reopening keeps what was typed before; an option
+                    // (a non-empty value) replaces it on purpose.
+                    let reopening = self.composingID != id && value.isEmpty
                     self.composingID = id
-                    self.drafts[id] = value
+                    if !(reopening && self.drafts[id] != nil) { self.drafts[id] = value }
                 } else if self.composingID == id {
                     self.composingID = nil
                     self.drafts[id] = nil

@@ -216,6 +216,12 @@ struct TendPendingQueue: Decodable, Hashable, Sendable {
     var items: [TendPendingItem] = []
     var truncated = false
     var unavailable: [String] = []
+    /// Entries tendd sent that this app could not read.
+    var undecoded = 0
+
+    /// Every source was read in full and every entry decoded: what the
+    /// queue leaves out is not pending.
+    var isComplete: Bool { !truncated && unavailable.isEmpty && undecoded == 0 }
 
     enum CodingKeys: String, CodingKey { case items, truncated, unavailable }
 
@@ -227,7 +233,9 @@ struct TendPendingQueue: Decodable, Hashable, Sendable {
 
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
-        items = ((try? values.decodeIfPresent([TendLenient<TendPendingItem>].self, forKey: .items)) ?? []).compactMap(\.value)
+        let raw = (try? values.decodeIfPresent([TendLenient<TendPendingItem>].self, forKey: .items)) ?? []
+        items = raw.compactMap(\.value)
+        undecoded = raw.count - items.count
         truncated = (try? values.decodeIfPresent(Bool.self, forKey: .truncated)) ?? false
         unavailable = (try? values.decodeIfPresent([String].self, forKey: .unavailable)) ?? []
     }
@@ -357,8 +365,10 @@ enum FleetDecisions {
     /// The queue Home shows. With the daemon's queue: its human requests and
     /// review items in its order (waiting agents are already Work cards),
     /// then the console mailbox's human requests it does not hold: other
-    /// hosts', and this Mac's when the queue read was partial (a source
-    /// unavailable, truncated, an entry this app could not decode). Without
+    /// hosts', and this Mac's only when the queue read was partial (a source
+    /// unavailable, truncated, an entry this app could not decode). A
+    /// complete queue is authoritative for this Mac: an older mailbox copy
+    /// of a request answered since never comes back. Without
     /// it: this Mac's open review items, then every host's human requests.
     /// One request is listed once.
     static func merge(
@@ -385,6 +395,7 @@ enum FleetDecisions {
         }
         let pending = messages
             .filter { $0.isHumanRequest && $0.request.needsHumanResponse }
+            .filter { queue?.isComplete != true || $0.host.alias != localHost.alias }
             .sorted { $0.request.createdAt < $1.request.createdAt }
         pending.forEach { add(FleetDecision(humanRequest: $0)) }
         return result

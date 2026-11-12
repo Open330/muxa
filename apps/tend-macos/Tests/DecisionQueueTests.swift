@@ -113,6 +113,11 @@ private func message(host: TendFleetHostIdentity, id: String, created: String, s
         let partial = TendPendingQueue(items: [], unavailable: ["human requests: locked"])
         let local2 = try message(host: local, id: "req_2", created: "2026-11-12T01:00:00Z")
         #expect(FleetDecisions.merge(queue: partial, reviews: [], messages: [local2], localHost: local).map(\.id) == ["human:mac:req_2"])
+        // A complete queue that no longer holds it means it was answered;
+        // the mailbox's older copy does not bring it back.
+        #expect(FleetDecisions.merge(queue: TendPendingQueue(), reviews: [], messages: [local2], localHost: local).isEmpty)
+        // An entry this app could not decode makes the read partial too.
+        #expect(!queue.isComplete && queue.undecoded == 1)
         #expect(decisions[0].title == "Merge #12 or hold for the perf run?")
         #expect(decisions[0].detail == "Merge #12 now?")
         #expect(decisions[0].asker == "@impl")
@@ -277,6 +282,25 @@ private func message(host: TendFleetHostIdentity, id: String, created: String, s
             }
         }
         #expect(await missing() == before, "Changes fetched from the promisor remote")
+    }
+
+    @MainActor
+    @Test func oneAnswerIsOpenAtATimeAndReopeningKeepsItsText() {
+        let feed = FleetDecisionFeed()
+        let first = feed.draft(for: "a")
+        let second = feed.draft(for: "b")
+        first.wrappedValue = "half an answer"
+        second.wrappedValue = ""
+        #expect(first.wrappedValue == nil, "only one composer is open")
+        #expect(second.wrappedValue == "")
+        first.wrappedValue = ""
+        #expect(first.wrappedValue == "half an answer", "reopening keeps the text")
+        #expect(second.wrappedValue == nil)
+        first.wrappedValue = "Merge now"
+        #expect(first.wrappedValue == "Merge now", "an option replaces it")
+        first.wrappedValue = nil
+        first.wrappedValue = ""
+        #expect(first.wrappedValue == "", "Cancel discards it")
     }
 
     @MainActor

@@ -386,7 +386,10 @@ struct FleetHomeView: View {
     @ViewBuilder
     private func lanes(_ works: [FleetWork], decisions: [FleetDecision], reviewedCount: Int) -> some View {
         Group {
-            if FleetBoard.showsEmptyBoard(visible: works.count + decisions.count, reviewed: reviewedCount) {
+            // A decision read that failed keeps the lanes, so its warning
+            // shows instead of an ordinary empty Home.
+            let problem = decisionFeed.problem == nil ? 0 : 1
+            if FleetBoard.showsEmptyBoard(visible: works.count + decisions.count + problem, reviewed: reviewedCount) {
                 FleetEmptyBoard(
                     isConnected: model.isConnected,
                     newAgent: { model.presentNewAgent() },
