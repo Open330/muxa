@@ -644,7 +644,6 @@ mod tests {
             paths: Vec::new(),
             artifacts: Vec::new(),
             links: Vec::new(),
-            air_artifacts: Vec::new(),
             status: RequestStatus::Queued,
             created_at: OffsetDateTime::now_utc(),
             claimed_at: None,
@@ -825,7 +824,6 @@ mod tests {
             status: RequestStatus::Completed,
             body: "changes required".into(),
             artifacts: Vec::new(),
-            air_artifacts: Vec::new(),
             at: now - time::Duration::minutes(2),
         });
         let mut second = request("req_2", from, to, "review round two");

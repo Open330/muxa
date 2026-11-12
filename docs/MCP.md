@@ -224,14 +224,14 @@ it:
 | `tend_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
 | `tend_collaboration_guide` | `workflows?` | Return identity, preferences, guardrails and running-daemon capabilities. `workflows=true` adds detailed examples; human-action guidance requires `capabilities.human_actions=true`. |
 | `tend_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
-| `tend_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `context_bound?`, `user_authorized?`, `spawn_agent?`, `spawn_timeout_secs?`, `air_artifacts?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and reuse or create a dedicated worker with configured provider permissions. |
+| `tend_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `context_bound?`, `user_authorized?`, `spawn_agent?`, `spawn_timeout_secs?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and reuse or create a dedicated worker with configured provider permissions. |
 | `tend_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
 | `tend_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
 | `tend_request_attention` | `body`, `action?`, `dispatch_id?`, `parent_request_id?` | Request required human approval, choice or information; delivered to connected Fleet operator clients. Reuse a UUID dispatch ID on retry; wait for and read the actual human reply. |
-| `tend_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `air_artifacts?`, `withdraw_reply_wakes?`, `user_authorized?` | Create a durable same-window peer request. `withdraw_reply_wakes` names your own earlier requests it replaces; their late replies stop waking you. `user_authorized=true`, only on the user's explicit instruction, lets a protected primary take the request without acceptance. |
+| `tend_send_message` | `target`, `body`, `kind?`, `work_mode?`, `paths?`, `withdraw_reply_wakes?`, `user_authorized?` | Create a durable same-window peer request. `withdraw_reply_wakes` names your own earlier requests it replaces; their late replies stop waking you. `user_authorized=true`, only on the user's explicit instruction, lets a protected primary take the request without acceptance. |
 | `tend_inbox` | `request_id?, full?` | Claim and read instructions, authority, paths and attachments. Use the wake’s `request_id` to read one request; `full=true` includes audit metadata. CLI: `tend msg accept ID --json` (one), `tend msg inbox --json` (compact inbox), `--json --full` (legacy audit records). |
 | `tend_list_messages` | `mailbox?`, `request_id?`, `limit?`, `offset?`, `include_body?`, `after_update?`, `full?` | List newest metadata records without claiming (default 20, max 100). Read an exact request or incremental progress explicitly. |
-| `tend_reply` | `request_id`, `status`, `body`, `artifacts?`, `air_artifacts?` | Return a structured terminal response. |
+| `tend_reply` | `request_id`, `status`, `body`, `artifacts?` | Return a structured terminal response. |
 | `tend_wait_reply` | `request_id`, `timeout_secs?` | Event-driven wait for a structured peer response. |
 | `tend_withdraw_reply_wake` | `request_ids` | Stop being woken for replies to your own requests you gave up on or replaced. Work, replies and `tend_wait_reply` results are unchanged. |
 | `tend_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
@@ -528,27 +528,6 @@ same tool call uses a bounded internal compatibility poll; the model is not
 sampled again. Current daemons always use the event-driven path.
 Do not replace either path with `sleep`, raw `tmux capture-pane`, or repeated
 status/capture calls.
-
-### AIR artifact handoff
-
-Collaboration requests and replies can carry typed references to existing AIR
-1.0 artifacts. tend transports and visualizes the reference; AIR Workbench
-remains the validator, editor, and graph viewer. This does not turn tend into
-an AIR executor and does not make an unvalidated document conformant.
-
-```json
-{
-  "artifact_id": "urn:air:sha256:<64 lowercase hex characters>",
-  "profile": "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
-  "label": "ENG-6924 execution plan",
-  "locator": { "display": ".air/eng-6924-plan.air.json", "disclosure": "local-only" }
-}
-```
-
-The exact supported profiles are workflow skill, native CLI plan, native run
-trace, and metadata-only session snapshot. Locators are display-only hints,
-never authority. Session snapshot references must not be used to smuggle
-prompts, messages, filesystem paths, or provider identifiers into AIR data.
 
 ## Orchestration examples
 

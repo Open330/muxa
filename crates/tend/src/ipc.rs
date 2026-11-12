@@ -36,7 +36,7 @@ use crate::automation::{
 };
 use crate::backend::{default_backend, HostKind, SharedBackend};
 use crate::collaboration::{
-    self, AirArtifactReference, CollaborationClientKind, CollaborationOptions, CollaborationOrigin,
+    self, CollaborationClientKind, CollaborationOptions, CollaborationOrigin,
     CollaborationOriginMatch, CollaborationPaneEvidence, CollaborationProvenance,
     CollaborationRequest, CollaborationStore, MailboxScope, NewRequest, Participant,
     RequestMailbox, RequestStatus, RoomContext,

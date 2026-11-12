@@ -484,11 +484,6 @@ window/session history has one combined stream, so `Tab`, `m`, `i`, and `e`
 are disabled there. A watch opened from a normal shell still collaborates as
 the operator console; it never borrows an agent identity from the launch pane.
 
-Requests with AIR artifact references carry profile-colored mailbox badges:
-blue `AIR WORKFLOW`, magenta `AIR PLAN`, cyan `AIR TRACE`, and light-cyan
-`AIR SESSION`. The selected detail shows whether each reference is an input or
-reply output, plus its short digest, label, and display-only locator.
-
 ## Preview
 
 Press `o` or `Alt-P` to preview the selected pane. In work view, if the selected

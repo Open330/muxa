@@ -21,7 +21,7 @@ final class TendModuleRegistry: ObservableObject {
 
     init(modules: [any TendModule]? = nil, defaults: UserDefaults = .standard) {
         self.defaults = defaults
-        self.modules = modules ?? [AasModule(), AirModule()]
+        self.modules = modules ?? [AasModule()]
     }
 
     /// Preference key for a module's switch.

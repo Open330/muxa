@@ -288,10 +288,6 @@ tend msg send peer "수정 결과를 검증해 주세요" --kind review \
 tend msg send pane:%18 "테스트를 보강해 주세요" \
   --kind task --execute --path 'crates/auth/**'
 
-# 검증된 AIR plan을 작업 입력으로 함께 전달
-tend msg send peer "이 계획의 위험을 검토해 주세요" --kind review \
-  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"ENG-6924 plan","locator":{"display":".air/eng-6924-plan.air.json","disclosure":"local-only"}}'
-
 # 수신 agent
 tend msg inbox
 tend msg reply req_... "검토 완료: ..." --status completed
@@ -402,7 +398,7 @@ watch composer는 `? QUESTION`, `◆ REVIEW`, `▶ TASK`, `! NOTICE`를 서로 �
 
 | Tool | 역할 |
 | --- | --- |
-| `tend_collaboration_guide` | reviewer/question/subagent/AIR 전달의 권장 계약 조회 |
+| `tend_collaboration_guide` | reviewer/question/subagent 전달의 권장 계약 조회 |
 | `tend_room_context` | self, same-window peers, unread count 조회 |
 | `tend_call_peer` | 등록 스킬 확장, peer 선택, durable 요청, 선택적 응답 대기, 확인 후 agent 생성 |
 | `tend_peer_report` | 이전 peer 요청의 최신 완료 보고 또는 정확한 request id 조회 |
@@ -517,27 +513,6 @@ agent가 상당한 작업을 시작할 때 권장 순서는 다음과 같습니�
 저장 request를 그대로 반환합니다. 메시지 본문에서 관계를 추측하지 말고 반환된
 request id를 다음 호출의 parent로 넘길 수 있습니다.
 
-## AIR artifact 전달과 시각화
-
-request와 reply의 `air_artifacts`에는 AIR 1.0 artifact의 타입이 지정된 참조를 최대
-8개까지 첨부할 수 있습니다. `tend watch`와 `tend dashboard` mailbox는 첫 참조를
-색상 배지로 표시하고, 상세 영역에서 input/output, 짧은 digest, label, 표시용
-locator를 보여줍니다.
-
-지원 profile은 AIR 1.0의 정확한 네 profile입니다.
-
-- `https://open330.github.io/air/profiles/1.0.0/workflow-skill` → `AIR WORKFLOW`
-- `https://open330.github.io/air/profiles/1.0.0/plan-native-cli` → `AIR PLAN`
-- `https://open330.github.io/air/profiles/1.0.0/trace-native-run` → `AIR TRACE`
-- `https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot` → `AIR SESSION`
-
-artifact ID는 `urn:air:sha256:` 뒤에 소문자 64자리 SHA-256 digest가 와야 합니다.
-locator는 `local-only` 또는 `redacted` disclosure를 가진 표시용 힌트일 뿐이며 파일
-접근 권한이나 실행 권한이 아닙니다. tend는 참조 형식만 검사하고 artifact의 AIR
-conformance를 주장하지 않습니다. 검증·편집·그래프 탐색은 AIR Workbench에서
-수행하세요. tend 협업 내용을 위해 새 trace profile을 만들거나 session snapshot에
-prompt/message/path/provider 식별자를 넣어서는 안 됩니다.
-
 ## Indexed history, migration, retention
 
 mailbox는 전달 전에 owner-only SQLite DB에 저장됩니다. 과거 기본 config path인
@@ -585,7 +560,7 @@ watch/dashboard 요청을 원자적으로 claim해 직접 전달하고, agent가
 `full`은 모든 요청을 직접 전달합니다.
 
 직접 전달은 terminal에 입력하기 전에 queued request 하나를 원자적으로 claim하고,
-request id/source/kind/work mode/paths/AIR reference와 원문을 구조화된 prompt로
+request id/source/kind/work mode/paths와 원문을 구조화된 prompt로
 전달합니다. 이 request에는 inbox를 다시 호출할 필요가 없어 tool round와 전체 JSON
 envelope를 줄입니다. idle generation 하나에는 원문 하나만 제출하고, 실제 Idle
 transition이 온 뒤 다음 요청을 전달합니다. reply 본문은 모든 모드에서 항상

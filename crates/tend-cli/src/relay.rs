@@ -679,7 +679,6 @@ async fn handle_request(
                     status,
                     &body,
                     &[],
-                    &[],
                     report.as_ref(),
                     tend::collaboration::CollaborationReadView::Full,
                 )

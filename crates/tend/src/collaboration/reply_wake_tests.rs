@@ -78,7 +78,6 @@ impl Pair {
                 status,
                 format!("answer to {id}"),
                 Vec::new(),
-                Vec::new(),
             )
             .await
             .unwrap();
@@ -452,7 +451,6 @@ fn legacy_rows_derive_their_release_from_timestamps() {
             status: RequestStatus::Completed,
             body: "done".into(),
             artifacts: Vec::new(),
-            air_artifacts: Vec::new(),
             at: now,
         }),
         status: RequestStatus::Completed,
@@ -521,7 +519,6 @@ fn legacy_request(pair: &Pair) -> CollaborationRequest {
         paths: Vec::new(),
         artifacts: Vec::new(),
         links: Vec::new(),
-        air_artifacts: Vec::new(),
         withdrew_reply_wakes: Vec::new(),
         status: RequestStatus::Queued,
         created_at: OffsetDateTime::now_utc(),

@@ -2380,7 +2380,6 @@ pub(super) async fn handle(
                     status,
                     body,
                     artifacts,
-                    air_artifacts,
                     view,
                     report,
                 } => {
@@ -2410,7 +2409,6 @@ pub(super) async fn handle(
                                 status,
                                 body,
                                 artifacts,
-                                air_artifacts,
                                 report,
                             )
                             .await

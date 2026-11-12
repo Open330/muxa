@@ -78,8 +78,8 @@ use tend::adapters::{
     OpencodeAdapter,
 };
 use tend::collaboration::{
-    AirArtifactReference, CollaborationClientKind, CollaborationOrigin, CollaborationOriginMatch,
-    MailboxScope, NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, WorkMode,
+    CollaborationClientKind, CollaborationOrigin, CollaborationOriginMatch, MailboxScope,
+    NewRequest, Participant, RequestKind, RequestMailbox, RequestStatus, WorkMode,
 };
 use tend::config::{IconSet, WatchConfig, WatchSortKey, WatchTheme};
 use tend::ipc::Client;
@@ -623,9 +623,6 @@ enum MsgCmd {
         /// Related URL or external resource. Repeatable.
         #[arg(long = "link")]
         links: Vec<String>,
-        /// AIR 1 artifact reference as JSON. Repeat for multiple references.
-        #[arg(long = "air-ref")]
-        air_refs: Vec<String>,
         /// Fire-and-forget message; do not expect a reply.
         #[arg(long)]
         no_reply: bool,
@@ -733,9 +730,6 @@ enum MsgCmd {
         status: String,
         #[arg(long = "artifact")]
         artifacts: Vec<String>,
-        /// AIR 1 artifact reference as JSON. Repeat for multiple references.
-        #[arg(long = "air-ref")]
-        air_refs: Vec<String>,
         /// Print a compact acknowledgement without repeating request/reply bodies.
         #[arg(long)]
         json: bool,

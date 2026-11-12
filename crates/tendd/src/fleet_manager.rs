@@ -549,7 +549,6 @@ impl LocalTask {
                         status,
                         &body,
                         &[],
-                        &[],
                         report.as_ref(),
                         tend::collaboration::CollaborationReadView::Full,
                     )

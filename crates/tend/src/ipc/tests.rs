@@ -259,7 +259,6 @@ async fn create_private_list_history(
                 RequestStatus::Completed,
                 "PRIVATE REPLY".repeat(300),
                 vec![],
-                vec![],
             )
             .await
             .unwrap();

@@ -1,8 +1,8 @@
 use super::{
     collaboration_output, mcp, mcp_output, parse_duration_secs, require_capability, time_range,
-    AirArtifactReference, Client, CollaborationOrigin, CollaborationOriginMatch, Context,
-    IdentityCmd, MailboxScope, MsgCmd, NewRequest, OffsetDateTime, Participant, Path, RequestKind,
-    RequestMailbox, RequestStatus, Result, WorkMode,
+    Client, CollaborationOrigin, CollaborationOriginMatch, Context, IdentityCmd, MailboxScope,
+    MsgCmd, NewRequest, OffsetDateTime, Participant, Path, RequestKind, RequestMailbox,
+    RequestStatus, Result, WorkMode,
 };
 
 /// The origin `tend peers`/`msg`/`identity` speak for.
@@ -52,17 +52,6 @@ pub(super) fn collaboration_request_status(value: &str) -> Result<RequestStatus>
             "status must be queued, claimed, completed, blocked, declined, failed, expired, or cancelled"
         ),
     }
-}
-
-pub(super) fn collaboration_air_references(values: &[String]) -> Result<Vec<AirArtifactReference>> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(index, value)| {
-            serde_json::from_str(value)
-                .with_context(|| format!("invalid --air-ref #{} JSON", index + 1))
-        })
-        .collect()
 }
 
 pub(super) fn collaboration_list_scope(value: &str) -> Result<MailboxScope> {
@@ -432,7 +421,6 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             paths,
             artifacts,
             links,
-            air_refs,
             no_reply,
             notify,
             withdraw,
@@ -462,7 +450,6 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     .map_err(anyhow::Error::msg)?;
             }
             let kind = collaboration_request_kind(&kind)?;
-            let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
                 .collaboration_send_view(
                     &origin,
@@ -494,7 +481,6 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                             WorkMode::ReadOnly
                         },
                         paths,
-                        air_artifacts,
                         thread_id: thread,
                         parent_request_id: parent,
                         workspace_id: workspace,
@@ -601,7 +587,6 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
             body,
             status,
             artifacts,
-            air_refs,
             json,
             full,
         } => {
@@ -612,7 +597,6 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     tend::collaboration::TaskReport::from_input(value).map_err(anyhow::Error::msg)
                 })
                 .transpose()?;
-            let air_artifacts = collaboration_air_references(&air_refs)?;
             let request = client
                 .collaboration_reply_report_view(
                     &origin,
@@ -620,7 +604,6 @@ pub(super) async fn cmd_msg(client: &Client, action: MsgCmd) -> Result<()> {
                     collaboration_reply_status(&status)?,
                     &body,
                     &artifacts,
-                    &air_artifacts,
                     report.as_ref(),
                     if full {
                         tend::collaboration::CollaborationReadView::Full
@@ -984,7 +967,6 @@ pub(super) fn render_inbox_request(request: &tend::collaboration::CollaborationR
         "paths",
         "artifacts",
         "links",
-        "air_artifacts",
         "updates",
         "human_action",
         "interruption",

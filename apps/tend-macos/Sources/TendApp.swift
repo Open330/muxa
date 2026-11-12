@@ -55,9 +55,8 @@ private final class TendApplicationDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// A module may be holding a process of its own — AIR Workbench serves a
-    /// loopback page until it is stopped — and quitting must not leave it
-    /// running.
+    /// A module may be holding a process of its own, and quitting must not
+    /// leave it running.
     func applicationWillTerminate(_ notification: Notification) {
         menuBar?.stop()
         menuBar = nil

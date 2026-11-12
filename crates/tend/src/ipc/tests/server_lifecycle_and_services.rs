@@ -964,7 +964,6 @@ async fn a_wait_cut_short_by_a_restart_is_answered_and_retried_until_the_reply()
             RequestStatus::Completed,
             "real reply".into(),
             vec![],
-            vec![],
         )
         .await
         .unwrap();

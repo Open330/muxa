@@ -149,7 +149,6 @@ mod tests {
                     RequestStatus::Completed,
                     "done".into(),
                     vec![],
-                    vec![],
                 )
                 .await
                 .unwrap();

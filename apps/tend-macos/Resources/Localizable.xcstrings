@@ -907,16 +907,6 @@
         }
       }
     },
-    "%lld" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%lld"
-          }
-        }
-      }
-    },
     "%lld / %lld online" : {
       "localizations" : {
         "ko" : {
@@ -3299,88 +3289,6 @@
         }
       }
     },
-    "AIR 1 traces describe a claude or codex run; @%@ runs %@." : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "AIR 1 traces describe a claude or codex run; @%1$@ runs %2$@."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR 1 트레이스는 claude 또는 codex 실행만 기술합니다. @%@은(는) %@을(를) 실행합니다."
-          }
-        }
-      }
-    },
-    "AIR Workbench folder" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR Workbench 폴더"
-          }
-        }
-      }
-    },
-    "AIR Workbench is serving %@ at %@." : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "AIR Workbench is serving %1$@ at %2$@."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR Workbench가 %@을(를) %@에서 열었습니다."
-          }
-        }
-      }
-    },
-    "AIR Workbench printed no address within %lld seconds." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR Workbench가 %lld초 안에 주소를 출력하지 않았습니다."
-          }
-        }
-      }
-    },
-    "AIR Workbench stopped without printing an address." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR Workbench가 주소를 출력하지 못하고 종료됐습니다."
-          }
-        }
-      }
-    },
-    "AIR Workbench stopped: %@" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR Workbench가 종료됐습니다: %@"
-          }
-        }
-      }
-    },
-    "AIR has no standard install location yet, so point Tend at the air-workbench folder of your AIR checkout — the one holding scripts/air.mjs." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR은 아직 표준 설치 위치가 없습니다. AIR 체크아웃에서 scripts/air.mjs가 들어 있는 air-workbench 폴더를 지정해 주세요."
-          }
-        }
-      }
-    },
     "Also stop agents that are mid-turn" : {
       "localizations" : {
         "ko" : {
@@ -4072,16 +3980,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "에이전트 대상을 구분할 수 없습니다. 해당 패널을 여세요"
-          }
-        }
-      }
-    },
-    "An AIR artifact is a JSON object." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR 아티팩트는 JSON 객체입니다."
           }
         }
       }
@@ -5223,16 +5121,6 @@
         }
       }
     },
-    "Choose a folder for the run evidence" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 기록을 저장할 폴더 선택"
-          }
-        }
-      }
-    },
     "Choose a folder that exists on this Mac." : {
       "localizations" : {
         "ko" : {
@@ -5299,26 +5187,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "알림 받을 항목은 설정 › 동작에서 고를 수 있습니다."
-          }
-        }
-      }
-    },
-    "Choose your air-workbench folder" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "air-workbench 폴더 선택"
-          }
-        }
-      }
-    },
-    "Choose your air-workbench folder first." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "먼저 air-workbench 폴더를 지정해 주세요."
           }
         }
       }
@@ -7462,68 +7330,12 @@
         }
       }
     },
-    "Export AIR workflow" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR 워크플로 내보내기"
-          }
-        }
-      }
-    },
-    "Export AIR workflow…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR 워크플로 내보내기…"
-          }
-        }
-      }
-    },
     "Export Global Ask conversation" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Global Ask 대화 내보내기"
-          }
-        }
-      }
-    },
-    "Export run evidence…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "실행 기록 내보내기…"
-          }
-        }
-      }
-    },
-    "Exported %@ to %@." : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Exported %1$@ to %2$@."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@을(를) %@(으)로 내보냈습니다."
-          }
-        }
-      }
-    },
-    "Exports are copies. config.toml stays the pipeline tend runs, and an import is checked the way the editor checks a pipeline before it reaches your config." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "내보낸 파일은 사본입니다. tend가 실제로 실행하는 파이프라인은 여전히 config.toml이며, 가져온 워크플로도 편집기가 파이프라인을 검사하는 것과 똑같은 방식으로 검사한 뒤에야 설정에 들어갑니다."
           }
         }
       }
@@ -8045,16 +7857,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "예: --model opus"
-          }
-        }
-      }
-    },
-    "Forget" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "지우기"
           }
         }
       }
@@ -8597,52 +8399,6 @@
         }
       }
     },
-    "Import" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "가져오기"
-          }
-        }
-      }
-    },
-    "Import AIR workflow" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR 워크플로 가져오기"
-          }
-        }
-      }
-    },
-    "Import AIR workflow…" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR 워크플로 가져오기…"
-          }
-        }
-      }
-    },
-    "Imported %@ from %@. Review it before saving." : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Imported %1$@ from %2$@. Review it before saving."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "%@을(를) %@에서 가져왔습니다. 저장하기 전에 확인해 주세요."
-          }
-        }
-      }
-    },
     "Inbox" : {
       "localizations" : {
         "ko" : {
@@ -8729,16 +8485,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "설치"
-          }
-        }
-      }
-    },
-    "Install Node.js 22.22 or newer" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Node.js 22.22 이상을 설치하세요"
           }
         }
       }
@@ -10176,38 +9922,6 @@
         }
       }
     },
-    "Tend reads AIR %@; this file is AIR %@." : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Tend reads AIR %1$@; this file is AIR %2$@."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Tend는 AIR %@을(를) 읽습니다. 이 파일은 AIR %@입니다."
-          }
-        }
-      }
-    },
-    "Tend reads AIR workflow-skill documents; this one is %@ · %@." : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Tend reads AIR workflow-skill documents; this one is %1$@ · %2$@."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Tend는 AIR workflow-skill 문서를 읽습니다. 이 파일은 %@ · %@입니다."
-          }
-        }
-      }
-    },
     "Tend runs the installed CLIs headlessly. Existing CLI sign-in works unchanged; optional API keys are stored only in the macOS login Keychain." : {
       "extractionState" : "stale",
       "localizations" : {
@@ -11243,16 +10957,6 @@
         }
       }
     },
-    "No participant of this Work can be described as an AIR 1 trace." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 Work의 참여자 중 AIR 1 트레이스로 기술할 수 있는 에이전트가 없습니다."
-          }
-        }
-      }
-    },
     "No pipeline agents configured. Add pipelines in Raw TOML." : {
       "localizations" : {
         "ko" : {
@@ -11530,16 +11234,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "사용할 수 없음"
-          }
-        }
-      }
-    },
-    "Not chosen" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "지정되지 않음"
           }
         }
       }
@@ -11963,16 +11657,6 @@
         }
       }
     },
-    "One AIR trace is written per agent. Metadata only: no prompts, no output, no file contents." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "에이전트마다 AIR 트레이스를 하나씩 씁니다. 메타데이터만 담기며 프롬프트, 출력, 파일 내용은 들어가지 않습니다."
-          }
-        }
-      }
-    },
     "one Work" : {
       "localizations" : {
         "ko" : {
@@ -12306,16 +11990,6 @@
         }
       }
     },
-    "Open a pipeline as a graph you can edit, and hand a finished Work's run evidence to anyone — in AIR, the Agent Intermediate Representation." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "파이프라인을 편집 가능한 그래프로 열고, 끝난 Work의 실행 증거를 누구에게나 전달하세요 — AIR(Agent Intermediate Representation)로."
-          }
-        }
-      }
-    },
     "Open a terminal on this Mac, or on an online fleet host from the network menu above." : {
       "localizations" : {
         "ko" : {
@@ -12353,16 +12027,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "Global Ask 열기"
-          }
-        }
-      }
-    },
-    "Open in AIR Workbench" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR Workbench에서 열기"
           }
         }
       }
@@ -12444,16 +12108,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "열린 탭과, 오른쪽 끝의 창 동작: 어디로든 이동, Work 시작, 새 셸, 새 에이전트, 그리고 나머지를 담은 … 메뉴."
-          }
-        }
-      }
-    },
-    "Open the page" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "페이지 열기"
           }
         }
       }
@@ -16530,16 +16184,6 @@
         }
       }
     },
-    "Still finishing the last one." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이전 작업을 아직 끝내는 중입니다."
-          }
-        }
-      }
-    },
     "Still idle" : {
       "localizations" : {
         "ko" : {
@@ -16566,16 +16210,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "아직 쿨다운 중"
-          }
-        }
-      }
-    },
-    "Still looking for AIR Workbench." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "아직 AIR Workbench를 찾는 중입니다."
           }
         }
       }
@@ -17121,16 +16755,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "텍스트에는 터미널 제어 문자를 쓸 수 없습니다. 실행 중인 에이전트에 그대로 입력되기 때문입니다. 탭과 줄바꿈은 괜찮습니다."
-          }
-        }
-      }
-    },
-    "That folder has no scripts/air.mjs." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "그 폴더에는 scripts/air.mjs가 없습니다."
           }
         }
       }
@@ -17835,46 +17459,6 @@
         }
       }
     },
-    "This file is not JSON that AIR can carry." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 파일은 AIR이 담을 수 있는 JSON이 아닙니다."
-          }
-        }
-      }
-    },
-    "This file is not an AIR artifact." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 파일은 AIR 아티팩트가 아닙니다."
-          }
-        }
-      }
-    },
-    "This file is not valid JSON." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 파일은 올바른 JSON이 아닙니다."
-          }
-        }
-      }
-    },
-    "This file's AIR integrity digest does not match its contents." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 파일의 AIR 무결성 다이제스트가 내용과 일치하지 않습니다."
-          }
-        }
-      }
-    },
     "This folder does not exist on this Mac." : {
       "localizations" : {
         "ko" : {
@@ -18132,16 +17716,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "이번 주"
-          }
-        }
-      }
-    },
-    "This workflow would not launch." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "이 워크플로는 실행되지 않습니다."
           }
         }
       }
@@ -19458,16 +19032,6 @@
         }
       }
     },
-    "Workbench is running" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "Workbench 실행 중"
-          }
-        }
-      }
-    },
     "Working" : {
       "localizations" : {
         "ko" : {
@@ -19625,22 +19189,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "%@의 이전 질문에 쓴 답입니다. 보내지 않았습니다."
-          }
-        }
-      }
-    },
-    "Wrote %lld AIR traces to %@." : {
-      "localizations" : {
-        "en" : {
-          "stringUnit" : {
-            "state" : "new",
-            "value" : "Wrote %1$lld AIR traces to %2$@."
-          }
-        },
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "AIR 트레이스 %lld개를 %@에 저장했습니다."
           }
         }
       }
@@ -20358,26 +19906,6 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "역할 없음"
-          }
-        }
-      }
-    },
-    "node %@ is too old — AIR Workbench needs 22.22 or newer." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "node %@은(는) 버전이 너무 낮습니다. AIR Workbench에는 22.22 이상이 필요합니다."
-          }
-        }
-      }
-    },
-    "node did not report a version." : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "node가 버전을 알려주지 않았습니다."
           }
         }
       }

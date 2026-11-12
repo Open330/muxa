@@ -710,7 +710,6 @@ impl Client {
         status: RequestStatus,
         body: &str,
         artifacts: &[String],
-        air_artifacts: &[AirArtifactReference],
     ) -> Result<CollaborationRequest, RuntimeError> {
         self.collaboration_reply_view(
             origin,
@@ -718,7 +717,6 @@ impl Client {
             status,
             body,
             artifacts,
-            air_artifacts,
             collaboration::CollaborationReadView::Full,
         )
         .await
@@ -732,18 +730,10 @@ impl Client {
         status: RequestStatus,
         body: &str,
         artifacts: &[String],
-        air_artifacts: &[AirArtifactReference],
         view: collaboration::CollaborationReadView,
     ) -> Result<CollaborationRequest, RuntimeError> {
         self.collaboration_reply_report_view(
-            origin,
-            request_id,
-            status,
-            body,
-            artifacts,
-            air_artifacts,
-            None,
-            view,
+            origin, request_id, status, body, artifacts, None, view,
         )
         .await
     }
@@ -756,7 +746,6 @@ impl Client {
         status: RequestStatus,
         body: &str,
         artifacts: &[String],
-        air_artifacts: &[AirArtifactReference],
         report: Option<&collaboration::TaskReport>,
         view: collaboration::CollaborationReadView,
     ) -> Result<CollaborationRequest, RuntimeError> {
@@ -769,7 +758,6 @@ impl Client {
             "status": status,
             "body": body,
             "artifacts": artifacts,
-            "air_artifacts": air_artifacts,
         });
         let resp = self.call_checked(&req).await?;
         let mut request = serde_json::from_value(resp["collaboration_request"].clone())

@@ -741,8 +741,6 @@ pub(super) enum RequestBody {
         #[serde(default)]
         artifacts: Vec<String>,
         #[serde(default)]
-        air_artifacts: Vec<AirArtifactReference>,
-        #[serde(default)]
         #[serde(deserialize_with = "collaboration::deserialize_report_input")]
         report: Option<collaboration::TaskReport>,
         #[serde(default)]

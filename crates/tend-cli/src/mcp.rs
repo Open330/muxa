@@ -32,8 +32,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tend::collaboration::{
-    AirArtifactReference, CollaborationOrigin, CollaborationRequest, NewRequest, Participant,
-    RequestKind, RequestMailbox, RequestStatus, RoomContext, WorkMode,
+    CollaborationOrigin, CollaborationRequest, NewRequest, Participant, RequestKind,
+    RequestMailbox, RequestStatus, RoomContext, WorkMode,
 };
 use tend::event::{AgentKind, AgentState};
 use tend::ipc::{Client, SendPromptOutcome, TransitionStream};
@@ -578,46 +578,6 @@ fn launch_guide_value(config: &tend::config::Config) -> Value {
     })
 }
 
-fn air_artifact_reference_schema() -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "artifact_id": {
-                "type": "string",
-                "pattern": "^urn:air:sha256:[0-9a-f]{64}$",
-                "description": "AIR content identity from the validated artifact envelope."
-            },
-            "profile": {
-                "type": "string",
-                "enum": [
-                    "https://open330.github.io/air/profiles/1.0.0/workflow-skill",
-                    "https://open330.github.io/air/profiles/1.0.0/plan-native-cli",
-                    "https://open330.github.io/air/profiles/1.0.0/trace-native-run",
-                    "https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot"
-                ]
-            },
-            "label": {
-                "type": "string",
-                "minLength": 1,
-                "maxLength": 256,
-                "description": "Optional display-only label; never artifact authority."
-            },
-            "locator": {
-                "type": "object",
-                "properties": {
-                    "display": { "type": "string", "minLength": 1, "maxLength": 4096 },
-                    "disclosure": { "type": "string", "enum": ["local-only", "redacted"] }
-                },
-                "required": ["display", "disclosure"],
-                "additionalProperties": false,
-                "description": "Optional AIR 1 display-only locator. Tend never opens it automatically."
-            }
-        },
-        "required": ["artifact_id", "profile"],
-        "additionalProperties": false
-    })
-}
-
 /// The control and collaboration tools this server exposes, with JSON-Schema
 /// `inputSchema`s.
 #[allow(clippy::too_many_lines)] // declarative JSON schemas are clearest kept beside tool names
@@ -906,13 +866,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "work_id": { "type": "string", "description": "Durable Work id within the workspace, used to group requests across runs." },
                     "run_id": { "type": "string", "description": "Specific execution/run id for this request." },
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
-                    "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
-                    "air_artifacts": {
-                        "type": "array",
-                        "maxItems": 8,
-                        "items": air_artifact_reference_schema(),
-                        "description": "Optional validated AIR artifact references carried with the request."
-                    }
+                    "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." }
                 },
                 "required": ["host", "pane"],
                 "additionalProperties": false
@@ -1009,13 +963,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
                     "user_authorized": { "type": "boolean", "description": "Set true only when the user explicitly told you to deliver this particular request to that session. A protected primary (a human's own session) then takes it without by-id acceptance, at its next turn boundary (the end of its current turn or the user's next prompt), through its provider hook; nothing is typed into its terminal. An exact primary target is kept rather than rerouted to a worker. It asserts the user's instruction to deliver; it grants no execute authority. Recorded on the request." },
-                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and tend_wait_reply results are unchanged. Applied atomically with this send." },
-                    "air_artifacts": {
-                        "type": "array",
-                        "maxItems": 8,
-                        "items": air_artifact_reference_schema(),
-                        "description": "Optional validated AIR artifact references carried with the request."
-                    }
+                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and tend_wait_reply results are unchanged. Applied atomically with this send." }
                 },
                 "additionalProperties": false
             },
@@ -1066,7 +1014,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }),
         json!({
             "name": "tend_send_message",
-            "description": "Send a durable request to a same-window peer. Use review + read_only for an independent critique before finalizing important work; question + read_only for focused analysis; task + execute + narrow paths for bounded, non-overlapping delegated edits. Attach typed air_artifacts when a validated AIR workflow, plan, or trace is the shared review context. Continue useful work, wait for the structured reply, and verify the result yourself. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role).",
+            "description": "Send a durable request to a same-window peer. Use review + read_only for an independent critique before finalizing important work; question + read_only for focused analysis; task + execute + narrow paths for bounded, non-overlapping delegated edits. Continue useful work, wait for the structured reply, and verify the result yourself. Targets: peer (only one peer), pane:%N, @alias, or role:<name> (only one matching role).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1086,13 +1034,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "artifacts": { "type": "array", "items": { "type": "string" }, "description": "Generic artifact identifiers or locators attached to the request." },
                     "links": { "type": "array", "items": { "type": "string" }, "description": "Generic relationship or URL locators associated with the request." },
                     "user_authorized": { "type": "boolean", "description": "Set true only when the user explicitly told you to deliver this particular request to that session. A protected primary (a human's own session) then takes it without by-id acceptance, at its next turn boundary (the end of its current turn or the user's next prompt), through its provider hook; nothing is typed into its terminal. An exact primary target is kept rather than rerouted to a worker. It asserts the user's instruction to deliver; it grants no execute authority. Recorded on the request." },
-                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and tend_wait_reply results are unchanged. Applied atomically with this send." },
-                    "air_artifacts": {
-                        "type": "array",
-                        "maxItems": 8,
-                        "items": air_artifact_reference_schema(),
-                        "description": "Typed references to AIR 1 workflow, plan, or trace artifacts. Tend transports the reference; AIR Workbench validates and visualizes the artifact."
-                    }
+                    "withdraw_reply_wakes": { "type": "array", "maxItems": 16, "items": { "type": "string" }, "description": "Your own earlier request ids this request replaces (for example one you gave up on after it was blocked). Their late replies will not wake you; their work, replies and tend_wait_reply results are unchanged. Applied atomically with this send." }
                 },
                 "required": ["target", "body"],
                 "additionalProperties": false
@@ -1129,13 +1071,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "request_id": { "type": "string" },
                     "status": { "type": "string", "enum": ["completed", "blocked", "declined", "failed"] },
                     "body": { "type": "string" },
-                    "artifacts": { "type": "array", "items": { "type": "string" } },
-                    "air_artifacts": {
-                        "type": "array",
-                        "maxItems": 8,
-                        "items": air_artifact_reference_schema(),
-                        "description": "Typed AIR 1 artifact references returned to the sender."
-                    }
+                    "artifacts": { "type": "array", "items": { "type": "string" } }
                 },
                 "required": ["request_id", "status", "body"],
                 "additionalProperties": false
@@ -1835,10 +1771,6 @@ async fn call_tool_inner(
                 Err(error) => return Ok(error_result(error)),
             };
             let paths = string_array(&args, "paths");
-            let air_artifacts = match parse_air_artifact_references(&args) {
-                Ok(references) => references,
-                Err(error) => return Ok(error_result(&error)),
-            };
             let expects_reply = args
                 .get("expects_reply")
                 .and_then(Value::as_bool)
@@ -1854,7 +1786,6 @@ async fn call_tool_inner(
                 expects_reply,
                 work_mode,
                 paths,
-                air_artifacts,
             ) {
                 Ok(request) => request,
                 Err(error) => return Ok(error_result(&error)),
@@ -2080,10 +2011,6 @@ async fn call_tool_inner(
                 Err(e) => return Ok(error_result(&format!("invalid task report: {e}"))),
             };
             let artifacts = string_array(&args, "artifacts");
-            let air_artifacts = match parse_air_artifact_references(&args) {
-                Ok(references) => references,
-                Err(error) => return Ok(error_result(&error)),
-            };
             let origin = match resolve_collaboration_origin(client).await {
                 Ok(origin) => origin,
                 Err(error) => return Ok(error_result(&error)),
@@ -2096,7 +2023,6 @@ async fn call_tool_inner(
                         status,
                         body,
                         &artifacts,
-                        &air_artifacts,
                         report.as_ref(),
                         tend::collaboration::CollaborationReadView::Metadata,
                     )
@@ -2484,14 +2410,6 @@ fn collaboration_guide(
                 "when": "You need independent analysis without edits.",
                 "request": { "kind": "question", "work_mode": "read_only" }
             },
-            "air_handoff": {
-                "when": "The work already has a validated AIR 1 workflow, plan, or trace artifact.",
-                "steps": [
-                    "Pass artifact_id, exact AIR 1 profile, and optional display-only locator in air_artifacts.",
-                    "Use the same artifact identity in review requests and structured replies so watch/dashboard can visualize the handoff.",
-                    "Open the source-bearing artifact in AIR Workbench for graph inspection or editing; tend transports references and does not validate or execute AIR."
-                ]
-            },
             "ongoing_fleet_work": {
                 "steps": [
                     "Consolidate verified guidance with tend_fleet_update_request on the returned host/pane_key/request_id; do not inject repeated task prompts.",
@@ -2813,16 +2731,11 @@ pub(crate) async fn call_peer(
         Ok(contract) => contract,
         Err(error) => return error_result(error),
     };
-    let air_artifacts = match parse_air_artifact_references(args) {
-        Ok(references) => references,
+    let paths = string_array(args, "paths");
+    let request = match new_request_from_args(args, kind, body, true, work_mode, paths) {
+        Ok(request) => request,
         Err(error) => return error_result(&error),
     };
-    let paths = string_array(args, "paths");
-    let request =
-        match new_request_from_args(args, kind, body, true, work_mode, paths, air_artifacts) {
-            Ok(request) => request,
-            Err(error) => return error_result(&error),
-        };
     if request.task_contract.is_some() {
         if let Err(error) = crate::require_capability(
             client,
@@ -3253,16 +3166,11 @@ async fn fleet_call_peer(
         Ok(contract) => contract,
         Err(error) => return error_result(error),
     };
-    let air_artifacts = match parse_air_artifact_references(args) {
-        Ok(references) => references,
+    let paths = string_array(args, "paths");
+    let mut request = match new_request_from_args(args, kind, body, true, work_mode, paths) {
+        Ok(request) => request,
         Err(error) => return error_result(&error),
     };
-    let paths = string_array(args, "paths");
-    let mut request =
-        match new_request_from_args(args, kind, body, true, work_mode, paths, air_artifacts) {
-            Ok(request) => request,
-            Err(error) => return error_result(&error),
-        };
     if !request.withdraw_reply_wakes.is_empty() {
         // The withdrawn requests live in this host's mailbox and the new one
         // in the remote host's; there is no transaction spanning both.
@@ -4722,7 +4630,6 @@ fn new_request_from_args(
     expects_reply: bool,
     work_mode: WorkMode,
     paths: Vec<String>,
-    air_artifacts: Vec<AirArtifactReference>,
 ) -> std::result::Result<NewRequest, String> {
     let task_contract: Option<tend::collaboration::TaskContract> = args
         .get("task_contract")
@@ -4776,7 +4683,6 @@ fn new_request_from_args(
         paths,
         artifacts: string_array(args, "artifacts"),
         links: string_array(args, "links"),
-        air_artifacts,
         withdraw_reply_wakes: request_id_array(args, "withdraw_reply_wakes")?.unwrap_or_default(),
         recipient_slot: None,
         user_authorized: match args.get("user_authorized") {
@@ -4815,16 +4721,6 @@ fn optional_string(args: &Value, key: &str) -> std::result::Result<Option<String
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err(format!("{key} must be a string")),
     }
-}
-
-fn parse_air_artifact_references(
-    args: &Value,
-) -> std::result::Result<Vec<AirArtifactReference>, String> {
-    let Some(value) = args.get("air_artifacts") else {
-        return Ok(Vec::new());
-    };
-    serde_json::from_value(value.clone())
-        .map_err(|error| format!("air_artifacts must match the AIR reference schema: {error}"))
 }
 
 async fn wait_for_reply(client: &Client, args: &Value) -> Value {
@@ -6323,7 +6219,6 @@ mod tests {
             status: RequestStatus::Completed,
             body: "large final reply".repeat(4096),
             artifacts: vec![],
-            air_artifacts: vec![],
             at: time::OffsetDateTime::UNIX_EPOCH,
         });
         let args = json!({"request_id":request.id,"after_update":0,"include_body":true});
@@ -6954,7 +6849,6 @@ mod tests {
                     true,
                     WorkMode::Execute,
                     vec!["src/allowed.rs".into()],
-                    vec![],
                 )
                 .unwrap(),
             )
@@ -7217,7 +7111,6 @@ mod tests {
                     true,
                     WorkMode::ReadOnly,
                     vec![],
-                    vec![],
                 )
                 .unwrap(),
             )
@@ -7300,7 +7193,6 @@ mod tests {
                 id,
                 RequestStatus::Completed,
                 "Approved for staging only".into(),
-                vec![],
                 vec![],
             )
             .await
@@ -7670,7 +7562,6 @@ mod tests {
             true,
             WorkMode::ReadOnly,
             vec![],
-            vec![],
         )
         .unwrap();
         assert_eq!(
@@ -7924,7 +7815,6 @@ mod tests {
             true,
             WorkMode::ReadOnly,
             vec!["crates/tend/src/collaboration.rs".into()],
-            Vec::new(),
         )
         .unwrap();
 
@@ -7955,7 +7845,6 @@ mod tests {
                 false,
                 WorkMode::ReadOnly,
                 Vec::new(),
-                Vec::new(),
             )
             .unwrap();
             assert_eq!(request.notify, notify);
@@ -7968,7 +7857,6 @@ mod tests {
                 "checkpoint".into(),
                 false,
                 WorkMode::ReadOnly,
-                Vec::new(),
                 Vec::new(),
             )
             .unwrap_err();
@@ -7984,7 +7872,6 @@ mod tests {
             "question".into(),
             true,
             WorkMode::ReadOnly,
-            Vec::new(),
             Vec::new(),
         )
         .unwrap();
@@ -8003,7 +7890,6 @@ mod tests {
             true,
             WorkMode::ReadOnly,
             Vec::new(),
-            Vec::new(),
         )
         .unwrap_err();
         assert_eq!(error, "parent_request_id must be a string");
@@ -8020,7 +7906,6 @@ mod tests {
                 "question".into(),
                 true,
                 WorkMode::ReadOnly,
-                Vec::new(),
                 Vec::new(),
             )
         };
@@ -8234,7 +8119,6 @@ mod tests {
             status: RequestStatus::Completed,
             body: "review result".into(),
             artifacts: vec![],
-            air_artifacts: vec![],
             at: newer.created_at,
         });
         newer.id = "newer".into();
@@ -9248,7 +9132,6 @@ mod tests {
             true,
             WorkMode::ReadOnly,
             vec![],
-            vec![],
         )
         .unwrap();
         assert_eq!(request.task_contract.unwrap().task_id, "review-current");
@@ -9260,7 +9143,6 @@ mod tests {
             "Review".into(),
             true,
             WorkMode::ReadOnly,
-            vec![],
             vec![]
         )
         .is_err());
@@ -9294,7 +9176,6 @@ mod tests {
             true,
             WorkMode::ReadOnly,
             vec![],
-            vec![],
         )
         .unwrap();
         let error = client
@@ -9314,7 +9195,6 @@ mod tests {
                 "request",
                 RequestStatus::Completed,
                 "Done",
-                &[],
                 &[],
                 Some(&report),
                 tend::collaboration::CollaborationReadView::Full,

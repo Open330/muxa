@@ -1401,7 +1401,6 @@ fn handle_key(
                             paths: Vec::new(),
                             artifacts: Vec::new(),
                             links: Vec::new(),
-                            air_artifacts: Vec::new(),
                             withdraw_reply_wakes: Vec::new(),
                             recipient_slot: None,
                         };
@@ -4898,7 +4897,6 @@ mod tests {
             paths: Vec::new(),
             artifacts: Vec::new(),
             links: Vec::new(),
-            air_artifacts: Vec::new(),
             withdraw_reply_wakes: Vec::new(),
             recipient_slot: None,
         }

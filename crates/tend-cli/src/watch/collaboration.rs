@@ -1345,7 +1345,6 @@ async fn run_watch_collaboration_broadcast(
             paths: Vec::new(),
             artifacts: Vec::new(),
             links: Vec::new(),
-            air_artifacts: Vec::new(),
             withdraw_reply_wakes: Vec::new(),
             recipient_slot: None,
         };
@@ -1420,7 +1419,6 @@ async fn run_watch_collaboration_single(
                 paths: Vec::new(),
                 artifacts: Vec::new(),
                 links: Vec::new(),
-                air_artifacts: Vec::new(),
                 withdraw_reply_wakes: Vec::new(),
                 recipient_slot: None,
             };
@@ -1455,7 +1453,7 @@ async fn run_watch_collaboration_single(
             request_id,
             status,
         } => match client
-            .collaboration_reply(&origin, &request_id, status, &composer.input, &[], &[])
+            .collaboration_reply(&origin, &request_id, status, &composer.input, &[])
             .await
         {
             Ok(request) => ActionOutcome::Ok(format!(

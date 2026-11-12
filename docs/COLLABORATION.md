@@ -447,8 +447,6 @@ tend msg send peer "review the auth change" --kind review
 tend msg send peer "verify the fix" --kind review \
   --parent req_... --workspace webapp --work ENG-7345 --run resolve-2 \
   --artifact commit:d4bf2aa --link https://example.test/review
-tend msg send peer "review the risks in this plan" --kind review \
-  --air-ref '{"artifact_id":"urn:air:sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","profile":"https://open330.github.io/air/profiles/1.0.0/plan-native-cli","label":"ENG-6924 plan","locator":{"display":".air/eng-6924-plan.air.json","disclosure":"local-only"}}'
 tend msg inbox
 tend msg reply req_... "review complete" --status completed
 tend msg wait req_... --timeout-secs 300 --body
@@ -552,7 +550,7 @@ worktrees remain the safest choice for concurrent edits.
 
 | Tool | Purpose |
 | --- | --- |
-| `tend_collaboration_guide` | Retrieve reviewer, question, delegated-subagent, and AIR handoff contracts. |
+| `tend_collaboration_guide` | Retrieve reviewer, question, and delegated-subagent contracts. |
 | `tend_room_context` | Identify self, list same-window peers, and show unread count. |
 | `tend_call_peer` | Expand a registered skill, select a peer, send a durable request, optionally wait, and explicitly spawn when confirmed. |
 | `tend_peer_report` | Read the newest completed report from a prior peer request, or retrieve an exact request id. |
@@ -648,28 +646,6 @@ The receiver should claim its inbox promptly, honor kind/work mode/paths, and
 always produce a terminal `tend_reply`. Avoid concurrent edits to the same
 files; use separate worktrees when scopes cannot be isolated.
 
-## AIR artifact handoff and visualization
-
-Requests and replies can attach up to eight typed AIR 1.0 artifact references
-through `air_artifacts`. The watch and dashboard mailboxes color the first
-reference by profile and show its input/output direction, short digest, label,
-and display-only locator in the detail view.
-
-The exact supported profiles are:
-
-- `https://open330.github.io/air/profiles/1.0.0/workflow-skill` → `AIR WORKFLOW`
-- `https://open330.github.io/air/profiles/1.0.0/plan-native-cli` → `AIR PLAN`
-- `https://open330.github.io/air/profiles/1.0.0/trace-native-run` → `AIR TRACE`
-- `https://open330.github.io/air/profiles/1.0.0/trace-session-snapshot` → `AIR SESSION`
-
-Artifact IDs must be `urn:air:sha256:` followed by a 64-character lowercase
-SHA-256 digest. A locator has `local-only` or `redacted` disclosure and is only
-a display hint, never file or execution authority. tend validates reference
-syntax but does not claim artifact conformance: validate, edit, and graph the
-artifact in AIR Workbench. Do not invent a collaboration trace profile or put
-prompts, messages, filesystem paths, or provider identifiers into an AIR
-session snapshot.
-
 ## Indexed history, migration, and retention
 
 The mailbox is persisted to an owner-only SQLite database before delivery.
@@ -715,7 +691,7 @@ is the operator console — currently watch and dashboard messages — are claim
 and delivered directly, while agent-originated MCP and CLI requests inject only
 a mailbox notice. `notice` keeps every request body in the mailbox. `full`
 directly delivers every request. Direct delivery injects a structured envelope
-containing request id, source, kind, work mode, paths, AIR references, and the
+containing request id, source, kind, work mode, paths, and the
 original body, removing one inbox tool round and its JSON envelope. Only one
 direct request is submitted per idle agent generation; the next waits for a
 real Idle transition. Terminal reply bodies always remain in the mailbox.
