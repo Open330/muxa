@@ -522,6 +522,7 @@ pub(crate) async fn run_fleet(
                         submit,
                         // A shell command may be a person or a script.
                         origin: None,
+                        force: None,
                     },
                 )
                 .await?;

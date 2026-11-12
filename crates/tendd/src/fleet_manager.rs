@@ -446,6 +446,7 @@ impl LocalTask {
                 text,
                 submit,
                 origin,
+                force,
             } => {
                 if text.len() > FLEET_MAX_FRAME_BYTES {
                     return Err(format!(
@@ -461,6 +462,7 @@ impl LocalTask {
                     text,
                     submit,
                     origin,
+                    force,
                 )
                 .await
             }
@@ -1033,6 +1035,7 @@ async fn local_capture_window(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)] // the FleetOperation::SendPrompt fields, unpacked
 async fn local_send_prompt(
     backends: &[SharedBackend],
     store: &SharedStore,
@@ -1041,6 +1044,7 @@ async fn local_send_prompt(
     text: String,
     submit: bool,
     origin: Option<tend::PromptOrigin>,
+    force: Option<bool>,
 ) -> Result<FleetCommandResult, String> {
     let backend = exact_local_backend(backends, &pane).await?;
     if !backend.caps().send_text {
@@ -1051,10 +1055,18 @@ async fn local_send_prompt(
     }
     let socket = pane.window.session.endpoint.socket;
     // The same guarded path as IPC `send_prompt`: a fleet prompt waits out a
-    // collaboration wake on this pane and is refused while it drains.
-    let delivered = tend::prompt_delivery::deliver_prompt(
+    // collaboration wake on this pane and is refused while it drains. A gated
+    // prompt is judged under that guard, before anything is typed.
+    let guard = tend::prompt_delivery::lock_pane(collaboration, &pane.pane_id).await;
+    let agents = store.by_pane(&pane.pane_id).await;
+    if force == Some(false) {
+        tend::prompt_delivery::idle_gate(&pane.pane_id, &agents, Some(&socket), None)?;
+    }
+    let delivered = tend::prompt_delivery::deliver_prompt_holding(
+        guard,
         collaboration,
         store,
+        &agents,
         backend,
         tend::prompt_delivery::PromptDelivery {
             pane: &pane.pane_id,
@@ -1529,6 +1541,22 @@ impl HostTask {
                         )));
                         continue;
                     }
+                    // A gated prompt reaches only a relay that enforces it;
+                    // an older relay would ignore the field and type.
+                    if matches!(
+                        command.operation,
+                        FleetOperation::SendPrompt { force: Some(false), .. }
+                    ) && !connected.hello.capabilities.iter().any(|capability| {
+                        capability == tend::fleet::FLEET_SEND_PROMPT_GATE_CAPABILITY
+                    }) {
+                        let _ = command.reply.send(Err(format!(
+                            "{}: host '{}' cannot check that the target is idle (no {}); nothing was sent",
+                            tend::prompt_delivery::TARGET_NOT_IDLE,
+                            self.alias,
+                            tend::fleet::FLEET_SEND_PROMPT_GATE_CAPABILITY,
+                        )));
+                        continue;
+                    }
                     if matches!(
                         command.operation,
                         FleetOperation::CollaborationSend { .. }
@@ -1645,13 +1673,13 @@ impl HostTask {
                             );
                             RelayRequest::CaptureWindow { request_id: id, window }
                         }
-                        FleetOperation::SendPrompt { pane, text, submit, origin } => {
+                        FleetOperation::SendPrompt { pane, text, submit, origin, force } => {
                             audit_operation(&self.alias, "send_prompt", text.len());
                             pending.insert(
                                 id.clone(),
                                 PendingRequest::new(PendingReply::Command(command.reply), command_timeout),
                             );
-                            RelayRequest::SendPrompt { request_id: id, pane, text, submit, origin }
+                            RelayRequest::SendPrompt { request_id: id, pane, text, submit, origin, force }
                         }
                         FleetOperation::SendKeys { pane, keys } => {
                             audit_operation(&self.alias, "send_keys", keys.len());

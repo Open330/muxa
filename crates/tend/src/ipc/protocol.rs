@@ -1086,6 +1086,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     "config_edit_v1",
     DAEMON_BOOT_ID_CAPABILITY,
     crate::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY,
+    crate::fleet::FLEET_SEND_PROMPT_GATE_CAPABILITY,
 ];
 
 /// Advertised by a daemon whose `hello` and successful config read/write
