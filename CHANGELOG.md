@@ -84,6 +84,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this repository instead of a path in the BarShelf repository that never
   existed.
 
+### Fixed
+
+- One precedence rule now decides whether a daemon observation may change
+  an agent row, replacing per-site timestamp checks. An older Codex rollout
+  record or screen capture can no longer undo a newer hook, and a heuristic
+  alone (screen text, a process name, a timer) can no longer stop a row a
+  hook described. The sweep that stops rows whose pane has run no agent
+  process for an hour now also needs the multiplexer to report a shell in
+  the foreground, so an agent running behind a wrapper (`aas`, `node`) is
+  never stopped by it.
+
 ## [0.10.13] - 2026-11-12
 
 ### Fixed

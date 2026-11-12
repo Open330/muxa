@@ -94,6 +94,28 @@ Precedence when several producers describe one pane: **hooks > herdr
 bridge > screen detection** — synthetic rows are evicted the moment a real
 hook claims the pane.
 
+Every state change records its source (`state_source`: hook, provider record,
+pane inventory, exact process, screen, timing, …; see `tend::provenance`), and
+one rule in `Store::apply_event` decides whether a daemon observation may
+change a row:
+
+1. Nothing overwrites a deterministic state unless it was observed strictly
+   after it. An older Codex rollout record or screen capture cannot undo a
+   newer hook, and re-reading an already applied record is not news.
+2. A heuristic alone never stops a row a deterministic source described. It
+   may stop a row only heuristics ever described (a screen or discovery
+   placeholder), and it may refine a deterministic row with a newer,
+   non-stopping observation (a resolved dialog clearing `WaitingInput`).
+
+Hook events themselves are not filtered: they are the authority the rule
+protects. The reconciler's direct sweeps follow the same rule: the agentless
+pane stop needs the multiplexer to report a shell in the foreground, not
+just the absence of a process named like an agent, and the timing sweeps only
+retire rows with no pane, pid or surface left to vouch for them. Two
+exceptions remain and are tagged as such: paneless Codex correlation by
+screen text (`correlation`), and the opt-in `stuck_*_timeout` demotion
+(`timing`).
+
 ## Data Files
 
 | File | Purpose |

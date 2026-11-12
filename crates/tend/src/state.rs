@@ -1433,6 +1433,22 @@ fn hook_moved_session(agent: &Agent, id: &AgentId) -> bool {
         && agent.kind != AgentKind::Codex
 }
 
+/// What set `row`'s state. A row restored from a snapshot written before
+/// provenance existed counts as its writer's kind at its last activity: a
+/// hook for a real session, discovery for a synthetic placeholder.
+pub(crate) fn effective_provenance(row: &Agent) -> StateProvenance {
+    row.state_source.unwrap_or_else(|| {
+        StateProvenance::new(
+            if is_synthetic(&row.session_id) {
+                StateSource::ProcessName
+            } else {
+                StateSource::Hook
+            },
+            row.last_activity_at,
+        )
+    })
+}
+
 /// Reconcile pane occupants for an incoming `Started` event.
 ///
 /// Returns `false` when the event should be dropped (re-running `tend sync`
@@ -1779,7 +1795,18 @@ impl Store {
     /// Apply a daemon observation (screen, rollout, host report, …) without
     /// advancing adapter time. `source` names the kind of signal it is.
     pub async fn apply_observed(&self, ev: &AgentEvent, source: StateSource) {
-        self.apply_event(ev, None, false, source).await;
+        self.apply_event(ev, None, false, source, true).await;
+    }
+
+    /// Apply a deterministic repair stamped at the row's own last activity,
+    /// for a caller that has just checked the row is unchanged since the
+    /// reading it repairs. That check is the ordering guarantee, so the
+    /// precedence rule's "strictly newer" test is skipped; the rule's
+    /// heuristic-stop refusal does not apply to a deterministic source.
+    pub async fn apply_observed_repair(&self, ev: &AgentEvent, source: StateSource) {
+        debug_assert!(source.is_deterministic());
+        self.apply_event(ev, None, false, source, !source.is_deterministic())
+            .await;
     }
 
     /// Apply an ingested adapter event. A real session's event is a hook; a
@@ -1790,7 +1817,7 @@ impl Store {
         } else {
             StateSource::Hook
         };
-        self.apply_event(ev, ask_entry, true, source).await;
+        self.apply_event(ev, ask_entry, true, source, false).await;
     }
 
     #[allow(clippy::too_many_lines)] // one event transaction, with provenance checked before pane reconciliation
@@ -1801,6 +1828,7 @@ impl Store {
         ask_entry: Option<&str>,
         ingested: bool,
         source: StateSource,
+        precedence: bool,
     ) {
         let mut sanitized;
         let ev = if ask_entry.is_some() {
@@ -1842,6 +1870,27 @@ impl Store {
             return;
         }
         let at = ev.at();
+        // One precedence rule for every daemon observation (see
+        // `provenance::admit`). Ingested hook events are the authority it
+        // protects and are not filtered.
+        if precedence {
+            if let Some(row) = agents.get(&id.session_id) {
+                let stops = matches!(ev, AgentEvent::SessionEnded { .. });
+                if let Err(refusal) =
+                    crate::provenance::admit(effective_provenance(row), source, at, stops)
+                {
+                    tracing::debug!(
+                        session = %id.session_id,
+                        ?refusal,
+                        incoming = %source,
+                        incoming_at = %at,
+                        current = ?row.state_source,
+                        "observation refused by state precedence"
+                    );
+                    return;
+                }
+            }
+        }
         // Tag the span with a stable string identifier for the variant
         // so trace consumers can group without leaking large fields
         // (prompts, response bodies). `tracing::Span::current` is cheap
@@ -2502,6 +2551,7 @@ impl Store {
     pub async fn stop_rows_without_agent_process(
         &self,
         by_pane: &HashMap<String, WorkloadSummary>,
+        foreground: &HashMap<String, String>,
         complete_kinds: &[HostKind],
         min_idle: Duration,
     ) -> usize {
@@ -2535,9 +2585,20 @@ impl Store {
             if workload.primary_pid.is_some() {
                 continue;
             }
+            // Finding no process *named* like an agent is a heuristic, and a
+            // heuristic alone never stops a hooked row: under a wrapper
+            // (`aas`, `node`) that walk once stopped live agents (#242). The
+            // stop needs the multiplexer itself to report a shell in the
+            // foreground, where no agent TUI can be running.
+            if !foreground
+                .get(pane_id)
+                .is_some_and(|command| crate::shell::is_shell_program(command))
+            {
+                continue;
+            }
             let prev = agent.state;
             agent.state = AgentState::Stopped;
-            agent.state_source = Some(StateProvenance::new(StateSource::ProcessName, now));
+            agent.state_source = Some(StateProvenance::new(StateSource::PaneInventory, now));
             agent.state_entered_at = now;
             stopped += 1;
             let _ = self.transitions.send(Transition {
@@ -3388,6 +3449,12 @@ impl Store {
             }) {
                 continue;
             }
+            // Known exception to "a heuristic alone never stops a row": the
+            // pane now shows another thread (`/new`), so the older owner is
+            // stopped on screen-text evidence alone. Leaving it running and
+            // paneless would let the next pass rebind it to the scrollback
+            // that still shows its prompt. Its source says `correlation`, and
+            // the deterministic replacement is the Codex app-server thread id.
             for owner in owners {
                 if let Some(previous) = agents.get_mut(&owner) {
                     previous.pane = None;
@@ -3732,7 +3799,7 @@ mod tests {
                             id: id("clock"),
                             at: OffsetDateTime::now_utc(),
                         },
-                        StateSource::Timing,
+                        StateSource::PaneInventory,
                     )
                     .await;
             } else {
@@ -4535,6 +4602,9 @@ mod tests {
         store
             .apply(&started("unscanned", "rmux:%70", long_ago))
             .await;
+        // #242: a live agent behind a wrapper has no process *named* like
+        // an agent, but the multiplexer reports the wrapper, not a shell.
+        store.apply(&started("wrapped", "rmux:%71", long_ago)).await;
         let shell_only = WorkloadSummary {
             shell_count: 1,
             ..WorkloadSummary::default()
@@ -4546,13 +4616,20 @@ mod tests {
         let by_pane = HashMap::from([
             ("rmux:%67".to_string(), shell_only.clone()),
             ("rmux:%68".to_string(), with_agent),
-            ("rmux:%69".to_string(), shell_only),
+            ("rmux:%69".to_string(), shell_only.clone()),
+            ("rmux:%71".to_string(), shell_only),
+        ]);
+        let foreground = HashMap::from([
+            ("rmux:%67".to_string(), "zsh".to_string()),
+            ("rmux:%68".to_string(), "claude".to_string()),
+            ("rmux:%69".to_string(), "zsh".to_string()),
+            ("rmux:%71".to_string(), "aas".to_string()),
         ]);
         let floor = Duration::from_secs(60 * 60);
         let complete = [HostKind::Rmux];
         assert_eq!(
             store
-                .stop_rows_without_agent_process(&by_pane, &complete, floor)
+                .stop_rows_without_agent_process(&by_pane, &foreground, &complete, floor)
                 .await,
             1
         );
@@ -4570,10 +4647,24 @@ mod tests {
             AgentState::Stopped,
             "no evidence this tick"
         );
+        assert_ne!(
+            of("wrapped"),
+            AgentState::Stopped,
+            "a heuristic alone never stops a hooked row"
+        );
+        assert_eq!(
+            snap.iter()
+                .find(|a| a.session_id == "dead")
+                .unwrap()
+                .state_source
+                .unwrap()
+                .source,
+            crate::provenance::StateSource::PaneInventory
+        );
         // Not repeated once stopped, and an incomplete host is left alone.
         assert_eq!(
             store
-                .stop_rows_without_agent_process(&by_pane, &[HostKind::Tmux], floor)
+                .stop_rows_without_agent_process(&by_pane, &foreground, &[HostKind::Tmux], floor)
                 .await,
             0
         );
@@ -8540,5 +8631,164 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(source_of(&store, &key).await, Some(StateSource::LaunchMark));
+    }
+
+    /// Was guarded in `poll_codex_rollouts` by `status.at >
+    /// last_activity_at`; now the Store's precedence rule: a rollout record
+    /// read after a newer hook cannot undo it, re-reading the record that was
+    /// already applied is not news, and a newer record still lands.
+    #[tokio::test]
+    async fn an_older_rollout_record_cannot_undo_a_newer_hook() {
+        use crate::provenance::StateSource;
+        let store = Store::shared();
+        let t = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+        let codex = || AgentId {
+            kind: AgentKind::Codex,
+            ..id("codex")
+        };
+        let stopped = |at| AgentEvent::TurnStopped {
+            id: codex(),
+            response: Some("old answer".into()),
+            recap: None,
+            ai_title: None,
+            idle_confirmed: true,
+            at,
+        };
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: codex(),
+                prompt: "next".into(),
+                at: t,
+            })
+            .await;
+        store
+            .apply_observed(
+                &stopped(t - time::Duration::seconds(5)),
+                StateSource::ProviderRecord,
+            )
+            .await;
+        let row = store.by_session("codex").await.unwrap();
+        assert_eq!(row.state, AgentState::Working, "older record ignored");
+        assert_eq!(row.last_response, None);
+
+        let later = t + time::Duration::seconds(5);
+        store
+            .apply_observed(&stopped(later), StateSource::ProviderRecord)
+            .await;
+        let row = store.by_session("codex").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle, "a newer record lands");
+        // The next poll reads the same record again: refused, not re-applied.
+        store
+            .apply(&AgentEvent::ToolStarted {
+                id: codex(),
+                tool: "Bash".into(),
+                subagent: None,
+                command: Some("ls".into()),
+                at: later,
+            })
+            .await;
+        store
+            .apply_observed(&stopped(later), StateSource::ProviderRecord)
+            .await;
+        let row = store.by_session("codex").await.unwrap();
+        assert_eq!(row.state, AgentState::Working);
+        assert_eq!(row.pending_command.as_deref(), Some("ls"));
+    }
+
+    /// Was guarded by `rl.at <= last_activity_at`: quota evidence older
+    /// than a resumed turn cannot flip it back to Error.
+    #[tokio::test]
+    async fn old_quota_evidence_cannot_cap_a_resumed_turn() {
+        use crate::provenance::StateSource;
+        let store = Store::shared();
+        let t = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+        let codex = || AgentId {
+            kind: AgentKind::Codex,
+            ..id("resumed")
+        };
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: codex(),
+                prompt: "continue".into(),
+                at: t,
+            })
+            .await;
+        store
+            .apply_observed(
+                &AgentEvent::RateLimited {
+                    id: codex(),
+                    scope: crate::event::RateLimitScope::FiveHour,
+                    source: RateLimitSource::CodexRollout,
+                    resets_at: None,
+                    message: None,
+                    at: t - time::Duration::seconds(30),
+                },
+                StateSource::ProviderRecord,
+            )
+            .await;
+        let row = store.by_session("resumed").await.unwrap();
+        assert_eq!(row.state, AgentState::Working);
+        assert_eq!(row.rate_limit_source, None);
+    }
+
+    /// A heuristic alone never stops a row a hook described, however recent
+    /// the heuristic is; a row only heuristics described is theirs to stop.
+    #[tokio::test]
+    async fn a_heuristic_alone_never_stops_a_hooked_row() {
+        use crate::provenance::StateSource;
+        let store = Store::shared();
+        let t = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+        store
+            .apply(&AgentEvent::Started {
+                id: id("hooked"),
+                at: t,
+            })
+            .await;
+        let synthetic = AgentId {
+            pane: Some("%5".into()),
+            ..id("synthetic-%5")
+        };
+        store
+            .apply_observed(
+                &AgentEvent::Started {
+                    id: synthetic.clone(),
+                    at: t,
+                },
+                StateSource::Screen,
+            )
+            .await;
+        let now = OffsetDateTime::now_utc();
+        for (session, row_id) in [("hooked", id("hooked")), ("synthetic-%5", synthetic)] {
+            store
+                .apply_observed(
+                    &AgentEvent::SessionEnded {
+                        id: row_id,
+                        at: now,
+                    },
+                    StateSource::Screen,
+                )
+                .await;
+            let state = store.by_session(session).await.unwrap().state;
+            if session == "hooked" {
+                assert_eq!(state, AgentState::Idle, "screen cannot stop a hooked row");
+            } else {
+                assert_eq!(state, AgentState::Stopped, "screen may stop its own row");
+            }
+        }
+        // A newer heuristic may still refine a hooked row without stopping it.
+        store
+            .apply_observed(
+                &AgentEvent::NotificationFired {
+                    id: id("hooked"),
+                    level: NotificationLevel::NeedsInput,
+                    message: "approve?".into(),
+                    at: now,
+                },
+                StateSource::Screen,
+            )
+            .await;
+        let row = store.by_session("hooked").await.unwrap();
+        assert_eq!(row.state, AgentState::WaitingInput);
+        assert_eq!(row.state_source.unwrap().source, StateSource::Screen);
     }
 }
