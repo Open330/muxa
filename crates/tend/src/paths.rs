@@ -16,6 +16,7 @@ pub const NODE_ID_FILENAME: &str = "host-id";
 pub const DASHBOARD_WORK_FILENAME: &str = "dashboard-work.json";
 pub const SNAPSHOT_DIRNAME: &str = "snapshots";
 pub const PIPELINE_RUN_FILENAME: &str = "pipeline-runs.json";
+pub const BACKUPS_DIRNAME: &str = "backups";
 
 /// [`std::fs::canonicalize`] in the form the rest of the system writes paths.
 ///
@@ -133,6 +134,13 @@ pub fn default_collaboration_file() -> Option<PathBuf> {
 pub fn default_collaboration_audit_file() -> Option<PathBuf> {
     xdg_dir("XDG_DATA_HOME", dirs::data_dir)
         .map(|d| d.join(CONFIG_DIRNAME).join(COLLABORATION_AUDIT_FILENAME))
+}
+
+/// Install and upgrade backups: `$XDG_DATA_HOME/tend/backups`. Each entry
+/// is one backup (a directory or a file); `[storage].backups_keep` bounds how
+/// many are kept.
+pub fn default_backups_dir() -> Option<PathBuf> {
+    xdg_dir("XDG_DATA_HOME", dirs::data_dir).map(|d| d.join(CONFIG_DIRNAME).join(BACKUPS_DIRNAME))
 }
 
 /// Durable logical Work records. Execution bindings remain owned by pane

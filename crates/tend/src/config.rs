@@ -178,6 +178,8 @@ pub struct Config {
     pub history: HistoryConfig,
     pub activity: ActivityConfig,
     pub state: StateConfig,
+    /// Size and retention caps for files tend writes under its data directory.
+    pub storage: StorageConfig,
     // WS-F: snapshot
     /// Workspace snapshots: how often tendd takes an automatic one.
     pub snapshot: SnapshotConfig,
@@ -823,9 +825,10 @@ pub struct CollaborationConfig {
     pub scope: CollaborationScope,
     #[serde(default = "default_collaboration_max_message_bytes")]
     pub max_message_bytes: usize,
-    /// Retain completed collaboration threads for this many days. Omitted by
-    /// default, which preserves all history. Pruning is whole-thread only and
-    /// never removes pending delivery or unread reply state.
+    /// Retain completed collaboration threads for this many days (default
+    /// 90). `0` preserves all history. Pruning is whole-thread only and never
+    /// removes pending delivery or unread reply state.
+    #[serde(default = "default_collaboration_retention_days")]
     pub retention_days: Option<u64>,
 }
 
@@ -840,7 +843,7 @@ impl Default for CollaborationConfig {
             wake_payload: CollaborationWakePayload::OperatorFull,
             scope: CollaborationScope::default(),
             max_message_bytes: default_collaboration_max_message_bytes(),
-            retention_days: None,
+            retention_days: default_collaboration_retention_days(),
         }
     }
 }
@@ -1518,8 +1521,37 @@ fn default_session_activity_interval_secs() -> u64 {
     5
 }
 
+#[allow(clippy::unnecessary_wraps)] // serde `default` for an `Option` field
+fn default_collaboration_retention_days() -> Option<u64> {
+    Some(90)
+}
+
 fn default_state_debounce_ms() -> u64 {
     200
+}
+
+/// `[storage]` — bounds on files that otherwise only grow.
+///
+/// Every cap here is a documented retention, and `0` turns that cap off.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default, deny_unknown_fields)]
+pub struct StorageConfig {
+    /// Rotate `collaboration-audit.ndjson` to `collaboration-audit.ndjson.1`
+    /// once it reaches this many bytes. One previous generation is kept.
+    pub audit_max_bytes: u64,
+    /// Keep only the newest this-many entries under the data directory's
+    /// `backups/` (install and upgrade backups). Older ones are deleted by
+    /// `tendd` at startup and hourly afterwards.
+    pub backups_keep: usize,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            audit_max_bytes: crate::collaboration_audit::DEFAULT_COLLABORATION_AUDIT_MAX_BYTES,
+            backups_keep: 5,
+        }
+    }
 }
 
 fn default_history_max_per_pane() -> usize {

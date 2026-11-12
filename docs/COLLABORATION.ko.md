@@ -160,7 +160,7 @@ wake = "idle_only"
 # 선택 사항: 기본값 "operator_full", 또는 "notice" / "full"
 wake_payload = "operator_full"
 # 선택 사항. 생략하면 이력을 영구 보존
-# retention_days = 90
+retention_days = 90 # 기본값, 0이면 영구 보존
 ```
 
 이미 있는 `wake` 값은 덮어쓰지 않습니다. `never`는 "mailbox는 쓰되 내 pane은
@@ -525,11 +525,11 @@ mailbox는 전달 전에 owner-only SQLite DB에 저장됩니다. 과거 기본 
 통제로 archive하거나 직접 제거하세요.
 
 이후 mutation은 전체 이력을 다시 쓰지 않고 indexed row만 갱신합니다. SQLite 본체,
-WAL, shared-memory 파일은 `0600`입니다. `retention_days`를 생략하면 영구 보존합니다.
-값을 설정하면 tendd 시작 시 newest activity가 cutoff보다 오래되고 모든 request가
+WAL, shared-memory 파일은 `0600`입니다. `retention_days`는 기본 90이며 `0`이면 영구 보존합니다.
+tendd는 시작 시와 이후 매시간 newest activity가 cutoff보다 오래되고 모든 request가
 terminal·전달 완료된 thread만 통째로 정리합니다. parent chain을 나누거나 pending
 delivery/wake 또는 아직 읽지 않은 reply 상태를 지우지 않습니다. 본문을 담지 않는
-별도 audit ledger는 그대로 유지됩니다. migration 뒤 구형 tendd를 남겨 둔 JSON에
+별도 audit ledger는 대신 크기 기준으로 회전합니다(`[storage]`). migration 뒤 구형 tendd를 남겨 둔 JSON에
 대해 실행하는 downgrade는 안전하지 않습니다. 구형 daemon이 stale fork를 써도 import
 완료된 SQLite가 다시 가져오지 않으므로 downgrade 전 두 파일을 모두 백업하세요.
 
@@ -582,7 +582,7 @@ text가 이미 기록된 것이 확실하면 Enter만 재시도하고, 기록 �
 
 모든 collaboration IPC 호출(context, identity, send, inbox, list, reply, get, wait,
 cancel)은 `$XDG_DATA_HOME/tend/collaboration-audit.ndjson`에도 append-only로
-기록됩니다. 이 로그는 `0600`이며 message/reply 본문을 중복 저장하지 않고 operation,
+기록되며, `[storage].audit_max_bytes`(기본 8 MiB)에 이르면 `.1`로 회전합니다. 이 로그는 `0600`이며 message/reply 본문을 중복 저장하지 않고 operation,
 request id, 대상, 결과, represented origin/session과 OS-observed caller만 담습니다.
 `tend msg list --json`과 `tend_list_messages`에서는 각 request의 생성 provenance를 바로
 볼 수 있습니다. 업그레이드 전 요청은 `provenance`가 없을 수 있습니다.

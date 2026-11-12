@@ -54,6 +54,8 @@ mod synthetic;
 const STOPPED_AGENT_TTL_MINUTES: i64 = 60;
 /// Cadence at which the GC task scans for evictable agents.
 const GC_SWEEP_INTERVAL_SECONDS: u64 = 60;
+/// Spawn-archive, backup, and mailbox retention run at startup and hourly.
+const STORAGE_SWEEP_INTERVAL_SECONDS: u64 = 60 * 60;
 const PANE_SESSION_CACHE_INTERVAL_SECONDS: u64 = 5;
 const SHUTDOWN_TASK_TIMEOUT_SECONDS: u64 = 2;
 /// Slow safety-net scan for collaboration wake delivery. Normal delivery is
@@ -358,7 +360,12 @@ async fn run() -> Result<()> {
         &activity_transition_shutdown_tx,
     )
     .await;
-    let gc_handle = spawn_gc_task(&store, &collaboration, &shutdown_tx);
+    let gc_handle = spawn_gc_task(
+        &store,
+        &collaboration,
+        cfg.storage.backups_keep,
+        &shutdown_tx,
+    );
     let directory_max_age = if cfg.reconciler.enabled {
         cfg.reconciler.interval_secs.saturating_add(2)
     } else {
@@ -828,8 +835,11 @@ fn build_collaboration_audit(cfg: &Config) -> Arc<CollaborationAuditLog> {
             .map(|mailbox| mailbox.with_file_name(paths::COLLABORATION_AUDIT_FILENAME))
             .or_else(paths::default_collaboration_audit_file);
         if let Some(path) = path {
-            tracing::info!(path = %path.display(), "collaboration audit enabled");
-            return CollaborationAuditLog::at_path(path);
+            tracing::info!(path = %path.display(), max_bytes = cfg.storage.audit_max_bytes, "collaboration audit enabled");
+            return CollaborationAuditLog::at_path_with_max_bytes(
+                path,
+                cfg.storage.audit_max_bytes,
+            );
         }
     }
     CollaborationAuditLog::in_memory()
@@ -3618,39 +3628,29 @@ async fn send_collaboration_text(
 fn spawn_gc_task(
     store: &tend::SharedStore,
     collaboration: &Arc<CollaborationStore>,
+    backups_keep: usize,
     shutdown_tx: &broadcast::Sender<()>,
 ) -> tokio::task::JoinHandle<()> {
     let store = store.clone();
     let collaboration = collaboration.clone();
     let ttl = time::Duration::minutes(STOPPED_AGENT_TTL_MINUTES);
     let tick = std::time::Duration::from_secs(GC_SWEEP_INTERVAL_SECONDS);
+    let storage_tick = std::time::Duration::from_secs(STORAGE_SWEEP_INTERVAL_SECONDS);
     let mut shutdown_rx = shutdown_tx.subscribe();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tick);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_storage_sweep: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    // Snapshot before evicting stopped rows. Open tickets protect
-                    // launches even before an agent has registered.
-                    let agents = store.snapshot().await;
-                    let mut protected: std::collections::BTreeSet<String> = collaboration.worker_spawn_records().await.into_iter()
-                        .filter(|spawn| spawn.closed_at.is_none()
-                            && spawn.phase != tend::collaboration::WorkerSpawnPhase::Failed)
-                        .map(|spawn| spawn.launch_id).collect();
-                    protected.extend(store.protected_launch_archives());
-                    if let Some(directory) = tend::launch_identity::archive_directory() {
-                        let result = tokio::task::spawn_blocking(move || {
-                            tend::launch_identity::prune_archives(
-                                &directory, &agents, &protected, std::time::SystemTime::now(),
-                            )
-                        }).await;
-                        match result {
-                            Ok(Ok(removed)) if removed > 0 => tracing::debug!(removed, "gc swept launch archives"),
-                            Ok(Err(error)) => tracing::warn!(%error, "launch archive sweep failed"),
-                            Err(error) => tracing::warn!(%error, "launch archive sweep task failed"),
-                            _ => {}
-                        }
+                    // Directory and mailbox retention move slowly; an hourly
+                    // pass is enough and keeps the per-minute tick to the
+                    // in-memory registry sweep. It runs before eviction so
+                    // its snapshot still sees rows about to be swept.
+                    if last_storage_sweep.is_none_or(|at| at.elapsed() >= storage_tick) {
+                        last_storage_sweep = Some(tokio::time::Instant::now());
+                        sweep_storage(&store, &collaboration, backups_keep).await;
                     }
                     let removed = store.gc(ttl).await;
                     if removed > 0 {
@@ -3664,6 +3664,69 @@ fn spawn_gc_task(
             }
         }
     })
+}
+
+/// Hourly storage retention: spawn archives, `backups/`, and expired
+/// mailbox threads. Each step logs and continues on failure.
+async fn sweep_storage(
+    store: &tend::SharedStore,
+    collaboration: &Arc<CollaborationStore>,
+    backups_keep: usize,
+) {
+    if let Some(directory) = tend::paths::default_backups_dir() {
+        let result = tokio::task::spawn_blocking(move || {
+            tend::retention::prune_backups(&directory, backups_keep)
+        })
+        .await;
+        match result {
+            Ok(Ok(removed)) if !removed.is_empty() => tracing::info!(
+                removed = removed.len(),
+                keep = backups_keep,
+                "storage retention pruned old backups"
+            ),
+            Ok(Err(error)) => tracing::warn!(%error, "backup retention sweep failed"),
+            Err(error) => tracing::warn!(%error, "backup retention sweep task failed"),
+            _ => {}
+        }
+    }
+    match collaboration.apply_retention().await {
+        Ok(removed) if removed > 0 => {
+            tracing::info!(removed, "collaboration retention pruned expired threads");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "collaboration retention sweep failed"),
+    }
+    // Snapshot first: open tickets and live rows protect launch archives,
+    // including launches that have not registered an agent yet.
+    let agents = store.snapshot().await;
+    let mut protected: std::collections::BTreeSet<String> = collaboration
+        .worker_spawn_records()
+        .await
+        .into_iter()
+        .filter(|spawn| {
+            spawn.closed_at.is_none()
+                && spawn.phase != tend::collaboration::WorkerSpawnPhase::Failed
+        })
+        .map(|spawn| spawn.launch_id)
+        .collect();
+    protected.extend(store.protected_launch_archives());
+    if let Some(directory) = tend::launch_identity::archive_directory() {
+        let result = tokio::task::spawn_blocking(move || {
+            tend::launch_identity::prune_archives(
+                &directory,
+                &agents,
+                &protected,
+                std::time::SystemTime::now(),
+            )
+        })
+        .await;
+        match result {
+            Ok(Ok(removed)) if removed > 0 => tracing::debug!(removed, "gc swept launch archives"),
+            Ok(Err(error)) => tracing::warn!(%error, "launch archive sweep failed"),
+            Err(error) => tracing::warn!(%error, "launch archive sweep task failed"),
+            _ => {}
+        }
+    }
 }
 
 fn install_shutdown_signal_handler(restart: Arc<RestartController>) {
