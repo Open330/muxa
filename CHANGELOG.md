@@ -18,7 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   decision record are Core. `tend stats` (with its report and activity views),
   `tend timeline` and the 16-step `tend onboard` live tour move to a new
   **Labs, frozen** tier: kept working, no new features. cmux and zellij are listed as adopt-only Labs
-  backends. `docs/MACOS.md` and the README describe the Mac app's Home screen.
+  backends (README host table, `docs/CMUX.md`); no further work is planned on
+  them unless they show use. Their code paths are unchanged: `HostKind` is part
+  of the IPC protocol and the Mac app, so removing them is not a contained
+  change. `docs/MACOS.md` and the README describe the Mac app's Home screen.
 
 ### Added
 

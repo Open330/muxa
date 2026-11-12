@@ -1,6 +1,8 @@
 # cmux backend
 
-Status: **initial identity and control slice implemented.** Tend can identify
+Status: **Labs, adopt-only** (see [DIRECTION.md](DIRECTION.md#feature-tiers)).
+The initial identity and control slice is implemented and kept working; no
+further cmux work is planned unless it shows use. Tend can identify
 the current cmux surface from hook environment, keep its socket endpoint, focus
 that exact surface, and send targeted text through cmux's documented Unix
 socket API. Full workspace/surface enumeration and sidebar presentation remain

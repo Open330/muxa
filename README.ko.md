@@ -441,7 +441,8 @@ tend는 여러 터미널 멀티플렉서 백엔드에서 에이전트를 관측�
 | --- | --- | --- |
 | tmux | 전체 | 기본 백엔드. |
 | [herdr](https://herdr.dev) | 전체 | herdr 소켓 API 경유; [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI 기본 (adopt 전용) | hook이 붙은 pane 관찰과 이동만 지원하며 capture·send는 없음. WASM 플러그인 계획은 중단. |
+| cmux | Labs (adopt 전용) | hook 환경으로 현재 surface를 식별해 이동·텍스트 전송만 지원하며 inventory·pid map·capture는 없음. [docs/CMUX.md](docs/CMUX.md) 참고. |
+| zellij | Labs (adopt 전용) | hook이 붙은 pane 관찰과 이동만 지원하며 capture·send는 없음. WASM 플러그인 계획은 중단. |
 
 여러 호스트 동시 관측은 [docs/MULTI_HOST.md](docs/MULTI_HOST.md) 참고.
 
