@@ -4,9 +4,9 @@
 //! without it.
 
 use super::{
-    paths, Arc, AutomationSubject, CollaborationStore, PlannedFiring, Result, Submissions, SwapEnd,
-    SwapEnded, SwapStart, WorkerIoGuard,
+    paths, Arc, AutomationSubject, CollaborationStore, PlannedFiring, Result, WorkerIoGuard,
 };
+use crate::automation_engine::{Submissions, SwapEnd, SwapEnded, SwapStart};
 
 /// Wait for running jobs to end, up to `timeout`.
 pub(crate) async fn drain(swap: &DaemonSwap, timeout: std::time::Duration) -> bool {
