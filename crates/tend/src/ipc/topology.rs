@@ -148,6 +148,22 @@ impl CollaborationTopology {
     /// know how to send. Work identity comes from the exact pane inventory row
     /// for the represented endpoint; the run id is a snapshot of that
     /// endpoint's room rather than a durable Work identity.
+    /// The durable Work (`workspace_id`, `work_id`) of `participant`'s pane,
+    /// when tend manages it.
+    pub(super) fn durable_work(
+        &self,
+        participant: &collaboration::Participant,
+    ) -> Option<(String, String)> {
+        if participant.console {
+            return None;
+        }
+        let pane = self
+            .panes
+            .iter()
+            .find(|pane| pane.pane_id == participant.pane && pane.socket == participant.socket)?;
+        Some((pane.workspace_id.clone()?, pane.work_id.clone()?))
+    }
+
     pub(super) fn stamp_request_metadata(
         &self,
         anchor: &collaboration::Participant,

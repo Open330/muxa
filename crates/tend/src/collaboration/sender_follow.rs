@@ -44,18 +44,23 @@ pub struct SenderFollowState {
 }
 
 /// The names `sender` can be followed by: its alias and its first role, in
-/// its window. None when it has neither.
-pub(super) fn sender_slot(sender: &Participant) -> Option<RecipientSlot> {
+/// its durable Work when it has one, else its window. None when it has
+/// neither name.
+pub(super) fn sender_slot(
+    sender: &Participant,
+    work: Option<(String, String)>,
+) -> Option<RecipientSlot> {
     if sender.console
         || super::is_pending_session(&sender.agent_session_id)
         || (sender.alias.is_none() && sender.roles.is_empty())
     {
         return None;
     }
+    let (workspace_id, work_id) = work.unzip();
     Some(RecipientSlot {
         room: sender.room.clone(),
-        workspace_id: None,
-        work_id: None,
+        workspace_id,
+        work_id,
         role: sender.roles.first().cloned(),
         alias: sender.alias.clone(),
     })
@@ -81,7 +86,10 @@ pub fn sender_whereabouts(
     panes: &[PaneInfo],
 ) -> SenderWhereabouts {
     let sender = &request.from;
-    if sender.console
+    // Daemon services (recovery, this module's own items) have no session to
+    // follow; their replies are consumed by the daemon.
+    if sender.agent_session_id.starts_with("tend:")
+        || sender.console
         || super::is_pending_session(&sender.agent_session_id)
         || participants
             .iter()
@@ -100,10 +108,6 @@ pub fn sender_whereabouts(
                 .agent_session_id
                 .starts_with(crate::state::SYNTHETIC_SESSION_PREFIX)
     };
-    let single = |holders: Vec<&Participant>| match holders.as_slice() {
-        [successor] => Some((*successor).clone()),
-        _ => None,
-    };
     // The one session that now holds the sender's alias, else its role.
     // Never a session merely because it reuses the sender's pane: identity
     // does not follow pane reuse.
@@ -121,24 +125,27 @@ pub fn sender_whereabouts(
             ..slot.clone()
         })
     };
-    [
+    // The preferred name decides when anyone holds it: an alias held by
+    // several sessions is ambiguous and never falls back to the role.
+    for slot in [
         narrowed(None, slot.alias.as_ref()),
         narrowed(slot.role.as_ref(), None),
     ]
     .into_iter()
     .flatten()
-    .find_map(|slot| {
-        single(
-            participants
-                .iter()
-                .filter(candidate)
-                .filter(|p| slot.held_by(p, panes))
-                .collect(),
-        )
-    })
-    .map_or(SenderWhereabouts::Gone, |successor| {
-        SenderWhereabouts::Successor(Box::new(successor))
-    })
+    {
+        let holders: Vec<_> = participants
+            .iter()
+            .filter(candidate)
+            .filter(|p| slot.held_by(p, panes))
+            .collect();
+        match holders.as_slice() {
+            [] => {}
+            [successor] => return SenderWhereabouts::Successor(Box::new((*successor).clone())),
+            _ => return SenderWhereabouts::Gone,
+        }
+    }
+    SenderWhereabouts::Gone
 }
 
 fn gone_sender_action(
@@ -160,6 +167,7 @@ fn gone_sender_action(
     action.interruption = None;
     action.turn_offer = None;
     action.sender_follow = None;
+    action.decision = None;
     action.from = Participant::console(parent.from.room.clone());
     action.from.console = false;
     action.from.agent_kind = AgentKind::Task;
@@ -190,7 +198,11 @@ fn gone_sender_action(
     action.notified_at = None;
     action.reply_notified_at = None;
     action.reply_read_at = None;
-    action.reply_wake = None;
+    // Nobody is woken for the answer: it is read off this item.
+    action.reply_wake = Some(super::ReplyWake::Released {
+        reason: super::ReplyWakeRelease::Withdrawn,
+        at: now,
+    });
     action.wake_delivery = None;
     action.reply = None;
     action.updates.clear();
@@ -493,5 +505,120 @@ mod tests {
             RequestStatus::Cancelled
         );
         assert!(store.pending_human_notifications().await.is_empty());
+    }
+
+    fn work_pane(id: &str, window: &str) -> PaneInfo {
+        PaneInfo {
+            session_group: None,
+            agent_program: None,
+            worker_launch_id: None,
+            agent_role: None,
+            agent_alias: None,
+            workspace_id: Some("webapp".into()),
+            work_id: Some("ENG-1".into()),
+            pane_id: id.into(),
+            session_id: "$1".into(),
+            session: "webapp".into(),
+            window_id: window.into(),
+            window_name: "ENG-1".into(),
+            window_index: "0".into(),
+            pane_index: "0".into(),
+            tty: String::new(),
+            current_command: "claude".into(),
+            title: String::new(),
+            current_path: "/repo".into(),
+            pane_pid: 0,
+            socket: Some("default".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn answering_the_gone_sender_item_owes_no_further_wake() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let lead = participant("lead-1", "%1", None);
+        let id = replied(&store, &lead).await;
+        {
+            let mut requests = store.requests.write().await;
+            let reply = requests.get_mut(&id).unwrap().reply.as_mut().unwrap();
+            reply.at -= SENDER_GONE_GRACE;
+        }
+        let action = store.report_gone_sender(&id).await.unwrap().unwrap();
+        store
+            .reply(
+                &action.to,
+                &action.id,
+                RequestStatus::Completed,
+                "seen".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let answered = row(&store, &action.id).await;
+        assert!(
+            !answered.reply_wake_owed(),
+            "the item's answer is read off the item, not woken to a service"
+        );
+        assert_eq!(
+            sender_whereabouts(&answered, &[], &[], &[]),
+            SenderWhereabouts::Present,
+            "a daemon service is never followed"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_alias_never_falls_back_to_a_role_holder() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut lead = participant("lead-1", "%1", Some("lead"));
+        lead.roles = vec!["implementer".into()];
+        let id = replied(&store, &lead).await;
+        let request = row(&store, &id).await;
+        let a = participant("a", "%2", Some("lead"));
+        let mut b = participant("b", "%3", Some("lead"));
+        b.roles = vec!["implementer".into()];
+        assert_eq!(
+            sender_whereabouts(&request, &[a, b], &[], &[]),
+            SenderWhereabouts::Gone
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sender_in_durable_work_is_followed_into_a_recreated_window() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let lead = participant("lead-1", "%1", Some("lead"));
+        let reviewer = worker("reviewer", "%9");
+        let id = store
+            .create_with_sender_work(
+                lead.clone(),
+                reviewer.clone(),
+                NewRequest {
+                    body: "review".into(),
+                    ..NewRequest::default()
+                },
+                None,
+                Some(("webapp".into(), "ENG-1".into())),
+            )
+            .await
+            .unwrap()
+            .id;
+        store.claim_by_id(&reviewer, &id).await.unwrap();
+        store
+            .reply(
+                &reviewer,
+                &id,
+                RequestStatus::Completed,
+                "ok".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let request = row(&store, &id).await;
+        // The Work's window was recreated: a new window id, same Work.
+        let mut successor = participant("lead-2", "%4", Some("lead"));
+        successor.room.window_id = "@7".into();
+        let panes = [work_pane("%4", "@7")];
+        assert_eq!(
+            sender_whereabouts(&request, std::slice::from_ref(&successor), &[], &panes),
+            SenderWhereabouts::Successor(Box::new(successor))
+        );
     }
 }

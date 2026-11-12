@@ -3097,13 +3097,28 @@ impl CollaborationStore {
         self.create_with_provenance(from, to, input, None).await
     }
 
-    #[allow(clippy::too_many_lines)] // request construction and persistence rollback form one transaction
     pub async fn create_with_provenance(
         &self,
         from: Participant,
         to: Participant,
         input: NewRequest,
         provenance: Option<CollaborationProvenance>,
+    ) -> Result<CollaborationRequest, CollaborationError> {
+        self.create_with_sender_work(from, to, input, provenance, None)
+            .await
+    }
+
+    /// [`Self::create_with_provenance`], also recording the durable Work
+    /// (`workspace_id`, `work_id`) of the sender's pane, so a reply wake can
+    /// follow the sender's slot into a recreated window of the same Work.
+    #[allow(clippy::too_many_lines)] // request construction and persistence rollback form one transaction
+    pub async fn create_with_sender_work(
+        &self,
+        from: Participant,
+        to: Participant,
+        input: NewRequest,
+        provenance: Option<CollaborationProvenance>,
+        sender_work: Option<(String, String)>,
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         let body = input.body.trim().to_string();
@@ -3239,11 +3254,12 @@ impl CollaborationStore {
                 ));
             }
         }
-        let sender_follow =
-            sender_follow::sender_slot(&from).map(|slot| sender_follow::SenderFollowState {
+        let sender_follow = sender_follow::sender_slot(&from, sender_work).map(|slot| {
+            sender_follow::SenderFollowState {
                 slot: Some(slot),
                 ..Default::default()
-            });
+            }
+        });
         let request = CollaborationRequest {
             sender_follow,
             attempt: input.task_contract.as_ref().map(TaskContract::attempt),

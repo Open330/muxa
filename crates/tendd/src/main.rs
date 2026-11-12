@@ -2783,6 +2783,7 @@ fn spawn_collaboration_waker_task(
         {
             tracing::warn!(%error, "initial peer interruption reconciliation failed");
         }
+        retire_gone_sender_items(&collaboration).await;
         if wake_enabled {
             wake_idle_collaboration_peers_with_inflight(
                 &collaboration,
@@ -2845,6 +2846,7 @@ fn spawn_collaboration_waker_task(
                 {
                     tracing::warn!(%error, "peer interruption reconciliation failed");
                 }
+                retire_gone_sender_items(&collaboration).await;
                 if wake_enabled {
                     wake_idle_collaboration_peers_with_inflight(
                         &collaboration,
@@ -2905,7 +2907,6 @@ async fn wake_idle_collaboration_peers_with_inflight(
     let replies = collaboration.pending_reply_unnotified().await;
     let agents = store.snapshot().await;
     let stranded = stranded_requests(collaboration, &agents).await;
-    retire_gone_sender_items(collaboration).await;
     if requests.is_empty() && replies.is_empty() && stranded.is_empty() {
         return;
     }
@@ -2932,7 +2933,9 @@ async fn wake_idle_collaboration_peers_with_inflight(
     for request in &stranded {
         follow_vanished_recipient(collaboration, request, &participants, &agents, &panes).await;
     }
-    follow_vanished_senders(collaboration, &replies, &participants, &agents, &panes).await;
+    // Boxed: kept off the waker future, which is already large.
+    let senders = follow_vanished_senders(collaboration, &replies, &participants, &agents, &panes);
+    Box::pin(senders).await;
 
     for request in requests {
         let Some(recipient) =
