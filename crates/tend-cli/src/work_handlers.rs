@@ -1,7 +1,7 @@
 use super::{
     agent_find, agent_launch, agent_move, agent_records, orchestration, tmux_work, work_backlog,
-    work_compose, work_init, work_options, work_pipeline, work_up, AgentCmd, Client, Config, Path,
-    PathBuf, Result, WindowCmd, WorkCmd, WorkspaceCmd,
+    work_compose, work_external, work_init, work_options, work_pipeline, work_up, AgentCmd, Client,
+    Config, Path, PathBuf, Result, WindowCmd, WorkCmd, WorkspaceCmd,
 };
 
 pub(super) async fn run_agent_cmd(
@@ -56,6 +56,8 @@ pub(super) async fn run_work_cmd(
         WorkCmd::Up(args) => work_up::run(args, cfg, config_path, Some(client)).await,
         WorkCmd::Start(args) => agent_launch::run_work_start(args, client.socket(), cfg),
         WorkCmd::Plan(args) => work_backlog::run_plan(args, client).await,
+        WorkCmd::Link(args) => work_external::run_link(args, client).await,
+        WorkCmd::Refresh(args) => work_external::run_refresh(args, client).await,
         WorkCmd::List(args) => match args.stage {
             Some(stage) => {
                 work_backlog::run_list_stage(client, stage, args.workspace.as_deref(), args.json)

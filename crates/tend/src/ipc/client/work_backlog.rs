@@ -44,6 +44,23 @@ impl Client {
         serde_json::from_value(response["work_record"].clone()).map_err(RuntimeError::Json)
     }
 
+    /// Store one fetched external reference on a Work record. Requires
+    /// `work_external_v1`.
+    pub async fn work_external_upsert(
+        &self,
+        identity: &WorkIdentity,
+        item: &crate::work::ExternalItemRef,
+    ) -> Result<WorkRecord, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "work_external_upsert",
+            "identity": identity,
+            "item": item,
+        });
+        let response = self.call_checked(&req).await?;
+        serde_json::from_value(response["work_record"].clone()).map_err(RuntimeError::Json)
+    }
+
     pub async fn work_record_show(
         &self,
         identity: &WorkIdentity,

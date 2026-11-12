@@ -293,7 +293,8 @@ async fn route(
         }
         body @ (RequestBody::WorkBacklog { .. }
         | RequestBody::WorkEdit { .. }
-        | RequestBody::WorkRecordShow { .. }) => {
+        | RequestBody::WorkRecordShow { .. }
+        | RequestBody::WorkExternalUpsert { .. }) => {
             let (name, response) = Box::pin(super::work_backlog::response(
                 &ctx.work_store,
                 &ctx.reviews,

@@ -157,6 +157,12 @@ pub(super) enum RequestBody {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         newest: Option<usize>,
     },
+    /// Attach or refresh one external issue reference on a Work record
+    /// (`work_external_v1`). The client fetched it; tendd only stores it.
+    WorkExternalUpsert {
+        identity: crate::work::WorkIdentity,
+        item: crate::work::ExternalItemRef,
+    },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
     PipelineSubscribe,
@@ -1057,6 +1063,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::decision_queue::DECISION_QUEUE_CAPABILITY,
     crate::work::WORK_BACKLOG_CAPABILITY,
     crate::work::WORK_RECENT_RESULTS_CAPABILITY,
+    crate::work::WORK_EXTERNAL_CAPABILITY,
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
