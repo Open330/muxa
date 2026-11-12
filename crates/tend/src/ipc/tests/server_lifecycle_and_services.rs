@@ -410,29 +410,28 @@ async fn client_disconnect_before_response_is_clean_handler_exit() {
     let (server_stream, mut client_stream) = Stream::pair().await.unwrap();
     let store = Store::shared();
     let (_stopping_tx, stopping_rx) = watch::channel(false);
-    let handle = tokio::spawn(handle(
-        server_stream,
+    let ctx = crate::ipc::dispatch::ServerCtx {
         store,
-        default_backend(),
-        vec![default_backend()],
-        PtySessionBackend::shared(),
-        CollaborationStore::in_memory(CollaborationOptions::default()),
-        CollaborationAuditLog::in_memory(),
-        crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
-        Arc::default(),
-        AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
-        None,
-        None,
-        PipelineRunStore::in_memory(),
-        crate::review::ReviewStore::in_memory(),
-        WorkUpManager::new(PathBuf::from("/tmp/tend-disconnect-test.sock")),
-        crate::mux_snapshot_control::MuxSnapshotControl::new(PathBuf::from(
+        backend: default_backend(),
+        backends: vec![default_backend()],
+        sessions: PtySessionBackend::shared(),
+        collaboration: CollaborationStore::in_memory(CollaborationOptions::default()),
+        collaboration_audit: CollaborationAuditLog::in_memory(),
+        ask: crate::ask::AskStore::in_memory(crate::ask::AskOptions::default()),
+        agent_directory: Arc::default(),
+        automation: AutomationStore::in_memory(crate::automation::AutomationConfig::default()),
+        restart: None,
+        fleet: None,
+        pipeline_runs: PipelineRunStore::in_memory(),
+        reviews: crate::review::ReviewStore::in_memory(),
+        work_up: WorkUpManager::new(PathBuf::from("/tmp/tend-disconnect-test.sock")),
+        mux_snapshots: crate::mux_snapshot_control::MuxSnapshotControl::new(PathBuf::from(
             "/tmp/tend-disconnect-test.sock",
         )),
-        None,
-        None,
-        stopping_rx,
-    ));
+        config_path: None,
+        swap: None,
+    };
+    let handle = tokio::spawn(handle(server_stream, ctx, stopping_rx));
 
     let req = serde_json::json!({
         "protocol": PROTOCOL_VERSION,
