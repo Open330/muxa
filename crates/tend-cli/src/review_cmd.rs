@@ -395,7 +395,9 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
         }
         Action::Queue { limit, json } => {
             require_queue_capability(client).await?;
-            let queue = client.decision_queue(limit).await?;
+            let queue = client
+                .decision_queue(&tend::decision_queue::operator_origin(), limit)
+                .await?;
             if json {
                 println!("{}", serde_json::to_string(&queue)?);
             } else {
@@ -405,7 +407,9 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
         }
         Action::History { limit, json } => {
             require_queue_capability(client).await?;
-            let history = client.decision_history(limit).await?;
+            let history = client
+                .decision_history(&tend::decision_queue::operator_origin(), limit)
+                .await?;
             if json {
                 println!("{}", serde_json::to_string(&history)?);
             } else {

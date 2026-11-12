@@ -117,8 +117,12 @@ The order is how much is blocked, then age. `tend attend --list` shows the
 same human requests and the open review count under the agents it can jump
 to. `tend review history` (IPC `decision_history`) lists decided review items
 with disposition, note and time, and answered human requests with the
-answer, newest first. Both reads take `--limit` (at most 500) and say when a
-source had more, or could not be read, instead of showing it as empty.
+answer, newest first. Both reads take `--limit` (at most 500, and at most
+4 MiB of records) and say when a source had more, or could not be read,
+instead of showing it as empty. Human requests from every room are an
+operator-console read, as for any listing past one's own mailbox: the CLI
+asks as the console and the read is written to the collaboration audit
+ledger; an agent's origin gets reviews and waiting agents only.
 
 ## Status line
 

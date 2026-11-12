@@ -71,6 +71,15 @@ pub(super) async fn review_response(
     }
 }
 
+/// Human requests from every room are an operator-console read, the same
+/// rule `collaboration_list` applies past the caller's own mailbox.
+fn operator_only(
+    origin: Option<&crate::collaboration::CollaborationOrigin>,
+) -> Option<crate::collaboration::CollaborationError> {
+    (!origin.is_some_and(|origin| origin.console))
+        .then_some(crate::collaboration::CollaborationError::ScopeDenied)
+}
+
 /// Serve `decision_queue` and `decision_history`. A source that cannot be
 /// read is named in `unavailable` rather than failing the whole read, so
 /// the person still sees what the other sources hold.
@@ -82,11 +91,15 @@ pub(super) async fn decision_response(
 ) -> (&'static str, Response) {
     use crate::decision_queue::{assemble_history, assemble_queue, MAX_QUEUE_LIMIT};
     match body {
-        RequestBody::DecisionQueue { limit } => {
+        RequestBody::DecisionQueue { limit, origin } => {
             let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
             let mut unavailable = Vec::new();
             let mut truncated = false;
-            let human = match collaboration.open_human_requests(limit).await {
+            let human = match operator_only(origin.as_ref()) {
+                Some(refused) => Err(refused),
+                None => collaboration.open_human_requests(limit).await,
+            };
+            let human = match human {
                 Ok((requests, more)) => {
                     truncated |= more;
                     requests
@@ -127,11 +140,15 @@ pub(super) async fn decision_response(
                 },
             )
         }
-        RequestBody::DecisionHistory { limit } => {
+        RequestBody::DecisionHistory { limit, origin } => {
             let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
             let mut unavailable = Vec::new();
             let mut truncated = false;
-            let answered = match collaboration.answered_human_requests(limit).await {
+            let answered = match operator_only(origin.as_ref()) {
+                Some(refused) => Err(refused),
+                None => collaboration.answered_human_requests(limit).await,
+            };
+            let answered = match answered {
                 Ok((requests, more)) => {
                     truncated |= more;
                     requests

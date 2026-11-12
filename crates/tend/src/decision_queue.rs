@@ -21,7 +21,43 @@ use time::OffsetDateTime;
 pub const DECISION_QUEUE_CAPABILITY: &str = "decision_queue_v1";
 /// Upper bound on one queue or history read.
 pub const MAX_QUEUE_LIMIT: usize = 500;
+/// Serialized-size budget for one read, well under the IPC line cap: a
+/// legal human request and its answer can each be tens of KiB, so a count
+/// alone does not bound the response.
+pub const MAX_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Keep items in order until `limit` or the byte budget is reached. The
+/// first item is always kept so a single large one is still readable.
+fn bounded<T: Serialize>(items: impl Iterator<Item = T>, limit: usize) -> (Vec<T>, bool) {
+    let mut kept = Vec::new();
+    let mut bytes = 0usize;
+    for item in items {
+        if kept.len() == limit {
+            return (kept, true);
+        }
+        let size = serde_json::to_vec(&item).map_or(0, |encoded| encoded.len());
+        if !kept.is_empty() && bytes.saturating_add(size) > MAX_QUEUE_BYTES {
+            return (kept, true);
+        }
+        bytes = bytes.saturating_add(size);
+        kept.push(item);
+    }
+    (kept, false)
+}
 const MAX_MESSAGE_CHARS: usize = 240;
+
+/// The origin a person's own client (CLI, Tend for Mac) reads the queue
+/// as: the operator console, not any pane's agent.
+#[must_use]
+pub fn operator_origin() -> crate::collaboration::CollaborationOrigin {
+    crate::collaboration::CollaborationOrigin {
+        pane: String::new(),
+        socket: None,
+        console: true,
+        agent_session_id: None,
+        exact_session: false,
+    }
+}
 
 /// One thing waiting on the person.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -222,35 +258,38 @@ pub fn assemble_queue(
         .filter(|request| request.needs_human_response())
         .collect();
     human.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
-    let mut waiting: Vec<&Agent> = agents.iter().filter(|a| agent_needs_person(a)).collect();
-    waiting.sort_by(|a, b| {
-        let rank = |agent: &Agent| blocking_rank(agent.state).unwrap_or(3);
-        rank(a)
-            .cmp(&rank(b))
-            .then(agent_entry(a).since.cmp(&agent_entry(b).since))
+    let mut waiting: Vec<(u8, AgentWaitingEntry)> = agents
+        .iter()
+        .filter(|a| agent_needs_person(a))
+        .map(|agent| (blocking_rank(agent.state).unwrap_or(3), agent_entry(agent)))
+        .collect();
+    waiting.sort_by(|(rank_a, a), (rank_b, b)| {
+        rank_a
+            .cmp(rank_b)
+            .then(a.since.cmp(&b.since))
             .then(a.session_id.cmp(&b.session_id))
     });
     let mut reviews: Vec<ReviewItem> = reviews.into_iter().filter(ReviewItem::is_open).collect();
     reviews.sort_by(|a, b| a.requested_at.cmp(&b.requested_at).then(a.id.cmp(&b.id)));
 
-    let total = human.len() + waiting.len() + reviews.len();
-    let items: Vec<PendingItem> = human
-        .into_iter()
-        .map(|request| PendingItem::HumanRequest(HumanRequestEntry::from_request(request)))
-        .chain(
-            waiting
-                .into_iter()
-                .map(|agent| PendingItem::AgentWaiting(agent_entry(agent))),
-        )
-        .chain(
-            reviews
-                .into_iter()
-                .map(|item| PendingItem::Review(Box::new(item))),
-        )
-        .take(limit)
-        .collect();
+    let (items, truncated) = bounded(
+        human
+            .into_iter()
+            .map(|request| PendingItem::HumanRequest(HumanRequestEntry::from_request(request)))
+            .chain(
+                waiting
+                    .into_iter()
+                    .map(|(_, entry)| PendingItem::AgentWaiting(entry)),
+            )
+            .chain(
+                reviews
+                    .into_iter()
+                    .map(|item| PendingItem::Review(Box::new(item))),
+            ),
+        limit,
+    );
     PendingQueue {
-        truncated: total > items.len(),
+        truncated,
         items,
         unavailable: Vec::new(),
     }
@@ -278,8 +317,7 @@ pub fn assemble_history(
         }))
         .collect();
     items.sort_by_key(|item| std::cmp::Reverse(item.decided_at()));
-    let truncated = items.len() > limit;
-    items.truncate(limit);
+    let (items, truncated) = bounded(items.into_iter(), limit);
     DecisionHistory {
         items,
         truncated,
@@ -391,6 +429,37 @@ mod tests {
         let short = assemble_queue(&humans, &agents, Vec::new(), 3);
         assert_eq!(short.items.len(), 3);
         assert!(short.truncated);
+    }
+
+    #[test]
+    fn a_page_of_large_legal_requests_stays_under_the_byte_budget() {
+        let big = "x".repeat(16 * 1024);
+        let humans: Vec<CollaborationRequest> = (0..500)
+            .map(|n| {
+                let mut request = human(&format!("rq_{n:03}"), "2026-11-12T08:00:00Z", None);
+                request.body.clone_from(&big);
+                request
+            })
+            .collect();
+        let queue = assemble_queue(&humans, &[], Vec::new(), MAX_QUEUE_LIMIT);
+        assert!(queue.truncated);
+        assert!(!queue.items.is_empty());
+        assert!(serde_json::to_vec(&queue).unwrap().len() <= MAX_QUEUE_BYTES + 1024);
+        let answered: Vec<CollaborationRequest> = (0..500)
+            .map(|n| {
+                let mut request = human(
+                    &format!("rq_{n:03}"),
+                    "2026-11-12T08:00:00Z",
+                    Some("2026-11-12T09:00:00Z"),
+                );
+                request.body.clone_from(&big);
+                request.reply.as_mut().unwrap().body.clone_from(&big);
+                request
+            })
+            .collect();
+        let history = assemble_history(Vec::new(), &answered, MAX_QUEUE_LIMIT);
+        assert!(history.truncated);
+        assert!(serde_json::to_vec(&history).unwrap().len() <= MAX_QUEUE_BYTES + 1024);
     }
 
     #[test]

@@ -1,6 +1,17 @@
 //! Human requests as decisions: the ones still waiting on a person and the
-//! ones a person answered, for the decision queue and its history.
-use super::{CollaborationError, CollaborationRequest, CollaborationStore};
+//! ones a person answered, for the decision queue and its history. Only
+//! the selected page is cloned out of the request map.
+use super::{CollaborationError, CollaborationRequest, CollaborationStore, RequestKind};
+
+/// A console request that asked for an answer and got one, whatever the
+/// operator replied (answered, declined, failed, blocked). Cancelled or
+/// retired requests carry no reply and are not decisions.
+fn answered_by_person(request: &CollaborationRequest) -> bool {
+    request.to.console
+        && request.expects_reply
+        && request.kind != RequestKind::Notice
+        && request.reply.is_some()
+}
 
 impl CollaborationStore {
     /// Requests to the operator still owed an answer, oldest first, and
@@ -11,39 +22,31 @@ impl CollaborationStore {
     ) -> Result<(Vec<CollaborationRequest>, bool), CollaborationError> {
         self.ensure_enabled()?;
         let requests = self.requests.read().await;
-        let mut open: Vec<CollaborationRequest> = requests
+        let mut open: Vec<&CollaborationRequest> = requests
             .values()
             .filter(|request| request.needs_human_response())
-            .cloned()
             .collect();
-        drop(requests);
         open.sort_by(|a, b| a.created_at.cmp(&b.created_at).then(a.id.cmp(&b.id)));
         let more = open.len() > limit;
-        open.truncate(limit);
-        Ok((open, more))
+        Ok((open.into_iter().take(limit).cloned().collect(), more))
     }
 
-    /// Human-action requests someone answered, newest answer first, and
-    /// whether more than `limit` exist.
+    /// Console requests someone answered, newest answer first, and whether
+    /// more than `limit` exist.
     pub async fn answered_human_requests(
         &self,
         limit: usize,
     ) -> Result<(Vec<CollaborationRequest>, bool), CollaborationError> {
         self.ensure_enabled()?;
         let requests = self.requests.read().await;
-        let mut answered: Vec<CollaborationRequest> = requests
+        let mut answered: Vec<&CollaborationRequest> = requests
             .values()
-            .filter(|request| {
-                request.to.console && request.human_action.is_some() && request.reply.is_some()
-            })
-            .cloned()
+            .filter(|request| answered_by_person(request))
             .collect();
-        drop(requests);
         let at = |request: &CollaborationRequest| request.reply.as_ref().map(|reply| reply.at);
         answered.sort_by(|a, b| at(b).cmp(&at(a)).then(b.id.cmp(&a.id)));
         let more = answered.len() > limit;
-        answered.truncate(limit);
-        Ok((answered, more))
+        Ok((answered.into_iter().take(limit).cloned().collect(), more))
     }
 }
 
@@ -65,7 +68,11 @@ mod tests {
         .unwrap();
         let console = Participant::console(sender.room.clone());
         let mut ids = Vec::new();
-        for body in ["first?", "second?", "third?"] {
+        for (body, action) in [
+            ("first?", Some(HumanAction::Choice)),
+            ("second?", None),
+            ("third?", Some(HumanAction::Approval)),
+        ] {
             let request = store
                 .create(
                     sender.clone(),
@@ -73,7 +80,7 @@ mod tests {
                     NewRequest {
                         body: body.into(),
                         kind: RequestKind::Question,
-                        human_action: Some(HumanAction::Choice),
+                        human_action: action,
                         ..NewRequest::default()
                     },
                 )
@@ -103,6 +110,23 @@ mod tests {
         let (answered, more) = store.answered_human_requests(10).await.unwrap();
         assert!(!more);
         assert_eq!(answered.len(), 1);
-        assert_eq!(answered[0].reply.as_ref().unwrap().body, "yes");
+        assert_eq!(
+            answered[0].reply.as_ref().unwrap().body,
+            "yes",
+            "a plain console question without human_action is a decision too"
+        );
+        store
+            .reply(
+                &console,
+                &ids[2],
+                RequestStatus::Declined,
+                "no".into(),
+                vec![],
+            )
+            .await
+            .unwrap();
+        let (answered, _) = store.answered_human_requests(10).await.unwrap();
+        assert_eq!(answered.len(), 2, "a declined answer is kept");
+        assert_eq!(answered[0].id, ids[2], "newest answer first");
     }
 }

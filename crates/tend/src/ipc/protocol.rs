@@ -119,15 +119,23 @@ pub(super) enum RequestBody {
     },
     /// Everything pending on the person, in one ordered list
     /// (`decision_queue_v1`).
+    ///
+    /// Human requests come only to an operator-console origin, as with any
+    /// listing past the caller's own mailbox; other callers get reviews and
+    /// waiting agents, with the human source named as unavailable.
     DecisionQueue {
         #[serde(default = "default_review_list_limit")]
         limit: usize,
+        #[serde(default)]
+        origin: Option<collaboration::CollaborationOrigin>,
     },
     /// Decided review items and answered human requests, newest first
     /// (`decision_queue_v1`).
     DecisionHistory {
         #[serde(default = "default_review_list_limit")]
         limit: usize,
+        #[serde(default)]
+        origin: Option<collaboration::CollaborationOrigin>,
     },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,

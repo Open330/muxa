@@ -310,13 +310,17 @@ fn paneless_waiters(agents: &[Agent]) -> Vec<&Agent> {
 #[derive(Default)]
 struct PendingDecisions {
     human: Vec<tend::decision_queue::HumanRequestEntry>,
-    reviews: usize,
-    truncated: bool,
+    /// More human requests than were read.
+    more_human: bool,
+    /// Open review items, from the store's own count rather than a page of
+    /// the queue, where higher-priority entries can push every review out.
+    reviews: u64,
+    unavailable: Vec<String>,
 }
 
 impl PendingDecisions {
     fn is_empty(&self) -> bool {
-        self.human.is_empty() && self.reviews == 0
+        self.human.is_empty() && self.reviews == 0 && self.unavailable.is_empty()
     }
 
     fn render(&self, leading_blank: bool, now: OffsetDateTime) -> String {
@@ -342,37 +346,60 @@ impl PendingDecisions {
                     crate::review_cmd::render_human_request(entry, now)
                 );
             }
+            if self.more_human {
+                out.push_str("  … more: tend review queue\n");
+            }
         }
         if self.reviews > 0 {
             let _ = writeln!(
                 out,
-                "{}{} result{} to review: tend review queue",
+                "{} result{} to review: tend review queue",
                 self.reviews,
-                if self.truncated { "+" } else { "" },
                 if self.reviews == 1 { "" } else { "s" }
             );
+        }
+        for source in &self.unavailable {
+            let _ = writeln!(out, "unavailable: {source}");
         }
         out
     }
 }
 
+/// Human requests lead the queue, so a page of it holds them first; a page
+/// that also reached past them read them all.
+const HUMAN_PAGE: usize = 100;
+
 async fn pending_decisions(client: &Client) -> PendingDecisions {
     if !crate::review_cmd::queue_supported(client).await {
         return PendingDecisions::default();
     }
-    let Ok(queue) = client.decision_queue(100).await else {
-        return PendingDecisions::default();
-    };
-    let mut pending = PendingDecisions {
-        truncated: queue.truncated,
-        ..PendingDecisions::default()
-    };
-    for item in queue.items {
-        match item {
-            tend::decision_queue::PendingItem::HumanRequest(entry) => pending.human.push(entry),
-            tend::decision_queue::PendingItem::Review(_) => pending.reviews += 1,
-            tend::decision_queue::PendingItem::AgentWaiting(_) => {}
+    let mut pending = PendingDecisions::default();
+    match client
+        .decision_queue(&tend::decision_queue::operator_origin(), HUMAN_PAGE)
+        .await
+    {
+        Ok(queue) => {
+            let read = queue.items.len();
+            for item in queue.items {
+                if let tend::decision_queue::PendingItem::HumanRequest(entry) = item {
+                    pending.human.push(entry);
+                }
+            }
+            pending.more_human = queue.truncated && pending.human.len() == read;
+            pending.unavailable = queue
+                .unavailable
+                .into_iter()
+                .filter(|source| !source.starts_with("review items"))
+                .collect();
         }
+        Err(error) => pending.unavailable.push(format!("decision queue: {error}")),
+    }
+    match client
+        .review_summary_with_timeout(std::time::Duration::from_secs(2))
+        .await
+    {
+        Ok(summary) => pending.reviews = summary.open,
+        Err(error) => pending.unavailable.push(format!("review items: {error}")),
     }
     pending
 }
@@ -684,6 +711,29 @@ mod tests {
         let cands = candidates(&agents, &panes);
         let cur = spatial_key("%1", &panes);
         assert_eq!(next_after(&cands, Some(&cur)).unwrap().pane, "%2");
+    }
+
+    #[test]
+    fn pending_decisions_render_the_store_count_and_unavailable_sources() {
+        let now = t(0);
+        let pending = PendingDecisions {
+            reviews: 1,
+            ..PendingDecisions::default()
+        };
+        assert_eq!(
+            pending.render(true, now),
+            "\n1 result to review: tend review queue\n"
+        );
+        let broken = PendingDecisions {
+            unavailable: vec!["review items: closed".into()],
+            ..PendingDecisions::default()
+        };
+        assert!(!broken.is_empty(), "a source that failed is never silence");
+        assert_eq!(
+            broken.render(false, now),
+            "unavailable: review items: closed\n"
+        );
+        assert_eq!(PendingDecisions::default().render(true, now), "");
     }
 
     #[test]
