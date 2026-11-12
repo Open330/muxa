@@ -1054,7 +1054,7 @@ fn outgoing_request(language: UiLanguage) -> Vec<String> {
     turn(
         Cli::Codex,
         &format!(
-            "tend_send_message(to: \"you\")  {DIM}·  {}{RESET}",
+            "tend_request_attention()  {DIM}·  {}{RESET}",
             tr(language, "waiting on a decision", "결정 대기 중")
         ),
         tr(

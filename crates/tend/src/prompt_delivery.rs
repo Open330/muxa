@@ -111,7 +111,7 @@ pub fn idle_gate(
     {
         return Err(format!(
             "{TARGET_NOT_IDLE}: the agent on pane {pane} is {}; nothing was sent. Wait for it to \
-             be idle (tend_wait_for_change), use the mailbox (tend_send_message) for work it \
+             be idle (tend_wait with pane), use the mailbox (tend_call_peer) for work it \
              should pick up, or pass force=true to type into it anyway.",
             busy.state
         ));

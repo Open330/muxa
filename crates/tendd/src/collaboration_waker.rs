@@ -462,7 +462,7 @@ fn reply_wake_prompt(
     };
     if let ([request], 0) = (batch.requests.as_slice(), batch.remaining) {
         return format!(
-            "[tend:{}] {} is ready. Read it with tend_wait_reply (MCP) or `tend msg wait {}`.",
+            "[tend:{}] {} is ready. Read it with tend_wait (MCP; tend_wait_reply before tend 0.10.15) or `tend msg wait {}`.",
             request.id,
             entry(request),
             request.id,
@@ -480,7 +480,7 @@ fn reply_wake_prompt(
         format!(" {} more will follow.", batch.remaining)
     };
     format!(
-        "[tend] {} replies are ready: {entries}.{more} Read each with tend_wait_reply (MCP) or `tend msg wait ID`.",
+        "[tend] {} replies are ready: {entries}.{more} Read each with tend_wait (MCP; tend_wait_reply before tend 0.10.15) or `tend msg wait ID`.",
         batch.requests.len(),
     )
 }

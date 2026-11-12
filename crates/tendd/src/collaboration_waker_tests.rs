@@ -1564,7 +1564,7 @@ async fn reply_wake_prompt_names_stale_requests() {
     assert_eq!(
         reply_wake_prompt(&single, now),
         format!(
-            "[tend:req_a] Completed reply from {} is ready. Read it with tend_wait_reply (MCP) or `tend msg wait req_a`.",
+            "[tend:req_a] Completed reply from {} is ready. Read it with tend_wait (MCP; tend_wait_reply before tend 0.10.15) or `tend msg wait req_a`.",
             single.requests[0].to.label()
         ),
         "a fresh single reply keeps the established text"
@@ -1800,7 +1800,7 @@ async fn terminal_reply_wakes_idle_sender_without_injecting_body() {
         assert_eq!(sends[0].0, "%1");
         assert!(sends[0].1.contains("reply"));
         assert!(sends[0].1.contains(&request.id));
-        assert!(sends[0].1.contains("tend_wait_reply"));
+        assert!(sends[0].1.contains("tend_wait (MCP"));
         assert!(sends[0].1.contains("tend msg wait"));
         assert!(!sends[0].1.contains("secret request body"));
         assert!(!sends[0].1.contains("secret reply body"));
