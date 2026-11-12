@@ -13,6 +13,8 @@ enum TendAgentLogoAsset: String, CaseIterable, Sendable {
     case claude
     /// OpenAI's blossom, which Codex wears too.
     case openai
+    /// Google's Gemini sparkle, for the Gemini Ask engine. Gemini CLI is no
+    /// longer an agent kind, so no agent wears it.
     case gemini
     case antigravity
     case opencode
@@ -61,7 +63,7 @@ enum TendAgentLogoAsset: String, CaseIterable, Sendable {
     }
 
     /// The mark for an agent kind or program in any spelling tend sees
-    /// (`claude_code`, `claude`, `gemini_cli`, `agy`, …), or nil.
+    /// (`claude_code`, `claude`, `agy`, `antigravity`, …), or nil.
     init?(kind: String) {
         guard let program = TendAgentProgram(configValue: kind) else { return nil }
         self = program.logo
@@ -73,7 +75,6 @@ extension TendAgentProgram {
         switch self {
         case .claude: .claude
         case .codex: .openai
-        case .gemini: .gemini
         case .agy: .antigravity
         case .opencode: .opencode
         }

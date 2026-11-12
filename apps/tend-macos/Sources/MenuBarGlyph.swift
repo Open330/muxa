@@ -2,7 +2,7 @@ import AppKit
 import SwiftUI
 
 /// What a menu-bar face shows: an SF Symbol name, a product's logo
-/// (`tend.claude`, `tend.codex`, `tend.gemini`, …), or a short text
+/// (`tend.claude`, `tend.codex`, `tend.antigravity`, …), or a short text
 /// (`text:🚀`, `text:MB`) a person chose for a fleet host. Drawn the same
 /// way in the menu-bar image and in the SwiftUI lists. A logo is drawn as
 /// its owner publishes it, on no background (`drawsOwnFace`); every other
@@ -10,7 +10,6 @@ import SwiftUI
 enum TendGlyph {
     static let claude = "tend.claude"
     static let codex = "tend.codex"
-    static let gemini = "tend.gemini"
     static let antigravity = "tend.antigravity"
     static let opencode = "tend.opencode"
     static let textPrefix = "text:"
@@ -28,7 +27,6 @@ enum TendGlyph {
         switch program {
         case .claude: claude
         case .codex: codex
-        case .gemini: gemini
         case .agy: antigravity
         case .opencode: opencode
         }
@@ -38,7 +36,6 @@ enum TendGlyph {
         switch value {
         case claude: return .logo(.claude)
         case codex: return .logo(.openai)
-        case gemini: return .logo(.gemini)
         case antigravity: return .logo(.antigravity)
         case opencode: return .logo(.opencode)
         default:
