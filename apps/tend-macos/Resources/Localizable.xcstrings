@@ -3199,16 +3199,6 @@
         }
       }
     },
-    "aas account" : {
-      "localizations" : {
-        "ko" : {
-          "stringUnit" : {
-            "state" : "translated",
-            "value" : "aas 계정"
-          }
-        }
-      }
-    },
     "Account" : {
       "localizations" : {
         "ko" : {
@@ -3219,12 +3209,12 @@
         }
       }
     },
-    "Account must be one aas account name, such as work@claude, or empty for the best account with quota left." : {
+    "Account must be one configured or aas account name, such as work@claude, or empty for the best account with quota left." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "계정은 work@claude 같은 aas 계정 이름 하나여야 합니다. 비워 두면 사용량이 남은 최적 계정을 고릅니다."
+            "value" : "계정은 work@claude 같은 계정 이름 하나여야 합니다. 비워 두면 사용량이 남은 최적 계정을 고릅니다."
           }
         }
       }
@@ -3249,12 +3239,12 @@
         }
       }
     },
-    "Accounts are read on %@. Leave this on Best account to let aas there choose." : {
+    "Accounts are read on %@. Leave this on Best account to let Tend there choose." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "계정은 %@에서 읽습니다. 그곳의 aas가 고르게 하려면 최적 계정으로 두세요."
+            "value" : "계정은 %@에서 읽습니다. 그곳의 Tend가 고르게 하려면 최적 계정으로 두세요."
           }
         }
       }
@@ -3391,12 +3381,12 @@
         }
       }
     },
-    "An aas account such as work@claude. Leave empty to let aas pick the best-ranked account of the same provider that still has quota." : {
+    "A configured account name or an aas account such as work@claude. Leave empty to let Tend choose an available account of the same provider." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "work@claude 같은 aas 계정입니다. 비워 두면 aas가 같은 제공자 중 사용량이 남은 가장 좋은 계정을 고릅니다."
+            "value" : "설정한 계정 이름 또는 work@claude 같은 aas 계정입니다. 비워 두면 Tend가 같은 제공자의 사용 가능한 계정을 고릅니다."
           }
         }
       }
@@ -10020,12 +10010,12 @@
         }
       }
     },
-    "Tend relaunches the same conversation on the aas account with the most quota left and carries the cut-off turn on. Needs aas and a second account." : {
+    "Tend relaunches the same conversation on an available account and carries the cut-off turn on. Needs a second configured account or an optional aas account." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Tend가 사용량이 가장 많이 남은 aas 계정에서 같은 대화를 다시 실행하고 끊긴 작업을 이어 갑니다. aas와 두 번째 계정이 필요합니다."
+            "value" : "Tend가 사용 가능한 계정에서 같은 대화를 다시 실행하고 끊긴 작업을 이어 갑니다. 두 번째 설정 계정 또는 선택적 aas 계정이 필요합니다."
           }
         }
       }
@@ -10762,12 +10752,12 @@
         }
       }
     },
-    "no aas account" : {
+    "no account" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "aas 계정 없음"
+            "value" : "계정 없음"
           }
         }
       }
@@ -10782,12 +10772,12 @@
         }
       }
     },
-    "No agent matches. Agents started without aas, or that are not Claude Code or Codex, cannot be switched." : {
+    "No agent matches. Agents without a known account, or that are not Claude Code or Codex, cannot be switched." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "해당하는 에이전트가 없습니다. aas 없이 시작했거나 Claude Code, Codex가 아닌 에이전트는 전환할 수 없습니다."
+            "value" : "해당하는 에이전트가 없습니다. 계정이 확인되지 않았거나 Claude Code, Codex가 아닌 에이전트는 전환할 수 없습니다."
           }
         }
       }
@@ -13405,12 +13395,12 @@
         }
       }
     },
-    "Reading aas accounts…" : {
+    "Reading accounts…" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "aas 계정을 읽는 중…"
+            "value" : "계정을 읽는 중…"
           }
         }
       }
@@ -13812,32 +13802,32 @@
         }
       }
     },
-    "Relaunch the capped agents on aas accounts with quota left and carry their turns on" : {
+    "Relaunch the capped agents on accounts with quota left and carry their turns on" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "한도에 걸린 에이전트를 사용량이 남은 aas 계정에서 다시 실행하고 작업을 이어 갑니다"
+            "value" : "한도에 걸린 에이전트를 사용량이 남은 계정에서 다시 실행하고 작업을 이어 갑니다"
           }
         }
       }
     },
-    "Relaunch this conversation on an aas account with quota left and carry the interrupted turn on" : {
+    "Relaunch this conversation on an account with quota left and carry the interrupted turn on" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "사용량이 남은 aas 계정에서 이 대화를 다시 실행하고 끊긴 작업을 이어 갑니다"
+            "value" : "사용량이 남은 계정에서 이 대화를 다시 실행하고 끊긴 작업을 이어 갑니다"
           }
         }
       }
     },
-    "Relaunch this conversation on another aas account" : {
+    "Relaunch this conversation on another account" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "다른 aas 계정에서 이 대화를 다시 실행합니다"
+            "value" : "다른 계정에서 이 대화를 다시 실행합니다"
           }
         }
       }
@@ -16650,28 +16640,28 @@
         }
       }
     },
-    "Stops %@%@, relaunches the same conversation on another aas account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped." : {
+    "Stops %@%@, relaunches the same conversation on another account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped." : {
       "localizations" : {
         "en" : {
           "stringUnit" : {
             "state" : "new",
-            "value" : "Stops %1$@%2$@, relaunches the same conversation on another aas account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped."
+            "value" : "Stops %1$@%2$@, relaunches the same conversation on another account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped."
           }
         },
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "%1$@%2$@을(를) 멈추고 다른 aas 계정에서 같은 대화를 다시 실행해 끊긴 작업을 이어 갑니다. 대화는 멈춘 곳에서 그대로 재개되므로 잃는 것이 없습니다."
+            "value" : "%1$@%2$@을(를) 멈추고 다른 계정에서 같은 대화를 다시 실행해 끊긴 작업을 이어 갑니다. 대화는 멈춘 곳에서 그대로 재개되므로 잃는 것이 없습니다."
           }
         }
       }
     },
-    "Stops the agent, relaunches the same conversation on another aas account, and types the follow-up so it carries on." : {
+    "Stops the agent, relaunches the same conversation on another account, and types the follow-up so it carries on." : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "에이전트를 멈추고 다른 aas 계정에서 같은 대화를 다시 실행한 뒤, 이어서 작업하도록 후속 프롬프트를 입력합니다."
+            "value" : "에이전트를 멈추고 다른 계정에서 같은 대화를 다시 실행한 뒤, 이어서 작업하도록 후속 프롬프트를 입력합니다."
           }
         }
       }

@@ -471,6 +471,23 @@ impl FakeSwap {
 }
 
 impl crate::swap_service::SwapJobs for FakeSwap {
+    fn accounts(&self) -> Result<Vec<crate::account_provider::ProviderCandidates>, String> {
+        Self::on_blocking_thread();
+        let accounts = crate::accounts::AccountsConfig {
+            claude: vec![crate::accounts::AccountProfile {
+                name: "work".into(),
+                env: [("SECRET".into(), "private".into())].into(),
+                env_file: None,
+            }],
+            ..Default::default()
+        };
+        Ok(vec![crate::account_provider::candidates(
+            "claude",
+            &accounts,
+            "/missing/aas",
+        )])
+    }
+
     fn health(&self) -> crate::swap_service::SwapHealth {
         if self.slow_health {
             std::thread::sleep(Duration::from_secs(3));

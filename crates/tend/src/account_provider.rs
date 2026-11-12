@@ -92,6 +92,41 @@ pub fn configured(provider: &str, profiles: &[AccountProfile], capped: &[&str]) 
         .collect()
 }
 
+/// Public account metadata only; no environment values or credential paths.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProviderCandidates {
+    pub provider: String,
+    pub source: String,
+    pub reason: Option<String>,
+    pub candidates: Vec<Candidate>,
+}
+
+/// Resolve the same backend as launches and swaps, preserving per-provider errors.
+pub fn candidates(provider: &str, accounts: &AccountsConfig, aas: &str) -> ProviderCandidates {
+    let (source, result) = match backend(provider, accounts, aas) {
+        Backend::Accounts(profiles) => ("configured", Ok(configured(provider, &profiles, &[]))),
+        Backend::Aas(program) => (
+            "aas",
+            crate::account_swap::query_candidates_within(
+                &program,
+                provider,
+                std::time::Duration::from_secs(10),
+            ),
+        ),
+        Backend::Unavailable(reason) => ("unavailable", Err(reason)),
+    };
+    let (candidates, reason) = match result {
+        Ok(candidates) => (candidates, None),
+        Err(reason) => (Vec::new(), Some(reason)),
+    };
+    ProviderCandidates {
+        provider: provider.into(),
+        source: source.into(),
+        reason,
+        candidates,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +154,24 @@ mod tests {
         assert!(configured("claude", &profiles, &[])
             .iter()
             .all(|c| c.eligible));
+    }
+
+    #[test]
+    fn candidate_listing_prefers_config_and_exposes_no_environment() {
+        let mut accounts = AccountsConfig::default();
+        accounts.claude.push(profile("work"));
+        let listing = candidates("claude", &accounts, "/missing/aas");
+        assert_eq!(listing.source, "configured");
+        assert!(listing.reason.is_none());
+        assert_eq!(listing.candidates[0].name, "work");
+        assert!(listing.candidates[0].eligible);
+        let json = serde_json::to_string(&listing).unwrap();
+        assert!(!json.contains("CLAUDE_CONFIG_DIR"));
+        assert!(!json.contains("/p/work"));
+        let missing = candidates("codex", &accounts, "/missing/aas");
+        assert_eq!(missing.source, "unavailable");
+        assert!(missing.candidates.is_empty());
+        assert!(missing.reason.unwrap().contains("[[accounts.codex]]"));
     }
 
     #[test]

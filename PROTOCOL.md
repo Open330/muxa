@@ -1000,3 +1000,15 @@ reports and read-only supersession. Contract-bearing operations use distinct
 request statuses and legacy operations remain unchanged. See
 [Task contracts](docs/COLLABORATION_CONTRACTS.md) for schemas, validation, storage
 compatibility and evidence semantics.
+
+### Account candidates (`swap_accounts_v1`)
+
+`{"protocol":6,"kind":"swap_accounts"}` returns `swap_accounts`, an array
+of provider objects with `provider` (`claude` or `codex`), `source`
+(`configured`, `aas`, or `unavailable`), nullable `reason`, and `candidates`.
+Each candidate contains `name`, `provider`, `eligible`, `active`, `reason`,
+and nullable `remainingPct`. Configured accounts take precedence per provider;
+otherwise the daemon queries optional aas. Environment values and credential
+paths are never returned. This read does not plan or start a swap and remains
+available while the swap service is halted. Clients gate the request on the
+`swap_accounts_v1` hello capability.

@@ -108,9 +108,9 @@ struct TendAgentAction: Identifiable, Hashable, Sendable {
     var help: String {
         switch kind {
         case .switchAccountAndResume:
-            String(localized: "Relaunch this conversation on an aas account with quota left and carry the interrupted turn on")
+            String(localized: "Relaunch this conversation on an account with quota left and carry the interrupted turn on")
         case .moveToAccount:
-            String(localized: "Relaunch this conversation on another aas account")
+            String(localized: "Relaunch this conversation on another account")
         case .sendContinue:
             String(localized: "Type continue into the agent and press Return")
         }
@@ -314,7 +314,7 @@ struct TendSwitchLimitedButton: View {
                 Label(group.agents.count == 1 ? "Switch Account…" : "Switch All…", systemImage: "arrow.triangle.2.circlepath")
             }
             .buttonStyle(.tendSecondary)
-            .help("Relaunch the capped agents on aas accounts with quota left and carry their turns on")
+            .help("Relaunch the capped agents on accounts with quota left and carry their turns on")
         } else if groups.count > 1 {
             Menu {
                 ForEach(groups, id: \.host.alias) { group in
@@ -327,7 +327,7 @@ struct TendSwitchLimitedButton: View {
             }
             .menuStyle(.borderlessButton)
             .fixedSize()
-            .help("Relaunch the capped agents on aas accounts with quota left and carry their turns on")
+            .help("Relaunch the capped agents on accounts with quota left and carry their turns on")
         }
     }
 

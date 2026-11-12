@@ -36,7 +36,9 @@ struct TendSwapSheet: View {
     @ObservedObject var swaps: TendSwapCenter
     let target: TendSwapSheetTarget
 
-    @StateObject private var accounts = AasAccountStore()
+    @State private var accountProviders: [TendProviderCandidates] = []
+    @State private var isReadingAccounts = false
+    @State private var accountsError: String?
     @State private var choice: AccountChoice = .auto
     @State private var typedAccount = ""
     @State private var followUp = ""
@@ -71,8 +73,8 @@ struct TendSwapSheet: View {
         }
     }
 
-    private var offeredAccounts: [AasAccount] {
-        accounts.accounts.filter { provider == nil || $0.provider == provider }
+    private var offeredAccounts: [TendAccountCandidate] {
+        accountProviders.flatMap(\.candidates).filter { (provider == nil || $0.provider == provider) && $0.eligible }
     }
 
     private var request: TendSwapRequest {
@@ -133,7 +135,7 @@ struct TendSwapSheet: View {
             if target.interruptsWork { force = true }
             if isLocal {
                 await model.swaps.refreshHealth()
-                await accounts.refresh()
+                await readAccounts()
             }
         }
         .task(id: request) {
@@ -159,7 +161,7 @@ struct TendSwapSheet: View {
 
     private var subtitle: String {
         let host = target.host.map { String(localized: " on \($0)") } ?? ""
-        return String(localized: "Stops \(target.label)\(host), relaunches the same conversation on another aas account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped.")
+        return String(localized: "Stops \(target.label)\(host), relaunches the same conversation on another account, and carries the interrupted turn on. Nothing is lost: the conversation resumes where it stopped.")
     }
 
     @ViewBuilder
@@ -181,23 +183,40 @@ struct TendSwapSheet: View {
             }
             .pickerStyle(.menu)
             if case .typed = choice {
-                TextField("aas account", text: $typedAccount, prompt: Text(verbatim: "work@claude"))
+                TextField("Account", text: $typedAccount, prompt: Text(verbatim: "work@claude"))
                     .font(.callout.monospaced())
             }
-            if isLocal, accounts.isRefreshing, accounts.accounts.isEmpty {
+            if isLocal, isReadingAccounts, offeredAccounts.isEmpty {
                 HStack(spacing: 6) {
                     ProgressView().controlSize(.small)
-                    Text("Reading aas accounts…").font(TendType.detail).foregroundStyle(.secondary)
+                    Text("Reading accounts…").font(TendType.detail).foregroundStyle(.secondary)
                 }
+            } else if let accountsError {
+                Text(accountsError).font(TendType.detail).foregroundStyle(.secondary)
             } else if !isLocal {
-                Text("Accounts are read on \(target.host ?? ""). Leave this on Best account to let aas there choose.")
+                Text("Accounts are read on \(target.host ?? ""). Leave this on Best account to let Tend there choose.")
                     .font(TendType.detail)
                     .foregroundStyle(.secondary)
             }
         }
     }
 
-    private func accountLabel(_ account: AasAccount) -> String {
+    @MainActor
+    private func readAccounts() async {
+        isReadingAccounts = true
+        defer { isReadingAccounts = false }
+        do {
+            accountProviders = try await model.client.swapAccounts()
+            accountsError = accountProviders
+                .filter { provider == nil || $0.provider == provider }
+                .compactMap(\.reason).joined(separator: "\n")
+            if accountsError?.isEmpty == true { accountsError = nil }
+        } catch {
+            accountsError = error.localizedDescription
+        }
+    }
+
+    private func accountLabel(_ account: TendAccountCandidate) -> String {
         var parts = [account.name]
         if let remaining = account.remainingPct {
             parts.append(String(localized: "\(Int(remaining.rounded()))% left"))
@@ -230,7 +249,7 @@ struct TendSwapSheet: View {
                     .fixedSize(horizontal: false, vertical: true)
             } else if let plan {
                 if plan.isEmpty {
-                    Text("No agent matches. Agents started without aas, or that are not Claude Code or Codex, cannot be switched.")
+                    Text("No agent matches. Agents without a known account, or that are not Claude Code or Codex, cannot be switched.")
                         .font(TendType.detail)
                         .foregroundStyle(.secondary)
                 }
@@ -359,7 +378,7 @@ struct TendSwapOutcomeRow: View {
                 }
                 if outcome.from != nil || outcome.to != nil {
                     HStack(spacing: 4) {
-                        Text(verbatim: outcome.from ?? String(localized: "no aas account"))
+                        Text(verbatim: outcome.from ?? String(localized: "no account"))
                         Image(systemName: "arrow.right").font(.system(size: 9))
                         Text(verbatim: outcome.to ?? "—").fontWeight(.semibold)
                     }

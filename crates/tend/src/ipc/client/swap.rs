@@ -1,5 +1,27 @@
 use super::{Client, RuntimeError, PROTOCOL_VERSION, SWAP_CLIENT_TIMEOUT};
 impl Client {
+    pub async fn swap_accounts(
+        &self,
+    ) -> Result<Vec<crate::account_provider::ProviderCandidates>, RuntimeError> {
+        let response = self
+            .call_with_timeout(
+                &serde_json::json!({
+                    "protocol": PROTOCOL_VERSION, "kind": "swap_accounts",
+                }),
+                SWAP_CLIENT_TIMEOUT,
+            )
+            .await?;
+        if response["ok"] != true {
+            return Err(RuntimeError::Daemon(
+                response["error"]
+                    .as_str()
+                    .unwrap_or("account query failed")
+                    .into(),
+            ));
+        }
+        serde_json::from_value(response["swap_accounts"].clone()).map_err(RuntimeError::Json)
+    }
+
     /// `swap_jobs_v1`: accept a swap under `request_key`, or get the job it
     /// already made.
     pub async fn swap_job_start(

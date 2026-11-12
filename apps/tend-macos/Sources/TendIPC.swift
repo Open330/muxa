@@ -1002,6 +1002,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     /// `swap_health`'s answer. Swap job requests also answer in `swap`,
     /// with another shape: that reads as nil rather than failing the reply.
     let swap: TendLenient<TendSwapHealth>?
+    let swapAccounts: [TendProviderCandidates]?
 
     enum CodingKeys: String, CodingKey {
         case ok, error, capabilities, agents, sessions, session, output, capture, fleet, swap
@@ -1022,6 +1023,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case askAgent = "ask_agent"
         case askEnabled = "ask_enabled"
         case askProviders = "ask_providers"
+        case swapAccounts = "swap_accounts"
     }
 }
 
@@ -1313,6 +1315,15 @@ actor TendIPCClient {
         let response = try await call(["protocol": Self.protocolVersion, "kind": "swap_health"])
         guard let health = response.swap?.value else { throw TendIPCError.missingField("swap") }
         return health
+    }
+
+    func swapAccounts() async throws -> [TendProviderCandidates] {
+        guard capabilities.contains("swap_accounts_v1") else {
+            throw TendIPCError.missingField("swap_accounts_v1 (update tendd)")
+        }
+        let response = try await call(["protocol": Self.protocolVersion, "kind": "swap_accounts"], timeout: 30)
+        guard let accounts = response.swapAccounts else { throw TendIPCError.missingField("swap_accounts") }
+        return accounts
     }
 
     static let swapHealthCapability = "swap_health_v1"
@@ -2490,4 +2501,26 @@ final class UnixSocketSubscription: @unchecked Sendable {
             throw TendIPCError.server(response.error ?? "tendd rejected the subscription")
         }
     }
+}
+
+/// Public candidate metadata from the daemon's account provider.
+struct TendAccountCandidate: Decodable, Sendable, Identifiable {
+    let name: String
+    let provider: String
+    let eligible: Bool
+    let active: Bool
+    let reason: String
+    let remainingPct: Double?
+    var id: String { "\(provider)/\(name)" }
+    enum CodingKeys: String, CodingKey {
+        case name, provider, eligible, active, reason
+        case remainingPct = "remainingPct"
+    }
+}
+
+struct TendProviderCandidates: Decodable, Sendable {
+    let provider: String
+    let source: String
+    let reason: String?
+    let candidates: [TendAccountCandidate]
 }

@@ -30,7 +30,7 @@ enum TendLimitPolicy: Hashable, Sendable, CaseIterable, Identifiable {
     var detail: String {
         switch self {
         case .switchAccount:
-            String(localized: "Tend relaunches the same conversation on the aas account with the most quota left and carries the cut-off turn on. Needs aas and a second account.")
+            String(localized: "Tend relaunches the same conversation on an available account and carries the cut-off turn on. Needs a second configured account or an optional aas account.")
         case .waitForReset:
             String(localized: "Tend types continue two minutes after the limit resets (or after 20 minutes when no reset time is known).")
         case .tellMe:

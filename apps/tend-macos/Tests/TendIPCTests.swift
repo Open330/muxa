@@ -6282,3 +6282,26 @@ func workCapableHostsSkipDisabledHosts() {
     ]
     #expect(AppModel.workCapable(hosts).map(\.alias) == ["local", "away", "zeta"])
 }
+
+@Test func swapAccountsReadsDaemonCandidatesAndGatesLegacyDaemons() async throws {
+    let client = TendIPCClient(socketPath: "/tmp/tend-swap-accounts.sock") { _, payload in
+        let request = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        if request["kind"] as? String == "hello" {
+            return try settingsPaneHello(capabilities: ["swap_accounts_v1"])
+        }
+        #expect(request["kind"] as? String == "swap_accounts")
+        return Data(#"{"ok":true,"swap_accounts":[{"provider":"claude","source":"configured","reason":null,"candidates":[{"name":"work","provider":"claude","eligible":true,"active":false,"reason":"configured","remainingPct":null}]},{"provider":"codex","source":"aas","reason":null,"candidates":[{"name":"personal@codex","provider":"codex","eligible":true,"active":true,"reason":"available","remainingPct":62.5}]}]}"#.utf8)
+    }
+    try await client.hello()
+    let accounts = try await client.swapAccounts()
+    #expect(accounts[0].candidates[0].name == "work")
+    #expect(accounts[0].source == "configured")
+    #expect(accounts[1].candidates[0].remainingPct == 62.5)
+    let old = TendIPCClient(socketPath: "/tmp/tend-swap-legacy.sock") { _, payload in
+        let request = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(request["kind"] as? String == "hello")
+        return try settingsPaneHello(capabilities: [])
+    }
+    try await old.hello()
+    await #expect(throws: (any Error).self) { _ = try await old.swapAccounts() }
+}

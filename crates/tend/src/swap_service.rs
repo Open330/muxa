@@ -897,6 +897,11 @@ impl SwapJobs for UnopenedSwap {
 /// What an IPC caller may do with swap jobs. Every request through it is a
 /// public one: it can never claim the daemon's own automation privileges.
 pub trait SwapJobs: Send + Sync {
+    /// Read account metadata without planning or acting on an agent.
+    fn accounts(&self) -> Result<Vec<crate::account_provider::ProviderCandidates>, String> {
+        Err("account candidates are unavailable".into())
+    }
+
     fn active(&self) -> Result<(), String>;
     fn plan(&self, overrides: &SwapOverrides) -> Result<PlanView, String>;
     fn submit(&self, request_key: &str, overrides: &SwapOverrides) -> Result<Accepted, String>;
@@ -922,6 +927,20 @@ pub trait SwapJobs: Send + Sync {
 }
 
 impl SwapJobs for SwapService {
+    fn accounts(&self) -> Result<Vec<crate::account_provider::ProviderCandidates>, String> {
+        let snapshot = self.inner.provider.snapshot()?;
+        Ok(["claude", "codex"]
+            .into_iter()
+            .map(|provider| {
+                crate::account_provider::candidates(
+                    provider,
+                    &snapshot.accounts,
+                    &snapshot.config.aas,
+                )
+            })
+            .collect())
+    }
+
     fn active(&self) -> Result<(), String> {
         self.inner.active()
     }

@@ -1022,7 +1022,7 @@ struct AutomationRuleEditor: View {
                     if draft.action.carriesAccount {
                         TextField("Account", text: $draft.account, prompt: Text("Best account with quota left"))
                             .font(.callout.monospaced())
-                        Text("An aas account such as work@claude. Leave empty to let aas pick the best-ranked account of the same provider that still has quota.")
+                        Text("A configured account name or an aas account such as work@claude. Leave empty to let Tend choose an available account of the same provider.")
                             .font(TendType.detail)
                             .foregroundStyle(.secondary)
                         TextField("Follow-up", text: $draft.text, prompt: Text("The [swap] follow-up from config.toml"))
@@ -1430,7 +1430,7 @@ func automationActionDetail(_ action: TendAutomationAction) -> String {
     case .interrupt:
         String(localized: "Sends the agent an interrupt, as Escape would.")
     case .swapAccount:
-        String(localized: "Stops the agent, relaunches the same conversation on another aas account, and types the follow-up so it carries on.")
+        String(localized: "Stops the agent, relaunches the same conversation on another account, and types the follow-up so it carries on.")
     case .other:
         String(localized: "An action this build of Tend does not know.")
     }

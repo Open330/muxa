@@ -64,7 +64,7 @@ enum TendAutomationRuleIssue: Hashable, Sendable {
         case .missingText:
             String(localized: "Send prompt needs the text to type.")
         case .invalidAccount:
-            String(localized: "Account must be one aas account name, such as work@claude, or empty for the best account with quota left.")
+            String(localized: "Account must be one configured or aas account name, such as work@claude, or empty for the best account with quota left.")
         case .textNotTerminalSafe:
             String(localized: "Text may not contain terminal control characters — it is typed into a live agent. Tabs and newlines are fine.")
         case .textTooLong:
