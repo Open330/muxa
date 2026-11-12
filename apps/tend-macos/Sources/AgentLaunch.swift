@@ -160,9 +160,9 @@ struct TendAgentLaunchDefaults: Codable, Equatable, Sendable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         let stored = try? container.decodeIfPresent(String.self, forKey: .program)
-        program = stored.flatMap { $0.flatMap(TendAgentProgram.init(rawValue:)) }
+        program = stored.flatMap(TendAgentProgram.init(rawValue:))
         placement = try container.decodeIfPresent(TendAgentPlacementKind.self, forKey: .placement)
-        let retired = stored.flatMap { $0 } != nil && program == nil
+        let retired = stored != nil && program == nil
         options = retired ? nil : try container.decodeIfPresent([String].self, forKey: .options)
     }
 
