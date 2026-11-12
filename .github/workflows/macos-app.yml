@@ -15,6 +15,8 @@ on:
     paths:
       - "apps/tend-macos/**"
       - ".github/workflows/macos-app.yml"
+  # Run on main by hand to seed the shared libghostty and Rust caches.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,12 +33,19 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+          # Only main's cache is visible to other refs; a PR or tag copy is
+          # half a gigabyte that crowds out the shared ones.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install xcodegen
         run: brew install xcodegen
 
-      - name: Cache libghostty
-        uses: actions/cache@v4
+      # Restore and save are separate so a build that fails later still
+      # leaves its libghostty behind, and only main writes the shared copy
+      # (a cache saved from a PR or tag is invisible to every other ref).
+      - name: Restore libghostty
+        id: libghostty
+        uses: actions/cache/restore@v4
         with:
           path: |
             apps/tend-macos/.build/dependencies
@@ -49,6 +58,16 @@ jobs:
         run: |
           Scripts/build-libghostty.sh
           xcodegen generate
+
+      - name: Save libghostty
+        if: steps.libghostty.outputs.cache-hit != 'true' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            apps/tend-macos/.build/dependencies
+            apps/tend-macos/.build/toolchains
+            apps/tend-macos/.build/libghostty.stamp
+          key: ${{ steps.libghostty.outputs.cache-primary-key }}
 
       - name: Test AFM workspace grounding
         run: bash apps/tend-macos/Scripts/test-ask-helper.sh
@@ -71,7 +90,9 @@ jobs:
 
       # The release builds the Release configuration (whole-module), whose
       # actor-isolation checking is stricter than Debug's: v0.8.57 passed
-      # this job and still failed the release. Compile it here too.
+      # this job and still failed the release. Compile it here too, for
+      # arm64 only: the check is the same per architecture, and the x86_64
+      # slice would rebuild the Rust helpers a second time.
       - name: Build the Release configuration
         working-directory: apps/tend-macos
         run: |
@@ -82,6 +103,7 @@ jobs:
             -configuration Release \
             -derivedDataPath .build/DerivedDataRelease \
             -destination 'platform=macOS' \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=YES \
             CODE_SIGNING_ALLOWED=NO \
             build > "$RUNNER_TEMP/xcodebuild-release.log" 2>&1 && status=0 || status=$?
           grep -E ': (error|warning): |\*\* BUILD ' "$RUNNER_TEMP/xcodebuild-release.log" | sort -u | head -200 || true
