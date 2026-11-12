@@ -3100,6 +3100,340 @@ func restartNoticeStaysUntilAReplacementSucceeds() {
     #expect(!notice.isShown(current: TendDaemonIdentity(generation: 0, pid: nil, replacements: 1)))
 }
 
+@Test
+func daemonIdentityPrefersTheBootID() {
+    let old = TendDaemonIdentity(bootID: "a", generation: 0, pid: 100)
+    // A boot id settles it: same id, same process, whatever else lags.
+    #expect(old.isSameDaemon(as: TendDaemonIdentity(bootID: "a", generation: 1, pid: 200)))
+    // A different id is a different process even at the same generation and pid.
+    #expect(!old.isSameDaemon(as: TendDaemonIdentity(bootID: "b", generation: 0, pid: 100)))
+    // Not known yet on one side: fall back to what both sides know.
+    #expect(old.isSameDaemon(as: TendDaemonIdentity(generation: 0)))
+    #expect(!old.isSameDaemon(as: TendDaemonIdentity(generation: 3)))
+    // An older build that has no boot id is a different process.
+    #expect(!old.isSameDaemon(as: TendDaemonIdentity(lacksBootID: true, generation: 0, pid: 100)))
+    // A completed replacement still counts.
+    #expect(!old.isSameDaemon(as: TendDaemonIdentity(bootID: "a", replacements: 1)))
+}
+
+@Test
+func restartNoticeClearsOnAnOutsideRestartWithANewBootID() {
+    // `tend daemon stop && tend daemon start`: a fresh process, generation 0
+    // again, and the app never ran a replacement.
+    var notice = TendRestartNotice()
+    notice.noteSaved(under: TendDaemonIdentity(bootID: "first", generation: 0))
+    #expect(notice.isShown(current: TendDaemonIdentity(bootID: "first", generation: 0)))
+    // Disconnected while the hello is pending: keep asking.
+    #expect(notice.isShown(current: TendDaemonIdentity()))
+    #expect(!notice.isShown(current: TendDaemonIdentity(bootID: "second", generation: 0)))
+}
+
+@Test
+func restartNoticeStaysWhileTheSameBootIDAnswers() {
+    var notice = TendRestartNotice()
+    let daemon = TendDaemonIdentity(bootID: "same", generation: 0)
+    notice.noteSaved(under: daemon)
+    // A reconnect to the same process, the generation read late.
+    notice.observe(TendDaemonIdentity(bootID: "same", generation: nil))
+    #expect(notice.isShown(current: TendDaemonIdentity(bootID: "same", generation: nil)))
+    #expect(notice.isShown(current: daemon))
+    #expect(!notice.learnedAfterSave)
+}
+
+@Test
+func restartNoticeFallsBackToPidForADaemonWithoutBootID() {
+    var notice = TendRestartNotice()
+    let old = TendDaemonIdentity(lacksBootID: true, generation: 0, pid: 100)
+    notice.noteSaved(under: old)
+    #expect(notice.isShown(current: old))
+    #expect(!notice.isShown(current: TendDaemonIdentity(lacksBootID: true, generation: 0, pid: 200)))
+    // Its replacement's pid not looked up yet: the same daemon, as far as known.
+    #expect(notice.isShown(current: TendDaemonIdentity(lacksBootID: true, generation: 0)))
+    // Upgraded to a build that names its process.
+    #expect(!notice.isShown(current: TendDaemonIdentity(bootID: "new", generation: 0)))
+
+    // Saved before the pid lookup finished: the pid is learned afterwards.
+    var early = TendRestartNotice()
+    early.noteSaved(under: TendDaemonIdentity(lacksBootID: true, generation: 0))
+    early.observe(TendDaemonIdentity(lacksBootID: true, generation: 0, pid: 100))
+    #expect(early.learnedAfterSave)
+    #expect(early.isShown(current: TendDaemonIdentity(lacksBootID: true, generation: 0, pid: 100)))
+    #expect(!early.isShown(current: TendDaemonIdentity(lacksBootID: true, generation: 0, pid: 200)))
+}
+
+@Test
+func restartNoticeSavedBeforeTheIdentityIsKnownStaysConservative() {
+    // Saved before any hello answered: nothing names the daemon.
+    var notice = TendRestartNotice()
+    notice.noteSaved(under: TendDaemonIdentity())
+    // Never claims the change applied while nothing was learned.
+    #expect(notice.isShown(current: TendDaemonIdentity(bootID: "first", generation: 0)))
+    #expect(notice.isShown(current: TendDaemonIdentity(lacksBootID: true, pid: 100)))
+
+    // The first hello after the save is captured as the saved daemon...
+    notice.observe(TendDaemonIdentity(bootID: "first", generation: 0))
+    #expect(notice.learnedAfterSave)
+    #expect(notice.savedUnder?.bootID == "first")
+    #expect(notice.isShown(current: TendDaemonIdentity(bootID: "first", generation: 0)))
+    // ...so a later fresh process is still told apart.
+    #expect(!notice.isShown(current: TendDaemonIdentity(bootID: "second", generation: 0)))
+    // Learning stops once a different daemon answers.
+    notice.observe(TendDaemonIdentity(bootID: "second", generation: 0))
+    #expect(notice.savedUnder?.bootID == "first")
+
+    // A fresh save under the new daemon starts from what is known.
+    notice.noteSaved(under: TendDaemonIdentity(bootID: "second", generation: 0))
+    #expect(!notice.learnedAfterSave)
+    #expect(notice.isShown(current: TendDaemonIdentity(bootID: "second", generation: 0)))
+}
+
+@Test
+func helloDecodesTheBootIDAndToleratesItsAbsence() async throws {
+    let withID = TendIPCClient(socketPath: "/tmp/tend-boot-id.sock") { _, _ in
+        var object = try #require(
+            JSONSerialization.jsonObject(with: settingsPaneHello(capabilities: ["daemon_boot_id_v1"]))
+                as? [String: Any]
+        )
+        object["boot_id"] = "0123456789abcdef0123456789abcdef"
+        object["generation"] = 0
+        return try JSONSerialization.data(withJSONObject: object)
+    }
+    let hello = try await withID.hello()
+    #expect(hello.bootID == "0123456789abcdef0123456789abcdef")
+    #expect(await withID.daemonBootID == "0123456789abcdef0123456789abcdef")
+    #expect(await withID.supports(TendIPCClient.daemonBootIDCapability))
+
+    let old = TendIPCClient(socketPath: "/tmp/tend-no-boot-id.sock") { _, _ in
+        try settingsPaneHello(capabilities: [])
+    }
+    #expect(try await old.hello().bootID == nil)
+    #expect(await old.daemonBootID == nil)
+}
+
+@Test
+func boundedSubprocessKillsAChildThatOverrunsItsTimeout() throws {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sleep")
+    process.arguments = ["30"]
+    let child = TendBoundedSubprocess(process)
+    let started = Date()
+    #expect(throws: TendBoundedSubprocess.TimedOut.self) { _ = try child.run(timeout: 0.2) }
+    #expect(Date().timeIntervalSince(started) < 5)
+    process.waitUntilExit()
+    #expect(!process.isRunning)
+
+    let echo = Process()
+    echo.executableURL = URL(fileURLWithPath: "/bin/echo")
+    echo.arguments = ["ok"]
+    let output = try TendBoundedSubprocess(echo).run(timeout: 5)
+    #expect(String(decoding: output, as: UTF8.self) == "ok\n")
+
+    let cancelled = TendBoundedSubprocess(Process())
+    cancelled.cancel()
+    #expect(throws: CancellationError.self) { _ = try cancelled.run(timeout: 1) }
+}
+
+private final class LockedBox<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var stored: Value
+    init(_ value: Value) { stored = value }
+    var value: Value {
+        get { lock.withLock { stored } }
+        set { lock.withLock { stored = newValue } }
+    }
+}
+
+/// A shell (and its `sleep`) that ignore SIGTERM, so only SIGKILL ends them.
+private func termIgnoringChild() -> Process {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/bin/sh")
+    process.arguments = ["-c", "trap '' TERM; sleep 30"]
+    return process
+}
+
+@Test
+func boundedSubprocessKillsATermIgnoringChildOnTimeout() throws {
+    let process = termIgnoringChild()
+    let child = TendBoundedSubprocess(process)
+    let started = Date()
+    #expect(throws: TendBoundedSubprocess.TimedOut.self) { _ = try child.run(timeout: 0.3) }
+    // Timeout + grace + reap, not the child's 30 seconds.
+    #expect(Date().timeIntervalSince(started) < 3)
+    #expect(child.hasExited, "reaped before run returned")
+    #expect(!process.isRunning)
+    #expect(child.readerFinished, "no reader left blocked on the pipe")
+    #expect(process.terminationReason == .uncaughtSignal)
+    #expect(process.terminationStatus == SIGKILL)
+}
+
+@Test
+func boundedSubprocessKillsATermIgnoringChildOnCancel() throws {
+    let process = termIgnoringChild()
+    let child = TendBoundedSubprocess(process)
+    DispatchQueue.global().asyncAfter(deadline: .now() + 0.3) { child.cancel() }
+    let started = Date()
+    #expect(throws: CancellationError.self) { _ = try child.run(timeout: 30) }
+    #expect(Date().timeIntervalSince(started) < 3)
+    #expect(child.hasExited)
+    #expect(!process.isRunning)
+    #expect(child.readerFinished)
+}
+
+@MainActor
+@Test
+func configWriteAnchorsToTheDaemonThatServedItNotTheCachedOne() async throws {
+    // The app last saw boot A; tendd was restarted outside the app as B and
+    // B served the write before any refresh adopted it.
+    let model = AppModel(client: TendIPCClient(socketPath: "/tmp/tend-anchor.sock") { _, _ in
+        Issue.record("a write that names its daemon needs no extra hello")
+        return Data()
+    })
+    _ = await model.daemonIdentityAfterWrite(servedBy: "A")
+    #expect(model.localDaemonBootID == "A")
+    let anchor = await model.daemonIdentityAfterWrite(servedBy: "B")
+    #expect(anchor.bootID == "B")
+    #expect(model.localDaemonBootID == "B")
+
+    var notice = TendRestartNotice()
+    notice.noteSaved(under: anchor)
+    // The next hello sees B: B never loaded the change, so the bar stays.
+    #expect(notice.isShown(current: TendDaemonIdentity(bootID: "B", generation: 0)))
+    #expect(!notice.isShown(current: TendDaemonIdentity(bootID: "C", generation: 0)))
+}
+
+@MainActor
+@Test
+func configWriteWithoutABootIDAsksAFreshHello() async throws {
+    let helloBootID = LockedBox<String?>(nil)
+    let model = AppModel(client: TendIPCClient(socketPath: "/tmp/tend-anchor-old.sock") { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        #expect(object["kind"] as? String == "hello")
+        var reply = try #require(
+            JSONSerialization.jsonObject(with: settingsPaneHello(capabilities: [])) as? [String: Any]
+        )
+        reply["generation"] = 3
+        if let bootID = helloBootID.value { reply["boot_id"] = bootID }
+        return try JSONSerialization.data(withJSONObject: reply)
+    })
+    _ = await model.daemonIdentityAfterWrite(servedBy: "A")
+
+    // An older tendd: the write and the fresh hello carry no boot id. The
+    // cached A is not evidence; the pid is left to a lookup that starts now.
+    let old = await model.daemonIdentityAfterWrite(servedBy: nil)
+    #expect(old.bootID == nil)
+    #expect(old.lacksBootID)
+    #expect(old.generation == 3)
+    #expect(old.pid == nil)
+    #expect(!old.isSameDaemon(as: TendDaemonIdentity(bootID: "A", generation: 3)))
+
+    // A boot id arriving only on the fresh hello is still the serving side.
+    helloBootID.value = "B"
+    let fresh = await model.daemonIdentityAfterWrite(servedBy: nil)
+    #expect(fresh.bootID == "B")
+}
+
+@Test
+func configWritesReportTheDaemonThatServedThem() async throws {
+    let client = TendConfigClient(socketPath: "/tmp/tend-config-served.sock") { _, payload in
+        let object = try #require(JSONSerialization.jsonObject(with: payload) as? [String: Any])
+        let document: [String: Any] = ["path": "/tmp/config.toml", "text": "", "exists": true]
+        switch object["kind"] as? String {
+        case "config_write":
+            return try JSONSerialization.data(withJSONObject: ["ok": true, "config": document, "boot_id": "B"])
+        case "config_launch_write":
+            return try JSONSerialization.data(withJSONObject: [
+                "ok": true, "config": document, "boot_id": "B",
+                "launch": ["providers": [], "pipelines": [], "legacy_guide": ["options": []]],
+            ])
+        default:
+            return try JSONSerialization.data(withJSONObject: ["ok": true, "config": document])
+        }
+    }
+    #expect(try await client.writeServed(text: "", expectedText: "").servedBy == "B")
+    let empty = TendLaunchSettings(providers: [], pipelines: [], legacyGuide: .init(program: nil, options: []))
+    #expect(try await client.writeLaunch(expectedText: "", settings: empty, baseline: empty).servedBy == "B")
+    // An older daemon: no boot id, so nothing is claimed.
+    let old = TendConfigClient(socketPath: "/tmp/tend-config-old.sock") { _, _ in
+        try JSONSerialization.data(withJSONObject: [
+            "ok": true, "config": ["path": "/tmp/config.toml", "text": "", "exists": true],
+        ])
+    }
+    #expect(try await old.writeServed(text: "", expectedText: "").servedBy == nil)
+}
+
+@Test
+func fleetStreamReportsItsHandshakeIdentityOnConnect() async throws {
+    let path = "/tmp/tend-fleet-ready-\(getpid()).sock"
+    let server = try OneShotSubscriptionServer(path: path, helloReply: [
+        "ok": true, "min_protocol": 1, "max_protocol": 6,
+        "capabilities": ["fleet_subscribe"], "boot_id": "B", "generation": 0,
+    ])
+    defer { server.close() }
+    let client = TendIPCClient(socketPath: path) { _, _ in
+        try settingsPaneHello(capabilities: ["fleet_subscribe"])
+    }
+    try await client.hello()
+    let ready = AsyncStream<TendDaemonHello>.makeStream()
+    let updates = try await client.fleetUpdates(onReady: { hello in
+        ready.continuation.yield(hello)
+        ready.continuation.finish()
+    })
+    var received: TendDaemonHello?
+    for await hello in ready.stream { received = hello }
+    #expect(received?.bootID == "B")
+    #expect(received?.generation == 0)
+    _ = updates
+}
+
+/// A unix-socket peer that acknowledges one subscription and then stays
+/// quiet, like an idle tendd.
+private final class OneShotSubscriptionServer: @unchecked Sendable {
+    private let listener: Int32
+    private let path: String
+    private var connection: Int32 = -1
+    private let lock = NSLock()
+
+    init(path: String, helloReply: [String: Any]) throws {
+        self.path = path
+        unlink(path)
+        listener = socket(AF_UNIX, SOCK_STREAM, 0)
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        withUnsafeMutableBytes(of: &address.sun_path) { buffer in
+            buffer.copyBytes(from: Array(path.utf8) + [0])
+        }
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(listener, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bound == 0, listen(listener, 1) == 0 else {
+            throw TendIPCError.posix(operation: "bind", code: errno)
+        }
+        let hello = try JSONSerialization.data(withJSONObject: helloReply) + Data("\n".utf8)
+        let listener = listener
+        Thread.detachNewThread { [self] in
+            let peer = accept(listener, nil, nil)
+            guard peer >= 0 else { return }
+            lock.withLock { connection = peer }
+            for reply in [hello, Data("{\"ok\":true}\n".utf8)] {
+                // One request line in, one acknowledgement out.
+                var byte: UInt8 = 0
+                while read(peer, &byte, 1) == 1, byte != UInt8(ascii: "\n") {}
+                _ = reply.withUnsafeBytes { write(peer, $0.baseAddress, reply.count) }
+            }
+        }
+    }
+
+    func close() {
+        lock.withLock {
+            if connection >= 0 { Darwin.close(connection) }
+        }
+        Darwin.close(listener)
+        unlink(path)
+    }
+}
+
 @MainActor
 @Test
 func behaviourDraftKeepsEditsWhenTheDaemonCannotWriteItsConfiguration() async {

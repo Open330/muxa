@@ -35,7 +35,12 @@ pub enum Action {
     /// Re-exec the running daemon, or start it when it is down.
     Restart,
     /// Report whether tendd is serving the selected socket.
-    Status,
+    Status {
+        /// Print the daemon's hello identity as JSON (generation, boot id,
+        /// version, protocol, socket).
+        #[arg(long)]
+        json: bool,
+    },
     /// Tail tendd's stdout/stderr logs without remembering paths.
     ///
     /// Falls back to `journalctl --user -u tendd` on Linux when the
@@ -53,7 +58,7 @@ pub async fn run(
         Action::Start { quiet } => start(client, socket, config_path, quiet).await,
         Action::Stop => stop(client, socket).await,
         Action::Restart => restart(client, socket, config_path).await,
-        Action::Status => status(client, socket).await,
+        Action::Status { json } => status(client, socket, json).await,
         Action::Logs(args) => crate::logs::run(args).await,
     }
 }
@@ -152,8 +157,12 @@ async fn restart(client: &Client, socket: &Path, config_path: Option<&Path>) -> 
     }
 }
 
-async fn status(client: &Client, socket: &Path) -> Result<()> {
+async fn status(client: &Client, socket: &Path, json: bool) -> Result<()> {
     match client.hello(CONTROL_TIMEOUT).await {
+        Ok(hello) if json => {
+            println!("{}", status_json(socket, &hello));
+            Ok(())
+        }
         Ok(hello) => {
             println!("tendd running ({})", describe(socket, &hello));
             Ok(())
@@ -163,6 +172,19 @@ async fn status(client: &Client, socket: &Path) -> Result<()> {
         }
         Err(error) => Err(error).context("checking tendd status"),
     }
+}
+
+/// `tend daemon status --json`. `boot_id` is `null` for a daemon that
+/// predates `daemon_boot_id_v1`.
+fn status_json(socket: &Path, hello: &Hello) -> serde_json::Value {
+    serde_json::json!({
+        "running": true,
+        "socket": socket.display().to_string(),
+        "generation": hello.generation,
+        "boot_id": hello.boot_id,
+        "version": hello.version,
+        "protocol": hello.protocol,
+    })
 }
 
 fn require_capability(hello: &Hello, capability: &str, operation: &str) -> Result<()> {
@@ -506,5 +528,27 @@ mod tests {
         crate::Args::try_parse_from(["tend", "daemon", "start", "--quiet"])
             .expect("start accepts --quiet");
         assert!(crate::Args::try_parse_from(["tend", "daemon", "status", "--quiet"]).is_err());
+    }
+
+    #[test]
+    fn status_json_reports_the_boot_id_and_null_for_an_old_daemon() {
+        crate::Args::try_parse_from(["tend", "daemon", "status", "--json"])
+            .expect("status accepts --json");
+        let socket = std::path::Path::new("/tmp/tend-test.sock");
+        let mut hello = tend::ipc::Hello {
+            collaboration_error: None,
+            capabilities: Vec::new(),
+            generation: Some(0),
+            boot_id: Some("0123456789abcdef0123456789abcdef".into()),
+            version: Some("1.2.3".into()),
+            protocol: 9,
+        };
+        let value = super::status_json(socket, &hello);
+        assert_eq!(value["running"], true);
+        assert_eq!(value["generation"], 0);
+        assert_eq!(value["boot_id"], "0123456789abcdef0123456789abcdef");
+        assert_eq!(value["socket"], "/tmp/tend-test.sock");
+        hello.boot_id = None;
+        assert!(super::status_json(socket, &hello)["boot_id"].is_null());
     }
 }

@@ -84,6 +84,7 @@ fn hello_reports_no_skew_against_a_matching_daemon() {
         collaboration_error: None,
         capabilities: Vec::new(),
         generation: None,
+        boot_id: None,
         protocol: PROTOCOL_VERSION,
         version: Some(env!("CARGO_PKG_VERSION").to_string()),
     };
@@ -98,6 +99,7 @@ fn hello_reports_skew_against_a_different_build() {
         collaboration_error: None,
         capabilities: Vec::new(),
         generation: None,
+        boot_id: None,
         protocol: PROTOCOL_VERSION,
         version: Some("0.0.1-ancient".to_string()),
     };
@@ -117,6 +119,7 @@ fn hello_treats_a_silent_daemon_as_skewed() {
         collaboration_error: None,
         capabilities: Vec::new(),
         generation: None,
+        boot_id: None,
         protocol: PROTOCOL_VERSION,
         version: None,
     };
