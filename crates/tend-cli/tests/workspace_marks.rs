@@ -120,6 +120,9 @@ fn run_tend(server: &Server, stub_bin: &Path, args: &[&str]) -> std::process::Ou
         // A socket no daemon answers: these paths mark tmux and report, and
         // must not reach the operator's running tendd.
         .env("TEND_SOCKET", server.dir.path().join("tendd.sock"))
+        // Launch archives go under `$XDG_DATA_HOME/tend/spawns`.
+        .env("XDG_DATA_HOME", server.dir.path().join("data-home"))
+        .env("XDG_STATE_HOME", server.dir.path().join("state-home"))
         .env_remove("RMUX")
         .env_remove("RMUX_PANE")
         .env_remove("TMUX")
