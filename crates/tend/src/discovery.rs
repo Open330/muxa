@@ -55,7 +55,6 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
     match command_name(cmd).to_ascii_lowercase().as_str() {
         "claude" => Some(AgentKind::ClaudeCode),
         "codex" => Some(AgentKind::Codex),
-        "gemini" | "gemini-cli" => Some(AgentKind::GeminiCli),
         // Antigravity ships a native binary, so it lands in tmux under its
         // own name rather than behind a `node` shim. `antigravity` is
         // accepted too: the installer's shell shim can be renamed, and the
@@ -318,7 +317,6 @@ pub fn synthesize_started(d: &Discovered, at: OffsetDateTime) -> AgentEvent {
 pub struct DiscoveryReport {
     pub claude_code: usize,
     pub codex: usize,
-    pub gemini_cli: usize,
     pub antigravity: usize,
     pub skipped_known: usize,
     pub failed: usize,
@@ -326,14 +324,13 @@ pub struct DiscoveryReport {
 
 impl DiscoveryReport {
     pub fn total_ingested(&self) -> usize {
-        self.claude_code + self.codex + self.gemini_cli + self.antigravity
+        self.claude_code + self.codex + self.antigravity
     }
 
     fn bump(&mut self, kind: AgentKind) {
         match kind {
             AgentKind::ClaudeCode => self.claude_code += 1,
             AgentKind::Codex => self.codex += 1,
-            AgentKind::GeminiCli => self.gemini_cli += 1,
             AgentKind::Antigravity => self.antigravity += 1,
             // We never synthesize for Opencode/Unknown/Task today.
             AgentKind::Opencode | AgentKind::Unknown | AgentKind::Task => {}
@@ -435,8 +432,9 @@ mod tests {
     fn classify_known_commands() {
         assert_eq!(classify_command("claude"), Some(AgentKind::ClaudeCode));
         assert_eq!(classify_command("codex"), Some(AgentKind::Codex));
-        assert_eq!(classify_command("gemini"), Some(AgentKind::GeminiCli));
-        assert_eq!(classify_command("gemini-cli"), Some(AgentKind::GeminiCli));
+        // The Gemini CLI is no longer a supported agent.
+        assert_eq!(classify_command("gemini"), None);
+        assert_eq!(classify_command("gemini-cli"), None);
         assert_eq!(classify_command("agy"), Some(AgentKind::Antigravity));
         assert_eq!(
             classify_command("antigravity"),
@@ -473,7 +471,7 @@ mod tests {
             pane("%2", "claude"),
             pane("%3", "vim"),
             pane("%4", "codex"),
-            pane("%5", "gemini-cli"),
+            pane("%5", "agy"),
             pane("%6", "less"),
         ];
         let out = discover_from_panes(&panes);
@@ -483,7 +481,7 @@ mod tests {
         assert_eq!(out[1].pane.pane_id, "%4");
         assert_eq!(out[1].kind, AgentKind::Codex);
         assert_eq!(out[2].pane.pane_id, "%5");
-        assert_eq!(out[2].kind, AgentKind::GeminiCli);
+        assert_eq!(out[2].kind, AgentKind::Antigravity);
     }
 
     #[test]
@@ -699,13 +697,13 @@ mod tests {
         r.bump(AgentKind::ClaudeCode);
         r.bump(AgentKind::ClaudeCode);
         r.bump(AgentKind::Codex);
-        r.bump(AgentKind::GeminiCli);
+        r.bump(AgentKind::Antigravity);
         // Bumps for kinds we don't synthesize must not move the total.
         r.bump(AgentKind::Opencode);
         r.bump(AgentKind::Unknown);
         assert_eq!(r.total_ingested(), 4);
         assert_eq!(r.claude_code, 2);
         assert_eq!(r.codex, 1);
-        assert_eq!(r.gemini_cli, 1);
+        assert_eq!(r.antigravity, 1);
     }
 }

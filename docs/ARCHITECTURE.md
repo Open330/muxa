@@ -83,7 +83,7 @@ pipeline store and pane adoption retain the recovery path.
 | `tendd` | Long-running daemon. Owns the registry, IPC server, background tasks, and optional dashboard. |
 | `tend` | CLI for status, watch, attend, recap, stats, reports, activity queries, init, hook entrypoints, and the `mcp` control server. |
 | `Tend.app` | Native macOS control surface. Renders tendd-owned PTY byte streams through a pinned, locally built libghostty XCFramework; it never owns agent process identity. |
-| Agent adapters | Translate Claude/Codex/Gemini/Antigravity hook events into tend state transitions. |
+| Agent adapters | Translate Claude/Codex/Antigravity hook events and opencode plugin events into tend state transitions. |
 | Pane backends | Resolve panes, sessions, captures, and foreground activity per host (tmux, cmux, rmux, herdr, zellij). The daemon can observe several at once; each non-tmux pane id is namespaced by host. |
 | herdr bridge | Translates herdr's own `agent_status` stream into synthetic rows for agents tend has no hooks for. |
 | Screen detection | Classifies hook-less agents (cursor, amp, …) from pane captures against TOML manifests; synthetic, hook-authoritative. |

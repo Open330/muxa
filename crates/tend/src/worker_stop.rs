@@ -390,7 +390,7 @@ mod tests {
         }
         let unknown = FakePane::showing(CLAUDE_IDLE);
         assert!(matches!(
-            stop(&unknown, AgentKind::GeminiCli, &alive),
+            stop(&unknown, AgentKind::Opencode, &alive),
             StopOutcome::Refused(_)
         ));
         let blind = FakePane::showing(CLAUDE_IDLE);

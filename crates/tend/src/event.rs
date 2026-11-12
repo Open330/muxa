@@ -21,13 +21,7 @@ pub enum AgentKind {
     ClaudeCode,
     Opencode,
     Codex,
-    /// The legacy Gemini CLI (`gemini`). Superseded by [`AgentKind::Antigravity`]
-    /// upstream, but kept first-class: its hook contract still works and
-    /// installs predate the switch.
-    GeminiCli,
-    /// Google's Antigravity CLI (`agy`), the Gemini CLI's successor. A
-    /// separate kind rather than a rename — the two ship different hook
-    /// formats, different config locations, and can be installed side by side.
+    /// Google's Antigravity CLI (`agy`), the retired Gemini CLI's successor.
     Antigravity,
     /// A non-agent background process (shell script, game, automation loop,
     /// or a `tend run` PTY child) registered via `tend register` / the
@@ -35,6 +29,10 @@ pub enum AgentKind {
     /// presence; it has no attention states, only `Working` (alive) and
     /// `Stopped` (exited).
     Task,
+    /// Also what a row written by an older tend under the removed Gemini CLI
+    /// kind (`gemini_cli`) decodes as, so old state and wire payloads still
+    /// load.
+    #[serde(alias = "gemini_cli")]
     Unknown,
 }
 
@@ -46,21 +44,21 @@ impl AgentKind {
     /// it beats `pane_current_command`: an npm-installed codex runs as `node`,
     /// which names no manifest, so command-only selection silently skipped
     /// every such pane. Claude also needs screen detection for startup trust
-    /// gates that appear before hooks run. Opencode and Gemini return `None`.
+    /// gates that appear before hooks run. Opencode returns `None`.
     #[must_use]
     pub fn screen_manifest_name(self) -> Option<&'static str> {
         match self {
             Self::ClaudeCode => Some("claude"),
             Self::Codex => Some("codex"),
             Self::Antigravity => Some("agy"),
-            Self::Opencode | Self::GeminiCli | Self::Task | Self::Unknown => None,
+            Self::Opencode | Self::Task | Self::Unknown => None,
         }
     }
 
     /// Can this agent's hook stream tell tend it is waiting on the operator?
     ///
-    /// Claude Code (`Notification`), Codex (`PermissionRequest`), the Gemini
-    /// CLI (`Notification`) and opencode (`permission.asked`) all can, so their
+    /// Claude Code (`Notification`), Codex (`PermissionRequest`) and opencode
+    /// (`permission.asked`) all can, so their
     /// rows reach [`AgentState::WaitingInput`] from hooks alone and screen
     /// inference must stay out of the way.
     ///
@@ -76,7 +74,7 @@ impl AgentKind {
     #[must_use]
     pub fn hooks_report_attention(self) -> bool {
         match self {
-            Self::ClaudeCode | Self::Codex | Self::GeminiCli | Self::Opencode => true,
+            Self::ClaudeCode | Self::Codex | Self::Opencode => true,
             Self::Antigravity => false,
             // Neither is a hook-driven agent: `Task` rows have no attention
             // states at all (only Working/Stopped), and `Unknown` is the kind
@@ -314,7 +312,7 @@ pub enum AgentEvent {
         /// 5-hour rolling rate-limit window utilization (0–100), when the
         /// adapter was able to read it. Optional + `#[serde(default)]` so
         /// older peers stay wire-compatible and adapters that don't carry
-        /// the field (Codex/Gemini today) emit `null`.
+        /// the field (Codex today) emit `null`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rate_limit_5h_pct: Option<f32>,
         #[serde(
@@ -429,10 +427,19 @@ mod tests {
 
     #[test]
     fn kind_serializes_snake_case() {
-        let json = serde_json::to_string(&AgentKind::GeminiCli).unwrap();
-        assert_eq!(json, "\"gemini_cli\"");
+        let json = serde_json::to_string(&AgentKind::ClaudeCode).unwrap();
+        assert_eq!(json, "\"claude_code\"");
         let json = serde_json::to_string(&AgentKind::Antigravity).unwrap();
         assert_eq!(json, "\"antigravity\"");
+    }
+
+    /// The Gemini CLI kind was removed; a row an older tend persisted or sent
+    /// with it must still decode rather than fail the whole snapshot.
+    #[test]
+    fn removed_gemini_cli_kind_decodes_as_unknown() {
+        let kind: AgentKind = serde_json::from_str("\"gemini_cli\"").unwrap();
+        assert_eq!(kind, AgentKind::Unknown);
+        assert_eq!(serde_json::to_string(&kind).unwrap(), "\"unknown\"");
     }
 
     /// Older tend peers emit `TurnStopped` without the `response` field.

@@ -8,8 +8,8 @@ This page keeps the detailed install and wiring notes out of the README.
 - tmux 3.x, or [rmux](https://rmux.io) 0.10+
 - Linux or macOS; Windows natively through rmux (see [WINDOWS.md](WINDOWS.md))
   or inside WSL2
-- One supported agent CLI: Claude Code, OpenAI Codex, Google Gemini CLI, or the
-  Google Antigravity CLI (`agy`)
+- One supported agent CLI: Claude Code, OpenAI Codex, the Google Antigravity
+  CLI (`agy`), or opencode
 
 ## Try Before Installing
 
@@ -228,8 +228,7 @@ hook commands without overwriting existing user hooks.
 | --- | --- |
 | Claude Code | Merge `examples/claude-settings.json` into `~/.claude/settings.json`. |
 | OpenAI Codex | Prefer `tend init` for compatible hooks. The daemon also reads local session-rollout logs every two seconds; hook support alone is not required for lifecycle recovery. |
-| Google Gemini CLI | Merge the hooks from `crates/tend/src/adapters/gemini.rs` into `~/.gemini/settings.json`. |
-| Google Antigravity CLI | Add the `tend` block from `crates/tend/src/adapters/antigravity.rs` to `~/.gemini/config/hooks.json`. Note this is agy's own `hooks.json`, **not** the Gemini CLI's `settings.json`. |
+| Google Antigravity CLI | Add the `tend` block from `crates/tend/src/adapters/antigravity.rs` to `~/.gemini/config/hooks.json`. Note this is agy's own `hooks.json`, **not** `~/.gemini/settings.json`. |
 
 ## Verify
 

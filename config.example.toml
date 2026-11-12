@@ -68,7 +68,7 @@
 # changing this section because its stdio server loaded the old config.
 [mcp.guide]
 # placement = "pane"                # pane (default) | window | session
-# agent = "codex"                   # claude | codex | gemini | agy | opencode
+# agent = "codex"                   # claude | codex | agy | opencode
 # options = ["--model", "preferred-model"]
 #                                   # superseded by [agent.<program>] below, which is
 #                                   # per provider and applies to every launch path.
@@ -323,7 +323,7 @@
 # capture-capable pane when context compaction renders it. Neither is in the
 # normal hook payload and both are sparse. The latest captured response takes
 # precedence; the title/prompt tiers keep the
-# column useful between recaps. Gemini currently falls through to last prompt.
+# column useful between recaps. agy currently falls through to last prompt.
 # The header reads SUMMARY unless set to "prompt".
 # summary = "recap"
 # Hide agents that aren't bound to a tmux pane (Claude SDK sub-processes,
@@ -390,7 +390,7 @@
 # When the agent has captured a response that wins; otherwise the user's
 # last prompt is shown so the detail row stays useful for older agents,
 # agents mid-turn, and adapters that don't read transcripts yet
-# (Codex / Gemini today). When BOTH are empty the detail line suppresses
+# (Codex today). When BOTH are empty the detail line suppresses
 # itself — that's normal for a freshly-discovered pane, not a bug.
 #
 # Available variables: pane, kind, state, model, ctx, cost, activity,
@@ -594,7 +594,7 @@
 
 # [[pipeline.triad.agent]]
 # alias   = 'plan'
-# program = 'codex'               # claude | codex | gemini | agy | opencode
+# program = 'codex'               # claude | codex | agy | opencode
 # role    = 'planner'             # peers can address it as role:planner
 # prompt  = 'You own the approach. Write the plan first; do not edit code.'
 

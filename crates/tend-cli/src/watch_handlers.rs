@@ -44,7 +44,6 @@ pub(super) async fn cmd_sync(client: &Client) -> Result<()> {
             .context("running discovery")?;
         report.claude_code += found.claude_code;
         report.codex += found.codex;
-        report.gemini_cli += found.gemini_cli;
         report.antigravity += found.antigravity;
         report.skipped_known += found.skipped_known;
         report.failed += found.failed;
@@ -58,9 +57,6 @@ pub(super) async fn cmd_sync(client: &Client) -> Result<()> {
     }
     if report.codex > 0 {
         parts.push(format!("{} codex", report.codex));
-    }
-    if report.gemini_cli > 0 {
-        parts.push(format!("{} gemini_cli", report.gemini_cli));
     }
     if report.antigravity > 0 {
         parts.push(format!("{} antigravity", report.antigravity));

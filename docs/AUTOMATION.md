@@ -528,7 +528,7 @@ what it did not render. Absent filters are omitted rather than sent null.
 `only_if_still` are the *effective* values with defaults already resolved,
 so a table view never has to know the defaults; `filters` is the same
 information as a one-line human summary. Agent kinds are always the
-canonical names (`claude_code`, `gemini_cli`), never the shorthand a rule
+canonical names (`claude_code`, `antigravity`), never the shorthand a rule
 may have been written with.
 
 `automation_log` is a list of:

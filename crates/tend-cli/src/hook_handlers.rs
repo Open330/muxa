@@ -1,6 +1,6 @@
 use super::{
     claude, run_hook, tmux_work, watch, AgentKind, AntigravityAdapter, ClaudeAdapter, Client,
-    CodexAdapter, Context, GeminiAdapter, HookCmd, OpencodeAdapter, Read, Result, Stdio, Write,
+    CodexAdapter, Context, HookCmd, OpencodeAdapter, Read, Result, Stdio, Write,
 };
 
 /// Hook commands are invoked on the agent's critical path (every prompt,
@@ -189,10 +189,9 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
                 println!("{output}");
             }
         }
-        HookCmd::Gemini { event } => {
-            let ev = run_hook::<GeminiAdapter, _>(&event, &mut std::io::stdin())?;
-            best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(client, &ev).await;
+        HookCmd::Gemini { .. } => {
+            // Drain stdin so the Gemini CLI never sees a broken pipe.
+            let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
         }
         HookCmd::Agy { event } => {
             // FAIL-OPEN, and deliberately unlike the other hook arms.

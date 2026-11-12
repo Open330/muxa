@@ -6,19 +6,19 @@ const details = {
   shell: { state: "shell", summary: "zsh", capture: ["demo@local:~/acme$ echo keep me", "keep me"] },
   claude: { state: "waiting_input", glyph: "▶", age: "4m", summary: "Choose retry strategy", capture: ["How should we retry?"] },
   codex: { state: "idle", glyph: "○", age: "18s", summary: "Ready for review", capture: ["OpenAI Codex"] },
-  gemini: { state: "working", glyph: "●", age: "2s", summary: "Running tests", capture: ["npm test"] },
+  agy: { state: "working", glyph: "●", age: "2s", summary: "Running tests", capture: ["npm test"] },
 };
 
 test("pane navigation follows the 2x2 layout without wrapping across edges", () => {
   assert.equal(adjacentPane("shell", "right"), "claude");
-  assert.equal(adjacentPane("claude", "down"), "gemini");
-  assert.equal(adjacentPane("gemini", "left"), "codex");
+  assert.equal(adjacentPane("claude", "down"), "agy");
+  assert.equal(adjacentPane("agy", "left"), "codex");
   assert.equal(adjacentPane("codex", "up"), "shell");
   assert.equal(adjacentPane("shell", "left"), "shell");
 });
 
 test("watch sorts by state while pane geometry stays unchanged", () => {
-  assert.deepEqual(watchPaneOrder(details), ["claude", "gemini", "codex", "shell"]);
+  assert.deepEqual(watchPaneOrder(details), ["claude", "agy", "codex", "shell"]);
   assert.equal(adjacentPane("shell", "right"), "claude");
 });
 

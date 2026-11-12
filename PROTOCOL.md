@@ -750,7 +750,7 @@ Tagged union. `type` field is the discriminant.
 
 `id`:
 ```json
-{ "kind": "claude_code" | "codex" | "gemini_cli" | "opencode" | "unknown",
+{ "kind": "claude_code" | "codex" | "antigravity" | "opencode" | "task" | "unknown",
   "session_id": "string",
   "pane": "string | null",
   "tmux_socket": "string | absent",

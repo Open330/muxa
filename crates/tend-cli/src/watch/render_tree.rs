@@ -56,7 +56,6 @@ pub(crate) fn agent_kind_short(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
-        AgentKind::GeminiCli => "gemini",
         AgentKind::Antigravity => "agy",
         AgentKind::Opencode => "opencode",
         AgentKind::Task => "task",

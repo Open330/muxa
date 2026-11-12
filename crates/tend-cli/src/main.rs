@@ -73,8 +73,7 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tend::adapters::{
-    claude, run_hook, AntigravityAdapter, ClaudeAdapter, CodexAdapter, GeminiAdapter,
-    OpencodeAdapter,
+    claude, run_hook, AntigravityAdapter, ClaudeAdapter, CodexAdapter, OpencodeAdapter,
 };
 use tend::collaboration::{
     CollaborationClientKind, CollaborationOrigin, CollaborationOriginMatch, MailboxScope,
@@ -1080,10 +1079,16 @@ enum HookCmd {
         #[arg(long)]
         event: String,
     },
-    /// Gemini CLI hook handler.
+    /// Retired Gemini CLI hook handler, kept as a silent no-op.
+    ///
+    /// An install that predates the removal still has `tend hook gemini`
+    /// wired in `~/.gemini/settings.json` until `tend init` cleans it up.
+    /// Exiting 0 without output keeps those leftover hooks from erroring on
+    /// every Gemini CLI turn.
+    #[command(hide = true)]
     Gemini {
         #[arg(long)]
-        event: String,
+        event: Option<String>,
     },
     /// Antigravity CLI (`agy`) hook handler. Reads hook JSON on stdin.
     ///

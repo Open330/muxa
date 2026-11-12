@@ -3924,7 +3924,6 @@ pub(crate) fn pane_has_agent_process(pane_pid: u32) -> Option<bool> {
         [
             AgentKind::ClaudeCode,
             AgentKind::Codex,
-            AgentKind::GeminiCli,
             AgentKind::Opencode,
             AgentKind::Antigravity,
         ]
@@ -5520,12 +5519,12 @@ mod tests {
         let agents = vec![
             agent("%1", "s1", AgentKind::ClaudeCode, AgentState::Working),
             agent("%2", "s2", AgentKind::Codex, AgentState::Idle),
-            agent("%3", "s3", AgentKind::GeminiCli, AgentState::Idle),
+            agent("%3", "s3", AgentKind::Antigravity, AgentState::Idle),
         ];
         let (chosen, skipped) = select(&agents, &request(SwapScope::All));
         assert_eq!(chosen.len(), 1);
         assert_eq!(chosen[0].session_id, "s2");
-        assert_eq!(skipped.len(), 1, "gemini is outside an aas swap's scope");
+        assert_eq!(skipped.len(), 1, "agy is outside an aas swap's scope");
         assert!(skipped[0].note.contains("--force"));
 
         let mut forced = request(SwapScope::All);

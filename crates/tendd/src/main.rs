@@ -4767,7 +4767,6 @@ fn spawn_startup_discovery(
                 tracing::info!(
                     claude_code = report.claude_code,
                     codex = report.codex,
-                    gemini_cli = report.gemini_cli,
                     skipped_known = report.skipped_known,
                     failed = report.failed,
                     "startup discovery complete",
@@ -4816,7 +4815,6 @@ async fn run_discovery_all(
             Ok((_, Ok(report))) => {
                 total.claude_code += report.claude_code;
                 total.codex += report.codex;
-                total.gemini_cli += report.gemini_cli;
                 total.skipped_known += report.skipped_known;
                 total.failed += report.failed;
             }
@@ -4861,8 +4859,7 @@ fn spawn_periodic_discovery(
                     tracing::debug!(
                         claude_code = report.claude_code,
                         codex = report.codex,
-                        gemini_cli = report.gemini_cli,
-                        skipped_known = report.skipped_known,
+                            skipped_known = report.skipped_known,
                         "periodic discovery pass",
                     );
                 }

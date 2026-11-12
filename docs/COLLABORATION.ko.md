@@ -241,7 +241,7 @@ tend peers --json
 ## 기본 handle
 
 agent pane은 아무도 이름을 붙이지 않아도 handle을 하나 받습니다. room에서 그
-런타임의 첫 agent가 `@claude`, `@codex`, `@gemini`, `@agy`, `@opencode`가 되고
+런타임의 첫 agent가 `@claude`, `@codex`, `@agy`, `@opencode`가 되고
 같은 종류의 두 번째가 `@claude2`가 됩니다. session의 첫 hook 이벤트에서 부여되며, pane 옵션 `@tend_agent_alias`에
 저장되어 tendd·CLI·agent 재시작보다 오래 남습니다.
 

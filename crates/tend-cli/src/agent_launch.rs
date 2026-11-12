@@ -18,9 +18,8 @@ use tend::ipc::Client;
 pub enum AgentProgram {
     Claude,
     Codex,
-    Gemini,
     /// The Antigravity CLI. Named for its binary (`agy`) rather than the
-    /// product, mirroring `Gemini` → `gemini`; `antigravity` stays accepted
+    /// product; `antigravity` stays accepted
     /// as an alias on both the CLI flag and [`AgentProgram::parse`].
     #[value(name = "agy", alias = "antigravity")]
     #[serde(rename = "agy")]
@@ -33,11 +32,13 @@ impl AgentProgram {
         match value.trim().to_ascii_lowercase().as_str() {
             "claude" | "claude_code" | "claude-code" => Ok(Self::Claude),
             "codex" | "cx" => Ok(Self::Codex),
-            "gemini" | "gemini_cli" | "gemini-cli" => Ok(Self::Gemini),
             "agy" | "antigravity" => Ok(Self::Antigravity),
             "opencode" => Ok(Self::Opencode),
+            other if tend::agent_control::is_retired_agent_program(other) => {
+                Err(tend::agent_control::RETIRED_GEMINI_NOTE.into())
+            }
             _ => Err(format!(
-                "unknown agent {value:?}; expected claude, codex, gemini, agy, or opencode"
+                "unknown agent {value:?}; expected claude, codex, agy, or opencode"
             )),
         }
     }
@@ -47,7 +48,6 @@ impl AgentProgram {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
             Self::Antigravity => "agy",
             Self::Opencode => "opencode",
         }
@@ -79,11 +79,6 @@ impl AgentProgram {
                     vec!["--dangerously-skip-permissions".into()]
                 }
                 Self::Codex => vec!["--yolo".into()],
-                Self::Gemini => vec![
-                    "--approval-mode".into(),
-                    "yolo".into(),
-                    "--skip-trust".into(),
-                ],
                 Self::Opencode => Vec::new(),
             }
         } else {
@@ -93,7 +88,7 @@ impl AgentProgram {
         if let Some(prompt) = prompt {
             match self {
                 Self::Claude | Self::Codex => args.push(prompt.into()),
-                Self::Gemini | Self::Antigravity => {
+                Self::Antigravity => {
                     args.push("-i".into());
                     args.push(prompt.into());
                 }
@@ -2114,12 +2109,20 @@ os.execv({real:?}, [{real:?}] + args)
         assert_eq!(launch.command, "codex");
         assert_eq!(launch.args, ["--yolo", "review June's changes; don't edit"]);
 
-        let gemini = AgentProgram::Gemini.native_launch(&[], Some("review it"));
-        assert_eq!(gemini.command, "gemini");
+        let agy = AgentProgram::Antigravity.native_launch(&[], Some("review it"));
+        assert_eq!(agy.command, "agy");
         assert_eq!(
-            gemini.args,
-            ["--approval-mode", "yolo", "--skip-trust", "-i", "review it"]
+            agy.args,
+            ["--dangerously-skip-permissions", "-i", "review it"]
         );
+    }
+
+    #[test]
+    fn the_retired_gemini_cli_is_refused_with_the_reason() {
+        for name in ["gemini", "gemini_cli", "Gemini-CLI"] {
+            let error = AgentProgram::parse(name).unwrap_err();
+            assert!(error.contains("no longer supported"), "{error}");
+        }
     }
 
     #[test]
@@ -2127,7 +2130,6 @@ os.execv({real:?}, [{real:?}] + args)
         for program in [
             AgentProgram::Codex,
             AgentProgram::Claude,
-            AgentProgram::Gemini,
             AgentProgram::Antigravity,
         ] {
             let launch = program.permission_launch(
@@ -2171,18 +2173,16 @@ os.execv({real:?}, [{real:?}] + args)
             "codex --yolo --model 'gpt 5; echo nope' 'review $HOME'"
         );
 
-        let native = AgentProgram::Gemini.native_launch(
-            &["--model".into(), "gemini-2.5-pro".into()],
+        let native = AgentProgram::Antigravity.native_launch(
+            &["--model".into(), "gemini-3.7-pro".into()],
             Some("review it"),
         );
         assert_eq!(
             native.args,
             [
-                "--approval-mode",
-                "yolo",
-                "--skip-trust",
+                "--dangerously-skip-permissions",
                 "--model",
-                "gemini-2.5-pro",
+                "gemini-3.7-pro",
                 "-i",
                 "review it"
             ]
@@ -2285,10 +2285,10 @@ os.execv({real:?}, [{real:?}] + args)
             "a bare session name would be read as a window in the caller's session: {args:?}",
         );
 
-        let mut session = request(AgentProgram::Gemini, Placement::Session);
+        let mut session = request(AgentProgram::Antigravity, Placement::Session);
         session.target = None;
         session.name = Some("cal.7041:review".into());
-        let args = tmux_args(&session, Path::new("/tmp"), "gemini").unwrap();
+        let args = tmux_args(&session, Path::new("/tmp"), "agy").unwrap();
         assert_eq!(args[0], "new-session");
         assert!(args
             .windows(2)

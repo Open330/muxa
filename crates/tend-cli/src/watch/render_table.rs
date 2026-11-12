@@ -609,7 +609,7 @@ fn resolve_var_chain(
 /// default `Recap` falls through response → recap → session title → last prompt. That
 /// matters because recaps are sparse (Claude Code writes one only when you
 /// return after being away; Codex prints one only after context compaction)
-/// and agents with no recap source, such as Gemini, would otherwise render an
+/// and agents with no recap source, such as agy, would otherwise render an
 /// empty column.
 pub(super) fn summary_line(a: &Agent, mode: WatchSummary) -> String {
     let picked = match mode {

@@ -1,11 +1,11 @@
 // Browser approximation of the classic watch renderer. Vocabulary, borders,
 // topology columns, width thresholds and keys follow tend-cli/src/watch.rs.
 export const DEMO_SESSIONS = [
-  { name: "acme", windows: [{ name: "retry", panes: ["shell", "claude", "codex", "gemini"] }, { name: "docs", panes: ["docs-shell", "docs-claude"] }] },
+  { name: "acme", windows: [{ name: "retry", panes: ["shell", "claude", "codex", "agy"] }, { name: "docs", panes: ["docs-shell", "docs-claude"] }] },
   { name: "ops", windows: [{ name: "build", panes: ["build-shell", "build-codex"] }, { name: "logs", panes: ["logs-shell"] }] },
 ];
 export const DEMO_PANES = DEMO_SESSIONS.flatMap(session => session.windows.flatMap(window => window.panes));
-export const PANE_IDS = { shell: "%11", claude: "%12", codex: "%13", gemini: "%14", "docs-shell": "%21", "docs-claude": "%22", "build-shell": "%31", "build-codex": "%32", "logs-shell": "%41" };
+export const PANE_IDS = { shell: "%11", claude: "%12", codex: "%13", agy: "%14", "docs-shell": "%21", "docs-claude": "%22", "build-shell": "%31", "build-codex": "%32", "logs-shell": "%41" };
 export const PANE_META = Object.fromEntries(DEMO_SESSIONS.flatMap(session => session.windows.flatMap(window => window.panes.map((name,index) => [name, { session:session.name, window:window.name, role:name.split("-").at(-1), index, location:`${session.name}:${window.name}.${index}` }]))));
 export function paneWindow(pane) { const meta=PANE_META[pane];return DEMO_SESSIONS.find(session=>session.name===meta.session).windows.find(window=>window.name===meta.window); }
 export function watchPaneOrder(details, panes = Object.keys(details).filter(name => PANE_META[name])) {

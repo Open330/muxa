@@ -71,7 +71,7 @@ Tend.app's pipeline editor gets from the daemon's `work_compose` request.
 
 ```console
 tend work compose "implementer in claude, reviewer in codex after it"
-tend work compose "add a gemini tester after review" --current pair.json --json
+tend work compose "add an agy tester after review" --current pair.json --json
 ```
 
 Do not want to spend a turn? Three built-in presets cover the common
@@ -345,7 +345,7 @@ behind by a pipeline you have since edited — is **reported and never
 touched**:
 
 ```console
-  ? (no alias) gemini    unclaimed    %30
+  ? (no alias) agy       unclaimed    %30
 ```
 
 Reconciling toward a desired state is useful. Reconciling *away* from a pane

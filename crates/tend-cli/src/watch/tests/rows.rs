@@ -63,10 +63,10 @@ fn render_does_not_panic_on_test_backend() {
             fake_agent(
                 "sess-c",
                 Some("%12"),
-                AgentKind::GeminiCli,
+                AgentKind::Antigravity,
                 AgentState::Idle,
                 Some("summarize this PR"),
-                Some("Gemini"),
+                Some("Gemini 3.7"),
                 Some(12.5),
                 Some(0.01),
             ),
@@ -299,7 +299,7 @@ fn summary_line_falls_through_recap_then_title_then_prompt() {
     );
 
     // No recap or title source, and nothing typed yet — renders the
-    // placeholder rather than an empty cell (the common Gemini shape).
+    // placeholder rather than an empty cell (the common agy shape).
     a.recap = None;
     a.ai_title = None;
     a.last_prompt = None;
@@ -583,7 +583,7 @@ fn work_view_label_summarizes_agent_states() {
         vec![
             fake_pane("%1", "main", 0, 0, "claude"),
             fake_pane("%2", "main", 0, 1, "codex"),
-            fake_pane("%3", "main", 0, 2, "gemini"),
+            fake_pane("%3", "main", 0, 2, "agy"),
             fake_pane("%4", "main", 0, 3, "claude"),
             fake_pane("%5", "main", 0, 4, "codex"),
         ],
@@ -629,7 +629,7 @@ fn work_view_state_summary_survives_long_session_name() {
         vec![
             fake_pane("%1", session, 0, 0, "claude"),
             fake_pane("%2", session, 0, 1, "codex"),
-            fake_pane("%3", session, 0, 2, "gemini"),
+            fake_pane("%3", session, 0, 2, "agy"),
         ],
         vec![fake_session("$1", session, 1)],
         vec![],

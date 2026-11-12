@@ -3,7 +3,7 @@
 #
 #   demo-paint.sh <agent> <state> <prompt> [tool line]... > frame.txt
 #
-#   agent   claude | codex | gemini
+#   agent   claude | codex | agy
 #   state   working | approval | choice | error | rate-limit | done
 #
 # Why this exists: `tend watch`'s inspector and preview show the selected
@@ -41,7 +41,7 @@ C_RED=$'\033[1;31m'
 case "$agent" in
   claude) dot="$C_MAG"  label=claude ;;
   codex)  dot="$C_CYAN" label=codex  ;;
-  gemini) dot="$C_BLUE" label=gemini ;;
+  agy)    dot="$C_BLUE" label=agy    ;;
   *) echo "demo-paint.sh: unknown agent '$agent'" >&2; exit 2 ;;
 esac
 

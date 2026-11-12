@@ -916,7 +916,6 @@ fn handle_event_on_any_screen(ev: Event, app: &mut App) -> Action {
                 agent: [
                     SpawnAgent::Claude,
                     SpawnAgent::Codex,
-                    SpawnAgent::Gemini,
                     SpawnAgent::Antigravity,
                     SpawnAgent::Opencode,
                 ]

@@ -738,7 +738,7 @@ fn check_systemd_unit_file() -> CheckResult {
     }
 }
 
-/// Run the per-agent hook check for Claude, Codex, Gemini, and agy. Each
+/// Run the per-agent hook check for Claude, Codex, and agy. Each
 /// returns `(label, result)` so `run()` can log them with a consistent
 /// `Hooks · <agent>` prefix.
 fn check_agent_hooks() -> Vec<(String, CheckResult)> {
@@ -751,11 +751,12 @@ fn check_agent_hooks() -> Vec<(String, CheckResult)> {
             "Hooks · Codex".to_string(),
             check_one_agent_hook("codex", codex::default_path(), codex_hook_configured),
         ),
-        (
-            "Hooks · Gemini".to_string(),
-            check_one_agent_hook("gemini", gemini::default_path(), gemini_hook_configured),
-        ),
     ];
+    // The Gemini CLI is retired. Its line appears only while an older
+    // tend's hooks are still in `~/.gemini/settings.json`.
+    if let Some(result) = check_retired_gemini_hooks() {
+        checks.push(("Hooks · Gemini CLI (retired)".to_string(), result));
+    }
     // agy only: reported when agy is actually installed. Unlike the other
     // three, a missing `hooks.json` is the *normal* state for a fresh agy
     // (it writes the file only once `/hooks` is used), so an unconditional
@@ -812,17 +813,24 @@ pub fn claude_hook_configured(settings_text: &str) -> bool {
     json_hooks_dict_has_command(settings_text, "tend hook claude")
 }
 
-/// True iff Gemini's settings.json contains at least one hook entry
-/// whose command starts with `tend hook gemini`. Same JSON shape as
-/// Claude.
-pub fn gemini_hook_configured(settings_text: &str) -> bool {
-    json_hooks_dict_has_command(settings_text, "tend hook gemini")
+/// Leftover `tend hook gemini` entries from before the Gemini CLI was
+/// retired. They are harmless (the handler is a no-op) but dead, so doctor
+/// points at the one command that removes them.
+fn check_retired_gemini_hooks() -> Option<CheckResult> {
+    let path = gemini::default_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    gemini::has_tend_hooks(&text).then(|| {
+        CheckResult::Warn(format!(
+            "{} still has hooks for the retired Gemini CLI — run `tend init --component gemini-hooks` to remove them",
+            path.display()
+        ))
+    })
 }
 
 /// True iff agy's `hooks.json` contains at least one handler whose command
 /// starts with `tend hook agy`.
 ///
-/// A different shape from the Claude/Gemini walker, not a variant of it: agy
+/// A different shape from the Claude walker, not a variant of it: agy
 /// keys the file by hook NAME first (`{"<name>": {"<Event>": [...]}}`), and an
 /// event's entries are either bare handlers (`Stop`, `PreInvocation`, …) or
 /// `{matcher, hooks[]}` groups (`PreToolUse`, `PostToolUse`). Both forms are
@@ -919,7 +927,7 @@ fn toml_table_has_tend_command(t: &toml_edit::Table) -> bool {
     }
 }
 
-/// Helper for the JSON-hook agents (Claude + Gemini). Both store hooks
+/// Helper for the JSON-hook agents (Claude, and formerly Gemini). Both store hooks
 /// as `{ "hooks": { "<Event>": [{ "hooks": [{ "command": "..." }] }] } }`,
 /// so the search shape is identical.
 fn json_hooks_dict_has_command(settings_text: &str, prefix: &str) -> bool {
@@ -2039,18 +2047,6 @@ esac
         assert!(!antigravity_hook_configured(gemini_shaped));
         assert!(!antigravity_hook_configured("{ not json"));
         assert!(!antigravity_hook_configured("[]"));
-    }
-
-    #[test]
-    fn gemini_hook_configured_walks_event_dict() {
-        let json = r#"{
-          "hooks": {
-            "BeforeAgent": [
-              { "hooks": [{ "type": "command", "command": "tend hook gemini --event before_agent" }] }
-            ]
-          }
-        }"#;
-        assert!(gemini_hook_configured(json));
     }
 
     #[test]

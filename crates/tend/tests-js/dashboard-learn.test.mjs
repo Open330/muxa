@@ -13,7 +13,7 @@ test("practice requires a sent request before its reply can be read", () => {
 
 test("attend chooses the waiting agent regardless of current selection", () => {
   let state = practiceAction(initialPractice(), "watch");
-  state = practiceAction(state, "gemini");
+  state = practiceAction(state, "agy");
   state = practiceAction(state, "attend");
   assert.equal(state.selected, "claude");
   assert.equal(state.step, 2);
@@ -21,7 +21,7 @@ test("attend chooses the waiting agent regardless of current selection", () => {
 
 test("answer cannot be sent from a different agent's pane", () => {
   let state = practiceAction(practiceAction(initialPractice(), "watch"), "attend");
-  state = practiceAction(state, "gemini");
+  state = practiceAction(state, "agy");
   assert.equal(practiceAction(state, "answer"), state);
   state = practiceAction(state, "claude");
   assert.equal(practiceAction(state, "answer").step, 3);

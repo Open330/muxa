@@ -65,7 +65,7 @@ tend work init --agent codex                  # 다른 resolver 사용
 
 ```console
 tend work compose "implementer는 claude, 그 뒤에 codex reviewer"
-tend work compose "review 뒤에 gemini tester 추가" --current pair.json --json
+tend work compose "review 뒤에 agy tester 추가" --current pair.json --json
 ```
 
 턴을 쓰고 싶지 않다면 내장 preset 셋이 흔한 구성을 덮습니다. `tend work preset
@@ -301,7 +301,7 @@ agent에게 prompt를 밀어 넣는 건 명시적으로 요청받을 만큼 방�
 남긴 것 — 은 **보고만 하고 절대 건드리지 않습니다**.
 
 ```console
-  ? (no alias) gemini    unclaimed    %30
+  ? (no alias) agy       unclaimed    %30
 ```
 
 desired state로 수렴시키는 건 유용합니다. 하지만 사람이 연 pane을 desired state

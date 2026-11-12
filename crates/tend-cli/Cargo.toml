@@ -57,7 +57,7 @@ ansi-to-tui = "8"
 # look (◇ ✔ ⚠ glyphs, multi-select, spinners) without rolling our own.
 cliclack = "0.3"
 console = "0.15"
-# Locate cargo / tmux / claude / codex / gemini binaries on PATH for
+# Locate cargo / tmux / claude / codex / agy binaries on PATH for
 # pre-flight detection.
 which = "7"
 # Round-trip TOML edits that preserve user formatting + comments — used

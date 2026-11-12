@@ -16,7 +16,6 @@ struct TendMenuBarAgentAppearance: Equatable {
         switch program {
         case .claude: symbol = TendGlyph.claude; provider = "Claude"
         case .codex: symbol = TendGlyph.codex; provider = "Codex"
-        case .gemini: symbol = "sparkles"; provider = "Gemini"
         case .agy: symbol = "arrow.up"; provider = "Antigravity"
         case .opencode: symbol = "terminal"; provider = "OpenCode"
         case nil: symbol = "terminal"; provider = kind.replacingOccurrences(of: "_", with: " ")

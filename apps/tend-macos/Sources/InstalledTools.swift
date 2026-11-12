@@ -15,7 +15,7 @@ struct InstalledTool: Identifiable, Sendable, Equatable {
 /// inherit a minimal PATH, so the login shell's PATH is consulted first and
 /// the usual per-user install folders are appended as a fallback.
 enum InstalledTools {
-    static let agentPrograms = ["claude", "codex", "gemini", "agy", "opencode"]
+    static let agentPrograms = ["claude", "codex", "agy", "opencode"]
     static let supportPrograms = ["tmux", "tend"]
 
     /// Directories appended after the login-shell PATH; cheap insurance for

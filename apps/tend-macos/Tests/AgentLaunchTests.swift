@@ -25,7 +25,9 @@ private func guide(program: String? = nil, placement: String? = nil, direction: 
 }
 
 @Test func agentProgramsMatchTheCLIAllowlistAndItsAliases() {
-    #expect(TendAgentProgram.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "agy", "opencode"])
+    #expect(TendAgentProgram.allCases.map(\.rawValue) == ["claude", "codex", "agy", "opencode"])
+    // The retired Gemini CLI is no longer a launch choice.
+    #expect(TendAgentProgram(configValue: "gemini") == nil)
     #expect(TendAgentProgram(configValue: "claude-code") == .claude)
     #expect(TendAgentProgram(configValue: " CX ") == .codex)
     #expect(TendAgentProgram(configValue: "antigravity") == .agy)
@@ -36,7 +38,7 @@ private func guide(program: String? = nil, placement: String? = nil, direction: 
 @Test func quickStartProgramPrefersTheRememberedDefaultThenTheGuide() {
     #expect(TendAgentLaunchDefaults().program(guide: nil) == nil)
     #expect(TendAgentLaunchDefaults().program(guide: guide(program: "codex")) == .codex)
-    #expect(TendAgentLaunchDefaults(program: .gemini).program(guide: guide(program: "codex")) == .gemini)
+    #expect(TendAgentLaunchDefaults(program: .agy).program(guide: guide(program: "codex")) == .agy)
 }
 
 @Test func launchDefaultsRoundTripThroughUserDefaults() throws {

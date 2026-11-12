@@ -948,7 +948,6 @@ impl AskStore {
             let kind = match engine {
                 AskEngine::Codex => Some(crate::AgentKind::Codex),
                 AskEngine::Claude => Some(crate::AgentKind::ClaudeCode),
-                AskEngine::Gemini => Some(crate::AgentKind::GeminiCli),
                 _ => None,
             };
             if let Some(kind) = kind {
