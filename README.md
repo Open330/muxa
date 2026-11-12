@@ -512,7 +512,7 @@ several at once (e.g. during a tmux→herdr migration):
 | tmux | Full | The default backend. |
 | [rmux](https://rmux.io) | Initial CLI backend | Pane discovery, capture, focus, and targeted input; see [docs/RMUX.md](docs/RMUX.md). The host on native Windows — see [docs/WINDOWS.md](docs/WINDOWS.md). |
 | [herdr](https://herdr.dev) | Full | Via herdr's socket API; see [docs/HERDR.md](docs/HERDR.md). |
-| cmux | Labs (adopt-only) | Identifies the current surface from hook env, focuses it and sends targeted text; no inventory, pid map or capture. See [docs/CMUX.md](docs/CMUX.md). |
+| cmux | Labs (adopt-only) | Identifies the current surface from hook env, focuses it and sends targeted text; no full inventory, pid map or capture. See [docs/CMUX.md](docs/CMUX.md). |
 | zellij | Labs (adopt-only) | Observes hooked panes and jumps to them; no capture or send. The planned WASM plugin was dropped. |
 
 See [docs/MULTI_HOST.md](docs/MULTI_HOST.md) for observing multiple hosts

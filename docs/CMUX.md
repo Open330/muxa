@@ -56,7 +56,9 @@ Official API references:
 - <https://cmux.com/docs/api>
 - <https://cmux.com/docs/dock>
 
-## Next slices
+## Parked ideas
+
+Not planned. These are only worth picking up if cmux shows real use:
 
 - Lock a supported cmux JSON schema into fixtures and enumerate every
   workspace/surface defensively.
