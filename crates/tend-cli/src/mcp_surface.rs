@@ -61,7 +61,8 @@ pub(crate) fn definitions() -> Vec<Value> {
             "name": "tend_wait",
             "description": "Wait on one handle: a request id (its reply), a swap job (until it ends), a dispatch UUID (current status, at once), or a pane's next state change (pane, no id). A timeout changes nothing. Prefer wakes; wait 30-60 s, not 1 s probes.",
             "inputSchema": {"type": "object", "properties": {
-                "id": {"type": "string", "description": "Also accepted as request_id." },
+                "id": {"type": "string" },
+                "request_id": {"type": "string", "description": "Same as id (receipts' next_step uses it)."},
                 "kind": {"type": "string", "enum": ["request", "dispatch", "swap"] },
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600 },
                 "after_update": {"type": "integer", "minimum": 0, "description": "Fleet: return on newer progress."},
@@ -1049,6 +1050,20 @@ mod tests {
             json!({"request_id": "req_remote", "action": "cancel", "host": "local"}),
         );
         assert_eq!(local.name, "tend_cancel_message");
+    }
+
+    /// Receipts' `next_step` routes name `tend_wait` with `request_id`;
+    /// the listed schema must allow it, and the router must take it.
+    #[test]
+    fn next_step_wait_routes_validate_against_the_listed_schema() {
+        let wait = definitions()
+            .into_iter()
+            .find(|tool| tool["name"] == "tend_wait")
+            .unwrap();
+        assert!(wait["inputSchema"]["properties"]["request_id"].is_object());
+        let routed = route_ok("tend_wait", json!({"request_id": "req_9"}));
+        assert_eq!(routed.name, "tend_wait_reply");
+        assert_eq!(routed.args["request_id"], "req_9");
     }
 
     #[test]

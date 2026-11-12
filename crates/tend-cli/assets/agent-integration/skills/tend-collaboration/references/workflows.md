@@ -41,8 +41,9 @@ or an already-granted permission does not justify this flow. CLI:
 
 ## Incoming work
 
-On a Tend wake, `tend_inbox(request_id=ID)` unless the full request was already
-delivered. A review returns findings without editing; a task edits only its
+On a Tend wake, `tend_inbox(request_id=ID)` unless the request was already
+claimed and delivered in full; a hook offer is not claimed. If the claim is
+refused (cancelled, superseded, handled), do not act on the offered text. A review returns findings without editing; a task edits only its
 scope and reports the checks it ran. With `expects_reply=true`, finish once
 with `tend_reply`. Absorb one-way notices silently. If a missing prerequisite
 ends the attempt, reply `blocked` and name it; while a human decision is
@@ -60,3 +61,12 @@ recovery when one exists; otherwise one `tend_request_attention` with
 provider"). Keep req_r open; a claimed request needs a verified stop or an
 isolated worktree before anyone else takes it. A Fleet request keeps its
 returned host and pane_key.
+
+## Historical agent-record investigation
+
+Ask `tend_agent_search` the user's question in natural language, then expand
+relevant hits with `event_id`. Check the interpreted terms, time range and
+coverage; follow each tool call to its result; broaden terms or the
+time/session scope before concluding; exclude your own investigating session
+when it repeats the evidence. A prose claim or quoted log is not proof of
+execution, and an incomplete search cannot prove absence.

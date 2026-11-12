@@ -35,10 +35,14 @@ or separate worktrees.
    editing needs `intent=task` and `execute=true` within the user's
    authorization. `target` picks a peer, provider, `%N`, `@alias` or `role:`;
    Tend reuses or creates a worker with configured permissions.
+   Use the exact `pane` the guide returned (including an `rmux:` prefix); if a
+   peer moved or vanished, refresh the guide once rather than retrying old ids.
 2. It returns at once with a `request_id`. Keep working; the reply arrives as
    a wake. Read it with `tend_inbox(view=report, request_id=ID)` or `tend_wait(id=ID)`
-   (30-60 s foreground waits, never repeated 1-second probes). Never send the
-   same work twice; a timeout is not failure.
+   (30-60 s foreground waits, never repeated 1-second probes). If your host
+   yields a running wait to the background, resume that cell instead of
+   starting another wait. Never send the same work twice; a timeout is not
+   failure.
 3. Verify the reply against the files and checks. A reply is not proof.
 
 Exact mailbox delivery (`exact=true`, or `intent=notice` for one-way
@@ -97,7 +101,8 @@ isolated worktree. `tend_guide(workflows=true)` has recovery examples.
 
 For a real approval, choice or missing information, call
 `tend_request_attention` (body, options, recommendation, evidence) and keep
-its id. Its answer arrives as a wake. Timeout is never consent; an answer
+its id; if the guide reports `capabilities.human_actions=false` or the tool is
+missing, ask in the existing user conversation instead. Its answer arrives as a wake. Timeout is never consent; an answer
 may be a refusal. Never answer a human request as an agent.
 
 ## Authority
@@ -108,8 +113,10 @@ permission prompt.
 
 ## Fleet
 
-Add `host` to reach a control-mode Fleet host: `tend_status(host)`,
-`tend_call_peer(host, pane)`, `tend_send_prompt(host, pane)`. Dispatch Work
+Add `host` to reach a control-mode Fleet host: `tend_status(host=all)` for
+host health, `tend_status(host, pane)` for one pane's screen,
+`tend_call_peer(host, pane)`, `tend_send_prompt(host, pane)`. Keep the
+returned host, pane_key and request id together. Dispatch Work
 with `tend_start_work(commit, dispatch_id, ...)`, reuse the dispatch id after
 an uncertain delivery, and read it with `tend_wait(id)`; launched means
 started, not done.

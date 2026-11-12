@@ -2427,7 +2427,7 @@ fn collaboration_guide(
             "peer_interruption": {
                 "wait_slice_secs": 60,
                 "owner": "The coordinator owns recovery; a capped peer may never send a reply. Set an overall wait budget; never renew timed-out waits blindly.",
-                "health": "Read the durable reply first, then fresh tend_status for the exact recipient agent/session/socket or tend_status(host) for the returned host/pane_key. Request to.state is stale. Missing/offline is unknown availability, not proof of a cap or process exit.",
+                "health": "Read the durable reply first, then fresh tend_status for the exact recipient agent/session/socket or tend_status(host=all) for Fleet host health (a pane capture with host+pane shows its screen, not a fresh recipient state). Request to.state is stale. Missing/offline is unknown availability, not proof of a cap or process exit.",
                 "evidence": ["state", "rate_limit_scope", "rate_limit_source", "rate_limited_until", "last_notification"],
                 "trigger": "Known cap/error/stopped, repeated unavailability, or exhausted overall budget requires a recovery decision. Utilization alone is insufficient; reset time is only a recheck hint.",
                 "recovery": "Record one update with evidence/artifacts. Use authorized independent work, one bounded reset recheck, or a healthy peer. Verify current health and progress; do not repeatedly prompt the capped agent.",
@@ -2445,7 +2445,7 @@ fn collaboration_guide(
                 "wait": "Retain the returned request_id; its answer arrives as a wake (tend_wait(id) to block). Continue independent work; never treat a timeout as consent or create duplicate questions. Keep the original peer request open while waiting.",
                 "answer": "The human answers in Need you (watch: e). Read status and body; completed is not necessarily approval. Honor refusal/cancellation and complete the original peer request after authorized work.",
                 "identity": "Never use console=true or claim/answer the operator inbox as an agent.",
-                "fallback": "If the installed schema lacks human_action, ask in the existing user conversation. Do not silently drop the question or redirect it to a peer."
+                "fallback": "If capabilities.human_actions is false or tend_request_attention is not installed, ask in the existing user conversation. Do not silently drop the question or redirect it to a peer."
             },
             "reviewer": {
                 "when": "After implementation, self-review, and relevant tests; before declaring important work complete.",
