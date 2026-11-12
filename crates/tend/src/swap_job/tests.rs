@@ -19,6 +19,7 @@ fn gone(_: u32, _: Option<&str>) -> Liveness {
 
 fn plan(targets: usize, text: Option<&str>) -> AcceptedPlan {
     AcceptedPlan {
+        resume: None,
         node_id: "node-1".into(),
         continue_when: "limited".into(),
         continue_text: text.map(TextRef::of),
@@ -353,7 +354,10 @@ fn recovery_marks_every_unfinished_job_without_replaying_it() {
 
     let status = next.status(&never).unwrap();
     assert_eq!(status.state, "abandoned");
-    assert_eq!(status.targets[0].reason.as_deref(), Some("not_started"));
+    assert_eq!(
+        status.targets[0].reason.as_deref(),
+        Some("resume_policy_unavailable")
+    );
 
     assert_eq!(next.status(&live).unwrap().state, "running");
     // Recovering again changes nothing.
@@ -741,7 +745,9 @@ fn a_v1_store_is_migrated_in_place() {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "DROP INDEX targets_retry_of;
+                "ALTER TABLE owner DROP COLUMN draining;
+                 DROP TABLE resume_counts;
+                 DROP INDEX targets_retry_of;
                  ALTER TABLE targets DROP COLUMN retry_of;
                  ALTER TABLE targets DROP COLUMN lineage;
                  ALTER TABLE jobs DROP COLUMN retry_of;
@@ -931,7 +937,9 @@ fn a_v2_store_is_migrated_in_place() {
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE jobs DROP COLUMN evidence_pruned_at;
+                "ALTER TABLE owner DROP COLUMN draining;
+                 DROP TABLE resume_counts;
+                 ALTER TABLE jobs DROP COLUMN evidence_pruned_at;
                  PRAGMA user_version = 2;",
             )
             .unwrap();
@@ -941,7 +949,7 @@ fn a_v2_store_is_migrated_in_place() {
         .hold()
         .pragma_query_value(None, "user_version", |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, SCHEMA_VERSION);
     let status = store.status(&job).unwrap();
     assert_eq!(status.state, "done");
     assert_eq!(status.targets[0].effects, 2);
@@ -1263,4 +1271,365 @@ fn a_pruned_follow_up_is_not_rebuilt_from_kept_effects() {
     let status = store.status(&job).unwrap();
     assert!(status.evidence_pruned_at.is_some());
     assert!(status.targets[0].follow_up.is_none());
+}
+
+fn resumable_plan(targets: usize) -> AcceptedPlan {
+    let mut plan = plan(targets, None);
+    plan.resume = Some(ResumePolicy {
+        public: true,
+        when_idle: true,
+        idle_deadline: time::OffsetDateTime::now_utc().unix_timestamp() + 3600,
+        restore_draft: true,
+        continue_when: crate::account_swap::ContinueWhen::Never,
+        continue_evidence: crate::account_swap::ContinueEvidence::Verified,
+        bare: crate::account_swap::BareMode::Skip,
+        force: false,
+        configured_text: true,
+    });
+    plan
+}
+
+#[test]
+fn drain_defers_pending_siblings_independently_of_an_active_effect() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let job = store
+        .create_job(&lease, "mixed", "digest", &resumable_plan(2))
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store.start_or_cancel(&lease, &job, 0, 1, true).unwrap();
+    let mut journal = store.journal(&lease, &job, 0, 1);
+    journal
+        .before(&effect(Purpose::Relaunch, Op::Text { chars: 1 }))
+        .unwrap();
+    store.begin_drain(&lease).unwrap();
+    let status = store.status(&job).unwrap();
+    assert_eq!(status.state, "running");
+    assert_eq!(status.targets[1].disposition.as_deref(), Some("deferred"));
+    assert_eq!(
+        store.start_or_cancel(&lease, &job, 1, 1, true).unwrap(),
+        Boundary::Deferred
+    );
+    assert_eq!(status.targets[1].effects, 0);
+    let next = store.acquire(&me("next", 2), &gone).unwrap();
+    store.recover(&next).unwrap();
+    let status = store.status(&job).unwrap();
+    assert_eq!(status.state, "needs_reconciliation");
+    assert_eq!(status.targets[0].uncertain_effects, 1);
+    assert_eq!(status.targets[1].disposition.as_deref(), Some("deferred"));
+    assert_eq!(
+        store.claim_resume(&next, &job, 1, 1, false).unwrap(),
+        Some(2)
+    );
+    assert_eq!(store.claim_resume(&next, &job, 1, 1, false).unwrap(), None);
+    store
+        .finish_target(&next, &job, 1, 2, Disposition::Swapped)
+        .unwrap();
+    store.finish(&next, &job).unwrap();
+    let status = store.status(&job).unwrap();
+    assert_eq!(status.state, "needs_reconciliation");
+    assert_eq!(status.targets.len(), 2);
+    assert_eq!(status.targets[1].attempt, 2);
+    assert_eq!(status.targets[1].disposition.as_deref(), Some("swapped"));
+}
+
+#[test]
+fn started_without_effects_is_not_automatically_resumable() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let job = store
+        .create_job(&lease, "started", "digest", &resumable_plan(2))
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store.start_or_cancel(&lease, &job, 0, 1, true).unwrap();
+    let next = store.acquire(&me("next", 2), &gone).unwrap();
+    store.recover(&next).unwrap();
+    let status = store.status(&job).unwrap();
+    assert_eq!(status.state, "needs_reconciliation");
+    assert_eq!(
+        status.targets[0].disposition.as_deref(),
+        Some("needs_reconciliation")
+    );
+    assert_eq!(status.targets[1].disposition.as_deref(), Some("deferred"));
+    assert_eq!(store.claim_resume(&next, &job, 0, 1, false).unwrap(), None);
+}
+
+#[test]
+fn crash_resumes_are_bounded_but_graceful_deferrals_are_not() {
+    for graceful in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let mut lease = store.acquire(&me("old", 1), &alive).unwrap();
+        let job = store
+            .create_job(&lease, "bounded", "digest", &resumable_plan(1))
+            .unwrap()
+            .job_id;
+        store.start(&lease, &job).unwrap();
+        for iteration in 1..=5 {
+            if graceful {
+                store.begin_drain(&lease).unwrap();
+            }
+            lease = store
+                .acquire(&me(&format!("next-{iteration}"), iteration + 1), &gone)
+                .unwrap();
+            store.recover(&lease).unwrap();
+            let attempt = store
+                .claim_resume(&lease, &job, 0, iteration, false)
+                .unwrap();
+            if !graceful && iteration == 4 {
+                assert_eq!(attempt, None);
+                let status = store.status(&job).unwrap();
+                assert_eq!(
+                    status.targets[0].reason.as_deref(),
+                    Some("crash_resume_limit")
+                );
+                assert_eq!(status.targets[0].effects, 0);
+                assert_eq!(status.state, "needs_reconciliation");
+                break;
+            }
+            assert_eq!(attempt, Some(iteration + 1));
+        }
+    }
+}
+
+#[test]
+fn cancellation_of_a_deferred_job_prevents_claiming_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let job = store
+        .create_job(&lease, "cancel", "digest", &resumable_plan(1))
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store.begin_drain(&lease).unwrap();
+    assert!(store.request_cancel(&lease, &job).unwrap());
+    let next = store.acquire(&me("next", 2), &gone).unwrap();
+    assert_eq!(store.claim_resume(&next, &job, 0, 1, false).unwrap(), None);
+    let status = store.status(&job).unwrap();
+    assert_eq!(status.state, "done");
+    assert_eq!(status.targets[0].reason.as_deref(), Some("cancelled"));
+}
+
+#[test]
+fn manual_retry_and_resume_share_the_same_unique_claim() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let plan = resumable_plan(1);
+    let job = store
+        .create_job(&lease, "parent", "digest", &plan)
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store.begin_drain(&lease).unwrap();
+    let lease = store.acquire(&me("next", 2), &gone).unwrap();
+    let link = RetryLink {
+        target_index: 0,
+        parent_target: 0,
+        parent_attempt: 1,
+        lineage: format!("{job}:0"),
+    };
+    store
+        .create_retry_job(&lease, "manual", "digest", &plan, &job, &[link])
+        .unwrap();
+    assert_eq!(store.claim_resume(&lease, &job, 0, 1, false).unwrap(), None);
+}
+
+#[test]
+fn deferred_evidence_is_never_pruned() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let job = store
+        .create_job(&lease, "prune", "digest", &resumable_plan(1))
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store.begin_drain(&lease).unwrap();
+    assert_eq!(
+        store
+            .prune_evidence(&lease, "9999-01-01T00:00:00Z", 10)
+            .unwrap(),
+        0
+    );
+    assert!(store.status(&job).unwrap().evidence_pruned_at.is_none());
+}
+
+#[test]
+fn deferred_marker_rejects_every_kind_of_existing_effect_and_observation() {
+    for transport in [
+        None,
+        Some(Transport::Accepted),
+        Some(Transport::Refused),
+        Some(Transport::Unconfirmed),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let lease = store.acquire(&me("old", 1), &alive).unwrap();
+        let job = store
+            .create_job(&lease, "effects", "digest", &resumable_plan(1))
+            .unwrap()
+            .job_id;
+        store.start(&lease, &job).unwrap();
+        let effect = effect(
+            Purpose::Interrupt,
+            Op::Key(crate::account_swap::effects::Key::Esc),
+        );
+        let mut journal = store.journal(&lease, &job, 0, 1);
+        journal.before(&effect).unwrap();
+        if let Some(transport) = transport {
+            journal.after(&effect, transport).unwrap();
+        }
+        store.begin_drain(&lease).unwrap();
+        assert!(store.status(&job).unwrap().targets[0].disposition.is_none());
+        assert!(store.defer_attempt(&lease, &job, 0, 1, "unsafe").is_err());
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let job = store
+        .create_job(&lease, "observation", "digest", &resumable_plan(1))
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store
+        .observe(
+            &lease,
+            &job,
+            0,
+            1,
+            &Observation::Binding {
+                pid: 1,
+                process_start: None,
+                conversation_id: "x".into(),
+                verified: true,
+            },
+        )
+        .unwrap();
+    store.begin_drain(&lease).unwrap();
+    assert!(store.status(&job).unwrap().targets[0].disposition.is_none());
+    assert!(store.defer_attempt(&lease, &job, 0, 1, "unsafe").is_err());
+}
+
+#[test]
+fn a_cancel_racing_a_resume_claim_never_leaves_a_startable_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(open(&dir));
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let job = store
+        .create_job(&lease, "race", "digest", &resumable_plan(1))
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store.begin_drain(&lease).unwrap();
+    let lease = store.acquire(&me("next", 2), &gone).unwrap();
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let peer = std::sync::Arc::clone(&store);
+    let peer_lease = lease.clone();
+    let peer_job = job.clone();
+    let peer_barrier = std::sync::Arc::clone(&barrier);
+    let cancel = std::thread::spawn(move || {
+        peer_barrier.wait();
+        peer.request_cancel(&peer_lease, &peer_job).unwrap();
+    });
+    barrier.wait();
+    let resumed = store.claim_resume(&lease, &job, 0, 1, false).unwrap();
+    cancel.join().unwrap();
+    if let Some(attempt) = resumed {
+        assert_eq!(
+            store
+                .start_or_cancel(&lease, &job, 0, attempt, true)
+                .unwrap(),
+            Boundary::Cancelled
+        );
+    }
+    let status = store.status(&job).unwrap();
+    assert!(status.cancel_requested);
+    assert_eq!(status.targets[0].disposition.as_deref(), Some("skipped"));
+    assert_eq!(status.targets[0].reason.as_deref(), Some("cancelled"));
+}
+
+#[test]
+fn a_real_v3_check_is_rebuilt_without_losing_journal_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("jobs.sqlite3");
+    {
+        let c = Connection::open(&path).unwrap();
+        let old_schema = SCHEMA.replace(",\n    draining INTEGER NOT NULL DEFAULT 0", "")
+            .replace(", 'deferred'", "")
+            .replace("CREATE TABLE resume_counts (lineage TEXT PRIMARY KEY, crashes INTEGER NOT NULL);\n", "");
+        c.execute_batch(&old_schema).unwrap();
+        c.pragma_update(None, "user_version", 3).unwrap();
+        c.execute(
+            "INSERT INTO owner (id, nonce, pid, acquired_at) VALUES (1, 'old', 1, 'then')",
+            [],
+        )
+        .unwrap();
+        let plan = serde_json::to_string(&resumable_plan(1)).unwrap();
+        c.execute("INSERT INTO jobs (job_id, node_id, request_key, request_digest, plan_digest, owner_nonce,
+            state, plan_json, revision, created_at, updated_at) VALUES ('job', 'node-1', 'key', 'digest', 'plan',
+            'old', 'running', ?1, 1, 'then', 'then')", [&plan]).unwrap();
+        c.execute("INSERT INTO targets (job_id, target_id, attempt, phase) VALUES ('job', 0, 1, 'pending')", []).unwrap();
+        assert!(c.execute("UPDATE jobs SET state = 'deferred'", []).is_err());
+    }
+    let store = SwapJobStore::open(&path).unwrap();
+    let lease = store.acquire(&me("new", 2), &gone).unwrap();
+    store.recover(&lease).unwrap();
+    assert_eq!(store.status_by_key("key").unwrap().state, "deferred");
+    assert_eq!(
+        store.claim_resume(&lease, "job", 0, 1, false).unwrap(),
+        Some(2)
+    );
+    let c = store.hold();
+    assert_eq!(
+        c.query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| r
+            .get::<_, u32>(
+            0
+        ))
+        .unwrap(),
+        0
+    );
+    assert_eq!(
+        c.query_row(
+            "SELECT COUNT(*) FROM targets WHERE job_id = 'job'",
+            [],
+            |r| r.get::<_, u32>(0)
+        )
+        .unwrap(),
+        2
+    );
+}
+
+#[test]
+fn an_automatic_claim_prevents_a_manual_retry_of_the_same_attempt() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(&dir);
+    let lease = store.acquire(&me("old", 1), &alive).unwrap();
+    let plan = resumable_plan(1);
+    let job = store
+        .create_job(&lease, "parent", "digest", &plan)
+        .unwrap()
+        .job_id;
+    store.start(&lease, &job).unwrap();
+    store.begin_drain(&lease).unwrap();
+    let lease = store.acquire(&me("next", 2), &gone).unwrap();
+    assert_eq!(
+        store.claim_resume(&lease, &job, 0, 1, false).unwrap(),
+        Some(2)
+    );
+    let link = RetryLink {
+        target_index: 0,
+        parent_target: 0,
+        parent_attempt: 1,
+        lineage: format!("{job}:0"),
+    };
+    assert!(store
+        .create_retry_job(&lease, "manual", "digest", &plan, &job, &[link])
+        .is_err());
+    assert_eq!(store.status(&job).unwrap().targets[0].attempt, 2);
 }

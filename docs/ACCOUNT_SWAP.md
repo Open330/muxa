@@ -130,8 +130,27 @@ reservation. The job waits at most `--idle-timeout` (default `6h`, units `s`, `m
 without stopping them. `--force` takes precedence and stops mid-turn now.
 `--local` cannot wait for idle. Panes running the agent directly without
 a shell retain the daemon's existing refusal and are reported as skipped;
-waiting jobs never hand those targets to a later local execution. A daemon restart leaves an unfinished job
-for the existing swap-job recovery workflow; it does not replay restarts.
+waiting jobs never hand those targets to a later local execution.
+
+On shutdown, untouched targets are recorded as `deferred`, even when another
+agent in the job is still being restarted. On startup, public jobs resume those
+targets automatically under the same job and request key. Each target gets a
+fresh attempt only after checking the original pane, conversation, process ID,
+and process start time, and keeps its originally assigned account. A positively
+changed process is skipped; unavailable snapshots or guards leave it deferred.
+The original idle deadline includes daemon downtime. `--cancel` also cancels
+deferred targets. Nothing that reached the start boundary is automatically
+replayed, even when it had not yet recorded an effect. Mixed jobs retain their
+reconciliation warning while untouched siblings can resume.
+
+The daemon does not save follow-up text or drafts. Resuming may restore a newly
+captured draft, and may use the configured follow-up only when its digest matches
+the accepted text. Custom text or changed configured text is withheld, with a
+persistent reason in status. Automation jobs and journals from before this
+feature lack reconstructable resume authority and are not automatically resumed.
+Crash recovery permits at most three fresh attempts per target lineage; ordinary
+graceful shutdown deferrals do not consume that limit. Fleet jobs resume only
+on the same node; continue using `--host <alias> --status <key>` to inspect them.
 
 Startup dialogs, background-shell preservation, scheduled-task-owner
 exclusions and follow-up policy are the same as other swaps. With the
@@ -282,8 +301,8 @@ skipped, never swapped as whatever runs there now. Those panes are not in the
 job's record, and get no exclusion against the daemon's automation.
 
 `tend swap --retry <key>` retries a daemon job that has ended. A target is
-swapped again only if it failed before anything at or past its relaunch was
-even attempted, nothing about it is uncertain, and the very agent the job
+swapped again only if it was deferred without effects, or failed before anything
+at or past its relaunch was even attempted, nothing about it is uncertain, and the very agent the job
 planned (same process) still runs on the same pane: it moves to the account
 first assigned to it, and no follow-up is typed or draft restored, as those
 belonged to the first run. Any other target that did not end swapped, kept
@@ -323,7 +342,7 @@ then says the detail was pruned, and such a job can no longer be retried,
 since how far each target got is no longer known. A job with any uncertain
 effect, or one needing reconciliation, keeps all of it. A failed pruning run
 is shown by `tend doctor` and retried the next day. The journal is at schema
-v3 from this version on; an older tend refuses it rather than misread it.
+v4 from this version on; an older tend refuses it rather than misread it.
 
 ## On a Fleet host
 

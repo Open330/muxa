@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   agents’ launch records and unfinished launch tickets.
 - The Mac app lists swap accounts configured in `config.toml`, falling back to
   optional aas accounts through the daemon, and explains unavailable providers.
+- Daemon restarts preserve swaps that are waiting for an agent to become idle.
+  Untouched targets in public swap jobs resume automatically under the same job
+  key, after checking that the same agent process is still there. Targets already
+  started still require inspection after an interruption. The original idle
+  timeout and cancellation remain in force; unavailable follow-up text is withheld.
 
 ## [0.10.8] - 2026-11-12
 
@@ -41,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - tend builds on Windows again. It had not compiled there for several releases
   (the IPC client, the listener scan and Linux-only helpers). On Windows,
   `tend servers` reports listening servers as unavailable for now.
+
 
 ## [0.10.7] - 2026-11-11
 

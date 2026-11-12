@@ -13,6 +13,7 @@
 //! faulted. Nothing is retried or replayed; a restarted daemon finds the job
 //! unfinished and leaves it for a person (`swap_job` recovery).
 
+mod resume;
 #[cfg(test)]
 mod tests;
 
@@ -26,7 +27,7 @@ use crate::event::AgentKind;
 use crate::state::Agent;
 use crate::swap_job::{
     request_digest, AcceptedPlan, Boundary, Disposition, JobError, Lease, Liveness, OwnerIdentity,
-    PlannedTarget, SettledEntry, SwapJobStore, TextRef,
+    PlannedTarget, ResumePolicy, SettledEntry, SwapJobStore, TextRef,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -503,6 +504,16 @@ pub(crate) trait Engine: Send + Sync + 'static {
         planned: &PlannedTarget,
         snapshot: &Snapshot,
     ) -> (SwapRequest, EngineStep<Self::Target>);
+    /// A changed binding is final; an unavailable read must remain deferred.
+    fn prepare_resume(
+        &self,
+        request: &SwapRequest,
+        planned: &PlannedTarget,
+        snapshot: &Snapshot,
+    ) -> (SwapRequest, EngineStep<Self::Target>, bool) {
+        let (request, step) = self.prepare_retry(request, planned, snapshot);
+        (request, step, false)
+    }
     /// Look at a target's pane now, read-only: a reason code.
     fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str;
     fn execute(
@@ -577,6 +588,32 @@ impl Engine for RealEngine {
             Step::Run(target) => EngineStep::Run(target),
         };
         (resolved, step)
+    }
+
+    fn prepare_resume(
+        &self,
+        request: &SwapRequest,
+        planned: &PlannedTarget,
+        snapshot: &Snapshot,
+    ) -> (SwapRequest, EngineStep<Self::Target>, bool) {
+        let (resolved, step, changed) = account_swap::prepare_retry_classified(
+            request,
+            &account_swap::RetryTarget {
+                endpoint: &planned.endpoint,
+                conversation_id: &planned.conversation_id,
+                process_pid: planned.process_pid,
+                process_start: planned.process_start.as_deref(),
+            },
+            &snapshot.agents,
+            &snapshot.backends,
+            &snapshot.config,
+            &snapshot.accounts,
+        );
+        let step = match step {
+            Step::Done(outcome) => EngineStep::Done(outcome),
+            Step::Run(target) => EngineStep::Run(target),
+        };
+        (resolved, step, changed)
     }
 
     fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str {
@@ -684,6 +721,30 @@ impl Engine for DaemonEngine {
         }
     }
 
+    fn prepare_resume(
+        &self,
+        request: &SwapRequest,
+        planned: &PlannedTarget,
+        snapshot: &Snapshot,
+    ) -> (SwapRequest, EngineStep<DaemonTarget>, bool) {
+        match self {
+            Self::Real(engine) => {
+                let (resolved, step, changed) = engine.prepare_resume(request, planned, snapshot);
+                let step = match step {
+                    EngineStep::Done(outcome) => EngineStep::Done(outcome),
+                    EngineStep::Run(target) => EngineStep::Run(DaemonTarget::Real(target)),
+                };
+                (resolved, step, changed)
+            }
+            #[cfg(feature = "test-support")]
+            Self::Inert(_) => {
+                let (request, step) =
+                    testing::InertEngine::prepare_retry(request, planned, snapshot);
+                (request, step, false)
+            }
+        }
+    }
+
     fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str {
         match self {
             Self::Real(engine) => engine.observe(planned, snapshot),
@@ -744,9 +805,11 @@ impl SwapService {
         let inner = Service::open(path, identity, &|_, _| Liveness::Gone, engine, provider)
             .map_err(|error| error.to_string())?
             .holding(lock);
-        Ok(Self {
-            inner: Arc::new(inner),
-        })
+        let inner = Arc::new(inner);
+        // Only the dispatcher can fail to launch here, before any resumed
+        // effect. Later admission failures fault the visible service handle.
+        Service::start_resumer(&inner)?;
+        Ok(Self { inner })
     }
 
     /// Whether a submit would be taken now: the store is still this
@@ -1123,6 +1186,15 @@ pub(crate) struct Service<E: Engine> {
     draining: AtomicBool,
 }
 
+/// A persisted attempt, independent of its position in a resumed queue.
+struct AttemptRun<T> {
+    target_id: u32,
+    attempt: u32,
+    report_index: usize,
+    identity: TargetIdentity,
+    target: T,
+}
+
 impl<E: Engine> Service<E> {
     pub(crate) fn open(
         path: &Path,
@@ -1240,6 +1312,16 @@ impl<E: Engine> Service<E> {
     pub(crate) async fn drain(this: Arc<Self>, timeout: std::time::Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;
         this.draining.store(true, Ordering::SeqCst);
+        let draining = Arc::clone(&this);
+        let begin =
+            tokio::task::spawn_blocking(move || draining.store.begin_drain(&draining.lease));
+        if !matches!(
+            tokio::time::timeout_at(deadline, begin).await,
+            Ok(Ok(Ok(())))
+        ) {
+            this.set_fault("could not durably defer pending swap targets on shutdown".into());
+            return false;
+        }
         // A submission holds the submit lock from its gate to its worker's
         // registration; taking the lock once means every one that passed the
         // gate before the flag has registered or given up.
@@ -1248,6 +1330,16 @@ impl<E: Engine> Service<E> {
             drop(gate.submit.lock());
         });
         if tokio::time::timeout_at(deadline, barrier).await.is_err() {
+            return false;
+        }
+        let draining = Arc::clone(&this);
+        let sweep =
+            tokio::task::spawn_blocking(move || draining.store.begin_drain(&draining.lease));
+        if !matches!(
+            tokio::time::timeout_at(deadline, sweep).await,
+            Ok(Ok(Ok(())))
+        ) {
+            this.set_fault("could not settle in-flight submissions on shutdown".into());
             return false;
         }
         let waiting = this.receivers();
@@ -1501,6 +1593,21 @@ impl<E: Engine> Service<E> {
             }
         }
         let plan = AcceptedPlan {
+            resume: Some(ResumePolicy {
+                public: origin == Origin::Public,
+                when_idle: resolved.when_idle,
+                idle_deadline: time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .saturating_add(
+                        i64::try_from(resolved.idle_timeout.as_secs()).unwrap_or(i64::MAX),
+                    ),
+                restore_draft: resolved.restore_draft,
+                continue_when: resolved.continue_when,
+                continue_evidence: resolved.continue_evidence,
+                bare: resolved.bare,
+                force: resolved.force,
+                configured_text: overrides.continue_text.is_none(),
+            }),
             node_id: snapshot.node_id.clone(),
             continue_when: resolved.continue_when.to_string(),
             continue_text: resolved.continue_text.as_deref().map(TextRef::of),
@@ -1572,6 +1679,17 @@ impl<E: Engine> Service<E> {
                 },
             );
         }
+        let runs = runs
+            .into_iter()
+            .enumerate()
+            .map(|(id, (report_index, identity, target))| AttemptRun {
+                target_id: u32::try_from(id).unwrap_or(u32::MAX),
+                attempt: 1,
+                report_index,
+                identity,
+                target,
+            })
+            .collect();
         Self::spawn(this, &job, resolved, runs, guard, targets, taken, still_due)?;
         let view = this.status(&JobRef::Id(job.clone()))?;
         Ok(Accepted {
@@ -1675,7 +1793,7 @@ impl<E: Engine> Service<E> {
                 settled.push(settle("not_retried"));
                 continue;
             }
-            let rerun = source.disposition.as_deref() == Some("failed")
+            let rerun = matches!(source.disposition.as_deref(), Some("failed" | "deferred"))
                 && !source.launched
                 && source.uncertain_effects == 0;
             if !this.reserve(&planned.endpoint, request_key) {
@@ -1737,6 +1855,21 @@ impl<E: Engine> Service<E> {
         }
         settled.sort_by_key(|entry| entry.report_index);
         let accepted = AcceptedPlan {
+            resume: resolved.as_ref().map(|request: &SwapRequest| ResumePolicy {
+                public: true,
+                when_idle: request.when_idle,
+                idle_deadline: time::OffsetDateTime::now_utc()
+                    .unix_timestamp()
+                    .saturating_add(
+                        i64::try_from(request.idle_timeout.as_secs()).unwrap_or(i64::MAX),
+                    ),
+                restore_draft: request.restore_draft,
+                continue_when: request.continue_when,
+                continue_evidence: request.continue_evidence,
+                bare: request.bare,
+                force: request.force,
+                configured_text: true,
+            }),
             node_id: snapshot.node_id.clone(),
             continue_when: ContinueWhen::Never.to_string(),
             continue_text: None,
@@ -1852,12 +1985,16 @@ impl<E: Engine> Service<E> {
         this: &Arc<Self>,
         job: &str,
         request: SwapRequest,
-        runs: Vec<(usize, TargetIdentity, E::Target)>,
+        runs: Vec<AttemptRun<E::Target>>,
         guard: Option<Box<dyn TargetGuard>>,
-        targets: usize,
+        _targets: usize,
         taken: &[String],
         still_due: Option<StillDue>,
     ) -> Result<(), String> {
+        let attempts: Vec<_> = runs
+            .iter()
+            .map(|run| (run.target_id, run.attempt))
+            .collect();
         let worker = Arc::clone(this);
         let worker_job = job.to_owned();
         let work: Box<dyn FnOnce() + Send> = Box::new(move || {
@@ -1878,12 +2015,20 @@ impl<E: Engine> Service<E> {
         if let Err(error) = (this.spawner)(name, work) {
             // Nothing ran: every target ends with no effect.
             let mut recorded = Ok(());
-            for target in 0..targets {
-                let target = u32::try_from(target).unwrap_or(u32::MAX);
-                if let Err(error) =
+            for (target, attempt) in attempts {
+                let settled = if attempt > 1 {
+                    this.store.defer_attempt(
+                        &this.lease,
+                        job,
+                        target,
+                        attempt,
+                        "worker_unavailable",
+                    )
+                } else {
                     this.store
-                        .finish_target(&this.lease, job, target, 1, Disposition::Failed)
-                {
+                        .finish_target(&this.lease, job, target, attempt, Disposition::Failed)
+                };
+                if let Err(error) = settled {
                     recorded = Err(error);
                 }
             }
@@ -1909,29 +2054,56 @@ impl<E: Engine> Service<E> {
         &self,
         job: &str,
         request: &SwapRequest,
-        runs: Vec<(usize, TargetIdentity, E::Target)>,
+        runs: Vec<AttemptRun<E::Target>>,
         adopted: Option<Box<dyn TargetGuard>>,
         still_due: Option<&StillDue>,
     ) {
         let mut adopted = adopted;
         let began = std::time::Instant::now();
-        let mut pending: std::collections::VecDeque<_> = runs.into_iter().enumerate().collect();
+        let mut pending: std::collections::VecDeque<_> = runs.into();
+        let deadline = match self.store.plan(job) {
+            Ok(plan) => plan.resume.map(|policy| policy.idle_deadline),
+            Err(error) => {
+                self.set_fault(format!(
+                    "job {job}: could not read its accepted policy: {error}"
+                ));
+                return;
+            }
+        };
         let mut next_poll = std::time::Instant::now();
-        while let Some((target_id, (report_index, identity, mut target))) = pending.pop_front() {
-            let target_id = u32::try_from(target_id).unwrap_or(u32::MAX);
+        while let Some(AttemptRun {
+            target_id,
+            attempt,
+            report_index,
+            identity,
+            mut target,
+        }) = pending.pop_front()
+        {
             if self.fault().is_some() {
                 // Halted: later targets are never reached, their pane stays
                 // reserved until the daemon restarts and recovers the job.
                 break;
             }
             // A cancelled job starts nothing more, without waiting on a pane.
-            match self.boundary(job, target_id, false) {
+            match self.boundary(job, target_id, attempt, false) {
+                Some(Boundary::Deferred) => {
+                    self.release(&identity.endpoint);
+                    continue;
+                }
                 Some(Boundary::Cancelled) => {
                     self.cancelled(job, report_index, &identity);
                     continue;
                 }
                 Some(_) => {}
                 None => break,
+            }
+            if request.when_idle
+                && !request.force
+                && deadline
+                    .is_some_and(|until| time::OffsetDateTime::now_utc().unix_timestamp() >= until)
+            {
+                self.timed_out(job, target_id, attempt, report_index, &identity);
+                continue;
             }
             // An adopted guard protects the one endpoint it was taken for.
             let held = match adopted.take() {
@@ -1944,10 +2116,15 @@ impl<E: Engine> Service<E> {
             };
             let guard = match held {
                 Ok(guard) => guard,
+                Err(_) if attempt > 1 => {
+                    self.defer_run(job, target_id, attempt, &identity, "guard_unavailable");
+                    continue;
+                }
                 Err(why) => {
                     self.settle(
                         job,
                         target_id,
+                        attempt,
                         report_index,
                         &identity,
                         Disposition::Skipped,
@@ -1977,20 +2154,28 @@ impl<E: Engine> Service<E> {
                 });
                 match fresh {
                     Ok(agent) if account_swap::waiting_for_idle(&agent) => {
-                        if began.elapsed() >= request.idle_timeout {
-                            self.timed_out(job, target_id, report_index, &identity);
+                        if deadline.map_or_else(
+                            || began.elapsed() >= request.idle_timeout,
+                            |until| time::OffsetDateTime::now_utc().unix_timestamp() >= until,
+                        ) {
+                            self.timed_out(job, target_id, attempt, report_index, &identity);
                         } else {
                             // Release the input exclusion while waiting. Keep only
                             // the per-endpoint reservation, to reject duplicate swaps;
                             // neither unrelated endpoints nor submissions are held.
                             drop(guard);
-                            pending
-                                .push_back((target_id as usize, (report_index, identity, target)));
+                            pending.push_back(AttemptRun {
+                                target_id,
+                                attempt,
+                                report_index,
+                                identity,
+                                target,
+                            });
                             // Rotate the queue, so a busy target never blocks ready targets.
                             // Bound CPU use and cancellation latency to one second per round.
                             if pending
                                 .front()
-                                .is_some_and(|(id, _)| *id <= target_id as usize)
+                                .is_some_and(|run| run.target_id <= target_id)
                             {
                                 let now = std::time::Instant::now();
                                 if now < next_poll {
@@ -2003,10 +2188,15 @@ impl<E: Engine> Service<E> {
                         continue;
                     }
                     Ok(agent) => self.engine.refresh_agent(&mut target, &agent),
+                    Err(_) if attempt > 1 => {
+                        self.defer_run(job, target_id, attempt, &identity, "snapshot_unavailable");
+                        continue;
+                    }
                     Err(why) => {
                         self.settle(
                             job,
                             target_id,
+                            attempt,
                             report_index,
                             &identity,
                             Disposition::Skipped,
@@ -2023,6 +2213,7 @@ impl<E: Engine> Service<E> {
                 self.settle(
                     job,
                     target_id,
+                    attempt,
                     report_index,
                     &identity,
                     Disposition::Skipped,
@@ -2033,15 +2224,19 @@ impl<E: Engine> Service<E> {
             }
             // The pane is held: start it, unless a cancel came first. From
             // here on it runs to its end.
-            match self.boundary(job, target_id, true) {
+            match self.boundary(job, target_id, attempt, true) {
                 Some(Boundary::Started) => {}
+                Some(Boundary::Deferred) => {
+                    self.release(&identity.endpoint);
+                    continue;
+                }
                 Some(_) => {
                     self.cancelled(job, report_index, &identity);
                     continue;
                 }
                 None => break,
             }
-            let mut journal = self.store.journal(&self.lease, job, target_id, 1);
+            let mut journal = self.store.journal(&self.lease, job, target_id, attempt);
             let outcome = self.engine.execute(request, &target, &mut journal);
             let uncertain = journal.uncertain();
             let failed = journal.failed();
@@ -2065,9 +2260,9 @@ impl<E: Engine> Service<E> {
                      no further target is started"
                 ));
             }
-            let recorded = self
-                .store
-                .finish_target(&self.lease, job, target_id, 1, disposition);
+            let recorded =
+                self.store
+                    .finish_target(&self.lease, job, target_id, attempt, disposition);
             if let Err(error) = &recorded {
                 self.set_fault(format!(
                     "job {job}: could not record target {target_id}: {error}"
@@ -2085,12 +2280,38 @@ impl<E: Engine> Service<E> {
         }
     }
 
-    fn timed_out(&self, job: &str, target_id: u32, report_index: usize, identity: &TargetIdentity) {
+    fn defer_run(
+        &self,
+        job: &str,
+        target: u32,
+        attempt: u32,
+        identity: &TargetIdentity,
+        reason: &str,
+    ) {
+        match self
+            .store
+            .defer_attempt(&self.lease, job, target, attempt, reason)
+        {
+            Ok(()) => self.release(&identity.endpoint),
+            Err(error) => self.set_fault(format!(
+                "job {job}: could not defer target {target}: {error}"
+            )),
+        }
+    }
+
+    fn timed_out(
+        &self,
+        job: &str,
+        target_id: u32,
+        attempt: u32,
+        report_index: usize,
+        identity: &TargetIdentity,
+    ) {
         if let Err(error) = self.store.finish_target_with_reason(
             &self.lease,
             job,
             target_id,
-            1,
+            attempt,
             Disposition::Skipped,
             Some("idle_timeout"),
         ) {
@@ -2110,10 +2331,10 @@ impl<E: Engine> Service<E> {
 
     /// One target boundary; `None` (the service now halted) if it could not
     /// be recorded: a cancel that cannot be read is never taken as none.
-    fn boundary(&self, job: &str, target_id: u32, start: bool) -> Option<Boundary> {
+    fn boundary(&self, job: &str, target_id: u32, attempt: u32, start: bool) -> Option<Boundary> {
         match self
             .store
-            .start_or_cancel(&self.lease, job, target_id, 1, start)
+            .start_or_cancel(&self.lease, job, target_id, attempt, start)
         {
             Ok(boundary) => Some(boundary),
             Err(error) => {
@@ -2155,15 +2376,16 @@ impl<E: Engine> Service<E> {
         &self,
         job: &str,
         target_id: u32,
+        attempt: u32,
         report_index: usize,
         identity: &TargetIdentity,
         disposition: Disposition,
         outcome: Option<SwapOutcome>,
         why: &str,
     ) {
-        if let Err(error) = self
-            .store
-            .finish_target(&self.lease, job, target_id, 1, disposition)
+        if let Err(error) =
+            self.store
+                .finish_target(&self.lease, job, target_id, attempt, disposition)
         {
             self.set_fault(format!(
                 "job {job}: could not record target {target_id}: {error}"
@@ -2253,7 +2475,13 @@ impl<E: Engine> Service<E> {
                 follow_up: None,
             })
             .collect();
-        for (target, planned) in status.targets.iter().zip(&plan.targets) {
+        for target in &status.targets {
+            let Some(planned) = usize::try_from(target.target_id)
+                .ok()
+                .and_then(|id| plan.targets.get(id))
+            else {
+                continue;
+            };
             entries.push(EntryView {
                 report_index: planned.report_index,
                 pane: Some(planned.pane.clone()),
@@ -2266,7 +2494,10 @@ impl<E: Engine> Service<E> {
             });
         }
         entries.sort_by_key(|entry| entry.report_index);
-        let unfinished = matches!(status.state.as_str(), "accepted" | "running");
+        let unfinished = matches!(status.state.as_str(), "accepted" | "running" | "deferred")
+            || entries
+                .iter()
+                .any(|entry| entry.disposition.as_deref() == Some("deferred"));
         Ok(JobView {
             job_id: status.job_id,
             node_id: status.node_id,

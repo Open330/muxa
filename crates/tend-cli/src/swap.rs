@@ -501,7 +501,12 @@ enum JobEnd {
 /// service faulted (a faulted job may stay `running` with nothing left to
 /// run it).
 fn settled(view: &JobView) -> bool {
-    view.fault.is_some() || !matches!(view.state.as_str(), "accepted" | "running")
+    view.fault.is_some()
+        || (!matches!(view.state.as_str(), "accepted" | "running" | "deferred")
+            && !view
+                .entries
+                .iter()
+                .any(|entry| entry.disposition.as_deref() == Some("deferred")))
 }
 
 /// Start `key` and follow it to its end. Ctrl-C is armed before the start
@@ -963,7 +968,7 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
     let status = match entry.disposition.as_deref() {
         Some("swapped") => SwapStatus::Swapped,
         Some("skipped") => SwapStatus::Skipped,
-        None => SwapStatus::Planned,
+        Some("deferred") | None => SwapStatus::Planned,
         _ => SwapStatus::Failed,
     };
     let mut outcome = entry.outcome.clone().unwrap_or_else(|| SwapOutcome {
@@ -1002,6 +1007,11 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
         .filter(|decision| !matches!(*decision, "allowed" | "not_due"))
     {
         outcome.continue_withheld = Some(reason.to_owned());
+        if reason == "text_unavailable" {
+            outcome
+                .note
+                .push_str("; follow-up withheld because text is unavailable");
+        }
     }
     if outcome.follow_up.is_none() {
         outcome.follow_up.clone_from(&entry.follow_up);
@@ -1038,6 +1048,9 @@ fn job_verdict(view: &JobView, key: &str, cancel_expected: bool) -> Result<()> {
             "swap job {} ({key}) stopped: the daemon's swap service faulted: {fault}",
             view.job_id
         );
+    }
+    if view.state == "deferred" {
+        bail!("swap job {} ({key}) has untouched targets waiting to resume; check `tend swap --status {key}`", view.job_id);
     }
     if view.state != "done" {
         bail!(
@@ -2755,5 +2768,64 @@ mod tests {
         assert!(checked_argv(&remote[1..]).is_ok());
         assert!(Cli::try_parse_from(["swap", "--local", "--when-idle"]).is_err());
         assert!(Cli::try_parse_from(["swap", "--idle-timeout", "1m"]).is_err());
+    }
+    #[test]
+    fn deferred_status_waits_without_allowing_the_direct_local_half() {
+        let mut job = view("deferred", None);
+        job.entries.push(EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("deferred".into()),
+            reason: Some("daemon_shutdown".into()),
+            uncertain_effects: 0,
+            outcome: None,
+            continuation: None,
+            follow_up: None,
+        });
+        assert!(!settled(&job));
+        job.state = "needs_reconciliation".into();
+        assert!(!settled(&job), "safe siblings still have work to resume");
+        job.state = "deferred".into();
+        assert!(local_half_withheld(&job).is_some());
+        assert_eq!(job_outcomes(&job)[0].status, SwapStatus::Planned);
+        assert!(job_verdict(&job, "k", false)
+            .unwrap_err()
+            .to_string()
+            .contains("waiting to resume"));
+        job.fault = Some("resume failed".into());
+        assert!(settled(&job));
+    }
+
+    #[test]
+    fn unavailable_continuation_is_reported_without_calling_the_swap_failed() {
+        let mut job = view("done", None);
+        job.entries.push(EntryView {
+            report_index: 0,
+            pane: Some("%1".into()),
+            disposition: Some("swapped".into()),
+            reason: Some("follow_up_text_unavailable".into()),
+            uncertain_effects: 0,
+            outcome: None,
+            continuation: Some("text_unavailable".into()),
+            follow_up: None,
+        });
+        let outcome = job_outcomes(&job).remove(0);
+        assert_eq!(outcome.status, SwapStatus::Swapped);
+        assert!(outcome
+            .note
+            .contains("follow-up withheld because text is unavailable"));
+        assert!(job_verdict(&job, "k", false).is_ok());
+    }
+
+    #[test]
+    fn remote_bounded_status_accepts_a_deferred_job_as_pending() {
+        let job = view("deferred", None);
+        let output = tend::work_control::WorkCommandOutput {
+            stdout: serde_json::to_string(&job).unwrap(),
+            stderr: String::new(),
+            exit_code: 0,
+        };
+        let cli = Cli::parse_from(["swap", "--status", "k", "--wait-secs", "1"]);
+        assert!(remote_job(&output, &cli.args, "remote").is_ok());
     }
 }
