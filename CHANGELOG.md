@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tend work link WORK --github OWNER/REPO#N | --linear KEY` attaches an
+  issue or pull request to a Work record, and `tend work refresh WORK`
+  (or `--all`) re-reads its title and state. Read-only, no agent turn: `gh
+  api` for GitHub, the GraphQL API with `LINEAR_API_KEY` for Linear
+  (`work_external_v1`).
 - `tend work dispatch-status` (and `tend_dispatch_status`) includes the
   result records filed on the dispatched Work: summary, decision asked for,
   evidence, and the person's disposition and note, refreshed on every read.

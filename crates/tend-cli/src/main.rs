@@ -60,6 +60,7 @@ mod watch;
 mod windows_detach;
 mod work_backlog;
 mod work_compose;
+mod work_external;
 mod work_init;
 mod work_options;
 mod work_pipeline;
@@ -999,6 +1000,11 @@ enum WorkCmd {
     /// Add or edit a planned Work in the backlog without launching it.
     /// `tend work up WORK` later starts it from the plan.
     Plan(work_backlog::PlanArgs),
+    /// Attach a GitHub issue/PR or Linear issue to a Work record, read from
+    /// the tracker without an agent turn.
+    Link(work_external::LinkArgs),
+    /// Re-read the title and state of a Work's linked issues (read-only).
+    Refresh(work_external::RefreshArgs),
     /// Create a work window with its first agent, or add an agent when it exists.
     Start(agent_launch::WorkStartArgs),
     /// List tend-managed work windows.

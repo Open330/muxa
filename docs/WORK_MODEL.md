@@ -61,6 +61,23 @@ dashboard's editor, which keeps the plan when it saves metadata) and are
 served over IPC as `work_backlog`, `work_edit` and `work_record_show`
 (`work_backlog_v1`).
 
+### External issues
+
+```sh
+tend work link ENG-1 --github Open330/tend#483   # or an issue/PR URL
+tend work link ENG-1 --linear ENG-1234
+tend work refresh ENG-1                          # or --all
+```
+
+`link` reads the issue and stores it on the Work record; `refresh` re-reads
+the title and state of every linked GitHub or Linear issue. Both are
+read-only toward the tracker and spend no agent turn: GitHub through
+`gh api` (your `gh` login), Linear through its GraphQL API with
+`LINEAR_API_KEY`. The tracker's state is shown (`tend work show`, the
+dashboard) but never moves the Work's own stage. tendd stores what the CLI
+fetched (`work_external_upsert`, `work_external_v1`) after checking it for
+control characters and size.
+
 ## Current tmux compatibility
 
 Managed tmux currently binds one workspace to a session, one active Work run to

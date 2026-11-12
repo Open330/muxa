@@ -2654,6 +2654,24 @@ async fn a_planned_work_round_trips_over_ipc_with_its_result_records() {
         .work_record_show(&WorkIdentity::new("web", "NOPE"))
         .await
         .is_err());
+    // A fetched issue reference is stored as given, and refused when it
+    // would print a terminal escape.
+    let item = crate::work::ExternalItemRef {
+        source: "github".into(),
+        scope: Some("o/r".into()),
+        stable_id: None,
+        display_key: "#7".into(),
+        title: Some("Login loops".into()),
+        url: Some("https://github.com/o/r/issues/7".into()),
+        status: Some("open".into()),
+        item_type: Some("issue".into()),
+        synced_at: time::OffsetDateTime::now_utc(),
+    };
+    let linked = client.work_external_upsert(&id, &item).await.unwrap();
+    assert_eq!(linked.external_items, vec![item.clone()]);
+    let mut bad = item;
+    bad.title = Some("x\u{1b}[2J".into());
+    assert!(client.work_external_upsert(&id, &bad).await.is_err());
     tx.send(()).unwrap();
     handle.await.unwrap();
 }

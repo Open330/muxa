@@ -65,6 +65,42 @@ pub struct ExternalItemRef {
     pub synced_at: OffsetDateTime,
 }
 
+impl ExternalItemRef {
+    /// Refuse what a terminal should not print or a list should not hold:
+    /// blank keys, control characters, oversized text, non-web URLs.
+    pub fn validate(&self) -> Result<(), String> {
+        let line = |label: &str, value: &str, max: usize| {
+            if value.trim().is_empty() || value.len() > max {
+                return Err(format!("{label} must be 1-{max} bytes"));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(format!("{label} cannot contain control characters"));
+            }
+            Ok(())
+        };
+        line("source", &self.source, 64)?;
+        line("display key", &self.display_key, 128)?;
+        for (label, value, max) in [
+            ("scope", self.scope.as_deref(), 256),
+            ("stable id", self.stable_id.as_deref(), 256),
+            ("title", self.title.as_deref(), 512),
+            ("status", self.status.as_deref(), 64),
+            ("item type", self.item_type.as_deref(), 64),
+        ] {
+            if let Some(value) = value {
+                line(label, value, max)?;
+            }
+        }
+        if let Some(url) = &self.url {
+            line("url", url, 2048)?;
+            if !url.starts_with("https://") && !url.starts_with("http://") {
+                return Err("url must be http(s)".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStage {
@@ -220,6 +256,9 @@ pub struct WorkRecord {
 pub const WORK_BACKLOG_CAPABILITY: &str = "work_backlog_v1";
 /// Daemons that honor `newest` on `work_record_show`.
 pub const WORK_RECENT_RESULTS_CAPABILITY: &str = "work_recent_results_v1";
+/// Daemons that store client-refreshed external references
+/// (`work_external_upsert`).
+pub const WORK_EXTERNAL_CAPABILITY: &str = "work_external_v1";
 
 /// What `tend work up` needs to start a planned Work, plus its backlog
 /// position. Every field is optional; `work up` arguments win over it.

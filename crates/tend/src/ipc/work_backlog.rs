@@ -69,6 +69,28 @@ pub(super) async fn response(
             }
             ("work_record_show", response)
         }
+        RequestBody::WorkExternalUpsert { identity, item } => {
+            if let Err(error) =
+                crate::work::validate_identity(&identity).and_then(|()| item.validate())
+            {
+                return ("work_external_upsert", Response::err(error));
+            }
+            let result = work_store
+                .lock()
+                .await
+                .upsert_external_item(identity, item)
+                .await;
+            (
+                "work_external_upsert",
+                match result {
+                    Ok(record) => Response {
+                        work_record: Some(Box::new(record)),
+                        ..Response::ok()
+                    },
+                    Err(error) => Response::err(format!("saving the Work record: {error}")),
+                },
+            )
+        }
         _ => ("work", Response::err("not a Work backlog request")),
     }
 }
