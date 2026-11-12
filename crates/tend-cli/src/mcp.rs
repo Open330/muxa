@@ -1193,13 +1193,19 @@ async fn call_tool_inner(
         object.insert("expects_reply".into(), json!(true));
         object.insert("notify".into(), json!(true));
         object.insert("work_mode".into(), json!("read_only"));
-        let stores = crate::decision_record::daemon_supports(
-            client,
-            tend::decision::HUMAN_DECISION_CAPABILITY,
-        )
-        .await;
-        if let Err(error) = crate::decision_record::attention_decision(object, stores) {
-            return Ok(error_result(&error));
+        if crate::decision_record::has_decision_fields(object) {
+            let stores = match crate::decision_record::daemon_supports(
+                client,
+                tend::decision::HUMAN_DECISION_CAPABILITY,
+            )
+            .await
+            {
+                Ok(stores) => stores,
+                Err(error) => return Ok(error_result(&error)),
+            };
+            if let Err(error) = crate::decision_record::attention_decision(object, stores) {
+                return Ok(error_result(&error));
+            }
         }
         "tend_send_message"
     } else {

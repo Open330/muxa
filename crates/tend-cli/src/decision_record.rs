@@ -104,6 +104,14 @@ pub(crate) fn render_plain(decision: &Decision) -> String {
         out.push_str("\n\nEvidence:");
         for evidence in &decision.evidence {
             let _ = write!(out, "\n- {}", evidence.describe());
+            if let Evidence::Test {
+                tail: Some(tail), ..
+            } = evidence
+            {
+                for line in tail.lines() {
+                    let _ = write!(out, "\n    {line}");
+                }
+            }
         }
     }
     out
@@ -130,12 +138,28 @@ pub(crate) fn attention_decision(
     Ok(())
 }
 
-/// Whether the daemon behind `client` advertises `capability`.
-pub(crate) async fn daemon_supports(client: &tend::ipc::Client, capability: &str) -> bool {
+/// Whether the daemon behind `client` advertises `capability`. A failed
+/// probe is an error, not "unsupported": choosing a fallback encoding on a
+/// timeout would make a retry of the same dispatch look like a different
+/// request.
+pub(crate) async fn daemon_supports(
+    client: &tend::ipc::Client,
+    capability: &str,
+) -> Result<bool, String> {
     client
         .hello(std::time::Duration::from_secs(2))
         .await
-        .is_ok_and(|hello| hello.capabilities.iter().any(|c| c == capability))
+        .map(|hello| hello.capabilities.iter().any(|c| c == capability))
+        .map_err(|error| {
+            format!("could not ask tendd whether it stores {capability} ({error}); nothing was sent, retry the same call")
+        })
+}
+
+/// Whether `args` carries any decision field.
+pub(crate) fn has_decision_fields(args: &Map<String, Value>) -> bool {
+    ["decision_needed", "options", "recommendation", "evidence"]
+        .iter()
+        .any(|key| args.get(*key).is_some_and(|value| !value.is_null()))
 }
 
 /// The `decision` field `attention_decision` left for the request builder.
@@ -195,12 +219,28 @@ mod tests {
             "body": "Merge #12?",
             "options": ["merge", "hold"],
             "recommendation": "merge",
+            "evidence": [{"kind": "test", "command": "cargo test", "passed": false, "tail": "boom\nat x.rs:3"}]
         }));
+        assert!(has_decision_fields(&args));
         attention_decision(&mut args, false).unwrap();
         assert!(args.get("decision").is_none());
         assert_eq!(
             args["body"],
-            "Merge #12?\n\nOptions:\n1. merge\n2. hold\n\nRecommendation: merge"
+            "Merge #12?\n\nOptions:\n1. merge\n2. hold\n\nRecommendation: merge\n\nEvidence:\n- test FAILED: cargo test\n    boom\n    at x.rs:3"
+        );
+        assert!(!has_decision_fields(&object(
+            json!({"body": "x", "options": null})
+        )));
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_daemon_is_an_error_not_a_missing_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = tend::ipc::Client::new(dir.path().join("absent.sock"));
+        assert!(
+            daemon_supports(&client, tend::decision::HUMAN_DECISION_CAPABILITY)
+                .await
+                .is_err()
         );
     }
 
