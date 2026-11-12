@@ -7457,6 +7457,7 @@ mod tests {
                 "tend_cancel_message",
                 "tend_agent_search",
                 "tend_agent_read",
+                "tend_file_result",
             ],
         );
         let start_agent = tools
