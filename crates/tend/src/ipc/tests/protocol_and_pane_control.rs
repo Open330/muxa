@@ -602,6 +602,21 @@ async fn send_prompt_state_gate_refuses_a_busy_target_unless_forced() {
         .expect("an idle target is typed into");
     assert_eq!(sends.lock().unwrap().len(), 2);
     sends.lock().unwrap().clear();
+    // The full `-S` path of the same server matches the recorded short name,
+    // as it does for the send's authority check.
+    client
+        .send_prompt_with_gate(
+            "%1",
+            "hi",
+            false,
+            Some("/tmp/tmux-501/default"),
+            None,
+            Some(false),
+        )
+        .await
+        .expect("the same endpoint spelled as a path");
+    assert_eq!(sends.lock().unwrap().len(), 1);
+    sends.lock().unwrap().clear();
 
     store
         .apply(&AgentEvent::PromptSubmitted {

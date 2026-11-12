@@ -4851,13 +4851,9 @@ async fn send_prompt_with_local_cmux(
             .into_iter()
             .filter(|agent| agent.pane.as_deref() == Some(pane))
             .collect();
-        // This path types without the daemon, so it applies the same gate.
-        if !force {
-            tend::prompt_delivery::idle_gate(pane, &on_pane, None, None)?;
-        }
         let mut endpoints = on_pane
-            .into_iter()
-            .filter_map(|agent| agent.tmux_socket)
+            .iter()
+            .filter_map(|agent| agent.tmux_socket.clone())
             .collect::<Vec<_>>();
         endpoints.sort();
         endpoints.dedup();
@@ -4870,6 +4866,12 @@ async fn send_prompt_with_local_cmux(
                 "cmux pane {pane} exists on multiple socket endpoints; run tend mcp inside the target cmux instance"
             ));
         };
+        // This path types without the daemon, so it applies the same gate,
+        // judged on the endpoint it is about to type into. It has no daemon
+        // input guard (it never had one); the state is as fresh as this read.
+        if !force {
+            tend::prompt_delivery::idle_gate(pane, &on_pane, Some(&endpoint), None)?;
+        }
         let target_pane = pane.to_string();
         let target_prompt = prompt.to_string();
         if let Ok(Some(outcome)) = tokio::task::spawn_blocking(move || {
@@ -4898,6 +4900,26 @@ async fn send_prompt_with_local_cmux(
         }
     }
 
+    // A daemon without the gate ignores `force` and would type into a busy
+    // target; refuse rather than silently lose the gate.
+    if !force {
+        let hello = client
+            .hello(Duration::from_secs(3))
+            .await
+            .map_err(|error| error.to_string())?;
+        if !hello
+            .capabilities
+            .iter()
+            .any(|cap| cap == tend::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY)
+        {
+            return Err(format!(
+                "{}: this tendd cannot check that the target is idle (no {}); nothing was sent. \
+                 Upgrade/restart tendd, or pass force=true to type regardless.",
+                tend::prompt_delivery::TARGET_NOT_IDLE,
+                tend::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY,
+            ));
+        }
+    }
     // This process's endpoint identifies the caller's server, never the
     // daemon's ambient server. Explicit targeting always wins.
     let caller_socket = socket
@@ -8512,6 +8534,57 @@ mod tests {
 
         tx.send(()).unwrap();
         handle.await.unwrap();
+    }
+
+    /// A daemon that predates `send_prompt_state_gate_v1` would ignore
+    /// `force` and type into a busy target, so a gated send refuses before
+    /// asking it to type anything. A forced send still works there.
+    #[tokio::test]
+    async fn send_prompt_refuses_to_lose_the_gate_against_an_older_daemon() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("old-daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let kinds = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = kinds.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(request["kind"].as_str().unwrap_or_default().to_string());
+                    // No capabilities: an old daemon.
+                    let _ = writer.write_all(b"{\"ok\":true}\n").await;
+                }
+            }
+        });
+        let client = Client::new(socket);
+        let call = |force: bool| {
+            json!({
+                "jsonrpc":"2.0", "id":41, "method":"tools/call",
+                "params":{"name":"tend_send_prompt", "arguments":{
+                    "pane":"%1", "text":"hi", "socket":"default", "force":force}},
+            })
+        };
+        let refused = dispatch(&client, &call(false)).await.unwrap();
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(refused.to_string().contains("send_prompt_state_gate_v1"));
+        assert!(!kinds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|kind| kind == "send_prompt"));
+        let forced = dispatch(&client, &call(true)).await.unwrap();
+        assert_ne!(forced["result"]["isError"], true, "{forced}");
+        assert!(kinds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|kind| kind == "send_prompt"));
     }
 
     #[tokio::test]

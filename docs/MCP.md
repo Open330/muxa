@@ -244,7 +244,8 @@ answer. Pass `force=true` only when a person explicitly asked for that
 keystroke. Work another agent should pick up belongs in the mailbox
 (`tend_send_message` / `tend_call_peer`), which waits for the recipient to be
 idle by itself. The gate is the daemon capability `send_prompt_state_gate_v1`;
-an older daemon ignores `force` and types as before. Operator clients (`tend
+against an older daemon, which would ignore it, a non-forced call is refused
+rather than typed. Operator clients (`tend
 watch`, Tend for Mac) omit the field and keep typing on a person's action;
 `tend_fleet_send_prompt` is not gated yet.
 

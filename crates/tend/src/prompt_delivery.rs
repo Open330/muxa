@@ -88,7 +88,15 @@ pub fn idle_gate(
     let live: Vec<_> = agents
         .iter()
         .filter(|agent| agent.state != crate::AgentState::Stopped)
-        .filter(|agent| socket.is_none_or(|socket| agent.tmux_socket.as_deref() == Some(socket)))
+        // The same endpoint matching as the send's authority resolver, so
+        // `default` and its full `-S` path name one server.
+        .filter(|agent| {
+            socket.is_none_or(|socket| {
+                agent.tmux_socket.as_deref().is_some_and(|recorded| {
+                    crate::backend::pane_endpoints_match(Some(pane), recorded, socket)
+                })
+            })
+        })
         .filter(|agent| session_id.is_none_or(|session| agent.session_id == session))
         .collect();
     if live.is_empty() {
@@ -273,6 +281,30 @@ mod tests {
                 at: OffsetDateTime::now_utc(),
             })
             .await;
+    }
+
+    /// The gate judges only rows on the endpoint being typed into: a live row
+    /// elsewhere neither vouches for nor blocks it.
+    #[tokio::test]
+    async fn the_idle_gate_is_scoped_to_the_selected_endpoint() {
+        let store = Store::shared();
+        let mut agents = start(&store).await;
+        let mut other = agents[0].clone();
+        other.session_id = "other".into();
+        other.tmux_socket = Some("/other.sock".into());
+        agents[0].state = crate::AgentState::Idle;
+        other.state = crate::AgentState::Stopped;
+        let rows = [agents[0].clone(), other.clone()];
+        // Idle on A, only a stopped row on B: typing into B is untracked.
+        assert!(idle_gate("rmux:%7", &rows, Some("/other.sock"), None).is_err());
+        assert!(idle_gate("rmux:%7", &rows, Some("/test.sock"), None).is_ok());
+        // Busy on A does not refuse an idle B.
+        agents[0].state = crate::AgentState::Working;
+        other.state = crate::AgentState::Idle;
+        let rows = [agents[0].clone(), other];
+        assert!(idle_gate("rmux:%7", &rows, Some("/other.sock"), None).is_ok());
+        let refused = idle_gate("rmux:%7", &rows, Some("/test.sock"), None).unwrap_err();
+        assert!(refused.starts_with(TARGET_NOT_IDLE), "{refused}");
     }
 
     #[tokio::test]
