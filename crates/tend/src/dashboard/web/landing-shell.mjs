@@ -71,7 +71,7 @@ function words(line) {
   if (active) result.push(word);
   return result;
 }
-export function runDemoCommand(shell, command, { status = "claude  %12  waiting_input\ncodex   %13  idle\ngemini  %14  working" } = {}) {
+export function runDemoCommand(shell, command, { status = "claude  %12  waiting_input\ncodex   %13  idle\nagy     %14  working" } = {}) {
   const next = { ...shell, history: command.trim() ? [...shell.history, command].slice(-100) : shell.history };
   let args; try { args = words(command); } catch (error) { return { shell: next, output: `zsh: ${error.message}` }; }
   if (!args.length) return { shell: next, output: "" };

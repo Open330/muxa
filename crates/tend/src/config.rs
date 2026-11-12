@@ -700,8 +700,8 @@ pub struct WorktreeConfig {
 
 /// One `[agent.<program>]` entry — how this provider's CLI is invoked.
 ///
-/// Keyed by the provider tend launches (`claude`, `codex`, `gemini`,
-/// `opencode`, `agy`) so a flag can never reach the wrong CLI. That is the
+/// Keyed by the provider tend launches (`claude`, `codex`, `opencode`,
+/// `agy`) so a flag can never reach the wrong CLI. That is the
 /// whole reason this is not one flat list: `--model` is spelled per
 /// provider, and a single shared list either only ever fits one of them or
 /// has to be guarded at every launch site to keep `claude`'s model name
@@ -753,7 +753,7 @@ pub struct PipelineAgentConfig {
     /// the desired-vs-actual diff runs on, so it has to be unique in the
     /// pipeline and must not change once panes exist under it.
     pub alias: String,
-    /// Allowlisted agent CLI: `claude`, `codex`, `gemini`, or `opencode`.
+    /// Allowlisted agent CLI: `claude`, `codex`, `agy`, or `opencode`.
     pub program: String,
     /// Collaboration role, recorded on the pane so peers can address it as
     /// `role:<role>`.
@@ -1143,7 +1143,7 @@ pub struct DiscoveryConfig {
     pub enabled: bool,
     /// Cadence of the periodic discovery rescan, in seconds. Startup
     /// discovery always runs once; this keeps newly-created panes (a fresh
-    /// `claude`/`codex`/`gemini` session in a new tmux session) appearing in
+    /// `claude`/`codex`/`agy` session in a new tmux session) appearing in
     /// `tend status` within `interval_secs` instead of only after the agent
     /// fires its first hook. Set `0` to keep the legacy run-once-at-startup
     /// behavior. The pass uses one `tmux list-panes` and, only for wrapper
@@ -1693,6 +1693,33 @@ impl Config {
                 "config.toml: dashboard OIDC sign-in and pane sharing were removed — this section is ignored; delete it",
             );
         }
+        let retired = self
+            .agent
+            .keys()
+            .filter(|program| crate::agent_control::is_retired_agent_program(program))
+            .map(|program| format!("agent.{program}"))
+            .chain(
+                self.mcp
+                    .guide
+                    .agent
+                    .as_deref()
+                    .filter(|agent| crate::agent_control::is_retired_agent_program(agent))
+                    .map(|_| "mcp.guide.agent".to_string()),
+            )
+            .chain(
+                self.automation
+                    .rule
+                    .iter()
+                    .filter(|rule| rule.agent.iter().any(|spec| spec.0.is_none()))
+                    .map(|rule| format!("automation.rule[{}].agent", rule.name)),
+            );
+        for path in retired {
+            tracing::warn!(
+                path = %path,
+                "config.toml: {}; this entry no longer applies and can be removed",
+                crate::agent_control::RETIRED_GEMINI_NOTE,
+            );
+        }
         if !self.unknown.is_empty() {
             // A newer tend wrote a section this build does not know, or a
             // top-level table is misspelled. Either way, running on the
@@ -1736,12 +1763,14 @@ fn validate_mcp(cfg: &McpConfig) -> std::result::Result<(), ConfigError> {
         message,
     };
     if let Some(agent) = cfg.guide.agent.as_deref() {
-        if !matches!(agent, "claude" | "codex" | "gemini" | "agy" | "opencode") {
+        // A retired provider still loads (warned in `warn_soft_issues`);
+        // launching through it fails with the reason instead.
+        if !matches!(agent, "claude" | "codex" | "agy" | "opencode")
+            && !crate::agent_control::is_retired_agent_program(agent)
+        {
             return Err(invalid(
                 "mcp.guide.agent",
-                format!(
-                    "unknown agent {agent:?}; expected claude, codex, gemini, agy, or opencode"
-                ),
+                format!("unknown agent {agent:?}; expected claude, codex, agy, or opencode"),
             ));
         }
     } else if !cfg.guide.options.is_empty() {
@@ -1779,12 +1808,14 @@ fn validate_agents(
             path: path.clone(),
             message,
         };
-        if !matches!(
-            program.as_str(),
-            "claude" | "codex" | "gemini" | "agy" | "opencode"
-        ) {
+        if crate::agent_control::is_retired_agent_program(program) {
+            // Written for an older tend; nothing launches it any more, so it
+            // configures nothing. Warned in `warn_soft_issues`.
+            continue;
+        }
+        if !matches!(program.as_str(), "claude" | "codex" | "agy" | "opencode") {
             return Err(invalid(format!(
-                "unknown agent {program:?}; expected claude, codex, gemini, agy, or opencode"
+                "unknown agent {program:?}; expected claude, codex, agy, or opencode"
             )));
         }
         if launch.account.is_some() && !crate::account_route::PROVIDERS.contains(&program.as_str())
@@ -2224,7 +2255,7 @@ pub struct WatchConfig {
     /// writes a recap only when you come back after being away; Codex prints
     /// one when it compacts conversation context, which tend observes from
     /// capture-capable panes. Agents with no recap source (for example,
-    /// Gemini) fall straight through to the last prompt.
+    /// agy) fall straight through to the last prompt.
     #[serde(default)]
     pub summary: WatchSummary,
     /// Hide agents that aren't bound to a tmux pane.
@@ -2671,7 +2702,34 @@ options = ["--model", "gpt-5-codex"]
         );
         // A provider nobody configured launches bare rather than borrowing
         // another's model name.
-        assert!(cfg.launch_options("gemini", None).is_empty());
+        assert!(cfg.launch_options("opencode", None).is_empty());
+    }
+
+    #[test]
+    fn a_config_naming_the_retired_gemini_cli_still_loads() {
+        // Written for a tend that still launched the Gemini CLI. Refusing it
+        // would stop the daemon on upgrade over an entry that now does
+        // nothing.
+        let cfg: Config = toml::from_str(
+            "[mcp.guide]\nagent = \"gemini\"\noptions = [\"--yolo\"]\n\
+             [agent.gemini]\noptions = [\"--model\", \"gemini-2.5-pro\"]\n\
+             [[automation.rule]]\nname = \"g\"\non = \"error\"\naction = \"notify\"\n\
+             message = \"x\"\nagent = [\"gemini\", \"codex\"]\n",
+        )
+        .unwrap();
+        cfg.validate().unwrap();
+        cfg.warn_soft_issues();
+        let rule = &cfg.automation.rule[0];
+        assert_eq!(
+            rule.agent,
+            [
+                crate::automation::AgentKindSpec(None),
+                crate::automation::AgentKindSpec(Some(crate::AgentKind::Codex)),
+            ]
+        );
+        // Written back unchanged, so the rule never widens to "any agent".
+        let back = toml::to_string(&cfg.automation).unwrap();
+        assert!(back.contains("\"gemini_cli\""), "{back}");
     }
 
     #[test]
@@ -2746,7 +2804,7 @@ options = ["--model", "gpt-5-codex"]
     #[test]
     fn account_routing_is_only_for_aas_providers_and_never_blank() {
         for bad in [
-            "[agent.gemini]\naccount = \"auto\"\n",
+            "[agent.opencode]\naccount = \"auto\"\n",
             "[agent.claude]\naccount = \" \"\n",
         ] {
             let cfg: Config = toml::from_str(bad).unwrap();

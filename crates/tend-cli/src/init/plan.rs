@@ -112,11 +112,13 @@ pub fn build(
 
     for c in &comps {
         match c {
-            // These share a manifest and are planned together after ordinary edits.
+            // These share a manifest and are planned together after ordinary
+            // edits; the retired Gemini sweep is planned once below.
             Component::AgentInstructions
             | Component::AgentSkills
             | Component::AgentMcp
-            | Component::Automation => {}
+            | Component::Automation
+            | Component::RetiredGeminiHooks => {}
             Component::TmuxPopup
             | Component::TmuxStatusLine
             | Component::TmuxPeek
@@ -127,7 +129,6 @@ pub fn build(
             }
             Component::ClaudeHooks => plan_claude(direction, *c, &mut actions, &mut warnings)?,
             Component::CodexHooks => plan_codex(direction, *c, &mut actions)?,
-            Component::GeminiHooks => plan_gemini(direction, *c, &mut actions)?,
             Component::AntigravityHooks => plan_antigravity(direction, *c, &mut actions)?,
             Component::OpencodeHooks => plan_opencode(direction, *c, &mut actions)?,
             Component::TenddSystemd => plan_systemd(direction, *c, detect, &mut actions)?,
@@ -201,6 +202,8 @@ pub fn build(
     // tend. We always include SourceTmuxConf here because the env block
     // may be brand-new (or newly removed) even when popup/statusline are
     // unchanged.
+    plan_retired_gemini(&comps, &mut actions)?;
+
     if tmux_selected {
         if let Some(path) = tmux_path {
             plan_tmux_env(direction, &path, socket, &mut actions)?;
@@ -258,7 +261,7 @@ fn plan_opencode(direction: Direction, c: Component, actions: &mut Vec<Action>) 
 /// Push an `EditFile`, but on **uninstall** demote it to a `DeleteFile`
 /// when stripping our block leaves the file empty. This keeps us from
 /// leaving a zero-byte orphan behind for files tend created from scratch
-/// (the opencode `tend.ts`, or a codex/gemini config that held nothing
+/// (the opencode `tend.ts`, or a codex config that held nothing
 /// but our hooks). An empty remainder is itself proof there was no
 /// pre-existing user content to preserve, so this never deletes a file
 /// the user had populated by hand.
@@ -491,25 +494,49 @@ fn plan_codex(direction: Direction, c: Component, actions: &mut Vec<Action>) -> 
     Ok(())
 }
 
-fn plan_gemini(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
+/// Remove the hooks an older tend wrote into `~/.gemini/settings.json` for
+/// the retired Gemini CLI, in either direction: there is nothing left to
+/// install. Only an actual tend entry produces an action, so a host that
+/// never had them (or a settings file tend cannot parse) sees no change.
+///
+/// Runs with any agent-hook component, so an upgrade's `tend init` leaves no
+/// dead hooks behind.
+fn plan_retired_gemini(comps: &[Component], actions: &mut Vec<Action>) -> Result<()> {
+    let agent_hooks = comps.iter().any(|c| {
+        matches!(
+            c,
+            Component::ClaudeHooks
+                | Component::CodexHooks
+                | Component::AntigravityHooks
+                | Component::OpencodeHooks
+                | Component::RetiredGeminiHooks
+        )
+    });
+    if !agent_hooks {
+        return Ok(());
+    }
     let Some(path) = files::gemini::default_path() else {
         return Ok(());
     };
-    let before = read_to_string_opt(&path)?;
-    let original = before.clone().unwrap_or_default();
-    let (after, outcome) = match direction {
-        Direction::Install => {
-            files::gemini::upsert(&original).context("merging gemini settings.json")?
-        }
-        Direction::Uninstall => {
-            files::gemini::remove(&original).context("scrubbing gemini settings.json")?
-        }
+    let Some(original) = read_to_string_opt(&path)? else {
+        return Ok(());
     };
-    push_edit_or_delete(direction, c, path, before, after, outcome, actions);
+    let Ok((after, outcome)) = files::gemini::remove(&original) else {
+        return Ok(());
+    };
+    if outcome.changed() {
+        actions.push(Action::EditFile {
+            component: Component::RetiredGeminiHooks,
+            path,
+            before: Some(original),
+            after,
+            outcome,
+        });
+    }
     Ok(())
 }
 
-/// agy's hooks live in their own file, so unlike `plan_gemini` this creates
+/// agy's hooks live in their own file, so unlike the old Gemini CLI hooks this creates
 /// `~/.gemini/config/hooks.json` when absent — that is the normal case, since
 /// agy only writes it once its own `/hooks` command is used.
 fn plan_antigravity(direction: Direction, c: Component, actions: &mut Vec<Action>) -> Result<()> {
@@ -938,7 +965,7 @@ mod tests {
         let mut actions = Vec::new();
         push_edit_or_delete(
             Direction::Uninstall,
-            Component::GeminiHooks,
+            Component::CodexHooks,
             PathBuf::from("/x"),
             None,
             String::new(),

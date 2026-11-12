@@ -399,7 +399,7 @@ only other agent; with three or more participants use a handle — `@claude`,
 `@codex` — or, failing that, `%N` / `pane:%N`.
 
 Every agent pane gets a handle without anyone asking for one. The first agent
-of a runtime in a room becomes `@claude`, `@codex`, `@gemini`, `@agy`, or
+of a runtime in a room becomes `@claude`, `@codex`, `@agy`, or
 `@opencode`; a second of the same kind becomes `@claude2`, and so on. tend
 mints it on the agent's first hook event of a session and stores it on the pane
 as `@tend_agent_alias`, so it outlives tendd, the CLI, and the agent restarting

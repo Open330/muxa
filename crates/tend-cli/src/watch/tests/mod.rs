@@ -1520,14 +1520,14 @@ fn snapshot_row_error() {
         vec![fake_agent(
             "s-err",
             Some("%4"),
-            AgentKind::GeminiCli,
+            AgentKind::Antigravity,
             AgentState::Error,
             Some("boom"),
             None,
             None,
             None,
         )],
-        vec![fake_pane("%4", "alpha", 3, 0, "gemini")],
+        vec![fake_pane("%4", "alpha", 3, 0, "agy")],
     );
     terminal.draw(|f| render(f, &mut app)).unwrap();
     insta::assert_snapshot!(snapshot_helpers::buffer_string(&terminal));

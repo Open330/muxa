@@ -32,11 +32,7 @@ impl WorkerSpawnSpec {
     fn normalize(mut self) -> Result<Self, CollaborationError> {
         if !matches!(
             self.agent_kind,
-            AgentKind::Codex
-                | AgentKind::ClaudeCode
-                | AgentKind::GeminiCli
-                | AgentKind::Opencode
-                | AgentKind::Antigravity
+            AgentKind::Codex | AgentKind::ClaudeCode | AgentKind::Opencode | AgentKind::Antigravity
         ) {
             return Err(CollaborationError::WorkerLaunch(
                 "not a worker provider".into(),

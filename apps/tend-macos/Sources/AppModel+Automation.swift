@@ -128,9 +128,9 @@ struct TendAutomationRuleDraft: Hashable, Sendable {
     var askCondition: TendAutomationAskCondition?
 
     /// The agent kinds the picker offers, as tendd stores them. Shorthand
-    /// (`claude`, `gemini`, `agy`) is accepted on the wire but normalised
+    /// (`claude`, `agy`) is accepted on the wire but normalised
     /// to these, so the app writes the canonical spelling from the start.
-    static let agentKinds = ["claude_code", "codex", "opencode", "gemini_cli", "antigravity"]
+    static let agentKinds = ["claude_code", "codex", "opencode", "antigravity"]
     /// `RateLimitScope`, for the rate-limit event's window filter.
     static let rateLimitScopes = ["five_hour", "seven_day", "unknown"]
     /// `local` is every pane this daemon governs; the rest narrow to one
@@ -559,10 +559,6 @@ struct TendAgentMark: Hashable, Sendable {
         TendAgentMark(
             wire: "codex", name: "Codex",
             engine: .codex, program: "codex", ownSymbol: nil
-        ),
-        TendAgentMark(
-            wire: "gemini_cli", name: "Gemini",
-            engine: .gemini, program: "gemini", ownSymbol: nil
         ),
         TendAgentMark(
             wire: "antigravity", name: "Antigravity",

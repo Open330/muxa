@@ -33,6 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `login` or `capabilities.pane_sharing`. Enrolled accounts and share
   databases under the data directory (`dashboard-operators/`,
   `dashboard-sharing/`) are no longer read and can be deleted.
+- The Google Gemini CLI is no longer a supported agent. Google retired it for
+  consumer tiers in June 2026 in favour of the Antigravity CLI (`agy`), which
+  tend keeps supporting in full. Gone: the `gemini` hook adapter and its
+  `tend init` component, the `gemini` launch profile (`tend agent start`,
+  `tend start`, the MCP `start_agent`/`spawn_agent` enums, pipelines, the
+  watch spawn form and the Mac app's New Agent sheet), discovery of `gemini`
+  panes, and the `gemini_cli` agent kind. Existing installs keep working:
+  `tend init` removes the hooks an older tend wrote into
+  `~/.gemini/settings.json` (the rest of that file and agy's own
+  `~/.gemini/config/hooks.json` are untouched), `tend doctor` reports any that
+  remain, and `tend hook gemini` stays as a silent no-op until then. A config
+  that still names `gemini` (`[agent.gemini]`, `mcp.guide.agent`, an
+  automation rule's `agent`) loads with a warning; launching through it fails
+  with the reason, and a rule's `gemini` filter matches no agent instead of
+  widening to every agent. Stored rows with the `gemini_cli` kind load as
+  `unknown`. The headless `tend ask` Gemini engine is unchanged in this
+  release.
 
 ### Changed
 
@@ -44,7 +61,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   everything) at startup and hourly rather than only at startup; and launch
   archives in `spawns/` that never completed expire after 90 days. The audit,
   backup and mailbox caps can each be turned off with `0`.
-
 ### Fixed
 
 - A peer that claims a request and ends its turn without replying no longer

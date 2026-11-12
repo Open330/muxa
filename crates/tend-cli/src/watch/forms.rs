@@ -233,7 +233,6 @@ pub(super) enum SpawnAgent {
     #[default]
     Claude,
     Codex,
-    Gemini,
     Antigravity,
     Opencode,
 }
@@ -243,7 +242,6 @@ impl SpawnAgent {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Gemini => "gemini",
             Self::Antigravity => "agy",
             Self::Opencode => "opencode",
         }
@@ -252,8 +250,7 @@ impl SpawnAgent {
     pub(super) fn next(self) -> Self {
         match self {
             Self::Claude => Self::Codex,
-            Self::Codex => Self::Gemini,
-            Self::Gemini => Self::Antigravity,
+            Self::Codex => Self::Antigravity,
             Self::Antigravity => Self::Opencode,
             Self::Opencode => Self::Claude,
         }
@@ -263,8 +260,7 @@ impl SpawnAgent {
         match self {
             Self::Claude => Self::Opencode,
             Self::Codex => Self::Claude,
-            Self::Gemini => Self::Codex,
-            Self::Antigravity => Self::Gemini,
+            Self::Antigravity => Self::Codex,
             Self::Opencode => Self::Antigravity,
         }
     }
@@ -282,7 +278,6 @@ impl SpawnAgent {
             Self::Codex => {
                 format!("codex --dangerously-bypass-approvals-and-sandbox {quoted}")
             }
-            Self::Gemini => format!("gemini --approval-mode yolo --skip-trust -i {quoted}"),
             Self::Antigravity => format!("agy --dangerously-skip-permissions -i {quoted}"),
             Self::Opencode => format!("opencode --prompt {quoted}"),
         }

@@ -7,7 +7,7 @@ README를 짧게 유지하기 위해 자세한 설치와 wiring 절차는 이 �
 - Rust 1.89+ (소스 빌드에만 필요)
 - tmux 3.x
 - Unix-like OS
-- Claude Code, OpenAI Codex, Google Gemini CLI, Google Antigravity CLI(`agy`) 중 하나
+- Claude Code, OpenAI Codex, Google Antigravity CLI(`agy`), opencode 중 하나
 
 ## 설치 전 체험
 
@@ -211,8 +211,7 @@ tmux source-file ~/.tmux.conf
 | --- | --- |
 | Claude Code | `examples/claude-settings.json`을 `~/.claude/settings.json`에 merge. |
 | OpenAI Codex | 호환되는 hook은 `tend init`으로 연결합니다. 데몬은 로컬 세션 rollout 로그도 2초마다 읽어 lifecycle을 복구합니다. |
-| Google Gemini CLI | `crates/tend/src/adapters/gemini.rs`의 hook block을 `~/.gemini/settings.json`에 merge. |
-| Google Antigravity CLI | `crates/tend/src/adapters/antigravity.rs`의 `tend` block을 `~/.gemini/config/hooks.json`에 추가. Gemini CLI의 `settings.json`이 **아니라** agy 전용 `hooks.json`입니다. |
+| Google Antigravity CLI | `crates/tend/src/adapters/antigravity.rs`의 `tend` block을 `~/.gemini/config/hooks.json`에 추가. `~/.gemini/settings.json`이 **아니라** agy 전용 `hooks.json`입니다. |
 
 ## 확인
 

@@ -6,7 +6,7 @@
 
 나를 기다리는 에이전트를 알려 주고 바로 데려다 줍니다. 그리고 팀 전체를 Work로
 운영합니다. 에이전트를 띄우고, 서로 리뷰하게 하고, 여러 호스트에 걸쳐 따라갑니다.
-이미 tmux에서 돌리는 Claude Code, Codex, Gemini CLI 세션에 설정 없이 붙어 시작하고,
+이미 tmux에서 돌리는 Claude Code, Codex, Antigravity CLI 세션에 설정 없이 붙어 시작하고,
 더 필요할 때 Tend가 에이전트를 직접 띄우고 소유하게 할 수 있습니다.
 
 [![CI](https://github.com/Open330/tend/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/tend/actions/workflows/ci.yml)
@@ -87,8 +87,8 @@ Tend는 두 층으로 되어 있습니다. **Attention** 층은 이미 돌리는
 **Runtime** 층은 Tend가 띄운 에이전트를 Work로 조직합니다. Attention은 Runtime 없이도
 동작합니다. [Direction](docs/DIRECTION.md)을 참고하세요.
 
-- **지금 환경을 그대로 둡니다.** Claude Code, Codex, Gemini CLI(후속인
-  Antigravity CLI `agy` 포함)의 hook에서 에이전트 상태를 읽고(hook이 없는
+- **지금 환경을 그대로 둡니다.** Claude Code, Codex, Antigravity CLI(`agy`)의
+  hook에서 에이전트 상태를 읽고(hook이 없는
   에이전트는 화면으로 감지), 이미 열어 둔 tmux pane에 연결합니다. 에이전트를 Tend로 띄울 필요도, 멀티플렉서를 바꿀 필요도
   없습니다. tmux, [rmux](https://rmux.io), [herdr](https://herdr.dev)를 동시에
   관찰할 수 있고 zellij는 CLI baseline을 지원합니다.
@@ -254,7 +254,7 @@ subagent로 활용하라는 협업 지침이 자동으로 노출됩니다.
 기존 peer 보고는 durable mailbox 보고 도구로 연결되며 명시적인 PR 참조 없이는
 GitHub PR을 의미하지 않습니다. `@peer`는 같은 window의 정상 agent를 결정적으로
 선택하고, `@claude`, `@codex`,
-`@gemini`, `@alias`, `role:name`으로 대상을 좁힐 수 있습니다. 기본 계약은
+`@agy`, `@alias`, `role:name`으로 대상을 좁힐 수 있습니다. 기본 계약은
 `REVIEW · READ-ONLY`입니다. 변경 실행은 명시적인 task 승인, 새 agent pane 생성은
 별도 확인이 있어야 합니다. Tend를 업그레이드하거나 등록된 스킬을 바꾼 뒤에는
 실행 중이던 agent를 재시작해야 MCP process가 새 도구와 템플릿을 읽습니다.
@@ -390,9 +390,12 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 | --- | --- | --- |
 | Claude Code | 지원 | `~/.claude/settings.json` |
 | OpenAI Codex | 지원 | `~/.codex/config.toml` |
-| Google Gemini CLI | 지원 | `~/.gemini/settings.json` |
 | Google Antigravity CLI (`agy`) | 지원 | `~/.gemini/config/hooks.json` — [문서](docs/ANTIGRAVITY.md) |
 | opencode | 실행 지원, hook 통합 예정 | [tracking issue](https://github.com/Open330/tend/issues/14) |
+
+Google Gemini CLI는 더 이상 지원하지 않습니다. 후속인 Antigravity CLI를 쓰세요.
+`tend init`이 예전 tend가 `~/.gemini/settings.json`에 쓴 hook을 지우고,
+남아 있으면 `tend doctor`가 알려 줍니다.
 
 데몬은 Codex 세션 rollout 로그도 2초마다 읽어 hook에서 빠진 활동과 턴 완료를
 보완합니다. 사용량 비율과 credit 정보는 통계이며, 실제 한도 오류가 있어야

@@ -389,23 +389,53 @@ impl AutomationCondition {
 }
 
 /// An [`AgentKind`] as an operator writes it. Accepts the canonical
-/// `snake_case` name and the everyday one (`claude`, `gemini`, `agy`);
-/// always serializes canonically so a rule written back to `config.toml`
-/// names the same kind the registry does.
+/// `snake_case` name and the everyday one (`claude`, `agy`); always
+/// serializes canonically so a rule written back to `config.toml` names the
+/// same kind the registry does.
+///
+/// `None` is a provider tend no longer supports (the Gemini CLI). A rule
+/// written for an older tend still loads, the entry matches no agent, and it
+/// is written back unchanged — dropping it would silently widen a rule
+/// limited to that provider into one that matches every agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct AgentKindSpec(pub AgentKind);
+pub struct AgentKindSpec(pub Option<AgentKind>);
+
+impl AgentKindSpec {
+    /// Canonical name of the retired kind a `None` spec stands for.
+    const RETIRED: &'static str = "gemini_cli";
+
+    #[must_use]
+    pub fn matches(self, kind: AgentKind) -> bool {
+        self.0 == Some(kind)
+    }
+}
+
+impl std::fmt::Display for AgentKindSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(kind) => kind.fmt(f),
+            None => write!(f, "{} (retired)", Self::RETIRED),
+        }
+    }
+}
 
 impl Serialize for AgentKindSpec {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.0.serialize(serializer)
+        match self.0 {
+            Some(kind) => kind.serialize(serializer),
+            None => serializer.serialize_str(Self::RETIRED),
+        }
     }
 }
 
 impl<'de> Deserialize<'de> for AgentKindSpec {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let text = String::deserialize(deserializer)?;
+        if crate::agent_control::is_retired_agent_program(&text) {
+            return Ok(Self(None));
+        }
         parse_agent_kind(&text)
-            .map(Self)
+            .map(|kind| Self(Some(kind)))
             .map_err(serde::de::Error::custom)
     }
 }
@@ -416,12 +446,11 @@ pub fn parse_agent_kind(raw: &str) -> Result<AgentKind, String> {
         "claude" | "claude_code" | "claude-code" => Ok(AgentKind::ClaudeCode),
         "codex" => Ok(AgentKind::Codex),
         "opencode" => Ok(AgentKind::Opencode),
-        "gemini" | "gemini_cli" | "gemini-cli" => Ok(AgentKind::GeminiCli),
         "agy" | "antigravity" => Ok(AgentKind::Antigravity),
         "task" => Ok(AgentKind::Task),
         "unknown" => Ok(AgentKind::Unknown),
         other => Err(format!(
-            "unknown agent {other:?}; use claude, codex, opencode, gemini, agy, task, or unknown"
+            "unknown agent {other:?}; use claude, codex, opencode, agy, task, or unknown"
         )),
     }
 }
@@ -925,7 +954,7 @@ impl AutomationRule {
     pub fn filter_summary(&self) -> String {
         let mut parts = Vec::new();
         if !self.agent.is_empty() {
-            let kinds: Vec<String> = self.agent.iter().map(|spec| spec.0.to_string()).collect();
+            let kinds: Vec<String> = self.agent.iter().map(ToString::to_string).collect();
             parts.push(format!("agent={}", kinds.join(",")));
         }
         if let Some(workspace) = &self.workspace {
@@ -1116,7 +1145,7 @@ impl AutomationSubject {
     }
 
     fn matches_filters(&self, rule: &AutomationRule) -> bool {
-        if !rule.agent.is_empty() && !rule.agent.iter().any(|spec| spec.0 == self.kind) {
+        if !rule.agent.is_empty() && !rule.agent.iter().any(|spec| spec.matches(self.kind)) {
             return false;
         }
         if let Some(pane) = &rule.pane {
@@ -2761,8 +2790,8 @@ only_if_still = "rate_limited"
         assert_eq!(
             rule.agent,
             vec![
-                AgentKindSpec(AgentKind::ClaudeCode),
-                AgentKindSpec(AgentKind::Codex)
+                AgentKindSpec(Some(AgentKind::ClaudeCode)),
+                AgentKindSpec(Some(AgentKind::Codex))
             ]
         );
         assert_eq!(
@@ -3008,7 +3037,7 @@ waaait = "5m"
             AutomationEvent::Error,
             AutomationAction::SendPrompt,
         );
-        rule.agent = vec![AgentKindSpec(AgentKind::Codex)];
+        rule.agent = vec![AgentKindSpec(Some(AgentKind::Codex))];
         rule.notification = Some("(?i)^Selected model is at capacity\\.".into());
         rule.text = Some("continue".into());
         rule.wait = Some(WaitSpec::after_event(time::Duration::minutes(2)));
@@ -3092,7 +3121,7 @@ waaait = "5m"
         };
 
         let mut rule = resume_rule();
-        rule.agent = vec![AgentKindSpec(AgentKind::ClaudeCode)];
+        rule.agent = vec![AgentKindSpec(Some(AgentKind::ClaudeCode))];
         rule.workspace = Some("webapp".into());
         rule.work = Some("^ENG-".into());
         rule.pane = Some("%42".into());
@@ -3101,7 +3130,7 @@ waaait = "5m"
         assert!(fires(&rule));
 
         for mutate in [
-            (|r: &mut AutomationRule| r.agent = vec![AgentKindSpec(AgentKind::Codex)])
+            (|r: &mut AutomationRule| r.agent = vec![AgentKindSpec(Some(AgentKind::Codex))])
                 as fn(&mut AutomationRule),
             |r: &mut AutomationRule| r.workspace = Some("other".into()),
             |r: &mut AutomationRule| r.work = Some("^JIRA-".into()),
@@ -4133,7 +4162,7 @@ waaait = "5m"
             on: AutomationEvent::RateLimited,
             enabled: true,
             action: AutomationAction::SendPrompt,
-            agent: vec![AgentKindSpec(AgentKind::ClaudeCode)],
+            agent: vec![AgentKindSpec(Some(AgentKind::ClaudeCode))],
             workspace: None,
             work: Some("^ENG-".into()),
             pane: None,

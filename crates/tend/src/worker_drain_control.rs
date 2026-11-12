@@ -868,7 +868,7 @@ mod tests {
             let mut p = worker.clone();
             match change {
                 0 => p.launch_purpose = LaunchPurpose::Primary,
-                1 => p.agent_kind = AgentKind::GeminiCli,
+                1 => p.agent_kind = AgentKind::Antigravity,
                 2 => p.agent_session_id = "pending-pane:default:%2".into(),
                 _ => p.state = AgentState::Working,
             }

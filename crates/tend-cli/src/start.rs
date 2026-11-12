@@ -108,7 +108,6 @@ async fn configure_agent(
     let hook = match program {
         AgentProgram::Claude => "claude-hooks",
         AgentProgram::Codex => "codex-hooks",
-        AgentProgram::Gemini => "gemini-hooks",
         AgentProgram::Antigravity => "agy-hooks",
         AgentProgram::Opencode => "opencode-hooks",
     };
@@ -136,7 +135,6 @@ fn choose(cwd: &std::path::Path) -> Result<&'static str> {
     let programs = [
         AgentProgram::Codex,
         AgentProgram::Claude,
-        AgentProgram::Gemini,
         AgentProgram::Antigravity,
         AgentProgram::Opencode,
     ];

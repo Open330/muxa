@@ -25,7 +25,9 @@ private func guide(program: String? = nil, placement: String? = nil, direction: 
 }
 
 @Test func agentProgramsMatchTheCLIAllowlistAndItsAliases() {
-    #expect(TendAgentProgram.allCases.map(\.rawValue) == ["claude", "codex", "gemini", "agy", "opencode"])
+    #expect(TendAgentProgram.allCases.map(\.rawValue) == ["claude", "codex", "agy", "opencode"])
+    // The retired Gemini CLI is no longer a launch choice.
+    #expect(TendAgentProgram(configValue: "gemini") == nil)
     #expect(TendAgentProgram(configValue: "claude-code") == .claude)
     #expect(TendAgentProgram(configValue: " CX ") == .codex)
     #expect(TendAgentProgram(configValue: "antigravity") == .agy)
@@ -36,7 +38,7 @@ private func guide(program: String? = nil, placement: String? = nil, direction: 
 @Test func quickStartProgramPrefersTheRememberedDefaultThenTheGuide() {
     #expect(TendAgentLaunchDefaults().program(guide: nil) == nil)
     #expect(TendAgentLaunchDefaults().program(guide: guide(program: "codex")) == .codex)
-    #expect(TendAgentLaunchDefaults(program: .gemini).program(guide: guide(program: "codex")) == .gemini)
+    #expect(TendAgentLaunchDefaults(program: .agy).program(guide: guide(program: "codex")) == .agy)
 }
 
 @Test func launchDefaultsRoundTripThroughUserDefaults() throws {
@@ -47,6 +49,14 @@ private func guide(program: String? = nil, placement: String? = nil, direction: 
     let saved = TendAgentLaunchDefaults(program: .codex, placement: .newWindow, options: ["--model", "o3"])
     saved.save(to: defaults)
     #expect(TendAgentLaunchDefaults.load(from: defaults) == saved)
+
+    // A default saved for the retired Gemini CLI keeps its placement but
+    // not its program or its Gemini-specific options.
+    defaults.set(
+        Data(#"{"program":"gemini","placement":"newWindow","options":["--model","gemini-2.5-pro"]}"#.utf8),
+        forKey: TendAgentLaunchDefaults.storageKey
+    )
+    #expect(TendAgentLaunchDefaults.load(from: defaults) == TendAgentLaunchDefaults(placement: .newWindow))
 }
 
 @Test func placementFollowsRememberedThenGuideAndDegrades() {

@@ -84,7 +84,7 @@ pushing. New lints otherwise appear in CI on code you did not touch.
 
 ## Adding a new agent adapter
 
-The stdin-JSON adapters (`claude`, `codex`, `gemini`, `antigravity`,
+The stdin-JSON adapters (`claude`, `codex`, `antigravity`,
 `opencode`) all implement the `HookAdapter` trait defined in
 `crates/tend/src/adapters/hook.rs`. To add a new agent:
 

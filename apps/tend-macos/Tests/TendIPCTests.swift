@@ -2729,7 +2729,7 @@ private let onboardingTestReleases = [
     #expect(OnboardingChecklist.agentTools(in: detected).map(\.name) == ["claude", "codex"])
     #expect(OnboardingChecklist.agentsStatus(in: detected) == .ready)
     #expect(OnboardingChecklist.agentsStatus(in: [detected[0]]) == .attention)
-    #expect(OnboardingChecklist.probedPrograms == ["tmux", "claude", "codex", "gemini", "agy", "opencode"])
+    #expect(OnboardingChecklist.probedPrograms == ["tmux", "claude", "codex", "agy", "opencode"])
 }
 
 @Test @MainActor
@@ -5884,7 +5884,8 @@ func waitControlsComposeTheAnchorSoNobodyTypesIt() {
 func agentMarksAndLimitWindowsSayWhatTheWireValueMeans() {
     #expect(TendAgentMark.title(for: "claude_code") == "Claude Code")
     #expect(TendAgentMark.title(for: "codex") == "Codex")
-    #expect(TendAgentMark.title(for: "gemini_cli") == "Gemini")
+    // The retired Gemini CLI kind is no longer one this build puts a face on.
+    #expect(TendAgentMark.known(for: "gemini_cli") == nil)
     #expect(TendAgentMark.title(for: "antigravity") == "Antigravity")
     #expect(TendAgentMark.title(for: "opencode") == "opencode")
 
@@ -5897,12 +5898,10 @@ func agentMarksAndLimitWindowsSayWhatTheWireValueMeans() {
     // third one.
     #expect(TendAgentMark.known(for: "claude_code")?.symbol == AskProviderEngine.claude.symbolName)
     #expect(TendAgentMark.known(for: "codex")?.symbol == AskProviderEngine.codex.symbolName)
-    #expect(TendAgentMark.known(for: "gemini_cli")?.symbol == AskProviderEngine.gemini.symbolName)
     #expect(TendAgentMark.known(for: "antigravity")?.symbol == "arrow.up.circle")
     #expect(TendAgentMark.known(for: "opencode")?.symbol == "terminal")
     #expect(TendAgentMark.known(for: "claude_code")?.tint == agentProgramTint("claude"))
     #expect(TendAgentMark.known(for: "codex")?.tint == agentProgramTint("codex"))
-    #expect(TendAgentMark.known(for: "gemini_cli")?.tint == agentProgramTint("gemini"))
     #expect(TendAgentMark.known(for: "antigravity")?.tint == agentProgramTint("agy"))
     #expect(TendAgentMark.known(for: "opencode")?.tint == agentProgramTint("opencode"))
 

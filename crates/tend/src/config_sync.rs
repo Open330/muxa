@@ -36,7 +36,7 @@ pub const SCHEMA_VERSION: i64 = 1;
 const HEADER_KEYS: &[&str] = &["schema_version", "source", "source_label", "categories"];
 
 /// Providers whose `[agent.<program>].options` a bundle may carry.
-const AGENT_PROGRAMS: &[&str] = &["claude", "codex", "gemini", "agy", "opencode"];
+const AGENT_PROGRAMS: &[&str] = &["claude", "codex", "agy", "opencode"];
 
 /// `[watch]` keys that are preferences rather than per-machine state. The
 /// composer's last kind and mode are written by the TUI as you use it.

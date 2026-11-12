@@ -9,7 +9,7 @@ import Foundation
 
 /// The providers `tend agent start --agent` accepts, by their CLI names.
 enum TendAgentProgram: String, CaseIterable, Codable, Identifiable, Sendable {
-    case claude, codex, gemini, agy, opencode
+    case claude, codex, agy, opencode
 
     var id: Self { self }
 
@@ -17,7 +17,6 @@ enum TendAgentProgram: String, CaseIterable, Codable, Identifiable, Sendable {
         switch self {
         case .claude: "Claude"
         case .codex: "Codex"
-        case .gemini: "Gemini"
         case .agy: "Antigravity"
         case .opencode: "OpenCode"
         }
@@ -29,7 +28,6 @@ enum TendAgentProgram: String, CaseIterable, Codable, Identifiable, Sendable {
         switch configValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
         case "claude", "claude_code", "claude-code": self = .claude
         case "codex", "cx": self = .codex
-        case "gemini", "gemini_cli", "gemini-cli": self = .gemini
         case "agy", "antigravity": self = .agy
         case "opencode": self = .opencode
         default: return nil
@@ -146,6 +144,27 @@ struct TendAgentLaunchDefaults: Codable, Equatable, Sendable {
     var placement: TendAgentPlacementKind?
     /// Provider arguments that replace the configured ones; nil inherits.
     var options: [String]?
+
+    init(program: TendAgentProgram? = nil, placement: TendAgentPlacementKind? = nil, options: [String]? = nil) {
+        self.program = program
+        self.placement = placement
+        self.options = options
+    }
+
+    private enum CodingKeys: String, CodingKey { case program, placement, options }
+
+    /// A remembered provider this build no longer offers (the retired
+    /// Gemini CLI) reads as "none chosen" and keeps the saved placement.
+    /// Its options are dropped with it: they were that CLI's flags
+    /// (`--model gemini-…`) and must not reach whichever CLI runs instead.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        let stored = try? container.decodeIfPresent(String.self, forKey: .program)
+        program = stored.flatMap(TendAgentProgram.init(rawValue:))
+        placement = try container.decodeIfPresent(TendAgentPlacementKind.self, forKey: .placement)
+        let retired = stored != nil && program == nil
+        options = retired ? nil : try container.decodeIfPresent([String].self, forKey: .options)
+    }
 
     static func load(from defaults: UserDefaults = .standard) -> TendAgentLaunchDefaults {
         guard let data = defaults.data(forKey: storageKey),

@@ -300,7 +300,7 @@ mkpane() { # <session> <window> [command] → echoes the new pane id
     -t "$1:$2" "${3:-cat}"
 }
 
-P_OPS=$(mk ops "$(frame ops gemini done 'review PR #482 — the new sorting knob in tend watch' \
+P_OPS=$(mk ops "$(frame ops codex done 'review PR #482 — the new sorting knob in tend watch' \
   'read  crates/tend-cli/src/watch.rs' 'posted 4 comments')")
 mkwin ops logs >/dev/null
 P_API=$(mk api "$(frame api claude working 'port the reconciler onto the new PaneBackend trait' \
@@ -499,10 +499,10 @@ hook "$P_DATA" claude user_prompt_submit \
   '{"session_id":"s-data","prompt":"backfill the analytics rollups for last week"}'
 hook "$P_DATA" claude stop '{"session_id":"s-data"}'
 
-# --- ops: gemini, idle -----------------------------------------------------
-hook "$P_OPS" gemini before_agent \
+# --- ops: codex, idle ------------------------------------------------------
+hook "$P_OPS" codex user_prompt_submit \
   '{"session_id":"s-c","prompt":"review PR #482 — focus on the new sorting knob in tend watch and whether the [Workspace, Activity] default surprises power users with many short-lived panes."}'
-hook "$P_OPS" gemini after_agent '{"session_id":"s-c"}'
+hook "$P_OPS" codex stop '{"session_id":"s-c"}'
 
 # ---------------------------------------------------------------------------
 # 5) Collaboration mailbox

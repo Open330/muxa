@@ -25,8 +25,10 @@ pub enum Component {
     ClaudeHooks,
     /// Codex shell hooks
     CodexHooks,
-    /// Gemini CLI shell hooks
-    GeminiHooks,
+    /// Removes the hooks an older tend wrote for the retired Gemini CLI.
+    /// Never offered or preset; planned automatically alongside any agent
+    /// hook component, and still accepted as `--component gemini-hooks`.
+    RetiredGeminiHooks,
     /// Antigravity CLI (`agy`) lifecycle hooks
     AntigravityHooks,
     /// opencode plugin event bridge
@@ -67,7 +69,6 @@ impl Component {
         Component::TmuxAutoView,
         Component::ClaudeHooks,
         Component::CodexHooks,
-        Component::GeminiHooks,
         Component::AntigravityHooks,
         Component::OpencodeHooks,
         Component::TenddSystemd,
@@ -93,7 +94,7 @@ impl Component {
             Component::TmuxAutoView => "tmux-auto-view",
             Component::ClaudeHooks => "claude-hooks",
             Component::CodexHooks => "codex-hooks",
-            Component::GeminiHooks => "gemini-hooks",
+            Component::RetiredGeminiHooks => "gemini-hooks",
             Component::AntigravityHooks => "agy-hooks",
             Component::OpencodeHooks => "opencode-hooks",
             Component::TenddSystemd => "tendd-systemd",
@@ -111,7 +112,11 @@ impl Component {
     }
 
     pub fn parse(s: &str) -> Option<Component> {
-        Component::ALL.iter().copied().find(|c| c.id() == s)
+        Component::ALL
+            .iter()
+            .copied()
+            .chain([Component::RetiredGeminiHooks])
+            .find(|c| c.id() == s)
     }
 
     /// One-line label shown in the multi-select.
@@ -126,7 +131,7 @@ impl Component {
             Component::TmuxAutoView => "tmux: each terminal gets its own window view",
             Component::ClaudeHooks => "Claude Code: shell hooks + statusLine",
             Component::CodexHooks => "OpenAI Codex: shell hooks",
-            Component::GeminiHooks => "Gemini CLI: shell hooks",
+            Component::RetiredGeminiHooks => "Gemini CLI (retired): remove leftover tend hooks",
             Component::AntigravityHooks => "Antigravity CLI (agy): lifecycle hooks",
             Component::OpencodeHooks => "opencode: plugin event bridge",
             Component::TenddSystemd => "tendd: systemd user service (auto-start on login)",
@@ -155,7 +160,9 @@ impl Component {
             Component::TmuxAutoView => "two terminals on one workspace stop following each other",
             Component::ClaudeHooks => "auto-detect when ~/.claude/settings.json exists",
             Component::CodexHooks => "auto-detect when ~/.codex/config.toml exists",
-            Component::GeminiHooks => "auto-detect when ~/.gemini/settings.json exists",
+            Component::RetiredGeminiHooks => {
+                "edits ~/.gemini/settings.json only to remove tend entries"
+            }
             Component::AntigravityHooks => "writes ~/.gemini/config/hooks.json; agy's own format",
             Component::OpencodeHooks => "installs ~/.config/opencode/plugins/tend.ts",
             Component::TenddSystemd => "Linux only; skipped on macOS / launchd hosts",
@@ -229,7 +236,6 @@ impl Component {
                 Component::TmuxAutoView,
                 Component::ClaudeHooks,
                 Component::CodexHooks,
-                Component::GeminiHooks,
                 Component::AntigravityHooks,
                 Component::OpencodeHooks,
                 Component::Collaboration,

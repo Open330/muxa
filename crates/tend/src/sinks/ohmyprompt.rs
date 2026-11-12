@@ -500,10 +500,8 @@ pub fn agent_kind_to_source(kind: AgentKind) -> Option<&'static str> {
     match kind {
         AgentKind::ClaudeCode => Some("claude-code"),
         AgentKind::Codex => Some("codex"),
-        AgentKind::GeminiCli => Some("gemini"),
-        // Reported under its own slug rather than folded into `gemini`:
-        // labelling agy runs as the CLI they replaced would quietly corrupt
-        // any per-tool breakdown downstream.
+        // Reported under its own slug rather than as `gemini`, the CLI it
+        // replaced, so a per-tool breakdown downstream stays honest.
         AgentKind::Antigravity => Some("antigravity"),
         AgentKind::Opencode => Some("opencode"),
         AgentKind::Unknown | AgentKind::Task => None,
@@ -515,7 +513,6 @@ pub fn agent_kind_to_cli_name(kind: AgentKind) -> Option<&'static str> {
     match kind {
         AgentKind::ClaudeCode => Some("claude"),
         AgentKind::Codex => Some("codex"),
-        AgentKind::GeminiCli => Some("gemini"),
         AgentKind::Antigravity => Some("agy"),
         AgentKind::Opencode => Some("opencode"),
         AgentKind::Unknown | AgentKind::Task => None,
@@ -628,9 +625,7 @@ mod tests {
             Some("claude-code")
         );
         assert_eq!(agent_kind_to_source(AgentKind::Codex), Some("codex"));
-        assert_eq!(agent_kind_to_source(AgentKind::GeminiCli), Some("gemini"));
-        // agy reports as itself. Folding it into `gemini` would silently
-        // merge two different tools in any downstream breakdown.
+        // agy reports as itself, not as the Gemini CLI it replaced.
         assert_eq!(
             agent_kind_to_source(AgentKind::Antigravity),
             Some("antigravity")

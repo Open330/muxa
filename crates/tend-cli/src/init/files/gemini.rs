@@ -1,23 +1,15 @@
-//! `~/.gemini/settings.json` content layer.
+//! `~/.gemini/settings.json` cleanup for the retired Gemini CLI.
 //!
-//! Same shape as `claude.rs` (JSON, hooks dict, append-with-dedupe),
-//! different event names and no `statusLine`. The duplication is
-//! intentional: each adapter's event list is small but specific, and
-//! a generic "JSON hooks merger" would obscure the per-agent contract.
+//! tend no longer supports the Gemini CLI, but older installs wrote
+//! `tend hook gemini --event …` entries into the `hooks` key of this file.
+//! This module only ever removes those entries, and leaves everything else in
+//! the file alone. The Antigravity CLI shares the `~/.gemini` tree but keeps
+//! its hooks in `~/.gemini/config/hooks.json` (see [`super::antigravity`]),
+//! which this module never touches.
 
 use crate::init::marker::Outcome;
 use anyhow::{Context, Result};
-use serde_json::{json, Map, Value};
-
-const HOOK_EVENTS: &[(&str, &str)] = &[
-    ("SessionStart", "session_start"),
-    ("BeforeAgent", "before_agent"),
-    ("AfterAgent", "after_agent"),
-    ("BeforeTool", "before_tool"),
-    ("AfterTool", "after_tool"),
-    ("Notification", "notification"),
-    ("SessionEnd", "session_end"),
-];
+use serde_json::Value;
 
 const HOOK_CMD_PREFIX: &str = "tend hook gemini";
 
@@ -25,27 +17,34 @@ pub fn default_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|h| h.join(".gemini").join("settings.json"))
 }
 
-pub fn upsert(original: &str) -> Result<(String, Outcome)> {
-    let mut root = parse_or_empty(original)?;
-    let root_obj = ensure_object(&mut root);
-    let changed = upsert_hooks(root_obj);
-    let new_text = pretty_print(&root)?;
-    let outcome = if original.is_empty() {
-        Outcome::Inserted
-    } else if changed || new_text.trim() != original.trim() {
-        Outcome::Replaced
-    } else {
-        Outcome::Unchanged
+/// Does `settings_text` still carry a hook entry an older tend wrote?
+pub fn has_tend_hooks(settings_text: &str) -> bool {
+    let Ok(Value::Object(root)) = serde_json::from_str::<Value>(settings_text) else {
+        return false;
     };
-    Ok((new_text, outcome))
+    let Some(Value::Object(hooks)) = root.get("hooks") else {
+        return false;
+    };
+    hooks
+        .values()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(|entry| entry.get("hooks").and_then(Value::as_array))
+        .flatten()
+        .any(handler_is_ours)
 }
 
+/// Strip every tend-owned handler. An entry keeps whatever other handlers it
+/// holds and is dropped only once none remain; event arrays (and the `hooks`
+/// key) that end up empty go too.
 pub fn remove(original: &str) -> Result<(String, Outcome)> {
     if original.trim().is_empty() {
         return Ok((original.to_string(), Outcome::AlreadyAbsent));
     }
-    let mut root = parse_or_empty(original)?;
-    let root_obj = ensure_object(&mut root);
+    let mut root: Value = serde_json::from_str(original).context("parsing gemini settings.json")?;
+    let Some(root_obj) = root.as_object_mut() else {
+        return Ok((original.to_string(), Outcome::AlreadyAbsent));
+    };
 
     let mut changed = false;
     if let Some(Value::Object(hooks)) = root_obj.get_mut("hooks") {
@@ -54,166 +53,120 @@ pub fn remove(original: &str) -> Result<(String, Outcome)> {
             let Some(Value::Array(arr)) = hooks.get_mut(&ev) else {
                 continue;
             };
-            let before = arr.len();
-            arr.retain(|entry| !entry_owned_by_us(entry));
-            if arr.len() != before {
+            let mut touched = false;
+            arr.retain_mut(|entry| {
+                let Some(Value::Array(handlers)) = entry.get_mut("hooks") else {
+                    return true;
+                };
+                let before = handlers.len();
+                handlers.retain(|h| !handler_is_ours(h));
+                if handlers.len() == before {
+                    return true;
+                }
+                touched = true;
+                !handlers.is_empty()
+            });
+            if touched {
                 changed = true;
-            }
-            if arr.is_empty() {
-                hooks.remove(&ev);
-                changed = true;
+                if arr.is_empty() {
+                    hooks.remove(&ev);
+                }
             }
         }
-        if hooks.is_empty() {
+        if changed && hooks.is_empty() {
             root_obj.remove("hooks");
         }
     }
-
-    let new_text = pretty_print(&root)?;
-    Ok((
-        new_text,
-        if changed {
-            Outcome::Removed
-        } else {
-            Outcome::AlreadyAbsent
-        },
-    ))
-}
-
-fn parse_or_empty(text: &str) -> Result<Value> {
-    if text.trim().is_empty() {
-        Ok(Value::Object(Map::new()))
-    } else {
-        serde_json::from_str(text).context("parsing gemini settings.json")
+    if !changed {
+        return Ok((original.to_string(), Outcome::AlreadyAbsent));
     }
+    let mut new_text = serde_json::to_string_pretty(&root)?;
+    new_text.push('\n');
+    Ok((new_text, Outcome::Removed))
 }
 
-fn ensure_object(v: &mut Value) -> &mut Map<String, Value> {
-    if !v.is_object() {
-        *v = Value::Object(Map::new());
-    }
-    v.as_object_mut().expect("just ensured object")
-}
-
-fn upsert_hooks(root: &mut Map<String, Value>) -> bool {
-    let hooks = root
-        .entry("hooks".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !hooks.is_object() {
-        *hooks = Value::Object(Map::new());
-    }
-    let hooks_obj = hooks.as_object_mut().expect("just ensured object");
-
-    let mut changed = false;
-    for (event_name, flag) in HOOK_EVENTS {
-        let arr = hooks_obj
-            .entry((*event_name).to_string())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        if !arr.is_array() {
-            *arr = Value::Array(Vec::new());
-            changed = true;
-        }
-        let arr = arr.as_array_mut().expect("just ensured array");
-        let want_cmd = format!("tend hook gemini --event {flag}");
-        if arr.iter().any(|e| entry_command_eq(e, &want_cmd)) {
-            continue;
-        }
-        arr.push(json!({
-            "hooks": [{ "type": "command", "command": want_cmd }]
-        }));
-        changed = true;
-    }
-    changed
-}
-
-fn entry_owned_by_us(entry: &Value) -> bool {
-    let Some(arr) = entry.get("hooks").and_then(Value::as_array) else {
-        return false;
-    };
-    arr.iter().any(|h| {
-        h.get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|c| c.trim_start().starts_with(HOOK_CMD_PREFIX))
-    })
-}
-
-fn entry_command_eq(entry: &Value, want_cmd: &str) -> bool {
-    let Some(arr) = entry.get("hooks").and_then(Value::as_array) else {
-        return false;
-    };
-    arr.iter().any(|h| {
-        h.get("command")
-            .and_then(Value::as_str)
-            .is_some_and(|c| c.trim() == want_cmd)
-    })
-}
-
-fn pretty_print(v: &Value) -> Result<String> {
-    let mut s = serde_json::to_string_pretty(v)?;
-    s.push('\n');
-    Ok(s)
+/// `tend hook gemini` itself, or followed by its arguments — not a longer
+/// command that merely starts with the same letters (`tend hook geminix`).
+fn handler_is_ours(handler: &Value) -> bool {
+    handler
+        .get("command")
+        .and_then(Value::as_str)
+        .map(str::trim_start)
+        .and_then(|c| c.strip_prefix(HOOK_CMD_PREFIX))
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn upsert_into_empty_creates_all_events() {
-        let (out, o) = upsert("").unwrap();
-        assert_eq!(o, Outcome::Inserted);
-        let v: Value = serde_json::from_str(&out).unwrap();
-        for (event, _) in HOOK_EVENTS {
-            assert!(
-                v["hooks"][event].as_array().is_some_and(|a| !a.is_empty()),
-                "missing {event}"
-            );
-        }
-    }
-
-    #[test]
-    fn upsert_is_idempotent() {
-        let (first, _) = upsert("").unwrap();
-        let (second, o) = upsert(&first).unwrap();
-        assert_eq!(o, Outcome::Unchanged);
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn upsert_preserves_user_hooks_and_extra_keys() {
-        let user = r#"{
+    /// What an older `tend init` left behind, beside a user's own hook.
+    const LEFTOVER: &str = r#"{
   "theme": "dark",
   "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "tend hook gemini --event session_start" }] }
+    ],
     "BeforeAgent": [
-      { "hooks": [{ "type": "command", "command": "echo user" }] }
+      { "hooks": [{ "type": "command", "command": "echo user" }] },
+      { "hooks": [{ "type": "command", "command": "tend hook gemini --event before_agent" }] }
     ]
   }
 }"#;
-        let (out, _) = upsert(user).unwrap();
-        let v: Value = serde_json::from_str(&out).unwrap();
-        assert_eq!(v["theme"], "dark");
-        let arr = v["hooks"]["BeforeAgent"].as_array().unwrap();
-        assert_eq!(arr.len(), 2, "user entry + tend entry");
-    }
 
     #[test]
     fn remove_strips_only_our_entries() {
-        let user = r#"{
-  "hooks": {
-    "BeforeAgent": [
-      { "hooks": [{ "type": "command", "command": "echo user" }] }
-    ]
-  }
-}"#;
-        let (with, _) = upsert(user).unwrap();
-        let (after, o) = remove(&with).unwrap();
+        assert!(has_tend_hooks(LEFTOVER));
+        let (after, o) = remove(LEFTOVER).unwrap();
         assert_eq!(o, Outcome::Removed);
+        assert!(!has_tend_hooks(&after));
         let v: Value = serde_json::from_str(&after).unwrap();
+        assert_eq!(v["theme"], "dark");
+        assert!(v["hooks"].get("SessionStart").is_none());
         let arr = v["hooks"]["BeforeAgent"].as_array().unwrap();
         assert_eq!(arr.len(), 1);
-        assert!(arr[0]["hooks"][0]["command"]
-            .as_str()
-            .unwrap()
-            .contains("echo user"));
+        assert_eq!(arr[0]["hooks"][0]["command"], "echo user");
+    }
+
+    #[test]
+    fn a_file_without_tend_hooks_is_left_byte_for_byte() {
+        let user = "{\n  \"hooks\": {},\n  \"theme\": \"light\"\n}\n";
+        assert!(!has_tend_hooks(user));
+        let (after, o) = remove(user).unwrap();
+        assert_eq!(o, Outcome::AlreadyAbsent);
+        assert_eq!(after, user);
+        assert_eq!(remove("").unwrap().1, Outcome::AlreadyAbsent);
+        assert!(remove("{ not json").is_err());
+        assert!(!has_tend_hooks("{ not json"));
+    }
+
+    /// One entry may group a user's handler with ours; only ours goes.
+    #[test]
+    fn a_mixed_entry_keeps_the_users_handler() {
+        let mixed = r#"{"theme":"dark","hooks":{"BeforeAgent":[{"hooks":[
+            {"type":"command","command":"echo user"},
+            {"type":"command","command":"tend hook gemini --event before_agent"}]}]}}"#;
+        let (after, o) = remove(mixed).unwrap();
+        assert_eq!(o, Outcome::Removed);
+        let v: Value = serde_json::from_str(&after).unwrap();
+        let handlers = v["hooks"]["BeforeAgent"][0]["hooks"].as_array().unwrap();
+        assert_eq!(handlers.len(), 1);
+        assert_eq!(handlers[0]["command"], "echo user");
+        assert_eq!(v["theme"], "dark");
+    }
+
+    #[test]
+    fn a_command_that_only_shares_the_prefix_is_not_ours() {
+        let other = r#"{"hooks":{"BeforeAgent":[{"hooks":[{"type":"command","command":"tend hook geminix"}]}]}}"#;
+        assert!(!has_tend_hooks(other));
+        assert_eq!(remove(other).unwrap().1, Outcome::AlreadyAbsent);
+    }
+
+    #[test]
+    fn only_tend_hooks_leaves_no_hooks_key() {
+        let ours = r#"{"hooks":{"AfterAgent":[{"hooks":[{"type":"command","command":"tend hook gemini --event after_agent"}]}]}}"#;
+        let (after, _) = remove(ours).unwrap();
+        let v: Value = serde_json::from_str(&after).unwrap();
+        assert!(v.get("hooks").is_none(), "{after}");
     }
 }

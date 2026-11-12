@@ -66,7 +66,7 @@ prompt = '''...'''            # context every agent in this pipeline gets
 
 [[pipeline.<name>.agent]]     # one per pane, at least one
 alias   = 'impl'              # unique within the pipeline; keys the pane diff
-program = 'codex'             # ONLY claude, codex, gemini, agy, or opencode
+program = 'codex'             # ONLY claude, codex, agy, or opencode
 role    = 'implementer'       # optional; peers address it as role:<role>
 task    = 'fix the reaper'    # optional; short label in `tend work show`/`watch`
 prompt  = '...'               # optional; this agent's own instructions
@@ -538,9 +538,9 @@ mod tests {
     fn the_compose_prompt_carries_the_draft_the_request_and_the_rejection() {
         let current: PipelineSpec = serde_json::from_str(DRAFT).unwrap();
         let prompt = compose_prompt(
-            "add a gemini tester after review",
+            "add an agy tester after review",
             Some(&current),
-            &["gemini".to_string()],
+            &["agy".to_string()],
             None,
         );
         assert!(prompt.contains("\"agents\": ["), "schema missing");
@@ -549,8 +549,8 @@ mod tests {
             prompt.contains("\"alias\": \"review\""),
             "current draft missing"
         );
-        assert!(prompt.contains("add a gemini tester after review"));
-        assert!(prompt.contains("gemini — prefer these"), "{prompt}");
+        assert!(prompt.contains("add an agy tester after review"));
+        assert!(prompt.contains("agy — prefer these"), "{prompt}");
         assert!(!prompt.contains("REJECTED"));
         assert!(prompt.contains("Do not run commands and do not edit files"));
 

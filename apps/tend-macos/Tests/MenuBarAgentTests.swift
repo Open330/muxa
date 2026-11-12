@@ -287,9 +287,9 @@ private func menuBarSnapshot(_ agents: [(String, String, String)], host: String 
 @Test func menuBarIdentityColorsPersistAndProviderSymbolsAreAvailable() {
     let a = TendMenuBarAgentAppearance(identity: "host:session-1", kind: "codex")
     #expect(a == TendMenuBarAgentAppearance(identity: "host:session-1", kind: "codex"))
-    let programs = ["codex", "claude_code", "gemini_cli", "antigravity", "opencode", "unknown"]
+    let programs = ["codex", "claude_code", "antigravity", "opencode", "unknown"]
     let styles = programs.map { TendMenuBarAgentAppearance(identity: "host:session-1", kind: $0) }
-    #expect(Set(styles.map(\.symbol)).count >= 5)
+    #expect(Set(styles.map(\.symbol)).count >= 4)
     for style in styles {
         // Claude and Codex draw tend's own marks; every other face is an SF Symbol.
         if case .symbol(let name) = TendGlyph.kind(style.symbol) {

@@ -1,8 +1,8 @@
 //! Google Antigravity CLI (`agy`) adapter.
 //!
-//! agy is the successor to the Gemini CLI, and its hook system is **not** the
-//! Claude-compatible one [`super::gemini`] targets. Three things differ, and
-//! all three break the older adapter silently:
+//! agy is the successor to the Gemini CLI (no longer supported by tend), and
+//! its hook system is **not** the Claude-compatible one the Gemini CLI had.
+//! Three things differ:
 //!
 //! 1. **Where.** Hooks live in their own `hooks.json` under a *customization
 //!    root* — `~/.gemini/config/hooks.json` globally, or
@@ -265,7 +265,7 @@ impl HookAdapter for AntigravityAdapter {
 }
 
 /// A model-label-only heartbeat. agy stamps `modelName` on every payload,
-/// which is more than Codex or the Gemini CLI expose; the rate-limit fields
+/// which is more than Codex exposes; the rate-limit fields
 /// have no agy source and stay `None`.
 fn heartbeat(id: AgentId, model: Option<String>, at: OffsetDateTime) -> AgentEvent {
     AgentEvent::Heartbeat {
@@ -315,7 +315,7 @@ mod tests {
 
     /// protojson is camelCase throughout. A `snake_case` reader would fail on
     /// the required key and take the whole hook down, which is exactly how
-    /// the Gemini CLI adapter fails against agy.
+    /// a Gemini CLI style reader fails against agy.
     #[test]
     fn requires_camel_case_conversation_id() {
         assert!(serde_json::from_str::<Input>(r#"{"conversation_id":"x"}"#).is_err());

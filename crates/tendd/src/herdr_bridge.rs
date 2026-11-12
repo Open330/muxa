@@ -128,8 +128,6 @@ fn classify_agent(agent: &str) -> AgentKind {
         AgentKind::ClaudeCode
     } else if agent.contains("codex") {
         AgentKind::Codex
-    } else if agent.contains("gemini") {
-        AgentKind::GeminiCli
     } else if agent.contains("antigravity") || agent == "agy" {
         AgentKind::Antigravity
     } else if agent.contains("opencode") {
@@ -664,7 +662,6 @@ fn agent_slug(kind: AgentKind) -> &'static str {
     match kind {
         AgentKind::ClaudeCode => "claude",
         AgentKind::Codex => "codex",
-        AgentKind::GeminiCli => "gemini",
         AgentKind::Antigravity => "agy",
         AgentKind::Opencode => "opencode",
         AgentKind::Task => "task",
@@ -1101,7 +1098,7 @@ mod tests {
         let cases = [
             ("claude", AgentKind::ClaudeCode),
             ("codex", AgentKind::Codex),
-            ("gemini", AgentKind::GeminiCli),
+            ("gemini", AgentKind::Unknown),
             ("opencode", AgentKind::Opencode),
             ("cursor", AgentKind::Unknown),
             ("copilot", AgentKind::Unknown),
@@ -1461,7 +1458,6 @@ mod tests {
     fn agent_slug_covers_every_kind() {
         assert_eq!(agent_slug(AgentKind::ClaudeCode), "claude");
         assert_eq!(agent_slug(AgentKind::Codex), "codex");
-        assert_eq!(agent_slug(AgentKind::GeminiCli), "gemini");
         assert_eq!(agent_slug(AgentKind::Opencode), "opencode");
         assert_eq!(agent_slug(AgentKind::Task), "task");
         assert_eq!(agent_slug(AgentKind::Unknown), "unknown");

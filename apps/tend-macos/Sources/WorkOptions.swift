@@ -372,7 +372,7 @@ struct TendPipelineDefinition: Codable, Equatable, Sendable {
         }
     }
 
-    static let allowedPrograms = ["claude", "codex", "gemini", "agy", "opencode"]
+    static let allowedPrograms = ["claude", "codex", "agy", "opencode"]
     static let layouts = ["main-vertical", "main-horizontal", "even-horizontal", "even-vertical", "tiled"]
 
     var description: String

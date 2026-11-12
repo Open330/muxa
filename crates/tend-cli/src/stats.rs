@@ -4589,7 +4589,7 @@ pub(crate) mod tests {
                 datetime!(2026-05-30 11:01:00 UTC),
             ),
             prompt(
-                AgentKind::GeminiCli,
+                AgentKind::Antigravity,
                 "c",
                 "%3",
                 Some("/home/june/other"),
@@ -4625,7 +4625,7 @@ pub(crate) mod tests {
                 datetime!(2026-05-30 11:01:00 UTC),
             ),
             prompt(
-                AgentKind::GeminiCli,
+                AgentKind::Antigravity,
                 "c",
                 "%3",
                 Some("/home/june/other"),

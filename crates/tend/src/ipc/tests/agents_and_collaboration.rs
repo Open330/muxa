@@ -1570,7 +1570,7 @@ async fn progress_peek_over_ipc_preserves_unread_reply_and_checks_participation(
     let store = Store::shared();
     add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
     add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
-    add_collaboration_agent(&store, "%3", "stranger", AgentKind::GeminiCli).await;
+    add_collaboration_agent(&store, "%3", "stranger", AgentKind::Antigravity).await;
     let backend: SharedBackend = Arc::new(CollaborationTestBackend {
         panes: vec![
             collaboration_test_pane("%1", "0"),
@@ -1654,7 +1654,7 @@ async fn widening_a_listing_over_ipc_is_console_only() {
     let store = Store::shared();
     add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
     add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
-    add_collaboration_agent(&store, "%3", "elsewhere", AgentKind::GeminiCli).await;
+    add_collaboration_agent(&store, "%3", "elsewhere", AgentKind::Antigravity).await;
     add_collaboration_agent(&store, "%4", "elsewhere-peer", AgentKind::Codex).await;
     // %3 and %4 sit in a second window, so they form a room of their own.
     let other_window = |pane_id: &str, pane_index: &str| PaneInfo {
@@ -1777,7 +1777,7 @@ async fn collaboration_round_trip_over_ipc_tracks_reply_and_cancellation() {
     let store = Store::shared();
     add_collaboration_agent(&store, "%1", "sender", AgentKind::Codex).await;
     add_collaboration_agent(&store, "%2", "recipient", AgentKind::ClaudeCode).await;
-    add_collaboration_agent(&store, "%3", "verifier", AgentKind::GeminiCli).await;
+    add_collaboration_agent(&store, "%3", "verifier", AgentKind::Antigravity).await;
     let backend: SharedBackend = Arc::new(CollaborationTestBackend {
         panes: vec![
             collaboration_test_pane("%1", "0"),

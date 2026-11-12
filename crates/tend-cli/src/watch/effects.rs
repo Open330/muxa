@@ -23,7 +23,7 @@ pub(crate) enum QuickAction {
     /// Send Ctrl-C to the pane to abort the current turn. The spec
     /// originally called this "restart"; the pragmatic shape is just
     /// "abort" because we don't know the original launch command to
-    /// re-run reliably across Claude/Codex/Gemini wrappers.
+    /// re-run reliably across Claude/Codex/agy wrappers.
     AbortTurn(String),
     /// Copy the selected agent's `last_prompt` to the system clipboard.
     /// String is the prompt body; the dispatcher tries pbcopy / wl-copy

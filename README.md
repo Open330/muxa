@@ -6,7 +6,7 @@
 
 See which agent is waiting on you and jump to it — then run the whole team as
 Work: launch agents, let them review each other, and follow them across hosts.
-Start with zero setup on the Claude Code, Codex, and Gemini CLI sessions you
+Start with zero setup on the Claude Code, Codex, and Antigravity CLI sessions you
 already run in tmux; let Tend launch and own agents when you want more.
 
 [![CI](https://github.com/Open330/tend/actions/workflows/ci.yml/badge.svg)](https://github.com/Open330/tend/actions/workflows/ci.yml)
@@ -90,7 +90,7 @@ organizes the agents Tend launches into Work. Attention never requires Runtime.
 See [Direction](docs/DIRECTION.md).
 
 - **Keeps your setup.** Reads agent state from Claude Code, Codex, and
-  Gemini CLI (and its Antigravity successor) hooks, with screen detection
+  Antigravity CLI (`agy`) hooks, with screen detection
   for hook-less agents, and maps it onto the tmux panes you already have.
   You can keep launching agents yourself, or use tend's optional agent and
   pipeline launchers. tmux, [rmux](https://rmux.io),
@@ -301,7 +301,7 @@ conversation. The agent maps the mention to Tend's durable peer-call tool:
 the peer-call tool; references to an existing peer report use the durable
 mailbox report tool and never imply a GitHub PR without an explicit PR reference.
 `@peer` chooses a healthy same-window agent deterministically; `@claude`,
-`@codex`, `@gemini`, `@alias`, and `role:name` narrow the target. Calls default
+`@codex`, `@agy`, `@alias`, and `role:name` narrow the target. Calls default
 to `REVIEW · READ-ONLY`. Executing changes requires an explicit task
 authorization, and creating a new agent pane requires a separate confirmation.
 Restart an already-running agent after upgrading Tend or changing registered
@@ -456,9 +456,12 @@ systems, so tend gets exact state transitions:
 | --- | --- | --- |
 | Claude Code | Supported | `~/.claude/settings.json` |
 | OpenAI Codex | Supported | `~/.codex/config.toml` |
-| Google Gemini CLI | Supported | `~/.gemini/settings.json` |
 | Google Antigravity CLI (`agy`) | Supported | `~/.gemini/config/hooks.json` — [details](docs/ANTIGRAVITY.md) |
 | opencode | Launch supported; hook integration planned | [tracking issue](https://github.com/Open330/tend/issues/14) |
+
+The Google Gemini CLI is no longer supported; use its successor, the
+Antigravity CLI. `tend init` removes the hooks an older tend wrote into
+`~/.gemini/settings.json`, and `tend doctor` points out any that remain.
 
 The daemon also reads Codex session-rollout logs every two seconds to recover activity and
 turn completion when hooks miss an update. Quota percentages and credits are

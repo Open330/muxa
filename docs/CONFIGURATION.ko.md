@@ -73,7 +73,7 @@ agent나 열린 worker ticket이 가리키는 기록은 남깁니다.
 ```toml
 [mcp.guide]
 placement = "window" # pane(기본값) | window | session
-agent = "codex"      # claude | codex | gemini | agy | opencode
+agent = "codex"      # claude | codex | agy | opencode
 options = ["--model", "preferred-model"]
 direction = "right"  # right(기본값) | down
 instructions = "작업 하나당 window 하나를 쓰고, 무관한 프로젝트는 session을 분리한다."
@@ -459,7 +459,7 @@ enabled = true
 interval_secs = 30
 ```
 
-discovery는 tmux pane을 훑어 알려진 agent CLI(`claude`/`codex`/`gemini`/`agy`)를
+discovery는 tmux pane을 훑어 알려진 agent CLI(`claude`/`codex`/`agy`)를
 찾아 hook이 오기 전에 레지스트리를 채웁니다. 데몬 시작 시 1회 실행되고 이후
 `interval_secs`마다 재스캔하므로, 새 tmux 세션에서 갓 시작한 agent가 첫 hook을
 쏘기 전이라도 그 주기 안에 `tend status`에 뜹니다. `interval_secs = 0`이면

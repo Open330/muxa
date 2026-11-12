@@ -1,24 +1,25 @@
 # Antigravity CLI (`agy`)
 
-Google's Antigravity CLI succeeded the Gemini CLI. It keeps the `~/.gemini`
-directory and it still runs Gemini models, which makes it easy to assume tend's
-existing Gemini support carries over. It does not — **none** of the three things
-tend needs is the same.
+Google's Antigravity CLI succeeded the Gemini CLI, which Google retired for
+consumer tiers in June 2026. tend no longer supports the Gemini CLI; agy is the
+supported way to run Gemini models under tend. agy keeps the `~/.gemini`
+directory, but none of the hook wiring the Gemini CLI used carries over:
 
-| | Gemini CLI (`gemini`) | Antigravity CLI (`agy`) |
+| | Gemini CLI (retired) | Antigravity CLI (`agy`) |
 | --- | --- | --- |
 | Hook config | `hooks` key inside `~/.gemini/settings.json` | its own `~/.gemini/config/hooks.json` |
 | Events | `SessionStart`, `BeforeAgent`, `AfterAgent`, `BeforeTool`, `AfterTool`, `Notification`, `SessionEnd` | `SessionStart`, `PreInvocation`, `PostInvocation`, `PreToolUse`, `PostToolUse`, `Stop` |
 | Payload | snake_case, `session_id` | camelCase protojson, `conversationId` |
-| tend kind | `gemini_cli` | `antigravity` |
-| tend hook | `tend hook gemini` | `tend hook agy` |
+| tend hook | `tend hook gemini` (now a silent no-op) | `tend hook agy` |
 
-The failure mode is silent in both directions: hooks written into
-`settings.json` make agy log `loaded 0 named hooks from 0 hooks.json file(s)`
-and carry on, and the Gemini adapter's required `session_id` would reject an agy
-payload outright. Hence a separate `AgentKind`, adapter, and init component
-rather than a rename. Both CLIs stay supported and can be installed side by
-side.
+Hooks written into `settings.json` make agy log
+`loaded 0 named hooks from 0 hooks.json file(s)` and carry on, so agy needs its
+own init component. If an older tend wired the Gemini CLI on this host,
+`tend init` removes those `settings.json` entries and leaves the rest of the
+file, and agy's `hooks.json`, alone. `tend doctor` reports any that remain.
+Rows and rules an older tend stored under the `gemini_cli` kind still load: a
+row decodes as `unknown`, and a rule's `gemini_cli` agent filter matches no
+agent.
 
 ## Install
 
@@ -162,7 +163,7 @@ in tend that swallows its own errors for that reason.
   process cwd is the directory holding `hooks.json`, so there is nothing to fall
   back to.
 - **No rate-limit or cost signal.** `modelName` rides on every payload (more
-  than Codex or the Gemini CLI give), but the usage fields stay `None`.
+  than Codex gives), but the usage fields stay `None`.
 
 ## Elsewhere in tend
 

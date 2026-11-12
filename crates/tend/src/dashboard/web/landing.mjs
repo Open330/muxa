@@ -16,7 +16,7 @@ const GITHUB = "https://github.com/Open330/tend";
 
 const COPY = {
   en: {
-    badge: "tmux · Claude Code · Codex · Gemini CLI",
+    badge: "tmux · Claude Code · Codex · Antigravity",
     title: "Know which agent<br>is <em>waiting on you.</em>",
     lead: "See which coding agent needs you, connect to its pane, and ask a peer to review the work. Start with the agents and tmux sessions you already use.",
     how: "How it works",
@@ -113,7 +113,7 @@ const COPY = {
     },
   },
   ko: {
-    badge: "tmux · Claude Code · Codex · Gemini CLI",
+    badge: "tmux · Claude Code · Codex · Antigravity",
     title: "어느 에이전트가<br><em>답을 기다릴까요?</em>",
     lead: "나를 기다리는 코딩 에이전트를 찾고, 그 pane에 연결하고, 동료에게 리뷰를 요청하세요. 지금 쓰는 tmux와 에이전트에서 시작합니다.",
     how: "어떻게 동작하나",
@@ -211,7 +211,7 @@ const COPY = {
   },
 };
 
-const AGENTS = ["Claude Code", "Codex", "Gemini CLI", "Antigravity", "opencode"];
+const AGENTS = ["Claude Code", "Codex", "Antigravity", "opencode"];
 const HOSTS = ["tmux", "rmux", "herdr"];
 
 /**

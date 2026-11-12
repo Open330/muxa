@@ -444,12 +444,7 @@ mod tests {
     /// inference fully out of the way — the pre-existing behavior.
     #[test]
     fn pane_ownership_hooked_for_agents_that_report_attention() {
-        for kind in [
-            AgentKind::ClaudeCode,
-            AgentKind::Codex,
-            AgentKind::GeminiCli,
-            AgentKind::Opencode,
-        ] {
+        for kind in [AgentKind::ClaudeCode, AgentKind::Codex, AgentKind::Opencode] {
             let owner = row(kind, "real", AgentState::Working);
             assert!(
                 matches!(pane_ownership(&[owner], LATER), PaneOwnership::Hooked),
@@ -527,7 +522,6 @@ mod tests {
         // Claude's startup trust gates appear before its hooks can report them.
         assert_eq!(AgentKind::ClaudeCode.screen_manifest_name(), Some("claude"));
         assert_eq!(AgentKind::Opencode.screen_manifest_name(), None);
-        assert_eq!(AgentKind::GeminiCli.screen_manifest_name(), None);
 
         let set = tend::screen::load_manifests();
         assert!(

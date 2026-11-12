@@ -49,7 +49,7 @@ private func release(_ version: String, highlights count: Int = 1) -> TendWhatsN
 
     let nothing = OnboardingChecklist.installCommands(for: [])
     #expect(nothing.tmux?.command == "brew install tmux")
-    #expect(nothing.agents.map(\.program) == ["claude", "codex", "gemini", "opencode"])
+    #expect(nothing.agents.map(\.program) == ["claude", "codex", "opencode"])
 
     let ready = OnboardingChecklist.installCommands(for: [
         InstalledTool(name: "tmux", path: "/opt/homebrew/bin/tmux", version: nil),
@@ -72,7 +72,7 @@ private func release(_ version: String, highlights count: Int = 1) -> TendWhatsN
         program: "codex", home: home, environment: ["CODEX_HOME": "/srv/codex"]
     ) { $0 == "/srv/codex/auth.json" } == .ready)
     // Providers whose sign-in cannot be read from a file are never guessed.
-    for program in ["claude", "gemini", "agy", "opencode"] {
+    for program in ["claude", "agy", "opencode"] {
         #expect(OnboardingChecklist.signInStatus(program: program, home: home, environment: [:]) { _ in false } == nil)
     }
     #expect(OnboardingChecklist.signInCommand(program: "codex")?.command == "codex login")

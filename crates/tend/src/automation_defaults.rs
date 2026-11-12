@@ -15,7 +15,9 @@ pub fn rules() -> Vec<AutomationRule> {
         AutomationEvent::Error,
         AutomationAction::SendPrompt,
     );
-    capacity.agent = vec![crate::automation::AgentKindSpec(crate::AgentKind::Codex)];
+    capacity.agent = vec![crate::automation::AgentKindSpec(Some(
+        crate::AgentKind::Codex,
+    ))];
     capacity.notification = Some(r"(?i)^Selected model is at capacity\.".into());
     capacity.text = Some("continue".into());
     capacity.wait = Some(WaitSpec::after_event(time::Duration::minutes(2)));
@@ -52,8 +54,8 @@ pub fn rules() -> Vec<AutomationRule> {
         AutomationAction::PressEnter,
     );
     confirm.agent = vec![
-        crate::automation::AgentKindSpec(crate::AgentKind::Codex),
-        crate::automation::AgentKindSpec(crate::AgentKind::ClaudeCode),
+        crate::automation::AgentKindSpec(Some(crate::AgentKind::Codex)),
+        crate::automation::AgentKindSpec(Some(crate::AgentKind::ClaudeCode)),
     ];
     confirm.wait = Some(WaitSpec::after_event(time::Duration::seconds(5)));
     confirm.jitter = Some(DurationSpec::seconds(0));

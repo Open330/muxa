@@ -6,7 +6,7 @@
 //! root (`~/.gemini/config/hooks.json`) — the same file agy's own `/hooks`
 //! command manages, and the one shared with the Antigravity backend.
 //!
-//! ## Why this is simpler than [`super::gemini`]
+//! ## Why this is simpler than the Gemini CLI hooks were
 //!
 //! agy's `hooks.json` is keyed by **hook name**, so tend owns exactly one
 //! top-level key (`tend`) instead of merging entries into per-event arrays.

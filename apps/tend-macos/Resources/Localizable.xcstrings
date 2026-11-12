@@ -13109,12 +13109,12 @@
         }
       }
     },
-    "Refine: for example make the reviewer use gemini" : {
+    "Refine: for example make the reviewer use codex" : {
       "localizations" : {
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "다듬기, 예: 리뷰어가 gemini를 쓰게 해줘"
+            "value" : "다듬기, 예: 리뷰어가 codex를 쓰게 해줘"
           }
         }
       }

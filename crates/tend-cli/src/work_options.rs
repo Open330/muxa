@@ -913,7 +913,7 @@ after = ['plan']
         let path = dir.path().join("config.toml");
         std::fs::write(
             &path,
-            "[pipeline.pair]\ndescription = 'mine'\n[[pipeline.pair.agent]]\nalias = 'x'\nprogram = 'gemini'\n",
+            "[pipeline.pair]\ndescription = 'mine'\n[[pipeline.pair.agent]]\nalias = 'x'\nprogram = 'agy'\n",
         )
         .unwrap();
         let before = std::fs::read_to_string(&path).unwrap();

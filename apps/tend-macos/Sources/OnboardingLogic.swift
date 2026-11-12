@@ -360,11 +360,6 @@ enum OnboardingChecklist {
         ),
         OnboardingInstallCommand(program: "codex", displayName: "Codex", command: "npm install -g @openai/codex"),
         OnboardingInstallCommand(
-            program: "gemini",
-            displayName: "Gemini CLI",
-            command: "npm install -g @google/gemini-cli"
-        ),
-        OnboardingInstallCommand(
             program: "opencode",
             displayName: "OpenCode",
             command: "curl -fsSL https://opencode.ai/install | bash"
@@ -384,7 +379,7 @@ enum OnboardingChecklist {
     /// from a file without running the CLI. Only Codex qualifies: `codex
     /// login` always writes `auth.json` under `$CODEX_HOME` (default
     /// `~/.codex`), for ChatGPT and API-key sign-ins alike. Claude Code keeps
-    /// its credentials in the Keychain and Gemini and OpenCode also accept
+    /// its credentials in the Keychain and OpenCode also accepts
     /// API keys from the environment, so a missing file proves nothing for
     /// them: nil means "cannot tell" and the row stays quiet.
     static func signInStatus(

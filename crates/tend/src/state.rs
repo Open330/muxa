@@ -260,7 +260,7 @@ pub struct Agent {
     pub cost_usd: Option<f64>,
     /// 5-hour rate-limit window utilization (0–100), refreshed by
     /// statusline Heartbeats. Optional because adapters that don't
-    /// surface limit data (Codex/Gemini today) leave it unset.
+    /// surface limit data (Codex today) leave it unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_5h_pct: Option<f32>,
     #[serde(
@@ -2305,7 +2305,7 @@ impl Store {
     /// Used by the reconciler to recover rows that a missed hook
     /// would otherwise leave stuck:
     /// - `from = Working` covers a missed `Stop`/`TurnStopped`
-    ///   (Claude/Codex/Gemini)
+    ///   (Claude/Codex)
     /// - `from = WaitingInput` covers Codex's permission-grant gap:
     ///   `permission_request` flips the row to `WaitingInput`, the
     ///   user grants permission, Codex resumes — but Codex never
@@ -2432,10 +2432,7 @@ impl Store {
                 || agent.surface.is_some()
                 || !matches!(
                     agent.kind,
-                    AgentKind::ClaudeCode
-                        | AgentKind::Codex
-                        | AgentKind::GeminiCli
-                        | AgentKind::Antigravity
+                    AgentKind::ClaudeCode | AgentKind::Codex | AgentKind::Antigravity
                 )
                 || now - agent.last_activity_at < min_idle
             {
@@ -6005,7 +6002,7 @@ mod tests {
             })
             .await;
         // A subsequent TurnStopped from an adapter that can't read
-        // transcripts (Codex/Gemini) must not blank the previously
+        // transcripts (Codex) must not blank the previously
         // captured response.
         store
             .apply(&AgentEvent::TurnStopped {
@@ -7194,9 +7191,9 @@ mod tests {
             at,
         };
         let claude = "9e48c8ff-1b70-4a3e-9f32-1581a05f0f75";
-        let gemini = "5b1c2d3e-0000-4000-8000-000000000001";
+        let other = "5b1c2d3e-0000-4000-8000-000000000001";
         store.apply(&started(AgentKind::ClaudeCode, claude)).await;
-        store.apply(&started(AgentKind::GeminiCli, gemini)).await;
+        store.apply(&started(AgentKind::Antigravity, other)).await;
         let bindings = vec![
             crate::process_tree::ResumeBinding {
                 session_id: claude.to_owned(),
@@ -7204,8 +7201,8 @@ mod tests {
                 pane: pane("rmux:%8"),
             },
             crate::process_tree::ResumeBinding {
-                session_id: gemini.to_owned(),
-                kind: AgentKind::GeminiCli,
+                session_id: other.to_owned(),
+                kind: AgentKind::Antigravity,
                 pane: pane("rmux:%9"),
             },
         ];
@@ -7217,7 +7214,7 @@ mod tests {
                 .and_then(|a| a.pane.clone())
         };
         assert_eq!(pane_of(claude).as_deref(), Some("rmux:%8"));
-        assert_eq!(pane_of(gemini).as_deref(), Some("rmux:%66"));
+        assert_eq!(pane_of(other).as_deref(), Some("rmux:%66"));
     }
 
     /// After a multiplexer restart reaped its row, a resumed agent that has

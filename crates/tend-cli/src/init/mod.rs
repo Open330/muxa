@@ -332,7 +332,7 @@ fn pick(uninstall: bool, args: &Args, detect: &Detection, mode: Mode) -> Result<
     if let Some(p) = args.preset {
         // Presets list every agent hook, but only wire up the ones whose
         // config is actually on disk — otherwise `--preset standard` on a
-        // host without Codex/Gemini/opencode would create their configs
+        // host without Codex/agy/opencode would create their configs
         // from scratch for tools the user never installed. Mirrors the
         // wizard's `Detection::default_selection` pre-check. Non-agent
         // components (tmux, daemon-manager, dashboard) are always kept.
@@ -367,7 +367,7 @@ fn manages_daemon(components: &[Component]) -> bool {
         .any(|c| matches!(c, Component::TenddSystemd | Component::TenddLaunchd))
 }
 
-/// Drop agent-hook components (Claude/Codex/Gemini/opencode) whose
+/// Drop agent-hook components (Claude/Codex/agy/opencode) whose
 /// config file/dir is absent, per `Detection::agent_config_present`.
 /// Non-agent components pass through untouched. Used only on the
 /// preset path — `--component` opt-ins bypass this so an explicit
@@ -398,7 +398,6 @@ mod tests {
             c,
             Component::ClaudeHooks
                 | Component::CodexHooks
-                | Component::GeminiHooks
                 | Component::AntigravityHooks
                 | Component::OpencodeHooks
         )

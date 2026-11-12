@@ -3,7 +3,7 @@
 Status: **implemented.** Core in `tend::screen`, daemon task in
 `tendd::screen_detect`, shared synthetic-row machinery in `tendd::synthetic`.
 
-tend gets authoritative agent state from **hooks** (Claude Code, Codex, Gemini,
+tend gets authoritative agent state from **hooks** (Claude Code, Codex,
 Antigravity), from Codex session-rollout events polled every two seconds,
 and, on herdr hosts, from **herdr's own detection** bridged into synthetic rows
 (`docs/HERDR.md`). For every *other* agent CLI — cursor-agent, amp, copilot,
@@ -147,7 +147,7 @@ Hook-authoritative precedence has exactly one carve-out. An agent CLI whose
 hooks cannot report "waiting on the operator" would otherwise be able to reach
 `WaitingInput` only by *not* installing tend's hooks — the wrong trade. Today
 that is the Antigravity CLI (`agy`); `AgentKind::hooks_report_attention()` is
-the predicate, and Claude Code, Codex, the Gemini CLI and opencode all return
+the predicate, and Claude Code, Codex and opencode all return
 `true` and keep the original behavior unchanged.
 
 For an attention-blind row, `tendd::synthetic::pane_ownership` returns

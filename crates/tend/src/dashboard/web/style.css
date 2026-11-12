@@ -2088,7 +2088,6 @@ a.unlinked-row:focus-visible {
 
 .collaboration-node.kind-codex rect { stroke: var(--green); }
 .collaboration-node.kind-claude_code rect { stroke: var(--magenta); }
-.collaboration-node.kind-gemini_cli rect { stroke: var(--cyan); }
 
 .collaboration-node-label {
   fill: var(--fg);

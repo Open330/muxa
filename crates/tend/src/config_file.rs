@@ -88,7 +88,7 @@ fn launch_settings(text: &str) -> Result<LaunchSettings, ConfigFileError> {
         .map_err(|error| ConfigFileError::Invalid(error.to_string()))?;
     let raw: toml::Value =
         toml::from_str(text).map_err(|error| ConfigFileError::Invalid(error.to_string()))?;
-    let providers = ["claude", "codex", "gemini", "opencode", "agy"]
+    let providers = ["claude", "codex", "opencode", "agy"]
         .into_iter()
         .map(|program| LaunchProvider {
             program: program.to_owned(),
@@ -202,7 +202,7 @@ pub fn write_launch(
         }
         match edit {
             LaunchEdit::Provider { program, options } => {
-                if !["claude", "codex", "gemini", "opencode", "agy"].contains(&program.as_str()) {
+                if !["claude", "codex", "opencode", "agy"].contains(&program.as_str()) {
                     return Err(ConfigFileError::Invalid(format!(
                         "unknown provider {program:?}"
                     )));

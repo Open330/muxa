@@ -21,11 +21,10 @@ pub struct Detection {
     pub cargo: Option<String>,
     pub claude_settings: Option<PathBuf>,
     pub codex_config: Option<PathBuf>,
-    pub gemini_settings: Option<PathBuf>,
-    /// Marker that the Antigravity CLI has run here. Separate from
-    /// `gemini_settings`: agy shares the `~/.gemini` tree with the CLI it
-    /// replaced, so the presence of `settings.json` says nothing about
-    /// whether `agy` is installed (and vice versa).
+    /// Marker that the Antigravity CLI has run here. agy shares the
+    /// `~/.gemini` tree with the retired Gemini CLI, so the presence of
+    /// `~/.gemini/settings.json` says nothing about whether `agy` is
+    /// installed.
     pub antigravity_home: Option<PathBuf>,
     pub opencode_config: Option<PathBuf>,
     pub tendd_running: bool,
@@ -55,7 +54,6 @@ impl Detection {
             cargo: tool_version("cargo", &["--version"]),
             claude_settings: agent_config(super::files::claude::default_path(), "claude"),
             codex_config: agent_config(super::files::codex::default_path(), "codex"),
-            gemini_settings: existing_file(home_join(".gemini/settings.json")),
             antigravity_home: detect_antigravity(),
             opencode_config: existing_dir(opencode_config_dir()),
             tendd_running: tendd_is_running(),
@@ -109,9 +107,6 @@ impl Detection {
                 Component::AgentMcp,
             ]);
         }
-        if self.gemini_settings.is_some() {
-            out.push(Component::GeminiHooks);
-        }
         if self.antigravity_home.is_some() {
             out.push(Component::AntigravityHooks);
         }
@@ -125,8 +120,8 @@ impl Detection {
 
     /// Whether an agent-hook component's config is present on disk.
     ///
-    /// Returns `Some(true)`/`Some(false)` for the five agent hooks
-    /// (Claude/Codex/Gemini/agy/opencode) and `None` for every other
+    /// Returns `Some(true)`/`Some(false)` for the four agent hooks
+    /// (Claude/Codex/agy/opencode) and `None` for every other
     /// component — the caller reads `None` as "not an agent hook, always
     /// keep". This is what lets the non-interactive/preset path skip
     /// wiring up an agent the user doesn't actually have installed,
@@ -135,7 +130,6 @@ impl Detection {
         match c {
             Component::ClaudeHooks => Some(self.claude_settings.is_some()),
             Component::CodexHooks => Some(self.codex_config.is_some()),
-            Component::GeminiHooks => Some(self.gemini_settings.is_some()),
             Component::AntigravityHooks => Some(self.antigravity_home.is_some()),
             Component::OpencodeHooks => Some(self.opencode_config.is_some()),
             _ => None,
@@ -197,14 +191,6 @@ fn tool_version(name: &str, args: &[&str]) -> Option<String> {
     }
     let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
     Some(if s.is_empty() { name.to_string() } else { s })
-}
-
-fn existing_file(p: PathBuf) -> Option<PathBuf> {
-    if p.is_file() {
-        Some(p)
-    } else {
-        None
-    }
 }
 
 fn agent_config(path: Option<PathBuf>, program: &str) -> Option<PathBuf> {

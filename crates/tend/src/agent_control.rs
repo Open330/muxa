@@ -21,7 +21,25 @@ use serde::{Deserialize, Serialize};
 use crate::work_control::{self, WorkCommandError, WorkCommandLimits, WorkCommandOutput};
 
 /// Providers `tend agent start --agent` accepts, by their CLI names.
-pub const AGENT_PROGRAMS: &[&str] = &["claude", "codex", "gemini", "agy", "opencode"];
+pub const AGENT_PROGRAMS: &[&str] = &["claude", "codex", "agy", "opencode"];
+
+/// Why a retired provider is refused, for errors and load-time warnings.
+pub const RETIRED_GEMINI_NOTE: &str =
+    "the Gemini CLI is no longer supported; use agy (the Antigravity CLI) instead";
+
+/// Is `name` a provider tend used to launch but no longer supports?
+///
+/// Only the Gemini CLI today. A config written for an older tend may still
+/// name it (`[agent.gemini]`, `mcp.guide.agent`, an automation rule's
+/// `agent`), and that config must keep loading: callers skip the entry with a
+/// warning instead of failing the load.
+#[must_use]
+pub fn is_retired_agent_program(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "gemini" | "gemini_cli" | "gemini-cli"
+    )
+}
 
 /// Environment a native launch may carry to the agent's PTY. The daemon's
 /// own environment is usually launchd's minimal one, so the client sends the
@@ -174,6 +192,9 @@ impl AgentStartRequest {
 
     pub fn validate(&self) -> Result<(), AgentStartError> {
         let invalid = |message: &str| Err(AgentStartError::Invalid(message.into()));
+        if is_retired_agent_program(&self.agent) {
+            return Err(AgentStartError::Invalid(RETIRED_GEMINI_NOTE.into()));
+        }
         if !AGENT_PROGRAMS.contains(&self.agent.as_str()) {
             return Err(AgentStartError::Invalid(format!(
                 "unknown agent {:?}; expected {}",

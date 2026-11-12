@@ -814,7 +814,7 @@ agent = 'codex'
         triad["agents"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"alias": "ship", "program": "gemini", "after": ["review"]}));
+            .push(json!({"alias": "ship", "program": "agy", "after": ["review"]}));
         let set = set_pipeline(&path, "triad", spec(triad)).unwrap();
         assert!(set.replaced);
         assert_eq!(set.agents, 3);
@@ -845,7 +845,7 @@ agent = 'codex'
             .map(|agent| agent.alias.as_str())
             .collect();
         assert_eq!(aliases, ["impl", "review", "ship"]);
-        assert_eq!(written.agent[2].program, "gemini");
+        assert_eq!(written.agent[2].program, "agy");
         assert_eq!(written.agent[2].after, ["review"]);
         assert_eq!(config.route[0].pipeline.as_deref(), Some("triad"));
         assert!(config.route[0].worktree.is_some());
@@ -1341,7 +1341,7 @@ after = ['plan']
 
 [[pipeline.full.agent]]
 alias = 'review'
-program = 'gemini'
+program = 'agy'
 direction = 'right'
 after = ['impl', 'plan']
 "
