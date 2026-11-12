@@ -1957,9 +1957,13 @@ mod tests {
         {
             return;
         }
-        let root =
-            std::path::PathBuf::from(format!("/private/tmp/tend-tmux-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        // A short, uniquely allocated scratch root: a socket path must fit
+        // in `sun_path`, so the platform temp dir can be too deep.
+        let base = tempfile::Builder::new()
+            .prefix("tend-tmux-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let root = base.path().to_path_buf();
         let private = root.join("private");
         std::fs::create_dir_all(&private).unwrap();
         let outside = root.join("outside.sock");
