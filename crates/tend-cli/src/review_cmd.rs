@@ -313,7 +313,8 @@ enum Action {
         #[arg(long)]
         json: bool,
     },
-    /// One review item in full.
+    /// One review item in full, with the command that opens each piece of
+    /// evidence (git in its recorded checkout, gh for a pull request).
     Show {
         id: String,
         #[arg(long)]
@@ -417,11 +418,22 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
             }
             Ok(())
         }
-        Action::Show { id, json } => print_item(&client.review_get(&id).await?, json),
+        Action::Show { id, json } => show(client, &id, json).await,
         Action::Accept(a) => dispose(client, DispositionKind::Accepted, a).await,
         Action::Return(a) => dispose(client, DispositionKind::Returned, a).await,
         Action::Withdraw(a) => dispose(client, DispositionKind::Withdrawn, a).await,
     }
+}
+
+/// One item in full, then the command that opens each piece of evidence.
+async fn show(client: &Client, id: &str, json: bool) -> Result<()> {
+    let item = client.review_get(id).await?;
+    print_item(&item, json)?;
+    if !json {
+        let evidence = crate::review_evidence::evidence_of(&item);
+        print!("{}", crate::review_evidence::render_open(&evidence));
+    }
+    Ok(())
 }
 
 async fn require_capability(client: &Client) -> Result<()> {
