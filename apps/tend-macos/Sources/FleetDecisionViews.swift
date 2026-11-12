@@ -22,6 +22,16 @@ final class FleetDecisionFeed: ObservableObject {
     /// The one decision whose answer is open, and the text typed so far.
     @Published private var composingID: String?
     @Published private var drafts: [String: String] = [:]
+    /// Past decisions on this Mac's daemon, for the history view.
+    @Published private(set) var history: TendDecisionHistory?
+    /// Results marked Looks Good in Home that tendd holds a record of; nil
+    /// while the daemon cannot record or report them, when Home keeps its
+    /// own marks instead.
+    @Published private(set) var reviewedKeys: Set<String>?
+    /// Looks Good sent and not yet seen in the history.
+    var pendingKeys: Set<String> = []
+    var lastHistoryLoad = Date.distantPast
+    static let historyEvery: TimeInterval = 30
     private var loading = false
 
     static let refreshEvery: Duration = .seconds(5)
@@ -46,6 +56,72 @@ final class FleetDecisionFeed: ObservableObject {
         } catch {
             problem = String(localized: "Could not read decisions: \(error.localizedDescription)")
         }
+        await loadHistory(client, force: false)
+    }
+
+    /// Reads the history at most every `historyEvery` seconds, or now.
+    func loadHistory(_ client: TendIPCClient, force: Bool) async {
+        guard await client.supports("review_record_v1"), await client.supports(tendDecisionQueueCapability) else {
+            reviewedKeys = nil
+            history = nil
+            return
+        }
+        guard force || Date().timeIntervalSince(lastHistoryLoad) >= Self.historyEvery else { return }
+        lastHistoryLoad = Date()
+        do {
+            guard let history = try await client.decisionHistory() else { return }
+            if self.history != history { self.history = history }
+            // A history missing its review source says nothing about what
+            // was reviewed: keep what was known rather than unhiding all.
+            guard !history.unavailable.contains(where: { $0.hasPrefix("review") }) else { return }
+            let recorded = FleetDecisionRecord.reviewedKeys(in: history)
+            pendingKeys.subtract(recorded)
+            let keys = recorded.union(pendingKeys)
+            if reviewedKeys != keys { reviewedKeys = keys }
+        } catch {
+            TendLog.app.warning("reading the decision history failed: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    /// Looks Good, recorded by tendd. Hidden at once; shown again with the
+    /// reason if the record fails.
+    func recordLooksGood(_ work: FleetWork, client: TendIPCClient) async {
+        guard let target = FleetBoard.reviewTarget(work) else { return }
+        let key = FleetBoard.reviewKey(work)
+        pendingKeys.insert(key)
+        reviewedKeys?.insert(key)
+        do {
+            try await client.recordDecision(
+                target: target, key: key, summary: FleetDecisionRecord.summary(work), disposition: .accepted, note: nil
+            )
+        } catch {
+            pendingKeys.remove(key)
+            reviewedKeys?.remove(key)
+            problem = String(localized: "Could not record Looks Good: \(error.localizedDescription)")
+        }
+        await loadHistory(client, force: true)
+    }
+
+    /// Records the results the person marked reviewed in this Mac's
+    /// settings before tendd kept the record, once. Only marks that still
+    /// hide a unit on the board mean anything; the rest are dropped. True
+    /// when every mark that mattered was recorded.
+    func migrate(_ marks: FleetReviewMarks, works: [FleetWork], client: TendIPCClient) async -> Bool {
+        var succeeded = true
+        for work in works where marks.marks[work.id] == work.revision && work.lane == .finished {
+            guard let target = FleetBoard.reviewTarget(work) else { continue }
+            do {
+                try await client.recordDecision(
+                    target: target, key: FleetBoard.reviewKey(work), summary: FleetDecisionRecord.summary(work),
+                    disposition: .accepted, note: nil
+                )
+            } catch {
+                succeeded = false
+                TendLog.app.warning("moving a review mark to tendd failed: \(error.localizedDescription, privacy: .public)")
+            }
+        }
+        await loadHistory(client, force: true)
+        return succeeded
     }
 
     /// What Home shows, oldest-blocked first, each with the asking agent's

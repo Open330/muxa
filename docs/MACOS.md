@@ -56,6 +56,15 @@ The native workspace follows two proven desktop navigation patterns:
   blocked in their pane stay Work cards. The Review sheet lists the same
   decisions at its top. Against a tendd without the queue, Home shows this
   Mac's open review items and every host's questions instead.
+- Decisions made from Home are recorded by tendd, not in the app's settings
+  (`review_record_v1`): **Looks Good** is an `accepted` review record keyed
+  to the unit and its exact revision, and that record is what hides the
+  result in Finished; **Send Back** and an answer typed or chosen for a
+  waiting agent are `returned` records with the words as the note, after the
+  message went. They show in `tend review history`. Marks an older Tend kept
+  in its settings are recorded once and then forgotten; against a tendd
+  without `review_record_v1` and `decision_queue_v1`, Home keeps local marks
+  as before.
 - Below Home, VS Code's Activity Bar pattern switches one contextual sidebar
   at a time while the editor area remains stable. Tend applies that to
   **Explore**, **Inbox**, **Ask**, **Shells**, and **Files**, with a filter scoped

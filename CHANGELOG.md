@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a read-only Changes view of that revision in one click; a pull request opens
   in the browser. Older daemons fall back to the review list and the console
   mailbox.
+- Tend for Mac records Home's decisions with tendd instead of in its own
+  settings: Looks Good, Send Back, and answers typed or chosen for a waiting
+  agent become review records (`review_record`), so `tend review history`
+  shows them and Home hides a reviewed result from tendd's record. Existing
+  Looks Good marks are recorded once and then removed from the app's
+  settings.
 
 ### Fixed
 

@@ -11,6 +11,7 @@ struct FleetHomeView: View {
     @State private var projectFilter: String?
     @State private var reviewed = FleetReviewMarks(defaults: .standard)
     @State private var showsReviewed = false
+    @State private var migrating = false
     /// Reply drafts per unit, kept while the inspector closes or the unit's
     /// focus changes, each bound to the question it was written for.
     @State private var drafts: [String: FleetReplyDraft] = [:]
@@ -35,14 +36,28 @@ struct FleetHomeView: View {
         model.homeWorks
     }
 
-    /// Also records the review with this Mac's daemon, asked and accepted
-    /// in one step, so `tend review list --all` shows it. The local mark
-    /// stays what hides the result here; a daemon that cannot record
-    /// changes nothing.
-    private func recordReviewed(_ work: FleetWork) {
+    /// What hides a finished result: tendd's record of Looks Good when the
+    /// daemon keeps one, else this Mac's own marks (an older tendd).
+    private var marks: FleetReviewMarks {
+        var marks = reviewed
+        marks.recorded = decisionFeed.reviewedKeys
+        return marks
+    }
+
+    /// Looks Good: recorded by tendd, which then hides the result. Against
+    /// a tendd that cannot record, a local mark hides it as before.
+    private func markReviewed(_ work: FleetWork) {
+        if decisionFeed.reviewedKeys != nil {
+            let feed = decisionFeed
+            let client = model.client
+            Task { await feed.recordLooksGood(work, client: client) }
+            return
+        }
+        reviewed.markReviewed(work)
+        reviewed.save(to: .standard)
         guard let target = FleetBoard.reviewTarget(work) else { return }
         let key = FleetBoard.reviewKey(work)
-        let summary = work.headline.isEmpty ? String(localized: "Reviewed in Home") : String(work.headline.prefix(2000))
+        let summary = FleetDecisionRecord.summary(work)
         let client = model.client
         Task {
             do {
@@ -50,6 +65,30 @@ struct FleetHomeView: View {
             } catch {
                 TendLog.app.warning("recording a review failed: \(error.localizedDescription, privacy: .public)")
             }
+        }
+    }
+
+    /// Hands this Mac's old review marks to tendd once it keeps the record,
+    /// then forgets them. A failure leaves them for the next try.
+    private func migrateMarksIfNeeded() {
+        guard decisionFeed.reviewedKeys != nil, model.isConnected, !allWorks.isEmpty,
+              !UserDefaults.standard.bool(forKey: FleetReviewMarks.migratedKey) else { return }
+        guard !reviewed.marks.isEmpty else {
+            UserDefaults.standard.set(true, forKey: FleetReviewMarks.migratedKey)
+            return
+        }
+        guard !migrating else { return }
+        migrating = true
+        let feed = decisionFeed
+        let client = model.client
+        let marks = reviewed
+        let works = allWorks
+        Task {
+            defer { migrating = false }
+            guard await feed.migrate(marks, works: works, client: client) else { return }
+            reviewed.clear()
+            reviewed.save(to: .standard)
+            UserDefaults.standard.set(true, forKey: FleetReviewMarks.migratedKey)
         }
     }
 
@@ -81,15 +120,11 @@ struct FleetHomeView: View {
                 decisions: { decisions },
                 decisionCard: { decisionCard($0, openRevision: $1) },
                 works: { allWorks },
-                marks: $reviewed,
+                marks: Binding(get: { marks }, set: { _ in }),
                 draft: draftBinding,
                 submit: { submit(for: $0) },
                 open: open,
-                markReviewed: { work in
-                    reviewed.markReviewed(work)
-                    reviewed.save(to: .standard)
-                    recordReviewed(work)
-                },
+                markReviewed: { markReviewed($0) },
                 send: { text, target in try await send(text, to: target) },
                 ask: { prompt in try await model.client.askOneShot(prompt) }
             )
@@ -138,7 +173,7 @@ struct FleetHomeView: View {
     /// Results the person asked for and has not reviewed, in the chosen
     /// range: the way to go through Finished quickly.
     private var reviewButton: some View {
-        let count = FleetBoard.reviewQueue(allWorks, marks: reviewed, scope: reviewScope).count
+        let count = FleetBoard.reviewQueue(allWorks, marks: marks, scope: reviewScope).count
         return Button {
             showsReview = true
         } label: {
@@ -262,8 +297,9 @@ struct FleetHomeView: View {
     private var board: some View {
         let all = FleetBoard.filter(allWorks, host: hostFilter, project: projectFilter)
         let decisions = decisions
-        let works = all.filter { showsReviewed || !reviewed.hides($0) }
-        let hiddenCount = all.filter { reviewed.hides($0) }.count
+        let marks = marks
+        let works = all.filter { showsReviewed || !marks.hides($0) }
+        let hiddenCount = all.filter { marks.hides($0) }.count
         let selected = all.first { $0.id == selectedID }
         return GeometryReader { geometry in
             // Beside the board while all three lanes keep a readable width;
@@ -301,7 +337,9 @@ struct FleetHomeView: View {
             var pruned = reviewed
             pruned.prune(keeping: Set(ids))
             if pruned != reviewed { reviewed = pruned; reviewed.save(to: .standard) }
+            migrateMarksIfNeeded()
         }
+        .onChange(of: decisionFeed.reviewedKeys != nil) { _ in migrateMarksIfNeeded() }
     }
 
     /// Marks the cards that changed lane so they can show where they came
@@ -329,7 +367,7 @@ struct FleetHomeView: View {
         FleetWorkInspector(
             model: model,
             work: work,
-            isReviewed: reviewed.hides(work),
+            isReviewed: marks.hides(work),
             close: { selectedID = nil },
             open: peek,
             openWork: { identity in model.select(.work(identity)) },
@@ -341,9 +379,7 @@ struct FleetHomeView: View {
                 approvalSeed = seed
             },
             markReviewed: {
-                reviewed.markReviewed(work)
-                reviewed.save(to: .standard)
-                recordReviewed(work)
+                markReviewed(work)
                 selectedID = nil
             },
             agentDraft: { draftBinding(Self.agentDraftKey(work, $0)) },
@@ -381,6 +417,18 @@ struct FleetHomeView: View {
         }
         if let blocker = TendNotificationActions.replyBlocker(current) { throw TendIPCError.server(blocker) }
         try await model.client.sendFleetPrompt(host: current.host, pane: current.pane, text: text)
+        // The words went to the agent; tendd records them as the decision.
+        let question = current.agent?.awaitingReply?.question
+            ?? allWorks.first { ($0.agents + $0.helpers).contains { $0.id == hosted.id } }?.headline
+        await FleetDecisionRecord.recordInstruction(
+            client: model.client,
+            target: model.homeReviewTarget(for: hosted),
+            reply: target.kind,
+            sessionID: target.sessionID,
+            waitSince: target.stateEnteredAt,
+            question: question,
+            text: text
+        )
     }
 
     @ViewBuilder

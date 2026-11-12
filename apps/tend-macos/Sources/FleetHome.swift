@@ -821,6 +821,10 @@ struct FleetReviewMarks: Equatable, Sendable {
     static let defaultsKey = "fleetHome.reviewed"
 
     private(set) var marks: [String: String] = [:]
+    /// The results tendd recorded as Looks Good from Home (their review
+    /// keys). When set, it decides what is hidden and the local marks are
+    /// only what is left to migrate.
+    var recorded: Set<String>?
 
     init(marks: [String: String] = [:]) { self.marks = marks }
 
@@ -833,8 +837,16 @@ struct FleetReviewMarks: Equatable, Sendable {
     }
 
     func hides(_ work: FleetWork) -> Bool {
-        work.lane == .finished && marks[work.id] == work.revision
+        guard work.lane == .finished else { return false }
+        if let recorded { return recorded.contains(FleetBoard.reviewKey(work)) }
+        return marks[work.id] == work.revision
     }
+
+    /// Set once this Mac's marks have been recorded by tendd.
+    static let migratedKey = "fleetHome.reviewed.migrated"
+
+    /// Forgets every local mark, after tendd recorded them.
+    mutating func clear() { marks = [:] }
 
     mutating func markReviewed(_ work: FleetWork) {
         marks[work.id] = work.revision

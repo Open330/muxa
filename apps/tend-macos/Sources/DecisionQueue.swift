@@ -402,6 +402,106 @@ enum FleetDecisions {
     }
 }
 
+// MARK: - History
+
+/// A human request and the answer it got.
+struct TendHumanAnswerEntry: Decodable, Hashable, Sendable {
+    let request: TendHumanRequestEntry
+    /// `completed` for an answer; `declined`, `failed` or `blocked` when the
+    /// person said so.
+    let status: String
+    let answer: String
+    let answeredAt: String
+
+    enum CodingKeys: String, CodingKey {
+        case status, answer
+        case answeredAt = "answered_at"
+    }
+
+    init(request: TendHumanRequestEntry, status: String, answer: String, answeredAt: String) {
+        self.request = request
+        self.status = status
+        self.answer = answer
+        self.answeredAt = answeredAt
+    }
+
+    init(from decoder: Decoder) throws {
+        // The request's fields sit beside the answer's (serde flatten).
+        request = try TendHumanRequestEntry(from: decoder)
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        status = try values.decode(String.self, forKey: .status)
+        answer = try values.decode(String.self, forKey: .answer)
+        answeredAt = try values.decode(String.self, forKey: .answeredAt)
+    }
+}
+
+enum TendDecidedItem: Decodable, Hashable, Sendable {
+    case review(TendReviewItem)
+    case humanAnswer(TendHumanAnswerEntry)
+
+    private enum CodingKeys: String, CodingKey { case kind }
+
+    init(from decoder: Decoder) throws {
+        let kind = try decoder.container(keyedBy: CodingKeys.self).decode(String.self, forKey: .kind)
+        switch kind {
+        case "review": self = .review(try TendReviewItem(from: decoder))
+        case "human_answer": self = .humanAnswer(try TendHumanAnswerEntry(from: decoder))
+        default:
+            throw DecodingError.dataCorrupted(.init(codingPath: decoder.codingPath, debugDescription: "unknown decided item \(kind)"))
+        }
+    }
+}
+
+/// `decision_history`'s answer, newest first.
+struct TendDecisionHistory: Decodable, Hashable, Sendable {
+    var items: [TendDecidedItem] = []
+    var truncated = false
+    var unavailable: [String] = []
+    /// Entries tendd sent that this app could not read.
+    var undecoded = 0
+
+    enum CodingKeys: String, CodingKey { case items, truncated, unavailable }
+
+    init(items: [TendDecidedItem] = [], truncated: Bool = false, unavailable: [String] = []) {
+        self.items = items
+        self.truncated = truncated
+        self.unavailable = unavailable
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        let raw = (try? values.decodeIfPresent([TendLenient<TendDecidedItem>].self, forKey: .items)) ?? []
+        items = raw.compactMap(\.value)
+        undecoded = raw.count - items.count
+        truncated = (try? values.decodeIfPresent(Bool.self, forKey: .truncated)) ?? false
+        unavailable = (try? values.decodeIfPresent([String].self, forKey: .unavailable)) ?? []
+    }
+}
+
+/// Text the review store accepts: no control characters but newline and
+/// tab, at most `maxBytes` of UTF-8, cut on a character boundary.
+enum TendRecordText {
+    static func bounded(_ text: String, maxBytes: Int) -> String {
+        var scalars = String.UnicodeScalarView()
+        for scalar in text.unicodeScalars
+        where scalar == "\n" || scalar == "\t" || scalar.properties.generalCategory != .control {
+            scalars.append(scalar)
+        }
+        let cleaned = String(scalars).trimmingCharacters(in: .whitespacesAndNewlines)
+        guard cleaned.utf8.count > maxBytes else { return cleaned }
+        var result = ""
+        var used = 0
+        let ellipsis = "…"
+        for character in cleaned {
+            let size = character.utf8.count
+            if used + size > maxBytes - ellipsis.utf8.count { break }
+            result.append(character)
+            used += size
+        }
+        return result + ellipsis
+    }
+}
+
 private extension String {
     var nilIfEmpty: String? { isEmpty ? nil : self }
 }
