@@ -354,7 +354,11 @@ impl WorkEdit {
             plan.priority = Some(priority);
         }
         record.plan = (!plan.is_empty()).then_some(plan);
-        if created && record.metadata.title.is_none() && record.plan.is_none() {
+        if created
+            && record.metadata.title.is_none()
+            && record.metadata.goal.is_none()
+            && record.plan.is_none()
+        {
             return Err("a planned Work needs at least a title, goal or prompt".into());
         }
         Ok(record)
@@ -1044,6 +1048,15 @@ mod tests {
             .map(|r| r.identity.work_id.as_str())
             .collect();
         assert_eq!(order, ["P1", "P2", "EARLY", "LATE"]);
+        assert!(
+            WorkEdit {
+                goal: Some("users land on /home".into()),
+                ..WorkEdit::default()
+            }
+            .apply(&WorkIdentity::new("w", "GOAL"), None, at(0))
+            .is_ok(),
+            "a goal alone is a plan"
+        );
         assert!(validate_identity(&WorkIdentity::new("a/b", "X")).is_err());
         assert!(validate_identity(&WorkIdentity::new("a", "X\u{1b}")).is_err());
         assert!(WorkEdit {

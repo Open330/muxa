@@ -1421,16 +1421,28 @@ fn show_json(work: Option<&WorkInfo>, show: &tend::ipc::WorkShow) -> serde_json:
 /// (what was asked, done and decided), which outlives the window.
 pub async fn run_work_show(args: WorkShowArgs, client: &tend::ipc::Client) -> Result<()> {
     let work = find_work_in(&args.work, args.workspace.as_deref())?;
+    let supported = crate::work_backlog::backlog_supported(client).await;
     let identity = if let Some(work) = &work {
         Some(tend::work::WorkIdentity::new(&work.workspace, &work.work))
-    } else {
+    } else if supported {
+        // No window: resolve from the durable records, the way `work up`
+        // starts a plan, not from whatever directory this runs in.
+        let records = client
+            .work_backlog(None)
+            .await
+            .context("reading the Work backlog")?;
         let here = std::env::current_dir()?;
-        crate::work_backlog::identity(&args.work, args.workspace.as_deref(), &here).ok()
+        crate::work_backlog::closed_work_identity(
+            &records,
+            &args.work,
+            args.workspace.as_deref(),
+            &here,
+        )?
+    } else {
+        None
     };
     let show = match identity {
-        Some(identity) if crate::work_backlog::backlog_supported(client).await => {
-            client.work_record_show(&identity).await.ok()
-        }
+        Some(identity) if supported => client.work_record_show(&identity).await.ok(),
         _ => None,
     };
     let Some(work) = work else {

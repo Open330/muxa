@@ -299,8 +299,15 @@ pub(crate) fn render_show(show: &WorkShow, now: OffsetDateTime) -> String {
 }
 
 /// Fill `tend work up` arguments the caller left out from the Work's plan,
-/// if one exists. Explicit arguments always win.
-pub(crate) fn fill_from_plan(args: &mut crate::work_up::UpArgs, record: &WorkRecord) {
+/// if one exists. Explicit arguments always win, `--no-ticket` keeps the
+/// saved issue out, and the saved prompt is used only for the first start
+/// (`initial`): on a re-run it would read as a steering body and restart
+/// every agent instead of converging.
+pub(crate) fn fill_from_plan(
+    args: &mut crate::work_up::UpArgs,
+    record: &WorkRecord,
+    initial: bool,
+) {
     let Some(plan) = &record.plan else {
         return;
     };
@@ -313,33 +320,64 @@ pub(crate) fn fill_from_plan(args: &mut crate::work_up::UpArgs, record: &WorkRec
     if args.pipeline.is_none() {
         args.pipeline.clone_from(&plan.pipeline);
     }
-    if args.body.is_none() {
+    if initial && args.body.is_none() && args.skill.is_none() {
         args.body.clone_from(&plan.prompt);
     }
-    if args.external.is_none() {
+    if args.external.is_none() && !args.no_ticket {
         args.external.clone_from(&plan.external);
     }
 }
 
-/// The planned record `tend work up WORK` should start from: the one with
-/// this Work id in the named workspace, or the only one when no workspace
-/// was named.
-pub(crate) fn planned_record<'a>(
+/// Which Work `tend work show WORK` means once its window is gone: the
+/// durable record with that id (an error when several match), else the
+/// identity `work up` would give it from here.
+pub(crate) fn closed_work_identity(
+    records: &[WorkRecord],
+    work: &str,
+    workspace: Option<&str>,
+    here: &Path,
+) -> Result<Option<WorkIdentity>> {
+    if let Some(record) = find_record(records, work, workspace, false)? {
+        return Ok(Some(record.identity.clone()));
+    }
+    Ok(identity(work, workspace, here).ok())
+}
+
+/// The record for Work id `work`: the one in the named workspace, or the
+/// only one when no workspace was named. Several without a workspace is an
+/// error naming them, never a silent "none". With `planned_only`, records
+/// without a plan are ignored.
+pub(crate) fn find_record<'a>(
     records: &'a [WorkRecord],
     work: &str,
     workspace: Option<&str>,
-) -> Option<&'a WorkRecord> {
-    let work = crate::tmux_work::normalize_work_id(work).ok()?;
-    let workspace = workspace.and_then(|w| crate::tmux_work::normalize_workspace_id(w).ok());
-    let mut matching = records.iter().filter(|record| {
-        record.plan.is_some()
-            && record.identity.work_id == work
-            && workspace
-                .as_ref()
-                .is_none_or(|w| &record.identity.workspace_id == w)
-    });
-    let first = matching.next()?;
-    matching.next().is_none().then_some(first)
+    planned_only: bool,
+) -> Result<Option<&'a WorkRecord>> {
+    let work = crate::tmux_work::normalize_work_id(work)?;
+    let workspace = workspace
+        .map(crate::tmux_work::normalize_workspace_id)
+        .transpose()?;
+    let matching: Vec<&WorkRecord> = records
+        .iter()
+        .filter(|record| {
+            (!planned_only || record.plan.is_some())
+                && record.identity.work_id == work
+                && workspace
+                    .as_ref()
+                    .is_none_or(|w| &record.identity.workspace_id == w)
+        })
+        .collect();
+    match matching.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one)),
+        many => bail!(
+            "Work {work} is recorded in several workspaces ({}); pass --workspace",
+            many.iter()
+                .map(|record| record.identity.workspace_id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -394,25 +432,79 @@ mod tests {
             record("web", "ENG-1", Some(plan)),
             record("api", "ENG-2", None),
         ];
-        let planned = planned_record(&records, "eng-1", None).unwrap();
+        let planned = find_record(&records, "eng-1", None, true).unwrap().unwrap();
         let mut args: crate::work_up::UpArgs =
             clap::Parser::try_parse_from(["up", "ENG-1", "--pipeline", "solo"])
                 .map(|wrapper: UpWrapper| wrapper.args)
                 .unwrap();
-        fill_from_plan(&mut args, planned);
+        fill_from_plan(&mut args, planned, true);
         assert_eq!(args.workspace.as_deref(), Some("web"));
         assert!(args.cwd.is_none(), "a plan's cwd is not an explicit --cwd");
         assert_eq!(args.planned_cwd.as_deref(), Some(Path::new("/src/web")));
         assert_eq!(args.pipeline.as_deref(), Some("solo"), "explicit wins");
         assert_eq!(args.body.as_deref(), Some("fix the login redirect"));
-        assert!(planned_record(&records, "ENG-2", None).is_none(), "no plan");
-        assert!(planned_record(&records, "ENG-1", Some("api")).is_none());
+        assert!(
+            find_record(&records, "ENG-2", None, true)
+                .unwrap()
+                .is_none(),
+            "no plan"
+        );
+        assert!(find_record(&records, "ENG-1", Some("api"), true)
+            .unwrap()
+            .is_none());
+        // A re-run converges: the saved prompt is not a steering body.
+        let mut rerun: crate::work_up::UpArgs = clap::Parser::try_parse_from(["up", "ENG-1"])
+            .map(|w: UpWrapper| w.args)
+            .unwrap();
+        fill_from_plan(&mut rerun, planned, false);
+        assert!(rerun.body.is_none());
+        // --no-ticket keeps a saved issue out.
+        let mut with_issue = planned.clone();
+        with_issue.plan.as_mut().unwrap().external = Some("ENG-123".into());
+        let mut offline: crate::work_up::UpArgs =
+            clap::Parser::try_parse_from(["up", "ENG-1", "--no-ticket"])
+                .map(|w: UpWrapper| w.args)
+                .unwrap();
+        fill_from_plan(&mut offline, &with_issue, true);
+        assert!(offline.external.is_none());
+        // The same id in two workspaces needs --workspace.
+        let twice = vec![
+            record("web", "ENG-9", Some(WorkPlan::default())),
+            record("api", "ENG-9", Some(WorkPlan::default())),
+        ];
+        let error = find_record(&twice, "ENG-9", None, true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("api, web") || error.contains("web, api"),
+            "{error}"
+        );
+        assert!(find_record(&twice, "ENG-9", Some("api"), true)
+            .unwrap()
+            .is_some());
     }
 
     #[derive(clap::Parser)]
     struct UpWrapper {
         #[command(flatten)]
         args: crate::work_up::UpArgs,
+    }
+
+    #[test]
+    fn a_closed_work_is_found_by_its_record_not_the_current_directory() {
+        let records = vec![record("web", "ENG-1", None)];
+        let here = Path::new("/src/repo");
+        assert_eq!(
+            closed_work_identity(&records, "eng-1", None, here).unwrap(),
+            Some(WorkIdentity::new("web", "ENG-1"))
+        );
+        assert_eq!(
+            closed_work_identity(&records, "ENG-2", None, here).unwrap(),
+            Some(WorkIdentity::new("repo", "ENG-2")),
+            "no record: the identity work up would use from here"
+        );
+        let twice = vec![record("web", "ENG-1", None), record("api", "ENG-1", None)];
+        assert!(closed_work_identity(&twice, "ENG-1", None, here).is_err());
     }
 
     #[test]

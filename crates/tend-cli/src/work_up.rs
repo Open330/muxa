@@ -193,14 +193,26 @@ pub async fn run(
     // the backlog record, and starting it moves it to in progress.
     let planned = match client {
         Some(client) if crate::work_backlog::backlog_supported(client).await => {
-            let records = client.work_backlog(None).await.unwrap_or_default();
-            crate::work_backlog::planned_record(&records, &args.work, args.workspace.as_deref())
+            let records = client
+                .work_backlog(None)
+                .await
+                .context("reading the Work backlog")?;
+            crate::work_backlog::find_record(&records, &args.work, args.workspace.as_deref(), true)?
                 .cloned()
         }
         _ => None,
     };
-    if let Some(record) = &planned {
-        crate::work_backlog::fill_from_plan(&mut args, record);
+    if let (Some(record), Some(client)) = (&planned, client) {
+        // The first start of a queued plan with no durable Run yet: only
+        // then is the saved prompt the launch instruction.
+        let initial = record.metadata.stage == tend::work::WorkStage::Queued
+            && client
+                .pipeline_runs()
+                .await
+                .context("reading durable pipeline Runs")?
+                .iter()
+                .all(|run| run.identity != record.identity);
+        crate::work_backlog::fill_from_plan(&mut args, record, initial);
     }
     let json = args.json;
     let dry_run = args.dry_run;
