@@ -2905,6 +2905,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
     let replies = collaboration.pending_reply_unnotified().await;
     let agents = store.snapshot().await;
     let stranded = stranded_requests(collaboration, &agents).await;
+    retire_gone_sender_items(collaboration).await;
     if requests.is_empty() && replies.is_empty() && stranded.is_empty() {
         return;
     }
@@ -2931,6 +2932,7 @@ async fn wake_idle_collaboration_peers_with_inflight(
     for request in &stranded {
         follow_vanished_recipient(collaboration, request, &participants, &agents, &panes).await;
     }
+    follow_vanished_senders(collaboration, &replies, &participants, &agents, &panes).await;
 
     for request in requests {
         let Some(recipient) =
@@ -3056,6 +3058,53 @@ async fn follow_vanished_recipient(
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(request_id = request.id, %error, "failed to readdress request");
+        }
+    }
+}
+
+/// Withdraw gone-sender items whose reply has since been read or delivered.
+async fn retire_gone_sender_items(collaboration: &CollaborationStore) {
+    if let Err(error) = collaboration.retire_gone_sender_items().await {
+        tracing::warn!(%error, "failed to retire gone-sender items");
+    }
+}
+
+/// Owed replies whose sender session is gone: rebind each to the single
+/// live successor in the sender's slot, whose next idle turn is then woken,
+/// or, with no successor, open one human item after the grace.
+async fn follow_vanished_senders(
+    collaboration: &CollaborationStore,
+    replies: &[CollaborationRequest],
+    participants: &[tend::collaboration::Participant],
+    agents: &[tend::state::Agent],
+    panes: &[tend::tmux::PaneInfo],
+) {
+    use tend::collaboration::sender_follow::{sender_whereabouts, SenderWhereabouts};
+    for request in replies {
+        match sender_whereabouts(request, participants, agents, panes) {
+            SenderWhereabouts::Present => {}
+            SenderWhereabouts::Successor(successor) => {
+                match collaboration
+                    .rebind_sender(&request.id, &request.from, *successor)
+                    .await
+                {
+                    Ok(Some(rebound)) => tracing::info!(
+                        request_id = rebound.id,
+                        from = request.from.agent_session_id,
+                        to = rebound.from.agent_session_id,
+                        "reply wake followed its sender's slot",
+                    ),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(request_id = request.id, %error, "failed to rebind sender");
+                    }
+                }
+            }
+            SenderWhereabouts::Gone => {
+                if let Err(error) = collaboration.report_gone_sender(&request.id).await {
+                    tracing::warn!(request_id = request.id, %error, "failed to report gone sender");
+                }
+            }
         }
     }
 }

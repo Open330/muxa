@@ -91,6 +91,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   backup and mailbox caps can each be turned off with `0`.
 ### Fixed
 
+- A reply no longer goes unannounced when the agent that asked has been
+  replaced or has exited. The reply wake follows the sender's alias (or role)
+  to the one session that now holds it. If no session does, a recovery item
+  tells you a reply is waiting for nobody.
 - A peer that claims a request and ends its turn without replying no longer
   leaves the sender waiting silently. Its `Stop` hook reminds it of the
   request id (at most three times, five minutes apart); if it stays idle

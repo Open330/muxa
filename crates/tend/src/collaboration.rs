@@ -918,6 +918,10 @@ pub struct CollaborationRequest {
     /// readable question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<crate::decision::Decision>,
+    /// The sender's slot, and where its reply wake followed it
+    /// (`sender_follow.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_follow: Option<sender_follow::SenderFollowState>,
 }
 
 impl CollaborationRequest {
@@ -3235,7 +3239,13 @@ impl CollaborationStore {
                 ));
             }
         }
+        let sender_follow =
+            sender_follow::sender_slot(&from).map(|slot| sender_follow::SenderFollowState {
+                slot: Some(slot),
+                ..Default::default()
+            });
         let request = CollaborationRequest {
+            sender_follow,
             attempt: input.task_contract.as_ref().map(TaskContract::attempt),
             task_contract: input.task_contract,
             supersedes_request_id: input.supersedes_request_id,
@@ -9989,6 +9999,7 @@ mod purpose_promote_tests;
 mod recipient_slot_tests;
 mod recovery;
 mod retirement;
+pub mod sender_follow;
 pub use retirement::{RequestRetirement, RETIRE_CAPABILITY};
 #[cfg(test)]
 mod reply_wake_tests;

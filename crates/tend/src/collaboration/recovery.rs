@@ -173,6 +173,8 @@ fn recovery_action(
     action.reply_wake = None;
     action.wake_delivery = None;
     action.reply = None;
+    action.turn_offer = None;
+    action.sender_follow = None;
     action.updates.clear();
     action
 }
