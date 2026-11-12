@@ -165,13 +165,14 @@ jobs:
     name: macOS app
     needs: [create-release]
     if: ${{ always() && (github.event_name == 'workflow_dispatch' || needs.create-release.result == 'success') }}
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v5
 
-      # AppIcon.icon (Icon Composer) needs Xcode 26 or newer. The runner's
-      # default Xcode can be older: it then copies the icon as a plain folder
-      # and the app ships without one (v0.10.12). Pick the newest Xcode 26+.
+      # AppIcon.icon (Icon Composer) needs Xcode 26 or newer on macOS 26 or
+      # newer: an older Xcode copies it as a plain folder and the app ships
+      # without an icon (v0.10.12), and Xcode 26 on a macOS 15 runner crashes
+      # in actool. Hence macos-26, and the newest Xcode 26+ on it.
       - name: Select Xcode 26 or newer
         run: |
           set -euo pipefail
