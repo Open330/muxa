@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- The app icon lights all four rooms in their state colours (coral error,
+  amber your turn, green done, paper working) instead of four white rooms on
+  graphite. The web mark beside "tend" on the site and dashboard uses the same
+  colours.
+
 ### Fixed
 
 - The daemon removes terminal launch archives after 30 days, retaining live
