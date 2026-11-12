@@ -128,6 +128,16 @@ pub(crate) fn route(name: &str, args: Value) -> Result<Routed, String> {
             replaced_by: Some(new),
         });
     }
+    // A selector of the wrong type must never widen to a default route
+    // (an unreadable `view` must not claim work).
+    if !args.is_object() {
+        return Err(format!("{name} arguments must be an object"));
+    }
+    for selector in ["view", "action", "topic", "kind", "host", "intent"] {
+        if args.get(selector).is_some_and(|value| !value.is_string()) {
+            return Err(format!("`{selector}` must be a string"));
+        }
+    }
     let routed = |name: &str, args: serde_json::Map<String, Value>| Routed {
         name: name.to_string(),
         args: Value::Object(args),
@@ -976,6 +986,17 @@ mod tests {
             "tend_peer_report"
         );
         assert!(route("tend_inbox", json!({"view": "nope"})).is_err());
+        for malformed in [json!({"view": null}), json!({"view": false}), json!([])] {
+            assert!(
+                route("tend_inbox", malformed.clone()).is_err(),
+                "{malformed}"
+            );
+        }
+        assert!(route(
+            "tend_update_request",
+            json!({"request_id": "r", "action": 1})
+        )
+        .is_err());
         assert_eq!(
             route_ok(
                 "tend_update_request",
