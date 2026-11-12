@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A peer that claims a request and ends its turn without replying no longer
+  leaves the sender waiting silently. Its `Stop` hook reminds it of the
+  request id (at most three times, five minutes apart); if it stays idle
+  without replying, the request is marked `peer_interrupted` with reason
+  `reply_overdue`, the sender's wait returns, and a recovery item reaches you
+  if the sender does not act.
+
 - A prompt sent from the dashboard or through Fleet while a peer's wake
   message was being typed into the same agent no longer merges with it. Both
   used to land on one input line and be submitted together by a single Enter;
