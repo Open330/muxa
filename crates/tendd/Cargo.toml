@@ -13,7 +13,7 @@ name = "tendd"
 path = "src/main.rs"
 
 [dependencies]
-tend = { workspace = true }
+tend = { workspace = true, features = ["dashboard"] }
 
 anyhow = { workspace = true }
 clap = { workspace = true }

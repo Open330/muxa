@@ -183,7 +183,9 @@ against glibc 2.17 (a native build would require the build host's glibc).
 ## Project layout
 
 - `crates/tend` — shared library: state, config, IPC, backends, agent adapters,
-  dashboard, and notifications
+  dashboard, and notifications. The dashboard's HTTP server and embedded web
+  assets sit behind the `dashboard` cargo feature, which only `tendd` enables;
+  check the CLI side with `cargo check -p tend-cli` (no feature)
 - `crates/tendd` — daemon binary
 - `crates/tend-cli` — CLI binary and terminal UIs
 - `apps/tend-macos` — native Mac app and bundled runtime build scripts

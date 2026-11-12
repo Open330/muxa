@@ -365,6 +365,9 @@ pub async fn load(path: &Path) -> std::io::Result<Vec<ActivityEntry>> {
     Ok(out)
 }
 
+// The append-aware cache below only backs the dashboard timeline, so a build
+// without the `dashboard` feature does not use it.
+#[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ActivityFileIdentity {
     #[cfg(unix)]
@@ -375,6 +378,7 @@ struct ActivityFileIdentity {
     created_at: Option<SystemTime>,
 }
 
+#[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
 impl ActivityFileIdentity {
     fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         #[cfg(unix)]
@@ -399,6 +403,7 @@ impl ActivityFileIdentity {
 /// Normal appends seek directly to the previously observed byte offset. Atomic
 /// compaction replacement and truncation trigger a full reload. Bytes after the
 /// final newline are retained until the writer completes that NDJSON record.
+#[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
 #[derive(Debug, Default)]
 pub(crate) struct ActivityCache {
     path: Option<PathBuf>,
@@ -408,6 +413,7 @@ pub(crate) struct ActivityCache {
     entries: Arc<Vec<ActivityEntry>>,
 }
 
+#[cfg_attr(not(feature = "dashboard"), allow(dead_code))]
 impl ActivityCache {
     pub(crate) async fn refresh(
         &mut self,
