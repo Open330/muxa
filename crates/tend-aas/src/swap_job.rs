@@ -161,7 +161,7 @@ impl From<std::io::Error> for JobError {
 pub(crate) struct OwnerIdentity {
     pub(crate) nonce: String,
     pub(crate) pid: u32,
-    /// [`crate::agent_conversation::process_start`] of `pid`, where known.
+    /// [`tend::agent_conversation::process_start`] of `pid`, where known.
     pub(crate) process_start: Option<String>,
 }
 
@@ -626,7 +626,7 @@ impl SwapJobStore {
     /// `<data dir>/tend/swap-jobs.sqlite3`.
     #[must_use]
     pub(crate) fn default_path() -> Option<PathBuf> {
-        crate::paths::data_dir().map(|dir| dir.join("tend").join("swap-jobs.sqlite3"))
+        tend::paths::data_dir().map(|dir| dir.join("tend").join("swap-jobs.sqlite3"))
     }
 
     /// Open (creating if absent) and validate the store. Opening never

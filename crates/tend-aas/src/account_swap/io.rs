@@ -9,10 +9,10 @@
 //! after it happens.
 
 use super::Target;
-pub(crate) use crate::agent_tui::Clock;
-use crate::backend::SharedBackend;
-use crate::pane_process::{is_agent_process, is_alive, pane_processes, signal_pids};
 use std::time::{Duration, Instant};
+pub(crate) use tend::agent_tui::Clock;
+use tend::backend::SharedBackend;
+use tend::pane_process::{is_agent_process, is_alive, pane_processes, signal_pids};
 
 /// An agent process and its arguments (`None`: unreadable).
 pub(crate) type AgentArgv = (u32, Option<Vec<String>>);
@@ -220,7 +220,7 @@ impl SwapIo for LiveIo<'_> {
     fn capture(&self) -> Option<String> {
         self.backend
             .capture_pane_on(self.target.socket.as_deref(), &self.target.pane)
-            .map(|screen| crate::screen::strip_ansi(&screen))
+            .map(|screen| tend::screen::strip_ansi(&screen))
     }
 
     fn send_text(&self, text: &str) -> bool {
@@ -268,7 +268,7 @@ impl SwapIo for LiveIo<'_> {
         pane_processes(pane_pid)
             .into_iter()
             .filter(|p| is_agent_process(p, self.target.kind))
-            .map(|p| (p.pid, crate::process_snapshot::process_argv(p.pid)))
+            .map(|p| (p.pid, tend::process_snapshot::process_argv(p.pid)))
             .collect()
     }
 
@@ -285,7 +285,7 @@ impl SwapIo for LiveIo<'_> {
     }
 
     fn submit_grace(&self) -> Duration {
-        crate::backend::prompt_submit_grace(&self.target.pane)
+        tend::backend::prompt_submit_grace(&self.target.pane)
     }
 
     fn prompt_cursor(&self) -> Option<u64> {

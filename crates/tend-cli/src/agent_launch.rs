@@ -116,7 +116,7 @@ impl NativeLaunch {
     /// skipped or never asked for runs as built.
     fn on_account(
         self,
-        routed: Option<&std::result::Result<tend::account_route::RoutedLaunch, String>>,
+        routed: Option<&std::result::Result<tend::swap_api::RoutedLaunch, String>>,
     ) -> Self {
         match routed {
             Some(Ok(routed)) => {
@@ -138,9 +138,9 @@ impl NativeLaunch {
 /// Settle `[agent.<program>].account` for one launch, before anything is
 /// created. A skipped route is reported, not fatal: the agent still starts.
 fn route_account(
-    route: Option<&tend::account_route::AccountRoute>,
-) -> Option<std::result::Result<tend::account_route::RoutedLaunch, String>> {
-    let outcome = tend::account_route::decide(route?);
+    route: Option<&tend::swap_api::AccountRoute>,
+) -> Option<std::result::Result<tend::swap_api::RoutedLaunch, String>> {
+    let outcome = crate::account_module::decide(route?);
     if let Err(reason) = &outcome {
         eprintln!("tend: starting without an account: {reason}");
     }
@@ -395,7 +395,7 @@ pub struct StartRequest {
     pub socket: PathBuf,
     /// `[agent.<program>].account`: which account the agent starts
     /// on. `None` runs the bare provider CLI.
-    pub account: Option<tend::account_route::AccountRoute>,
+    pub account: Option<tend::swap_api::AccountRoute>,
 }
 
 /// The caller's own `--option`/`options` list, or `None` when they named
@@ -471,7 +471,7 @@ pub struct StartResult {
     pub cwd: PathBuf,
     pub prompt_supplied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub account: Option<tend::account_route::AccountDecision>,
+    pub account: Option<tend::swap_api::AccountDecision>,
 }
 
 /// Stable `tend agent start --json` envelope across execution hosts.
@@ -504,7 +504,7 @@ struct AgentStartOutput {
     alias: Option<String>,
     cwd: PathBuf,
     prompt_supplied: bool,
-    account: Option<tend::account_route::AccountDecision>,
+    account: Option<tend::swap_api::AccountDecision>,
 }
 
 impl AgentStartOutput {
@@ -645,7 +645,7 @@ async fn run_native(
         alias: None,
         cwd,
         prompt_supplied: prompt.is_some(),
-        account: routed.as_ref().map(tend::account_route::report),
+        account: routed.as_ref().map(tend::swap_api::report),
     };
     if args.json {
         println!("{}", serde_json::to_string_pretty(&result)?);
@@ -1137,7 +1137,7 @@ pub fn start(mut request: StartRequest) -> Result<StartResult> {
         alias,
         cwd,
         prompt_supplied: prompt.is_some(),
-        account: routed.as_ref().map(tend::account_route::report),
+        account: routed.as_ref().map(tend::swap_api::report),
     })
 }
 
@@ -1175,7 +1175,7 @@ fn claude_session_options(options: &mut Vec<String>) -> Option<String> {
 }
 
 /// ` on <account>` for a routed launch's one-line report.
-fn account_suffix(decision: Option<&tend::account_route::AccountDecision>) -> String {
+fn account_suffix(decision: Option<&tend::swap_api::AccountDecision>) -> String {
     decision
         .and_then(|decision| decision.account.as_deref())
         .map_or_else(String::new, |account| format!(" on {account}"))
@@ -2071,7 +2071,7 @@ os.execv({real:?}, [{real:?}] + args)
         let build = || {
             AgentProgram::Codex.permission_launch(&["--no-daemon".into()], Some("it's\nfine"), true)
         };
-        let routed = Ok(tend::account_route::RoutedLaunch::via_aas(
+        let routed = Ok(tend::swap_api::RoutedLaunch::via_aas(
             "/opt/aas".into(),
             "ok@codex".into(),
         ));

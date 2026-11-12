@@ -17,40 +17,14 @@
 //! Already-running agents are [`crate::account_swap`]'s business.
 
 use crate::account_swap::{find_aas, query_candidates_within, Candidate};
-pub use crate::swap_api::{AccountDecision, AccountRoute, SpawnAccount, PROVIDERS};
 use std::time::Duration;
+pub use tend::swap_api::{
+    report, AccountDecision, AccountRoute, RoutedLaunch, SpawnAccount, PROVIDERS,
+};
 
 /// How long `aas candidates` gets before a launch gives up on it. `aas`
 /// answers from its usage cache, so this only trips when it hangs.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// A decided launch: the words that start the provider CLI on `account`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RoutedLaunch {
-    pub account: String,
-    /// `aas e <account>` (with `aas` as an absolute path where one was
-    /// found: the pane's shell need not have this process's `PATH`), or a
-    /// configured account's `env K=V … <provider>`. Either way it ends where
-    /// the provider's own arguments begin.
-    pub launcher: Vec<String>,
-}
-
-impl RoutedLaunch {
-    /// The argv that starts `provider_args` on this account.
-    #[must_use]
-    pub fn argv(&self, provider_args: impl IntoIterator<Item = String>) -> Vec<String> {
-        self.launcher.iter().cloned().chain(provider_args).collect()
-    }
-
-    /// Through `aas`, which picks the provider CLI from the account.
-    #[must_use]
-    pub fn via_aas(aas: String, account: String) -> Self {
-        Self {
-            launcher: vec![aas, "e".into(), account.clone()],
-            account,
-        }
-    }
-}
 
 /// A configured account, by name or the first one for `auto`. Configured
 /// accounts are not ranked by quota yet; a swap moves the agent on when it
@@ -61,7 +35,7 @@ fn from_profiles(route: &AccountRoute) -> Result<RoutedLaunch, String> {
         return Err("configured accounts launch through `env`/`sh`, which this shell lacks".into());
     }
     let profile = match &route.choice {
-        SpawnAccount::Named(name) => crate::accounts::find_profile(&route.profiles, provider, name)
+        SpawnAccount::Named(name) => tend::accounts::find_profile(&route.profiles, provider, name)
             .ok_or_else(|| {
                 format!("no {provider} account named {name} in [[accounts.{provider}]]")
             })?,
@@ -115,6 +89,9 @@ fn pinned(candidates: &[Candidate], name: &str, provider: &str) -> Result<String
 
 /// Decide where a new agent starts. `Err` is the reason it starts bare.
 pub fn decide(route: &AccountRoute) -> Result<RoutedLaunch, String> {
+    if route.module_off {
+        return Err(tend::swap_api::module_unavailable(true));
+    }
     decide_with(route, |aas, provider| {
         query_candidates_within(aas, provider, QUERY_TIMEOUT)
     })
@@ -150,21 +127,6 @@ fn decide_found(
     Ok(RoutedLaunch::via_aas(aas, account))
 }
 
-/// [`decide`], folded into what the launch result reports.
-#[must_use]
-pub fn report(outcome: &Result<RoutedLaunch, String>) -> AccountDecision {
-    match outcome {
-        Ok(routed) => AccountDecision {
-            account: Some(routed.account.clone()),
-            skipped: None,
-        },
-        Err(reason) => AccountDecision {
-            account: None,
-            skipped: Some(reason.clone()),
-        },
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,6 +154,7 @@ mod tests {
             // Any file that exists stands in for the binary.
             aas: std::env::current_exe().unwrap().display().to_string(),
             profiles: Vec::new(),
+            module_off: false,
         }
     }
 
@@ -304,8 +267,8 @@ mod tests {
         );
     }
 
-    fn profile(name: &str) -> crate::accounts::AccountProfile {
-        crate::accounts::AccountProfile {
+    fn profile(name: &str) -> tend::accounts::AccountProfile {
+        tend::accounts::AccountProfile {
             name: name.into(),
             env: [("CLAUDE_CONFIG_DIR".to_owned(), format!("/p/{name}"))].into(),
             env_file: None,

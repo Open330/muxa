@@ -1189,15 +1189,13 @@ async fn hello_returns_capabilities_and_negotiated_protocol() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn swap_requests_go_to_the_service_off_the_reactor() {
     let swap = FakeSwap::new(true);
-    let (_dir, client, tx, handle) = swap_server(Some(
-        Arc::clone(&swap) as Arc<dyn crate::swap_service::SwapJobs>
-    ))
-    .await;
+    let (_dir, client, tx, handle) =
+        swap_server(Some(Arc::clone(&swap) as Arc<dyn crate::swap_api::SwapJobs>)).await;
     assert!(advertises_swap(
         &client.hello(Duration::from_secs(2)).await.unwrap()
     ));
 
-    let overrides = crate::swap_service::SwapOverrides::default();
+    let overrides = crate::swap_api::SwapOverrides::default();
     let first = client.swap_job_start("key-1", &overrides).await.unwrap();
     assert!(!first.existing);
     // A lost acknowledgement: the same key again, or a status by key,
@@ -1208,7 +1206,7 @@ async fn swap_requests_go_to_the_service_off_the_reactor() {
         (first.job_id.as_str(), true)
     );
     let by_key = client
-        .swap_job_status(&crate::swap_service::JobRef::Key("key-1".into()))
+        .swap_job_status(&crate::swap_api::JobRef::Key("key-1".into()))
         .await
         .unwrap();
     assert_eq!(by_key.job_id, first.job_id);
@@ -1223,11 +1221,9 @@ async fn swap_requests_go_to_the_service_off_the_reactor() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_halted_swap_service_still_answers_status() {
     let swap = FakeSwap::new(true);
-    let (_dir, client, tx, handle) = swap_server(Some(
-        Arc::clone(&swap) as Arc<dyn crate::swap_service::SwapJobs>
-    ))
-    .await;
-    let overrides = crate::swap_service::SwapOverrides::default();
+    let (_dir, client, tx, handle) =
+        swap_server(Some(Arc::clone(&swap) as Arc<dyn crate::swap_api::SwapJobs>)).await;
+    let overrides = crate::swap_api::SwapOverrides::default();
     let accepted = client.swap_job_start("key", &overrides).await.unwrap();
     swap.healthy
         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1240,12 +1236,12 @@ async fn a_halted_swap_service_still_answers_status() {
         .iter()
         .any(|c| c == SWAP_CANCEL_CAPABILITY));
     assert!(client
-        .swap_job_cancel(&crate::swap_service::JobRef::Id(accepted.job_id.clone()))
+        .swap_job_cancel(&crate::swap_api::JobRef::Id(accepted.job_id.clone()))
         .await
         .is_ok());
     assert!(client.swap_job_start("next", &overrides).await.is_err());
     let status = client
-        .swap_job_status(&crate::swap_service::JobRef::Id(accepted.job_id.clone()))
+        .swap_job_status(&crate::swap_api::JobRef::Id(accepted.job_id.clone()))
         .await
         .unwrap();
     assert_eq!(status.job_id, accepted.job_id);
@@ -1263,26 +1259,24 @@ async fn a_halted_swap_service_still_answers_status() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn swap_health_answers_in_every_state() {
     let swap = FakeSwap::new(true);
-    let (_dir, client, tx, handle) = swap_server(Some(
-        Arc::clone(&swap) as Arc<dyn crate::swap_service::SwapJobs>
-    ))
-    .await;
+    let (_dir, client, tx, handle) =
+        swap_server(Some(Arc::clone(&swap) as Arc<dyn crate::swap_api::SwapJobs>)).await;
     let hello = client.hello(Duration::from_secs(2)).await.unwrap();
     assert!(hello
         .capabilities
         .iter()
         .any(|c| c == SWAP_HEALTH_CAPABILITY));
     let ready = client.swap_health().await.unwrap();
-    assert_eq!(ready.readiness, crate::swap_service::SwapReadiness::Ready);
+    assert_eq!(ready.readiness, crate::swap_api::SwapReadiness::Ready);
     swap.healthy
         .store(false, std::sync::atomic::Ordering::SeqCst);
     let halted = client.swap_health().await.unwrap();
-    assert_eq!(halted.readiness, crate::swap_service::SwapReadiness::Halted);
+    assert_eq!(halted.readiness, crate::swap_api::SwapReadiness::Halted);
     tx.send(()).unwrap();
     handle.await.unwrap();
 
-    let unopened: Arc<dyn crate::swap_service::SwapJobs> = Arc::new(
-        crate::swap_service::UnopenedSwap::new("schema 9, this build reads 2".into(), 2),
+    let unopened: Arc<dyn crate::swap_api::SwapJobs> = Arc::new(
+        crate::swap_api::UnopenedSwap::new("schema 9, this build reads 2".into(), 2),
     );
     let (_dir, client, tx, handle) = swap_server(Some(unopened)).await;
     let hello = client.hello(Duration::from_secs(2)).await.unwrap();
@@ -1297,7 +1291,7 @@ async fn swap_health_answers_in_every_state() {
     let health = client.swap_health().await.unwrap();
     assert_eq!(
         health.readiness,
-        crate::swap_service::SwapReadiness::Unavailable
+        crate::swap_api::SwapReadiness::Unavailable
     );
     assert!(health.reason.unwrap().contains("schema 9"));
     tx.send(()).unwrap();
@@ -1311,7 +1305,7 @@ async fn swap_health_answers_in_every_state() {
     let mut slow = FakeSwap::new(true);
     Arc::get_mut(&mut slow).unwrap().slow_health = true;
     let (_dir, client, tx, handle) =
-        swap_server(Some(slow as Arc<dyn crate::swap_service::SwapJobs>)).await;
+        swap_server(Some(slow as Arc<dyn crate::swap_api::SwapJobs>)).await;
     let started = std::time::Instant::now();
     let error = client.swap_health().await.unwrap_err().to_string();
     assert!(error.contains("did not answer"), "{error}");
@@ -1331,11 +1325,11 @@ async fn without_a_swap_service_every_swap_request_is_refused() {
         .capabilities
         .iter()
         .any(|c| c == SWAP_CANCEL_CAPABILITY));
-    let overrides = crate::swap_service::SwapOverrides::default();
+    let overrides = crate::swap_api::SwapOverrides::default();
     let refused = client.swap_job_start("key", &overrides).await.unwrap_err();
     assert!(refused.to_string().contains("unavailable"), "{refused}");
     assert!(client
-        .swap_job_status(&crate::swap_service::JobRef::Key("key".into()))
+        .swap_job_status(&crate::swap_api::JobRef::Key("key".into()))
         .await
         .is_err());
     tx.send(()).unwrap();
@@ -1352,7 +1346,7 @@ async fn a_slow_swap_health_check_is_not_advertised() {
         jobs: std::sync::Mutex::new(Vec::new()),
     });
     let (_dir, client, tx, handle) =
-        swap_server(Some(swap as Arc<dyn crate::swap_service::SwapJobs>)).await;
+        swap_server(Some(swap as Arc<dyn crate::swap_api::SwapJobs>)).await;
     let started = std::time::Instant::now();
     let hello = client.hello(Duration::from_secs(5)).await.unwrap();
     assert!(!advertises_swap(&hello));

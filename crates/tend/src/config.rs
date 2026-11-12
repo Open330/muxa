@@ -165,6 +165,9 @@ pub struct Config {
     /// one is written.
     #[serde(default)]
     pub automation: crate::automation::AutomationConfig,
+    /// Optional modules this install uses: `[modules] accounts`.
+    #[serde(skip_serializing_if = "crate::swap_api::ModulesConfig::is_unset")]
+    pub modules: crate::swap_api::ModulesConfig,
     /// Defaults for moving agents onto another account: `tend swap` and the
     /// `swap_account` automation action.
     pub swap: crate::swap_api::SwapConfig,
@@ -249,6 +252,51 @@ impl Config {
         Vec::new()
     }
 
+    /// Whether the optional account module is on for this config, and why.
+    /// `[modules] accounts` decides when set; otherwise the module is on
+    /// exactly when the config already uses accounts, so a fresh install
+    /// leaves it off and an existing swap setup keeps working after an
+    /// upgrade. Whether this build carries the module is the caller's
+    /// question (the `aas` cargo feature of `tend-cli` and `tendd`).
+    #[must_use]
+    pub fn accounts_module(&self) -> crate::swap_api::ModuleSwitch {
+        if let Some(enabled) = self.modules.accounts {
+            return crate::swap_api::ModuleSwitch {
+                enabled,
+                uses: Vec::new(),
+                explicit: true,
+            };
+        }
+        let mut uses = Vec::new();
+        for (program, agent) in &self.agent {
+            if agent
+                .account
+                .as_deref()
+                .is_some_and(|a| !a.trim().is_empty())
+            {
+                uses.push(format!("[agent.{program}].account"));
+            }
+        }
+        for provider in crate::swap_api::PROVIDERS {
+            if !self.accounts.for_provider(provider).is_empty() {
+                uses.push(format!("[[accounts.{provider}]]"));
+            }
+        }
+        for rule in &self.automation.rule {
+            if rule.action == crate::automation::AutomationAction::SwapAccount {
+                uses.push(format!("automation rule {:?} (swap_account)", rule.name));
+            }
+        }
+        if self.swap != crate::swap_api::SwapConfig::default() {
+            uses.push("[swap]".into());
+        }
+        crate::swap_api::ModuleSwitch {
+            enabled: !uses.is_empty(),
+            uses,
+            explicit: false,
+        }
+    }
+
     /// The account routing for a new `program` agent, when
     /// `[agent.<program>].account` asks for it.
     #[must_use]
@@ -263,6 +311,7 @@ impl Config {
             choice,
             aas: self.swap.aas.clone(),
             profiles: self.accounts.for_provider(program).to_vec(),
+            module_off: !self.accounts_module().enabled,
         })
     }
 
@@ -2762,9 +2811,49 @@ options = ["--model", "gpt-5-codex"]
                 choice: crate::swap_api::SpawnAccount::Auto,
                 aas: "/opt/aas".into(),
                 profiles: Vec::new(),
+                module_off: false,
             })
         );
         assert_eq!(cfg.account_route("claude"), None);
+    }
+
+    #[test]
+    fn the_account_module_is_off_by_default_and_on_for_configs_that_use_accounts() {
+        let fresh = Config::default().accounts_module();
+        assert!(!fresh.enabled && !fresh.explicit && fresh.uses.is_empty());
+        // The owner's shape: only `[agent.*].account`, accounts from aas.
+        let owner: Config = toml::from_str(
+            "[agent.claude]\naccount = \"e-ed@claude\"\n[agent.codex]\naccount = \"auto\"\n",
+        )
+        .unwrap();
+        let module = owner.accounts_module();
+        assert!(module.enabled);
+        assert_eq!(
+            module.uses,
+            ["[agent.claude].account", "[agent.codex].account"]
+        );
+        assert!(!owner.account_route("claude").unwrap().module_off);
+        for used in [
+            "[[accounts.codex]]\nname = \"a\"\nenv = { CODEX_HOME = \"/a\" }\n",
+            "[swap]\ncontinue_text = \"go on\"\n",
+            "[[automation.rule]]\nname = \"swap\"\non = \"rate_limited\"\naction = \"swap_account\"\n",
+        ] {
+            let cfg: Config = toml::from_str(used).unwrap();
+            assert!(cfg.accounts_module().enabled, "{used}");
+        }
+        // An explicit switch wins either way, and survives a round trip.
+        let off: Config =
+            toml::from_str("[modules]\naccounts = false\n[agent.claude]\naccount = \"auto\"\n")
+                .unwrap();
+        assert!(!off.accounts_module().enabled && off.accounts_module().explicit);
+        assert!(off.account_route("claude").unwrap().module_off);
+        let text = toml::to_string(&off).unwrap();
+        assert!(text.contains("[modules]"), "{text}");
+        assert!(!toml::to_string(&Config::default())
+            .unwrap()
+            .contains("modules"));
+        let on: Config = toml::from_str("[modules]\naccounts = true\n").unwrap();
+        assert!(on.accounts_module().enabled);
     }
 
     #[test]

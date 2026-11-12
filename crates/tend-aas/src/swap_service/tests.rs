@@ -286,7 +286,7 @@ impl ContextProvider for FakeProvider {
             agents: self.agents.lock().unwrap().clone(),
             backends: Vec::new(),
             config: self.config.lock().unwrap().clone(),
-            accounts: crate::accounts::AccountsConfig::default(),
+            accounts: tend::accounts::AccountsConfig::default(),
             config_path: self.config_path.clone(),
         })
     }
@@ -1553,9 +1553,9 @@ fn a_retry_with_another_configuration_is_refused() {
 
 // --- prompt receipts ---------------------------------------------------------
 
-fn prompt(kind: AgentKind, session: &str, pane: &str, seq: u64) -> crate::state::PromptRecord {
-    crate::state::PromptRecord {
-        id: crate::event::AgentId {
+fn prompt(kind: AgentKind, session: &str, pane: &str, seq: u64) -> tend::state::PromptRecord {
+    tend::state::PromptRecord {
+        id: tend::event::AgentId {
             kind,
             session_id: session.into(),
             surface: None,
@@ -1567,7 +1567,7 @@ fn prompt(kind: AgentKind, session: &str, pane: &str, seq: u64) -> crate::state:
         at: time::OffsetDateTime::now_utc(),
         model: None,
         seq,
-        origin: crate::state::PromptOrigin::Unknown,
+        origin: tend::state::PromptOrigin::Unknown,
     }
 }
 
@@ -1999,7 +1999,7 @@ fn the_service_prunes_old_evidence_as_upkeep() {
     assert!(health.fault.is_none());
 }
 
-fn test_agent(pane: &str, sid: &str, kind: AgentKind, state: crate::event::AgentState) -> Agent {
+fn test_agent(pane: &str, sid: &str, kind: AgentKind, state: tend::event::AgentState) -> Agent {
     let at = time::macros::datetime!(2026-10-15 12:00:00 UTC);
     Agent {
         ask_origin: None,
@@ -2009,7 +2009,7 @@ fn test_agent(pane: &str, sid: &str, kind: AgentKind, state: crate::event::Agent
         session_id: sid.into(),
         surface: None,
         pid: None,
-        workload: crate::WorkloadSummary::default(),
+        workload: tend::WorkloadSummary::default(),
         subagents: Vec::new(),
         pane: Some(pane.into()),
         cwd: None,
@@ -2046,14 +2046,14 @@ fn waiting_agent(pane: &str, busy: bool) -> Agent {
         pane,
         &format!("conv-{pane}"),
         AgentKind::ClaudeCode,
-        crate::event::AgentState::Idle,
+        tend::event::AgentState::Idle,
     );
     agent.pane = Some(pane.into());
     agent.tmux_socket = Some("/tmp/tmux-1/default".into());
     agent.state = if busy {
-        crate::event::AgentState::Working
+        tend::event::AgentState::Working
     } else {
-        crate::event::AgentState::Idle
+        tend::event::AgentState::Idle
     };
     agent.last_activity_at = time::OffsetDateTime::now_utc() - time::Duration::minutes(1);
     agent
@@ -2562,7 +2562,7 @@ fn an_agent_closed_while_the_daemon_was_down_settles_as_target_gone() {
         let job = write_fixture(&h, &resume_fixture(&h, 1));
         h.service.store.begin_drain(&h.service.lease).unwrap();
         if stopped_row {
-            h.provider.agents.lock().unwrap()[0].state = crate::event::AgentState::Stopped;
+            h.provider.agents.lock().unwrap()[0].state = tend::event::AgentState::Stopped;
         } else {
             h.provider.agents.lock().unwrap().clear();
         }
@@ -2704,7 +2704,7 @@ fn a_resumer_stops_when_no_targets_are_deferred() {
 
 #[test]
 fn backend_absence_requires_a_complete_scan() {
-    use crate::backend::PaneObservation;
+    use tend::backend::PaneObservation;
     assert!(pane_absent(
         "%1",
         Some("/tmp/default"),

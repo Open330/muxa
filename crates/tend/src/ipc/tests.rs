@@ -457,8 +457,8 @@ impl FakeSwap {
         })
     }
 
-    fn view(job: &str) -> crate::swap_service::JobView {
-        crate::swap_service::JobView {
+    fn view(job: &str) -> crate::swap_api::JobView {
+        crate::swap_api::JobView {
             job_id: job.to_owned(),
             node_id: "node".into(),
             state: "running".into(),
@@ -478,34 +478,34 @@ impl FakeSwap {
     }
 }
 
-impl crate::swap_service::SwapJobs for FakeSwap {
-    fn accounts(&self) -> Result<Vec<crate::account_provider::ProviderCandidates>, String> {
+impl crate::swap_api::SwapJobs for FakeSwap {
+    fn accounts(&self) -> Result<Vec<crate::swap_api::ProviderCandidates>, String> {
         Self::on_blocking_thread();
-        let accounts = crate::accounts::AccountsConfig {
-            claude: vec![crate::accounts::AccountProfile {
+        Ok(vec![crate::swap_api::ProviderCandidates {
+            provider: "claude".into(),
+            source: "configured".into(),
+            reason: None,
+            candidates: vec![crate::swap_api::Candidate {
                 name: "work".into(),
-                env: [("SECRET".into(), "private".into())].into(),
-                env_file: None,
+                provider: "claude".into(),
+                eligible: true,
+                active: false,
+                reason: "configured".into(),
+                remaining_pct: None,
             }],
-            ..Default::default()
-        };
-        Ok(vec![crate::account_provider::candidates(
-            "claude",
-            &accounts,
-            "/missing/aas",
-        )])
+        }])
     }
 
-    fn health(&self) -> crate::swap_service::SwapHealth {
+    fn health(&self) -> crate::swap_api::SwapHealth {
         if self.slow_health {
             std::thread::sleep(Duration::from_secs(3));
         }
         let ready = self.healthy.load(std::sync::atomic::Ordering::SeqCst);
-        crate::swap_service::SwapHealth {
+        crate::swap_api::SwapHealth {
             readiness: if ready {
-                crate::swap_service::SwapReadiness::Ready
+                crate::swap_api::SwapReadiness::Ready
             } else {
-                crate::swap_service::SwapReadiness::Halted
+                crate::swap_api::SwapReadiness::Halted
             },
             reason: (!ready).then(|| "halted".to_owned()),
             schema: Some(2),
@@ -516,24 +516,21 @@ impl crate::swap_service::SwapJobs for FakeSwap {
         }
     }
 
-    fn cancel(
-        &self,
-        job: &crate::swap_service::JobRef,
-    ) -> Result<crate::swap_service::JobView, String> {
+    fn cancel(&self, job: &crate::swap_api::JobRef) -> Result<crate::swap_api::JobView, String> {
         self.status(job)
     }
 
     fn retry(
         &self,
         key: &str,
-        _: &crate::swap_service::JobRef,
-        overrides: &crate::swap_service::RetryOverrides,
-    ) -> Result<crate::swap_service::Accepted, String> {
+        _: &crate::swap_api::JobRef,
+        overrides: &crate::swap_api::RetryOverrides,
+    ) -> Result<crate::swap_api::Accepted, String> {
         self.submit(
             key,
-            &crate::swap_service::SwapOverrides {
+            &crate::swap_api::SwapOverrides {
                 force: overrides.force,
-                ..crate::swap_service::SwapOverrides::default()
+                ..crate::swap_api::SwapOverrides::default()
             },
         )
     }
@@ -551,10 +548,10 @@ impl crate::swap_service::SwapJobs for FakeSwap {
 
     fn plan(
         &self,
-        _: &crate::swap_service::SwapOverrides,
-    ) -> Result<crate::swap_service::PlanView, String> {
+        _: &crate::swap_api::SwapOverrides,
+    ) -> Result<crate::swap_api::PlanView, String> {
         Self::on_blocking_thread();
-        Ok(crate::swap_service::PlanView {
+        Ok(crate::swap_api::PlanView {
             outcomes: Vec::new(),
             direct_targets: Vec::new(),
             executable: self.active().is_ok(),
@@ -565,13 +562,13 @@ impl crate::swap_service::SwapJobs for FakeSwap {
     fn submit(
         &self,
         key: &str,
-        _: &crate::swap_service::SwapOverrides,
-    ) -> Result<crate::swap_service::Accepted, String> {
+        _: &crate::swap_api::SwapOverrides,
+    ) -> Result<crate::swap_api::Accepted, String> {
         Self::on_blocking_thread();
         self.active()?;
         let mut jobs = self.jobs.lock().unwrap();
         if let Some((_, job)) = jobs.iter().find(|(k, _)| k == key) {
-            return Ok(crate::swap_service::Accepted {
+            return Ok(crate::swap_api::Accepted {
                 job_id: job.clone(),
                 existing: true,
                 view: Self::view(job),
@@ -579,22 +576,19 @@ impl crate::swap_service::SwapJobs for FakeSwap {
         }
         let job = format!("swap-{}", jobs.len());
         jobs.push((key.to_owned(), job.clone()));
-        Ok(crate::swap_service::Accepted {
+        Ok(crate::swap_api::Accepted {
             job_id: job.clone(),
             existing: false,
             view: Self::view(&job),
         })
     }
 
-    fn status(
-        &self,
-        job: &crate::swap_service::JobRef,
-    ) -> Result<crate::swap_service::JobView, String> {
+    fn status(&self, job: &crate::swap_api::JobRef) -> Result<crate::swap_api::JobView, String> {
         Self::on_blocking_thread();
         let jobs = self.jobs.lock().unwrap();
         let found = jobs.iter().find(|(key, id)| match job {
-            crate::swap_service::JobRef::Id(wanted) => id == wanted,
-            crate::swap_service::JobRef::Key(wanted) => key == wanted,
+            crate::swap_api::JobRef::Id(wanted) => id == wanted,
+            crate::swap_api::JobRef::Key(wanted) => key == wanted,
         });
         found
             .map(|(_, id)| Self::view(id))
@@ -603,7 +597,7 @@ impl crate::swap_service::SwapJobs for FakeSwap {
 }
 
 async fn swap_server(
-    swap: Option<Arc<dyn crate::swap_service::SwapJobs>>,
+    swap: Option<Arc<dyn crate::swap_api::SwapJobs>>,
 ) -> (
     tempfile::TempDir,
     Client,

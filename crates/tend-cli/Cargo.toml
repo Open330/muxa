@@ -12,9 +12,21 @@ description = "tend CLI"
 name = "tend"
 path = "src/main.rs"
 
+[features]
+# The account module (`tend-aas`): `tend swap`, the `swap_account`
+# automation action, `tend_swap_account` and `[agent.<program>].account`
+# launches. On by default so every release path (`scripts/release-local.sh`,
+# `release.yml`, `embed-tendd.sh`, `install.sh`) ships it; whether it is used
+# is `[modules] accounts` in config.toml. `--no-default-features` builds
+# without it.
+default = ["aas"]
+aas = ["dep:tend-aas"]
+
 [dependencies]
 uuid.workspace = true
 tend = { workspace = true }
+# The optional account module; see the `aas` feature.
+tend-aas = { workspace = true, optional = true }
 
 anyhow = { workspace = true }
 clap = { workspace = true }

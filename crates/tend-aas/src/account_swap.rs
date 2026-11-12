@@ -22,20 +22,6 @@ mod executor_tests;
 mod io;
 pub(crate) mod preflight;
 
-use crate::agent_tui::{
-    claude_switch, composer_draft, open_question, pending_dialog, screen_tail, turn_running,
-    type_keys, wait_for_resume_answering, Consent, Resume, BYPASS_SWITCH, CLAUDE_VALUE_OPTIONS,
-    DIALOG_TAIL_LINES, EXIT_DIALOGS, READY_QUIET,
-};
-use crate::backend::SharedBackend;
-use crate::event::{AgentKind, AgentState};
-use crate::pane_process::{codex_writer_owners, is_agent_process, pane_processes, shell_above};
-use crate::process_snapshot::ProcessInfo;
-use crate::state::Agent;
-pub use crate::swap_api::{
-    BareMode, Candidate, ContinueEvidence, ContinueReason, ContinueWhen, DirectTarget,
-    FollowUpReport, SessionIdSource, SwapConfig, SwapOutcome, SwapStatus,
-};
 use crate::swap_job::{
     ContinueDecision, Observation, Phase, Readiness, Submission, TurnEvidence, WithheldReason,
 };
@@ -43,6 +29,20 @@ use effects::{Purpose, Runner};
 use serde::Deserialize;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tend::agent_tui::{
+    claude_switch, composer_draft, open_question, pending_dialog, screen_tail, turn_running,
+    type_keys, wait_for_resume_answering, Consent, Resume, BYPASS_SWITCH, CLAUDE_VALUE_OPTIONS,
+    DIALOG_TAIL_LINES, EXIT_DIALOGS, READY_QUIET,
+};
+use tend::backend::SharedBackend;
+use tend::event::{AgentKind, AgentState};
+use tend::pane_process::{codex_writer_owners, is_agent_process, pane_processes, shell_above};
+use tend::process_snapshot::ProcessInfo;
+use tend::state::Agent;
+pub use tend::swap_api::{
+    BareMode, Candidate, ContinueEvidence, ContinueReason, ContinueWhen, DirectTarget,
+    FollowUpReport, SessionIdSource, SwapConfig, SwapOutcome, SwapStatus,
+};
 
 /// How long a stopped agent gets to exit on `SIGTERM` before `SIGKILL`.
 const STOP_GRACE: Duration = Duration::from_secs(5);
@@ -157,7 +157,7 @@ impl SwapRequest {
     }
 }
 
-/// [`SwapOutcome`] lives in [`crate::swap_api`]; this builds one from a
+/// [`SwapOutcome`] lives in [`tend::swap_api`]; this builds one from a
 /// registry row.
 pub(crate) trait OutcomeFor {
     fn new(agent: &Agent, status: SwapStatus, note: impl Into<String>) -> Self;
@@ -359,16 +359,16 @@ fn same_aas_account(line: &LaunchLine) -> Option<String> {
 /// binaries), the account its `aas e <name>` line names, so `auto` still
 /// does not send it back to the account it is capped on.
 fn profile_account(
-    resolved: &crate::accounts::ResolvedAccounts,
+    resolved: &tend::accounts::ResolvedAccounts,
     launch: &PaneLaunch,
     provider: &str,
 ) -> Option<String> {
-    let environ = crate::accounts::process_environ(launch.agent_pid);
+    let environ = tend::accounts::process_environ(launch.agent_pid);
     if environ.is_empty() {
         return launch
             .line
             .account()
-            .map(|name| crate::accounts::bare_name(name, provider).to_owned());
+            .map(|name| tend::accounts::bare_name(name, provider).to_owned());
     }
     resolved.identify(&environ).map(str::to_owned)
 }
@@ -400,7 +400,7 @@ enum Landed {
 fn resumed_account(
     target: &Target,
     bound: Option<u32>,
-    resolved: &crate::accounts::ResolvedAccounts,
+    resolved: &tend::accounts::ResolvedAccounts,
 ) -> Landed {
     let pid = bound.or_else(|| {
         pane_processes(target.pane_pid.get())
@@ -413,7 +413,7 @@ fn resumed_account(
     let Some(pid) = pid else {
         return Landed::On(None);
     };
-    let environ = crate::accounts::process_environ(pid);
+    let environ = tend::accounts::process_environ(pid);
     if environ.is_empty() {
         return Landed::Unreadable;
     }
@@ -496,7 +496,7 @@ impl LaunchLine {
         let program = tokens
             .iter()
             .take(2)
-            .position(|t| crate::discovery::command_name(t) == "aas")?;
+            .position(|t| tend::discovery::command_name(t) == "aas")?;
         if !matches!(
             tokens.get(program + 1).map(String::as_str),
             Some("e" | "exec")
@@ -654,7 +654,7 @@ pub fn relaunch_line(
     }
     words.extend(resume_suffix(kind, session_id));
     // Typed into the pane's own shell: PowerShell under rmux on Windows.
-    Ok(crate::shell::Dialect::native().command_line(&words))
+    Ok(tend::shell::Dialect::native().command_line(&words))
 }
 
 /// The line that resumes `session_id` on a configured account: the
@@ -665,13 +665,13 @@ pub fn profile_relaunch_line(
     line: &LaunchLine,
     kind: AgentKind,
     session_id: &str,
-    profile: &crate::accounts::AccountProfile,
+    profile: &tend::accounts::AccountProfile,
 ) -> Result<String, String> {
     let (program, args) = agent_program_and_args(line, kind);
     let mut words = profile.launch_prefix(&program);
     words.extend(resume_free_args(args, kind));
     words.extend(resume_suffix(kind, session_id));
-    let dialect = crate::shell::Dialect::native();
+    let dialect = tend::shell::Dialect::native();
     if cfg!(windows) {
         return Err(
             "configured accounts relaunch through `env`/`sh`, which this shell lacks".into(),
@@ -699,7 +699,7 @@ fn agent_program_and_args(line: &LaunchLine, kind: AgentKind) -> (String, &[Stri
         .tokens
         .iter()
         .take(2)
-        .position(|token| crate::discovery::classify_command(token) == Some(kind))
+        .position(|token| tend::discovery::classify_command(token) == Some(kind))
     {
         Some(at) => (line.tokens[at].clone(), &line.tokens[at + 1..]),
         None => (provider, line.tokens.get(1..).unwrap_or(&[])),
@@ -871,7 +871,7 @@ pub fn find_aas(configured: &str) -> Option<String> {
         Some(std::path::PathBuf::from(configured)).filter(|path| path.is_file())
     } else if cfg!(windows) {
         // `aas.exe` / `aas.cmd`: PATH lookup has to try the extensions.
-        crate::shell::find_program(configured)
+        tend::shell::find_program(configured)
     } else {
         let home = std::env::var("HOME").unwrap_or_default();
         std::env::var_os("PATH")
@@ -904,7 +904,7 @@ pub fn run(
     agents: &[Agent],
     backends: &[SharedBackend],
     config: &SwapConfig,
-    accounts: &crate::accounts::AccountsConfig,
+    accounts: &tend::accounts::AccountsConfig,
 ) -> Vec<SwapOutcome> {
     let (request, steps) = prepare(request, agents, backends, config, accounts);
     steps
@@ -928,7 +928,7 @@ pub fn run_bound(
     agents: &[Agent],
     backends: &[SharedBackend],
     config: &SwapConfig,
-    accounts: &crate::accounts::AccountsConfig,
+    accounts: &tend::accounts::AccountsConfig,
     bound: &[DirectTarget],
 ) -> Vec<SwapOutcome> {
     let (request, steps) = prepare(request, agents, backends, config, accounts);
@@ -1138,7 +1138,7 @@ mod prerequisite_tests {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("work.env");
         std::fs::write(&file, "TOKEN=x\n").unwrap();
-        let profile: crate::accounts::AccountProfile = toml::from_str(&format!(
+        let profile: tend::accounts::AccountProfile = toml::from_str(&format!(
             "name = \"work\"\nenv_file = \"{}\"\nenv = {{ CLAUDE_CONFIG_DIR = \"/w\" }}\n",
             file.display()
         ))
@@ -1413,8 +1413,8 @@ pub(crate) struct PreparedTarget {
     candidates: Arc<Vec<Candidate>>,
     profiles: Option<
         Arc<(
-            Vec<crate::accounts::AccountProfile>,
-            crate::accounts::ResolvedAccounts,
+            Vec<tend::accounts::AccountProfile>,
+            tend::accounts::ResolvedAccounts,
         )>,
     >,
     /// The account the profiles identify it on; reported as `from` when it
@@ -1447,7 +1447,7 @@ pub(crate) struct TargetIdentity {
 /// The server a located pane is on: the one the planner found it on, not
 /// what the registry row happens to carry — a row without a socket is not a
 /// second server. Identity, guard, reservation and every effect use this.
-pub(crate) fn target_socket(pane: &crate::tmux::PaneInfo, agent: &Agent) -> Option<String> {
+pub(crate) fn target_socket(pane: &tend::tmux::PaneInfo, agent: &Agent) -> Option<String> {
     pane.socket.clone().or_else(|| agent.tmux_socket.clone())
 }
 
@@ -1455,7 +1455,7 @@ pub(crate) fn target_socket(pane: &crate::tmux::PaneInfo, agent: &Agent) -> Opti
 #[must_use]
 pub(crate) fn endpoint_key(pane: &str, socket: Option<&str>) -> String {
     let server = socket.map_or_else(String::new, |socket| {
-        crate::backend::pane_endpoint_identity(Some(pane), socket)
+        tend::backend::pane_endpoint_identity(Some(pane), socket)
     });
     format!("{pane}@{server}")
 }
@@ -1530,7 +1530,7 @@ pub(crate) fn prepare(
     agents: &[Agent],
     backends: &[SharedBackend],
     config: &SwapConfig,
-    accounts: &crate::accounts::AccountsConfig,
+    accounts: &tend::accounts::AccountsConfig,
 ) -> (SwapRequest, Vec<Step>) {
     let (resolved, agents, outcomes) = scoped(request, agents, backends);
     let mut steps: Vec<Step> = outcomes.into_iter().map(Step::Done).collect();
@@ -1641,12 +1641,12 @@ fn plan(
         }
         match locate(agent, backends) {
             Ok((launch, pane, backend)) => {
-                let process_start = crate::agent_conversation::process_start(launch.agent_pid);
+                let process_start = tend::agent_conversation::process_start(launch.agent_pid);
                 let runtime = match agent.kind {
                     AgentKind::ClaudeCode => {
-                        crate::agent_conversation::claude_conversation(launch.agent_pid)
+                        tend::agent_conversation::claude_conversation(launch.agent_pid)
                     }
-                    _ => crate::agent_conversation::Conversation::Unknown(
+                    _ => tend::agent_conversation::Conversation::Unknown(
                         "not read for this provider".into(),
                     ),
                 };
@@ -1665,10 +1665,10 @@ fn plan(
                     source,
                     verified: matches!(
                         runtime,
-                        crate::agent_conversation::Conversation::Verified(_)
+                        tend::agent_conversation::Conversation::Verified(_)
                     ),
                     unverified_reason: match &runtime {
-                        crate::agent_conversation::Conversation::Unknown(why) => Some(why.clone()),
+                        tend::agent_conversation::Conversation::Unknown(why) => Some(why.clone()),
                         _ => None,
                     },
                     process_start,
@@ -1690,7 +1690,7 @@ fn assign_accounts(
     request: &SwapRequest,
     planned: Vec<Planned>,
     config: &SwapConfig,
-    accounts: &crate::accounts::AccountsConfig,
+    accounts: &tend::accounts::AccountsConfig,
 ) -> Vec<Step> {
     use crate::account_provider::Backend;
     // One backend (and one `aas candidates`) per provider, shared by that
@@ -1782,10 +1782,10 @@ fn assign_accounts(
 fn profile_steps(
     request: &SwapRequest,
     group: Vec<Planned>,
-    profiles: &[crate::accounts::AccountProfile],
+    profiles: &[tend::accounts::AccountProfile],
     provider: &str,
 ) -> Vec<Step> {
-    let resolved = crate::accounts::ResolvedAccounts::new(profiles);
+    let resolved = tend::accounts::ResolvedAccounts::new(profiles);
     let current: Vec<Option<String>> = group
         .iter()
         .map(|p| profile_account(&resolved, &p.launch, provider))
@@ -1800,7 +1800,7 @@ fn profile_steps(
     let ranked = crate::account_provider::configured(provider, profiles, &capped);
     let choice = match &request.to {
         AccountChoice::Named(name) => {
-            AccountChoice::Named(crate::accounts::bare_name(name, provider).to_owned())
+            AccountChoice::Named(tend::accounts::bare_name(name, provider).to_owned())
         }
         other => other.clone(),
     };
@@ -1836,8 +1836,8 @@ fn swap_one(
     account: Result<String, String>,
     candidates: &[Candidate],
     profiles: Option<(
-        &[crate::accounts::AccountProfile],
-        &crate::accounts::ResolvedAccounts,
+        &[tend::accounts::AccountProfile],
+        &tend::accounts::ResolvedAccounts,
     )>,
     observer: &mut dyn effects::EffectObserver,
     probe: Option<&dyn TurnProbe>,
@@ -1933,7 +1933,7 @@ fn swap_one(
         evidence: request.continue_evidence,
         restore_draft: request.restore_draft,
         ran_with_bypass: claude_switch(
-            crate::process_snapshot::process_argv(launch.agent_pid).as_deref(),
+            tend::process_snapshot::process_argv(launch.agent_pid).as_deref(),
             BYPASS_SWITCH,
         ),
     };
@@ -2053,8 +2053,8 @@ fn verify_account(
     target: &Target,
     bound: Option<u32>,
     profiles: Option<(
-        &[crate::accounts::AccountProfile],
-        &crate::accounts::ResolvedAccounts,
+        &[tend::accounts::AccountProfile],
+        &tend::accounts::ResolvedAccounts,
     )>,
     account: &str,
 ) -> Result<AccountVerdict, AccountVerdict> {
@@ -2103,8 +2103,8 @@ fn relaunch_command(
     planned: &Planned,
     account: &str,
     profiles: Option<(
-        &[crate::accounts::AccountProfile],
-        &crate::accounts::ResolvedAccounts,
+        &[tend::accounts::AccountProfile],
+        &tend::accounts::ResolvedAccounts,
     )>,
 ) -> Result<(String, preflight::Prerequisites), String> {
     let Planned {
@@ -2115,7 +2115,7 @@ fn relaunch_command(
     } = planned;
     let provider = provider_name(agent.kind).unwrap_or_default();
     match profiles {
-        Some((profiles, _)) => match crate::accounts::find_profile(profiles, provider, account) {
+        Some((profiles, _)) => match tend::accounts::find_profile(profiles, provider, account) {
             Some(profile) => Ok((
                 profile_relaunch_line(&launch.line, agent.kind, session_id, profile)?,
                 profile_prerequisites(&launch.line, agent.kind, profile),
@@ -2159,13 +2159,13 @@ fn aas_prerequisites(line: &LaunchLine, kind: AgentKind) -> preflight::Prerequis
 fn profile_prerequisites(
     line: &LaunchLine,
     kind: AgentKind,
-    profile: &crate::accounts::AccountProfile,
+    profile: &tend::accounts::AccountProfile,
 ) -> preflight::Prerequisites {
     let (program, _) = agent_program_and_args(line, kind);
     let mut programs = Vec::new();
     let env_file = profile.env_file.as_deref().map(|file| {
         programs.push((preflight::Stage::Shell, "sh".to_owned()));
-        let path = crate::accounts::expand_home(file);
+        let path = tend::accounts::expand_home(file);
         let digest = io::file_digest(&path);
         (path, digest)
     });
@@ -2191,7 +2191,7 @@ pub(crate) struct Planned {
     /// before it is stopped.
     process_start: Option<String>,
     launch: PaneLaunch,
-    pane: crate::tmux::PaneInfo,
+    pane: tend::tmux::PaneInfo,
     backend: SharedBackend,
 }
 
@@ -2225,9 +2225,9 @@ fn unavailable(candidates: &[Candidate]) -> String {
 fn conversation_for(
     registry: Option<&str>,
     argv: Option<&str>,
-    runtime: &crate::agent_conversation::Conversation,
+    runtime: &tend::agent_conversation::Conversation,
 ) -> Result<(String, SessionIdSource), String> {
-    use crate::agent_conversation::Conversation;
+    use tend::agent_conversation::Conversation;
     match runtime {
         Conversation::Conflict(ids) => Err(format!(
             "identity conflict: session files for this process name {}; left alone",
@@ -2270,14 +2270,14 @@ fn still_as_planned(planned: &Planned) -> Result<(), String> {
     .map(|launch| launch.agent_pid);
     let now = planned
         .verified
-        .then(|| crate::agent_conversation::claude_conversation(pid));
+        .then(|| tend::agent_conversation::claude_conversation(pid));
     recheck(
         &Expected {
             pid,
             start: planned.process_start.as_deref(),
             conversation: planned.verified.then_some(planned.session_id.as_str()),
         },
-        crate::agent_conversation::process_start(pid).as_deref(),
+        tend::agent_conversation::process_start(pid).as_deref(),
         owner,
         now.as_ref(),
     )
@@ -2297,9 +2297,9 @@ fn recheck(
     expected: &Expected,
     start_now: Option<&str>,
     owner_now: Option<u32>,
-    conversation_now: Option<&crate::agent_conversation::Conversation>,
+    conversation_now: Option<&tend::agent_conversation::Conversation>,
 ) -> Result<(), String> {
-    use crate::agent_conversation::Conversation;
+    use tend::agent_conversation::Conversation;
     if expected.start.is_some() && start_now != expected.start {
         return Err("the agent process changed since the swap was planned; left alone".into());
     }
@@ -2431,9 +2431,9 @@ fn unresolved(target: &str, note: &str) -> SwapOutcome {
 fn locate(
     agent: &Agent,
     backends: &[SharedBackend],
-) -> Result<(PaneLaunch, crate::tmux::PaneInfo, SharedBackend), String> {
+) -> Result<(PaneLaunch, tend::tmux::PaneInfo, SharedBackend), String> {
     let pane_id = agent.pane.as_deref().unwrap_or_default();
-    let host = crate::backend::pane_id_host_kind(pane_id)
+    let host = tend::backend::pane_id_host_kind(pane_id)
         .ok_or_else(|| format!("unknown pane namespace for {pane_id}"))?;
     let backend = backends
         .iter()
@@ -2467,7 +2467,7 @@ fn locate(
     if direct
         && !matches!(
             host,
-            crate::backend::HostKind::Tmux | crate::backend::HostKind::Rmux
+            tend::backend::HostKind::Tmux | tend::backend::HostKind::Rmux
         )
     {
         return Err("the pane runs the agent directly, with no shell to relaunch into".into());
@@ -2642,7 +2642,7 @@ pub(crate) fn prepare_retry(
     agents: &[Agent],
     backends: &[SharedBackend],
     config: &SwapConfig,
-    accounts: &crate::accounts::AccountsConfig,
+    accounts: &tend::accounts::AccountsConfig,
 ) -> (SwapRequest, Step) {
     let (request, step, _) =
         prepare_retry_classified(request, planned, agents, backends, config, accounts);
@@ -2656,7 +2656,7 @@ pub(crate) fn prepare_retry_classified(
     agents: &[Agent],
     backends: &[SharedBackend],
     config: &SwapConfig,
-    accounts: &crate::accounts::AccountsConfig,
+    accounts: &tend::accounts::AccountsConfig,
 ) -> (SwapRequest, Step, bool) {
     let (resolved, steps) = prepare(request, agents, backends, config, accounts);
     let mut settled = None;
@@ -2745,9 +2745,9 @@ pub(crate) fn observe_target(
     conversation_id: &str,
     assigned: Option<&str>,
     backends: &[SharedBackend],
-    accounts: &crate::accounts::AccountsConfig,
+    accounts: &tend::accounts::AccountsConfig,
 ) -> &'static str {
-    let Some(host) = crate::backend::pane_id_host_kind(pane) else {
+    let Some(host) = tend::backend::pane_id_host_kind(pane) else {
         return "observed_unknown";
     };
     let pane_pid = backends
@@ -2765,7 +2765,7 @@ pub(crate) fn observe_target(
     let candidates: Vec<io::AgentArgv> = pane_processes(pane_pid)
         .into_iter()
         .filter(|p| is_agent_process(p, kind))
-        .map(|p| (p.pid, crate::process_snapshot::process_argv(p.pid)))
+        .map(|p| (p.pid, tend::process_snapshot::process_argv(p.pid)))
         .collect();
     observed(&candidates, kind, conversation_id, assigned, |pid| {
         let profiles = provider_name(kind)
@@ -2774,12 +2774,12 @@ pub(crate) fn observe_target(
         if profiles.is_empty() {
             return Landed::Unreadable;
         }
-        let environ = crate::accounts::process_environ(pid);
+        let environ = tend::accounts::process_environ(pid);
         if environ.is_empty() {
             return Landed::Unreadable;
         }
         Landed::On(
-            crate::accounts::ResolvedAccounts::new(profiles)
+            tend::accounts::ResolvedAccounts::new(profiles)
                 .identify(&environ)
                 .map(str::to_owned),
         )
@@ -2888,7 +2888,7 @@ pub(crate) fn argv_resumes(argv: &[String], kind: AgentKind, session_id: &str) -
     let Some(program) = argv
         .iter()
         .take(2)
-        .position(|word| crate::discovery::classify_command(word) == Some(kind))
+        .position(|word| tend::discovery::classify_command(word) == Some(kind))
     else {
         return ArgvResume::Other;
     };
@@ -2940,7 +2940,7 @@ fn claude_resumed(words: &[String]) -> Vec<Option<&str>> {
 /// The conversation Codex's `resume` subcommand names: none when it is not
 /// `resume`, `[None]` for `resume` with no id or `--last`.
 fn codex_resumed(words: &[String]) -> Vec<Option<&str>> {
-    let options = crate::adapters::proc_ancestry::CODEX_VALUE_OPTIONS;
+    let options = tend::adapters::proc_ancestry::CODEX_VALUE_OPTIONS;
     let mut words = words.iter().map(String::as_str);
     let mut positional = false;
     // The subcommand: the first positional word.
@@ -3323,7 +3323,7 @@ fn relaunch_in_place(runner: &Runner, target: &Target, command: &str) -> Result<
         .clone()
         .ok_or_else(|| Refusal::Failed("no shell to respawn the pane through".into()))?;
     let line =
-        crate::shell::Dialect::native().command_line(&[shell, "-lic".into(), command.to_owned()]);
+        tend::shell::Dialect::native().command_line(&[shell, "-lic".into(), command.to_owned()]);
     if !runner.respawn(Purpose::Respawn, &target.cwd, &line) {
         return Err(
             "the agent stopped, but its pane could not be respawned with the relaunch; \
@@ -3508,8 +3508,8 @@ fn stop(runner: &Runner, launch: &PaneLaunch) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_tui::{DOWN, ENTER};
-    use crate::pane_process::{is_shell, outside_codex_servers};
+    use tend::agent_tui::{DOWN, ENTER};
+    use tend::pane_process::{is_shell, outside_codex_servers};
 
     #[test]
     fn exit_dialogs_keep_background_work_and_worktrees_and_spot_scheduled_tasks() {
@@ -3611,7 +3611,7 @@ mod tests {
         assert_eq!(launch.agent_pid, 11);
         assert_eq!(launch.top_pid, 10);
     }
-    use crate::event::RateLimitScope;
+    use tend::event::RateLimitScope;
 
     fn agent(pane: &str, sid: &str, kind: AgentKind, state: AgentState) -> Agent {
         let at = time::macros::datetime!(2026-10-15 12:00:00 UTC);
@@ -3623,7 +3623,7 @@ mod tests {
             session_id: sid.into(),
             surface: None,
             pid: None,
-            workload: crate::WorkloadSummary::default(),
+            workload: tend::WorkloadSummary::default(),
             subagents: Vec::new(),
             pane: Some(pane.into()),
             cwd: None,
@@ -3815,7 +3815,7 @@ mod tests {
     /// and the command line name; a disagreement leaves the agent alone.
     #[test]
     fn a_swap_resumes_only_the_conversation_the_process_is_on() {
-        use crate::agent_conversation::Conversation;
+        use tend::agent_conversation::Conversation;
         const A: &str = "96f5e88c-62df-42a7-914e-e206355969fb";
         const B: &str = "01a18182-0bf0-7801-97bf-c91154132258";
         let verified = Conversation::Verified(A.into());
@@ -3912,7 +3912,7 @@ mod tests {
     /// agent, and the verified conversation it was planned as.
     #[test]
     fn the_agent_is_read_again_before_it_is_stopped() {
-        use crate::agent_conversation::Conversation;
+        use tend::agent_conversation::Conversation;
         const A: &str = "96f5e88c-62df-42a7-914e-e206355969fb";
         const B: &str = "01a18182-0bf0-7801-97bf-c91154132258";
         let verified = Expected {
@@ -3953,7 +3953,7 @@ mod tests {
     fn a_target_runs_on_the_server_its_pane_was_found_on() {
         let mut row = agent("%1", "s1", AgentKind::ClaudeCode, AgentState::Idle);
         row.tmux_socket = None;
-        let mut pane = crate::tmux::PaneInfo {
+        let mut pane = tend::tmux::PaneInfo {
             session_group: None,
             agent_program: None,
             worker_launch_id: None,
@@ -4425,8 +4425,8 @@ mod tests {
 
     // ---- configured accounts: no aas involved ----
 
-    fn account(name: &str, key: &str, value: &str) -> crate::accounts::AccountProfile {
-        crate::accounts::AccountProfile {
+    fn account(name: &str, key: &str, value: &str) -> tend::accounts::AccountProfile {
+        tend::accounts::AccountProfile {
             name: name.into(),
             env: [(key.to_owned(), value.to_owned())].into(),
             env_file: None,
@@ -4483,8 +4483,8 @@ mod tests {
         assert_eq!(moves, vec![Ok("c".to_owned()), Ok("a".to_owned())]);
     }
 
-    fn test_pane(pane_id: &str) -> crate::tmux::PaneInfo {
-        crate::tmux::PaneInfo {
+    fn test_pane(pane_id: &str) -> tend::tmux::PaneInfo {
+        tend::tmux::PaneInfo {
             session_group: None,
             agent_program: None,
             worker_launch_id: None,
@@ -4529,7 +4529,7 @@ mod tests {
                 resumed_id: None,
             },
             pane,
-            backend: crate::backend::default_backend(),
+            backend: tend::backend::default_backend(),
         };
         let config = SwapConfig {
             aas: "/nonexistent/tend-test/aas".into(),
@@ -4539,7 +4539,7 @@ mod tests {
             &request(SwapScope::All),
             vec![planned],
             &config,
-            &crate::accounts::AccountsConfig::default(),
+            &tend::accounts::AccountsConfig::default(),
         );
         let [Step::Done(outcome)] = steps.as_slice() else {
             panic!("no account backend must settle the target without running it");
@@ -4573,7 +4573,7 @@ mod tests {
             .into_iter()
             .find(|path| cfg!(target_os = "macos") && std::path::Path::new(path).exists())
             .unwrap_or("/bin/sh");
-        crate::test_support::write_executable(
+        tend::test_support::write_executable(
             &claude,
             format!(
                 "#!{shell}\n{}",
@@ -4588,7 +4588,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let socket = dir.join("tmux.sock");
         let socket = socket.to_str().unwrap();
         let tmux = |args: &[&str]| {
-            let out = Command::new(crate::tmux::tmux_binary())
+            let out = Command::new(tend::tmux::tmux_binary())
                 .arg("-S")
                 .arg(socket)
                 .args(args)
@@ -4617,7 +4617,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         tmux(&["send-keys", "-t", &pane, &launch, "Enter"]);
         std::thread::sleep(Duration::from_secs(1));
 
-        let accounts = crate::accounts::AccountsConfig {
+        let accounts = tend::accounts::AccountsConfig {
             claude: vec![
                 account("work", "CLAUDE_CONFIG_DIR", "/acct/work"),
                 account("home", "CLAUDE_CONFIG_DIR", "/acct/home"),
@@ -4627,7 +4627,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let mut capped = limited(&pane, sid);
         capped.tmux_socket = None;
         let request = request(SwapScope::Targets(vec![pane.clone()]));
-        let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
+        let backend: SharedBackend = std::sync::Arc::new(tend::backend::tmux::TmuxBackend::new());
         let outcomes = run(
             &request,
             &[capped],
@@ -4676,7 +4676,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let claude = bin.join("claude");
-        crate::test_support::write_executable(
+        tend::test_support::write_executable(
             &claude,
             format!(
                 "#!/bin/sh\n{}",
@@ -4691,7 +4691,7 @@ while read line; do case "$line" in */exit*) echo EXITING; exit 0 ;; esac; echo 
         let socket = dir.join("tmux.sock");
         let socket = socket.to_str().unwrap();
         let tmux = |args: &[&str]| {
-            let out = Command::new(crate::tmux::tmux_binary())
+            let out = Command::new(tend::tmux::tmux_binary())
                 .arg("-S")
                 .arg(socket)
                 .args(args)
@@ -4720,10 +4720,10 @@ while read line; do case "$line" in */exit*) echo EXITING; exit 0 ;; esac; echo 
         tmux(&["send-keys", "-t", &pane, &launch, "Enter"]);
         std::thread::sleep(Duration::from_secs(1));
         let env_file = dir.join("home.env");
-        let accounts = crate::accounts::AccountsConfig {
+        let accounts = tend::accounts::AccountsConfig {
             claude: vec![
                 account("work", "CLAUDE_CONFIG_DIR", "/acct/work"),
-                crate::accounts::AccountProfile {
+                tend::accounts::AccountProfile {
                     name: "home".into(),
                     env: std::collections::BTreeMap::new(),
                     env_file: Some(env_file.to_str().unwrap().to_owned()),
@@ -4735,7 +4735,7 @@ while read line; do case "$line" in */exit*) echo EXITING; exit 0 ;; esac; echo 
         capped.tmux_socket = None;
         let mut request = request(SwapScope::Targets(vec![pane.clone()]));
         request.to = AccountChoice::Named("home".into());
-        let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
+        let backend: SharedBackend = std::sync::Arc::new(tend::backend::tmux::TmuxBackend::new());
         let refused = run(
             &request,
             std::slice::from_ref(&capped),
@@ -4785,7 +4785,7 @@ while read line; do case "$line" in */exit*) echo EXITING; exit 0 ;; esac; echo 
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let script = |name: &str, body: &str| {
-            crate::test_support::write_executable(
+            tend::test_support::write_executable(
                 &bin.join(name),
                 format!("#!/bin/sh\n{body}\n"),
                 0o755,
@@ -4805,7 +4805,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let socket = dir.join("tmux.sock");
         let socket = socket.to_str().unwrap();
         let tmux = |args: &[&str]| {
-            let out = Command::new(crate::tmux::tmux_binary())
+            let out = Command::new(tend::tmux::tmux_binary())
                 .arg("-S")
                 .arg(socket)
                 .args(args)
@@ -4838,13 +4838,13 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         capped.tmux_socket = None;
         let mut request = request(SwapScope::Targets(vec![pane.clone()]));
         request.to = AccountChoice::Named("spare@claude".into());
-        let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
+        let backend: SharedBackend = std::sync::Arc::new(tend::backend::tmux::TmuxBackend::new());
         let outcomes = run(
             &request,
             &[capped],
             &[backend],
             &SwapConfig::default(),
-            &crate::accounts::AccountsConfig::default(),
+            &tend::accounts::AccountsConfig::default(),
         );
         let screen = tmux(&["capture-pane", "-p", "-t", &pane]);
         let still_there = tmux(&[
@@ -4878,7 +4878,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let bin = dir.join("bin");
         std::fs::create_dir_all(&bin).unwrap();
         let script = |name: &str, body: &str| {
-            crate::test_support::write_executable(
+            tend::test_support::write_executable(
                 &bin.join(name),
                 format!("#!/bin/sh\n{body}\n"),
                 0o755,
@@ -4907,7 +4907,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let socket = dir.join("tmux.sock");
         let socket = socket.to_str().unwrap();
         let tmux = |args: &[&str]| {
-            let out = Command::new(crate::tmux::tmux_binary())
+            let out = Command::new(tend::tmux::tmux_binary())
                 .arg("-S")
                 .arg(socket)
                 .args(args)
@@ -4918,7 +4918,7 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
         Command::new("env")
             .arg(format!("PATH={path}"))
-            .arg(crate::tmux::tmux_binary())
+            .arg(tend::tmux::tmux_binary())
             .args(["-S", socket, "-f", "/dev/null", "new-session", "-d"])
             .args(["-x", "160", "-y", "40", "/bin/sh"])
             .status()
@@ -4939,13 +4939,13 @@ while read line; do case "$line" in */exit*) exit 0 ;; esac; echo "GOT $line"; e
         capped.tmux_socket = None;
         let mut request = request(SwapScope::Targets(vec![pane.clone()]));
         request.to = AccountChoice::Named("spare@claude".into());
-        let backend: SharedBackend = std::sync::Arc::new(crate::backend::tmux::TmuxBackend::new());
+        let backend: SharedBackend = std::sync::Arc::new(tend::backend::tmux::TmuxBackend::new());
         let outcomes = run(
             &request,
             &[capped],
             &[backend],
             &SwapConfig::default(),
-            &crate::accounts::AccountsConfig::default(),
+            &tend::accounts::AccountsConfig::default(),
         );
         let screen = tmux(&["capture-pane", "-p", "-t", &pane]);
         tmux(&["kill-server"]);

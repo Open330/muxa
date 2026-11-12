@@ -8,7 +8,6 @@ use super::effects::{
 };
 use super::io::{AgentArgv, Clock, SwapIo};
 use super::{execute, AccountVerdict, LaunchLine, PaneLaunch, Refusal, Target};
-use crate::event::AgentKind;
 use crate::swap_job::{
     AccountCheck, ContinueDecision, Observation, Phase, Readiness, Submission, TurnEvidence,
     WithheldReason,
@@ -16,6 +15,7 @@ use crate::swap_job::{
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+use tend::event::AgentKind;
 
 const AGENT: u32 = 10;
 const WRAPPER: u32 = 11;

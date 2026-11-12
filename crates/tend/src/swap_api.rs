@@ -15,6 +15,50 @@ use crate::event::AgentKind;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// `[modules]` in `config.toml`: optional modules this install uses.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ModulesConfig {
+    /// The account module: `tend swap`, the `swap_account` automation
+    /// action, `tend_swap_account`, and `[agent.<program>].account`
+    /// launches. Unset: on when this config already uses accounts
+    /// ([`crate::Config::accounts_module`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accounts: Option<bool>,
+}
+
+impl ModulesConfig {
+    #[must_use]
+    pub fn is_unset(&self) -> bool {
+        self.accounts.is_none()
+    }
+}
+
+/// Whether the account module is on for a config, and on what evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModuleSwitch {
+    pub enabled: bool,
+    /// The settings that turned it on when `[modules] accounts` is unset.
+    pub uses: Vec<String>,
+    /// `[modules] accounts` was set.
+    pub explicit: bool,
+}
+
+/// Why the account module does not answer, for a build that carries it
+/// (`compiled`) or one that does not.
+#[must_use]
+pub fn module_unavailable(compiled: bool) -> String {
+    if compiled {
+        "the account module is not enabled: set `[modules] accounts = true` in config.toml \
+         (or configure `[agent.<program>].account` / `[[accounts.<provider>]]`) and restart tendd"
+            .into()
+    } else {
+        "the account module is not in this build: rebuild tend-cli and tendd with the `aas` \
+         feature (on by default)"
+            .into()
+    }
+}
+
 /// `[swap]` in `config.toml`: defaults shared by `tend swap` and the
 /// `swap_account` automation action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -656,6 +700,9 @@ pub struct AccountRoute {
     /// The provider's `[[accounts.<provider>]]`, in config order. When
     /// present, routing needs no external tool.
     pub profiles: Vec<crate::accounts::AccountProfile>,
+    /// `[modules] accounts = false` with an account asked for: the launch
+    /// starts bare and says why.
+    pub module_off: bool,
 }
 
 /// What routing decided, reported with the launch result.
@@ -666,4 +713,47 @@ pub struct AccountDecision {
     /// Why it started bare, when it did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+}
+
+/// A decided launch: the words that start the provider CLI on `account`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutedLaunch {
+    pub account: String,
+    /// `aas e <account>` (with `aas` as an absolute path where one was
+    /// found: the pane's shell need not have this process's `PATH`), or a
+    /// configured account's `env K=V … <provider>`. Either way it ends where
+    /// the provider's own arguments begin.
+    pub launcher: Vec<String>,
+}
+
+impl RoutedLaunch {
+    /// The argv that starts `provider_args` on this account.
+    #[must_use]
+    pub fn argv(&self, provider_args: impl IntoIterator<Item = String>) -> Vec<String> {
+        self.launcher.iter().cloned().chain(provider_args).collect()
+    }
+
+    /// Through `aas`, which picks the provider CLI from the account.
+    #[must_use]
+    pub fn via_aas(aas: String, account: String) -> Self {
+        Self {
+            launcher: vec![aas, "e".into(), account.clone()],
+            account,
+        }
+    }
+}
+
+/// `decide`, folded into what the launch result reports.
+#[must_use]
+pub fn report(outcome: &Result<RoutedLaunch, String>) -> AccountDecision {
+    match outcome {
+        Ok(routed) => AccountDecision {
+            account: Some(routed.account.clone()),
+            skipped: None,
+        },
+        Err(reason) => AccountDecision {
+            account: None,
+            skipped: Some(reason.clone()),
+        },
+    }
 }
