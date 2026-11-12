@@ -1,7 +1,5 @@
 import { collaborationSummary, messagePreview, responseLatency, graphFitScale, initResizeHandle, setStableHTML, clearStableHTML, participantLocation, messageLink } from "./collaboration-view.mjs";
 import { baseSessionName, canonicalDashboardPanes, intervalPlacement } from "./session-model.mjs";
-import { openShareManager } from "./sharing-admin.mjs";
-import { openAccessManager } from "./operators-admin.mjs";
 import { renderLanding } from "./landing.mjs";
 import { createPaneDrawer, parsePaneHash, withPaneHash } from "./pane-drawer.mjs";
 import { TILE_STREAM_BUDGET, openPaneStream, planTileStreams } from "./pane-stream.mjs";
@@ -66,16 +64,6 @@ import {
 //   * Fetch /api/health and /api/access. In `public_read` mode reads and SSE
 //     work anonymously while the same bearer token acts as a browser PAT for
 //     the separate control routes.
-//   * When `[dashboard.login]` is configured, a signed-out browser is offered
-//     OIDC sign-in instead of a token prompt. The resulting operator session
-//     is an HttpOnly cookie the browser attaches to same-origin fetches; every
-//     control request also sends `X-Tend-Operator: 1`, which the server
-//     requires (with a matching Origin) before a cookie may change state.
-//     An account outside the operator group can be enrolled once with the
-//     token on the server-rendered /auth/enroll page. Accounts matching a
-//     viewer rule or `viewer_group` sign in read-only ("view only") and can
-//     upgrade themselves with the token. The "access" dialog shows the
-//     current account and manages enrolled operators and viewer rules.
 //   * Fetch /api/agents and /api/panes to paint initial tables.
 //   * Open a streaming POST-less fetch on /api/events and parse SSE
 //     manually (EventSource can't carry an Authorization header).
@@ -149,87 +137,16 @@ function authHeaders() {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
-// ── Operator sign-in (OIDC) ────────────────────────────────────────
-
-function normalizeLogin(data) {
-  return {
-    available: Boolean(data?.available),
-    signedIn: Boolean(data?.signed_in),
-    email: typeof data?.email === "string" ? data.email : null,
-    role: ["none", "viewer", "operator"].includes(data?.role) ? data.role : "none",
-    via: ["group", "enrollment", "viewer_group", "viewer_rule"].includes(data?.via) ? data.via : null,
-    enrollment: Boolean(data?.enrollment),
-    loginUrl: typeof data?.login_url === "string" ? data.login_url : null,
-  };
-}
-
-// A read came back 401: this browser has neither an operator session nor a
-// token that works. Show the landing page with the ways in (sign-in when
-// the server has a provider, and the token) instead of an empty dashboard.
-// Boot and polling stop here; signing in or entering a token reloads.
-async function showLanding() {
+// A read came back 401: this browser has no token that works. Show the
+// landing page, which points at the `tend init` dashboard link, instead of
+// an empty dashboard. Boot and polling stop here; opening the link reloads.
+function showLanding() {
   if (store.access.signInRequired) return;
   store.access.signInRequired = true;
-  try {
-    const resp = await fetch("/auth/session", { credentials: "same-origin", cache: "no-store" });
-    if (resp.ok) store.access.login = normalizeLogin(await resp.json());
-  } catch (_) {
-    // No session endpoint: the dashboard link from `tend init` is the way in.
-  }
   document.body.dataset.view = "landing";
   renderLanding(dom.landing, {
-    login: store.access.login,
     tokenRejected: Boolean(localStorage.getItem(TOKEN_KEY)),
-    actions: { signIn, signOut },
   });
-}
-
-function signIn() {
-  const here = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-  const target = store.access.login.loginUrl || "/auth/login";
-  window.location.assign(`${target}?return_to=${encodeURIComponent(here)}`);
-}
-
-// A signed-in viewer enrolls its own account as an operator with the
-// dashboard token. The server checks the token once and replaces the
-// viewer session with an operator session; nothing is stored here.
-async function upgradeWithToken() {
-  const token = window.prompt("Dashboard access token (makes this account an operator)");
-  if (!token) return;
-  let payload = null;
-  try {
-    const resp = await fetch("/auth/enroll", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "Content-Type": "application/json", "X-Tend-Operator": "1" },
-      body: JSON.stringify({ token: token.trim() }),
-    });
-    payload = await resp.json().catch(() => null);
-    if (resp.ok) {
-      window.location.reload();
-      return;
-    }
-    if (payload?.restart) {
-      window.location.reload();
-      return;
-    }
-  } catch (_) {
-    // Reported below.
-  }
-  showToast(payload?.error || "upgrade failed");
-}
-
-async function signOut() {
-  clearCollaborationDetails();
-  try {
-    await fetch("/auth/logout", {
-      method: "POST",
-      credentials: "same-origin",
-      headers: { "X-Tend-Operator": "1" },
-    });
-  } finally {
-    window.location.reload();
-  }
 }
 
 // ── HTTP helpers ───────────────────────────────────────────────────
@@ -241,7 +158,7 @@ async function jsonFetch(path, options = {}) {
     headers: { ...authHeaders(), ...(options.headers || {}) },
   });
   if (resp.status === 401) {
-    await showLanding();
+    showLanding();
     throw new Error("unauthorized");
   }
   if (!resp.ok) {
@@ -257,9 +174,6 @@ async function controlFetch(path, options = {}) {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      // Required by the server before an operator session cookie may
-      // authorize a state change; harmless alongside a bearer token.
-      "X-Tend-Operator": "1",
       ...authHeaders(),
       ...(options.headers || {}),
     },
@@ -272,12 +186,11 @@ async function controlFetch(path, options = {}) {
   }
   if (resp.status === 401 || resp.status === 403) {
     // Ask the server what this browser may do instead of assuming the
-    // credential is gone: a 403 is also what a signed-in operator gets when
-    // the request's Origin is not the configured public URL, and flipping
-    // writeAuthorized off here used to hide every control until a reload.
+    // credential is gone; flipping writeAuthorized off here used to hide
+    // every control until a reload.
     await fetchAccess().catch(() => {});
     if (store.access.writeAuthorized) {
-      throw new Error(payload?.error || "request refused — open the dashboard at its public address and try again");
+      throw new Error(payload?.error || "request refused");
     }
     throw new Error(resp.status === 401 ? "invalid or missing edit PAT" : "dashboard is read-only");
   }
@@ -362,8 +275,6 @@ const dom = {
   landing: document.getElementById("landing"),
   accessMode: document.getElementById("access-mode"),
   editAccess: document.getElementById("edit-access"),
-  operatorLogin: document.getElementById("operator-login"),
-  upgradeAccess: document.getElementById("upgrade-access"),
   conn: document.getElementById("conn"),
   connLabel: document.getElementById("conn-label"),
   counts: document.getElementById("counts"),
@@ -464,43 +375,22 @@ function showToast(msg) {
 
 function renderAccess() {
   const access = store.access;
-  const login = access.login;
   const editing = access.writeAuthorized;
-  const viaSession = editing && login.signedIn && !localStorage.getItem(TOKEN_KEY);
-  const viewing = !editing && login.signedIn && login.role === "viewer";
-  const canUpgrade = viewing && login.enrollment && access.writeAvailable;
-  document.querySelector("#manage-shares").hidden = !editing;
-  document.querySelector("#manage-access").hidden = !(editing && login.available);
-  if (dom.upgradeAccess) dom.upgradeAccess.hidden = !canUpgrade;
   const canStartWork = editing && access.workStartAvailable;
   dom.workItemsPanel?.classList.toggle("can-start", Boolean(access.workStartAvailable));
-  dom.accessMode.textContent = viaSession
-    ? "signed in"
-    : viewing
-      ? "signed in · view only"
-      : editing
-        ? "edit unlocked"
-        : access.mode === "public_read"
-          ? "public read-only"
-          : access.mode === "token"
-            ? "private"
-            : "read-only";
-  dom.accessMode.title = (viaSession || viewing) && login.email
-    ? `signed in as ${login.email}${login.via === "enrollment" ? " (registered account)" : ""}${viewing ? " (view only)" : ""}`
-    : "";
+  dom.accessMode.textContent = editing
+    ? "edit unlocked"
+    : access.mode === "public_read"
+      ? "public read-only"
+      : access.mode === "token"
+        ? "private"
+        : "read-only";
   dom.accessMode.classList.toggle("edit", editing);
-  // The token path stays available next to sign-in: it is the API
-  // credential and the way in when the identity provider is down.
-  dom.editAccess.hidden = !access.writeAvailable || viaSession || canUpgrade;
+  dom.editAccess.hidden = !access.writeAvailable;
   dom.editAccess.disabled = access.mode === "token" && editing;
   dom.editAccess.textContent = editing
     ? access.mode === "public_read" ? "lock edit" : "PAT active"
     : "unlock edit";
-  if (dom.operatorLogin) {
-    dom.operatorLogin.hidden = !login.available || (editing && !login.signedIn);
-    dom.operatorLogin.textContent = login.signedIn ? "sign out" : "sign in";
-    dom.operatorLogin.title = login.signedIn && login.email ? `signed in as ${login.email}` : "";
-  }
   [dom.workStartId, dom.workStartExternal, dom.workStartBody, dom.workStartSubmit]
     .filter(Boolean)
     .forEach((control) => { control.disabled = !canStartWork; });
@@ -532,12 +422,10 @@ async function fetchAccess() {
   store.access = {
     mode: data.mode || "read_only",
     readRequiresToken: Boolean(data.read_requires_token),
-    paneSharingAvailable: Boolean(data.capabilities?.pane_sharing),
     writeAvailable: Boolean(data.write_available),
     writeAuthorized: Boolean(data.write_authorized),
     workStartAvailable: Boolean(data.capabilities?.work_start),
     signInRequired: false,
-    login: normalizeLogin(data.login),
   };
   renderAccess();
   if (wasAuthorized !== store.access.writeAuthorized) {
@@ -548,19 +436,10 @@ async function fetchAccess() {
 }
 
 function initAccessControl() {
-  dom.operatorLogin?.addEventListener("click", () => {
-    if (store.access.login.signedIn) signOut();
-    else signIn();
-  });
-  dom.upgradeAccess?.addEventListener("click", upgradeWithToken);
   dom.editAccess.addEventListener("click", async () => {
     if (store.access.writeAuthorized && store.access.mode === "public_read") {
       localStorage.removeItem(TOKEN_KEY);
       clearCollaborationDetails();
-      if (store.access.login.signedIn && store.access.login.role === "operator") {
-        await signOut();
-        return;
-      }
       await fetchAccess().catch(() => {});
       showToast("edit locked · public read-only");
       return;
@@ -629,9 +508,8 @@ const store = {
     writeAvailable: false,
     writeAuthorized: false,
     workStartAvailable: false,
-    // Set when a read was refused and sign-in is offered instead.
+    // Set when a read was refused and the landing page is shown instead.
     signInRequired: false,
-    login: { available: false, signedIn: false, role: "none", email: null, via: null, enrollment: false, loginUrl: null },
   },
   agents: new Map(), // session_id -> Agent
   panes: [], // PaneSummary[]
@@ -2191,7 +2069,7 @@ function paneRowAttrs(pane, socket, label = pane, cls = "pane-row") {
   return ` class="${cls}" tabindex="0" aria-haspopup="dialog" aria-label="Open ${esc(label)}" data-open-pane="${esc(pane)}" data-open-socket="${esc(socket || "")}"`;
 }
 
-// The one per-row action: open the drawer (output, message, abort, share).
+// The one per-row action: open the drawer (output, message, abort).
 function paneOpenButton(pane, socket = "") {
   if (!pane) return "—";
   return `<button class="control-btn open-btn" type="button" aria-haspopup="dialog" data-open-pane="${esc(pane)}" data-open-socket="${esc(socket || "")}">open</button>`;
@@ -2395,7 +2273,6 @@ function initPaneDrawer() {
       meta: byId("pane-drawer-meta"),
       cwd: byId("pane-drawer-cwd"),
       close: byId("close-pane-drawer"),
-      share: byId("pane-drawer-share"),
       abort: byId("pane-drawer-abort"),
       updated: byId("pane-drawer-updated"),
       viewOnly: byId("pane-drawer-view-only"),
@@ -2409,7 +2286,6 @@ function initPaneDrawer() {
       send: byId("pane-composer-send"),
     },
     isOperator: () => store.access.writeAuthorized,
-    canShare: (target) => Boolean(target && store.access.paneSharingAvailable && /^(%|rmux:)/.test(target.pane)),
     describe: describePane,
     // Plain fetch, not jsonFetch: a refused output read must not swap the
     // whole dashboard for the landing page.
@@ -2420,7 +2296,6 @@ function initPaneDrawer() {
     }),
     openStream: (url, handlers) => openPaneStream({ url, headers: authHeaders, ...handlers }),
     controlFetch,
-    openShare: (target) => openShareManager(target, controlFetch),
     showToast,
     onHashChange(target) {
       const url = new URL(window.location.href);
@@ -2784,8 +2659,6 @@ function ensureLayout(window) {
 function renderWindowDetail(window) {
   const layout = ensureLayout(window);
   const byId = new Map(window.panes.map((pane) => [pane.id, pane]));
-  const shareable = store.access.writeAuthorized && store.access.paneSharingAvailable
-    && window.panes.some((pane) => /^(%|rmux:)/.test(pane.id));
   const body = layout
     ? `<div class="window-layout" style="aspect-ratio:${layout.aspect.toFixed(3)}">${layout.tiles.map((tile) => {
       const pane = byId.get(tile.paneId);
@@ -2803,7 +2676,6 @@ function renderWindowDetail(window) {
       </nav>
       ${statePill(window.state)}
       <span class="tnode-count">${esc(nodeCountsLabel(window))}${layout ? "" : window.host === "tmux" ? "" : ` · ${esc(window.host)}`}</span>
-      ${shareable ? `<button class="control-btn" type="button" data-share-window="${esc(window.key)}">share window</button>` : ""}
     </div>
     ${note}
     ${body}`;
@@ -3038,8 +2910,7 @@ function initTopology() {
     });
     item.tabIndex = 0;
   });
-  // Clicks on window cards, breadcrumbs (here and in the Agents table) and
-  // the window share button.
+  // Clicks on window cards and breadcrumbs (here and in the Agents table).
   document.addEventListener("click", (event) => {
     const nav = event.target.closest?.("[data-tselect]");
     if (nav) {
@@ -3055,20 +2926,6 @@ function initTopology() {
           dom.topologyPanel.querySelector("[data-collapse-target]")?.click();
         }
         dom.topologyPanel.scrollIntoView({ behavior: "smooth", block: "start" });
-      }
-      return;
-    }
-    const share = event.target.closest?.("[data-share-window]");
-    if (share) {
-      const window = currentTopology().nodes.get(share.getAttribute("data-share-window"));
-      const pane = window?.panes.find((candidate) => /^(%|rmux:)/.test(candidate.id));
-      if (pane) {
-        openShareManager({
-          pane: pane.id,
-          socket: pane.socket || null,
-          scope: "window",
-          label: `${window.sessionName}:${window.index}`,
-        }, controlFetch);
       }
     }
   });
@@ -3448,10 +3305,6 @@ function initDynamicEventDelegation() {
     }
     if (event.target.closest("[data-unlock-collaboration]")) {
       dom.editAccess.click();
-      return;
-    }
-    if (event.target.closest("[data-login-collaboration]")) {
-      signIn();
       return;
     }
     if (!event.target.closest("[data-close-collaboration-detail]")) return;
@@ -4234,9 +4087,8 @@ function renderCollaborationDetail(request) {
       <dt>response time</dt><dd>${responseLatency(request) === null ? "—" : formatDuration(responseLatency(request) / 1000)}</dd>
       <dt>updates</dt><dd>${request.updates?.length || 0}</dd>
     </dl>
-    ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">${store.access.mode === "read_only" ? "Message details are unavailable on this read-only dashboard." : "Sign in as an operator or unlock access to read the request, reply, and artifacts."}
+    ${detailsIncluded ? `<div class="collaboration-message-body"><span>request</span><pre>${esc(request.body || "")}</pre></div>` : `<div class="collaboration-detail-redacted">${store.access.mode === "read_only" ? "Message details are unavailable on this read-only dashboard." : "Unlock access to read the request, reply, and artifacts."}
       ${store.access.writeAvailable && !store.access.writeAuthorized ? '<button class="control-btn" type="button" data-unlock-collaboration>unlock details with PAT</button>' : ""}
-      ${store.access.login.available && !store.access.login.signedIn ? '<button class="control-btn" type="button" data-login-collaboration>sign in</button>' : ""}
       </div>`}
     ${detailsIncluded ? (request.updates || []).map(update => `<div class="collaboration-message-body"><span>update · ${esc(participantLabel(update.author))} · ${esc(new Date(update.at).toLocaleString())}</span><pre>${esc(update.body || "")}</pre></div>`).join("") : ""}
     ${detailsIncluded && reply ? `<div class="collaboration-message-body reply"><span>reply · ${esc(reply.status || request.status)} · ${esc(reply.at ? new Date(reply.at).toLocaleString() : "")}</span><pre>${esc(reply.body || "")}</pre></div>` : ""}
@@ -4983,6 +4835,3 @@ async function pollCollaboration() {
 }
 
 main();
-
-document.querySelector("#manage-shares")?.addEventListener("click", () => openShareManager(null, controlFetch));
-document.querySelector("#manage-access")?.addEventListener("click", () => openAccessManager(controlFetch));

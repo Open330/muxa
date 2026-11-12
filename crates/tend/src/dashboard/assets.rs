@@ -154,8 +154,6 @@ mod tests {
         assert!(WebAssets::get("work-model.mjs").is_some());
         assert!(WebAssets::get("collaboration-model.mjs").is_some());
         assert!(WebAssets::get("style.css").is_some());
-        assert!(WebAssets::get("operator-enroll.mjs").is_some());
-        assert!(WebAssets::get("operators-admin.mjs").is_some());
         assert!(WebAssets::get("pane-drawer.mjs").is_some());
         assert!(WebAssets::get("pane-stream.mjs").is_some());
         assert!(WebAssets::get("topology-model.mjs").is_some());
@@ -206,18 +204,11 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers()[header::CONTENT_TYPE], "font/woff2");
         assert_eq!(response.headers()[header::CACHE_CONTROL], "no-cache");
-        // Every stylesheet that renders pane output falls back to it.
-        for css in ["style.css", "share.css"] {
-            let text = String::from_utf8(WebAssets::get(css).unwrap().data.into_owned()).unwrap();
-            assert!(
-                text.contains("url(\"/static/fonts/tend-nerd-symbols.woff2\")"),
-                "{css}"
-            );
-            assert!(
-                text.contains("unicode-range: U+E000-F8FF, U+F0000-FFFFF"),
-                "{css}"
-            );
-        }
+        // The stylesheet that renders pane output falls back to it.
+        let text =
+            String::from_utf8(WebAssets::get("style.css").unwrap().data.into_owned()).unwrap();
+        assert!(text.contains("url(\"/static/fonts/tend-nerd-symbols.woff2\")"));
+        assert!(text.contains("unicode-range: U+E000-F8FF, U+F0000-FFFFF"));
     }
 
     #[test]

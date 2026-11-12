@@ -278,6 +278,5 @@ export const accessJson = () => ({
   read_requires_token: true,
   write_available: true,
   write_authorized: true,
-  capabilities: { work_start: true, pane_sharing: false },
-  login: { available: false, signed_in: false, email: null, role: "operator", via: null, enrollment: false, login_url: null },
+  capabilities: { work_start: true },
 });

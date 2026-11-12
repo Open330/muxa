@@ -636,41 +636,9 @@ dashboard는 명시적으로 public binding을 허용하기 전까지 loopback-o
 제어 요청을 비활성화합니다.
 자세한 내용은 [DASHBOARD.md](DASHBOARD.md).
 
-### 로그인 기반 pane·window 공유
-
-`[dashboard.sharing]`에 `public_url`, `issuer_url`, `client_id`를 설정하면
-대시보드에서 특정 tmux/rmux pane 또는 window의 현재 pane들을 이메일로 초대할 수 있습니다. OIDC 로그인,
-보기 전용/프롬프트 전송 권한, 만료, 회수를 지원합니다. `auth = "token"`이
-필수이며 운영자 토큰은 공유받는 사람에게 전달하지 않습니다.
-
-```toml
-[dashboard.sharing]
-public_url = "https://tend.example.com"
-issuer_url = "https://login.example.com"
-client_id = "tend-dashboard"
-client_secret_env = "TEND_SHARING_CLIENT_SECRET" # 필요한 경우 환경 변수 이름 지정
-# storage_path = "/absolute/path/to/shares.sqlite3" # 선택: 비공개 로컬 파일의 절대 경로
-```
-
-`public_url`은 경로·query·fragment가 없는 origin이어야 합니다. 설정 변경 후 daemon을 재시작하세요.
-Window 공유에는 초대 시점의 pane 프로세스가 최대 16개 포함되며, 이후 만든 pane은 포함되지 않습니다.
-
-OIDC 제공자에 `https://tend.example.com/share/auth/callback`을 등록하고,
-ID 토큰에 검증된 이메일(`email_verified = true`)이 포함되도록 설정합니다.
-외부 접속에는 HTTPS 프록시가 필요합니다. 공유 링크·회수 상태·계정 연결·명령 처리 기록은 비공개 SQLite 파일에 저장됩니다.
-daemon 재시작 후 같은 pane 프로세스가 살아 있으면 링크를 계속 사용할 수 있고,
-공유받은 사람은 다시 로그인합니다. 프롬프트 권한은 해당 pane의 프로세스에 명령을 보낼 수 있는 권한이며, shell pane에서는 shell 명령이 실행됩니다.
-전체 설정과 제약은 [대시보드 문서](DASHBOARD.md#invite-someone-to-a-pane)를 참고하세요.
-
-운영자는 **Shares → Check login setup**에서 로그인 제공자의 discovery와 서명 키 연결을 진단할 수 있습니다.
-이 검사는 client secret이나 실제 계정의 claim을 검증하지 않습니다.
-`storage_path`로 저장 파일의 절대 경로를 지정할 수 있으며, 기본 위치는 플랫폼 데이터
-디렉터리의 `tend/dashboard-sharing/shares.sqlite3`입니다. 같은 저장 파일을 두 daemon이
-동시에 사용할 수 없습니다. 저장 실패 시 변경을 완료했다고 응답하거나 새 명령을 실행하지
-않습니다. 브라우저는 응답이 유실된 명령을 같은 요청 ID로 확인하여 중복 실행을 막습니다.
-
-실제 외부 접속은 HTTPS 주소·OIDC client 설정과 해당 계정 로그인으로 별도 확인해야 합니다.
-프록시의 로그인 callback 접근 로그에는 query string을 남기지 않도록 설정하세요.
+대시보드는 단일 사용자용이며 bearer token이 유일한 인증 수단입니다. 예전 설정에
+`[dashboard.login]`이나 `[dashboard.sharing]`이 남아 있으면 경고와 함께 무시하고
+그대로 로드합니다. 해당 섹션은 지우세요.
 
 ## External Sinks
 

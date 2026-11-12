@@ -10,28 +10,14 @@ test("landing language: saved choice, then browser preference, then English", ()
   assert.equal(pickLanguage(null, []), "en");
 });
 
-test("landing offers sign-in when the server has a login provider", () => {
-  const access = landingAccess({ available: true, signedIn: false, role: "none" });
-  assert.equal(access.signIn, true);
-  assert.equal(access.signOut, false);
-  assert.equal(access.linkHint, false);
-});
-
-test("without a login provider the landing points at the tend init link, not a token field", () => {
-  const access = landingAccess({ available: false, signedIn: false, role: "none" });
-  assert.equal(access.signIn, false);
+test("the landing points at the tend init link, not a token field or a sign-in", () => {
+  const access = landingAccess();
   assert.equal(access.linkHint, true);
   assert.equal("token" in access, false);
-});
-
-test("a signed-in account without access is told so and can sign out", () => {
-  const access = landingAccess({ available: true, signedIn: true, role: "none", email: "a@b.c" });
-  assert.equal(access.signIn, false);
-  assert.equal(access.signOut, true);
-  assert.equal(access.signedInNoAccess, true);
+  assert.equal("signIn" in access, false);
 });
 
 test("a rejected stored token is reported", () => {
-  assert.equal(landingAccess(null, { tokenRejected: true }).tokenRejected, true);
-  assert.equal(landingAccess(null).tokenRejected, false);
+  assert.equal(landingAccess({ tokenRejected: true }).tokenRejected, true);
+  assert.equal(landingAccess().tokenRejected, false);
 });

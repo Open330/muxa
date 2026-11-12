@@ -1047,11 +1047,14 @@ pub struct WebhookToml {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DashboardTomlConfig {
-    /// Optional authenticated, pane-scoped browser sharing.
-    pub sharing: Option<Box<crate::dashboard::sharing::SharingConfig>>,
-    /// Optional operator sign-in through an `OpenID` Connect provider. The
-    /// bearer token stays required and keeps working alongside it.
-    pub login: Option<Box<crate::dashboard::operator::LoginConfig>>,
+    /// Removed: OIDC pane sharing. Still accepted so an old
+    /// config loads; the value is ignored and a warning is logged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sharing: Option<toml::Value>,
+    /// Removed: OIDC operator/viewer sign-in. Accepted and
+    /// ignored the same way as `sharing`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login: Option<toml::Value>,
     pub enabled: Option<bool>,
     /// Socket address as `ip:port`. Default `127.0.0.1:7878`.
     pub bind: Option<String>,
@@ -1077,6 +1080,22 @@ pub struct DashboardTomlConfig {
     /// bypassed. That is a different kind of authority and deserves a
     /// different grant, the same way `[ask]` and `[collaboration]` do.
     pub allow_work_start: Option<bool>,
+}
+
+impl DashboardTomlConfig {
+    /// `[dashboard.*]` sections an older tend accepted that this one only
+    /// tolerates: present in the file, ignored at runtime.
+    #[must_use]
+    pub fn removed_sections(&self) -> Vec<&'static str> {
+        let mut keys = Vec::new();
+        if self.sharing.is_some() {
+            keys.push("dashboard.sharing");
+        }
+        if self.login.is_some() {
+            keys.push("dashboard.login");
+        }
+        keys
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1668,6 +1687,12 @@ impl Config {
     /// `[watch.detail] template`. Never errors. Keeping these as warnings
     /// means a config written for a newer/older `tend` version still loads.
     fn warn_soft_issues(&self) {
+        for key in self.dashboard.removed_sections() {
+            tracing::warn!(
+                section = %key,
+                "config.toml: dashboard OIDC sign-in and pane sharing were removed — this section is ignored; delete it",
+            );
+        }
         if !self.unknown.is_empty() {
             // A newer tend wrote a section this build does not know, or a
             // top-level table is misspelled. Either way, running on the
@@ -3028,6 +3053,46 @@ knobs = ["a", "b"]
         // silently delete the newer build's settings.
         let rendered = toml::to_string(&cfg).expect("serialize");
         assert!(rendered.contains("from_the_future"), "{rendered}");
+    }
+
+    /// Dashboard OIDC sign-in and pane sharing were removed. A config that
+    /// still carries their sections loads (with a warning) instead of
+    /// refusing to start, and the daemon-only checks accept it too.
+    #[test]
+    fn removed_dashboard_sharing_and_login_sections_still_load() {
+        let cfg: Config = toml::from_str(
+            r#"
+[dashboard]
+enabled = true
+token = "t"
+
+[dashboard.sharing]
+public_url = "https://tend.example.com"
+issuer_url = "https://id.example.com"
+client_id = "tend"
+
+[dashboard.login]
+public_url = "https://tend.example.com"
+issuer_url = "https://id.example.com"
+client_id = "tend"
+required_group = "tend-operators"
+viewer_rules = ["email:*@example.com"]
+"#,
+        )
+        .expect("removed dashboard sections must not fail the load");
+        cfg.validate().expect("removed sections are not invalid");
+        cfg.validate_for_daemon()
+            .expect("removed sections do not fail daemon validation");
+        assert_eq!(
+            cfg.dashboard.removed_sections(),
+            vec!["dashboard.sharing", "dashboard.login"]
+        );
+        let resolved = crate::dashboard::DashboardConfig::resolve(
+            &cfg.dashboard,
+            &crate::dashboard::DashboardOverrides::default(),
+        )
+        .expect("the dashboard resolves without the removed sections");
+        assert!(resolved.enabled);
     }
 
     /// Inside a section, an unknown key is still a typo worth refusing.
