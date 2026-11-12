@@ -186,7 +186,6 @@ against glibc 2.17 (a native build would require the build host's glibc).
   dashboard, and notifications
 - `crates/tendd` — daemon binary
 - `crates/tend-cli` — CLI binary and terminal UIs
-- `crates/tend-zellij-plugin` — zellij plugin
 - `apps/tend-macos` — native Mac app and bundled runtime build scripts
 - `site` — GitHub Pages entry point using the dashboard's shared landing assets
 

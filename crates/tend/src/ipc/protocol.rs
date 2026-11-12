@@ -831,8 +831,9 @@ pub(super) enum RequestBody {
     },
 
     /// Wholesale pane-metadata snapshot pushed by an out-of-process
-    /// backend source — today the zellij WASM plugin forwarding
-    /// `PaneUpdate` events. The daemon hands the panes to its
+    /// backend source. Designed for a zellij WASM plugin that never shipped
+    /// (the stub crate was removed); no in-tree sender exists today, and the
+    /// command stays for wire compatibility. The daemon hands the panes to its
     /// `SharedBackend::ingest_pane_snapshot`, which the zellij backend
     /// caches so `list_panes` / `resolve_pane` answer from real data. A
     /// no-op on tmux (that backend enumerates panes itself).

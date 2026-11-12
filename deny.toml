@@ -41,12 +41,6 @@ ignore = [
     "RUSTSEC-2026-0371", # zbus_names
     "RUSTSEC-2026-0372", # zvariant_derive
 
-    # Transitive through zellij-tile 0.44.3 -> zellij-utils -> clap 3.
-    # zellij-tile 0.44.3 is the latest plugin API crate as of v0.8.0, and
-    # these are unmaintained advisories rather than memory-safety CVEs.
-    # Revisit when zellij-tile moves off clap 3.
-    "RUSTSEC-2024-0370", # proc-macro-error
-    "RUSTSEC-2024-0375", # atty
     # Transitive through notify-rust -> tauri-winrt-notification -> quick-xml.
     # tauri-winrt-notification is a Windows-only (WinRT toast) dependency, so
     # quick-xml is compiled into the Windows build only. Both are

@@ -12,9 +12,9 @@
 //!
 //! The other trait methods (`list_panes`, `resolve_pane`,
 //! `capture_pane`, `pane_pid_map`) need pane-level metadata zellij
-//! only exposes through the plugin API. This module pre-positions a
-//! snapshot cache the future plugin will push into; until that lands,
-//! the cache is permanently empty and the methods report it that way.
+//! only exposes through the plugin API. This module keeps a snapshot
+//! cache a plugin could push into; no plugin ships, so the cache is
+//! empty and the methods report it that way.
 //! [`crate::backend::BackendCaps`] flags are flipped to `false` for the
 //! plugin-only methods so callers (discovery, hook ancestry, watch
 //! preview) can branch on capability rather than mistaking "structurally
@@ -51,9 +51,9 @@ use crate::tmux::PaneInfo;
 
 /// CLI-baseline zellij backend.
 ///
-/// Holds a shared snapshot of pane metadata that the future
-/// `tend-zellij-plugin` WASM module will populate over IPC. Without the
-/// plugin the snapshot stays empty and methods that depend on
+/// Holds a shared snapshot of pane metadata that a WASM plugin could
+/// populate over IPC. No such plugin ships (the stub crate was removed),
+/// so the snapshot stays empty and methods that depend on
 /// pane-level metadata return empty / `None` — `caps()` is the
 /// authoritative signal for what's actually available.
 ///

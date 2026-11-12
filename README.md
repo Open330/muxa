@@ -124,7 +124,6 @@ See [Direction](docs/DIRECTION.md).
 | `tend stats activity` | Raw duration ledger query for debugging exactly what fed stats/report. |
 | `tend automation` | Rules that act on agent state — the built-in one resumes a session after its usage cap resets. |
 | `tend swap` | Restart agents on their own accounts with `--all --to same --when-idle`, or move agents onto another account (configured accounts, or the optional `aas` provider) and resume them in place — the rate-limited ones, named panes, or all. See [docs/ACCOUNT_SWAP.md](docs/ACCOUNT_SWAP.md). |
-| BarShelf widget (macOS) | Menu-bar popover summary of active, working, waiting, and error agents. |
 | Tend for Mac | Native workbench for Work, Explore, Inbox, Ask, Shells, and Files, with a libghostty terminal and notifications; native PTYs remain owned by `tendd`. |
 | Dashboard | Optional loopback HTTP UI with live updates, timeline, collaboration graphs, and [OIDC pane/window sharing](docs/DASHBOARD.md#invite-someone-to-a-pane) with view or prompt permissions. |
 | Notifications | Optional desktop alerts when agents need attention. |
@@ -378,7 +377,6 @@ the tour. `--print` emits the same sixteen-step workflow without starting tmux.
 | `tend status [--flat\|--json]` | Agents as a session / window / pane tree (`--flat`: one row per agent), or a versioned JSON snapshot for desktop integrations. |
 | `tend watch [--view session\|window\|pane]` | Live workspace → work → agent TUI picker/dashboard. |
 | `tend dashboard [--since today]` | The watch Work board: per-agent and Work-wide prompt/interrupt, messages and mailbox as an agent, collaboration counts, and an ACT/WACT summary. |
-| `tend graph [--limit 200]` | Interactive terminal collaboration graph with session/window groups, spring motion, zoom, and message inspection. |
 | `tend attend [--cycle] [--list]` | Focus or list agents needing attention. |
 | `tend status-line [--pane %N]` | tmux status-line output. |
 | `tend peek [--plain] [--expanded]` | Per-pane overlay for the current tmux window; `--plain` prints it as text. The overlay is a tmux popup, so where nothing can draw one — a front-end that attaches no client (cmux), or a control-mode client (`tmux -CC` — amux, iTerm2) — peek prints the text report instead and says why on stderr. |
@@ -511,7 +509,7 @@ several at once (e.g. during a tmux→herdr migration):
 | tmux | Full | The default backend. |
 | [rmux](https://rmux.io) | Initial CLI backend | Pane discovery, capture, focus, and targeted input; see [docs/RMUX.md](docs/RMUX.md). The host on native Windows — see [docs/WINDOWS.md](docs/WINDOWS.md). |
 | [herdr](https://herdr.dev) | Full | Via herdr's socket API; see [docs/HERDR.md](docs/HERDR.md). |
-| zellij | CLI baseline | Richer plugin path planned; see [docs/ZELLIJ.md](docs/proposals/ZELLIJ.md). |
+| zellij | CLI baseline (adopt-only) | Observes hooked panes and jumps to them; no capture or send. The planned WASM plugin was dropped. |
 
 See [docs/MULTI_HOST.md](docs/MULTI_HOST.md) for observing multiple hosts
 simultaneously.

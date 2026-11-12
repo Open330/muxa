@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/tend", "crates/tend-cli", "crates/tendd", "crates/tend-zellij-plugin"]
+members = ["crates/tend", "crates/tend-cli", "crates/tendd"]
 
 [workspace.package]
 version = "0.10.11"

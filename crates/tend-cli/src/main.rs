@@ -20,7 +20,6 @@ mod doctor_report;
 mod fleet_cli;
 mod fleet_sync;
 mod fleet_watch;
-mod graph;
 mod help_groups;
 mod init;
 mod interactive_child;
@@ -286,8 +285,6 @@ enum Cmd {
     /// The Work board: `tend watch` opened on its board screen, tracking Work,
     /// Runs, external issues, agents and their collaboration.
     Dashboard(dashboard_cmd::Args),
-    /// Explore session/window/pane message connections in an interactive terminal graph.
-    Graph(graph::Args),
     /// Former name of `tend stats activity`.
     #[command(hide = true)]
     Activity(activity_query::ActivityInvocation),

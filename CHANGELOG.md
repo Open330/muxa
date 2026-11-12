@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Removed
+
+- `tend graph`, the interactive terminal collaboration graph. It was a fourth
+  view of the same collaboration data that `tend watch`, the dashboard and Tend
+  for Mac already show, and nothing in use depended on it. Its Korean-only
+  guide (`docs/GRAPH.ko.md`) is gone with it. `tend graph` now fails as an
+  unknown command; it never had config keys.
+- The BarShelf `tend Watch` widget (`widgets/tend-watch`). The Tend for Mac
+  menu bar covers the same summary. `tend status --json`, which the widget
+  read, is unchanged, so a copy installed from the BarShelf gallery keeps
+  working.
+- The `tend-zellij-plugin` crate. It was a WASM stub the zellij backend never
+  received data from. zellij support stays at the CLI baseline it already had
+  (adopt-only: observe hooked panes and jump to them, no capture or send).
+
 ### Fixed
 
 - A prompt sent from the dashboard or through Fleet while a peer's wake

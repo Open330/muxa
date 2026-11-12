@@ -170,13 +170,13 @@ Effort is S (≤1 day, one file), M (a few files or a new field), or L (a protoc
 | rmux | complete | yes | yes | yes | yes | yes | — |
 | herdr | complete or incomplete | `process_info` | `pane.read` | `pane.send_text` | no | no | `agent_status_changed` (herdr's own screen heuristics) |
 | cmux | own surface only | no | no | `surface.send_text` | no | no | none |
-| zellij | plugin snapshot, 10s TTL | plugin only | no | no | — | no | plugin `PaneUpdate` |
+| zellij | none (hook rows only; the plugin was removed) | no | no | no | — | no | none |
 
 | # | Finding | Verdict | Effort / risk |
 | --- | --- | --- | --- |
 | F1 | herdr `SocketMissing` ⇒ authoritative empty host ⇒ reap (`herdr.rs:236`). This is right when the server is down, and wrong if the socket path was resolved wrongly. | CONVERT: authoritative only when the socket path comes from env or config, not a guessed default; otherwise `incomplete` | S / low |
 | F2 | herdr state is imported from herdr's own screen detection (`docs/HERDR.md`) | KEEP, tagged `screen` (provenance travels with the row) | S / low |
-| F3 | zellij id mismatch (code reading, not verified at runtime): the plugin mints `zellij:terminal:<id>` (`tend-zellij-plugin/src/lib.rs:60`); the hook passes `$ZELLIJ_PANE_ID` verbatim (`hook.rs:292`). Real zellij exports a bare number, and `pane_id_host_kind` needs the `zellij:` prefix, so hook rows likely never join plugin rows. | verify, then fix as a bug (namespace the env value in the hook adapter) | S / low |
+| F3 | ~~zellij hook/plugin id mismatch~~ — obsolete: the `tend-zellij-plugin` stub was removed (2026-11-12), so there are no plugin rows to join. zellij is adopt-only (hook rows, jump). | OBSOLETE | — |
 | F4 | cmux and zellij cannot capture, so screen-gated actions (worker stop, swap, PressEnter) refuse there. That is the correct veto-only behavior. | KEEP | — |
 
 ---
