@@ -72,7 +72,8 @@ const FLEET_REPLY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// agent-integration bootstrap carries the same rule, but agents read it
 /// only for Tend work, so an agent on ordinary work would end its turn on a
 /// prose question that tend can only infer (`tend::awaiting_reply`).
-const MCP_SERVER_INSTRUCTIONS: &str = "Read tend_collaboration_guide once. Delivery is not task success; reported_status is peer-declared. \
+const MCP_SERVER_INSTRUCTIONS: &str =
+    "Read tend_guide once. Delivery is not task success; reported_status is peer-declared. \
      Blocked on a person's decision? Call tend_request_attention, not just prose.";
 
 /// How often `tend_wait_for_change` reconciles against a fresh daemon
@@ -642,11 +643,6 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
             },
         }),
         json!({
-            "name": "tend_guide",
-            "description": "Return the user's configured Tend orchestration preferences: pane/window/session placement, default agent, additional CLI options, split direction, and free-form guidance. Consult it before choosing a surface when the user did not specify one.",
-            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
-        }),
-        json!({
             "name": "tend_start_agent",
             "description": start_description,
             "inputSchema": {
@@ -1137,6 +1133,12 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
     }
     tools.extend(crate::agent_records::definitions());
     tools.extend(crate::decision_record::definitions());
+    tools.extend(crate::mcp_surface::definitions());
+    tools.retain(|tool| {
+        tool["name"]
+            .as_str()
+            .is_some_and(crate::mcp_surface::is_listed)
+    });
     tools
 }
 
@@ -1159,7 +1161,34 @@ async fn call_tool(
                 .is_some_and(|action| {
                     matches!(action, "terminate_agent" | "close_work" | "close_workspace")
                 }));
-    let result = call_tool_inner(client, params, config).await;
+    // Route listed tools onto their handlers; a retired name runs its own
+    // handler and its result names the replacement.
+    let routed = match name {
+        Some(name) => {
+            let args = params
+                .and_then(|p| p.get("arguments"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            match crate::mcp_surface::route(name, args) {
+                Ok(routed) => Some((name.to_string(), routed)),
+                Err(error) => return Ok(error_result(&error)),
+            }
+        }
+        None => None,
+    };
+    let result = match &routed {
+        Some((_, routed)) => {
+            let params = json!({"name": routed.name, "arguments": routed.args});
+            call_tool_inner(client, Some(&params), config).await
+        }
+        None => call_tool_inner(client, params, config).await,
+    };
+    let result = match (&routed, result) {
+        (Some((old, routed)), Ok(value)) => {
+            Ok(crate::mcp_surface::annotate(value, routed.replaced_by, old))
+        }
+        (_, result) => result,
+    };
     if mutates {
         let _ = client.invalidate_agent_directory().await;
     }
@@ -1351,7 +1380,7 @@ async fn call_tool_inner(
                 Err(error) => error_result(&format!("recent_prompts failed: {error}")),
             },
         ),
-        "tend_guide" => Ok(json_result(&launch_guide_value(config))),
+        "tend_launch_guide" => Ok(json_result(&launch_guide_value(config))),
         "tend_start_agent" => {
             let explicit_agent = args.get("agent").and_then(Value::as_str);
             let Some(agent) = explicit_agent.or(config.mcp.guide.agent.as_deref()) else {
@@ -3304,6 +3333,9 @@ async fn fleet_call_peer(
     let Some(sent) = result.collaboration_request.map(|request| *request) else {
         return error_result("fleet_call_peer send returned no collaboration request");
     };
+    if let Ok(pane_key_value) = serde_json::to_value(&pane_key) {
+        crate::mcp_surface::remember_fleet_request(&sent.id, host, &pane_key_value);
+    }
     let common = json!({
         "dispatch_id": dispatch_id,
         "sent": true,
@@ -5886,6 +5918,32 @@ fn swap_error(call: &SwapCall, error: &str) -> Value {
 
 #[cfg(test)]
 mod tests {
+    /// `cargo test -p tend-cli --bin tend mcp_schema_bytes -- --ignored --nocapture`
+    /// prints what an agent pays for `tools/list`, per tool and in total.
+    #[test]
+    #[ignore = "measurement"]
+    fn mcp_schema_bytes() {
+        let tools = tool_definitions(&tend::config::Config::default());
+        let mut rows: Vec<_> = tools
+            .iter()
+            .map(|tool| {
+                (
+                    tool.to_string().len(),
+                    tool["name"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        rows.sort();
+        for (bytes, name) in &rows {
+            println!("{bytes:>6} {name}");
+        }
+        println!(
+            "{:>6} TOTAL {} tools",
+            serde_json::json!({ "tools": tools }).to_string().len(),
+            tools.len()
+        );
+    }
+
     use super::*;
 
     // --- tend_swap_account -------------------------------------------------
@@ -7454,7 +7512,7 @@ mod tests {
         // Every session pays for these: a pointer to the guide, plus the one
         // rule every agent needs whatever its task (asking the person).
         assert!(instructions.len() < 200, "instructions: {instructions}");
-        assert!(instructions.contains("tend_collaboration_guide"));
+        assert!(instructions.contains("tend_guide"));
         assert!(instructions.contains("reported_status"));
         assert!(instructions.contains("tend_request_attention"));
 
@@ -7472,7 +7530,6 @@ mod tests {
                 "tend_agent_find",
                 "tend_status",
                 "tend_recent_prompts",
-                "tend_guide",
                 "tend_start_agent",
                 "tend_start_work",
                 "tend_swap_account",
@@ -7483,14 +7540,9 @@ mod tests {
                 "tend_fleet_capture",
                 "tend_fleet_send_prompt",
                 "tend_dispatch_work",
-                "tend_dispatch_status",
                 "tend_fleet_call_peer",
                 "tend_update_request",
                 "tend_fleet_update_request",
-                "tend_fleet_wait_reply",
-                "tend_wait_for_change",
-                "tend_collaboration_guide",
-                "tend_room_context",
                 "tend_call_peer",
                 "tend_peer_report",
                 "tend_set_identity",
@@ -7499,12 +7551,13 @@ mod tests {
                 "tend_inbox",
                 "tend_list_messages",
                 "tend_reply",
-                "tend_wait_reply",
                 "tend_withdraw_reply_wake",
                 "tend_cancel_message",
                 "tend_agent_search",
                 "tend_agent_read",
                 "tend_file_result",
+                "tend_guide",
+                "tend_wait",
             ],
         );
         let start_agent = tools
@@ -7526,7 +7579,7 @@ mod tests {
         assert!(manage_tmux["inputSchema"]["properties"]["workspace"].is_object());
         let guide = tools
             .iter()
-            .find(|tool| tool["name"] == "tend_collaboration_guide")
+            .find(|tool| tool["name"] == "tend_guide")
             .unwrap();
         assert!(guide["description"]
             .as_str()
@@ -7555,7 +7608,7 @@ mod tests {
         assert!(status["inputSchema"]["properties"]["full"].is_object());
         let wait = tools
             .iter()
-            .find(|tool| tool["name"] == "tend_wait_for_change")
+            .find(|tool| tool["name"] == "tend_wait")
             .unwrap();
         assert_eq!(
             wait["inputSchema"]["properties"]["timeout_secs"]["maximum"],
@@ -7580,16 +7633,12 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("never auto-selects or spawns"));
-        let fleet_wait = tools
+        let wait = tools
             .iter()
-            .find(|tool| tool["name"] == "tend_fleet_wait_reply")
+            .find(|tool| tool["name"] == "tend_wait")
             .unwrap();
         assert_eq!(
-            fleet_wait["inputSchema"]["required"],
-            json!(["host", "pane_key", "request_id"])
-        );
-        assert_eq!(
-            fleet_wait["inputSchema"]["properties"]["pane_key"]["type"],
+            wait["inputSchema"]["properties"]["pane_key"]["type"],
             "object"
         );
     }
