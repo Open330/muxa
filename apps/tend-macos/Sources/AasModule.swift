@@ -759,6 +759,7 @@ private struct AasAccountRow: View {
                     .font(.body.weight(account.active ? .semibold : .regular))
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .layoutPriority(1)
                 if let error = account.error, !error.isEmpty {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
@@ -770,6 +771,8 @@ private struct AasAccountRow: View {
             Group {
                 if let plan = account.planText {
                     Text(verbatim: plan)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 1)
                         .background(Color.accentColor.opacity(0.12), in: Capsule())

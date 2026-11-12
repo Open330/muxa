@@ -822,6 +822,8 @@ struct TendFleetSettingsRow: View {
                     Circle().fill(fleetHostColor(host.state)).frame(width: 7, height: 7)
                         .accessibilityHidden(true)
                     Text(host.alias).font(.headline)
+                        .lineLimit(1)
+                        .layoutPriority(1)
                     Group {
                         Text(verbatim: fleetHostStateLabel(host.state))
                         if host.local {
@@ -832,6 +834,8 @@ struct TendFleetSettingsRow: View {
                     }
                     .font(TendType.meta.weight(.semibold))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
                 Group {
                     if let target = host.sshTarget {
@@ -876,6 +880,8 @@ struct TendFleetSettingsRow: View {
                         .controlSize(.small)
                 }
             }
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.vertical, 2)
     }

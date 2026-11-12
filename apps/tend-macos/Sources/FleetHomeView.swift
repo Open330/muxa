@@ -1080,9 +1080,12 @@ private struct FleetHostsPopover: View {
                             .fill(fleetHostColor(host.state))
                             .frame(width: 7, height: 7)
                         Text(host.alias).fontWeight(.medium)
+                            .lineLimit(1)
                         Spacer(minLength: 12)
                         Text(fleetHostStateLabel(host.state))
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     .contentShape(Rectangle())
                 }

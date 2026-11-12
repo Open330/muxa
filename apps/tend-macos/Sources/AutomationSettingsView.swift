@@ -348,11 +348,15 @@ private struct AutomationRuleRow: View {
         HStack(alignment: .top, spacing: 10) {
             Toggle(isOn: enabledBinding) {
                 VStack(alignment: .leading, spacing: 5) {
-                    HStack(spacing: 8) {
-                        Text(verbatim: rule.name)
-                            .font(.headline)
-                        AutomationBadge(text: automationEventTitle(rule.on), symbol: "bolt.horizontal")
-                        AutomationBadge(text: automationActionTitle(rule.action), symbol: "arrow.right.circle")
+                    ViewThatFits(in: .horizontal) {
+                        HStack(spacing: 8) {
+                            ruleName
+                            badges
+                        }
+                        VStack(alignment: .leading, spacing: 4) {
+                            ruleName
+                            HStack(spacing: 6) { badges }
+                        }
                     }
                     Group {
                         AutomationTargetSummary(rule: rule)
@@ -391,6 +395,19 @@ private struct AutomationRuleRow: View {
         }
         .padding(.vertical, 2)
     }
+
+    private var ruleName: some View {
+        Text(verbatim: rule.name)
+            .font(.headline)
+            .lineLimit(1)
+            .layoutPriority(1)
+    }
+
+    @ViewBuilder
+    private var badges: some View {
+        AutomationBadge(text: automationEventTitle(rule.on), symbol: "bolt.horizontal")
+        AutomationBadge(text: automationActionTitle(rule.action), symbol: "arrow.right.circle")
+    }
 }
 
 /// The filters a rule matches on. An agent kind and a limit window are said
@@ -406,17 +423,23 @@ private struct AutomationTargetSummary: View {
                 .font(TendType.detail)
                 .foregroundStyle(.secondary)
         } else {
-            HStack(spacing: 10) {
-                if !rule.agent.isEmpty {
-                    AutomationTokenChips(title: "Agent", tokens: rule.agent, style: .agent)
-                }
-                if showsScope {
-                    AutomationTokenChips(title: "Limit window", tokens: rule.scope, style: .limitScope)
-                }
-                ForEach(Array(chipList.enumerated()), id: \.offset) { _, chip in
-                    AutomationChip(title: chip.title, value: chip.value)
-                }
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 10) { filters }
+                VStack(alignment: .leading, spacing: 4) { filters }
             }
+        }
+    }
+
+    @ViewBuilder
+    private var filters: some View {
+        if !rule.agent.isEmpty {
+            AutomationTokenChips(title: "Agent", tokens: rule.agent, style: .agent)
+        }
+        if showsScope {
+            AutomationTokenChips(title: "Limit window", tokens: rule.scope, style: .limitScope)
+        }
+        ForEach(Array(chipList.enumerated()), id: \.offset) { _, chip in
+            AutomationChip(title: chip.title, value: chip.value)
         }
     }
 
@@ -547,6 +570,8 @@ private struct AutomationTokenChips: View {
             ForEach(tokens, id: \.self) { token in
                 AutomationTokenLabel(token: token, style: style)
                     .font(TendType.meta.weight(.medium))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                     .padding(.horizontal, 5)
                     .padding(.vertical, 1)
                     .background(style.capsuleTint(for: token).opacity(0.12), in: Capsule())
@@ -566,6 +591,8 @@ private struct AutomationChip: View {
                 .foregroundStyle(.secondary)
             Text(verbatim: value)
                 .font(TendType.detail.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
         }
     }
 }
@@ -581,6 +608,8 @@ private struct AutomationBadge: View {
             Image(systemName: symbol)
         }
         .font(TendType.meta.weight(.semibold))
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(Color.accentColor.opacity(0.12), in: Capsule())
