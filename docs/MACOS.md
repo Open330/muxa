@@ -66,6 +66,10 @@ The native workspace follows two proven desktop navigation patterns:
   message went. They show in `tend review history`. Marks an older Tend kept
   in its settings are recorded once and then forgotten; against a tendd
   without `review_record_v1`, Home keeps local marks as before.
+- The Review sheet's **History** shows what was already decided, newest
+  first, from `decision_history`: Looks Good, Send Back and answers from
+  Home, review dispositions made anywhere (`tend review`), and answered
+  human requests with the answer. It is read-only and filterable.
 - Below Home, VS Code's Activity Bar pattern switches one contextual sidebar
   at a time while the editor area remains stable. Tend applies that to
   **Explore**, **Inbox**, **Ask**, **Shells**, and **Files**, with a filter scoped

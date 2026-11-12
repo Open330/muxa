@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shows them and Home hides a reviewed result from tendd's record. Existing
   Looks Good marks are recorded once and then removed from the app's
   settings.
+- Tend for Mac: the Review sheet has a **History** of decided items, newest
+  first, from tendd's `decision_history`: what was decided, what you said and
+  when.
 
 ### Fixed
 

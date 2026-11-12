@@ -26,6 +26,8 @@ struct FleetReviewView: View {
     @AppStorage("home.review.scope") private var scope: FleetReviewScope = .day
     /// Units put off with Later in this session: they go to the end.
     @State private var later: [String] = []
+    /// The sheet shows what was already decided instead of what is left.
+    @State private var showsHistory = false
 
     private var queue: [FleetWork] {
         let base = FleetBoard.reviewQueue(works(), marks: marks, scope: scope)
@@ -38,30 +40,43 @@ struct FleetReviewView: View {
         VStack(spacing: 0) {
             header
             Divider()
-            FleetReviewRequests(
-                feed: feed,
-                decisions: decisions(),
-                card: decisionCard,
-                reload: { await feed.load(model.client) }
-            )
-            let queue = queue
-            Group {
-                if queue.isEmpty {
-                    caughtUp
-                } else {
-                    switch mode {
-                    case .cards: FleetReviewCards(queue: queue, actions: actions)
-                    case .inbox: FleetReviewInbox(queue: queue, actions: actions)
-                    case .digest: FleetReviewDigest(queue: queue, actions: actions)
-                    }
+            if showsHistory {
+                FleetDecisionHistoryView(feed: feed) { [client = model.client] in
+                    await feed.loadHistory(client, force: true)
                 }
+            } else {
+                review
             }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .frame(minWidth: 860, idealWidth: 960, minHeight: 620, idealHeight: 720)
         .environment(\.fleetEvidence, FleetEvidenceReader { [client = model.client] session, since in
             try await client.turnEvidence(sessionID: session, since: since)
         })
+    }
+
+    /// What is left: decisions waiting on the person, then the results
+    /// Home gathered.
+    @ViewBuilder
+    private var review: some View {
+        FleetReviewRequests(
+            feed: feed,
+            decisions: decisions(),
+            card: decisionCard,
+            reload: { await feed.load(model.client) }
+        )
+        let queue = queue
+        Group {
+            if queue.isEmpty {
+                caughtUp
+            } else {
+                switch mode {
+                case .cards: FleetReviewCards(queue: queue, actions: actions)
+                case .inbox: FleetReviewInbox(queue: queue, actions: actions)
+                case .digest: FleetReviewDigest(queue: queue, actions: actions)
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     private var actions: FleetReviewActions {
@@ -87,30 +102,42 @@ struct FleetReviewView: View {
 
     private var header: some View {
         HStack(spacing: 12) {
-            Text("Review")
+            Text(showsHistory ? "Decided" : "Review")
                 .font(.system(size: 17, weight: .semibold))
-            Text("\(queue.count)")
-                .font(.system(size: 13, weight: .semibold))
-                .monospacedDigit()
-                .foregroundStyle(.secondary)
-            Picker("Mode", selection: $mode) {
-                ForEach(FleetReviewMode.allCases) { mode in
-                    Label(mode.title, systemImage: mode.systemImage).tag(mode)
+            if !showsHistory {
+                Text("\(queue.count)")
+                    .font(.system(size: 13, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+                Picker("Mode", selection: $mode) {
+                    ForEach(FleetReviewMode.allCases) { mode in
+                        Label(mode.title, systemImage: mode.systemImage).tag(mode)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .help("Three ways through the same results; pick the one that works best")
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
-            .help("Three ways through the same results; pick the one that works best")
             Spacer(minLength: 8)
-            Picker("Range", selection: $scope) {
-                ForEach(FleetReviewScope.allCases) { scope in
-                    Text(scope.title).tag(scope)
+            if !showsHistory {
+                Picker("Range", selection: $scope) {
+                    ForEach(FleetReviewScope.allCases) { scope in
+                        Text(scope.title).tag(scope)
+                    }
                 }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .fixedSize()
+            Button {
+                showsHistory.toggle()
+            } label: {
+                Label(showsHistory ? "Back to Review" : "History",
+                      systemImage: showsHistory ? "chevron.backward" : "clock.arrow.circlepath")
+            }
+            .buttonStyle(.tendGhost)
+            .help("What you already decided, newest first")
             Button("Done") { dismiss() }
                 .keyboardShortcut(.cancelAction)
         }
