@@ -25,11 +25,19 @@
 //!   message's parts; the plugin joins the non-synthetic text parts and sends
 //!   them as `tend.prompt`.
 //! - **The response comes from the assistant's text parts**, collected as
-//!   they stream and attached to `session.idle` as `tend.response`.
-//! - **The pane follows the active session.** When events start arriving for
-//!   a different top-level session (the TUI switched to it, or resumed one),
-//!   the plugin sends `tend.session.active` first, which becomes `Started` and
-//!   moves the pane's row to that session.
+//!   they stream, reset at each prompt, and attached to `session.idle` as
+//!   `tend.response` only when the turn ended without `session.error`
+//!   (a failed or aborted turn's partial output is not its answer).
+//! - **A pane is bound by a prompt, not by event arrival.** opencode delivers
+//!   every session's events in the directory to the plugin, so an event says
+//!   nothing about which session the TUI shows. `session.created` and the
+//!   first prompt into a session tend has not seen created (a resumed one)
+//!   become `Started`, once per session; everything else only updates that
+//!   session's own row.
+//!
+//! `session.idle` is opencode's explicit `status = idle`, so it is sent with
+//! `idle_confirmed`: it clears a pending wait, keeps an error, and never
+//! counts as a successful turn unless it carries a response.
 //!
 //! Payload envelope: `{ "type": "...", "properties": {...}, "tend": {
 //! "directory"?, "response"? } }`.
@@ -121,7 +129,7 @@ fn normalize(envelope: &Envelope, pane: Option<String>, at: OffsetDateTime) -> O
                 .map(|text| truncate(text, 8000)),
             recap: None,
             ai_title: None,
-            idle_confirmed: false,
+            idle_confirmed: true,
             at,
         }),
         "message.part.updated" => tool_event(p, id, at),
@@ -462,6 +470,59 @@ mod tests {
         assert!(check_flag("event").is_ok());
         assert!(check_flag("session_start").is_err());
         assert!(parse("not json", None).is_err());
+    }
+
+    async fn state_after(events: Vec<Value>) -> crate::event::AgentState {
+        let store = crate::state::Store::shared();
+        for payload in events {
+            if let Some(event) = ev(payload) {
+                store.apply(&event).await;
+            }
+        }
+        let snapshot = store.snapshot().await;
+        assert_eq!(snapshot.len(), 1, "{snapshot:?}");
+        snapshot[0].state
+    }
+
+    fn prompt(text: &str) -> Value {
+        json!({ "type": "tend.prompt", "properties": { "sessionID": "s", "text": text } })
+    }
+
+    /// An explicit idle after Esc releases a pending permission prompt.
+    #[tokio::test]
+    async fn idle_after_an_abort_clears_a_wait() {
+        let state = state_after(vec![
+            prompt("deploy"),
+            json!({ "type": "permission.asked", "properties": { "sessionID": "s", "permission": "bash", "patterns": [] } }),
+            json!({ "type": "session.error", "properties": { "sessionID": "s", "error": { "name": "MessageAbortedError" } } }),
+            json!({ "type": "session.idle", "properties": { "sessionID": "s" } }),
+        ])
+        .await;
+        assert_eq!(state, crate::event::AgentState::Idle);
+    }
+
+    /// The plugin sends no response for a failed turn, and a response-less
+    /// idle must leave the error in place.
+    #[tokio::test]
+    async fn a_failed_turn_stays_in_error_after_idle() {
+        let state = state_after(vec![
+            prompt("deploy"),
+            json!({ "type": "session.error", "properties": { "sessionID": "s",
+                "error": { "name": "APIError", "data": { "message": "overloaded" } } } }),
+            json!({ "type": "session.idle", "properties": { "sessionID": "s" } }),
+        ])
+        .await;
+        assert_eq!(state, crate::event::AgentState::Error);
+    }
+
+    #[tokio::test]
+    async fn a_clean_turn_ends_idle() {
+        let state = state_after(vec![
+            prompt("deploy"),
+            json!({ "type": "session.idle", "properties": { "sessionID": "s" }, "tend": { "response": "Done." } }),
+        ])
+        .await;
+        assert_eq!(state, crate::event::AgentState::Idle);
     }
 
     /// The previous adapter searched every nested object for keys such as

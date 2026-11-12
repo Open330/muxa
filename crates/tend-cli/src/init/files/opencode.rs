@@ -14,17 +14,17 @@ const BODY: &str = r#"// Forward opencode's own events to tend, without blocking
 // Every fact comes from opencode's plugin API: session ids, statuses, tool
 // states, permission and question prompts. The plugin only filters and
 // de-duplicates; `tend hook opencode` maps the documented shapes to tend
-// state. Child sessions (subagent tasks) never reach tend, so a pane shows
-// the conversation its user is driving.
+// state. Child sessions (subagent tasks) never reach tend.
 export const TendPlugin = async ({ $, client, directory }) => {
   const queue = [];
   let flushing = false;
   const children = new Set();
   const roles = new Map(); // messageID -> "user" | "assistant"
   const replies = new Map(); // sessionID -> { messageID, parts: Map<partID, text> }
-  const tools = new Map(); // callID -> last forwarded status
+  const tools = new Map(); // sessionID:messageID:callID -> last forwarded status
   const completed = new Map(); // assistant messageIDs already reported
-  let active = null;
+  const announced = new Map(); // top-level sessionIDs tend has been told about
+  const incomplete = new Set(); // sessionIDs whose current turn failed or was aborted
 
   const remember = (map, key, value, cap = 512) => {
     map.set(key, value);
@@ -57,10 +57,12 @@ export const TendPlugin = async ({ $, client, directory }) => {
   const send = (type, properties, extra) => {
     const sessionID = properties && properties.sessionID;
     if (sessionID && children.has(sessionID)) return;
-    // The pane follows the session that is producing events, so switching
-    // sessions in the TUI moves the pane's row instead of leaving two.
-    if (sessionID && sessionID !== active && type !== "session.deleted") {
-      active = sessionID;
+    // A prompt is the one event that says this pane's user is driving a
+    // session. The first prompt into a session tend has not seen created
+    // (resumed, or picked in the session list) binds the pane to it, once.
+    // Any other event only updates that session's own row.
+    if (type === "tend.prompt" && sessionID && !announced.has(sessionID)) {
+      remember(announced, sessionID, true);
       queue.push({ type: "tend.session.active", properties: { sessionID }, tend: { directory } });
     }
     queue.push({ type, properties, tend: { directory, ...extra } });
@@ -73,7 +75,10 @@ export const TendPlugin = async ({ $, client, directory }) => {
     return p.sessionID || (p.info && (p.info.sessionID || p.info.id)) || (p.part && p.part.sessionID);
   };
 
+  // Only a turn that ended cleanly reports text: a failed or aborted turn's
+  // partial output is not its answer.
   const replyText = (sessionID) => {
+    if (incomplete.has(sessionID)) return undefined;
     const reply = replies.get(sessionID);
     if (!reply) return undefined;
     const text = [...reply.parts.values()].join("\n").trim();
@@ -87,6 +92,9 @@ export const TendPlugin = async ({ $, client, directory }) => {
         .map((part) => part.text)
         .join("\n")
         .trim();
+      // A new turn: nothing captured earlier belongs to it.
+      replies.delete(input.sessionID);
+      incomplete.delete(input.sessionID);
       send("tend.prompt", { sessionID: input.sessionID, text });
     },
     event: async ({ event }) => {
@@ -100,20 +108,25 @@ export const TendPlugin = async ({ $, client, directory }) => {
             return;
           }
           if (event.type === "session.created") {
+            remember(announced, p.info.id, true);
             send(event.type, { sessionID, info: { id: p.info.id, directory: p.info.directory } });
           }
           return;
         case "session.deleted":
-          if (sessionID === active) active = null;
           send(event.type, { sessionID });
           return;
         case "session.idle":
           send(event.type, { sessionID }, { response: replyText(sessionID) });
+          replies.delete(sessionID);
+          incomplete.delete(sessionID);
+          return;
+        case "session.error":
+          if (sessionID) incomplete.add(sessionID);
+          send(event.type, p);
           return;
         case "session.status":
           if (p.status && p.status.type === "retry") send(event.type, p);
           return;
-        case "session.error":
         case "permission.updated":
         case "permission.asked":
         case "permission.replied":
@@ -129,6 +142,7 @@ export const TendPlugin = async ({ $, client, directory }) => {
           return;
         case "message.updated": {
           const info = p.info || {};
+          if (children.has(info.sessionID)) return;
           remember(roles, info.id, info.role);
           if (info.role === "assistant") {
             const reply = replies.get(info.sessionID);
@@ -147,6 +161,7 @@ export const TendPlugin = async ({ $, client, directory }) => {
         }
         case "message.part.updated": {
           const part = p.part || {};
+          if (children.has(part.sessionID)) return;
           if (part.type === "text" && roles.get(part.messageID) === "assistant" && !part.synthetic) {
             const reply = replies.get(part.sessionID);
             if (reply && reply.messageID === part.messageID) reply.parts.set(part.id, part.text || "");
@@ -154,8 +169,9 @@ export const TendPlugin = async ({ $, client, directory }) => {
           }
           if (part.type !== "tool" || !part.state) return;
           const status = part.state.status;
-          if (status === "pending" || tools.get(part.callID) === status) return;
-          remember(tools, part.callID, status);
+          const key = `${part.sessionID}:${part.messageID}:${part.callID}`;
+          if (status === "pending" || tools.get(key) === status) return;
+          remember(tools, key, status);
           const input = part.state.input || {};
           send(event.type, {
             sessionID: part.sessionID,

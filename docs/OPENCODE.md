@@ -28,14 +28,14 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
 
 | opencode signal | tend event | State |
 | --- | --- | --- |
-| `session.created`, or the first event of a session the TUI switched to | `Started` | idle |
+| `session.created`, or the first prompt into a session tend has not seen created | `Started` | idle |
 | `chat.message` (non-synthetic text parts of the user message) | `PromptSubmitted` | working |
 | tool part `state.status` → `running` | `ToolStarted` (`bash` carries its command) | working |
 | tool part `state.status` → `completed` / `error` | `ToolCompleted` | — |
 | `permission.updated` (v1), `permission.asked`, `permission.v2.asked` | `NotificationFired` needs input | waiting input |
 | `question.asked`, `question.v2.asked` | `NotificationFired` needs choice | waiting choice |
 | `permission.replied`, `question.replied` / `rejected` | `ToolCompleted` | working |
-| `session.idle` (with the last assistant message's text) | `TurnStopped` | idle |
+| `session.idle` (confirmed idle; the assistant's text only when the turn had no `session.error`) | `TurnStopped` | idle, or error kept |
 | `session.error` (except `MessageAbortedError`, i.e. Esc) | `NotificationFired` error | error |
 | `session.status` `retry` | `NotificationFired` warning | — |
 | assistant `message.updated` with `time.completed` | `Heartbeat` (model, cost) | — |
@@ -46,10 +46,15 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
   `properties.part.sessionID`.
 - **Child sessions** (subagent tasks, `Session.parentID` set) are dropped in
   the plugin, so one pane is one conversation.
-- **Switching sessions** in the TUI moves the pane's row to the session that
-  is producing events. opencode can run several sessions at once in one
-  server; while two are busy in the same pane, the row follows whichever
-  reported last.
+- **Pane binding comes from prompts, not from event arrival.** opencode hands
+  the plugin every session's events in its directory, so an event does not
+  say which session the TUI is showing. A session is bound to the pane when
+  it is created, or by the first prompt sent into it (a resumed session),
+  once. Events from other sessions update only their own rows. Switching
+  back to a session already bound in this pane does not move the row.
+- **Responses** are reset at each prompt and reported only for a turn that
+  ended without `session.error`; a failed or aborted turn's partial output is
+  not recorded as its answer, and a failed turn stays in error after idle.
 - **Discovery.** A pane whose process is `opencode` is registered before its
   first event, like `claude`, `codex` and `agy`. opencode creates a session
   only when the first prompt is sent, so until then the row has a placeholder
@@ -66,3 +71,7 @@ opencode` maps the documented shapes (`@opencode-ai/sdk`, checked against
   they reach any pane-based agent without that hook: delivered into the pane
   when its row is idle.
 - **Account routing** is Claude/Codex only.
+- **Modes.** Discovery sees the process name only, so a pane running
+  `opencode serve` or `opencode run` is registered too and stays idle; only
+  the interactive TUI (what `tend agent start --agent opencode` launches)
+  produces events.
