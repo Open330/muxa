@@ -72,6 +72,19 @@ pub(super) async fn history_handler(
 }
 
 /// `GET /needs`: the phone-first page that renders the two reads above.
+///
+/// Never framed: a page that will hold decision buttons must not be
+/// clickable from inside another site's frame.
 pub(super) async fn page_handler() -> Response {
-    super::assets::serve_page("needs.html")
+    let mut response = super::assets::serve_page("needs.html");
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        axum::http::header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    response
 }

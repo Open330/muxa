@@ -4069,6 +4069,11 @@ mod tests {
         // The page itself is a static asset, like `/`.
         let page = get(app, "/needs", None).await;
         assert_eq!(page.status(), StatusCode::OK);
+        assert_eq!(page.headers()[header::X_FRAME_OPTIONS], "DENY");
+        assert_eq!(
+            page.headers()[header::CONTENT_SECURITY_POLICY],
+            "frame-ancestors 'none'"
+        );
     }
 
     #[tokio::test]

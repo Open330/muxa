@@ -55,6 +55,8 @@ test("review and waiting-agent cards", () => {
   );
   assert.equal(agent.label, "waiting for input");
   assert.equal(agent.pane, "%4");
+  const other = pendingCard({ kind: "agent_waiting", session_id: "t", agent_kind: "codex", pane: "%4", tmux_socket: "/tmp/tmux-501/b", state: "error", since: "2026-11-12T11:59:30Z" }, now);
+  assert.equal(other.socket, "/tmp/tmux-501/b", "the socket tells two %4 panes apart");
   assert.equal(pendingCard({ kind: "mystery" }), null);
 });
 

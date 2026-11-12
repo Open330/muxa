@@ -4,12 +4,13 @@
 // Everything an agent wrote is rendered with textContent, never as HTML.
 
 import { decidedCard, pendingCard } from "./needs-model.mjs";
+import { withPaneHash } from "./pane-drawer.mjs";
 
 const TOKEN_KEY = "tend.token";
 const REFRESH_MS = 10000;
 
 const $ = (id) => document.getElementById(id);
-const state = { tab: "queue", timer: null };
+const state = { tab: "queue", timer: null, generation: 0 };
 
 function authHeaders() {
   let token = null;
@@ -72,7 +73,8 @@ function renderCard(card) {
   }
   if (card.pane) {
     const link = el("a", "meta", "open the pane");
-    link.href = `/#pane=${encodeURIComponent(card.pane)}`;
+    // Pane ids repeat across tmux servers: the socket picks the right one.
+    link.href = `/${withPaneHash("", { pane: card.pane, socket: card.socket })}`;
     li.append(link);
   }
   if (card.outcome) li.append(el("p", "outcome", card.outcome));
@@ -91,11 +93,24 @@ function unavailableNote(unavailable, truncated) {
   return notes.join(" · ");
 }
 
+/// Drop everything private on the page: after a lost session nothing an
+/// operator could read may stay on screen.
+function forget() {
+  $("queue").replaceChildren();
+  $("history").replaceChildren();
+  $("count").textContent = "";
+  $("covers").textContent = "";
+}
+
 async function refresh() {
   const status = $("status");
+  // A later refresh (or an auth failure) wins over one still in flight.
+  const generation = ++state.generation;
+  const current = () => generation === state.generation;
   try {
     if (state.tab === "queue") {
       const data = await read("/api/decisions");
+      if (!current()) return;
       const cards = (data.queue?.items || []).map((item) => pendingCard(item)).filter(Boolean);
       renderList($("queue"), cards, "Nothing is waiting on you.");
       $("count").textContent = cards.length ? `${cards.length} waiting` : "";
@@ -103,6 +118,7 @@ async function refresh() {
       $("covers").textContent = `Covers ${data.covers || "this host"}.`;
     } else {
       const data = await read("/api/decisions/history");
+      if (!current()) return;
       const cards = (data.history?.items || []).map((item) => decidedCard(item)).filter(Boolean);
       renderList($("history"), cards, "No decisions recorded yet.");
       status.textContent = unavailableNote(data.history?.unavailable, data.history?.truncated);
@@ -110,8 +126,11 @@ async function refresh() {
     }
     $("login").hidden = true;
   } catch (error) {
+    if (!current()) return;
     status.textContent = error.message;
     if (error.auth) {
+      state.generation += 1;
+      forget();
       const login = $("login");
       login.href = `/auth/login?return_to=${encodeURIComponent("/needs")}`;
       login.hidden = false;

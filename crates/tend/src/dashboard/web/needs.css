@@ -1,6 +1,7 @@
 :root { color-scheme: dark light; --bg: #0f1115; --fg: #e8e6e3; --muted: #9aa0a6; --card: #181b21; --line: #2a2f38; --accent: #7cc4ff; --warn: #f0b35a; --bad: #ef6b6b; --good: #6bcf8d; }
 @media (prefers-color-scheme: light) { :root { --bg: #f7f7f5; --fg: #1d1f23; --muted: #5f6368; --card: #fff; --line: #e2e2de; --accent: #0b63c5; } }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; background: var(--bg); color: var(--fg); font: 16px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
 .bar { position: sticky; top: 0; display: flex; gap: .75rem; align-items: baseline; padding: .75rem 1rem; background: var(--bg); border-bottom: 1px solid var(--line); }
 .bar h1 { font-size: 1.1rem; margin: 0; }

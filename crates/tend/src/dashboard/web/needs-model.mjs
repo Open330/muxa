@@ -101,6 +101,7 @@ export function pendingCard(item, now = Date.now()) {
         title: item.message || "waiting in its pane",
         meta: `${item.agent_kind} ${item.pane || item.session_id} · ${ago(item.since, now)}`,
         pane: item.pane || null,
+        socket: item.tmux_socket || null,
         ...decisionParts(null),
       };
     case "review": {
