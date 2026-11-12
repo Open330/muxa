@@ -1,8 +1,9 @@
 // Live pane output over SSE (GET /api/panes/{pane}/output/stream).
 //
 // EventSource cannot send an Authorization header, so this uses fetch() and
-// parses the frames itself, the same way main.js reads /api/events: the
-// bearer token travels in the header.
+// parses the frames itself, the same way main.js reads /api/events: bearer
+// tokens travel in the header and an operator session cookie rides along
+// with `credentials: "same-origin"`.
 //
 // The pure helpers (reconnect delay, status classification, the tile stream
 // budget, the frame parser) are tested in tests-js/dashboard-pane-stream.test.mjs;

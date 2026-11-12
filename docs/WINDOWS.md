@@ -74,6 +74,9 @@ real client:
   doctor`, `status`, `panes`, `capture`, `send`, `attach` and `fleet watch`
   against a Linux host. A WSL host on `localhost` needs `HostName 127.0.0.1`:
   WSL forwards localhost over IPv4 only.
+- Dashboard pane sharing's whole flow — OIDC sign-in, share link, guest
+  prompt, reconnect, daemon restart, revocation — through
+  `scripts/dashboard-sharing-smoke.py` on a private rmux label.
 - `tend restore --boot` from a logon task, into a stopped server.
 
 ### Known gaps

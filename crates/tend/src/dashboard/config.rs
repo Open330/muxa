@@ -14,6 +14,11 @@
 //!    alone is insufficient; exposing unauthenticated API data requires
 //!    a second explicit opt-in.
 //!
+//! 4. Pane sharing and operator sign-in (`[dashboard.sharing]`,
+//!    `[dashboard.login]`) require `auth = "token"` with a token: the token
+//!    remains the API credential and the break-glass path when the provider
+//!    is down. When both are set they must name the same public origin.
+//!
 //! These invariants are enforced once, at startup. The HTTP layer trusts
 //! the resolved value.
 
@@ -32,6 +37,10 @@ pub const DEFAULT_PANE_CACHE_TTL: Duration = Duration::from_secs(2);
 /// [`DashboardConfig::resolve`]; the HTTP server takes this by reference.
 #[derive(Debug, Clone)]
 pub struct DashboardConfig {
+    #[cfg(feature = "dashboard")]
+    pub sharing: Option<super::sharing::SharingConfig>,
+    #[cfg(feature = "dashboard")]
+    pub login: Option<super::operator::LoginConfig>,
     pub enabled: bool,
     pub bind: SocketAddr,
     pub auth: DashboardAuthMode,
@@ -76,6 +85,12 @@ pub enum DashboardConfigError {
          or set dashboard.auth=\"none\" (or --dashboard-auth none) to expose reads and disable control"
     )]
     MissingToken,
+
+    #[error("invalid dashboard sharing configuration: {0}")]
+    Sharing(String),
+
+    #[error("invalid dashboard login configuration: {0}")]
+    Login(String),
 
     #[error(
         "dashboard.bind={addr} is non-loopback; set allow_public=true (or pass --allow-public) \
@@ -149,7 +164,38 @@ impl DashboardConfig {
             }
         }
 
+        #[cfg(feature = "dashboard")]
+        if let Some(sharing) = &toml.sharing {
+            sharing.validate().map_err(DashboardConfigError::Sharing)?;
+            if !matches!(auth, DashboardAuthMode::Token) || token.is_none() {
+                return Err(DashboardConfigError::Sharing(
+                    "sharing requires auth = token and an operator token".into(),
+                ));
+            }
+        }
+        #[cfg(feature = "dashboard")]
+        if let Some(login) = &toml.login {
+            login.validate().map_err(DashboardConfigError::Login)?;
+            if !matches!(auth, DashboardAuthMode::Token) || token.is_none() {
+                return Err(DashboardConfigError::Login(
+                    "operator sign-in requires auth = token and an operator token".into(),
+                ));
+            }
+            if toml
+                .sharing
+                .as_ref()
+                .is_some_and(|sharing| sharing.origin() != login.origin())
+            {
+                return Err(DashboardConfigError::Login(
+                    "dashboard.login.public_url must equal dashboard.sharing.public_url".into(),
+                ));
+            }
+        }
         Ok(Self {
+            #[cfg(feature = "dashboard")]
+            sharing: toml.sharing.as_deref().cloned(),
+            #[cfg(feature = "dashboard")]
+            login: toml.login.as_deref().cloned(),
             enabled,
             bind,
             auth,
@@ -165,6 +211,10 @@ impl DashboardConfig {
     #[must_use]
     pub fn loopback_default() -> Self {
         Self {
+            #[cfg(feature = "dashboard")]
+            sharing: None,
+            #[cfg(feature = "dashboard")]
+            login: None,
             enabled: false,
             bind: SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT)),
             auth: DashboardAuthMode::Token,

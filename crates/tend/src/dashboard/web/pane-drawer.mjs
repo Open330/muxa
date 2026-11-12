@@ -4,7 +4,7 @@
 // live output and a composer. Operators see output (streamed from the
 // operator-only /api/panes/{pane}/output/stream, or polled from
 // /api/panes/{pane}/output on a daemon without the stream route) and can send
-// a message or abort; everyone else sees the pane's metadata and a
+// a message, abort or share; everyone else sees the pane's metadata and a
 // "view only" note, and the output endpoints are never called for them.
 //
 // The pure helpers at the top carry the rules worth testing without a DOM
@@ -71,12 +71,14 @@ export function updatedLabel(lastMs, nowMs, live = false) {
 /// Wire the drawer. `deps` supplies everything that lives in main.js:
 ///   elements           — the drawer's DOM nodes (see index.html)
 ///   isOperator()       — may this browser read output and send?
+///   canShare(target)   — show the share action for this pane?
 ///   describe(target)   — { title, kind, state, model, cwd, activity, command }
 ///   fetchOutput(url)   — GET returning a Response (auth headers attached)
 ///   openStream(url, handlers) — open a live output stream (pane-stream.mjs
 ///                        openPaneStream with auth headers); optional, the
 ///                        drawer polls without it
 ///   controlFetch(url, options) — the dashboard's control fetch (CSRF + auth)
+///   openShare(target)  — open the existing share dialog
 ///   showToast(msg)
 export function createPaneDrawer(deps) {
   const el = deps.elements;
@@ -132,6 +134,7 @@ export function createPaneDrawer(deps) {
     el.outputWrap.hidden = !operator;
     el.composer.hidden = !operator;
     el.abort.hidden = !operator;
+    el.share.hidden = !(operator && deps.canShare(target));
     el.updated.hidden = !operator;
   }
 
@@ -221,7 +224,7 @@ export function createPaneDrawer(deps) {
         } else if (state === "denied") {
           stream = null;
           denied = true;
-          setStatus("Output needs operator access. Unlock edit with the dashboard token.");
+          setStatus("Output needs operator access. Sign in or unlock edit.");
         } else if (state === "unsupported") {
           // An older daemon: poll /output instead.
           stream = null;
@@ -254,7 +257,7 @@ export function createPaneDrawer(deps) {
       try { payload = await resp.json(); } catch (_) { /* status-only rejection */ }
       if (resp.status === 401 || resp.status === 403) {
         denied = true;
-        setStatus("Output needs operator access. Unlock edit with the dashboard token.");
+        setStatus("Output needs operator access. Sign in or unlock edit.");
         return;
       }
       if (!resp.ok) {
@@ -413,6 +416,9 @@ export function createPaneDrawer(deps) {
     send();
   });
   el.abort.addEventListener("click", abort);
+  el.share.addEventListener("click", () => {
+    if (target) deps.openShare({ ...target });
+  });
   el.output.addEventListener("scroll", () => {
     if (isNearBottom(el.output)) el.jump.hidden = true;
   });
@@ -422,7 +428,7 @@ export function createPaneDrawer(deps) {
   });
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape" || !isOpen()) return;
-    // A dialog on top owns Escape.
+    // A share dialog on top owns Escape.
     if (document.querySelector("dialog[open]")) return;
     event.preventDefault();
     close();
@@ -439,7 +445,7 @@ export function createPaneDrawer(deps) {
     close,
     isOpen,
     target: () => (target ? { ...target } : null),
-    /// Re-read access and metadata (after an access change or a data poll).
+    /// Re-read access and metadata (after a sign-in change or a data poll).
     refreshAccess() {
       if (!isOpen()) return;
       const operator = deps.isOperator();

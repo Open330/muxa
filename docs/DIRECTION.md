@@ -107,7 +107,7 @@ whether the feature matters.
 | Tier | Bar | Members |
 | --- | --- | --- |
 | **Core** | Regressions block release; tests required | Attention layer, Work/Run model, collaboration mailbox, review queue and decision record (`tend review`, the `tend work done` result), MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
-| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, loopback dashboard (single user, bearer token, `dashboard` cargo feature), usage-limit recovery (`resume-after-limit`) |
+| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, dashboard (loopback with a bearer token, or published with OIDC operator sign-in, viewer accounts and pane/window sharing; `dashboard` cargo feature), usage-limit recovery (`resume-after-limit`) |
 | **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts, cmux and zellij backends (adopt-only) |
 | **Labs, frozen** | Kept working, no new features; candidates for removal at the next review | `tend stats` (with `stats report` and `stats activity`) and `tend timeline` analytics, the 16-step `tend onboard` live tour |
 
@@ -122,9 +122,11 @@ evidence (from `tend stats` or issues) that it is used outside a single
 workflow. A feature with no use over a release cycle is a removal candidate;
 the Work board replacing the card dashboard is the model. Removals are
 recorded in CHANGELOG.md under **Removed** with the reason. The 2026-11-12
-pass removed `tend graph`, the BarShelf widget, the zellij plugin stub, and
-the dashboard's OIDC sign-in, viewer accounts and pane sharing; it moved
-analytics and the 16-step onboarding tour to frozen Labs.
+pass removed `tend graph`, the BarShelf widget and the zellij plugin stub,
+and moved analytics and the 16-step onboarding tour to frozen Labs. It also
+removed the dashboard's OIDC sign-in and sharing, which a published
+dashboard was using; it was restored after 0.10.13. Check every
+host's config before calling a feature unused.
 
 Frozen means: bug fixes and keeping it compiling with the rest of tend, but
 no new screens, options or data. Work there is better spent on Core, and a

@@ -11,7 +11,14 @@ description = "observability for AI coding agents in tmux."
 [features]
 # The web dashboard's HTTP server and embedded assets. tendd enables it; the
 # `tend` CLI, which every hook spawns, builds without it.
-dashboard = ["dep:axum", "dep:tower-http", "dep:futures", "dep:tokio-stream", "dep:rust-embed"]
+dashboard = [
+    "dep:axum",
+    "dep:tower-http",
+    "dep:futures",
+    "dep:tokio-stream",
+    "dep:rust-embed",
+    "dep:openidconnect",
+]
 
 [dependencies]
 serde = { workspace = true }
@@ -42,6 +49,8 @@ uuid = { workspace = true }
 rusqlite = { workspace = true }
 base64 = { workspace = true }
 sha2 = "0.10"
+# Operator sign-in and viewer accounts for a published dashboard.
+openidconnect = { version = "4.0.1", default-features = false, features = ["reqwest", "rustls-tls"], optional = true }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 # Windows has neither `/proc` nor `ps`; sysinfo reads the process table
