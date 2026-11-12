@@ -316,8 +316,9 @@ async fn run() -> Result<()> {
     let observing_kinds: Vec<tend::HostKind> = backends.iter().map(|b| b.kind()).collect();
     tracing::info!(hosts = ?observing_kinds, "pane backends selected");
     // One shared, short-lived `list_panes` per host for the periodic
-    // observers (screen detection, pane→session cache, Fleet's local tick,
-    // periodic discovery). Request paths and the reconciler keep `backends`.
+    // observers (screen detection, pane→session cache, periodic discovery).
+    // Request paths, Fleet (whose published snapshot must never move back
+    // behind a fresh refresh) and the reconciler keep `backends`.
     let inventory = tend::backend::inventory::InventoryBackend::share(
         &backends,
         tend::backend::inventory::DEFAULT_INVENTORY_TTL,
@@ -356,7 +357,6 @@ async fn run() -> Result<()> {
         &cfg.fleet,
         store.clone(),
         backends.clone(),
-        inventory.clone(),
         collaboration.clone(),
         Client::new(socket.clone()),
         restart.generation(),

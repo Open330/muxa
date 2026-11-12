@@ -143,11 +143,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   process table per tick instead of two; each IPC connection no longer spawns
   `ps -o comm=` for its caller (the executable is looked up in-process); and a Codex hook checks its
   ancestry with per-process queries once, instead of two full `ps` passes.
-- Screen detection, the pane→session cache, Fleet's local refresh and
-  periodic discovery now share one `list-panes` per host, reused for 2.5 s
-  with concurrent callers waiting on the one in flight. In the same benchmark
-  `list-panes` dropped from 40 to 22 a minute. Requests, explicit Fleet
-  refreshes and liveness reconciliation still list fresh.
+- Screen detection, the pane→session cache and periodic discovery now share
+  one `list-panes` per host, reused for 2.5 s with concurrent callers waiting
+  on the one in flight; in the same benchmark `list-panes` dropped from 40 to
+  26 a minute. Requests, Fleet and liveness reconciliation still list fresh.
 
 ### Fixed
 

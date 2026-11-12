@@ -1,8 +1,8 @@
 //! A shared, short-lived pane inventory for the daemon's periodic tasks.
 //!
-//! Screen detection (every 3 s), the pane→session cache (5 s), Fleet's local
-//! snapshot (15 s) and periodic discovery (30 s) each used to run their own
-//! `list-panes` against every pane host. [`InventoryBackend`] wraps one
+//! Screen detection (every 3 s), the pane→session cache (5 s) and periodic
+//! discovery (30 s) each used to run their own `list-panes` against every
+//! pane host. [`InventoryBackend`] wraps one
 //! backend so those tasks share a single listing: a call within the TTL of
 //! the previous listing reuses it, and concurrent callers wait for the one
 //! listing in flight instead of starting their own (single-flight).
@@ -10,9 +10,13 @@
 //! Only [`PaneBackend::list_panes`] is cached. Everything else — including
 //! [`PaneBackend::observe_panes`], which liveness reconciliation treats as
 //! authoritative, and every capture, send and mutation — delegates to the
-//! wrapped backend unchanged. Request paths (IPC, launches) keep using the
-//! unwrapped backends, so a pane created a moment ago is always visible to
-//! the request that needs it.
+//! wrapped backend unchanged. Request paths (IPC, launches) and Fleet keep
+//! using the unwrapped backends, so a pane created a moment ago is always
+//! visible to the request that needs it, and a published Fleet snapshot is
+//! never replaced by an older cached listing.
+//!
+//! Staleness is bounded, not zero: a listing is reused for the TTL after it
+//! completed, so any one observation may see panes up to that old.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -22,8 +26,10 @@ use super::{BackendCaps, HostKind, PaneBackend, PaneObservation, SharedBackend};
 use crate::tmux::PaneInfo;
 
 /// How long one listing serves later callers. Shorter than the fastest
-/// periodic caller (screen detection's 3 s tick), so that caller still sees
-/// a listing taken this tick, while slower callers ride along on it.
+/// periodic caller's interval (screen detection's 3 s tick), so a listing
+/// is reused across callers but never across two of that caller's ticks
+/// on its own; with other callers interleaved, one screen observation may
+/// see a listing up to this old.
 pub const DEFAULT_INVENTORY_TTL: Duration = Duration::from_millis(2500);
 
 /// A [`PaneBackend`] whose `list_panes` is shared for [`Self::ttl`].

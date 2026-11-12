@@ -84,7 +84,7 @@ pipeline store and pane adoption retain the recovery path.
 | `tend` | CLI for status, watch, attend, recap, stats, reports, activity queries, init, hook entrypoints, and the `mcp` control server. |
 | `Tend.app` | Native macOS control surface. Renders tendd-owned PTY byte streams through a pinned, locally built libghostty XCFramework; it never owns agent process identity. |
 | Agent adapters | Translate Claude/Codex/Antigravity hook events and opencode plugin events into tend state transitions. |
-| Pane backends | Resolve panes, sessions, captures, and foreground activity per host (tmux, cmux, rmux, herdr, zellij). The daemon can observe several at once; each non-tmux pane id is namespaced by host. The periodic observers (screen detection, the pane→session cache, Fleet's local tick, periodic discovery) share one `list_panes` per host through a 2.5 s single-flight inventory; request paths and liveness reconciliation always list fresh. |
+| Pane backends | Resolve panes, sessions, captures, and foreground activity per host (tmux, cmux, rmux, herdr, zellij). The daemon can observe several at once; each non-tmux pane id is namespaced by host. The periodic observers (screen detection, the pane→session cache, periodic discovery) share one `list_panes` per host through a 2.5 s single-flight inventory; request paths, Fleet and liveness reconciliation always list fresh. |
 | herdr bridge | Translates herdr's own `agent_status` stream into synthetic rows for agents tend has no hooks for. |
 | Screen detection | Classifies hook-less agents (cursor, amp, …) from pane captures against TOML manifests; synthetic, hook-authoritative. |
 | Activity ledger | Append-only duration source for state/foreground/human intervals. |
