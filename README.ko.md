@@ -322,7 +322,7 @@ locale에서는 한글을 자동 선택하고 `--lang ko`로 명시하거나 도
 
 | Command | 목적 |
 | --- | --- |
-| `tend status [--flat\|--json]` | 추적 중인 agent를 session / window / pane 트리로 보여 줌(`--flat`: agent당 한 줄), 또는 desktop integration용 versioned JSON snapshot. |
+| `tend status [--flat\|--json] [-v]` | 추적 중인 agent를 session / window / pane 트리로 보여 줌(`--flat`: agent당 한 줄), 또는 desktop integration용 versioned JSON snapshot. `-v`는 각 행의 상태가 어디서 왔는지(`hook`, `provider_record`, `~screen`, `~timing` 등, `~`는 추정)도 보여 줌. |
 | `tend watch [--view session\|window\|pane]` | workspace → work → agent live TUI picker/dashboard. |
 | `tend dashboard [--since today]` | watch Work board: agent별/Work 일괄 prompt·중단, agent로서 메시지·메일함, 협업 수, ACT/WACT 요약. |
 | `tend attend [--cycle] [--list]` | attention이 필요한 agent로 focus 또는 list. |

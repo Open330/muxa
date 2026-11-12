@@ -58,9 +58,7 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
     // Skipped silently when tendd is unreachable: `check_tendd` already
     // owns and reported that condition.
     if reachable {
-        for result in check_collaboration(&socket).await {
-            add(&mut report, "tendd", None, result);
-        }
+        add_live_daemon_checks(&mut report, &socket, verbose).await;
     }
     for result in check_hook_spool(time::OffsetDateTime::now_utc()) {
         add(&mut report, "tendd", None, result);
@@ -177,6 +175,90 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
     };
     println!("└  {summary}");
     Ok(())
+}
+
+/// Checks that need a daemon that answered: the mailbox, and where the
+/// live rows' states came from.
+async fn add_live_daemon_checks(report: &mut Report, socket: &Path, verbose: bool) {
+    for result in check_collaboration(socket).await {
+        add(report, "tendd", None, result);
+    }
+    if let Some(result) = check_state_sources(socket, verbose).await {
+        add(report, "tendd", None, result);
+    }
+}
+
+/// Where the live agent rows' states came from. Always informational: a
+/// heuristic state is legitimate for agents tend has no hooks for. Verbose
+/// runs name each row whose state is only inferred.
+async fn check_state_sources(socket: &Path, verbose: bool) -> Option<CheckResult> {
+    let client = Client::new(socket.to_path_buf());
+    let agents = timeout(Duration::from_secs(2), client.snapshot())
+        .await
+        .ok()?
+        .ok()?;
+    Some(CheckResult::Ok(state_sources_message(&agents, verbose)))
+}
+
+pub(crate) fn state_sources_message(agents: &[tend::Agent], verbose: bool) -> String {
+    let live: Vec<&tend::Agent> = agents
+        .iter()
+        .filter(|agent| agent.state != tend::AgentState::Stopped)
+        .collect();
+    let mut counts: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for agent in &live {
+        let label = agent.state_source.map_or_else(
+            || "unknown".to_string(),
+            |provenance| {
+                format!(
+                    "{}{}",
+                    if provenance.source.is_deterministic() {
+                        ""
+                    } else {
+                        "~"
+                    },
+                    provenance.source
+                )
+            },
+        );
+        *counts.entry(label).or_default() += 1;
+    }
+    if live.is_empty() {
+        return "agent state sources: no live agents".into();
+    }
+    let mut message = format!(
+        "agent state sources: {}",
+        counts
+            .iter()
+            .map(|(label, count)| format!("{count} {label}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if verbose {
+        let inferred: Vec<String> = live
+            .iter()
+            .filter(|agent| {
+                agent
+                    .state_source
+                    .is_some_and(|provenance| !provenance.source.is_deterministic())
+            })
+            .map(|agent| {
+                format!(
+                    "{} {} ({})",
+                    agent.pane.as_deref().unwrap_or(&agent.session_id),
+                    agent.state,
+                    agent
+                        .state_source
+                        .map_or("unknown".into(), |p| p.source.to_string())
+                )
+            })
+            .collect();
+        if !inferred.is_empty() {
+            message.push_str("; inferred: ");
+            message.push_str(&inferred.join(", "));
+        }
+    }
+    message
 }
 
 /// Hook events that did not reach tendd: those still spooled, and what the

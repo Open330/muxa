@@ -120,7 +120,12 @@ pub(super) async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Cmd::Status { theme, flat, json } => cmd_status(&client, &cfg, theme, flat, json).await,
+        Cmd::Status {
+            theme,
+            flat,
+            json,
+            verbose,
+        } => cmd_status(&client, &cfg, theme, flat, json, verbose).await,
         Cmd::StatusLine {
             pane,
             needs_attention,

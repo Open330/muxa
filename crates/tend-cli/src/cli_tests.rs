@@ -1859,6 +1859,7 @@ fn status_json_cli_flag_parses_and_conflicts_with_theme() {
             json: true,
             theme: None,
             flat: false,
+            verbose: false,
         }
     ));
     assert!(Args::try_parse_from(["tend", "status", "--json", "--theme", "minimal"]).is_err());
@@ -1870,6 +1871,33 @@ fn status_json_cli_flag_parses_and_conflicts_with_theme() {
         Cmd::Status { flat: true, .. }
     ));
     assert!(Args::try_parse_from(["tend", "status", "--json", "--flat"]).is_err());
+}
+
+#[test]
+fn status_verbose_lists_each_rows_state_source() {
+    let args = Args::try_parse_from(["tend", "status", "-v"]).unwrap();
+    assert!(matches!(
+        args.cmd.expect("explicit subcommand"),
+        Cmd::Status { verbose: true, .. }
+    ));
+    assert!(Args::try_parse_from(["tend", "status", "-v", "--json"]).is_err());
+
+    let now = OffsetDateTime::now_utc();
+    let mut hooked = agent("hooked", Some("%1"), AgentState::Working, "");
+    hooked.state_source = Some(tend::provenance::StateProvenance::new(
+        tend::provenance::StateSource::Hook,
+        now - time::Duration::minutes(2),
+    ));
+    let mut guessed = agent("guessed", Some("%2"), AgentState::Idle, "");
+    guessed.state_source = Some(tend::provenance::StateProvenance::new(
+        tend::provenance::StateSource::Screen,
+        now,
+    ));
+    let legacy = agent("legacy", Some("%3"), AgentState::Idle, "");
+    let text = crate::status_handlers::render_state_sources(&[hooked, guessed, legacy], &[], now);
+    assert!(text.contains("hook, 2m"), "{text}");
+    assert!(text.contains("~screen"), "{text}");
+    assert!(text.contains("unknown"), "{text}");
 }
 
 #[test]
@@ -2377,4 +2405,31 @@ fn mutation_json_has_an_explicit_legacy_full_escape() {
         args.extend(["--json", "--full"]);
         assert!(Args::try_parse_from(args).is_ok());
     }
+}
+
+#[test]
+fn doctor_counts_live_state_sources_and_names_inferred_rows_when_verbose() {
+    use tend::provenance::{StateProvenance, StateSource};
+    let at = OffsetDateTime::now_utc();
+    let row = |session: &str, pane: &str, state, source: Option<StateSource>| {
+        let mut agent = agent(session, Some(pane), state, "");
+        agent.state_source = source.map(|source| StateProvenance::new(source, at));
+        agent
+    };
+    let agents = [
+        row("1", "%1", AgentState::Working, Some(StateSource::Hook)),
+        row("2", "%2", AgentState::Idle, Some(StateSource::Hook)),
+        row("3", "%3", AgentState::Idle, Some(StateSource::Screen)),
+        row("4", "%4", AgentState::Idle, None),
+        row("5", "%5", AgentState::Stopped, Some(StateSource::Timing)),
+    ];
+    assert_eq!(
+        crate::doctor::state_sources_message(&agents, false),
+        "agent state sources: 2 hook, 1 unknown, 1 ~screen"
+    );
+    let verbose = crate::doctor::state_sources_message(&agents, true);
+    assert!(
+        verbose.ends_with("; inferred: %3 idle (screen)"),
+        "{verbose}"
+    );
 }

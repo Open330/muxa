@@ -148,6 +148,10 @@ enum Cmd {
         /// Emit a stable JSON snapshot for desktop widgets and other integrations.
         #[arg(long)]
         json: bool,
+        /// Also list where each agent's current state came from (a hook, the
+        /// Codex rollout, the screen, a timer, …); `~` marks a heuristic.
+        #[arg(short, long, conflicts_with = "json")]
+        verbose: bool,
     },
     /// Print a one-liner status suitable for tmux `status-right`.
     #[command(hide = true)]
