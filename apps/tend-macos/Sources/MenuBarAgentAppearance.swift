@@ -13,12 +13,12 @@ struct TendMenuBarAgentAppearance: Equatable {
         let hash = identity.utf8.reduce(UInt64(14695981039346656037)) { ($0 ^ UInt64($1)) &* 1099511628211 }
         paletteIndex = Int(hash % UInt64(Self.palette.count))
         let program = TendAgentProgram(configValue: kind)
-        switch program {
-        case .claude: symbol = TendGlyph.claude; provider = "Claude"
-        case .codex: symbol = TendGlyph.codex; provider = "Codex"
-        case .agy: symbol = "arrow.up"; provider = "Antigravity"
-        case .opencode: symbol = "terminal"; provider = "OpenCode"
-        case nil: symbol = "terminal"; provider = kind.replacingOccurrences(of: "_", with: " ")
+        if let program {
+            symbol = TendGlyph.logo(for: program)
+            provider = program.displayName
+        } else {
+            symbol = "terminal"
+            provider = kind.replacingOccurrences(of: "_", with: " ")
         }
     }
 
@@ -71,10 +71,12 @@ struct TendMenuBarAvatar: View {
     var showsStatus = true
 
     var body: some View {
-        TendGlyphView(value: item.appearance.symbol, size: size * 0.45)
-            .frame(width: size, height: size)
-            .background(item.appearance.gradient, in: Circle())
-            .overlay(Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5))
+        TendGlyphFace(value: item.appearance.symbol, gradient: item.appearance.gradient, size: size, glyphSize: size * 0.45)
+            .overlay {
+                if !TendGlyph.drawsOwnFace(item.appearance.symbol, slot: (size * 0.78).rounded()) {
+                    Circle().strokeBorder(.white.opacity(0.18), lineWidth: 0.5)
+                }
+            }
             .overlay(alignment: .bottomTrailing) {
                 if showsStatus {
                     Image(systemName: item.menuStatusSymbol)

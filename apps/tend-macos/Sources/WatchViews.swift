@@ -1006,6 +1006,11 @@ struct FleetPaneInspector: View {
                     Text(pane.host.alias)
                     if let agent = pane.agent {
                         Text(verbatim: "·")
+                        HStack(spacing: 4) {
+                            TendAgentLogo(kind: agent.kind, size: 13)
+                            Text(verbatim: TendAgentMark.productName(forKind: agent.kind))
+                        }
+                        Text(verbatim: "·")
                         // The breadcrumb bar above carries the reset time
                         // and the auto-resume action for a rate limit.
                         AgentStatusTag(status: agent.status, detailed: !agent.status.isLimited)

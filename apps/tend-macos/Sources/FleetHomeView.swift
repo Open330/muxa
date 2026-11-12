@@ -635,6 +635,9 @@ private struct FleetWorkCard: View {
                     .foregroundStyle(.orange)
             }
             HStack(spacing: 6) {
+                if !work.agentKinds.isEmpty {
+                    TendAgentLogoStack(kinds: work.agentKinds, size: 12)
+                }
                 if let repo = work.repo {
                     Text(repo)
                 }
@@ -884,6 +887,7 @@ private struct FleetWorkInspector: View {
     private func agentRow(_ hosted: TendHostedAgent) -> some View {
         HStack(spacing: 8) {
             AgentStatusTag(status: hosted.agent.status, showsLabel: false)
+            TendAgentLogo(kind: hosted.agent.kind, size: 18)
             VStack(alignment: .leading, spacing: 1) {
                 Text(FleetBoard.owner(hosted))
                     .font(TendType.body.weight(.medium))
@@ -1033,9 +1037,14 @@ private struct FleetStageRow: View {
             .frame(width: 12)
             VStack(alignment: .leading, spacing: 1) {
                 Text(stage.name).fontWeight(.semibold)
-                Text(stage.owner)
-                    .font(TendType.meta)
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    if let kind = stage.kind {
+                        TendAgentLogo(kind: kind, size: 12)
+                    }
+                    Text(stage.owner)
+                }
+                .font(TendType.meta)
+                .foregroundStyle(.secondary)
             }
             .padding(.bottom, isLast ? 0 : 10)
             Spacer(minLength: 4)
@@ -1071,9 +1080,12 @@ private struct FleetHostsPopover: View {
                             .fill(fleetHostColor(host.state))
                             .frame(width: 7, height: 7)
                         Text(host.alias).fontWeight(.medium)
+                            .lineLimit(1)
                         Spacer(minLength: 12)
                         Text(fleetHostStateLabel(host.state))
                             .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
                     }
                     .contentShape(Rectangle())
                 }
@@ -1129,9 +1141,7 @@ struct FleetHostBadges: View {
             ForEach(hosts, id: \.alias) { host in
                 let icon = TendHostIcons.icon(for: host.alias, local: host.local)
                 HStack(spacing: 3) {
-                    TendGlyphView(value: icon, size: 7)
-                        .frame(width: 14, height: 14)
-                        .background(TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                    TendGlyphFace(value: icon, gradient: TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, size: 14, glyphSize: 7)
                     Text(verbatim: host.alias)
                         .lineLimit(1)
                 }

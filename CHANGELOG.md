@@ -22,6 +22,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them unless they show use. Their code paths are unchanged: `HostKind` is part
   of the IPC protocol and the Mac app, so removing them is not a contained
   change. `docs/MACOS.md` and the README describe the Mac app's Home screen.
+- The macOS app shows each agent with its product's official logo, exactly
+  as the vendor publishes it, instead of a stand-in SF Symbol. That covers
+  Claude Code (the Claude spark), Codex (the OpenAI blossom) and
+  Antigravity, plus the Anthropic symbol for the Anthropic API engine and
+  the Gemini sparkle for the Gemini Ask engine.
+  OpenCode's mark appears only where its brand minimum size and clear space
+  fit, and its name shows everywhere else.
+  - The logos appear on Fleet Home cards, stages and agent rows, Quick Look,
+    the sidebar's agent rows, Command Center, the Watch inspector, Ask
+    providers and answers, Automation rule chips, pipeline program chips,
+    the Accounts provider groups, and the New Agent and onboarding agent
+    pickers.
+  - In the menu bar, a logo is drawn on its own, with no coloured disc.
+    Claude and Codex faces also draw in the status item now. Before, they
+    showed an empty circle.
+  - The logos are third-party trademarks and are not covered by Tend's
+    licence. Sources are in `apps/tend-macos/Resources/AgentLogos-NOTICE.md`.
 
 ### Added
 

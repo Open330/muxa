@@ -408,6 +408,10 @@ private struct AskConversationTurn: View {
         AskProviderStore.shared.symbolName(for: entry.agent)
     }
 
+    private var providerLogo: TendAgentLogoAsset? {
+        AskProviderStore.shared.logo(for: entry.agent)
+    }
+
     private var statusColor: Color {
         switch entry.status {
         case "failed": .red
@@ -458,6 +462,7 @@ private struct AskConversationTurn: View {
                 AskMessageBlock(
                     role: providerTitle,
                     icon: providerIcon,
+                    logo: providerLogo,
                     source: entry.answer,
                     tint: .primary,
                     compact: false
@@ -546,13 +551,19 @@ private func askStatusLabel(_ status: String) -> String {
 private struct AskMessageBlock: View {
     let role: String
     let icon: String
+    /// The provider's logo, drawn in place of `icon` when there is one.
+    var logo: TendAgentLogoAsset? = nil
     let source: String
     let tint: Color
     let compact: Bool
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-                Label(role, systemImage: icon)
+            Label {
+                Text(role)
+            } icon: {
+                TendAgentLogo(asset: logo, fallbackSymbol: icon, size: 14)
+            }
                 .font(TendType.detail.weight(.semibold))
                 .foregroundStyle(compact ? tint : Color.secondary)
 

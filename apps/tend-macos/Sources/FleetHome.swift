@@ -57,6 +57,9 @@ struct FleetWorkStage: Hashable, Sendable {
     /// before an agent was spawned for it.
     let owner: String
     let state: State
+    /// The agent kind (or, before an agent exists, the program) doing the
+    /// stage, for its logo.
+    var kind: String? = nil
 }
 
 struct FleetWork: Identifiable, Sendable {
@@ -111,6 +114,16 @@ struct FleetWork: Identifiable, Sendable {
     /// never hides a helper's question.
     var hostAliases: [String] {
         Array(Set((agents + helpers).map(\.host.alias))).sorted()
+    }
+
+    /// The products doing the unit's stages, one each in stage order, for
+    /// the card's logos. Spelled as one program, so `claude_code` and a
+    /// planned `claude` stage count once.
+    var agentKinds: [String] {
+        var seen = Set<String>()
+        return stages.compactMap(\.kind).filter { kind in
+            seen.insert(TendAgentProgram(configValue: kind)?.rawValue ?? kind).inserted
+        }
     }
 
     /// The hosts behind `hostAliases`, one each, in the same order.
@@ -408,7 +421,8 @@ enum FleetBoard {
                 return FleetWorkStage(
                     name: desired.role.flatMap(nonEmpty) ?? desired.alias,
                     owner: participant.map(owner) ?? desired.program,
-                    state: state
+                    state: state,
+                    kind: participant?.agent.kind ?? desired.program
                 )
             }
             // An agent stamped with the Work but outside the pipeline (an ad hoc
@@ -428,7 +442,8 @@ enum FleetBoard {
                 ?? participant.pane?.agentAlias.flatMap(nonEmpty)
                 ?? kindName(participant.agent.kind),
             owner: owner(participant),
-            state: stageState(aliasStatus: nil, agent: participant.agent, now: now)
+            state: stageState(aliasStatus: nil, agent: participant.agent, now: now),
+            kind: participant.agent.kind
         )
     }
 
@@ -472,7 +487,8 @@ enum FleetBoard {
         let stage = FleetWorkStage(
             name: kindName(agent.kind),
             owner: owner(hosted),
-            state: stageState(aliasStatus: nil, agent: agent, now: now)
+            state: stageState(aliasStatus: nil, agent: agent, now: now),
+            kind: agent.kind
         )
         let lane = lane(for: [stage])
         let title = agent.aiTitle.flatMap(nonEmpty)

@@ -86,7 +86,8 @@ struct NewAgentView: View {
                             set: { program = $0; programTouched = true }
                         ),
                         options: TendAgentProgram.allCases,
-                        label: { Text(verbatim: $0.displayName) }
+                        label: { Text(verbatim: $0.displayName) },
+                        logo: { $0.logo }
                     )
                     programCaption
                     Toggle("Override provider options for this launch", isOn: $overridesOptions)

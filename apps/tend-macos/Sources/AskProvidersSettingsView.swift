@@ -286,6 +286,8 @@ struct AskProviderKindBadge: View {
             }
         }
         .font(TendType.meta.weight(.semibold))
+        .lineLimit(1)
+        .fixedSize(horizontal: true, vertical: false)
         .padding(.horizontal, 6)
         .padding(.vertical, 2)
         .background(Color.primary.opacity(0.08), in: Capsule())
@@ -297,6 +299,13 @@ struct AskProviderUsabilityBadge: View {
     let usability: AskProviderUsability
 
     var body: some View {
+        label
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
+    }
+
+    @ViewBuilder
+    private var label: some View {
         switch usability {
         case .usable:
             Label("Ready", systemImage: "checkmark.circle.fill")
@@ -336,20 +345,50 @@ struct AskProviderRow: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(systemName: provider.symbolName)
+            TendAgentLogo(asset: provider.logo, fallbackSymbol: provider.symbolName, size: 16)
                 .foregroundStyle(.tint)
                 .frame(width: 20)
-                .accessibilityHidden(true)
-            Text(provider.title)
-                .lineLimit(1)
-            AskProviderKindBadge(kind: provider.kind)
-            AskProviderUsabilityBadge(usability: store.usability(provider))
-            if model.askAgent == provider.id {
-                Label("Default", systemImage: "checkmark")
-                    .font(TendType.meta.weight(.semibold))
-                    .foregroundStyle(.tint)
+            ViewThatFits(in: .horizontal) {
+                HStack(spacing: 8) {
+                    name
+                    chips
+                }
+                VStack(alignment: .leading, spacing: 3) {
+                    name
+                    HStack(spacing: 6) { chips }
+                }
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
+            buttons
+                .fixedSize(horizontal: true, vertical: false)
+        }
+        .controlSize(.small)
+    }
+
+    private var name: some View {
+        Text(provider.title)
+            .lineLimit(1)
+            .truncationMode(.tail)
+            .layoutPriority(1)
+    }
+
+    @ViewBuilder
+    private var chips: some View {
+        AskProviderKindBadge(kind: provider.kind)
+        AskProviderUsabilityBadge(usability: store.usability(provider))
+        if model.askAgent == provider.id {
+            Label("Default", systemImage: "checkmark")
+                .font(TendType.meta.weight(.semibold))
+                .foregroundStyle(.tint)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    @ViewBuilder
+    private var buttons: some View {
+        HStack(spacing: 8) {
             if provider.kind == .cli, provider.takesCredential {
                 Button("Log In…") {
                     Task { await model.openProviderCLI(provider) }
@@ -366,7 +405,6 @@ struct AskProviderRow: View {
                     .accessibilityLabel(Text("Remove \(provider.title)"))
             }
         }
-        .controlSize(.small)
     }
 }
 
@@ -379,17 +417,18 @@ struct AskProviderDetectedRow: View {
 
     var body: some View {
         HStack(spacing: 10) {
-            Image(systemName: provider.symbolName)
+            TendAgentLogo(asset: provider.logo, fallbackSymbol: provider.symbolName, size: 16)
                 .foregroundStyle(.tint)
                 .frame(width: 20)
-                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(provider.title)
+                        .lineLimit(1)
                     AskProviderKindBadge(kind: provider.kind)
                 }
                 requirement
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
             Button {
                 Task {
@@ -568,7 +607,7 @@ struct AskProviderEditSheet: View {
                     Label {
                         Text(provider.title)
                     } icon: {
-                        Image(systemName: provider.symbolName).accessibilityHidden(true)
+                        TendAgentLogo(asset: provider.logo, fallbackSymbol: provider.symbolName, size: 14)
                     }
                 }
 

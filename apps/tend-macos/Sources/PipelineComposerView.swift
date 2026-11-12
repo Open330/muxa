@@ -383,12 +383,7 @@ private struct ComposerAgentRow: View {
                 .font(.subheadline.weight(.semibold))
                 .frame(width: 110, alignment: .leading)
                 .lineLimit(1)
-            Text(agent.program)
-                .font(TendType.meta.weight(.medium))
-                .foregroundStyle(agentProgramTint(agent.program))
-                .padding(.horizontal, 5)
-                .padding(.vertical, 1)
-                .background(agentProgramTint(agent.program).opacity(0.12), in: Capsule())
+            TendAgentProgramChip(program: agent.program)
             if agent.role.isEmpty {
                 Text("no role")
                     .font(TendType.detail)

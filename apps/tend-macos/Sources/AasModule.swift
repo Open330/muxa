@@ -727,9 +727,14 @@ private struct AasAccountTable: View {
             .accessibilityHidden(true)
             ForEach(groups) { group in
                 Divider()
-                Text(verbatim: group.title)
-                    .font(TendType.detail.weight(.semibold))
-                    .foregroundStyle(.secondary)
+                HStack(spacing: 5) {
+                    if let logo = TendAgentLogoAsset(kind: group.provider) {
+                        TendAgentLogo(asset: logo, fallbackSymbol: "terminal", size: 13)
+                    }
+                    Text(verbatim: group.title)
+                }
+                .font(TendType.detail.weight(.semibold))
+                .foregroundStyle(.secondary)
                 ForEach(group.accounts) { account in
                     AasAccountRow(account: account, module: module, model: model)
                 }
@@ -754,6 +759,7 @@ private struct AasAccountRow: View {
                     .font(.body.weight(account.active ? .semibold : .regular))
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .layoutPriority(1)
                 if let error = account.error, !error.isEmpty {
                     Image(systemName: "exclamationmark.triangle.fill")
                         .foregroundStyle(.orange)
@@ -765,6 +771,8 @@ private struct AasAccountRow: View {
             Group {
                 if let plan = account.planText {
                     Text(verbatim: plan)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                         .padding(.horizontal, 6)
                         .padding(.vertical, 1)
                         .background(Color.accentColor.opacity(0.12), in: Capsule())

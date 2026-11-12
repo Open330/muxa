@@ -617,7 +617,8 @@ private struct CommandCenterAttentionList: View {
             HStack(alignment: .top, spacing: 10) {
                 HostIdentityBadge(identity: hosted.host, size: 26)
                 VStack(alignment: .leading, spacing: 3) {
-                    HStack(spacing: 8) {
+                    HStack(spacing: 6) {
+                        TendAgentLogo(kind: hosted.agent.kind, size: 14)
                         Text(commandCenterAgentTitle(hosted))
                             .font(TendType.body.weight(.semibold))
                             .lineLimit(1)

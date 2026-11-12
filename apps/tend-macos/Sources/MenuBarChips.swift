@@ -106,8 +106,7 @@ struct TendMenuBarChipPeek: View {
     let item: TendMenuBarChip
     var body: some View {
         HStack(spacing: 10) {
-            TendGlyphView(value: item.appearance.symbol, size: 12)
-                .frame(width: 26, height: 26).background(item.appearance.gradient, in: Circle())
+            TendGlyphFace(value: item.appearance.symbol, gradient: item.appearance.gradient, size: 26, glyphSize: 12)
             VStack(alignment: .leading, spacing: 3) {
                 HStack {
                     Text(verbatim: item.name).font(TendType.detail.weight(.semibold))

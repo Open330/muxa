@@ -595,9 +595,7 @@ private struct TendMenuBarSettingsView: View {
         let isCustomText = TendGlyph.kind(icon) != .symbol(icon)
         return GridRow {
             HStack(spacing: 8) {
-                TendGlyphView(value: icon, size: 11)
-                    .frame(width: 22, height: 22)
-                    .background(TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                TendGlyphFace(value: icon, gradient: TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, size: 22, glyphSize: 11)
                     .accessibilityHidden(true)
                 Text(verbatim: host.alias)
                     .lineLimit(1)
@@ -822,6 +820,8 @@ struct TendFleetSettingsRow: View {
                     Circle().fill(fleetHostColor(host.state)).frame(width: 7, height: 7)
                         .accessibilityHidden(true)
                     Text(host.alias).font(.headline)
+                        .lineLimit(1)
+                        .layoutPriority(1)
                     Group {
                         Text(verbatim: fleetHostStateLabel(host.state))
                         if host.local {
@@ -832,6 +832,8 @@ struct TendFleetSettingsRow: View {
                     }
                     .font(TendType.meta.weight(.semibold))
                     .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
                 }
                 Group {
                     if let target = host.sshTarget {
@@ -876,6 +878,8 @@ struct TendFleetSettingsRow: View {
                         .controlSize(.small)
                 }
             }
+            .lineLimit(1)
+            .fixedSize(horizontal: true, vertical: false)
         }
         .padding(.vertical, 2)
     }

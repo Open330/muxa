@@ -368,6 +368,9 @@ struct TendAskProvider: Decodable, Identifiable, Sendable {
         return kind == .api ? "network" : "terminal"
     }
 
+    /// The vendor's logo, drawn in place of `symbolName` where there is one.
+    var logo: TendAgentLogoAsset? { engineDescriptor?.logo }
+
     /// Shell command that installs a known CLI; nil when unknown.
     var installCommand: String? { engineDescriptor?.installCommand }
 

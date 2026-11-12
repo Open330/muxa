@@ -556,6 +556,8 @@ cargo fmt --all -- --check
 
 MIT OR Apache-2.0.
 
+The third-party product logos in `apps/tend-macos/Resources/Assets.xcassets/AgentLogos` are trademarks of their owners and are not covered by this licence; see [AgentLogos-NOTICE.md](apps/tend-macos/Resources/AgentLogos-NOTICE.md).
+
 ### Peek expanded reader
 
 Inside peek, press `|` to read the active pane in fullscreen. Use `j/k`, arrows, `PgUp/PgDn`, or `Home/End` to scroll; `n/p` changes panes, `r` refreshes the reading snapshot, `|`/`Esc` returns to the overlay, and `q` closes it. `Tab` switches between saved agent text and terminal history. Saved responses may be capped at ingestion; terminal history includes everything tmux still retains, but cannot recover discarded scrollback.
