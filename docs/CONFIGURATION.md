@@ -204,6 +204,12 @@ swap](ACCOUNT_SWAP.md)):
   `aas candidates` (it never changes `aas active`). The binary is
   `[swap].aas`; it is run, never linked.
 
+Account routing belongs to the optional account module. Setting `account`
+turns the module on unless `[modules] accounts = false` says otherwise; see
+[the account module](ACCOUNT_SWAP.md#the-account-module). With the module
+off, or not in the build, the agent starts bare and the reason is reported
+below.
+
 When there is no provider, `aas` takes longer than 5 seconds, or no account
 has quota left, the agent starts bare as before, which may still be the
 capped account. The reason goes to stderr and to the `account` field of

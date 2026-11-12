@@ -60,9 +60,15 @@ tend is built by heavy daily use, but it ships for everyone. Nothing in Core
 or Runtime may require a tool, account layout, or workflow that only one user
 has.
 
-- Account routing and usage-limit recovery (swap-on-limit, resume-after-limit)
-  solve a problem every heavy Claude/Codex user hits. They work with plain
-  configuration; `aas` is one optional provider, not a prerequisite.
+- Usage-limit *observation* is core: a capped agent shows as attention, and
+  `resume-after-limit` resumes it after its reset with no accounts at all.
+  *Moving* agents between accounts (`tend swap`, `swap_account`, account-routed
+  launches, swap jobs) is the optional account module, `tend-aas`. It is off
+  on a fresh install, on for configs that already use accounts, and
+  `[modules] accounts` decides explicitly. It works with plain
+  `[[accounts.<provider>]]` configuration; `aas` is the recommended provider,
+  not a prerequisite. Core never depends on the module: it speaks to it
+  through `tend::swap_api`.
 - No product default, preset, or code path assumes a specific organization or
   project. Personal workflows live in user config and user skills, not in
   tend.
@@ -101,9 +107,15 @@ whether the feature matters.
 | Tier | Bar | Members |
 | --- | --- | --- |
 | **Core** | Regressions block release; tests required | Attention layer, Work/Run model, collaboration mailbox, review queue and decision record (`tend review`, the `tend work done` result), MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
-| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, loopback dashboard (single user, bearer token, `dashboard` cargo feature), account routing and usage-limit recovery |
+| **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, loopback dashboard (single user, bearer token, `dashboard` cargo feature), usage-limit recovery (`resume-after-limit`) |
 | **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts, cmux and zellij backends (adopt-only) |
 | **Labs, frozen** | Kept working, no new features; candidates for removal at the next review | `tend stats` (with `stats report` and `stats activity`) and `tend timeline` analytics, the 16-step `tend onboard` live tour |
+
+**Optional modules** are separate crates that core never depends on, each
+with a cargo feature and a config switch. A module keeps the bar of its
+tier while it is enabled, and every surface it adds still answers when it
+is absent ("not enabled", not a missing command). Today there is one: the
+account module (`tend-aas`, Runtime bar), see [ACCOUNT_SWAP](ACCOUNT_SWAP.md).
 
 A Labs feature graduates when it has a written contract, a recovery path, and
 evidence (from `tend stats` or issues) that it is used outside a single

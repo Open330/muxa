@@ -5,6 +5,42 @@ long as the accounts share `projects/` (Claude) and `sessions/` (Codex), the
 same provider session id resumes under any account. `tend swap` moves agents
 onto another account and resumes each one in its own pane.
 
+## The account module
+
+Account swapping is an optional module, `tend-aas`. It covers `tend swap`,
+the `swap_account` automation action, `tend_swap_account`, the daemon's
+swap jobs (`swap-jobs.sqlite3`) and `[agent.<program>].account` launches.
+Without it, tend still sees a usage limit: the agent shows as rate limited,
+`attend` and notifications surface it, and `resume-after-limit` resumes it
+after its reset.
+
+```toml
+[modules]
+accounts = true    # or false; leave it out for the automatic choice
+```
+
+When `accounts` is left out, the module is on exactly when the config
+already uses accounts: an `[agent.<program>].account`, an
+`[[accounts.<provider>]]` entry, a `swap_account` rule, or a `[swap]`
+setting that differs from the default. A fresh install leaves it off, and a
+setup that swapped before the module existed keeps swapping after an
+upgrade without an edit. tendd reads the switch at start, so restart it
+after a change (`tend daemon restart`). `tend doctor` reports whether the
+module is on and why. If this host has swap jobs from before (a
+`swap-jobs.sqlite3`) while the module is off, it names the line to add.
+
+With the module off, `tend swap` and `tend_swap_account` refuse with "the
+account module is not enabled" and send nothing. Reading or cancelling an
+existing job (`--status`, `--cancel`) still works. A launch that asks for
+an account starts bare and reports why, as it does when no account backend
+is found.
+
+Release builds include the module. It is the `aas` cargo feature of
+`tend-cli` and `tendd`, on by default, so `scripts/release-local.sh`, the
+release workflow, `embed-tendd.sh` and `install.sh` need no flag.
+`cargo build --no-default-features -p tend-cli -p tendd` builds tend without
+it. Those binaries answer "the account module is not in this build".
+
 Accounts come from an *account provider*, chosen per provider (Claude,
 Codex) in this order:
 
