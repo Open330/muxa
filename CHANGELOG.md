@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.11] - 2026-11-12
+
 ### Changed
 
 - The macOS Settings window has nine tabs instead of ten: General,
