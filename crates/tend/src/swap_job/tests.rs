@@ -1633,3 +1633,85 @@ fn an_automatic_claim_prevents_a_manual_retry_of_the_same_attempt() {
         .is_err());
     assert_eq!(store.status(&job).unwrap().targets[0].attempt, 2);
 }
+
+#[test]
+fn resume_windows_survive_new_attempts_and_restarts_without_extending() {
+    for when_idle in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir);
+        let lease = store.acquire(&me("old", 1), &alive).unwrap();
+        let mut plan = resumable_plan(1);
+        plan.resume.as_mut().unwrap().when_idle = when_idle;
+        let job = store
+            .create_job(&lease, "window", "digest", &plan)
+            .unwrap()
+            .job_id;
+        store.start(&lease, &job).unwrap();
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        store.begin_drain(&lease).unwrap();
+        let deadline = store.resume_deadline(&job, 0, 1).unwrap();
+        if when_idle {
+            assert_eq!(deadline, plan.resume.as_ref().unwrap().idle_deadline);
+        } else {
+            assert!((now + 1800..=now + 1801).contains(&deadline));
+        }
+        let lease = store.acquire(&me("next", 2), &gone).unwrap();
+        let attempt = store
+            .claim_resume(&lease, &job, 0, 1, false)
+            .unwrap()
+            .unwrap();
+        store
+            .defer_attempt(&lease, &job, 0, attempt, "guard_unavailable")
+            .unwrap();
+        assert_eq!(store.resume_deadline(&job, 0, attempt).unwrap(), deadline);
+        let reopened = open(&dir);
+        let lease = reopened.acquire(&me("third", 3), &gone).unwrap();
+        assert_eq!(
+            reopened.resume_deadline(&job, 0, attempt).unwrap(),
+            deadline
+        );
+        reopened
+            .hold()
+            .execute("UPDATE resume_windows SET deadline = 0", [])
+            .unwrap();
+        assert_eq!(
+            reopened
+                .claim_resume(&lease, &job, 0, attempt, false)
+                .unwrap(),
+            None
+        );
+        assert_eq!(reopened.status(&job).unwrap().targets[0].attempt, attempt);
+    }
+}
+
+#[test]
+fn an_initial_v4_deferral_gets_a_window_from_its_original_transition() {
+    let dir = tempfile::tempdir().unwrap();
+    let job = {
+        let store = open(&dir);
+        let lease = store.acquire(&me("old", 1), &alive).unwrap();
+        let mut plan = resumable_plan(1);
+        plan.resume.as_mut().unwrap().when_idle = false;
+        let job = store
+            .create_job(&lease, "old-v4", "digest", &plan)
+            .unwrap()
+            .job_id;
+        store.start(&lease, &job).unwrap();
+        store.begin_drain(&lease).unwrap();
+        store
+            .hold()
+            .execute_batch(
+                "DROP TABLE resume_windows;
+            UPDATE jobs SET updated_at = '2001-01-01T00:00:00Z';",
+            )
+            .unwrap();
+        job
+    };
+    let store = open(&dir);
+    assert_eq!(
+        store.resume_deadline(&job, 0, 1).unwrap(),
+        978_307_200 + 1800
+    );
+    let lease = store.acquire(&me("next", 2), &gone).unwrap();
+    assert_eq!(store.claim_resume(&lease, &job, 0, 1, false).unwrap(), None);
+}

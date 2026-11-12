@@ -76,6 +76,18 @@ pub(super) fn defer_one(
             why: "attempt is not provably untouched".into(),
         });
     }
+    // A lineage keeps its first resume deadline across attempts, crashes,
+    // sibling transitions, and repeated transient failures.
+    tx.execute(
+        "INSERT OR IGNORE INTO resume_windows (lineage, deadline)
+        SELECT COALESCE(t.lineage, t.job_id || ':' || t.target_id),
+            CASE WHEN json_extract(j.plan_json, '$.resume.when_idle') = 1
+            THEN json_extract(j.plan_json, '$.resume.idle_deadline')
+            ELSE unixepoch() + 1800 END
+        FROM targets t JOIN jobs j ON j.job_id = t.job_id
+        WHERE t.job_id = ?1 AND t.target_id = ?2 AND t.attempt = ?3",
+        params![job, target, attempt],
+    )?;
     Ok(())
 }
 
@@ -178,6 +190,23 @@ impl SwapJobStore {
         })
     }
 
+    pub(crate) fn resume_deadline(
+        &self,
+        job: &str,
+        target: u32,
+        attempt: u32,
+    ) -> Result<i64, JobError> {
+        self.with(|c| {
+            Ok(c.query_row(
+                "SELECT w.deadline FROM targets t JOIN resume_windows w
+            ON w.lineage = COALESCE(t.lineage, t.job_id || ':' || t.target_id)
+            WHERE t.job_id = ?1 AND t.target_id = ?2 AND t.attempt = ?3",
+                params![job, target, attempt],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
     pub(crate) fn deferred_jobs(&self) -> Result<Vec<String>, JobError> {
         self.with(|c| {
             let mut stmt = c.prepare(&format!(
@@ -207,6 +236,8 @@ impl SwapJobStore {
                 WHERE t.job_id = ?1 AND t.target_id = ?2 AND t.attempt = ?3 AND {LATEST}
                 AND t.disposition = 'deferred' AND t.phase = 'pending' AND j.cancel_requested = 0
                 AND j.evidence_pruned_at IS NULL AND (SELECT draining FROM owner WHERE id = 1) = 0
+                AND EXISTS (SELECT 1 FROM resume_windows w WHERE w.lineage =
+                    COALESCE(t.lineage, t.job_id || ':' || t.target_id) AND w.deadline > unixepoch())
                 AND NOT EXISTS (SELECT 1 FROM targets r WHERE r.retry_of = ?4)
                 AND NOT EXISTS (SELECT 1 FROM effects e WHERE e.job_id = t.job_id AND e.target_id = t.target_id AND e.attempt = t.attempt)
                 AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.job_id = t.job_id AND o.target_id = t.target_id AND o.attempt = t.attempt))"),

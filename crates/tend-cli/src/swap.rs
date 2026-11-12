@@ -1001,6 +1001,13 @@ fn entry_outcome(entry: &EntryView) -> SwapOutcome {
         };
         outcome.status = status;
     }
+    if matches!(
+        entry.reason.as_deref(),
+        Some("target_gone" | "resume_window_expired")
+    ) && !outcome.note.contains("nothing was done")
+    {
+        outcome.note.push_str("; nothing was done");
+    }
     if let Some(reason) = entry
         .continuation
         .as_deref()
@@ -2827,5 +2834,26 @@ mod tests {
         };
         let cli = Cli::parse_from(["swap", "--status", "k", "--wait-secs", "1"]);
         assert!(remote_job(&output, &cli.args, "remote").is_ok());
+    }
+    #[test]
+    fn vanished_and_expired_resume_targets_are_clean_skips() {
+        for reason in ["target_gone", "resume_window_expired"] {
+            let mut job = view("done", None);
+            job.entries.push(EntryView {
+                report_index: 0,
+                pane: Some("%1".into()),
+                disposition: Some("skipped".into()),
+                reason: Some(reason.into()),
+                uncertain_effects: 0,
+                outcome: None,
+                continuation: None,
+                follow_up: None,
+            });
+            assert!(settled(&job));
+            assert!(job_verdict(&job, "k", false).is_ok());
+            let outcome = job_outcomes(&job).remove(0);
+            assert_eq!(outcome.status, SwapStatus::Skipped);
+            assert!(outcome.note.contains("nothing was done"));
+        }
     }
 }

@@ -257,6 +257,8 @@ impl Drop for TrackedGuard {
 }
 
 struct FakeProvider {
+    snapshot_gate: Mutex<Option<Arc<Gate>>>,
+    snapshot_calls: AtomicUsize,
     snapshot_failure: AtomicBool,
     guard_failure: AtomicBool,
     config_path: Option<PathBuf>,
@@ -271,6 +273,11 @@ struct FakeProvider {
 
 impl ContextProvider for FakeProvider {
     fn snapshot(&self) -> Result<Snapshot, String> {
+        self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+        let gate = self.snapshot_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate.wait();
+        }
         if self.snapshot_failure.load(Ordering::SeqCst) {
             return Err("temporarily unavailable".into());
         }
@@ -331,6 +338,8 @@ fn harness(script: Script) -> Harness {
     let config_path = dir.path().join("config.toml");
     std::fs::write(&config_path, "").unwrap();
     let provider = Arc::new(FakeProvider {
+        snapshot_gate: Mutex::new(None),
+        snapshot_calls: AtomicUsize::new(0),
         snapshot_failure: AtomicBool::new(false),
         guard_failure: AtomicBool::new(false),
         config_path: Some(config_path),
@@ -668,6 +677,7 @@ fn a_plan_writes_nothing() {
 #[test]
 fn a_restarted_service_reads_an_interrupted_job_back_in_order() {
     let gate = Arc::new(Gate::default());
+    let _release = OpenOnDrop(Arc::clone(&gate));
     let held = Arc::clone(&gate);
     let h = harness(Box::new(move || {
         vec![
@@ -686,7 +696,8 @@ fn a_restarted_service_reads_an_interrupted_job_back_in_order() {
         None,
     )
     .unwrap();
-    // The daemon "restarts" while the target is held, before it runs.
+    gate.until_reached();
+    // The daemon restarts after the start boundary, before the first effect.
     let restarted = Service::open(
         &h.dir.path().join("swap-jobs.sqlite3"),
         OwnerIdentity {
@@ -757,6 +768,8 @@ fn one_live_manager_holds_the_store_until_it_is_gone() {
     let path = dir.path().join("swap-jobs.sqlite3");
     let provider = || {
         Arc::new(FakeProvider {
+            snapshot_gate: Mutex::new(None),
+            snapshot_calls: AtomicUsize::new(0),
             snapshot_failure: AtomicBool::new(false),
             guard_failure: AtomicBool::new(false),
             config_path: None,
@@ -915,6 +928,8 @@ fn an_executor_that_cannot_start_ends_the_job_without_effects() {
             requests: Arc::default(),
         },
         Arc::new(FakeProvider {
+            snapshot_gate: Mutex::new(None),
+            snapshot_calls: AtomicUsize::new(0),
             snapshot_failure: AtomicBool::new(false),
             guard_failure: AtomicBool::new(false),
             config_path: None,
@@ -983,6 +998,8 @@ fn ownership_outlives_the_handle_while_a_job_runs() {
     let path = dir.path().join("swap-jobs.sqlite3");
     let provider = || {
         Arc::new(FakeProvider {
+            snapshot_gate: Mutex::new(None),
+            snapshot_calls: AtomicUsize::new(0),
             snapshot_failure: AtomicBool::new(false),
             guard_failure: AtomicBool::new(false),
             config_path: None,
@@ -2209,6 +2226,9 @@ fn idle_wait_releases_input_guards_and_allows_other_jobs_but_reserves_its_target
 }
 
 fn resume_fixture(h: &Harness, count: usize) -> AcceptedPlan {
+    *h.provider.agents.lock().unwrap() = (0..count)
+        .map(|id| waiting_agent(&format!("%{id}"), false))
+        .collect();
     AcceptedPlan {
         node_id: "node-1".into(),
         continue_when: "always".into(),
@@ -2377,7 +2397,7 @@ fn automatic_resume_respects_automation_legacy_node_deadline_and_changed_identit
         "automation_not_resumed",
         "resume_policy_unavailable",
         "resume_node_changed",
-        "idle_timeout",
+        "resume_window_expired",
         "changed_while_deferred",
     ] {
         let h = harness(Box::new(Vec::new));
@@ -2386,7 +2406,7 @@ fn automatic_resume_respects_automation_legacy_node_deadline_and_changed_identit
             "automation_not_resumed" => plan.resume.as_mut().unwrap().public = false,
             "resume_policy_unavailable" => plan.resume = None,
             "resume_node_changed" => plan.node_id = "another-node".into(),
-            "idle_timeout" => {
+            "resume_window_expired" => {
                 let p = plan.resume.as_mut().unwrap();
                 p.when_idle = true;
                 p.idle_deadline = 0;
@@ -2522,4 +2542,257 @@ fn startup_dispatcher_resumes_without_a_new_submission() {
         );
         std::thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn expire_resume_window(service: &Service<FakeEngine>) {
+    service
+        .store
+        .hold()
+        .execute("UPDATE resume_windows SET deadline = 0", [])
+        .unwrap();
+}
+
+#[test]
+fn an_agent_closed_while_the_daemon_was_down_settles_as_target_gone() {
+    for stopped_row in [false, true] {
+        let h = harness(Box::new(Vec::new));
+        let job = write_fixture(&h, &resume_fixture(&h, 1));
+        h.service.store.begin_drain(&h.service.lease).unwrap();
+        if stopped_row {
+            h.provider.agents.lock().unwrap()[0].state = crate::event::AgentState::Stopped;
+        } else {
+            h.provider.agents.lock().unwrap().clear();
+        }
+        let next = reopen_fixture(&h);
+        assert_eq!(Service::resume_pending(&next).unwrap(), 0);
+        let view = next.status(&JobRef::Id(job)).unwrap();
+        assert_eq!(view.state, "done");
+        assert_eq!(view.entries[0].disposition.as_deref(), Some("skipped"));
+        assert_eq!(view.entries[0].reason.as_deref(), Some("target_gone"));
+        assert!(h.executed.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn unreadable_binding_and_snapshot_errors_expire_without_resetting_the_window() {
+    for provider_error in [false, true] {
+        let h = harness(Box::new(Vec::new));
+        let mut plan = resume_fixture(&h, 1);
+        plan.targets[0].process_start = None;
+        let job = write_fixture(&h, &plan);
+        h.service.store.begin_drain(&h.service.lease).unwrap();
+        let next = reopen_fixture(&h);
+        h.provider
+            .snapshot_failure
+            .store(provider_error, Ordering::SeqCst);
+        Service::resume_pending(&next).unwrap();
+        assert_eq!(next.store.status(&job).unwrap().state, "deferred");
+        let deadline = next.store.resume_deadline(&job, 0, 1).unwrap();
+        Service::resume_pending(&next).unwrap();
+        assert_eq!(next.store.resume_deadline(&job, 0, 1).unwrap(), deadline);
+        expire_resume_window(&next);
+        Service::resume_pending(&next).unwrap();
+        let view = next.status(&JobRef::Id(job)).unwrap();
+        assert_eq!(view.state, "done");
+        assert_eq!(
+            view.entries[0].reason.as_deref(),
+            Some("resume_window_expired")
+        );
+        assert!(h.executed.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_slow_resume_snapshot_does_not_hold_the_submission_gate_and_cancel_is_rechecked() {
+    let h = harness(Box::new(Vec::new));
+    let job = write_fixture(&h, &resume_fixture(&h, 1));
+    h.service.store.begin_drain(&h.service.lease).unwrap();
+    let next = reopen_fixture(&h);
+    let gate = Arc::new(Gate::default());
+    let _release = OpenOnDrop(Arc::clone(&gate));
+    *h.provider.snapshot_gate.lock().unwrap() = Some(Arc::clone(&gate));
+    let worker = Arc::clone(&next);
+    let pass = std::thread::spawn(move || Service::resume_pending(&worker));
+    gate.until_reached();
+    assert!(
+        next.submit.try_lock().is_ok(),
+        "snapshot blocked new submissions"
+    );
+    next.cancel(&JobRef::Id(job.clone())).unwrap();
+    gate.open();
+    assert_eq!(pass.join().unwrap().unwrap(), 0);
+    assert_eq!(
+        next.store.status(&job).unwrap().targets[0]
+            .reason
+            .as_deref(),
+        Some("cancelled")
+    );
+    assert!(h.executed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn resumed_worker_skips_a_successfully_observed_missing_registration() {
+    let h = harness(Box::new(Vec::new));
+    let mut plan = resume_fixture(&h, 1);
+    plan.resume.as_mut().unwrap().when_idle = true;
+    let job = write_fixture(&h, &plan);
+    h.service.store.begin_drain(&h.service.lease).unwrap();
+    let next = reopen_fixture(&h);
+    let attempt = next
+        .store
+        .claim_resume(&next.lease, &job, 0, 1, false)
+        .unwrap()
+        .unwrap();
+    h.provider.agents.lock().unwrap().clear();
+    let id = identity("%0", "/tmp/tmux-1/default");
+    let request = SwapRequest {
+        when_idle: true,
+        ..SwapRequest::new(
+            SwapScope::Targets(vec!["conv-%0".into()]),
+            &SwapConfig::default(),
+        )
+    };
+    next.run(
+        &job,
+        &request,
+        vec![AttemptRun {
+            target_id: 0,
+            attempt,
+            report_index: 0,
+            identity: id.clone(),
+            target: FakeTarget {
+                identity: id,
+                gate: None,
+            },
+        }],
+        None,
+        None,
+    );
+    let view = next.status(&JobRef::Id(job)).unwrap();
+    assert_eq!(view.state, "done");
+    assert_eq!(view.entries[0].reason.as_deref(), Some("target_gone"));
+    assert!(h.executed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn a_resumer_stops_when_no_targets_are_deferred() {
+    let h = harness(Box::new(Vec::new));
+    let calls = h.provider.snapshot_calls.load(Ordering::SeqCst);
+    Service::start_resumer(&h.service).unwrap();
+    assert!(!h.service.resumer_running.load(Ordering::SeqCst));
+    assert_eq!(h.provider.snapshot_calls.load(Ordering::SeqCst), calls);
+
+    let job = write_fixture(&h, &resume_fixture(&h, 1));
+    h.service.store.begin_drain(&h.service.lease).unwrap();
+    h.provider.agents.lock().unwrap().clear();
+    let next = reopen_fixture(&h);
+    Service::start_resumer(&next).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while next.resumer_running.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "resumer did not stop");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(next.store.status(&job).unwrap().state, "done");
+    let calls = h.provider.snapshot_calls.load(Ordering::SeqCst);
+    Service::start_resumer(&next).unwrap();
+    assert!(!next.resumer_running.load(Ordering::SeqCst));
+    assert_eq!(h.provider.snapshot_calls.load(Ordering::SeqCst), calls);
+}
+
+#[test]
+fn backend_absence_requires_a_complete_scan() {
+    use crate::backend::PaneObservation;
+    assert!(pane_absent(
+        "%1",
+        Some("/tmp/default"),
+        &PaneObservation::complete(Vec::new())
+    ));
+    assert!(!pane_absent(
+        "%1",
+        Some("/tmp/default"),
+        &PaneObservation::incomplete(Vec::new())
+    ));
+    assert!(!pane_absent(
+        "%1",
+        Some("/tmp/default"),
+        &PaneObservation::partial(Vec::new())
+    ));
+}
+
+#[test]
+fn resume_backoff_reaches_thirty_seconds_and_resets_after_admission() {
+    let mut backoff = super::resume::ResumeBackoff::default();
+    for seconds in [1, 2, 4, 8, 16, 30, 30] {
+        assert_eq!(backoff.after_pass(0), Duration::from_secs(seconds));
+    }
+    assert_eq!(backoff.after_pass(1), Duration::from_secs(1));
+    assert_eq!(backoff.after_pass(0), Duration::from_secs(2));
+}
+
+#[test]
+fn a_worker_deferral_restarts_admission_after_the_dispatcher_stopped() {
+    let h = harness(Box::new(Vec::new));
+    let job = write_fixture(&h, &resume_fixture(&h, 1));
+    h.service.store.begin_drain(&h.service.lease).unwrap();
+    let next = reopen_fixture(&h);
+    let attempt = next
+        .store
+        .claim_resume(&next.lease, &job, 0, 1, false)
+        .unwrap()
+        .unwrap();
+    assert!(!next.resumer_running.load(Ordering::SeqCst));
+    h.provider.guard_failure.store(true, Ordering::SeqCst);
+    h.provider.snapshot_failure.store(true, Ordering::SeqCst);
+    next.done
+        .lock()
+        .unwrap()
+        .insert(job.clone(), tokio::sync::watch::channel(false).0);
+    let id = identity("%0", "/tmp/tmux-1/default");
+    let request = SwapRequest::new(
+        SwapScope::Targets(vec!["conv-%0".into()]),
+        &SwapConfig::default(),
+    );
+    Service::spawn(
+        &next,
+        &job,
+        request,
+        vec![AttemptRun {
+            target_id: 0,
+            attempt,
+            report_index: 0,
+            identity: id.clone(),
+            target: FakeTarget {
+                identity: id.clone(),
+                gate: None,
+            },
+        }],
+        None,
+        1,
+        std::slice::from_ref(&id.endpoint),
+        None,
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !next.resumer_running.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "worker did not restart the dispatcher"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(next.store.status(&job).unwrap().state, "deferred");
+    h.provider.guard_failure.store(false, Ordering::SeqCst);
+    h.provider.snapshot_failure.store(false, Ordering::SeqCst);
+    loop {
+        let view = next.status(&JobRef::Id(job.clone())).unwrap();
+        if view.state == "done" {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "restarted dispatcher did not admit: {view:?}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(*h.executed.lock().unwrap(), ["%0"]);
 }

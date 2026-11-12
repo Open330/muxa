@@ -704,6 +704,19 @@ impl SwapJobStore {
                 ));
             }
         }
+        // Additive v4 metadata: also opens journals written by the initial
+        // unreleased v4 build. Seed old deferrals once from their transition.
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS resume_windows (
+            lineage TEXT PRIMARY KEY, deadline INTEGER NOT NULL);
+            INSERT OR IGNORE INTO resume_windows (lineage, deadline)
+            SELECT COALESCE(t.lineage, t.job_id || ':' || t.target_id),
+                CASE WHEN json_extract(j.plan_json, '$.resume.when_idle') = 1
+                THEN json_extract(j.plan_json, '$.resume.idle_deadline')
+                ELSE COALESCE(CAST(strftime('%s', j.updated_at) AS INTEGER), unixepoch()) + 1800 END
+            FROM targets t JOIN jobs j ON j.job_id = t.job_id
+            WHERE t.disposition = 'deferred';",
+        )?;
         secure_files(path)?;
         let store = Self {
             path: path.to_path_buf(),

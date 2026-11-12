@@ -10,8 +10,9 @@
 //!
 //! The service stops taking work the moment it cannot write: a journal or
 //! store failure halts the job before its next target and marks the service
-//! faulted. Nothing is retried or replayed; a restarted daemon finds the job
-//! unfinished and leaves it for a person (`swap_job` recovery).
+//! faulted. Started or uncertain attempts are left for a person after restart;
+//! untouched public targets may get fresh attempts under a bounded resume window.
+//! No effect is automatically replayed (`swap_job` recovery).
 
 mod resume;
 #[cfg(test)]
@@ -514,6 +515,10 @@ pub(crate) trait Engine: Send + Sync + 'static {
         let (request, step) = self.prepare_retry(request, planned, snapshot);
         (request, step, false)
     }
+    /// Only a complete backend scan can prove that its pane has gone.
+    fn pane_gone(&self, _planned: &PlannedTarget, _snapshot: &Snapshot) -> bool {
+        false
+    }
     /// Look at a target's pane now, read-only: a reason code.
     fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str;
     fn execute(
@@ -522,6 +527,40 @@ pub(crate) trait Engine: Send + Sync + 'static {
         target: &Self::Target,
         observer: &mut dyn EffectObserver,
     ) -> SwapOutcome;
+}
+
+fn registered_target<'a>(
+    agents: &'a [Agent],
+    conversation: &str,
+    pane: &str,
+    endpoint: &str,
+) -> Option<&'a Agent> {
+    agents.iter().find(|agent| {
+        agent.session_id == conversation
+            && agent.state != crate::event::AgentState::Stopped
+            && agent.pane.as_deref() == Some(pane)
+            && agent
+                .tmux_socket
+                .as_deref()
+                .is_none_or(|socket| account_swap::endpoint_key(pane, Some(socket)) == endpoint)
+    })
+}
+
+fn pane_absent(
+    pane: &str,
+    socket: Option<&str>,
+    observation: &crate::backend::PaneObservation,
+) -> bool {
+    observation.is_complete()
+        && !observation.panes.iter().any(|found| {
+            found.pane_id == pane
+                && found.socket.as_deref().is_none_or(|found_socket| {
+                    socket.is_none_or(|socket| {
+                        account_swap::endpoint_key(pane, Some(socket))
+                            == account_swap::endpoint_key(pane, Some(found_socket))
+                    })
+                })
+        })
 }
 
 /// The real thing: `account_swap`.
@@ -614,6 +653,21 @@ impl Engine for RealEngine {
             Step::Run(target) => EngineStep::Run(target),
         };
         (resolved, step, changed)
+    }
+
+    fn pane_gone(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> bool {
+        let kind = crate::backend::pane_id_host_kind(&planned.pane);
+        snapshot
+            .backends
+            .iter()
+            .filter(|backend| Some(backend.kind()) == kind)
+            .any(|backend| {
+                pane_absent(
+                    &planned.pane,
+                    planned.socket.as_deref(),
+                    &backend.observe_panes(),
+                )
+            })
     }
 
     fn observe(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> &'static str {
@@ -742,6 +796,14 @@ impl Engine for DaemonEngine {
                     testing::InertEngine::prepare_retry(request, planned, snapshot);
                 (request, step, false)
             }
+        }
+    }
+
+    fn pane_gone(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> bool {
+        match self {
+            Self::Real(engine) => engine.pane_gone(planned, snapshot),
+            #[cfg(feature = "test-support")]
+            Self::Inert(_) => false,
         }
     }
 
@@ -1184,6 +1246,8 @@ pub(crate) struct Service<E: Engine> {
     done: Mutex<HashMap<String, tokio::sync::watch::Sender<bool>>>,
     /// Shutting down: no new job is taken.
     draining: AtomicBool,
+    /// One dispatcher at a time; workers restart it when they defer again.
+    resumer_running: AtomicBool,
 }
 
 /// A persisted attempt, independent of its position in a resumed queue.
@@ -1222,6 +1286,7 @@ impl<E: Engine> Service<E> {
             ownership: None,
             done: Mutex::new(HashMap::new()),
             draining: AtomicBool::new(false),
+            resumer_running: AtomicBool::new(false),
         };
         // Upkeep a restart brings due at once: old evidence goes before any
         // job is taken.
@@ -1332,6 +1397,7 @@ impl<E: Engine> Service<E> {
         if tokio::time::timeout_at(deadline, barrier).await.is_err() {
             return false;
         }
+        // Catch submissions that passed the gate before the flag and registered after the first sweep.
         let draining = Arc::clone(&this);
         let sweep =
             tokio::task::spawn_blocking(move || draining.store.begin_drain(&draining.lease));
@@ -2010,6 +2076,9 @@ impl<E: Engine> Service<E> {
             }
             // Ended — finished, halted or panicked — whoever waits is woken.
             worker.ended(&worker_job);
+            if let Err(error) = Self::start_resumer(&worker) {
+                worker.set_fault(format!("could not restart swap resumer: {error}"));
+            }
         });
         let name = format!("swap-{}", &job[..job.len().min(13)]);
         if let Err(error) = (this.spawner)(name, work) {
@@ -2061,8 +2130,8 @@ impl<E: Engine> Service<E> {
         let mut adopted = adopted;
         let began = std::time::Instant::now();
         let mut pending: std::collections::VecDeque<_> = runs.into();
-        let deadline = match self.store.plan(job) {
-            Ok(plan) => plan.resume.map(|policy| policy.idle_deadline),
+        let accepted = match self.store.plan(job) {
+            Ok(plan) => plan,
             Err(error) => {
                 self.set_fault(format!(
                     "job {job}: could not read its accepted policy: {error}"
@@ -2070,6 +2139,7 @@ impl<E: Engine> Service<E> {
                 return;
             }
         };
+        let deadline = accepted.resume.as_ref().map(|policy| policy.idle_deadline);
         let mut next_poll = std::time::Instant::now();
         while let Some(AttemptRun {
             target_id,
@@ -2135,25 +2205,25 @@ impl<E: Engine> Service<E> {
                 }
             };
             if request.when_idle && !request.force {
-                let fresh = self.provider.snapshot().and_then(|snapshot| {
-                    snapshot
-                        .agents
-                        .into_iter()
-                        .find(|agent| {
-                            agent.session_id == identity.conversation_id
-                                && agent.pane.as_deref() == Some(&identity.pane)
-                                && agent.tmux_socket.as_deref().is_none_or(|socket| {
-                                    account_swap::endpoint_key(&identity.pane, Some(socket))
-                                        == identity.endpoint
-                                })
-                        })
-                        .ok_or_else(|| {
-                            "planned agent is no longer registered on its endpoint; left alone"
-                                .into()
-                        })
+                let fresh = self.provider.snapshot().map(|snapshot| {
+                    if attempt > 1
+                        && usize::try_from(target_id)
+                            .ok()
+                            .and_then(|id| accepted.targets.get(id))
+                            .is_some_and(|planned| self.engine.pane_gone(planned, &snapshot))
+                    {
+                        return None;
+                    }
+                    registered_target(
+                        &snapshot.agents,
+                        &identity.conversation_id,
+                        &identity.pane,
+                        &identity.endpoint,
+                    )
+                    .cloned()
                 });
                 match fresh {
-                    Ok(agent) if account_swap::waiting_for_idle(&agent) => {
+                    Ok(Some(agent)) if account_swap::waiting_for_idle(&agent) => {
                         if deadline.map_or_else(
                             || began.elapsed() >= request.idle_timeout,
                             |until| time::OffsetDateTime::now_utc().unix_timestamp() >= until,
@@ -2187,7 +2257,11 @@ impl<E: Engine> Service<E> {
                         }
                         continue;
                     }
-                    Ok(agent) => self.engine.refresh_agent(&mut target, &agent),
+                    Ok(Some(agent)) => self.engine.refresh_agent(&mut target, &agent),
+                    Ok(None) => {
+                        self.target_gone(job, target_id, attempt, report_index, &identity);
+                        continue;
+                    }
                     Err(_) if attempt > 1 => {
                         self.defer_run(job, target_id, attempt, &identity, "snapshot_unavailable");
                         continue;
@@ -2278,6 +2352,35 @@ impl<E: Engine> Service<E> {
                 self.set_fault(format!("job {job}: could not record its end: {error}"));
             }
         }
+    }
+
+    fn target_gone(
+        &self,
+        job: &str,
+        target: u32,
+        attempt: u32,
+        report_index: usize,
+        identity: &TargetIdentity,
+    ) {
+        if let Err(error) = self.store.finish_target_with_reason(
+            &self.lease,
+            job,
+            target,
+            attempt,
+            Disposition::Skipped,
+            Some("target_gone"),
+        ) {
+            self.set_fault(format!(
+                "job {job}: could not settle absent target {target}: {error}"
+            ));
+            return;
+        }
+        self.remember(
+            job,
+            report_index,
+            skipped_outcome(identity, "target gone; nothing was done"),
+        );
+        self.release(&identity.endpoint);
     }
 
     fn defer_run(

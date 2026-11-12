@@ -137,10 +137,19 @@ agent in the job is still being restarted. On startup, public jobs resume those
 targets automatically under the same job and request key. Each target gets a
 fresh attempt only after checking the original pane, conversation, process ID,
 and process start time, and keeps its originally assigned account. A positively
-changed process is skipped; unavailable snapshots or guards leave it deferred.
+changed process is skipped. A successfully read snapshot with no matching agent,
+or a complete backend scan with no matching pane, skips it as `target_gone`;
+nothing was done. Unavailable snapshots, guards, unreadable process bindings,
+and ambiguous bindings leave it deferred. Deferrals expire as `resume_window_expired`
+at the original idle deadline for idle-wait jobs, or 30 minutes after first
+deferral otherwise. The persisted window does not reset on another attempt or
+restart. Admission snapshots run outside the submission gate; unsuccessful
+passes back off from one to thirty seconds, and stop when no deferrals remain.
 The original idle deadline includes daemon downtime. `--cancel` also cancels
 deferred targets. Nothing that reached the start boundary is automatically
-replayed, even when it had not yet recorded an effect. Mixed jobs retain their
+replayed, even when it had not yet recorded an effect. Targets already stopped
+or typed into when the daemon went down still need a person to inspect them
+(`needs_reconciliation`). Mixed jobs retain their
 reconciliation warning while untouched siblings can resume.
 
 The daemon does not save follow-up text or drafts. Resuming may restore a newly

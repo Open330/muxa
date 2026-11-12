@@ -1,47 +1,126 @@
 //! Admission of fresh attempts for untouched targets after restart.
 use super::{
-    refusal, AccountChoice, Arc, AttemptRun, ContinueWhen, Engine, EngineStep, Ordering, Origin,
-    Service, SwapRequest, SwapScope, TextRef,
+    refusal, registered_target, AccountChoice, Arc, AttemptRun, ContinueWhen, Engine, EngineStep,
+    Ordering, Origin, Service, SwapRequest, SwapScope, TextRef,
 };
 
+/// Admission retries start at one second and stop growing at thirty.
+#[derive(Default)]
+pub(super) struct ResumeBackoff {
+    delay: u64,
+}
+
+impl ResumeBackoff {
+    pub(super) fn after_pass(&mut self, admitted: usize) -> std::time::Duration {
+        self.delay = if admitted > 0 {
+            1
+        } else {
+            self.delay.saturating_mul(2).clamp(1, 30)
+        };
+        std::time::Duration::from_secs(self.delay)
+    }
+}
+
 impl<E: Engine> Service<E> {
-    /// Retry unavailable snapshots/guards without claiming another attempt.
-    /// Weak ownership lets the daemon/service shut down normally.
+    /// Only run while deferrals exist. A worker that defers again restarts
+    /// admission; the final recheck closes the exit/worker handoff race.
     pub(super) fn start_resumer(this: &Arc<Self>) -> Result<(), String> {
+        if this.draining.load(Ordering::SeqCst)
+            || this.fault().is_some()
+            || this
+                .store
+                .deferred_jobs()
+                .map_err(|e| e.to_string())?
+                .is_empty()
+            || this.resumer_running.swap(true, Ordering::SeqCst)
+        {
+            return Ok(());
+        }
         let weak = Arc::downgrade(this);
-        std::thread::Builder::new()
+        let launched = std::thread::Builder::new()
             .name("swap-resume".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let Some(service) = weak.upgrade() else {
-                    break;
-                };
-                if service.draining.load(Ordering::SeqCst) {
-                    break;
-                }
-                if let Err(error) = Self::resume_pending(&service) {
-                    if !service.draining.load(Ordering::SeqCst) {
-                        service.set_fault(format!("could not resume deferred swap jobs: {error}"));
+            .spawn(move || {
+                let mut backoff = ResumeBackoff::default();
+                loop {
+                    let Some(service) = weak.upgrade() else {
+                        break;
+                    };
+                    if service.draining.load(Ordering::SeqCst) || service.fault().is_some() {
+                        service.resumer_running.store(false, Ordering::SeqCst);
+                        break;
                     }
-                    break;
+                    let admitted = match Self::resume_pending(&service) {
+                        Ok(count) => count,
+                        Err(error) => {
+                            if !service.draining.load(Ordering::SeqCst) {
+                                service.set_fault(format!(
+                                    "could not resume deferred swap jobs: {error}"
+                                ));
+                            }
+                            service.resumer_running.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    };
+                    let remaining = match service.store.deferred_jobs() {
+                        Ok(jobs) => jobs,
+                        Err(error) => {
+                            service.set_fault(format!("could not read deferred swaps: {error}"));
+                            service.resumer_running.store(false, Ordering::SeqCst);
+                            break;
+                        }
+                    };
+                    if remaining.is_empty() {
+                        service.resumer_running.store(false, Ordering::SeqCst);
+                        // A worker either sees false and launches a dispatcher,
+                        // or leaves a new deferral for this last recheck.
+                        match service.store.deferred_jobs() {
+                            Ok(jobs)
+                                if !jobs.is_empty() && !service.draining.load(Ordering::SeqCst) =>
+                            {
+                                if service.resumer_running.swap(true, Ordering::SeqCst) {
+                                    break;
+                                }
+                                continue;
+                            }
+                            Ok(_) => break,
+                            Err(error) => {
+                                service.set_fault(format!(
+                                    "could not recheck deferred swaps: {error}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                    let delay = backoff.after_pass(admitted);
+                    drop(service);
+                    std::thread::sleep(delay);
                 }
-            })
-            .map_err(|e| e.to_string())?;
+            });
+        if let Err(error) = launched {
+            this.resumer_running.store(false, Ordering::SeqCst);
+            return Err(error.to_string());
+        }
         Ok(())
     }
 
     #[allow(clippy::too_many_lines)] // admission, policy reconstruction, and fenced handover in order
-    pub(super) fn resume_pending(this: &Arc<Self>) -> Result<(), String> {
+    pub(super) fn resume_pending(this: &Arc<Self>) -> Result<usize, String> {
+        let jobs = this.store.deferred_jobs().map_err(|e| e.to_string())?;
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+        // A full provider read can be slow. New submissions can pass their
+        // gate while it runs; all journal decisions are rechecked below.
+        let snapshot = this.provider.snapshot().ok();
         let _gate = this
             .submit
             .lock()
             .map_err(|_| "swap submission lock poisoned")?;
         this.active()?;
-        for job in this.store.deferred_jobs().map_err(|e| e.to_string())? {
+        let mut admitted = 0;
+        for job in jobs {
             // Exactly one worker per job, including mixed jobs.
-            if this.receiver(&job).is_some() {
-                continue;
-            }
+            let worker_running = this.receiver(&job).is_some();
             let plan = this.store.plan(&job).map_err(|e| e.to_string())?;
             let status = this.store.status(&job).map_err(|e| e.to_string())?;
             let deferred: Vec<_> = status
@@ -73,12 +152,28 @@ impl<E: Engine> Service<E> {
                 }
                 continue;
             }
-            // Missing live data/guard is temporary; never settle on absence.
-            let Ok(snapshot) = this.provider.snapshot() else {
+            // Expiry is journal-only and works even when the provider is down.
+            let mut eligible = Vec::new();
+            for source in deferred {
+                if time::OffsetDateTime::now_utc().unix_timestamp()
+                    >= this
+                        .store
+                        .resume_deadline(&job, source.target_id, source.attempt)
+                        .map_err(|e| e.to_string())?
+                {
+                    skip(source, "resume_window_expired")?;
+                } else {
+                    eligible.push(source);
+                }
+            }
+            if worker_running {
+                continue;
+            }
+            let Some(snapshot) = snapshot.as_ref() else {
                 continue;
             };
             if snapshot.node_id != plan.node_id {
-                for target in deferred {
+                for target in eligible {
                     skip(target, "resume_node_changed")?;
                 }
                 continue;
@@ -89,18 +184,23 @@ impl<E: Engine> Service<E> {
             let mut runs = Vec::new();
             let mut taken = Vec::new();
             let mut resolved = None;
-            for source in deferred {
+            for source in eligible {
                 let Some(planned) = usize::try_from(source.target_id)
                     .ok()
                     .and_then(|id| plan.targets.get(id))
                 else {
                     return Err(format!("job {job} has an invalid target id"));
                 };
-                if policy.when_idle
-                    && !policy.force
-                    && time::OffsetDateTime::now_utc().unix_timestamp() >= policy.idle_deadline
+                if registered_target(
+                    &snapshot.agents,
+                    &planned.conversation_id,
+                    &planned.pane,
+                    &planned.endpoint,
+                )
+                .is_none()
+                    || this.engine.pane_gone(planned, snapshot)
                 {
-                    skip(source, "idle_timeout")?;
+                    skip(source, "target_gone")?;
                     continue;
                 }
                 let Some(account) = &planned.assigned_account else {
@@ -139,7 +239,7 @@ impl<E: Engine> Service<E> {
                 };
                 request.allow_direct_respawn = false;
                 let (request, step, changed) =
-                    this.engine.prepare_resume(&request, planned, &snapshot);
+                    this.engine.prepare_resume(&request, planned, snapshot);
                 let EngineStep::Run(target) = step else {
                     this.release(&planned.endpoint);
                     if changed {
@@ -193,17 +293,14 @@ impl<E: Engine> Service<E> {
                 if let Ok(mut live) = this.live.lock() {
                     live.remove(&job);
                 }
-                if let Err(error) =
-                    Self::spawn(this, &job, request, runs, None, taken.len(), &taken, None)
-                {
-                    if this.fault().is_some() {
-                        return Err(error);
-                    }
-                    // A refused thread launch did nothing and left its fresh
-                    // attempts deferred. The next pass may retry them.
+                let count = runs.len();
+                match Self::spawn(this, &job, request, runs, None, taken.len(), &taken, None) {
+                    Ok(()) => admitted += count,
+                    Err(error) if this.fault().is_some() => return Err(error),
+                    Err(_) => {} // No effects: worker launch left fresh attempts deferred.
                 }
             }
         }
-        Ok(())
+        Ok(admitted)
     }
 }
