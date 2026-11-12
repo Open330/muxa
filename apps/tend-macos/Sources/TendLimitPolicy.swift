@@ -197,6 +197,7 @@ struct TendLimitPolicyPicker: View {
                 Image(systemName: selected ? "largecircle.fill.circle" : "circle")
                     .foregroundStyle(selected ? Color.accentColor : Color.secondary)
                     .frame(width: 14)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 2) {
                     Label(policy.title, systemImage: policy.systemImage)
                         .font(TendType.detail.weight(selected ? .semibold : .regular))
@@ -213,5 +214,9 @@ struct TendLimitPolicyPicker: View {
         }
         .buttonStyle(.plain)
         .disabled(store.isMutating)
+        // The circle only draws the choice; say it as one radio-like
+        // element that reports whether it is the selected policy.
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? [.isButton, .isSelected] : [.isButton])
     }
 }

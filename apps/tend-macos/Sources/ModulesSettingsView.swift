@@ -48,6 +48,7 @@ private struct ModuleCard: View {
                     .font(.title3)
                     .foregroundStyle(isEnabled ? Color.accentColor : Color.secondary)
                     .frame(width: 24)
+                    .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
                     Text(verbatim: module.identity.title)
                         .font(.headline)

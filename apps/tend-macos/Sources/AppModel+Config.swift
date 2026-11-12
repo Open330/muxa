@@ -393,6 +393,12 @@ struct TendBehaviourSettings: Hashable, Sendable {
 
     static let daemonDefaults = TendBehaviourSettings()
 
+    /// Whether tendd actually posts desktop notifications: switched on *and*
+    /// given a delivery method. Enabled with Delivery off posts nothing.
+    var daemonPostsNotifications: Bool {
+        notifierEnabled && notifierBackend != .none
+    }
+
     static func read(from text: String) -> TendBehaviourSettings {
         var settings = TendBehaviourSettings()
         settings.notifierEnabled = TendTOMLPatcher.bool(

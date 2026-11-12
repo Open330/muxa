@@ -748,6 +748,8 @@ private struct AasAccountRow: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+                // Without a plan badge the summary describes the account.
+                .help(account.planText == nil ? headline : Text(verbatim: ""))
                 Spacer(minLength: 8)
                 if let plan = account.planText {
                     Text(verbatim: plan)
@@ -755,6 +757,7 @@ private struct AasAccountRow: View {
                         .padding(.horizontal, 6)
                         .padding(.vertical, 2)
                         .background(Color.accentColor.opacity(0.12), in: Capsule())
+                        .help(headline)
                 }
                 Button("New shell") {
                     Task { await module.openShell(for: account, model: model) }
@@ -782,10 +785,11 @@ private struct AasAccountRow: View {
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
-        .help(headline)
     }
 
-    /// aas's own `key=value` summary of the plan, on hover. Raw provider
+    /// aas's own `key=value` summary of the plan, on hover over the plan
+    /// badge (or the account name when there is no badge) — not the whole
+    /// row, whose buttons and meters have help of their own. Raw provider
     /// detail, so it stays out of the row itself.
     private var headline: Text { Text(verbatim: account.headline ?? "") }
 }

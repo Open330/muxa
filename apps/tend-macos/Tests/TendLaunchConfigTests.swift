@@ -28,6 +28,16 @@ private func launchFixture() -> TendLaunchSettings {
     #expect(settings.legacyGuide.options == ["legacy"])
 }
 
+/// Launch options read as arguments, not as Swift array syntax.
+@Test func launchOptionsDisplayAsSpaceSeparatedArguments() {
+    #expect(TendLaunchSettings.displayText([]) == "None")
+    #expect(TendLaunchSettings.displayText(["--x"]) == "--x")
+    #expect(TendLaunchSettings.displayText(["--model", "opus", "--yes"]) == "--model opus --yes")
+    // Boundaries stay visible where a space or an empty argument would hide them.
+    #expect(TendLaunchSettings.displayText(["--name", "two words", ""]) == #"--name "two words" """#)
+    #expect(TendLaunchSettings.displayText([#"say "hi""#]) == #""say \"hi\"""#)
+}
+
 @Test func launchConfigEditsPreserveNullEmptyAndArgumentBoundaries() throws {
     let baseline = launchFixture()
     #expect(baseline.edits(against: baseline).isEmpty)

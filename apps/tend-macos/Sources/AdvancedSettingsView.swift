@@ -199,7 +199,7 @@ struct AdvancedSettingsPane: View {
                         GroupBox("Legacy guide options") {
                             VStack(alignment: .leading, spacing: 6) {
                                 Text("[mcp.guide].options still supplies \(program)'s fallback. Provider defaults override it, even when empty. These legacy settings are preserved; edit them in Raw TOML if needed.")
-                                Text(verbatim: String(describing: settings.legacyGuide.options))
+                                Text(verbatim: TendLaunchSettings.displayText(settings.legacyGuide.options))
                                     .font(TendType.detail.monospaced())
                                     .textSelection(.enabled)
                             }
@@ -229,7 +229,7 @@ struct AdvancedSettingsPane: View {
                         let agent = settings.pipelines[index]
                         TendLaunchOptionsRow(
                             title: "\(agent.pipeline) / \(agent.name) · \(agent.program)",
-                            detail: "pipeline agent #\(agent.index + 1)",
+                            detail: String(localized: "pipeline agent #\(agent.index + 1)"),
                             inheritLabel: "Inherit provider defaults",
                             options: Binding(
                                 get: { store.launchDraft?.pipelines[index].options },
@@ -335,7 +335,7 @@ private struct TendLaunchOptionsRow: View {
                 } else {
                     Text(inheritLabel).font(TendType.detail).foregroundStyle(.secondary)
                 }
-                Text("Effective options: \(String(describing: effective))")
+                Text("Effective options: \(TendLaunchSettings.displayText(effective))")
                     .font(TendType.detail.monospaced())
                     .textSelection(.enabled)
             }

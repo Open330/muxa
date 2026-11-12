@@ -99,6 +99,17 @@ enum InstalledTools {
             .first { !$0.isEmpty }
     }
 
+    /// Pure helper (unit-tested): the tool and its version as one phrase,
+    /// without naming the tool twice when its version line already starts
+    /// with it (`tmux 3.5a`).
+    static func versionSummary(name: String, version: String?) -> String {
+        guard let version = version?.trimmingCharacters(in: .whitespaces), !version.isEmpty else {
+            return name
+        }
+        if version.lowercased().hasPrefix(name.lowercased() + " ") { return version }
+        return "\(name) \(version)"
+    }
+
     /// Version flags to try, in order. Most tools take `--version`; tmux only
     /// understands `-V` and prints its usage to stderr for anything else.
     static func versionArguments(for name: String) -> [[String]] {

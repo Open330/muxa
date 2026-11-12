@@ -73,3 +73,11 @@ import Testing
     #expect(InstalledTools.versionArguments(for: "claude").first == ["--version"])
     #expect(InstalledTools.versionArguments(for: "tmux").contains(["--version"]))
 }
+
+/// The provider card's "Installed" line names the tool once.
+@Test func installedToolsVersionSummaryNamesTheToolOnce() {
+    #expect(InstalledTools.versionSummary(name: "claude", version: "2.1.3 (Claude Code)") == "claude 2.1.3 (Claude Code)")
+    #expect(InstalledTools.versionSummary(name: "tmux", version: "tmux 3.5a") == "tmux 3.5a")
+    #expect(InstalledTools.versionSummary(name: "codex", version: nil) == "codex")
+    #expect(InstalledTools.versionSummary(name: "codex", version: "  ") == "codex")
+}

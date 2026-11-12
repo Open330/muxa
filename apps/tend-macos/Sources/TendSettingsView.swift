@@ -197,6 +197,7 @@ private struct TendMenuBarSettingsView: View {
             TendGlyphView(value: icon, size: 12)
                 .frame(width: 26, height: 26)
                 .background(TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                .accessibilityHidden(true)
             Text(verbatim: host.alias)
             Spacer()
             Menu {
@@ -213,6 +214,14 @@ private struct TendMenuBarSettingsView: View {
             .menuStyle(.borderlessButton)
             .fixedSize()
             .help("Choose a symbol")
+            .accessibilityLabel(Text("Choose a symbol"))
+            // A Form would put the field's own label beside it and squeeze
+            // both into the fixed width; the caption sits outside instead.
+            Text("Text")
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize()
+                .accessibilityHidden(true)
             TextField("Text", text: Binding(
                 get: { customText[host.alias] ?? (isCustomText ? String(icon.dropFirst(TendGlyph.textPrefix.count)) : "") },
                 set: { value in
@@ -221,7 +230,11 @@ private struct TendMenuBarSettingsView: View {
                     setIcon(cleaned.isEmpty ? nil : TendGlyph.text(cleaned), for: host.alias)
                 }
             ))
-            .frame(width: 54)
+            .labelsHidden()
+            .textFieldStyle(.roundedBorder)
+            .multilineTextAlignment(.center)
+            .frame(width: 48)
+            .accessibilityLabel(Text("Text"))
             .help("Up to two characters or an emoji instead of a symbol")
             if hostIcons[host.alias] != nil {
                 Button("Reset") {
@@ -435,12 +448,17 @@ private struct TendFleetSettingsRow: View {
                     .foregroundStyle(.tint)
             }
             .frame(width: 42, height: 42)
+            .accessibilityHidden(true)
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack(spacing: 7) {
+                    // The dot's colour is backed by the state in words, so
+                    // the state never rests on colour alone.
                     Circle().fill(stateColor).frame(width: 7, height: 7)
+                        .accessibilityHidden(true)
                     Text(host.alias).font(.headline)
                     Group {
+                        Text(verbatim: fleetHostStateLabel(host.state))
                         if host.local {
                             Text("Local")
                         } else {
