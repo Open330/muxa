@@ -860,11 +860,7 @@ impl Store {
         agent.state = AgentState::Working;
         // tend registered this task itself (`tend run`/`register`, a
         // tend-owned PTY), with the exact pid it tracks.
-        agent.state_source = Some(StateProvenance::advance(
-            agent.state_source,
-            StateSource::LaunchMark,
-            now,
-        ));
+        agent.state_source = Some(advance_state(&agent, StateSource::LaunchMark, now));
         agent.pid = pid;
         agent.last_prompt_at = command.as_ref().map(|_| now);
         agent.last_prompt = command;
@@ -1438,13 +1434,37 @@ fn hook_moved_session(agent: &Agent, id: &AgentId) -> bool {
 }
 
 /// The newest deterministic observation of `row`'s state, the watermark
-/// the precedence rule holds daemon observations to. A row restored from a
-/// snapshot written before provenance existed counts as hook-described at
-/// its last activity, unless it is a synthetic placeholder.
+/// the precedence rule holds daemon observations to. Rows from older
+/// snapshots are read the way they were written: a `state_source` without
+/// `deterministic_at` (#480) counts its own time when its source is
+/// deterministic, and a row with no `state_source` at all counts as
+/// hook-described at its last activity, unless it is a synthetic
+/// placeholder.
 pub(crate) fn deterministic_watermark(row: &Agent) -> Option<OffsetDateTime> {
     match row.state_source {
-        Some(provenance) => provenance.deterministic_at,
+        Some(provenance) => provenance.deterministic_at.or_else(|| {
+            provenance
+                .source
+                .is_deterministic()
+                .then_some(provenance.at)
+        }),
         None => (!is_synthetic(&row.session_id)).then_some(row.last_activity_at),
+    }
+}
+
+/// `row`'s provenance once `source` sets its state at `at`, carrying the
+/// row's deterministic watermark (including one inferred for an older
+/// snapshot's row) across a heuristic stamp.
+fn advance_state(row: &Agent, source: StateSource, at: OffsetDateTime) -> StateProvenance {
+    let carried = deterministic_watermark(row);
+    StateProvenance {
+        source,
+        at,
+        deterministic_at: if source.is_deterministic() {
+            Some(carried.map_or(at, |carried| carried.max(at)))
+        } else {
+            carried
+        },
     }
 }
 
@@ -1519,7 +1539,7 @@ fn reconcile_pane_for_started(
             && other.state != AgentState::Stopped
         {
             other.state = AgentState::Stopped;
-            other.state_source = Some(StateProvenance::advance(other.state_source, source, at));
+            other.state_source = Some(advance_state(other, source, at));
             other.last_activity_at = at;
         }
     }
@@ -1729,11 +1749,7 @@ impl Store {
             let now = OffsetDateTime::now_utc();
             let mut row = Agent::new(kind, session.into(), None, None, Some(cwd.into()), now);
             // tend is starting this Ask run itself.
-            row.state_source = Some(StateProvenance::advance(
-                row.state_source,
-                StateSource::Control,
-                now,
-            ));
+            row.state_source = Some(advance_state(&row, StateSource::Control, now));
             row
         });
         // A conversation may have been opened interactively since the last
@@ -1766,8 +1782,8 @@ impl Store {
                 .is_some_and(|o| o.execution_id == run)
         }) {
             row.state = AgentState::Stopped;
-            row.state_source = Some(StateProvenance::advance(
-                row.state_source,
+            row.state_source = Some(advance_state(
+                row,
                 StateSource::Control,
                 OffsetDateTime::now_utc(),
             ));
@@ -1904,6 +1920,10 @@ impl Store {
         // telemetry, and is never held back by it.
         let row = agents.get(&id.session_id);
         let verdict = match (admission, row) {
+            // A repair whose row has since been forgotten must not recreate it.
+            (Admission::RepairIfUnchanged { .. }, None) => {
+                Err(crate::provenance::Refusal::Superseded)
+            }
             (_, None) | (Admission::Ingested, _) => Ok(()),
             (_, Some(_)) if matches!(ev, AgentEvent::Heartbeat { .. }) => Ok(()),
             (Admission::Rule, Some(row)) => crate::provenance::admit(
@@ -2052,7 +2072,7 @@ impl Store {
         // Only an event that set or confirmed the state owns it: an Info
         // notification, a stale prompt or an ignored tool call does not.
         if asserted {
-            agent.state_source = Some(StateProvenance::advance(agent.state_source, source, at));
+            agent.state_source = Some(advance_state(agent, source, at));
         }
         if ingested {
             agent.last_event_at = Some(agent.last_event_at.map_or(at, |last| last.max(at)));
@@ -2071,7 +2091,7 @@ impl Store {
         {
             agent.state = AgentState::Stopped;
             agent.state_entered_at = at;
-            agent.state_source = Some(StateProvenance::advance(agent.state_source, source, at));
+            agent.state_source = Some(advance_state(agent, source, at));
         }
         if touches_activity {
             agent.last_activity_at = at;
@@ -2174,8 +2194,8 @@ impl Store {
         }
         let from = agent.state;
         agent.state = AgentState::Stopped;
-        agent.state_source = Some(StateProvenance::advance(
-            agent.state_source,
+        agent.state_source = Some(advance_state(
+            agent,
             StateSource::Control,
             OffsetDateTime::now_utc(),
         ));
@@ -2401,8 +2421,8 @@ impl Store {
             let previous = agent.state;
             if previous != AgentState::Stopped {
                 agent.state = AgentState::Stopped;
-                agent.state_source = Some(StateProvenance::advance(
-                    agent.state_source,
+                agent.state_source = Some(advance_state(
+                    agent,
                     StateSource::LaunchMark,
                     OffsetDateTime::now_utc(),
                 ));
@@ -2516,11 +2536,7 @@ impl Store {
             }
             let prev = agent.state;
             agent.state = AgentState::Idle;
-            agent.state_source = Some(StateProvenance::advance(
-                agent.state_source,
-                StateSource::Timing,
-                now,
-            ));
+            agent.state_source = Some(advance_state(agent, StateSource::Timing, now));
             agent.state_entered_at = now;
             agent.last_activity_at = now;
             flipped += 1;
@@ -2572,11 +2588,7 @@ impl Store {
         }
         let from = agent.state;
         agent.state = AgentState::Idle;
-        agent.state_source = Some(StateProvenance::advance(
-            agent.state_source,
-            StateSource::Screen,
-            at,
-        ));
+        agent.state_source = Some(advance_state(agent, StateSource::Screen, at));
         agent.state_entered_at = at;
         agent.last_notification = None;
         let _ = self.transitions.send(Transition {
@@ -2648,11 +2660,7 @@ impl Store {
             }
             let prev = agent.state;
             agent.state = AgentState::Stopped;
-            agent.state_source = Some(StateProvenance::advance(
-                agent.state_source,
-                StateSource::PaneInventory,
-                now,
-            ));
+            agent.state_source = Some(advance_state(agent, StateSource::PaneInventory, now));
             agent.state_entered_at = now;
             stopped += 1;
             let _ = self.transitions.send(Transition {
@@ -2727,11 +2735,7 @@ impl Store {
             let prev = agent.state;
             let now = OffsetDateTime::now_utc();
             agent.state = AgentState::Stopped;
-            agent.state_source = Some(StateProvenance::advance(
-                agent.state_source,
-                StateSource::ProcessExact,
-                now,
-            ));
+            agent.state_source = Some(advance_state(agent, StateSource::ProcessExact, now));
             agent.state_entered_at = now;
             // Touch last_activity_at so the GC's Stopped-row TTL is measured
             // from when the task died, not from registration — otherwise a
@@ -2805,11 +2809,7 @@ impl Store {
             let prev = agent.state;
             let now = OffsetDateTime::now_utc();
             agent.state = AgentState::Stopped;
-            agent.state_source = Some(StateProvenance::advance(
-                agent.state_source,
-                StateSource::Timing,
-                now,
-            ));
+            agent.state_source = Some(advance_state(agent, StateSource::Timing, now));
             agent.state_entered_at = now;
             // Measure the GC's Stopped-row TTL from when we gave up on the
             // row, not from its last real activity — otherwise a row already
@@ -2861,11 +2861,7 @@ impl Store {
             };
             let prev = agent.state;
             agent.state = AgentState::Stopped;
-            agent.state_source = Some(StateProvenance::advance(
-                agent.state_source,
-                StateSource::Timing,
-                now,
-            ));
+            agent.state_source = Some(advance_state(agent, StateSource::Timing, now));
             agent.state_entered_at = now;
             agent.last_activity_at = now;
             flipped += 1;
@@ -2953,11 +2949,7 @@ impl Store {
             let prev = agent.state;
             let now = OffsetDateTime::now_utc();
             agent.state = AgentState::Stopped;
-            agent.state_source = Some(StateProvenance::advance(
-                agent.state_source,
-                StateSource::Timing,
-                now,
-            ));
+            agent.state_source = Some(advance_state(agent, StateSource::Timing, now));
             agent.state_entered_at = now;
             // Measure the GC's Stopped-row TTL from when we gave up on the
             // row, not from its last real activity — same rationale as
@@ -3323,8 +3315,8 @@ impl Store {
             }
             if agent.ask_origin.is_some() && agent.state == AgentState::Stopped {
                 agent.state = AgentState::Starting;
-                agent.state_source = Some(StateProvenance::advance(
-                    agent.state_source,
+                agent.state_source = Some(advance_state(
+                    agent,
                     StateSource::ProcessExact,
                     OffsetDateTime::now_utc(),
                 ));
@@ -3530,8 +3522,8 @@ impl Store {
                 if let Some(previous) = agents.get_mut(&owner) {
                     previous.pane = None;
                     previous.state = AgentState::Stopped;
-                    previous.state_source = Some(StateProvenance::advance(
-                        previous.state_source,
+                    previous.state_source = Some(advance_state(
+                        previous,
                         StateSource::Correlation,
                         OffsetDateTime::now_utc(),
                     ));
@@ -3590,8 +3582,11 @@ impl Store {
                 let mut stopped = a.clone();
                 let from = stopped.state;
                 stopped.state = AgentState::Stopped;
-                stopped.state_source =
-                    Some(StateProvenance::new(StateSource::PaneInventory, reaped_at));
+                stopped.state_source = Some(advance_state(
+                    &stopped,
+                    StateSource::PaneInventory,
+                    reaped_at,
+                ));
                 stopped.state_entered_at = reaped_at;
                 stopped.last_activity_at = reaped_at;
                 stale_transitions.push(Transition {
@@ -9029,5 +9024,86 @@ mod tests {
             store.by_session("repair").await.unwrap().state,
             AgentState::Working
         );
+    }
+
+    /// Rows restored from older snapshots keep their deterministic
+    /// protection: a #480 row (`state_source` without `deterministic_at`)
+    /// and a pre-#480 row (no `state_source`) both resist a screen stop
+    /// after a screen refinement.
+    #[tokio::test]
+    async fn rows_from_older_snapshots_keep_their_deterministic_protection() {
+        use crate::provenance::StateSource;
+        let at = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        for drop_whole_source in [false, true] {
+            let mut row = stored_agent("legacy", AgentKind::ClaudeCode, AgentState::Idle, None);
+            row.last_activity_at = at;
+            row.state_source = Some(crate::provenance::StateProvenance::new(
+                StateSource::Hook,
+                at,
+            ));
+            let mut json = serde_json::to_value(&row).unwrap();
+            let fields = json.as_object_mut().unwrap();
+            if drop_whole_source {
+                fields.remove("state_source");
+            } else {
+                fields["state_source"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("deterministic_at");
+            }
+            let restored: Agent = serde_json::from_value(json).unwrap();
+            let store = Store::shared();
+            store.hydrate(vec![restored]).await;
+            let now = OffsetDateTime::now_utc();
+            store
+                .apply_observed(
+                    &AgentEvent::NotificationFired {
+                        id: id("legacy"),
+                        level: NotificationLevel::NeedsInput,
+                        message: "approve?".into(),
+                        at: now - time::Duration::seconds(1),
+                    },
+                    StateSource::Screen,
+                )
+                .await;
+            store
+                .apply_observed(
+                    &AgentEvent::SessionEnded {
+                        id: id("legacy"),
+                        at: now,
+                    },
+                    StateSource::Screen,
+                )
+                .await;
+            assert_eq!(
+                store.by_session("legacy").await.unwrap().state,
+                AgentState::WaitingInput,
+                "legacy format (whole source dropped: {drop_whole_source})"
+            );
+        }
+    }
+
+    /// A repair whose row was forgotten after it was read is not applied:
+    /// it would recreate the row.
+    #[tokio::test]
+    async fn a_repair_never_recreates_a_forgotten_row() {
+        use crate::provenance::StateSource;
+        let store = Store::shared();
+        let at = OffsetDateTime::now_utc() - time::Duration::minutes(1);
+        let repair = AgentEvent::TurnStopped {
+            id: AgentId {
+                kind: AgentKind::Codex,
+                ..id("gone")
+            },
+            response: Some("old".into()),
+            recap: None,
+            ai_title: None,
+            idle_confirmed: false,
+            at,
+        };
+        store
+            .apply_observed_repair_if_unchanged(&repair, StateSource::ProviderRecord, at)
+            .await;
+        assert!(store.by_session("gone").await.is_none());
     }
 }
