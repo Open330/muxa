@@ -20,8 +20,8 @@
 //!    accounts at all.
 
 use crate::account_swap::Candidate;
-use crate::accounts::{AccountProfile, AccountsConfig};
-pub use crate::swap_api::ProviderCandidates;
+use tend::accounts::{AccountProfile, AccountsConfig};
+pub use tend::swap_api::ProviderCandidates;
 
 /// The backend that serves one provider's accounts.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -191,6 +191,25 @@ mod tests {
         assert_eq!(
             backend_with("codex", &accounts, "aas", found),
             Backend::Aas("/opt/aas".into())
+        );
+    }
+
+    #[test]
+    fn candidates_carry_no_environment_values() {
+        let accounts = AccountsConfig {
+            claude: vec![AccountProfile {
+                name: "work".into(),
+                env: [("SECRET".into(), "private".into())].into(),
+                env_file: None,
+            }],
+            ..Default::default()
+        };
+        let listed = candidates("claude", &accounts, "/missing/aas");
+        let json = serde_json::to_string(&listed).unwrap();
+        assert!(json.contains("work"), "{json}");
+        assert!(
+            !json.contains("private") && !json.contains("SECRET"),
+            "{json}"
         );
     }
 }

@@ -331,6 +331,7 @@ pub(super) async fn main() -> Result<()> {
                 &cfg.swap,
                 &cfg.accounts,
                 args.config.as_deref(),
+                crate::account_module::unavailable(&cfg),
             )
             .await
         }

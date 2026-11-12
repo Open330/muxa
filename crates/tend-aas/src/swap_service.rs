@@ -23,13 +23,6 @@ use crate::account_swap::{
     self, AccountChoice, BareMode, ContinueEvidence, ContinueWhen, PreparedTarget, Step,
     SwapConfig, SwapOutcome, SwapRequest, SwapScope, SwapStatus, TargetIdentity,
 };
-use crate::backend::SharedBackend;
-use crate::event::AgentKind;
-use crate::state::Agent;
-pub use crate::swap_api::{
-    validate_key, Accepted, EntryView, JobRef, JobView, PlanView, RetryOverrides, StillDue,
-    SwapHealth, SwapJobs, SwapOverrides, SwapReadiness, UnopenedSwap,
-};
 use crate::swap_job::{
     request_digest, AcceptedPlan, Boundary, Disposition, JobError, Lease, Liveness, OwnerIdentity,
     PlannedTarget, ResumePolicy, SettledEntry, SwapJobStore, TextRef,
@@ -39,11 +32,18 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use tend::backend::SharedBackend;
+use tend::event::AgentKind;
+use tend::state::Agent;
+pub use tend::swap_api::{
+    validate_key, Accepted, EntryView, JobRef, JobView, PlanView, RetryOverrides, StillDue,
+    SwapHealth, SwapJobs, SwapOverrides, SwapReadiness, UnopenedSwap,
+};
 
 /// The job store schema this build writes and reads.
 pub const JOB_SCHEMA: i64 = crate::swap_job::SCHEMA_VERSION;
 
-/// [`SwapOverrides`] lives in [`crate::swap_api`]; the module completes it.
+/// [`SwapOverrides`] lives in [`tend::swap_api`]; the module completes it.
 pub trait ResolveOverrides {
     /// The request as `config` completes it.
     fn resolve(&self, config: &SwapConfig) -> Result<SwapRequest, String>;
@@ -74,7 +74,7 @@ impl ResolveOverrides for SwapOverrides {
         request.force = self.force;
         request.when_idle = self.when_idle;
         if let Some(timeout) = &self.idle_timeout {
-            request.idle_timeout = crate::automation::parse_duration(timeout)?
+            request.idle_timeout = tend::automation::parse_duration(timeout)?
                 .try_into()
                 .map_err(|_| "idle_timeout must be nonnegative")?;
         }
@@ -116,7 +116,7 @@ pub struct Snapshot {
     pub agents: Vec<Agent>,
     pub backends: Vec<SharedBackend>,
     pub config: SwapConfig,
-    pub accounts: crate::accounts::AccountsConfig,
+    pub accounts: tend::accounts::AccountsConfig,
     /// The configuration file the daemon loaded.
     pub config_path: Option<PathBuf>,
 }
@@ -194,7 +194,7 @@ impl PromptReceipts {
 
     /// Note one prompt hook, by who sent it and from where, under the number
     /// the store gave it; its text is not kept.
-    pub fn record(&self, record: &crate::state::PromptRecord) {
+    pub fn record(&self, record: &tend::state::PromptRecord) {
         let Ok(mut seen) = self.seen.lock() else {
             return;
         };
@@ -299,7 +299,7 @@ fn registered_target<'a>(
 ) -> Option<&'a Agent> {
     agents.iter().find(|agent| {
         agent.session_id == conversation
-            && agent.state != crate::event::AgentState::Stopped
+            && agent.state != tend::event::AgentState::Stopped
             && agent.pane.as_deref() == Some(pane)
             && agent
                 .tmux_socket
@@ -311,7 +311,7 @@ fn registered_target<'a>(
 fn pane_absent(
     pane: &str,
     socket: Option<&str>,
-    observation: &crate::backend::PaneObservation,
+    observation: &tend::backend::PaneObservation,
 ) -> bool {
     observation.is_complete()
         && !observation.panes.iter().any(|found| {
@@ -418,7 +418,7 @@ impl Engine for RealEngine {
     }
 
     fn pane_gone(&self, planned: &PlannedTarget, snapshot: &Snapshot) -> bool {
-        let kind = crate::backend::pane_id_host_kind(&planned.pane);
+        let kind = tend::backend::pane_id_host_kind(&planned.pane);
         snapshot
             .backends
             .iter()
@@ -776,7 +776,7 @@ pub fn automation_request_key(
 #[cfg(target_os = "linux")]
 fn owner_start(pid: u32) -> Option<String> {
     // Counted from boot, so scoped to that boot.
-    let start = crate::agent_conversation::process_start(pid)?;
+    let start = tend::agent_conversation::process_start(pid)?;
     let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
     Some(format!("{}:{start}", boot.trim()))
 }
@@ -2332,7 +2332,7 @@ fn planned_target(report_index: usize, identity: &TargetIdentity) -> PlannedTarg
     PlannedTarget {
         report_index,
         endpoint: identity.endpoint.clone(),
-        host: crate::backend::pane_id_host_kind(&identity.pane)
+        host: tend::backend::pane_id_host_kind(&identity.pane)
             .map_or_else(String::new, |host| host.to_string()),
         socket: identity.socket.clone(),
         pane: identity.pane.clone(),
@@ -2453,7 +2453,7 @@ pub mod testing {
         SwapOutcome {
             pane: pane.map(str::to_owned),
             agent_session_id: session.to_owned(),
-            kind: crate::event::AgentKind::ClaudeCode,
+            kind: tend::event::AgentKind::ClaudeCode,
             from: None,
             to: None,
             status,

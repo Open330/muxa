@@ -1752,7 +1752,7 @@ async fn call_tool_inner(
         }
         "tend_call_peer" => Ok(call_peer(client, &args, config).await),
         "tend_start_work" => Ok(start_work(client, &args, config).await),
-        "tend_swap_account" => Ok(swap_account(client, &args).await),
+        "tend_swap_account" => Ok(swap_account(client, &args, config).await),
         "tend_peer_report" => Ok(peer_report(client, &args).await),
         "tend_set_identity" => {
             let alias = args.get("alias").and_then(Value::as_str);
@@ -5398,12 +5398,19 @@ fn error_result(message: &str) -> Value {
 /// caller's own or one minted here before anything is sent, and every
 /// result carries it: the handle to find the job again. Nothing is ever
 /// sent twice. The caller's own pane is never swapped from under its call.
-async fn swap_account(client: &Client, args: &Value) -> Value {
+async fn swap_account(client: &Client, args: &Value, config: &tend::config::Config) -> Value {
     let host = tend::work_control::remote_host_alias(args.get("host").and_then(Value::as_str));
     let plan = match swap_plan(args, host, own_pane()) {
         Ok(plan) => plan,
         Err(error) => return swap_error(&SwapCall::rejected(host, args), &error),
     };
+    // Here, a start or retry needs the account module; a Fleet host
+    // decides for itself, and reading a job never needs it.
+    if host.is_none() && matches!(plan.action, SwapAction::Swap | SwapAction::Retry) {
+        if let Some(why) = crate::account_module::unavailable(config) {
+            return swap_error(&plan.call(host), &format!("{why}; nothing was sent"));
+        }
+    }
     if plan.action == SwapAction::Retry && host.is_none() {
         if let Err(error) =
             retry_spares_caller(client, plan.job.as_deref(), own_pane().as_deref()).await
@@ -5684,9 +5691,9 @@ async fn retry_spares_caller(
         .strip_prefix("swap-")
         .is_some_and(|uuid| uuid::Uuid::parse_str(uuid).is_ok())
     {
-        tend::swap_service::JobRef::Id(parent.to_owned())
+        tend::swap_api::JobRef::Id(parent.to_owned())
     } else {
-        tend::swap_service::JobRef::Key(parent.to_owned())
+        tend::swap_api::JobRef::Key(parent.to_owned())
     };
     let view = client
         .swap_job_status(&parent_ref)
@@ -5782,7 +5789,7 @@ fn swap_reply(
 fn typed_payload(plan: &SwapPlan, stdout: &str) -> Option<Value> {
     match plan.action {
         SwapAction::Status | SwapAction::Cancel => {
-            serde_json::from_str::<tend::swap_service::JobView>(stdout)
+            serde_json::from_str::<tend::swap_api::JobView>(stdout)
                 .ok()
                 .and_then(|view| serde_json::to_value(view).ok())
         }
@@ -5794,7 +5801,7 @@ fn typed_payload(plan: &SwapPlan, stdout: &str) -> Option<Value> {
                     .all(|field| !field.trim().is_empty())
             })
             .and_then(|ack| serde_json::to_value(ack).ok()),
-        _ => serde_json::from_str::<Vec<tend::account_swap::SwapOutcome>>(stdout)
+        _ => serde_json::from_str::<Vec<tend::swap_api::SwapOutcome>>(stdout)
             .ok()
             .and_then(|outcomes| serde_json::to_value(outcomes).ok()),
     }
@@ -6047,10 +6054,10 @@ mod tests {
     /// A daemon whose one job planned pane `%9`.
     struct OneJob;
 
-    impl tend::swap_service::SwapJobs for OneJob {
-        fn health(&self) -> tend::swap_service::SwapHealth {
-            tend::swap_service::SwapHealth {
-                readiness: tend::swap_service::SwapReadiness::Ready,
+    impl tend::swap_api::SwapJobs for OneJob {
+        fn health(&self) -> tend::swap_api::SwapHealth {
+            tend::swap_api::SwapHealth {
+                readiness: tend::swap_api::SwapReadiness::Ready,
                 reason: None,
                 schema: Some(2),
                 expected_schema: 2,
@@ -6064,35 +6071,29 @@ mod tests {
         }
         fn plan(
             &self,
-            _: &tend::swap_service::SwapOverrides,
-        ) -> Result<tend::swap_service::PlanView, String> {
+            _: &tend::swap_api::SwapOverrides,
+        ) -> Result<tend::swap_api::PlanView, String> {
             Err("no".into())
         }
         fn submit(
             &self,
             _: &str,
-            _: &tend::swap_service::SwapOverrides,
-        ) -> Result<tend::swap_service::Accepted, String> {
+            _: &tend::swap_api::SwapOverrides,
+        ) -> Result<tend::swap_api::Accepted, String> {
             Err("no".into())
         }
         fn retry(
             &self,
             _: &str,
-            _: &tend::swap_service::JobRef,
-            _: &tend::swap_service::RetryOverrides,
-        ) -> Result<tend::swap_service::Accepted, String> {
+            _: &tend::swap_api::JobRef,
+            _: &tend::swap_api::RetryOverrides,
+        ) -> Result<tend::swap_api::Accepted, String> {
             Err("no".into())
         }
-        fn cancel(
-            &self,
-            _: &tend::swap_service::JobRef,
-        ) -> Result<tend::swap_service::JobView, String> {
+        fn cancel(&self, _: &tend::swap_api::JobRef) -> Result<tend::swap_api::JobView, String> {
             Err("no".into())
         }
-        fn status(
-            &self,
-            _: &tend::swap_service::JobRef,
-        ) -> Result<tend::swap_service::JobView, String> {
+        fn status(&self, _: &tend::swap_api::JobRef) -> Result<tend::swap_api::JobView, String> {
             Ok(serde_json::from_value(json!({
                 "job_id": "swap-1", "node_id": "n", "state": "done", "revision": 1,
                 "reason": null, "fault": null,

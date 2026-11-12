@@ -3131,6 +3131,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "tend-aas"
+version = "0.10.11"
+dependencies = [
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "strum",
+ "sysinfo",
+ "tempfile",
+ "tend",
+ "thiserror 2.0.21",
+ "time",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "tend-cli"
 version = "0.10.11"
 dependencies = [
@@ -3155,6 +3175,7 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "tend",
+ "tend-aas",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -3176,6 +3197,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tend",
+ "tend-aas",
  "time",
  "tokio",
  "tracing",

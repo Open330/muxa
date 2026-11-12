@@ -175,7 +175,7 @@ pub(crate) struct Resolved {
     /// rather than failing the launch.
     states: HashMap<String, AgentState>,
     /// `[agent.<program>].account` for each provider that sets one.
-    accounts: Vec<tend::account_route::AccountRoute>,
+    accounts: Vec<tend::swap_api::AccountRoute>,
 }
 
 pub async fn run(
@@ -765,8 +765,8 @@ pub(crate) async fn resolve(
     })
 }
 
-fn account_routes(config: &Config) -> Vec<tend::account_route::AccountRoute> {
-    tend::account_route::PROVIDERS
+fn account_routes(config: &Config) -> Vec<tend::swap_api::AccountRoute> {
+    tend::swap_api::PROVIDERS
         .iter()
         .filter_map(|program| config.account_route(program))
         .collect()

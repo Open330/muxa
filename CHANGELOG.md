@@ -81,6 +81,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Account swapping is now an optional module, `tend-aas`. It covers
+  `tend swap`, the `swap_account` automation action, `tend_swap_account`,
+  swap jobs and `[agent.<program>].account` launches. A config switch,
+  `[modules] accounts = true | false`, turns it on or off. When the switch is
+  unset, the module is on only if the config already uses accounts
+  (`[agent.<program>].account`, `[[accounts.<provider>]]`, a `swap_account`
+  rule, or a `[swap]` table). A fresh install leaves it off, and an existing
+  swap setup keeps working after the upgrade with no edit. `tend doctor`
+  reports the module's state, and if this host has swap jobs from before
+  while the module is off, it names the line to add. With the module off,
+  `tend swap` and `tend_swap_account` say "the account module is not
+  enabled" and send nothing, an account-routed launch starts the agent bare
+  and says why, and a usage limit still shows as attention and still fires
+  `resume-after-limit`. Release builds include the module (cargo feature
+  `aas`, on by default); `--no-default-features` builds `tend` and `tendd`
+  without it.
 - tendd now bounds the files it used to grow forever. The collaboration audit
   ledger rotates to `collaboration-audit.ndjson.1` at 8 MiB
   (`[storage].audit_max_bytes`); `backups/` under the data directory keeps the

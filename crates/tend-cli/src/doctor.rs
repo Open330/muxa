@@ -64,9 +64,7 @@ pub async fn run(socket: PathBuf, config: Option<&Path>, verbose: bool) -> Resul
     }
     // Its own check, on any daemon that answered: a failed verdict on
     // something else (a corrupt mailbox) never hides why swaps are down.
-    if responded {
-        add(&mut report, "tendd", None, check_swap(&socket).await);
-    }
+    check_accounts(&mut report, config, &socket, responded).await;
     add(&mut report, "tendd", None, check_service_manager());
     add(&mut report, "tendd", None, check_unit_file());
     // Recent tendd errors. These are warnings, not failures: a stale ERROR
@@ -344,6 +342,81 @@ fn tendd_hello_verdict(hello: &tend::ipc::Hello, socket: &Path) -> CheckResult {
     CheckResult::Ok(format!("tendd responding at {}", socket.display()))
 }
 
+/// The account module's switch, then (when it is on and the daemon
+/// answered) whether the daemon's swap service takes jobs.
+async fn check_accounts(
+    report: &mut Report,
+    config: Option<&Path>,
+    socket: &Path,
+    responded: bool,
+) {
+    let accounts = tend::Config::load_or_default(config)
+        .map(|cfg| cfg.accounts_module())
+        .ok();
+    add(
+        report,
+        "tendd",
+        None,
+        accounts_module_verdict(
+            accounts.as_ref(),
+            crate::account_module::COMPILED,
+            swap_store_exists(),
+        ),
+    );
+    if responded && accounts.as_ref().is_none_or(|module| module.enabled) {
+        add(report, "tendd", None, check_swap(socket).await);
+    }
+}
+
+/// Whether a swap job store from an earlier run is on this host: evidence
+/// it swapped before, whatever its config says now.
+fn swap_store_exists() -> bool {
+    tend::paths::data_dir().is_some_and(|dir| dir.join("tend").join("swap-jobs.sqlite3").exists())
+}
+
+/// Whether the optional account module is on, and exactly what to switch on
+/// when a host that swapped before would lose it.
+fn accounts_module_verdict(
+    module: Option<&tend::swap_api::ModuleSwitch>,
+    compiled: bool,
+    swapped_before: bool,
+) -> CheckResult {
+    const SWITCH: &str = "add `[modules]\naccounts = true` to config.toml and restart tendd";
+    let Some(module) = module else {
+        return CheckResult::Warn("account module: unknown (config did not load)".into());
+    };
+    if module.enabled && !compiled {
+        return CheckResult::Fail(format!(
+            "account module: this config needs it ({}), but this build has none: {}",
+            if module.explicit {
+                "[modules] accounts = true".to_owned()
+            } else {
+                module.uses.join(", ")
+            },
+            tend::swap_api::module_unavailable(false)
+        ));
+    }
+    match (module.enabled, module.explicit) {
+        (true, true) => CheckResult::Ok("account module: on ([modules] accounts = true)".into()),
+        (true, false) => CheckResult::Ok(format!(
+            "account module: on, because this config uses {}",
+            module.uses.join(", ")
+        )),
+        (false, true) => CheckResult::Ok(
+            "account module: off ([modules] accounts = false); tend swap and swap_account rules refuse"
+                .into(),
+        ),
+        (false, false) if swapped_before => CheckResult::Warn(format!(
+            "account module: off, but this host has swap jobs from before (swap-jobs.sqlite3); \
+             to keep `tend swap`, `tend_swap_account` and swap_account rules, {SWITCH}"
+        )),
+        (false, false) => CheckResult::Ok(
+            "account module: off (optional; `[modules] accounts = true` turns on account swapping)"
+                .into(),
+        ),
+    }
+}
+
 /// Whether the daemon's swap service takes jobs, and if not why: read-only,
 /// bounded, and never a plan.
 async fn check_swap(socket: &Path) -> CheckResult {
@@ -372,11 +445,11 @@ enum Probe {
     NotOffered,
     /// Swap jobs, but no health endpoint: an older daemon.
     NoHealth,
-    Health(tend::swap_service::SwapHealth),
+    Health(tend::swap_api::SwapHealth),
 }
 
 fn swap_verdict(probe: &Probe) -> CheckResult {
-    use tend::swap_service::SwapReadiness;
+    use tend::swap_api::SwapReadiness;
     let health = match probe {
         Probe::NotOffered => {
             return CheckResult::Ok(
@@ -1436,11 +1509,11 @@ fn uid_string() -> String {
 #[cfg(test)]
 mod tests {
     fn health(
-        readiness: tend::swap_service::SwapReadiness,
+        readiness: tend::swap_api::SwapReadiness,
         reason: Option<&str>,
         schema: Option<i64>,
     ) -> Probe {
-        Probe::Health(tend::swap_service::SwapHealth {
+        Probe::Health(tend::swap_api::SwapHealth {
             readiness,
             reason: reason.map(str::to_owned),
             schema,
@@ -1455,7 +1528,7 @@ mod tests {
     /// service taking jobs (or no service at all) is OK.
     #[test]
     fn the_swap_verdict_names_each_state() {
-        use tend::swap_service::SwapReadiness::{Draining, Halted, Ready, Unavailable};
+        use tend::swap_api::SwapReadiness::{Draining, Halted, Ready, Unavailable};
         let text = |result: &CheckResult| match result {
             CheckResult::Ok(t) | CheckResult::Warn(t) | CheckResult::Fail(t) => t.clone(),
         };
@@ -1502,6 +1575,37 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn the_account_module_verdict_says_what_to_switch_on() {
+        use tend::swap_api::ModuleSwitch;
+        let off = ModuleSwitch {
+            enabled: false,
+            uses: Vec::new(),
+            explicit: false,
+        };
+        assert!(matches!(
+            accounts_module_verdict(Some(&off), true, false),
+            CheckResult::Ok(_)
+        ));
+        let CheckResult::Warn(warn) = accounts_module_verdict(Some(&off), true, true) else {
+            panic!("a host that swapped before is warned");
+        };
+        assert!(warn.contains("accounts = true"), "{warn}");
+        let used = ModuleSwitch {
+            enabled: true,
+            uses: vec!["[agent.claude].account".into()],
+            explicit: false,
+        };
+        let CheckResult::Ok(on) = accounts_module_verdict(Some(&used), true, true) else {
+            panic!("auto-on is fine");
+        };
+        assert!(on.contains("[agent.claude].account"), "{on}");
+        assert!(matches!(
+            accounts_module_verdict(Some(&used), false, false),
+            CheckResult::Fail(_)
+        ));
+    }
 
     #[test]
     fn same_version_daemon_without_spawn_coordination_still_warns() {
@@ -2237,8 +2341,8 @@ esac
             tend::collaboration::CollaborationOptions::default(),
             "corrupt durable mailbox".into(),
         );
-        let unopened: std::sync::Arc<dyn tend::swap_service::SwapJobs> =
-            std::sync::Arc::new(tend::swap_service::UnopenedSwap::new(
+        let unopened: std::sync::Arc<dyn tend::swap_api::SwapJobs> =
+            std::sync::Arc::new(tend::swap_api::UnopenedSwap::new(
                 "swap jobs are owned by another live manager (pid 7)".into(),
                 2,
             ));

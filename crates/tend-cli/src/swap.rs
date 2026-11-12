@@ -7,19 +7,24 @@
 //! planned. A daemon from before swap jobs, or `--local`, means the whole
 //! swap runs here, as [`tend::account_swap::run`].
 
+// Without the account module only the parts that read a job are reachable;
+// the rest stays compiled so both builds share one source.
+#![cfg_attr(not(feature = "aas"), allow(dead_code, unused_imports))]
+
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, ValueEnum};
 use std::fmt::Write as _;
 use std::future::Future;
 use std::path::Path;
 use std::time::Duration;
-use tend::account_swap::{
-    self, AccountChoice, BareMode, ContinueWhen, DirectTarget, SwapConfig, SwapOutcome,
-    SwapRequest, SwapScope, SwapStatus,
-};
 use tend::event::AgentKind;
 use tend::ipc::{Client, RuntimeError};
-use tend::swap_service::{Accepted, EntryView, JobRef, JobView, SwapOverrides};
+use tend::swap_api::{Accepted, EntryView, JobRef, JobView, SwapOverrides};
+use tend::swap_api::{
+    BareMode, ContinueEvidence, ContinueWhen, DirectTarget, SwapConfig, SwapOutcome, SwapStatus,
+};
+#[cfg(feature = "aas")]
+use tend_aas::account_swap::{self, AccountChoice, SwapRequest, SwapScope};
 
 /// Move agents whose account ran out onto another account, resuming each
 /// conversation in place.
@@ -237,6 +242,7 @@ const CONTINUE_DEPRECATED: &str = "tend swap: --continue is deprecated; use --co
      It now keeps the configured continue_when policy (only agents whose turn was cut off); \
      add --continue-when always to send it to every swapped agent";
 
+#[cfg(feature = "aas")]
 fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
     let scope = if !args.targets.is_empty() {
         SwapScope::Targets(args.targets.clone())
@@ -275,8 +281,8 @@ fn request(args: &Args, config: &SwapConfig) -> SwapRequest {
     }
     if let Some(evidence) = args.continue_evidence {
         request.continue_evidence = match evidence {
-            Evidence::Binding => account_swap::ContinueEvidence::Binding,
-            Evidence::Verified => account_swap::ContinueEvidence::Verified,
+            Evidence::Binding => ContinueEvidence::Binding,
+            Evidence::Verified => ContinueEvidence::Verified,
         };
     }
     request.dry_run = args.dry_run;
@@ -290,12 +296,20 @@ pub(crate) async fn run(
     config: &SwapConfig,
     accounts: &tend::accounts::AccountsConfig,
     explicit_config: Option<&Path>,
+    module_unavailable: Option<String>,
 ) -> Result<()> {
     if args.continue_legacy.is_some() {
         eprintln!("{CONTINUE_DEPRECATED}");
     }
+    // A Fleet host decides for itself whether it runs the account module.
     if let Some(host) = tend::work_control::remote_host_alias(args.host.as_deref()) {
         return run_remote(client, &args, host).await;
+    }
+    // Reading or cancelling a job the daemon already has stays possible;
+    // anything that would start a swap needs the module.
+    let reads_a_job = args.status.is_some() || args.cancel.is_some();
+    if let Some(why) = module_unavailable.filter(|_| !reads_a_job) {
+        bail!("tend swap: {why}. Nothing was sent.");
     }
     // Reading a job never depends on the service taking new ones.
     if args.wait_secs.is_some() && args.status.is_none() && args.cancel.is_none() {
@@ -310,8 +324,28 @@ pub(crate) async fn run(
     if let Some(parent) = &args.retry {
         return run_retry(client, &args, parent, explicit_config).await;
     }
+    #[cfg(not(feature = "aas"))]
+    {
+        let _ = (config, accounts, explicit_config);
+        bail!("tend swap: {}", tend::swap_api::module_unavailable(false));
+    }
+    #[cfg(feature = "aas")]
+    {
+        run_swap(client, &args, config, accounts, explicit_config).await
+    }
+}
+
+/// A swap that starts something: as a daemon job, or here.
+#[cfg(feature = "aas")]
+async fn run_swap(
+    client: &Client,
+    args: &Args,
+    config: &SwapConfig,
+    accounts: &tend::accounts::AccountsConfig,
+    explicit_config: Option<&Path>,
+) -> Result<()> {
     if args.local {
-        return run_local(client, &args, config, accounts).await;
+        return run_local(client, args, config, accounts).await;
     }
     let hello = client.hello(HELLO_TIMEOUT).await.map_err(|error| {
         anyhow!(
@@ -327,7 +361,7 @@ pub(crate) async fn run(
         route => route,
     };
     match route {
-        Route::Daemon => run_routed(client, &args, config, accounts, explicit_config).await,
+        Route::Daemon => run_routed(client, args, config, accounts, explicit_config).await,
         Route::Unavailable => bail!("{UNAVAILABLE}"),
         // A relayed swap names its key: it must become that job, never an
         // in-process swap the caller cannot find again.
@@ -339,7 +373,7 @@ pub(crate) async fn run(
         }
         Route::Legacy => {
             eprintln!("tend swap: this daemon predates swap jobs; swapping in this process");
-            run_local(client, &args, config, accounts).await
+            run_local(client, args, config, accounts).await
         }
     }
 }
@@ -393,6 +427,7 @@ fn route(capabilities: &[String]) -> Route {
     }
 }
 
+#[cfg(feature = "aas")]
 /// The whole swap in this process.
 async fn run_local(
     client: &Client,
@@ -633,7 +668,7 @@ async fn run_retry(
              unavailable); nothing was sent"
         );
     }
-    let overrides = tend::swap_service::RetryOverrides {
+    let overrides = tend::swap_api::RetryOverrides {
         continue_evidence: args.continue_evidence.map(|e| e.as_str().to_owned()),
         force: args.force,
         caller_config: explicit_config.map(Path::to_path_buf),
@@ -778,6 +813,7 @@ async fn run_cancel(client: &Client, text: &str, json: bool, wait: Option<u64>) 
     job_verdict(&view, text, true)
 }
 
+#[cfg(feature = "aas")]
 /// The daemon-owned swap, with any direct panes swapped here afterwards.
 async fn run_routed(
     client: &Client,
@@ -892,6 +928,7 @@ fn skipped_direct(direct: &[DirectTarget]) -> String {
     )
 }
 
+#[cfg(feature = "aas")]
 /// The planned direct panes, swapped here: the request's own scope, bound
 /// to exactly the agents the daemon planned.
 async fn run_planned_direct(
@@ -1636,7 +1673,7 @@ fn render(outcomes: &[SwapOutcome]) -> String {
     out
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "aas"))]
 mod tests {
     use super::*;
     use clap::Parser;
@@ -1897,7 +1934,7 @@ mod tests {
         let cli = Cli::parse_from(["swap", "%5", "--continue-evidence", "verified"]);
         assert_eq!(
             request(&cli.args, &SwapConfig::default()).continue_evidence,
-            account_swap::ContinueEvidence::Verified
+            ContinueEvidence::Verified
         );
         assert_eq!(
             overrides(&cli.args, None).continue_evidence.as_deref(),
@@ -1938,7 +1975,7 @@ mod tests {
         );
         // The follow-up's journalled evidence is shown after a restart too.
         entry.continuation = Some("allowed".into());
-        entry.follow_up = Some(account_swap::FollowUpReport {
+        entry.follow_up = Some(tend::swap_api::FollowUpReport {
             kept: false,
             submission: "delivered".into(),
             evidence: Some("prompt_hook".into()),
@@ -2766,7 +2803,7 @@ mod tests {
         ]);
         let request = overrides(&cli.args, None);
         let resolved =
-            tend::swap_service::ResolveOverrides::resolve(&request, &SwapConfig::default())
+            tend_aas::swap_service::ResolveOverrides::resolve(&request, &SwapConfig::default())
                 .unwrap();
         assert_eq!(resolved.to, AccountChoice::Same);
         assert!(resolved.when_idle);

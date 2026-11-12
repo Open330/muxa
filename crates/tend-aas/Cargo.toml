@@ -1,0 +1,37 @@
+[package]
+name = "tend-aas"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Optional tend module: move agents between accounts (configured profiles or aas) and resume them."
+
+[features]
+# A swap service over an inert engine, for daemon tests. Never in a release.
+test-support = []
+
+[dependencies]
+tend = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+strum = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+rusqlite = { workspace = true }
+sha2 = "0.10"
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+sysinfo = { version = "0.37.2", default-features = false, features = ["system"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tempfile = "3"
+toml = { workspace = true }
+
+[lints]
+workspace = true

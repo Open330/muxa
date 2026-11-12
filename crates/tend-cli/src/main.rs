@@ -1,5 +1,6 @@
 //! tend CLI — user-facing entry point.
 
+mod account_module;
 mod activity_query;
 mod agent_find;
 mod agent_launch;

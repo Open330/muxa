@@ -41,6 +41,9 @@ jobs:
       # `dashboard` there. This builds the CLI side the way `cargo install
       # --path crates/tend-cli` does, without the dashboard server.
       - run: cargo clippy -p tend -p tend-cli --all-targets -- -D warnings
+      # The account module (`tend-aas`) is optional: tend and tendd must also
+      # build, lint clean and answer "not in this build" without it.
+      - run: cargo clippy -p tend-cli -p tendd --no-default-features --all-targets -- -D warnings
 
   test:
     name: test
