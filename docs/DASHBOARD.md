@@ -518,13 +518,12 @@ stream with the same access rules, validation and `Cache-Control: no-store` as
 ### Nerd Font glyphs
 
 Shell prompts (powerlevel10k, starship) and agent status lines often print
-Nerd Font icons, which live in Unicode's Private Use Areas. The dashboard,
-including the shared-pane page, bundles a subset of **Symbols Nerd Font Mono**
+Nerd Font icons, which live in Unicode's Private Use Areas. The dashboard
+bundles a subset of **Symbols Nerd Font Mono**
 and lists it after the primary monospace font with a `unicode-range` of
 U+E000–U+F8FF and U+F0000–U+FFFFF, so ordinary text keeps your system's
 monospace font and browsers fetch the icon font (about 1.2 MB, served from
-`/static/fonts/`) only when output actually contains such a glyph. The
-shared-pane page's Content-Security-Policy allows it with `font-src 'self'`.
+`/static/fonts/`) only when output actually contains such a glyph.
 See [Third-party notices](#third-party-notices).
 
 ## Starting work from the board

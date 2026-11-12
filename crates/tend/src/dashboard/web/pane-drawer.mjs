@@ -221,7 +221,7 @@ export function createPaneDrawer(deps) {
         } else if (state === "denied") {
           stream = null;
           denied = true;
-          setStatus("Output needs operator access. Sign in or unlock edit.");
+          setStatus("Output needs operator access. Unlock edit with the dashboard token.");
         } else if (state === "unsupported") {
           // An older daemon: poll /output instead.
           stream = null;
@@ -254,7 +254,7 @@ export function createPaneDrawer(deps) {
       try { payload = await resp.json(); } catch (_) { /* status-only rejection */ }
       if (resp.status === 401 || resp.status === 403) {
         denied = true;
-        setStatus("Output needs operator access. Sign in or unlock edit.");
+        setStatus("Output needs operator access. Unlock edit with the dashboard token.");
         return;
       }
       if (!resp.ok) {
@@ -439,7 +439,7 @@ export function createPaneDrawer(deps) {
     close,
     isOpen,
     target: () => (target ? { ...target } : null),
-    /// Re-read access and metadata (after a sign-in change or a data poll).
+    /// Re-read access and metadata (after an access change or a data poll).
     refreshAccess() {
       if (!isOpen()) return;
       const operator = deps.isOperator();
