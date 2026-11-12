@@ -4,10 +4,15 @@
 //! Claude Code writes `<config dir>/sessions/<pid>.json` for each running
 //! interactive session: its pid, the conversation (`sessionId`) and
 //! `procStart`, the process's start time. On Linux `procStart` is field 22 of
-//! `/proc/<pid>/stat` (clock ticks since boot) written as a decimal string,
-//! so a file left behind by an exited process whose pid was reused does not
-//! match the new one. Elsewhere the start time is not compared and the
+//! `/proc/<pid>/stat` (clock ticks since boot) written as a decimal string;
+//! on macOS it is `ps -o lstart` read in UTC (`Thu Nov 12 05:42:03 2026`).
+//! Either way a file left behind by an exited process whose pid was reused
+//! does not match the new one. Where the start time cannot be read the
 //! conversation stays unknown: a pid alone is not an identity.
+//!
+//! Codex keeps the rollout it appends to open for the life of the thread
+//! (`<CODEX_HOME>/sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl`),
+//! so the thread a TUI process is on is the one its own open rollout names.
 //!
 //! A swap stops and relaunches the agent, so a guess is worse than nothing:
 //! an unreadable process, a missing file and files that disagree all come
@@ -78,7 +83,7 @@ pub fn claude_conversation_from(
     };
     let mut ids: Vec<&str> = files
         .iter()
-        .filter(|file| file.pid == pid && file.proc_start == start)
+        .filter(|file| file.pid == pid && same_start(&file.proc_start, start))
         .map(|file| file.session_id.as_str())
         .collect();
     ids.sort_unstable();
@@ -90,8 +95,10 @@ pub fn claude_conversation_from(
     }
 }
 
-/// A process's start time in the form Claude writes as `procStart`, or
-/// `None` where that form is not known.
+/// A process's start time: on Linux the decimal Claude writes as
+/// `procStart`, elsewhere `epoch:<unix seconds>`, which [`same_start`]
+/// compares with the `lstart` text Claude writes there. `None` where it
+/// cannot be read.
 #[must_use]
 pub fn process_start(pid: u32) -> Option<String> {
     #[cfg(target_os = "linux")]
@@ -101,9 +108,71 @@ pub fn process_start(pid: u32) -> Option<String> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = pid;
-        None
+        use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+        let wanted = Pid::from_u32(pid);
+        let mut system = System::new();
+        system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[wanted]),
+            true,
+            ProcessRefreshKind::nothing(),
+        );
+        // A process that could not be read comes back with a zero start:
+        // that is no identity at all.
+        system
+            .process(wanted)
+            .map(sysinfo::Process::start_time)
+            .filter(|start| *start > 0)
+            .map(|start| format!("epoch:{start}"))
     }
+}
+
+/// Whether a session file's `procStart` is the start [`process_start`] read.
+/// Linux writes the same decimal both ways. On macOS Claude writes
+/// `ps -o lstart` in UTC, which is compared to the second.
+fn same_start(written: &str, start: &str) -> bool {
+    if written == start {
+        return true;
+    }
+    let Some(seconds) = start
+        .strip_prefix("epoch:")
+        .and_then(|s| s.parse::<i64>().ok())
+    else {
+        return false;
+    };
+    lstart_utc(written) == Some(seconds)
+}
+
+/// `Thu Nov 12 05:42:03 2026` (`ps -o lstart`, read in UTC) as Unix
+/// seconds. A single-digit day may be padded with a space.
+fn lstart_utc(text: &str) -> Option<i64> {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let [_weekday, month, day, clock, year] = words.as_slice() else {
+        return None;
+    };
+    let month = match *month {
+        "Jan" => time::Month::January,
+        "Feb" => time::Month::February,
+        "Mar" => time::Month::March,
+        "Apr" => time::Month::April,
+        "May" => time::Month::May,
+        "Jun" => time::Month::June,
+        "Jul" => time::Month::July,
+        "Aug" => time::Month::August,
+        "Sep" => time::Month::September,
+        "Oct" => time::Month::October,
+        "Nov" => time::Month::November,
+        "Dec" => time::Month::December,
+        _ => return None,
+    };
+    let mut hms = clock.split(':').map(str::parse::<u8>);
+    let (Some(Ok(hour)), Some(Ok(minute)), Some(Ok(second)), None) =
+        (hms.next(), hms.next(), hms.next(), hms.next())
+    else {
+        return None;
+    };
+    let date = time::Date::from_calendar_date(year.parse().ok()?, month, day.parse().ok()?).ok()?;
+    let clock = time::Time::from_hms(hour, minute, second).ok()?;
+    Some(date.with_time(clock).assume_utc().unix_timestamp())
 }
 
 /// Field 22 of a `/proc/<pid>/stat` line. The command name (field 2) may
@@ -119,7 +188,7 @@ fn linux_start_ticks(stat: &str) -> Option<String> {
 
 /// Where Claude may have written this process's session file: its own
 /// `CLAUDE_CONFIG_DIR` first, then this process's, `~/.claude` and the
-/// account profiles under `~/.config/asx/profiles`. Duplicates (symlinks,
+/// aas account profiles. Duplicates (symlinks,
 /// the same directory twice) are listed once.
 #[must_use]
 pub fn claude_roots(pid: u32) -> Vec<PathBuf> {
@@ -128,10 +197,17 @@ pub fn claude_roots(pid: u32) -> Vec<PathBuf> {
     roots.extend(std::env::var_os("CLAUDE_CONFIG_DIR").map(PathBuf::from));
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".claude"));
-        if let Ok(profiles) = std::fs::read_dir(home.join(".config/asx/profiles")) {
-            let mut found: Vec<PathBuf> = profiles.flatten().map(|entry| entry.path()).collect();
-            found.sort();
-            roots.extend(found);
+        // aas keeps its profiles in the platform's data directory
+        // (`~/Library/Application Support` on macOS) or `~/.config`.
+        let mut bases = vec![home.join(".config/asx/profiles")];
+        bases.extend(dirs::data_dir().map(|data| data.join("asx/profiles")));
+        for base in bases {
+            if let Ok(profiles) = std::fs::read_dir(base) {
+                let mut found: Vec<PathBuf> =
+                    profiles.flatten().map(|entry| entry.path()).collect();
+                found.sort();
+                roots.extend(found);
+            }
         }
     }
     let mut seen = Vec::new();
@@ -181,21 +257,184 @@ pub fn claude_conversation(pid: u32) -> Conversation {
 /// kept; `None` when unreadable.
 fn process_env(pid: u32, name: &str) -> Option<String> {
     #[cfg(target_os = "linux")]
-    {
-        let bytes = read_bounded(Path::new(&format!("/proc/{pid}/environ")), MAX_ENVIRON)?;
-        let prefix = format!("{name}=");
-        bytes
-            .split(|byte| *byte == 0)
-            .filter_map(|entry| std::str::from_utf8(entry).ok())
-            .find_map(|entry| entry.strip_prefix(&prefix))
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-    }
+    let bytes = read_bounded(Path::new(&format!("/proc/{pid}/environ")), MAX_ENVIRON)?;
     #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, name);
-        None
+    let bytes = crate::accounts::process_environ_raw(pid)?;
+    let prefix = format!("{name}=");
+    bytes
+        .split(|byte| *byte == 0)
+        .filter_map(|entry| std::str::from_utf8(entry).ok())
+        .find_map(|entry| entry.strip_prefix(&prefix))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+/// The Codex thread a rollout path names: `rollout-<time>-<thread id>.jsonl`
+/// directly under a `sessions/YYYY/MM/DD` tree. Anything else (an archived
+/// rollout, another file the process has open) names none.
+#[must_use]
+pub fn rollout_thread_id(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let stem = name.strip_prefix("rollout-")?.strip_suffix(".jsonl")?;
+    let id = stem.get(stem.len().checked_sub(36)?..)?;
+    uuid::Uuid::parse_str(id).ok()?;
+    // `.../sessions/2026/11/10/rollout-...`: three date levels, then `sessions`.
+    let sessions = path.ancestors().nth(4)?;
+    (sessions.file_name()? == "sessions").then(|| id.to_owned())
+}
+
+/// The thread a Codex process is on according to the files it has open.
+/// `None`: its open files could not be listed.
+#[must_use]
+pub fn codex_conversation_from(open: Option<&[PathBuf]>) -> Conversation {
+    let Some(open) = open else {
+        return Conversation::Unknown("the process's open files cannot be read here".into());
+    };
+    let mut ids: Vec<String> = open
+        .iter()
+        .filter_map(|path| rollout_thread_id(path))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    match ids.len() {
+        0 => Conversation::Unknown("the process has no rollout open".into()),
+        1 => Conversation::Verified(ids.remove(0)),
+        _ => Conversation::Conflict(ids),
     }
+}
+
+/// The thread the running Codex process `pid` is on, from the rollout it
+/// has open. Read like [`claude_conversation`]: the start time before and
+/// after, so a pid reused in between is not taken for this one.
+#[must_use]
+pub fn codex_conversation(pid: u32) -> Conversation {
+    let before = process_start(pid);
+    if before.is_none() {
+        return Conversation::Unknown("the process start time cannot be read here".into());
+    }
+    let open = open_files(pid);
+    let answer = match codex_conversation_from(open.as_deref()) {
+        // The file name is the claim; the rollout's own first record has
+        // to agree before it is taken as the thread.
+        Conversation::Verified(id) => {
+            let mut named = open
+                .iter()
+                .flatten()
+                .filter(|path| rollout_thread_id(path).as_deref() == Some(id.as_str()));
+            if named.all(|path| rollout_meta_id(path).as_deref() == Some(id.as_str())) {
+                Conversation::Verified(id)
+            } else {
+                Conversation::Unknown("the open rollout's session record does not name it".into())
+            }
+        }
+        other => other,
+    };
+    if process_start(pid) != before {
+        return Conversation::Unstable("the process changed while it was being read".into());
+    }
+    answer
+}
+
+/// The thread id a rollout's first record (`session_meta`) names. That
+/// record carries the base instructions, so it is read up to 1 MiB.
+fn rollout_meta_id(path: &Path) -> Option<String> {
+    use std::io::{BufRead, Read};
+    const MAX_META: u64 = 1024 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(file.take(MAX_META))
+        .read_line(&mut line)
+        .ok()?;
+    if !line.ends_with('\n') {
+        return None;
+    }
+    let record: serde_json::Value = serde_json::from_str(&line).ok()?;
+    if record.get("type")?.as_str()? != "session_meta" {
+        return None;
+    }
+    let id = record.get("payload")?.get("id")?.as_str()?;
+    uuid::Uuid::parse_str(id).ok()?;
+    Some(id.to_owned())
+}
+
+/// The paths of the regular files `pid` has open, or `None` when they
+/// cannot be listed.
+#[cfg(target_os = "linux")]
+fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
+    let entries = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    Some(
+        entries
+            .flatten()
+            .filter_map(|entry| std::fs::read_link(entry.path()).ok())
+            .filter(|path| path.is_absolute())
+            .collect(),
+    )
+}
+
+/// The paths of the regular files `pid` has open, from `lsof`, or `None`
+/// when they cannot be listed in time.
+#[cfg(all(unix, not(target_os = "linux")))]
+fn open_files(pid: u32) -> Option<Vec<PathBuf>> {
+    use std::process::{Command, Stdio};
+    const LSOF_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+    let mut child = Command::new("lsof")
+        // -b/-w: never block on a kernel call or warn; -a: AND the
+        // selections; -Fn: one `n<path>` line per file.
+        .args([
+            "-b",
+            "-w",
+            "-n",
+            "-P",
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            "^txt",
+            "-Fn",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Drained on its own thread so a long listing never fills the pipe
+    // and stalls `lsof` until the deadline.
+    let mut stdout = child.stdout.take()?;
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut text).map(|_| text)
+    });
+    let deadline = std::time::Instant::now() + LSOF_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+    let text = reader.join().ok()?.ok()?;
+    Some(parse_lsof_names(&text))
+}
+
+#[cfg(windows)]
+fn open_files(_pid: u32) -> Option<Vec<PathBuf>> {
+    None
+}
+
+/// The `n<path>` lines of `lsof -Fn` output.
+#[cfg_attr(not(all(unix, not(target_os = "linux"))), allow(dead_code))]
+fn parse_lsof_names(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| line.strip_prefix('n'))
+        .filter(|path| path.starts_with('/'))
+        .map(PathBuf::from)
+        .collect()
 }
 
 fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
@@ -319,5 +558,163 @@ mod tests {
             claude_conversation_from(pid, process_start(pid).as_deref(), &[]),
             Conversation::Unknown(_)
         ));
+    }
+
+    /// macOS: Claude writes `ps -o lstart` in UTC; tend reads the start in
+    /// seconds. They are the same process only to the second.
+    #[test]
+    fn a_macos_proc_start_matches_the_same_second_only() {
+        // Thu Nov 12 05:42:03 2026 UTC.
+        let seconds = time::macros::datetime!(2026-11-12 05:42:03 UTC).unix_timestamp();
+        let start = format!("epoch:{seconds}");
+        assert!(same_start("Thu Nov 12 05:42:03 2026", &start));
+        assert!(same_start(
+            "Thu Nov  5 05:42:03 2026",
+            &format!("epoch:{}", seconds - 7 * 86_400)
+        ));
+        assert!(!same_start("Thu Nov 12 05:42:04 2026", &start));
+        // Read in local time (KST) it is another instant.
+        assert!(!same_start("Thu Nov 12 14:42:03 2026", &start));
+        assert!(!same_start("not a date", &start));
+        assert!(!same_start("51554631", &start));
+        // Linux writes the same decimal both ways.
+        assert!(same_start("51554631", "51554631"));
+        assert!(!same_start("51554631", "51554632"));
+        let files = [file(7, A, "Thu Nov 12 05:42:03 2026")];
+        assert_eq!(
+            claude_conversation_from(7, Some(&start), &files),
+            Conversation::Verified(A.into())
+        );
+    }
+
+    /// This test's own process has a start time on every platform tend
+    /// swaps on, so a session file can be matched to it.
+    #[cfg(unix)]
+    #[test]
+    fn this_process_has_a_start_time() {
+        let start = process_start(std::process::id()).expect("a start time");
+        #[cfg(target_os = "linux")]
+        assert!(start.parse::<u64>().is_ok());
+        #[cfg(not(target_os = "linux"))]
+        {
+            let seconds: i64 = start.strip_prefix("epoch:").unwrap().parse().unwrap();
+            let written = time::OffsetDateTime::from_unix_timestamp(seconds)
+                .unwrap()
+                .format(time::macros::format_description!(
+                    "[weekday repr:short] [month repr:short] [day padding:space] [hour]:[minute]:[second] [year]"
+                ))
+                .unwrap();
+            assert!(same_start(&written, &start), "{written} vs {start}");
+        }
+    }
+
+    #[test]
+    fn a_rollout_path_names_its_thread() {
+        let path = Path::new(
+            "/h/.codex/sessions/2026/11/10/rollout-2026-11-10T16-39-46-01a1c466-13a8-7d80-9b8c-752a2b822a25.jsonl",
+        );
+        assert_eq!(
+            rollout_thread_id(path).as_deref(),
+            Some("01a1c466-13a8-7d80-9b8c-752a2b822a25")
+        );
+        // Archived, misplaced, or not a rollout: no thread.
+        for other in [
+            "/h/.codex/archived_sessions/rollout-2026-11-10T16-39-46-01a1c466-13a8-7d80-9b8c-752a2b822a25.jsonl",
+            "/h/.codex/sessions/2026/11/rollout-2026-11-10T16-39-46-01a1c466-13a8-7d80-9b8c-752a2b822a25.jsonl",
+            "/h/.codex/sessions/2026/11/10/rollout-2026-11-10T16-39-46-not-a-uuid.jsonl",
+            "/h/.codex/sessions/2026/11/10/history.jsonl",
+            "/h/.codex/log/codex-tui.log",
+        ] {
+            assert_eq!(rollout_thread_id(Path::new(other)), None, "{other}");
+        }
+    }
+
+    #[test]
+    fn a_codex_process_is_on_the_one_rollout_it_has_open() {
+        let rollout = |id: &str| {
+            PathBuf::from(format!(
+                "/h/.codex/sessions/2026/11/10/rollout-2026-11-10T16-39-46-{id}.jsonl"
+            ))
+        };
+        let log = PathBuf::from("/h/.codex/log/codex-tui.log");
+        assert_eq!(
+            codex_conversation_from(Some(&[log.clone(), rollout(B), rollout(B)])),
+            Conversation::Verified(B.into())
+        );
+        assert!(matches!(
+            codex_conversation_from(Some(std::slice::from_ref(&log))),
+            Conversation::Unknown(_)
+        ));
+        assert!(matches!(
+            codex_conversation_from(None),
+            Conversation::Unknown(_)
+        ));
+        assert!(matches!(
+            codex_conversation_from(Some(&[rollout(A), rollout(B)])),
+            Conversation::Conflict(_)
+        ));
+    }
+
+    #[test]
+    fn lsof_name_lines_are_paths() {
+        let out = "p42\nf3\nn/h/.codex/log/codex-tui.log\nf42\nn/h/x y.jsonl\nf7\nn[kqueue]\n";
+        assert_eq!(
+            parse_lsof_names(out),
+            vec![
+                PathBuf::from("/h/.codex/log/codex-tui.log"),
+                PathBuf::from("/h/x y.jsonl")
+            ]
+        );
+    }
+
+    /// End to end on this host: a process holding a rollout open reads as
+    /// on that thread, through `/proc/<pid>/fd` or `lsof`.
+    #[cfg(unix)]
+    #[test]
+    fn an_open_rollout_is_read_from_the_live_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("sessions/2026/11/10");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join(format!("rollout-2026-11-10T16-39-46-{B}.jsonl"));
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{B}\",\"source\":\"cli\"}}}}\n"
+            ),
+        )
+        .unwrap();
+        // A child of its own, so no other test's open files are in the way.
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exec 3<\"$1\"; exec sleep 30")
+            .arg("sh")
+            .arg(&path)
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut seen = codex_conversation(child.id());
+        while seen != Conversation::Verified(B.into()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            seen = codex_conversation(child.id());
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(seen, Conversation::Verified(B.into()));
+    }
+
+    #[test]
+    fn a_rollout_is_on_the_thread_its_session_record_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("r.jsonl");
+        let meta = |id: &str| {
+            format!(r#"{{"type":"session_meta","payload":{{"id":"{id}","source":"cli"}}}}"#)
+        };
+        std::fs::write(&path, format!("{}\n{{}}\n", meta(B))).unwrap();
+        assert_eq!(rollout_meta_id(&path).as_deref(), Some(B));
+        // A first record still being written, or another record type.
+        std::fs::write(&path, meta(B)).unwrap();
+        assert_eq!(rollout_meta_id(&path), None);
+        std::fs::write(&path, "{\"type\":\"response_item\",\"payload\":{}}\n").unwrap();
+        assert_eq!(rollout_meta_id(&path), None);
     }
 }

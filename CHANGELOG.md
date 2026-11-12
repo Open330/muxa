@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Account swap binds the conversation it resumes from the provider's own
+  record for the exact process on macOS and for Codex too, not only for
+  Claude on Linux. On macOS Claude's `sessions/<pid>.json` `procStart`
+  (`ps -o lstart` in UTC) is compared with the process start to the second,
+  and the aas profiles under `~/Library/Application Support/asx/profiles`
+  are searched. A Codex TUI is bound to the rollout it has open, confirmed by
+  that rollout's `session_meta` record (`session_id_source:
+  "codex_rollout"`). Where neither can be read the swap falls back to the
+  registry and the command line as before; a record that disagrees with them
+  leaves the agent alone.
+
 ## [0.10.15] - 2026-11-12
 
 ### Added

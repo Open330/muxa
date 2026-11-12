@@ -240,15 +240,29 @@ list it without touching it. Naming it swaps it only with `--force`, and it
 gets a follow-up only under `--continue-when always`.
 
 Before stopping an agent, the swap checks which conversation the running
-process is actually on. For Claude on Linux that is
-`<config dir>/sessions/<pid>.json`, matched on the pid and the process's
-start time (`conversation_verified: true`). A conversation tend can verify
-this way can be swapped even without a hook-registered id. One that
-disagrees with the registry or the command line is reported as an identity
-conflict and left alone. The process is checked again right before it is
-stopped, together with the pane's agent process and, when it was verified,
-the conversation. Where it cannot be read (Codex, macOS), the registry and
-then the command line decide, as before, and the outcome says why
+process is actually on, from the record its provider keeps for that exact
+process (`conversation_verified: true`):
+
+- Claude: `<config dir>/sessions/<pid>.json`, matched on the pid and the
+  process's start time. Linux compares `/proc/<pid>/stat` ticks; macOS
+  compares Claude's `procStart` (`ps -o lstart`, UTC) to the second. The
+  config dirs searched are the process's own `CLAUDE_CONFIG_DIR`, `~/.claude`
+  and the aas profiles (`~/.config/asx/profiles`, and
+  `~/Library/Application Support/asx/profiles` on macOS).
+- Codex: the rollout the process has open
+  (`sessions/YYYY/MM/DD/rollout-<time>-<thread id>.jsonl`, through
+  `/proc/<pid>/fd` or `lsof`), whose first `session_meta` record must name
+  the same thread (`session_id_source: "codex_rollout"` when nothing else
+  named it).
+
+A conversation tend can verify this way can be swapped even without a
+hook-registered id. One that disagrees with the registry or the command line
+is reported as an identity conflict and left alone. The process is checked
+again right before it is stopped, together with the pane's agent process and,
+when it was verified, the conversation. Where the record cannot be read (a
+shared Codex app-server frontend holds no rollout, a Codex process with more
+than one rollout open, Windows), the registry and then the command line
+decide, as before, and the outcome says why
 (`conversation_unverified_reason`). Not reconciled yet: a pane whose
 top-level agent is another provider than the row it is matched to (for
 example a Codex with a nested Claude child).

@@ -1642,23 +1642,20 @@ fn plan(
         match locate(agent, backends) {
             Ok((launch, pane, backend)) => {
                 let process_start = tend::agent_conversation::process_start(launch.agent_pid);
-                let runtime = match agent.kind {
-                    AgentKind::ClaudeCode => {
-                        tend::agent_conversation::claude_conversation(launch.agent_pid)
-                    }
-                    _ => tend::agent_conversation::Conversation::Unknown(
-                        "not read for this provider".into(),
-                    ),
-                };
+                let runtime = runtime_conversation(agent.kind, launch.agent_pid);
                 let registry = Some(agent.session_id.as_str()).filter(|id| resumable_id(id));
-                let (session_id, source) =
-                    match conversation_for(registry, launch.resumed_id.as_deref(), &runtime) {
-                        Ok(found) => found,
-                        Err(note) => {
-                            outcomes.push(SwapOutcome::new(agent, SwapStatus::Skipped, note));
-                            continue;
-                        }
-                    };
+                let (session_id, source) = match conversation_for(
+                    registry,
+                    launch.resumed_id.as_deref(),
+                    &runtime,
+                    record_source(agent.kind),
+                ) {
+                    Ok(found) => found,
+                    Err(note) => {
+                        outcomes.push(SwapOutcome::new(agent, SwapStatus::Skipped, note));
+                        continue;
+                    }
+                };
                 planned.push(Planned {
                     agent: agent.clone(),
                     session_id,
@@ -2222,10 +2219,41 @@ fn unavailable(candidates: &[Candidate]) -> String {
 /// or the swap would resume something other than what is running. Where the
 /// process cannot be read, the registry and then the command line decide,
 /// as before.
+/// The conversation the running agent process `pid` is on, from the record
+/// its provider keeps for that exact process: Claude's `sessions/<pid>.json`,
+/// the Codex rollout the process has open.
+///
+/// A Codex process with more than one rollout open is not a fact tend can
+/// act on yet, so it reads as unknown and the swap keeps its earlier
+/// evidence (the registry, then the command line) rather than refusing.
+fn runtime_conversation(kind: AgentKind, pid: u32) -> tend::agent_conversation::Conversation {
+    use tend::agent_conversation::{claude_conversation, codex_conversation, Conversation};
+    match kind {
+        AgentKind::ClaudeCode => claude_conversation(pid),
+        AgentKind::Codex => match codex_conversation(pid) {
+            Conversation::Conflict(ids) => Conversation::Unknown(format!(
+                "the process has rollouts open for {}",
+                ids.join(" and ")
+            )),
+            other => other,
+        },
+        _ => Conversation::Unknown("not read for this provider".into()),
+    }
+}
+
+/// The source a conversation read by [`runtime_conversation`] is reported as.
+fn record_source(kind: AgentKind) -> SessionIdSource {
+    match kind {
+        AgentKind::Codex => SessionIdSource::CodexRollout,
+        _ => SessionIdSource::ClaudeSessionFile,
+    }
+}
+
 fn conversation_for(
     registry: Option<&str>,
     argv: Option<&str>,
     runtime: &tend::agent_conversation::Conversation,
+    record: SessionIdSource,
 ) -> Result<(String, SessionIdSource), String> {
     use tend::agent_conversation::Conversation;
     match runtime {
@@ -2248,7 +2276,7 @@ fn conversation_for(
                     "identity conflict: launched with {launched} but the running process is on {id}; left alone"
                 ));
             }
-            Ok((id.clone(), SessionIdSource::ClaudeSessionFile))
+            Ok((id.clone(), record))
         }
         Conversation::Unknown(_) => match (registry, argv) {
             (Some(id), _) => Ok((id.to_owned(), SessionIdSource::Registry)),
@@ -2270,7 +2298,7 @@ fn still_as_planned(planned: &Planned) -> Result<(), String> {
     .map(|launch| launch.agent_pid);
     let now = planned
         .verified
-        .then(|| tend::agent_conversation::claude_conversation(pid));
+        .then(|| runtime_conversation(planned.agent.kind, pid));
     recheck(
         &Expected {
             pid,
@@ -3819,47 +3847,63 @@ mod tests {
         use tend::agent_conversation::Conversation;
         const A: &str = "96f5e88c-62df-42a7-914e-e206355969fb";
         const B: &str = "01a18182-0bf0-7801-97bf-c91154132258";
+        const CLAUDE: SessionIdSource = SessionIdSource::ClaudeSessionFile;
         let verified = Conversation::Verified(A.into());
         let unknown = Conversation::Unknown("unreadable".into());
 
         assert_eq!(
-            conversation_for(Some(A), None, &verified).unwrap(),
+            conversation_for(Some(A), None, &verified, CLAUDE).unwrap(),
             (A.to_owned(), SessionIdSource::Registry)
         );
         // A stale row for the same provider in a reused pane, on another id.
-        assert!(conversation_for(Some(B), None, &verified)
+        assert!(conversation_for(Some(B), None, &verified, CLAUDE)
             .unwrap_err()
             .contains("identity conflict"));
         // No registry id: the session file names it, so it can be swapped.
         assert_eq!(
-            conversation_for(None, None, &verified).unwrap(),
+            conversation_for(None, None, &verified, CLAUDE).unwrap(),
             (A.to_owned(), SessionIdSource::ClaudeSessionFile)
         );
         // Launched on one conversation, now on another: not guessed.
-        assert!(conversation_for(None, Some(B), &verified).is_err());
+        assert!(conversation_for(None, Some(B), &verified, CLAUDE).is_err());
         // The registry agreeing with the process outranks a stale launch id.
-        assert_eq!(conversation_for(Some(A), Some(B), &verified).unwrap().0, A);
+        assert_eq!(
+            conversation_for(Some(A), Some(B), &verified, CLAUDE)
+                .unwrap()
+                .0,
+            A
+        );
         assert!(conversation_for(
             Some(A),
             None,
-            &Conversation::Conflict(vec![A.into(), B.into()])
+            &Conversation::Conflict(vec![A.into(), B.into()]),
+            CLAUDE
         )
         .is_err());
         // Seen to change while read: evidence against the plan, not a reason
         // to fall back to the registry.
-        assert!(
-            conversation_for(Some(A), None, &Conversation::Unstable("changed".into())).is_err()
-        );
+        assert!(conversation_for(
+            Some(A),
+            None,
+            &Conversation::Unstable("changed".into()),
+            CLAUDE
+        )
+        .is_err());
         // Unreadable process: the registry, then the command line, as before.
         assert_eq!(
-            conversation_for(Some(A), Some(B), &unknown).unwrap(),
+            conversation_for(Some(A), Some(B), &unknown, CLAUDE).unwrap(),
             (A.to_owned(), SessionIdSource::Registry)
         );
         assert_eq!(
-            conversation_for(None, Some(B), &unknown).unwrap(),
+            conversation_for(None, Some(B), &unknown, CLAUDE).unwrap(),
             (B.to_owned(), SessionIdSource::Argv)
         );
-        assert!(conversation_for(None, None, &unknown).is_err());
+        assert!(conversation_for(None, None, &unknown, CLAUDE).is_err());
+        // A Codex thread read from its open rollout is reported as such.
+        assert_eq!(
+            conversation_for(None, None, &verified, SessionIdSource::CodexRollout).unwrap(),
+            (A.to_owned(), SessionIdSource::CodexRollout)
+        );
     }
 
     /// A bare `%N` means the one live pane it names; the same `%N` on two
