@@ -35,6 +35,29 @@ pub struct Server {
 }
 
 impl Server {
+    /// The shared state one connection handler gets.
+    fn dispatch_ctx(&self) -> super::dispatch::ServerCtx {
+        super::dispatch::ServerCtx {
+            store: self.store.clone(),
+            backend: self.backend.clone(),
+            backends: self.backends.clone(),
+            sessions: self.sessions.clone(),
+            collaboration: self.collaboration.clone(),
+            collaboration_audit: self.collaboration_audit.clone(),
+            ask: self.ask.clone(),
+            agent_directory: self.agent_directory.clone(),
+            automation: self.automation.clone(),
+            restart: self.restart.clone(),
+            fleet: self.fleet.clone(),
+            pipeline_runs: self.pipeline_runs.clone(),
+            reviews: self.reviews.clone(),
+            work_up: self.work_up.clone(),
+            mux_snapshots: self.mux_snapshots.clone(),
+            config_path: self.config_path.clone(),
+            swap: self.swap.clone(),
+        }
+    }
+
     pub fn new(socket_path: PathBuf, store: SharedStore) -> Self {
         let backend = default_backend();
         let work_up = WorkUpManager::new(socket_path.clone());
@@ -311,49 +334,13 @@ impl Server {
                             continue;
                         }
                     };
-                    let store = self.store.clone();
-                    let backend = self.backend.clone();
-                    let backends = self.backends.clone();
-                    let sessions = self.sessions.clone();
-                    let collaboration = self.collaboration.clone();
-                    let collaboration_audit = self.collaboration_audit.clone();
-                    let ask = self.ask.clone();
-                    let agent_directory = self.agent_directory.clone();
-                    let automation = self.automation.clone();
-                    let restart = self.restart.clone();
-                    let fleet = self.fleet.clone();
-                    let pipeline_runs = self.pipeline_runs.clone();
-                    let reviews = self.reviews.clone();
-                    let work_up = self.work_up.clone();
-                    let mux_snapshots = self.mux_snapshots.clone();
-                    let config_path = self.config_path.clone();
-                    let swap = self.swap.clone();
+                    let ctx = self.dispatch_ctx();
                     let stopping = stopping_rx.clone();
                     handlers.spawn(async move {
                         // Held for the handler's lifetime; released here on exit.
                         let _permit = permit;
                         if let Err(e) =
-                            Box::pin(handle(
-                                stream,
-                                store,
-                                backend,
-                                backends,
-                                sessions,
-                                collaboration,
-                                collaboration_audit,
-                                ask,
-                                agent_directory,
-                                automation,
-                                restart,
-                                fleet,
-                                pipeline_runs,
-                                reviews,
-                                work_up,
-                                mux_snapshots,
-                                config_path,
-                                swap,
-                                stopping,
-                            ))
+                            Box::pin(handle(stream, ctx, stopping))
                             .await
                         {
                             if e.is_client_disconnect() {
