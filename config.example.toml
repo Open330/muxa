@@ -237,6 +237,12 @@
 # categories = ["pipeline", "skills", "automation"]   # default: all
 # ignore     = ["pipeline.solo", "ticket"]
 
+# Optional modules. `accounts` is the account module (tend-aas): `tend swap`,
+# the `swap_account` action, `tend_swap_account` and `[agent.*].account`
+# launches. Left out, it is on only when this config already uses accounts.
+# [modules]
+# accounts = true
+
 # Moving agents onto another account (`tend swap`, and the `swap_account`
 # automation action). Accounts come from [[accounts.<provider>]] above, or an
 # installed aas when none are listed. See docs/ACCOUNT_SWAP.md.
