@@ -1172,9 +1172,10 @@ async fn call_tool(
                 }
             }
             let params = json!({"name": routed.name, "arguments": args});
-            call_tool_inner(client, Some(&params), config).await
+            // Boxed: the routed dispatch future is large on some targets.
+            Box::pin(call_tool_inner(client, Some(&params), config)).await
         }
-        None => call_tool_inner(client, params, config).await,
+        None => Box::pin(call_tool_inner(client, params, config)).await,
     };
     let result = match (&routed, result) {
         // tend_guide's default needs this session's identity; launch
