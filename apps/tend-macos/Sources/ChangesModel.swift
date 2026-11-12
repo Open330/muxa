@@ -17,12 +17,61 @@ enum ChangesCompare: Hashable, Sendable {
     /// The merge-base with the upstream (or the default branch) against the
     /// working tree: what the agent changed on this branch, committed or not.
     case branch
+    /// One recorded revision (a commit or a range a decision points at),
+    /// read-only: no working tree, no review comments.
+    case revision
+}
+
+/// A commit or a revision range to show in Changes, from a decision's
+/// evidence. Validated before git sees it.
+struct ChangesRevision: Hashable, Sendable {
+    enum Spec: Hashable, Sendable {
+        case commit(String)
+        /// `A..B`, `A...B`, or one revision against the working tree, as
+        /// `git diff` reads them.
+        case range(String)
+    }
+
+    let spec: Spec
+
+    init?(commit sha: String) {
+        guard TendRevisionSpec.isCommitSHA(sha) else { return nil }
+        spec = .commit(sha)
+    }
+
+    init?(range: String) {
+        guard TendRevisionSpec.isRange(range) else { return nil }
+        spec = .range(range)
+    }
+
+    static let workingTreeReason = String(localized: "This compares with the working tree; open the agent's Changes tab to see it")
+
+    /// Two ends git can compare without the working tree.
+    var comparesCommits: Bool {
+        switch spec {
+        case .commit: true
+        case .range(let range): range.contains("..")
+        }
+    }
+
+    var label: String {
+        switch spec {
+        case .commit(let sha): String(sha.prefix(12))
+        case .range(let range): range
+        }
+    }
 }
 
 struct BranchBase: Equatable, Sendable {
     /// What the base was resolved from, e.g. `origin/main`.
     let ref: String
     let sha: String
+    /// The other end of a recorded revision; nil compares with the working
+    /// tree.
+    var head: String? = nil
+
+    /// `git diff` arguments for base..head.
+    var revisions: [String] { [sha] + (head.map { [$0] } ?? []) }
 
     var shortSHA: String { String(sha.prefix(8)) }
 }
@@ -135,9 +184,49 @@ struct ChangesLoader: Sendable {
         }
     }
 
+    /// Resolves a recorded revision to the two ends `git diff` compares,
+    /// each verified as a commit in `root`. A root commit compares with the
+    /// empty tree.
+    func resolve(_ revision: ChangesRevision, root: String) async -> Result<BranchBase, ChangesFailure> {
+        func commit(_ rev: String) async -> String? {
+            let output = await git.run(["rev-parse", "--verify", "--quiet", "--end-of-options", rev + "^{commit}"], in: root, limit: 4096, timeout: 10)
+            let sha = output.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+            return output.status == 0 && !sha.isEmpty ? sha : nil
+        }
+        let missing = { (rev: String) in ChangesFailure.error(String(localized: "\(rev) is not a commit in this checkout")) }
+        switch revision.spec {
+        case .commit(let sha):
+            guard let head = await commit(sha) else { return .failure(missing(sha)) }
+            var parent = await commit(head + "^1")
+            if parent == nil {
+                let empty = await git.run(["hash-object", "-t", "tree", "/dev/null"], in: root, limit: 4096, timeout: 5)
+                parent = empty.status == 0 ? empty.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+            }
+            guard let parent, !parent.isEmpty else { return .failure(missing(sha + "^")) }
+            return .success(BranchBase(ref: revision.label, sha: parent, head: head))
+        case .range(let range):
+            let symmetric = range.contains("...")
+            let parts = range.components(separatedBy: symmetric ? "..." : "..")
+            guard parts.count <= 2 else { return .failure(.error(String(localized: "\(range) is not a revision range"))) }
+            // One revision alone is `git diff REV`: against the working
+            // tree, where a repository's clean filters would run. A recorded
+            // revision only ever compares two commits.
+            guard parts.count == 2 else { return .failure(.error(ChangesRevision.workingTreeReason)) }
+            let from = parts[0].isEmpty ? "HEAD" : parts[0]
+            let to = parts[1].isEmpty ? "HEAD" : parts[1]
+            guard let fromSHA = await commit(from) else { return .failure(missing(from)) }
+            guard let toSHA = await commit(to) else { return .failure(missing(to)) }
+            guard symmetric else { return .success(BranchBase(ref: range, sha: fromSHA, head: toSHA)) }
+            let mergeBase = await git.run(["merge-base", fromSHA, toSHA], in: root, limit: 4096, timeout: 10)
+            let base = mergeBase.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard mergeBase.status == 0, !base.isEmpty else { return .failure(.error(mergeBase.failureReason)) }
+            return .success(BranchBase(ref: range, sha: base, head: toSHA))
+        }
+    }
+
     func branchFiles(root: String, base: BranchBase) async -> Result<[ChangedFile], ChangesFailure> {
-        async let names = git.run(["diff", "--name-status", "-z", "-M", "--no-ext-diff", base.sha], in: root, limit: Self.statusLimit, timeout: 20)
-        async let numbers = git.run(["diff", "--numstat", "-z", "-M", "--no-ext-diff", "--no-textconv", base.sha], in: root, limit: Self.statusLimit, timeout: 20)
+        async let names = git.run(["diff", "--name-status", "-z", "-M", "--no-ext-diff"] + base.revisions, in: root, limit: Self.statusLimit, timeout: 20)
+        async let numbers = git.run(["diff", "--numstat", "-z", "-M", "--no-ext-diff", "--no-textconv"] + base.revisions, in: root, limit: Self.statusLimit, timeout: 20)
         let nameOutput = await names
         guard nameOutput.status == 0 else { return .failure(.error(nameOutput.failureReason)) }
         let counts = GitNumstatParser.parse(await numbers.stdout)
@@ -170,7 +259,7 @@ struct ChangesLoader: Sendable {
             args = ["diff", "--no-index"] + Self.diffFlags + ["--", "/dev/null", file.path]
         case .branch:
             guard let base else { return .failure(.error(String(localized: "No branch base to compare with"))) }
-            args = ["diff", "-M"] + Self.diffFlags + [base.sha, "--"] + paths
+            args = ["diff", "-M"] + Self.diffFlags + base.revisions + ["--"] + paths
         }
         let output = await git.run(args, in: root, limit: Self.diffLimit, timeout: 10)
         // `--no-index` exits 1 whenever the files differ, which they always do.
@@ -193,7 +282,7 @@ struct ChangesLoader: Sendable {
             (["diff"] + Self.diffFlags, files.filter { $0.group == .unstaged || $0.group == .conflicts }),
         ]
         if let base {
-            batches.append((["diff", "-M"] + Self.diffFlags + [base.sha], files.filter { $0.group == .branch }))
+            batches.append((["diff", "-M"] + Self.diffFlags + base.revisions, files.filter { $0.group == .branch }))
         }
         for (args, files) in batches where !files.isEmpty {
             let paths = files.flatMap { file in [file.origPath, file.path].compactMap { $0 } }
@@ -544,14 +633,28 @@ final class ChangesModel: ObservableObject {
     private var settleTask: Task<Void, Never>?
     private var forcedLargePaths: Set<String> = []
 
-    init(source: ChangesSource, drafts: ReviewDraftStore = .shared, viewed: ViewedFilesStore = .shared) {
+    /// Set when the model shows one recorded revision instead of the
+    /// working tree.
+    let revision: ChangesRevision?
+
+    init(
+        source: ChangesSource,
+        revision: ChangesRevision? = nil,
+        drafts: ReviewDraftStore = .shared,
+        viewed: ViewedFilesStore = .shared
+    ) {
         self.source = source
+        self.revision = revision
         self.drafts = drafts
         self.viewed = viewed
+        if revision != nil { compare = .revision }
     }
 
+    /// Review comments go back to the agent working in the tree; a recorded
+    /// revision has none.
     var draftKey: ReviewDraftKey? {
-        snapshot.map { ReviewDraftKey(hostAlias: source.hostAlias, root: $0.root) }
+        guard revision == nil else { return nil }
+        return snapshot.map { ReviewDraftKey(hostAlias: source.hostAlias, root: $0.root) }
     }
 
     var selectedFile: ChangedFile? {
@@ -568,7 +671,7 @@ final class ChangesModel: ObservableObject {
     }
 
     func setCompare(_ compare: ChangesCompare) {
-        guard compare != self.compare else { return }
+        guard revision == nil, compare != .revision, compare != self.compare else { return }
         guard compare == .uncommitted || branchBase != nil else { return }
         self.compare = compare
         restart()
@@ -593,7 +696,8 @@ final class ChangesModel: ObservableObject {
     // MARK: Viewed
 
     func viewedKey(for file: ChangedFile) -> String? {
-        snapshot.map { ViewedFiles.key(hostAlias: source.hostAlias, root: $0.root, fileID: file.id) }
+        guard revision == nil else { return nil }
+        return snapshot.map { ViewedFiles.key(hostAlias: source.hostAlias, root: $0.root, fileID: file.id) }
     }
 
     func isViewed(_ file: ChangedFile) -> Bool {
@@ -744,6 +848,10 @@ final class ChangesModel: ObservableObject {
             return
         }
         guard !Task.isCancelled else { return }
+        if let revision {
+            await loadRevision(revision, root: root, loader: loader)
+            return
+        }
         drafts.register(hostAlias: source.hostAlias, path: path, root: root)
 
         let status: GitStatusSnapshot
@@ -805,6 +913,9 @@ final class ChangesModel: ObservableObject {
                 return
             }
             guard !Task.isCancelled else { return }
+        case .revision:
+            // Loaded by `loadRevision` before the working tree is read.
+            return
         }
         refreshError = nil
         failure = nil
@@ -814,6 +925,35 @@ final class ChangesModel: ObservableObject {
         }
         loadDiff(keepCurrent: true)
         verifyViewed(next)
+    }
+
+    /// The files and diffs of one recorded revision. Nothing here touches
+    /// the working tree, the index or the review drafts.
+    private func loadRevision(_ revision: ChangesRevision, root: String, loader: ChangesLoader) async {
+        let base: BranchBase
+        switch await loader.resolve(revision, root: root) {
+        case .success(let value): base = value
+        case .failure(let failure):
+            guard !Task.isCancelled else { return }
+            fail(failure)
+            return
+        }
+        guard !Task.isCancelled else { return }
+        branchBase = base
+        switch await loader.branchFiles(root: root, base: base) {
+        case .success(let files):
+            guard !Task.isCancelled else { return }
+            refreshError = nil
+            failure = nil
+            publish(GitChangesSnapshot(
+                root: root, branch: GitBranchInfo(oid: base.head), files: files,
+                omittedCount: 0, compare: .revision, base: base, countsLoaded: true
+            ))
+            loadDiff(keepCurrent: true)
+        case .failure(let failure):
+            guard !Task.isCancelled else { return }
+            fail(failure)
+        }
     }
 
     private func fail(_ failure: ChangesFailure) {

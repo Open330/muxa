@@ -43,11 +43,13 @@ private func render<V: View>(_ view: V, name: String, scheme: ColorScheme) throw
     ]}
     """.utf8))
     for scheme in [ColorScheme.light, .dark] {
+        let host = TendFleetHostIdentity(alias: "local", local: true, state: "online", mode: "local")
+        let decision = FleetDecision(review: items[0], host: host)
         _ = try render(
-            FleetReviewRequestRow(item: items[0], busy: false, returning: .constant(false), note: .constant(""), decide: { _, _ in }),
+            FleetDecisionCard(decision: decision, openRevision: { _ in }, answer: { _ in true }, decide: { _, _ in true }),
             name: "request-row", scheme: scheme)
         _ = try render(
-            FleetReviewRequestRow(item: items[0], busy: false, returning: .constant(true), note: .constant("tests missing"), decide: { _, _ in }),
+            FleetDecisionCard(decision: decision, openRevision: { _ in }, answer: { _ in true }, decide: { _, _ in true }, initialAnswer: "tests missing"),
             name: "request-row-returning", scheme: scheme)
         _ = try render(FleetEvidenceList(evidence: evidence), name: "recorded-commands", scheme: scheme)
     }

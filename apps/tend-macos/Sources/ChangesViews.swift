@@ -250,7 +250,7 @@ struct ChangesWorkspaceView: View {
                 ) { compare in
                     switch compare {
                     case .uncommitted: Text("Uncommitted")
-                    case .branch: Text("Branch")
+                    case .branch, .revision: Text("Branch")
                     }
                 }
                 .help(compareHelp)
@@ -436,6 +436,120 @@ struct ChangesWorkspaceView: View {
     }
 }
 
+/// One recorded revision a decision points at (a commit, a range), opened
+/// from Home in one click: its files and diffs, read-only. The checkout is
+/// the asker's declaration; reading it is the person's own click, with the
+/// same read-only git settings as the rest of Changes.
+struct ChangesRevisionView: View {
+    let repo: String
+    let revision: ChangesRevision
+    @StateObject private var changes: ChangesModel
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
+
+    init(repo: String, revision: ChangesRevision) {
+        self.repo = repo
+        self.revision = revision
+        _changes = StateObject(wrappedValue: ChangesModel(
+            source: ChangesSource(hostAlias: "local", isLocal: true, path: repo),
+            revision: revision
+        ))
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            toolbar
+            TendTheme.border(colorScheme).frame(height: 1)
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .background(TendTheme.editor(colorScheme))
+        .frame(minWidth: 860, idealWidth: 1040, minHeight: 560, idealHeight: 720)
+        .onAppear { changes.refresh() }
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 10) {
+            Label {
+                Text(verbatim: revision.label)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .textSelection(.enabled)
+            } icon: {
+                Image(systemName: { if case .commit = revision.spec { "smallcircle.filled.circle" } else { "plusminus" } }())
+            }
+            .font(.system(size: 12, weight: .medium))
+            Text(verbatim: (repo as NSString).lastPathComponent)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .help(repo)
+            if let snapshot = changes.snapshot {
+                Text("\(snapshot.fileCount) files")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+                ChangeCountsLabel(added: snapshot.totalAdded, deleted: snapshot.totalDeleted)
+            } else if changes.isRefreshing {
+                ProgressView().controlSize(.small).scaleEffect(0.7)
+            }
+            Spacer(minLength: 8)
+            Button("Done") { dismiss() }
+                .keyboardShortcut(.cancelAction)
+        }
+        .lineLimit(1)
+        .padding(.leading, 12)
+        .padding(.trailing, 8)
+        .frame(height: TendTheme.breadcrumbHeight + 8)
+    }
+
+    @ViewBuilder
+    private var content: some View {
+        if let failure = changes.failure {
+            switch failure {
+            case .notRepository(let path):
+                ChangesEmptyState(title: "Not a git repository", systemImage: "folder", message: Text(verbatim: path)) { EmptyView() }
+            case .gitMissing:
+                ChangesEmptyState(
+                    title: "git was not found",
+                    systemImage: "exclamationmark.triangle",
+                    message: Text("Install the Xcode Command Line Tools (xcode-select --install) or Homebrew git, then refresh.")
+                ) { EmptyView() }
+            case .noPath, .remote:
+                ChangesEmptyState(
+                    title: "No working directory",
+                    systemImage: "folder.badge.questionmark",
+                    message: Text(verbatim: repo)
+                ) { EmptyView() }
+            case .error(let message):
+                ChangesEmptyState(title: "git failed", systemImage: "exclamationmark.triangle", message: Text(verbatim: message)) {
+                    Button("Retry") { changes.refresh() }.buttonStyle(.tendSecondary)
+                }
+            }
+        } else if let snapshot = changes.snapshot {
+            if snapshot.files.isEmpty {
+                ChangesEmptyState(
+                    title: "No changes",
+                    systemImage: "checkmark.seal",
+                    message: Text("Nothing differs in \(revision.label).")
+                ) { EmptyView() }
+            } else {
+                HSplitView {
+                    ChangesFileList(changes: changes, viewed: changes.viewed, snapshot: snapshot, commentedPaths: [])
+                        .frame(minWidth: 200, idealWidth: 260, maxWidth: 420)
+                    ChangesDiffPane(changes: changes, drafts: changes.drafts, viewed: changes.viewed)
+                        .frame(minWidth: 320, maxWidth: .infinity)
+                }
+            }
+        } else {
+            VStack(spacing: 8) {
+                ProgressView().controlSize(.small)
+                Text("Reading the commit…")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 struct ChangesEmptyState<Actions: View>: View {
     let title: LocalizedStringKey
     let systemImage: String
@@ -514,7 +628,7 @@ private struct ChangesFileList: View {
                 }
                 .padding(8)
             }
-            viewedProgress
+            if changes.revision == nil { viewedProgress }
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
                     ForEach(snapshot.groups, id: \.self) { group in
@@ -580,7 +694,9 @@ private struct ChangesFileList: View {
         case .staged: String(localized: "Staged")
         case .unstaged: String(localized: "Changes")
         case .untracked: String(localized: "Untracked")
-        case .branch: String(localized: "Changes vs \(base?.ref ?? "base")")
+        case .branch:
+            // A recorded revision names itself; a branch is against its base.
+            changes.revision != nil ? (base?.ref ?? "") : String(localized: "Changes vs \(base?.ref ?? "base")")
         }
     }
 
@@ -589,8 +705,10 @@ private struct ChangesFileList: View {
         let isViewed = changes.isViewed(file)
         return HStack(spacing: 0) {
             rowButton(file, isViewed: isViewed)
-            ViewedCheckbox(isViewed: isViewed) { changes.toggleViewed(file) }
-                .padding(.trailing, 6)
+            if changes.revision == nil {
+                ViewedCheckbox(isViewed: isViewed) { changes.toggleViewed(file) }
+                    .padding(.trailing, 6)
+            }
         }
         .background(selected ? TendTheme.selection(colorScheme) : Color.clear)
     }
@@ -804,8 +922,10 @@ private struct ChangesDiffPane: View {
                 }
             }
             .help("Show the diff as one column, or old and new side by side")
-            ViewedCheckbox(isViewed: changes.isViewed(file), showsTitle: true) {
-                changes.toggleViewed(file)
+            if changes.revision == nil {
+                ViewedCheckbox(isViewed: changes.isViewed(file), showsTitle: true) {
+                    changes.toggleViewed(file)
+                }
             }
         }
         .padding(.leading, 12)

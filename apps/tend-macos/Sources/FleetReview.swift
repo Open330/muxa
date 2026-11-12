@@ -251,11 +251,25 @@ struct TendReviewItem: Decodable, Hashable, Identifiable, Sendable {
     let anchor: String?
     let requestedAt: String?
     let requestedBy: Actor
+    /// What the asker wants decided (`review_decision_v1`); nil from an
+    /// older daemon or when they gave none.
+    var decision: TendDecision? = nil
+    /// Set once someone decided the item (`decision_history`).
+    var disposition: Disposition? = nil
+    var idempotencyKey: String? = nil
+
+    struct Disposition: Decodable, Hashable, Sendable {
+        let kind: String
+        let by: Actor
+        let at: String
+        let note: String?
+    }
 
     enum CodingKeys: String, CodingKey {
-        case id, target, generation, summary, anchor
+        case id, target, generation, summary, anchor, decision, disposition
         case requestedAt = "requested_at"
         case requestedBy = "requested_by"
+        case idempotencyKey = "idempotency_key"
     }
 
     /// Who asked, as they declared it (not verified).

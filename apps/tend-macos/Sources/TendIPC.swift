@@ -890,6 +890,8 @@ struct TendCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
         interruption?.active == true && interruption?.requestID == id && ["queued", "claimed"].contains(status)
     }
     var humanAction: String? = nil
+    /// The asker's decision context (`collaboration_human_decision_v1`).
+    var decision: TendDecision? = nil
     var needsHumanResponse: Bool {
         to.console == true && expectsReply && kind != "notice" && ["queued", "claimed"].contains(status)
     }
@@ -913,7 +915,7 @@ struct TendCollaborationRequest: Decodable, Identifiable, Hashable, Sendable {
 
     enum CodingKeys: String, CodingKey {
         case id, from, to, kind, body, status, reply
-        case interruption
+        case interruption, decision
         case humanAction = "human_action"
         case expectsReply = "expects_reply"
         case workMode = "work_mode"
@@ -1004,6 +1006,7 @@ private struct TendIPCResponse: Decodable, Sendable {
     let reviewItems: [TendReviewItem]?
     let reviewHasMore: Bool?
     let reviewItem: TendReviewItem?
+    let decisionQueue: TendLenient<TendPendingQueue>?
     /// `swap_health`'s answer. Swap job requests also answer in `swap`,
     /// with another shape: that reads as nil rather than failing the reply.
     let swap: TendLenient<TendSwapHealth>?
@@ -1021,6 +1024,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case reviewItems = "review_items"
         case reviewHasMore = "review_has_more"
         case reviewItem = "review_item"
+        case decisionQueue = "decision_queue"
         case workOperation = "work_operation"
         case askEntries = "ask_entries"
         case askEntry = "ask_entry"
@@ -1514,6 +1518,24 @@ actor TendIPCClient {
             "offset": offset,
         ])
         return (response.reviewItems ?? [], response.reviewHasMore ?? false)
+    }
+
+    /// Everything pending on the person on this Mac's daemon, in its order
+    /// (`decision_queue_v1`), read as the operator console so human
+    /// requests are included. nil from a daemon without the queue: the
+    /// caller falls back to the review list and the console mailbox.
+    func decisionQueue(limit: Int = 200) async throws -> TendPendingQueue? {
+        guard capabilities.contains(tendDecisionQueueCapability) else { return nil }
+        let response = try await call([
+            "protocol": Self.protocolVersion,
+            "kind": "decision_queue",
+            "limit": limit,
+            "origin": ["pane": "", "console": true],
+        ], timeout: 10)
+        guard let queue = response.decisionQueue?.value else {
+            throw TendIPCError.server(String(localized: "tendd sent a decision queue this app cannot read"))
+        }
+        return queue
     }
 
     /// Accept, return or withdraw a review item, as the person.

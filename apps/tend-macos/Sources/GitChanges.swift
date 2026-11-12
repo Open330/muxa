@@ -73,6 +73,7 @@ struct GitRunner: Sendable {
             "-c", "color.diff=false",
             "-c", "color.status=false",
             "-c", "core.fsmonitor=false",
+            "-c", "protocol.allow=never",
             "-c", "diff.mnemonicPrefix=false",
             "-c", "diff.noprefix=false",
         ] + args
@@ -86,6 +87,12 @@ struct GitRunner: Sendable {
             environment.removeValue(forKey: key)
         }
         environment["GIT_OPTIONAL_LOCKS"] = "0"
+        // A partial clone must not reach out to its promisor remote to fill
+        // in an object a diff asks for: reading stays local.
+        environment["GIT_NO_LAZY_FETCH"] = "1"
+        // Older gits ignore GIT_NO_LAZY_FETCH; an empty allow-list refuses
+        // every transport, so no git this app runs can fetch at all.
+        environment["GIT_ALLOW_PROTOCOL"] = ""
         environment["GIT_TERMINAL_PROMPT"] = "0"
         environment["GIT_PAGER"] = "cat"
         environment["LC_ALL"] = "C"

@@ -41,6 +41,21 @@ The native workspace follows two proven desktop navigation patterns:
   project, with an inspector (answer a waiting agent, send work back, mark it
   **Looks Good**), **Start Work**, and the Review sheet (⇧⌘R). The Work list has no rail entry of its own; Home manages Work units,
   and the list column folds while Home or a Work page is focused.
+- **Your turn** also holds the daemon's decision queue (`decision_queue_v1`,
+  see [REVIEW](REVIEW.md#one-queue)): questions agents asked the person
+  (`tend_request_attention`) and explicit requests for review, as cards above
+  the Work cards, in the daemon's order. A card shows what to decide, the
+  asker's options as buttons, their recommendation, and the evidence as
+  chips. An option fills the answer for a look before **Send**; the answer is
+  a human-request reply, and **Accept** / **Return…** / **Withdraw** dispose
+  a review item, so the decision is recorded by tendd. A commit or a revision
+  range opens a read-only Changes view of exactly that revision in one click,
+  in the checkout the asker recorded (else the asking agent's working
+  directory), on this Mac only; a pull request opens in the browser, a path
+  in Finder. Other hosts' questions come from their console mailbox. Agents
+  blocked in their pane stay Work cards. The Review sheet lists the same
+  decisions at its top. Against a tendd without the queue, Home shows this
+  Mac's open review items and every host's questions instead.
 - Below Home, VS Code's Activity Bar pattern switches one contextual sidebar
   at a time while the editor area remains stable. Tend applies that to
   **Explore**, **Inbox**, **Ask**, **Shells**, and **Files**, with a filter scoped
