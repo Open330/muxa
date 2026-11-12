@@ -1,8 +1,13 @@
 use super::*;
 use crate::test_support::*;
+// The worker-drain test drives the waker's delivery paths as well.
+#[cfg(target_os = "linux")]
+use crate::collaboration_waker::{deliver_full_collaboration_request, send_collaboration_wake};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tend::backend::{BackendCaps, HostKind, PaneBackend};
+#[cfg(target_os = "linux")]
+use tend::collaboration::NewRequest;
 use tend::event::{AgentEvent, AgentId, AgentKind};
 use tend::tmux::PaneInfo;
 use time::OffsetDateTime;

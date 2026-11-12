@@ -497,7 +497,7 @@ fn requested_ago(created_at: time::OffsetDateTime, now: time::OffsetDateTime) ->
     }
 }
 
-async fn deliver_full_collaboration_request(
+pub(super) async fn deliver_full_collaboration_request(
     collaboration: &CollaborationStore,
     recipient: &tend::collaboration::Participant,
     pending: &CollaborationRequest,
@@ -955,7 +955,7 @@ fn clear_wake_inflight_for_agent(
         .retain(|(key_pane, key_socket, _)| key_pane != pane || *key_socket != agent.tmux_socket);
 }
 
-async fn send_collaboration_wake(
+pub(super) async fn send_collaboration_wake(
     collaboration: &CollaborationStore,
     participant: &tend::collaboration::Participant,
     prompt: &str,
