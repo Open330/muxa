@@ -1435,20 +1435,32 @@ fn hook_moved_session(agent: &Agent, id: &AgentId) -> bool {
 
 /// The newest deterministic observation of `row`'s state, the watermark
 /// the precedence rule holds daemon observations to. Rows from older
-/// snapshots are read the way they were written: a `state_source` without
-/// `deterministic_at` (#480) counts its own time when its source is
-/// deterministic, and a row with no `state_source` at all counts as
-/// hook-described at its last activity, unless it is a synthetic
-/// placeholder.
+/// snapshots have no recorded watermark; a real session's row then counts
+/// as deterministically described at its last activity (or at its own
+/// deterministic stamp, if later), and a synthetic placeholder only at its
+/// own deterministic stamp.
 pub(crate) fn deterministic_watermark(row: &Agent) -> Option<OffsetDateTime> {
+    let real = !is_synthetic(&row.session_id);
     match row.state_source {
-        Some(provenance) => provenance.deterministic_at.or_else(|| {
-            provenance
+        Some(StateProvenance {
+            deterministic_at: Some(at),
+            ..
+        }) => Some(at),
+        // A #480 row: its lineage was not recorded, and a real session may
+        // have been hook- or rollout-described before a heuristic refined it.
+        // Hold it, conservatively, to its last activity.
+        Some(provenance) => {
+            let own = provenance
                 .source
                 .is_deterministic()
-                .then_some(provenance.at)
-        }),
-        None => (!is_synthetic(&row.session_id)).then_some(row.last_activity_at),
+                .then_some(provenance.at);
+            if real {
+                Some(own.map_or(row.last_activity_at, |own| own.max(row.last_activity_at)))
+            } else {
+                own
+            }
+        }
+        None => real.then_some(row.last_activity_at),
     }
 }
 
@@ -9034,26 +9046,44 @@ mod tests {
     async fn rows_from_older_snapshots_keep_their_deterministic_protection() {
         use crate::provenance::StateSource;
         let at = OffsetDateTime::now_utc() - time::Duration::minutes(5);
-        for drop_whole_source in [false, true] {
+        let cases = [
+            (false, StateSource::Hook),
+            (false, StateSource::Timing),
+            (false, StateSource::Screen),
+            (true, StateSource::Hook),
+        ];
+        for (drop_whole_source, legacy_source) in cases {
             let mut row = stored_agent("legacy", AgentKind::ClaudeCode, AgentState::Idle, None);
             row.last_activity_at = at;
-            row.state_source = Some(crate::provenance::StateProvenance::new(
-                StateSource::Hook,
-                at,
-            ));
+            row.state_source = Some(crate::provenance::StateProvenance::new(legacy_source, at));
             let mut json = serde_json::to_value(&row).unwrap();
             let fields = json.as_object_mut().unwrap();
             if drop_whole_source {
                 fields.remove("state_source");
-            } else {
-                fields["state_source"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("deterministic_at");
+            } else if let Some(source) = fields["state_source"].as_object_mut() {
+                source.remove("deterministic_at");
             }
             let restored: Agent = serde_json::from_value(json).unwrap();
             let store = Store::shared();
             store.hydrate(vec![restored]).await;
+            // Re-reading a record from before the snapshot is not news.
+            store
+                .apply_observed(
+                    &AgentEvent::ToolStarted {
+                        id: id("legacy"),
+                        tool: "codex rollout activity".into(),
+                        subagent: None,
+                        command: None,
+                        at,
+                    },
+                    StateSource::ProviderRecord,
+                )
+                .await;
+            assert_eq!(
+                store.by_session("legacy").await.unwrap().state,
+                AgentState::Idle,
+                "legacy {legacy_source} row re-read"
+            );
             let now = OffsetDateTime::now_utc();
             store
                 .apply_observed(
@@ -9078,7 +9108,7 @@ mod tests {
             assert_eq!(
                 store.by_session("legacy").await.unwrap().state,
                 AgentState::WaitingInput,
-                "legacy format (whole source dropped: {drop_whole_source})"
+                "legacy {legacy_source} row (whole source dropped: {drop_whole_source})"
             );
         }
     }
