@@ -174,10 +174,10 @@ pub fn definitions() -> Vec<Value> {
     vec![
         json!({
             "name":"tend_agent_search",
-            "description":"Search local Claude/Codex conversation and command evidence using a Korean/English natural-language question, identifiers, or keywords. Uses transparent local keyword/intent expansion, not embeddings or a model. Returns the interpreted terms/time range, ranked excerpts, event_ids, source lines, and coverage. Dates refer to event timestamps, never file creation dates. To investigate broadly, follow hits with tend_agent_read, vary terms/time/session filters, and inspect calls AND results. No match is not proof of absence; repeat when indexing is incomplete. Read-only on provider files; builds a private disposable local index. No network calls.",
+            "description":"Search local Claude/Codex conversations and commands with a Korean/English question, identifiers or keywords (local keyword expansion, no model). Returns interpreted terms/time range, ranked excerpts with event_ids, and coverage. Expand a hit with event_id; check calls AND results. No match is not proof of absence while indexing is incomplete. Read-only.",
             "inputSchema":{"type":"object","properties":{
-                "query":{"type":"string","description":"Question, e.g. 2026.10.22 11:54 KST에 app-internal 버킷을 우리가 만들었는지. Date + time means ±15 minutes; date alone means that day. Explicit from/to override inferred bounds."},
-                "terms":{"type":"array","items":{"type":"string"},"maxItems":24,"description":"Supplement with alternate literal terms; OR retrieval allows broader investigation."},
+                "query":{"type":"string","description":"The question. A date+time means ±15 min, a date that day; from/to override."},
+                "terms":{"type":"array","items":{"type":"string"},"maxItems":24,"description":"Alternate literal terms (OR)."},
                 "from":{"type":"string","description":"Inclusive RFC3339 event timestamp with timezone."},
                 "to":{"type":"string","description":"Exclusive RFC3339 event timestamp with timezone."},
                 "timezone":{"type":"string","description":"For dates in query: UTC (default), KST, Asia/Seoul, or ±HH:MM."},
@@ -185,13 +185,13 @@ pub fn definitions() -> Vec<Value> {
                 "session_id":{"type":"string","description":"Exact historical session; omit keywords to browse its timeline."},
                 "cwd":{"type":"string","description":"Exact historical working directory."},
                 "kinds":{"type":"array","items":{"type":"string","enum":["user","assistant","tool_call","tool_result","instruction"]}},
-                "exclude_session_ids":{"type":"array","items":{"type":"string"},"maxItems":100,"description":"Exclude your own investigating session and known copied conversations."},
+                "exclude_session_ids":{"type":"array","items":{"type":"string"},"maxItems":100,"description":"Your own session and copies."},
                 "include_instructions":{"type":"boolean","description":"Include auto-attached instructions and skill text. Default false."},
                 "limit":{"type":"integer","minimum":1,"maximum":100,"default":20},
                 "offset":{"type":"integer","minimum":0,"maximum":1900,"default":0},
-                "roots":{"type":"array","items":{"type":"string"},"description":"Additional local transcript directories; defaults, provider env homes and discovered ASX profiles remain included."},
-            "only_roots":{"type":"boolean","default":false,"description":"Search only explicit roots; requires roots. Useful to focus on selected files/directories without indexing every provider home."},
-            "max_index_bytes":{"type":"integer","minimum":1,"maximum":1_073_741_824,"default":134_217_728,"description":"New-source-byte budget this call; prefix verification is additional I/O. Discovery/indexing is also bounded to ~12 seconds. Repeat calls continue from saved positions."}
+                "roots":{"type":"array","items":{"type":"string"},"description":"Extra transcript directories."},
+            "only_roots":{"type":"boolean","default":false,"description":"Search only roots."},
+            "max_index_bytes":{"type":"integer","minimum":1,"maximum":1_073_741_824,"default":134_217_728,"description":"Indexing budget per call; repeat calls continue."}
             },"additionalProperties":false}
         }),
         json!({

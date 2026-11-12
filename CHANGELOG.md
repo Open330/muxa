@@ -40,6 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tend_send_prompt` and `tend_start_work` take `host`/`commit` for Fleet;
   `tend_agent_search` expands a hit with `event_id`. The eight tools they
   absorb stay callable but unlisted. 23 tools, 45,984 bytes.
+- MCP: `tend_call_peer` is the one way to send a request (`exact` or
+  `intent=notice` for exact mailbox delivery, `host` for Fleet), and it no
+  longer waits for the reply by default (`wait=false`; the reply arrives as a
+  wake). `tend_inbox` reads history and peer replies with `view`;
+  `tend_update_request` also cancels and withdraws reply wakes (`action`).
+  Ids the daemon stamps from your pane (`thread_id`, `workspace_id`,
+  `work_id`, `run_id`) are no longer advertised. 16 tools, 26,607 bytes,
+  about half of the 52,864 this stream started from.
 
 ### Fixed
 
