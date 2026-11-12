@@ -38,8 +38,8 @@ The native workspace follows two proven desktop navigation patterns:
   a badge counting the units waiting for you. It shows Work, not agents: each
   unit of work (a solo agent counts as a one-stage unit) is a card in one of
   three lanes, **Your turn**, **In progress** and **Finished**, grouped by
-  project, with a read-only inspector, **Start Work**, and the Review sheet
-  (⇧⌘R). The Work list has no rail entry of its own; Home manages Work units,
+  project, with an inspector (answer a waiting agent, send work back, mark it
+  **Looks Good**), **Start Work**, and the Review sheet (⇧⌘R). The Work list has no rail entry of its own; Home manages Work units,
   and the list column folds while Home or a Work page is focused.
 - Below Home, VS Code's Activity Bar pattern switches one contextual sidebar
   at a time while the editor area remains stable. Tend applies that to

@@ -103,7 +103,7 @@ whether the feature matters.
 | **Core** | Regressions block release; tests required | Attention layer, Work/Run model, collaboration mailbox, review queue and decision record (`tend review`, the `tend work done` result), MCP status/prompt/wait tools, daemon/IPC, `init`/`doctor`/`upgrade` |
 | **Runtime** | Stable contract, documented recovery path | Fleet, workers, snapshot/restore/reload, tendd-owned PTYs, Tend for Mac, loopback dashboard (single user, bearer token, `dashboard` cargo feature), account routing and usage-limit recovery |
 | **Labs** | Off by default or clearly marked; may change or be removed | `automation` rules beyond limit recovery, pipelines, `ask`, collaboration contracts, cmux and zellij backends (adopt-only) |
-| **Labs, frozen** | Kept working, no new features; candidates for removal at the next review | `stats`/`report`/`timeline`/`activity` analytics, the 16-step `tend onboard` live tour |
+| **Labs, frozen** | Kept working, no new features; candidates for removal at the next review | `tend stats` (with `stats report` and `stats activity`) and `tend timeline` analytics, the 16-step `tend onboard` live tour |
 
 A Labs feature graduates when it has a written contract, a recovery path, and
 evidence (from `tend stats` or issues) that it is used outside a single

@@ -15,7 +15,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cargo install --path crates/tend-cli` no longer compile axum, rust-embed
   or the server. The dashboard itself is unchanged.
 - `docs/DIRECTION.md` tiers now match what tend is for. The review queue and
-  decision record are Core. Stats, report, timeline and activity analytics and
+  decision record are Core. `tend stats` (with its report and activity views),
+  `tend timeline` and
   the 16-step `tend onboard` live tour move to a new **Labs, frozen** tier: kept
   working, no new features. cmux and zellij are listed as adopt-only Labs
   backends. `docs/MACOS.md` and the README describe the Mac app's Home screen.
