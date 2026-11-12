@@ -42,6 +42,9 @@ struct TendWorkRecord: Decodable, Hashable, Identifiable, Sendable {
 
     var id: String { identity.id }
 
+    /// The project its plan starts in, as Home's project filter names it.
+    var project: String? { plan?.cwd.map { ($0 as NSString).lastPathComponent } }
+
     var title: String {
         metadata.title?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfBlank ?? identity.workID
     }

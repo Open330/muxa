@@ -211,8 +211,10 @@ struct FleetHomeView: View {
     /// Narrows the board to one host and/or one project.
     private var filterMenu: some View {
         let all = allWorks
-        let hosts = Array(Set(all.flatMap(\.hostAliases))).sorted()
-        let projects = Array(Set(all.compactMap(\.repo))).sorted()
+        // Planned Work counts too: a project with only a plan can be picked.
+        let planned = backlogFeed.shown(on: all)
+        let hosts = Array(Set(all.flatMap(\.hostAliases) + (planned.isEmpty ? [] : [model.localHostAlias]))).sorted()
+        let projects = Array(Set(all.compactMap(\.repo) + planned.compactMap(\.project))).sorted()
         let active = hostFilter != nil || projectFilter != nil
         return Menu {
             Picker("Host", selection: $hostFilter) {
@@ -291,7 +293,7 @@ struct FleetHomeView: View {
     private var backlog: [TendWorkRecord] {
         guard hostFilter == nil || hostFilter == model.localHostAlias else { return [] }
         return backlogFeed.shown(on: allWorks).filter { record in
-            projectFilter == nil || record.plan?.cwd.map { ($0 as NSString).lastPathComponent } == projectFilter
+            projectFilter == nil || record.project == projectFilter
         }
     }
 
@@ -455,7 +457,7 @@ struct FleetHomeView: View {
         Group {
             // A decision read that failed keeps the lanes, so its warning
             // shows instead of an ordinary empty Home.
-            let problem = decisionFeed.problem == nil ? 0 : 1
+            let problem = decisionFeed.problem == nil && backlogFeed.problem == nil ? 0 : 1
             let backlog = backlog
             if FleetBoard.showsEmptyBoard(visible: works.count + decisions.count + backlog.count + problem, reviewed: reviewedCount) {
                 FleetEmptyBoard(
@@ -465,7 +467,8 @@ struct FleetHomeView: View {
                 )
             } else {
                 HStack(alignment: .top, spacing: 12) {
-                    if !backlog.isEmpty {
+                    // A failed backlog read shows its column with the reason.
+                    if !backlog.isEmpty || backlogFeed.problem != nil {
                         FleetBacklogColumn(feed: backlogFeed, records: backlog) { record in
                             let feed = backlogFeed
                             let model = model
