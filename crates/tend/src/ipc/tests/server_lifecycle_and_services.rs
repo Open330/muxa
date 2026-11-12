@@ -1282,7 +1282,7 @@ async fn swap_health_answers_in_every_state() {
     handle.await.unwrap();
 
     let unopened: Arc<dyn crate::swap_service::SwapJobs> = Arc::new(
-        crate::swap_service::UnopenedSwap::new("schema 9, this build reads 2".into()),
+        crate::swap_service::UnopenedSwap::new("schema 9, this build reads 2".into(), 2),
     );
     let (_dir, client, tx, handle) = swap_server(Some(unopened)).await;
     let hello = client.hello(Duration::from_secs(2)).await.unwrap();

@@ -2984,7 +2984,7 @@ pub(crate) async fn call_peer(
                         })
                     })
                     .await;
-                    allowed = matches!(result, Ok(Ok(report)) if report.state == tend::account_swap::worker_startup::State::Ready);
+                    allowed = matches!(result, Ok(Ok(report)) if report.state == tend::worker_startup::State::Ready);
                 }
             }
             if !allowed {

@@ -2,7 +2,7 @@ use super::{Client, RuntimeError, PROTOCOL_VERSION, SWAP_CLIENT_TIMEOUT};
 impl Client {
     pub async fn swap_accounts(
         &self,
-    ) -> Result<Vec<crate::account_provider::ProviderCandidates>, RuntimeError> {
+    ) -> Result<Vec<crate::swap_api::ProviderCandidates>, RuntimeError> {
         let response = self
             .call_with_timeout(
                 &serde_json::json!({
@@ -27,8 +27,8 @@ impl Client {
     pub async fn swap_job_start(
         &self,
         request_key: &str,
-        overrides: &crate::swap_service::SwapOverrides,
-    ) -> Result<crate::swap_service::Accepted, RuntimeError> {
+        overrides: &crate::swap_api::SwapOverrides,
+    ) -> Result<crate::swap_api::Accepted, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_job_start",
@@ -41,8 +41,8 @@ impl Client {
     /// `swap_jobs_v1`: a job by id or request key.
     pub async fn swap_job_status(
         &self,
-        job: &crate::swap_service::JobRef,
-    ) -> Result<crate::swap_service::JobView, RuntimeError> {
+        job: &crate::swap_api::JobRef,
+    ) -> Result<crate::swap_api::JobView, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_job_status",
@@ -52,7 +52,7 @@ impl Client {
     }
 
     /// `swap_health_v1`: how the daemon's swap service is.
-    pub async fn swap_health(&self) -> Result<crate::swap_service::SwapHealth, RuntimeError> {
+    pub async fn swap_health(&self) -> Result<crate::swap_api::SwapHealth, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_health",
@@ -63,8 +63,8 @@ impl Client {
     /// `swap_cancel_v1`: ask `job` to start no further target.
     pub async fn swap_job_cancel(
         &self,
-        job: &crate::swap_service::JobRef,
-    ) -> Result<crate::swap_service::JobView, RuntimeError> {
+        job: &crate::swap_api::JobRef,
+    ) -> Result<crate::swap_api::JobView, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_job_cancel",
@@ -77,9 +77,9 @@ impl Client {
     pub async fn swap_job_retry(
         &self,
         request_key: &str,
-        parent: &crate::swap_service::JobRef,
-        overrides: &crate::swap_service::RetryOverrides,
-    ) -> Result<crate::swap_service::Accepted, RuntimeError> {
+        parent: &crate::swap_api::JobRef,
+        overrides: &crate::swap_api::RetryOverrides,
+    ) -> Result<crate::swap_api::Accepted, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_job_retry",
@@ -93,8 +93,8 @@ impl Client {
     /// `swap_plan_v1`: what a start would do.
     pub async fn swap_plan(
         &self,
-        overrides: &crate::swap_service::SwapOverrides,
-    ) -> Result<crate::swap_service::PlanView, RuntimeError> {
+        overrides: &crate::swap_api::SwapOverrides,
+    ) -> Result<crate::swap_api::PlanView, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "swap_plan",

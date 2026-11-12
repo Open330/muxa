@@ -29,7 +29,7 @@ pub struct Server {
     pub(super) config_path: Option<PathBuf>,
     /// Daemon-owned swap jobs; `None` when the daemon could not take its
     /// job store, in which case every swap request is refused.
-    pub(super) swap: Option<Arc<dyn crate::swap_service::SwapJobs>>,
+    pub(super) swap: Option<Arc<dyn crate::swap_api::SwapJobs>>,
     pub(super) handler_limit: usize,
     pub(super) endpoint_check: Duration,
 }
@@ -94,7 +94,7 @@ impl Server {
 
     /// Serve swap jobs from `swap`.
     #[must_use]
-    pub fn with_swap(mut self, swap: Option<Arc<dyn crate::swap_service::SwapJobs>>) -> Self {
+    pub fn with_swap(mut self, swap: Option<Arc<dyn crate::swap_api::SwapJobs>>) -> Self {
         self.swap = swap;
         self
     }

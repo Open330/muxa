@@ -14,7 +14,7 @@ pub(super) const SWAP_HEALTH_ANSWER: Duration = Duration::from_secs(2);
 /// The swap service's health, off the reactor and bounded: a check that
 /// cannot answer in time is reported as such, never waited on.
 pub(super) async fn swap_health_response(
-    swap: Option<&Arc<dyn crate::swap_service::SwapJobs>>,
+    swap: Option<&Arc<dyn crate::swap_api::SwapJobs>>,
 ) -> Response {
     let Some(swap) = swap.cloned() else {
         return Response::err("swap jobs are not offered by this daemon".to_owned());
@@ -49,7 +49,7 @@ pub(super) const SWAP_HEALTH_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Whether the swap service would take a job now. Its check reads the job
 /// store, so it runs off the reactor, and a slow answer counts as no.
-pub(super) async fn swap_healthy(swap: Option<&Arc<dyn crate::swap_service::SwapJobs>>) -> bool {
+pub(super) async fn swap_healthy(swap: Option<&Arc<dyn crate::swap_api::SwapJobs>>) -> bool {
     let Some(swap) = swap.cloned() else {
         return false;
     };
@@ -63,8 +63,8 @@ pub(super) async fn swap_healthy(swap: Option<&Arc<dyn crate::swap_service::Swap
 /// Run a swap request against the service off the reactor. No service is a
 /// refusal: there is no other path a swap could take.
 pub(super) async fn swap_call(
-    swap: Option<&Arc<dyn crate::swap_service::SwapJobs>>,
-    call: impl FnOnce(&dyn crate::swap_service::SwapJobs) -> Result<serde_json::Value, String>
+    swap: Option<&Arc<dyn crate::swap_api::SwapJobs>>,
+    call: impl FnOnce(&dyn crate::swap_api::SwapJobs) -> Result<serde_json::Value, String>
         + Send
         + 'static,
 ) -> Response {

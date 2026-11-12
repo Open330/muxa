@@ -67,10 +67,10 @@ fn quit_command(kind: AgentKind) -> Option<&'static str> {
 /// Read the composer strictly. Unlike swap's draft reader, a screen that does
 /// not parse is `Unknown`, never `Empty`.
 fn read_composer(screen: &str, kind: AgentKind) -> Composer {
-    if crate::account_swap::turn_running(screen) {
+    if crate::agent_tui::turn_running(screen) {
         return Composer::Unknown("a turn is running".into());
     }
-    if let Some(question) = crate::account_swap::open_question(screen) {
+    if let Some(question) = crate::agent_tui::open_question(screen) {
         return Composer::Unknown(format!("a dialog is open: {question}"));
     }
     let lines: Vec<&str> = screen.lines().collect();
@@ -109,7 +109,7 @@ fn read_composer(screen: &str, kind: AgentKind) -> Composer {
                 return Composer::Unknown("no Codex composer on screen".into());
             };
             let text = line.trim_start_matches('›').trim();
-            if text.is_empty() || crate::account_swap::CODEX_PLACEHOLDERS.contains(&text) {
+            if text.is_empty() || crate::agent_tui::CODEX_PLACEHOLDERS.contains(&text) {
                 Composer::Empty
             } else {
                 Composer::Draft
@@ -150,7 +150,7 @@ fn codex_placeholder_shown(raw: &str, kind: AgentKind) -> bool {
     }
     let shown = text.trim().trim_end_matches('…').trim_end();
     !shown.is_empty()
-        && crate::account_swap::CODEX_PLACEHOLDERS
+        && crate::agent_tui::CODEX_PLACEHOLDERS
             .iter()
             .any(|placeholder| placeholder.starts_with(shown))
 }

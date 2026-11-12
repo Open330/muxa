@@ -2240,6 +2240,7 @@ esac
         let unopened: std::sync::Arc<dyn tend::swap_service::SwapJobs> =
             std::sync::Arc::new(tend::swap_service::UnopenedSwap::new(
                 "swap jobs are owned by another live manager (pid 7)".into(),
+                2,
             ));
         let server = tend::ipc::Server::new(socket.clone(), tend::Store::shared())
             .with_collaboration(mailbox)
