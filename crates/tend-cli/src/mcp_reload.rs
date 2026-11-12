@@ -615,7 +615,7 @@ async fn verify_host(
                     if server["runtimeStatus"]=="connected" {connected+=1;}
                     if server["runtimeStatus"] == "connected"
                         && server.pointer("/serverInfo/version").and_then(Value::as_str).is_some_and(|version| version.ends_with(&suffix))
-                        && server.pointer("/tools/tend_peer_report/inputSchema/properties/full").is_some() { current += 1; }
+                        && server.pointer("/tools/tend_inbox/inputSchema/properties/view").is_some() { current += 1; }
                 }
             }
             cursor = page.get("nextCursor").cloned().unwrap_or(Value::Null);
@@ -1011,7 +1011,7 @@ mod tests {
                 assert_eq!(request["params"]["detail"], "toolsAndAuthOnly");
                 send(&mut connection, json!({"id":id,"result":{"data":[{
                     "name":"tend","runtimeStatus":"connected","serverInfo":{"version":version},
-                    "tools":{"tend_peer_report":{"inputSchema":{"properties":{"full":{"type":"boolean"}}}}}
+                    "tools":{"tend_inbox":{"inputSchema":{"properties":{"view":{"type":"string"}}}}}
                 }]}})).await.unwrap();
             }
         });
