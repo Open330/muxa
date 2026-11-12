@@ -1,0 +1,26 @@
+{
+  "decision_queue": {
+    "items": [
+      {
+        "generation": 1,
+        "id": "rv_09748a6915534c29bc3d4a03a07c5fea",
+        "idempotency_key": "fixture:1",
+        "kind": "review",
+        "requested_at": "2026-11-12T14:49:39.836376Z",
+        "requested_by": {
+          "kind": "agent",
+          "label": "impl"
+        },
+        "summary": "check the migration",
+        "target": {
+          "kind": "session",
+          "provider": "claude",
+          "session_id": "s1"
+        }
+      }
+    ],
+    "truncated": false
+  },
+  "ok": true,
+  "protocol": 6
+}

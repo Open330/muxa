@@ -1,0 +1,30 @@
+{
+  "agents": [
+    {
+      "agent_session_id": "s1",
+      "context_used_pct": null,
+      "cost_usd": null,
+      "cwd": "/repo",
+      "kind": "claude_code",
+      "last_activity_at": "2026-11-12T00:00:01Z",
+      "last_event_at": "2026-11-12T00:00:01Z",
+      "last_notification": null,
+      "last_prompt": "fix the flaky test",
+      "last_prompt_at": "2026-11-12T00:00:01Z",
+      "last_prompt_origin": "unknown",
+      "last_response": null,
+      "model": null,
+      "pane": "%1",
+      "started_at": "2026-11-12T00:00:00Z",
+      "state": "working",
+      "state_entered_at": "2026-11-12T00:00:01Z",
+      "state_source": {
+        "at": "2026-11-12T00:00:01Z",
+        "deterministic_at": "2026-11-12T00:00:01Z",
+        "source": "hook"
+      }
+    }
+  ],
+  "ok": true,
+  "protocol": 6
+}

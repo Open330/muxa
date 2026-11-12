@@ -944,7 +944,7 @@ struct TendCollaborationMailbox: Sendable {
     }
 }
 
-private struct TendFleetCommandResult: Decodable, Sendable {
+struct TendFleetCommandResult: Decodable, Sendable {
     let accepted: Bool
     let message: String?
     let capture: String?
@@ -974,7 +974,9 @@ private struct TendFleetCommandResult: Decodable, Sendable {
     }
 }
 
-private struct TendIPCResponse: Decodable, Sendable {
+/// One reply line. Internal, not private, so `TendIPCFixtureTests` can decode
+/// the daemon's golden replies with exactly this type.
+struct TendIPCResponse: Decodable, Sendable {
     let ok: Bool
     let error: String?
     let minProtocol: UInt32?

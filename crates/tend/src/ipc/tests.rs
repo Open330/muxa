@@ -753,4 +753,5 @@ mod server_lifecycle_and_services;
 mod history_invalidations;
 mod launch_identity;
 mod mutation_views;
+mod swift_fixtures;
 mod turn_boundary;
