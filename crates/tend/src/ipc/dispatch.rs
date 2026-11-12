@@ -417,6 +417,45 @@ pub(super) async fn handle(
                     kind = name;
                     response
                 }
+                body
+                @ (RequestBody::DecisionQueue { .. } | RequestBody::DecisionHistory { .. }) => {
+                    // An operator read of every room's human requests goes
+                    // in the collaboration ledger like a widened listing.
+                    let audit = match &body {
+                        RequestBody::DecisionQueue { origin, limit }
+                        | RequestBody::DecisionHistory { origin, limit } => origin
+                            .as_ref()
+                            .filter(|origin| origin.console)
+                            .map(|origin| {
+                                let mut context = CollaborationAuditContext::new(
+                                    CollaborationAuditOperation::List,
+                                    origin.clone(),
+                                );
+                                context.scope = Some(MailboxScope::All);
+                                context.read_view =
+                                    Some(collaboration::CollaborationReadView::Full);
+                                context.query_limit = Some(*limit);
+                                context
+                            }),
+                        _ => None,
+                    };
+                    let (name, response) = Box::pin(super::review::decision_response(
+                        &reviews,
+                        &collaboration,
+                        &store,
+                        body,
+                    ))
+                    .await;
+                    kind = name;
+                    if let Some(context) = audit {
+                        pending_audit = Some(collaboration_audit_entry(
+                            &collaboration_actor,
+                            context,
+                            &response,
+                        ));
+                    }
+                    response
+                }
                 RequestBody::PipelineRuns => {
                     kind = "pipeline_runs";
                     Response::with_pipeline_runs(pipeline_runs.list().await)

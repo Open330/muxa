@@ -2346,6 +2346,68 @@ async fn ask_provider_add_and_remove_compose_the_list_over_the_wire() {
 }
 
 #[tokio::test]
+async fn human_requests_in_the_decision_queue_are_an_operator_read() {
+    use crate::collaboration::{
+        CollaborationOptions, CollaborationStore, HumanAction, NewRequest, Participant, RequestKind,
+    };
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("tend-queue.sock");
+    let mailbox = CollaborationStore::in_memory(CollaborationOptions::default());
+    let sender: Participant = serde_json::from_value(serde_json::json!({
+        "agent_kind":"codex", "agent_session_id":"a", "pane":"%1",
+        "room":{"host":"tmux","socket":"default","window_id":"@1"},
+        "state":"idle", "launch_purpose":"worker"
+    }))
+    .unwrap();
+    let console = Participant::console(sender.room.clone());
+    mailbox
+        .create(
+            sender,
+            console,
+            NewRequest {
+                body: "Merge?".into(),
+                kind: RequestKind::Question,
+                human_action: Some(HumanAction::Choice),
+                ..NewRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let server = Server::new(sock.clone(), Store::shared()).with_collaboration(mailbox);
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+
+    let operator = client
+        .decision_queue(&crate::decision_queue::operator_origin(), 10)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&operator.items[..], [crate::decision_queue::PendingItem::HumanRequest(h)] if h.body == "Merge?"),
+        "{operator:?}"
+    );
+    // An agent's origin, even one in the same room, does not read them.
+    let agent = crate::collaboration::CollaborationOrigin {
+        pane: "%1".into(),
+        socket: Some("default".into()),
+        ..crate::decision_queue::operator_origin()
+    };
+    let agent = crate::collaboration::CollaborationOrigin {
+        console: false,
+        ..agent
+    };
+    let refused = client.decision_queue(&agent, 10).await.unwrap();
+    assert!(refused.items.is_empty(), "{refused:?}");
+    assert_eq!(refused.unavailable.len(), 1, "{refused:?}");
+    let history = client.decision_history(&agent, 10).await.unwrap();
+    assert_eq!(history.unavailable.len(), 1, "{history:?}");
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}
+
+#[tokio::test]
+#[allow(clippy::too_many_lines)] // one daemon fixture covers create, queue, dispose and history
 async fn review_items_round_trip_over_ipc() {
     use crate::review::{ActorKind, DispositionKind, NewReview, ReviewActor, ReviewTarget};
     let dir = tempdir().unwrap();
@@ -2395,6 +2457,20 @@ async fn review_items_round_trip_over_ipc() {
     let item = client.review_create(&new).await.unwrap();
     assert_eq!(client.review_create(&new).await.unwrap(), item);
     assert_eq!(item.decision, new.decision, "the decision round-trips");
+    let queue = client
+        .decision_queue(&crate::decision_queue::operator_origin(), 10)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&queue.items[..], [crate::decision_queue::PendingItem::Review(r)] if r.id == item.id),
+        "{queue:?}"
+    );
+    assert!(client
+        .decision_history(&crate::decision_queue::operator_origin(), 10)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
     assert_eq!(client.review_get(&item.id).await.unwrap(), item);
     let summary = client
         .review_summary_with_timeout(Duration::from_secs(3))
@@ -2414,6 +2490,21 @@ async fn review_items_round_trip_over_ipc() {
     assert_eq!(
         returned.disposition.as_ref().map(|d| d.kind),
         Some(DispositionKind::Returned)
+    );
+    assert!(client
+        .decision_queue(&crate::decision_queue::operator_origin(), 10)
+        .await
+        .unwrap()
+        .items
+        .is_empty());
+    let history = client
+        .decision_history(&crate::decision_queue::operator_origin(), 10)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&history.items[..], [crate::decision_queue::DecidedItem::Review(r)]
+            if r.disposition.as_ref().and_then(|d| d.note.as_deref()) == Some("no tests")),
+        "{history:?}"
     );
     let query = |open_only| crate::review::ReviewQuery {
         open_only,

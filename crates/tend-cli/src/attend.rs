@@ -188,7 +188,9 @@ pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Op
     let paneless = paneless_waiters(&agents);
 
     if args.list {
-        if cands.is_empty() && paneless.is_empty() {
+        let decisions = pending_decisions(client).await;
+        let nothing = cands.is_empty() && paneless.is_empty();
+        if nothing && decisions.is_empty() {
             print_nothing(&agents);
         } else {
             if !cands.is_empty() {
@@ -197,6 +199,7 @@ pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Op
             // Separate the un-jumpable section from the queue with a
             // blank line only when both are present.
             print_paneless(&paneless, !cands.is_empty());
+            print!("{}", decisions.render(!nothing, OffsetDateTime::now_utc()));
         }
         return Ok(None);
     }
@@ -299,6 +302,106 @@ fn paneless_waiters(agents: &[Agent]) -> Vec<&Agent> {
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
     waiters
+}
+
+/// Human requests and open review items from the decision queue, for
+/// `--list`. Empty on a daemon without `decision_queue_v1`, so `attend`
+/// keeps working against an older tendd.
+#[derive(Default)]
+struct PendingDecisions {
+    human: Vec<tend::decision_queue::HumanRequestEntry>,
+    /// More human requests than were read.
+    more_human: bool,
+    /// Open review items, from the store's own count rather than a page of
+    /// the queue, where higher-priority entries can push every review out.
+    reviews: u64,
+    unavailable: Vec<String>,
+}
+
+impl PendingDecisions {
+    fn is_empty(&self) -> bool {
+        self.human.is_empty() && self.reviews == 0 && self.unavailable.is_empty()
+    }
+
+    fn render(&self, leading_blank: bool, now: OffsetDateTime) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if self.is_empty() {
+            return out;
+        }
+        if leading_blank {
+            out.push('\n');
+        }
+        if !self.human.is_empty() {
+            let n = self.human.len();
+            let _ = writeln!(
+                out,
+                "{n} question{} for you (answer in `tend watch`, key e, or Tend for Mac):",
+                if n == 1 { "" } else { "s" }
+            );
+            for entry in &self.human {
+                let _ = writeln!(
+                    out,
+                    "  ? {}",
+                    crate::review_cmd::render_human_request(entry, now)
+                );
+            }
+            if self.more_human {
+                out.push_str("  … more: tend review queue\n");
+            }
+        }
+        if self.reviews > 0 {
+            let _ = writeln!(
+                out,
+                "{} result{} to review: tend review queue",
+                self.reviews,
+                if self.reviews == 1 { "" } else { "s" }
+            );
+        }
+        for source in &self.unavailable {
+            let _ = writeln!(out, "unavailable: {source}");
+        }
+        out
+    }
+}
+
+/// Human requests lead the queue, so a page of it holds them first; a page
+/// that also reached past them read them all.
+const HUMAN_PAGE: usize = 100;
+
+async fn pending_decisions(client: &Client) -> PendingDecisions {
+    if !crate::review_cmd::queue_supported(client).await {
+        return PendingDecisions::default();
+    }
+    let mut pending = PendingDecisions::default();
+    match client
+        .decision_queue(&tend::decision_queue::operator_origin(), HUMAN_PAGE)
+        .await
+    {
+        Ok(queue) => {
+            let read = queue.items.len();
+            for item in queue.items {
+                if let tend::decision_queue::PendingItem::HumanRequest(entry) = item {
+                    pending.human.push(entry);
+                }
+            }
+            pending.more_human = queue.truncated && pending.human.len() == read;
+            pending.unavailable = queue
+                .unavailable
+                .into_iter()
+                .filter(|source| !source.starts_with("review items"))
+                .collect();
+        }
+        Err(error) => pending.unavailable.push(format!("decision queue: {error}")),
+    }
+    match client
+        .review_summary_with_timeout(std::time::Duration::from_secs(2))
+        .await
+    {
+        Ok(summary) => pending.reviews = summary.open,
+        Err(error) => pending.unavailable.push(format!("review items: {error}")),
+    }
+    pending
 }
 
 /// "nothing to do" line — separates "nothing tracked" from "everything's
@@ -608,6 +711,29 @@ mod tests {
         let cands = candidates(&agents, &panes);
         let cur = spatial_key("%1", &panes);
         assert_eq!(next_after(&cands, Some(&cur)).unwrap().pane, "%2");
+    }
+
+    #[test]
+    fn pending_decisions_render_the_store_count_and_unavailable_sources() {
+        let now = t(0);
+        let pending = PendingDecisions {
+            reviews: 1,
+            ..PendingDecisions::default()
+        };
+        assert_eq!(
+            pending.render(true, now),
+            "\n1 result to review: tend review queue\n"
+        );
+        let broken = PendingDecisions {
+            unavailable: vec!["review items: closed".into()],
+            ..PendingDecisions::default()
+        };
+        assert!(!broken.is_empty(), "a source that failed is never silence");
+        assert_eq!(
+            broken.render(false, now),
+            "unavailable: review items: closed\n"
+        );
+        assert_eq!(PendingDecisions::default().render(true, now), "");
     }
 
     #[test]

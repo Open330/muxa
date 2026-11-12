@@ -70,3 +70,116 @@ pub(super) async fn review_response(
         (kind, Err(error)) => (kind, Response::err(error.to_string())),
     }
 }
+
+/// Human requests from every room are an operator-console read, the same
+/// rule `collaboration_list` applies past the caller's own mailbox.
+fn operator_only(
+    origin: Option<&crate::collaboration::CollaborationOrigin>,
+) -> Option<crate::collaboration::CollaborationError> {
+    (!origin.is_some_and(|origin| origin.console))
+        .then_some(crate::collaboration::CollaborationError::ScopeDenied)
+}
+
+/// Serve `decision_queue` and `decision_history`. A source that cannot be
+/// read is named in `unavailable` rather than failing the whole read, so
+/// the person still sees what the other sources hold.
+pub(super) async fn decision_response(
+    reviews: &ReviewStore,
+    collaboration: &crate::collaboration::CollaborationStore,
+    store: &super::SharedStore,
+    body: RequestBody,
+) -> (&'static str, Response) {
+    use crate::decision_queue::{assemble_history, assemble_queue, MAX_QUEUE_LIMIT};
+    match body {
+        RequestBody::DecisionQueue { limit, origin } => {
+            let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
+            let mut unavailable = Vec::new();
+            let mut truncated = false;
+            let human = match operator_only(origin.as_ref()) {
+                Some(refused) => Err(refused),
+                None => collaboration.open_human_requests(limit).await,
+            };
+            let human = match human {
+                Ok((requests, more)) => {
+                    truncated |= more;
+                    requests
+                }
+                Err(crate::collaboration::CollaborationError::Disabled) => Vec::new(),
+                Err(error) => {
+                    unavailable.push(format!("human requests: {error}"));
+                    Vec::new()
+                }
+            };
+            let page = reviews
+                .list(crate::review::ReviewQuery {
+                    open_only: true,
+                    oldest_first: true,
+                    limit,
+                    offset: 0,
+                })
+                .await;
+            let reviews = match page {
+                Ok(page) => {
+                    truncated |= page.has_more;
+                    page.items
+                }
+                Err(error) => {
+                    unavailable.push(format!("review items: {error}"));
+                    Vec::new()
+                }
+            };
+            let agents = store.snapshot().await;
+            let mut queue = assemble_queue(&human, &agents, reviews, limit);
+            queue.truncated |= truncated;
+            queue.unavailable = unavailable;
+            (
+                "decision_queue",
+                Response {
+                    decision_queue: Some(Box::new(queue)),
+                    ..Response::ok()
+                },
+            )
+        }
+        RequestBody::DecisionHistory { limit, origin } => {
+            let limit = limit.clamp(1, MAX_QUEUE_LIMIT);
+            let mut unavailable = Vec::new();
+            let mut truncated = false;
+            let answered = match operator_only(origin.as_ref()) {
+                Some(refused) => Err(refused),
+                None => collaboration.answered_human_requests(limit).await,
+            };
+            let answered = match answered {
+                Ok((requests, more)) => {
+                    truncated |= more;
+                    requests
+                }
+                Err(crate::collaboration::CollaborationError::Disabled) => Vec::new(),
+                Err(error) => {
+                    unavailable.push(format!("human requests: {error}"));
+                    Vec::new()
+                }
+            };
+            let decided = match reviews.decided(limit).await {
+                Ok(page) => {
+                    truncated |= page.has_more;
+                    page.items
+                }
+                Err(error) => {
+                    unavailable.push(format!("review items: {error}"));
+                    Vec::new()
+                }
+            };
+            let mut history = assemble_history(decided, &answered, limit);
+            history.truncated |= truncated;
+            history.unavailable = unavailable;
+            (
+                "decision_history",
+                Response {
+                    decision_history: Some(Box::new(history)),
+                    ..Response::ok()
+                },
+            )
+        }
+        _ => ("decision", Response::err("not a decision request")),
+    }
+}

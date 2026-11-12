@@ -33,6 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record instead of the pane. `tend work done` files the record before
   completing the alias, and repeating it returns the same record. The
   installed agent guide now says finishing work means filing it.
+- `tend review queue` lists everything waiting on you in one ordered list:
+  human requests (with options and recommendation), agents blocked in their
+  pane, then open review items. `tend review history` lists what was decided:
+  review dispositions with their notes and answered human requests with the
+  answer. `tend attend --list` now shows open human requests and the review
+  count too. Served over IPC as `decision_queue` / `decision_history`
+  (`decision_queue_v1`).
 - Review items and human requests can carry a structured decision: what
   needs deciding, the options, the asker's recommendation and typed
   evidence (commit, pull request, diff range, test command with its result

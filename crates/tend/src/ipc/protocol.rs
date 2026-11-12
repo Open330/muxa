@@ -117,6 +117,26 @@ pub(super) enum RequestBody {
         #[serde(default)]
         note: Option<String>,
     },
+    /// Everything pending on the person, in one ordered list
+    /// (`decision_queue_v1`).
+    ///
+    /// Human requests come only to an operator-console origin, as with any
+    /// listing past the caller's own mailbox; other callers get reviews and
+    /// waiting agents, with the human source named as unavailable.
+    DecisionQueue {
+        #[serde(default = "default_review_list_limit")]
+        limit: usize,
+        #[serde(default)]
+        origin: Option<collaboration::CollaborationOrigin>,
+    },
+    /// Decided review items and answered human requests, newest first
+    /// (`decision_queue_v1`).
+    DecisionHistory {
+        #[serde(default = "default_review_list_limit")]
+        limit: usize,
+        #[serde(default)]
+        origin: Option<collaboration::CollaborationOrigin>,
+    },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
     PipelineSubscribe,
@@ -1012,6 +1032,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::review::REVIEW_RECORD_CAPABILITY,
     crate::decision::REVIEW_DECISION_CAPABILITY,
     crate::decision::HUMAN_DECISION_CAPABILITY,
+    crate::decision_queue::DECISION_QUEUE_CAPABILITY,
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
@@ -1253,6 +1274,12 @@ pub struct Response {
     pub review_has_more: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub review_summary: Option<crate::review::ReviewSummary>,
+    /// `decision_queue_v1`: everything pending on the person.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_queue: Option<Box<crate::decision_queue::PendingQueue>>,
+    /// `decision_queue_v1`: past decisions, newest first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_history: Option<Box<crate::decision_queue::DecisionHistory>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pipeline_claims: Option<Vec<PipelineClaim>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1370,6 +1397,8 @@ impl Response {
             review_items: None,
             review_has_more: None,
             review_summary: None,
+            decision_queue: None,
+            decision_history: None,
             pipeline_claims: None,
             work_operation: None,
             work_command: None,
