@@ -4856,10 +4856,9 @@ mod tests {
         assert!(scrubbed.contains("since=24h"), "scrubbed: {scrubbed}");
 
         // No query → untouched path.
-        let encoded: axum::http::Uri =
-            "/api/agents?co%64e=secret&sta%74e=secret&to%6ben=secret"
-                .parse()
-                .unwrap();
+        let encoded: axum::http::Uri = "/api/agents?co%64e=secret&sta%74e=secret&to%6ben=secret"
+            .parse()
+            .unwrap();
         assert!(!scrub_token_from_uri(&encoded).contains("secret"));
         let plain: axum::http::Uri = "/api/health".parse().unwrap();
         assert_eq!(scrub_token_from_uri(&plain), "/api/health");
