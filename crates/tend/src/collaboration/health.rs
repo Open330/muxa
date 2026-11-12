@@ -63,6 +63,86 @@ pub struct CollaborationHealth {
     pub stale_queued: usize,
     pub stale_quiet_notices: usize,
     pub example_quiet_notice_ids: Vec<String>,
+    /// How agent requests that expected a reply ended, per 7-day bucket
+    /// back from now (newest first), so a delivery default can be judged on
+    /// evidence. Absent from older daemons.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub weekly_outcomes: Vec<WeeklyOutcome>,
+}
+
+/// Outcomes of the agent-to-agent requests created in one 7-day bucket.
+/// Counts exact original requests only: human items, Tend's own service
+/// requests and notices are excluded.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WeeklyOutcome {
+    /// First day of the bucket (UTC calendar date).
+    pub since: String,
+    pub requests: usize,
+    /// Finished with a reply (any reported status).
+    pub replied: usize,
+    pub expired: usize,
+    /// Still open or cancelled, not replied.
+    pub open: usize,
+    /// The latest recorded interruption reason, by reason.
+    pub reply_overdue: usize,
+    pub wake_unsubmitted: usize,
+    pub other_interruptions: usize,
+}
+
+/// Buckets reported by [`CollaborationStore::health`].
+pub const OUTCOME_WEEKS: i64 = 4;
+
+fn weekly_outcomes<'a>(
+    requests: impl Iterator<Item = &'a CollaborationRequest>,
+    now: OffsetDateTime,
+) -> Vec<WeeklyOutcome> {
+    let mut weeks: Vec<WeeklyOutcome> = (0..OUTCOME_WEEKS)
+        .map(|week| WeeklyOutcome {
+            since: (now - time::Duration::days(7 * (week + 1)))
+                .date()
+                .to_string(),
+            ..WeeklyOutcome::default()
+        })
+        .collect();
+    for request in requests {
+        if !request.expects_reply
+            || request.kind == RequestKind::Notice
+            || request.to.console
+            || request.human_action.is_some()
+            || request.from.agent_session_id.starts_with("tend:")
+        {
+            continue;
+        }
+        let age = now - request.created_at;
+        if age.is_negative() {
+            continue;
+        }
+        let Ok(week) = usize::try_from(age.whole_days() / 7) else {
+            continue;
+        };
+        let Some(bucket) = weeks.get_mut(week) else {
+            continue;
+        };
+        bucket.requests += 1;
+        if request.reply.is_some() {
+            bucket.replied += 1;
+        } else if request.status == RequestStatus::Expired {
+            bucket.expired += 1;
+        } else {
+            bucket.open += 1;
+        }
+        match request
+            .interruption
+            .as_ref()
+            .map(|info| info.reason.as_str())
+        {
+            Some("reply_overdue") => bucket.reply_overdue += 1,
+            Some("wake_unsubmitted") => bucket.wake_unsubmitted += 1,
+            Some(_) => bucket.other_interruptions += 1,
+            None => {}
+        }
+    }
+    weeks
 }
 
 impl CollaborationRequest {
@@ -120,6 +200,7 @@ impl CollaborationStore {
                 }
             }
         }
+        health.weekly_outcomes = weekly_outcomes(requests.values(), OffsetDateTime::now_utc());
         health.example_request_ids = interrupted_examples.into_iter().map(|(_, id)| id).collect();
         health.example_quiet_notice_ids = quiet_examples.into_iter().map(|(_, id)| id).collect();
         Ok(health)
@@ -330,5 +411,80 @@ mod tests {
             store.requests.read().await[&ids[8]].status,
             RequestStatus::Queued
         );
+    }
+
+    #[tokio::test]
+    async fn weekly_outcomes_count_agent_requests_by_ending_and_interruption_reason() {
+        let store = CollaborationStore::in_memory(CollaborationOptions::default());
+        let mut ids = Vec::new();
+        for body in ["replied", "expired", "overdue", "unsubmitted", "old"] {
+            ids.push(
+                store
+                    .create(
+                        participant("a"),
+                        participant("b"),
+                        NewRequest {
+                            body: body.into(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap()
+                    .id,
+            );
+        }
+        let notice = store
+            .create(
+                participant("a"),
+                participant("b"),
+                NewRequest {
+                    kind: RequestKind::Notice,
+                    expects_reply: false,
+                    body: "fyi".into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let now = OffsetDateTime::now_utc();
+        {
+            let mut requests = store.requests.write().await;
+            let interruption = |reason: &str| PeerInterruption {
+                request_id: String::new(),
+                reason: reason.into(),
+                active: false,
+                observed_at: now,
+                reset_at: None,
+                action_request_id: None,
+                decision: None,
+            };
+            requests.get_mut(&ids[0]).unwrap().reply =
+                Some(crate::collaboration::CollaborationReply {
+                    status: RequestStatus::Completed,
+                    body: "ok".into(),
+                    artifacts: vec![],
+                    at: now,
+                    report: None,
+                });
+            requests.get_mut(&ids[1]).unwrap().status = RequestStatus::Expired;
+            requests.get_mut(&ids[2]).unwrap().interruption = Some(interruption("reply_overdue"));
+            requests.get_mut(&ids[3]).unwrap().interruption =
+                Some(interruption("wake_unsubmitted"));
+            requests.get_mut(&ids[4]).unwrap().created_at = now - time::Duration::days(8);
+        }
+        let health = store.health().await.unwrap();
+        let this_week = &health.weekly_outcomes[0];
+        assert_eq!(
+            this_week.requests, 4,
+            "the notice and last week's request are elsewhere"
+        );
+        assert_eq!(this_week.replied, 1);
+        assert_eq!(this_week.expired, 1);
+        assert_eq!(this_week.open, 2);
+        assert_eq!(this_week.reply_overdue, 1);
+        assert_eq!(this_week.wake_unsubmitted, 1);
+        assert_eq!(health.weekly_outcomes[1].requests, 1);
+        assert_eq!(health.weekly_outcomes.len(), 4);
+        let _ = notice;
     }
 }

@@ -27,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to read. A few lines from its `SessionStart` hook; nothing is claimed or
   changed.
 
+- `tend doctor` reports how agent requests that expected a reply ended,
+  per week for the last four weeks: how many were replied to, expired, or
+  interrupted as `reply_overdue` or `wake_unsubmitted`, with shares. The
+  daemon's collaboration health carries it as `weekly_outcomes`.
+
 ### Changed
 
 - Account swap binds the conversation it resumes from the provider's own

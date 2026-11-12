@@ -714,7 +714,35 @@ fn health_verdicts(health: &tend::collaboration::CollaborationHealth) -> Vec<Che
     } else {
         CheckResult::Warn(format!("{} ordinary queued request(s) older than 24h; {} quiet undelivered notice(s) eligible for selective cleanup ({}). Preview with `tend msg expire --older-than 24h --quiet-only --request-id REQUEST --dry-run`; remove `--dry-run` only after reviewing. Other requests require individual review.",health.stale_queued,health.stale_quiet_notices,health.example_quiet_notice_ids.join(", ")))
     });
+    results.extend(health.weekly_outcomes.iter().map(outcome_line));
     results
+}
+
+/// One informational line per week of agent requests that expected a reply:
+/// how many were answered, expired, or interrupted as `reply_overdue` /
+/// `wake_unsubmitted`. Evidence for delivery defaults, never a failure.
+fn outcome_line(week: &tend::collaboration::WeeklyOutcome) -> CheckResult {
+    let share = |count: usize| {
+        if week.requests == 0 {
+            "0%".to_string()
+        } else {
+            // Integer percent, rounded half up.
+            format!("{}%", (count * 200 + week.requests) / (week.requests * 2))
+        }
+    };
+    CheckResult::Ok(format!(
+        "requests since {}: {} sent, {} replied, {} expired ({}), {} reply_overdue ({}), {} wake_unsubmitted ({}), {} still open",
+        week.since,
+        week.requests,
+        week.replied,
+        week.expired,
+        share(week.expired),
+        week.reply_overdue,
+        share(week.reply_overdue),
+        week.wake_unsubmitted,
+        share(week.wake_unsubmitted),
+        week.open,
+    ))
 }
 
 fn synthetic_verdicts(
@@ -1904,6 +1932,36 @@ mod tests {
         assert!(health_verdicts(&orphan).iter().any(
             |r| matches!(r, CheckResult::Warn(_)) && message(r).contains("1 pending recovery")
         ));
+    }
+
+    #[test]
+    fn weekly_outcomes_are_informational_lines_with_shares() {
+        let health = tend::collaboration::CollaborationHealth {
+            weekly_outcomes: vec![tend::collaboration::WeeklyOutcome {
+                since: "2026-11-05".into(),
+                requests: 40,
+                replied: 30,
+                expired: 4,
+                open: 6,
+                reply_overdue: 2,
+                wake_unsubmitted: 1,
+                other_interruptions: 0,
+            }],
+            ..Default::default()
+        };
+        let results = health_verdicts(&health);
+        let line = results.last().unwrap();
+        assert!(matches!(line, CheckResult::Ok(_)));
+        let text = message(line);
+        assert!(
+            text.contains("since 2026-11-05: 40 sent, 30 replied, 4 expired (10%)"),
+            "{text}"
+        );
+        assert!(text.contains("2 reply_overdue (5%)"), "{text}");
+        assert!(
+            text.contains("1 wake_unsubmitted (2%)") || text.contains("1 wake_unsubmitted (3%)"),
+            "{text}"
+        );
     }
 
     #[cfg(unix)]
