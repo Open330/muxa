@@ -288,8 +288,11 @@ pub struct WorkDoneArgs {
     pub generation: Option<u64>,
     /// Restart this alias's completion generation and hold/reconcile its
     /// downstream aliases again.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "summary")]
     pub undo: bool,
+    /// File a result record for the person with this completion.
+    #[command(flatten)]
+    pub record: crate::review_cmd::ResultRecordArgs,
     /// Emit JSON.
     #[arg(long)]
     pub json: bool,
@@ -1001,6 +1004,46 @@ fn take_window_name_buffer(buffer: &str) -> Result<String> {
     Ok(value.trim_end_matches(['\r', '\n']).to_string())
 }
 
+/// The pipeline Work, alias and generation a pane was launched for, from
+/// the marks `tend work up` set on it. Explicit values win.
+pub(crate) fn pane_pipeline(
+    pane: &str,
+    alias: Option<String>,
+    generation: Option<u64>,
+) -> Result<(tend::work::WorkIdentity, String, u64)> {
+    let pane = pane.to_owned();
+    validate_pane_id(&pane)?;
+    let alias = match alias {
+        Some(alias) => alias,
+        None => pane_option(&pane, AGENT_ALIAS_OPTION)?
+            .ok_or_else(|| anyhow::anyhow!("pane {pane} has no pipeline alias; pass --alias"))?,
+    }
+    .trim()
+    .to_ascii_lowercase();
+    let workspace = pane_option(&pane, PANE_WORKSPACE_OPTION)?.ok_or_else(|| {
+        anyhow::anyhow!("pane {pane} has no pipeline workspace; run `tend work up` first")
+    })?;
+    let work = pane_option(&pane, PANE_WORK_OPTION)?.ok_or_else(|| {
+        anyhow::anyhow!("pane {pane} has no pipeline Work; run `tend work up` first")
+    })?;
+    let generation = match generation {
+        Some(generation) => generation,
+        None => pane_option(&pane, AGENT_GENERATION_OPTION)?
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pane {pane} has no pipeline generation; run `tend work up` to adopt it"
+                )
+            })?
+            .parse::<u64>()
+            .with_context(|| format!("pane {pane} has an invalid pipeline generation"))?,
+    };
+    Ok((
+        tend::work::WorkIdentity::new(workspace, work),
+        alias,
+        generation,
+    ))
+}
+
 /// Report that this agent has finished its part, which is what opens an
 /// `after` edge for whatever waits on it.
 ///
@@ -1019,32 +1062,20 @@ pub async fn run_work_done(
         .or_else(crate::mcp::own_tmux_pane)
         .filter(|pane| !pane.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("no pane to read; pass --pane (outside tmux, or under a shared Codex app-server whose TMUX_PANE names another pane)"))?;
-    validate_pane_id(&pane)?;
-    let alias = match args.alias.clone() {
-        Some(alias) => alias,
-        None => pane_option(&pane, AGENT_ALIAS_OPTION)?
-            .ok_or_else(|| anyhow::anyhow!("pane {pane} has no pipeline alias; pass --alias"))?,
+    let (identity, alias, generation) = pane_pipeline(&pane, args.alias.clone(), args.generation)?;
+    let mut filed = None;
+    if !args.undo {
+        if let Some(record) = args.record.into_review(&identity, &alias, generation)? {
+            // Filed before completion: a refused record leaves the alias
+            // open, so a retry files and completes together, and the key
+            // makes that retry return the same item.
+            filed = Some(
+                crate::review_cmd::file(client, &record)
+                    .await
+                    .context("filing the result record; the alias is not reported done yet")?,
+            );
+        }
     }
-    .trim()
-    .to_ascii_lowercase();
-    let workspace = pane_option(&pane, PANE_WORKSPACE_OPTION)?.ok_or_else(|| {
-        anyhow::anyhow!("pane {pane} has no pipeline workspace; run `tend work up` first")
-    })?;
-    let work = pane_option(&pane, PANE_WORK_OPTION)?.ok_or_else(|| {
-        anyhow::anyhow!("pane {pane} has no pipeline Work; run `tend work up` first")
-    })?;
-    let generation = match args.generation {
-        Some(generation) => generation,
-        None => pane_option(&pane, AGENT_GENERATION_OPTION)?
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "pane {pane} has no pipeline generation; run `tend work up` to adopt it"
-                )
-            })?
-            .parse::<u64>()
-            .with_context(|| format!("pane {pane} has an invalid pipeline generation"))?,
-    };
-    let identity = tend::work::WorkIdentity::new(workspace, work);
     let run = if args.undo {
         client
             .pipeline_invalidate(&identity, &alias, generation)
@@ -1074,12 +1105,19 @@ pub async fn run_work_done(
                 "alias": alias,
                 "generation": run.generation,
                 "done": done,
+                "record": filed.as_ref().map(|item| &item.id),
             }))?
         );
     } else if args.undo {
         println!("{alias} is no longer reported done");
     } else {
         println!("{alias} reported done ({})", done.join(", "));
+        if let Some(item) = &filed {
+            println!(
+                "result record {} (generation {}): tend review show {}",
+                item.id, item.generation, item.id
+            );
+        }
     }
     Ok(())
 }

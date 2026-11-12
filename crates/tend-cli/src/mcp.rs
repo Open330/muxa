@@ -1134,6 +1134,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
         }
     }
     tools.extend(crate::agent_records::definitions());
+    tools.extend(crate::decision_record::definitions());
     tools
 }
 
@@ -1248,6 +1249,12 @@ async fn call_tool_inner(
                     Err(error) => error_result(&error.to_string()),
                 },
             )
+        }
+        crate::decision_record::FILE_RESULT_TOOL => {
+            Ok(match crate::decision_record::call(client, args).await {
+                Ok(result) => json_result(&result),
+                Err(error) => error_result(&error),
+            })
         }
         "tend_agent_search" | "tend_agent_read" => {
             Ok(match crate::agent_records::call(name, args).await {
@@ -7231,6 +7238,65 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(invalid["result"]["isError"], true);
+
+        // Structured fields are stored on the human request, not in body.
+        let structured = decode(
+            dispatch(
+                &client,
+                &tool(
+                    "tend_request_attention",
+                    json!({"body":"Merge #12?", "action":"choice",
+                        "options":["merge","hold"], "recommendation":"merge",
+                        "evidence":["https://github.com/o/r/pull/12"]}),
+                ),
+            )
+            .await
+            .unwrap(),
+        );
+        let stored = client
+            .collaboration_get(&origin, structured["request_id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(stored.body, "Merge #12?");
+        let decision = stored.decision.expect("decision stored");
+        assert_eq!(decision.options, ["merge", "hold"]);
+        assert_eq!(decision.recommendation.as_deref(), Some("merge"));
+
+        // One call files the caller's result record; the key makes a retry
+        // return the same item.
+        let args = json!({"summary":"Done: retry path", "commit":["abc123"],
+            "decision_needed":"Ship now?", "options":["ship","hold"],
+            "evidence":["test-pass:cargo test"], "key":"result-1"});
+        let filed = decode(
+            dispatch(&client, &tool("tend_file_result", args.clone()))
+                .await
+                .unwrap(),
+        );
+        let again = decode(
+            dispatch(&client, &tool("tend_file_result", args))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(filed["record"]["id"], again["record"]["id"]);
+        assert_eq!(
+            filed["record"]["target"],
+            json!({"kind":"session","provider":"codex","session_id":"compact-recipient"})
+        );
+        assert_eq!(filed["record"]["requested_by"]["kind"], "agent");
+        assert_eq!(
+            filed["record"]["decision"]["evidence"][0],
+            json!({"kind":"commit","sha":"abc123"})
+        );
+        let refused = dispatch(
+            &client,
+            &tool(
+                "tend_file_result",
+                json!({"summary":"x", "target":"someone"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["result"]["isError"], true);
 
         shutdown.send(()).unwrap();
         daemon.await.unwrap();

@@ -85,6 +85,16 @@ Never reply to or acknowledge a one-way notice solely to confirm receipt.
 Do not treat idle status or terminal text as a durable completion report. Use
 `tend_wait_for_change` for process state waits and mailbox tools for peer results.
 
+## Finishing work
+
+Finishing means filing one result record the person can decide from without
+reading your pane: `tend work done --summary ...` inside a managed pipeline
+(it also completes the alias), otherwise `tend_file_result`. Give the summary,
+commits and test evidence (`test-pass:CMD`/`test-fail:CMD`), and, when the
+person must choose, `decision_needed`, `options` and your `recommendation`.
+The record is not approval and nothing waits on it; use
+`tend_request_attention` when you are blocked on the answer.
+
 ## Transport and compact reads
 
 Tend reports delivery and final reply receipt; it does not judge task success.

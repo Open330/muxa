@@ -41,6 +41,21 @@ tend review withdraw rv_… [--note "…"]
 Every command takes `--json`. `request` and the dispositions take
 `--as user|agent` (default `user`) and an optional `--label`.
 
+## From agents
+
+An agent files a result record with the `tend_file_result` MCP tool (target:
+its managed Work alias, else its session), or inside a pipeline with
+
+```sh
+tend work done --summary "Migration and retry path done" --commit 1a2b3c \
+  --evidence "test-pass:cargo test -p tend review" \
+  --decision-needed "Ship behind the flag or on by default?" \
+  --option "behind the flag" --option "on by default" --recommend "behind the flag"
+```
+
+which files the item, keyed by Work, alias and pipeline generation, before it
+reports the alias done. A refused record leaves the alias open.
+
 ## Decision fields
 
 An item may carry a `decision`: `needed` (the question), `options` (up to

@@ -173,6 +173,143 @@ pub(crate) fn request_decision(args: &Value) -> Result<Option<Decision>, String>
         .transpose()
 }
 
+/// The one agent-side entry point for a result record.
+pub(crate) const FILE_RESULT_TOOL: &str = "tend_file_result";
+
+/// MCP definition of [`FILE_RESULT_TOOL`].
+pub(crate) fn definitions() -> Vec<Value> {
+    let mut properties = serde_json::json!({
+        "summary": { "type": "string", "description": "What you finished, in one paragraph the person can read without your pane." },
+        "commit": { "type": "array", "items": { "type": "string" }, "description": "Commit SHAs holding the result, in your working directory's checkout." },
+        "request_id": { "type": "string", "description": "File the record against this collaboration request's result instead of your own Work or session." },
+        "key": { "type": "string", "description": "Retry key: the same key returns the same record instead of filing another. Reuse it when retrying one result." }
+    });
+    if let (Some(properties), Value::Object(decision)) =
+        (properties.as_object_mut(), decision_schema_properties())
+    {
+        properties.extend(decision);
+    }
+    vec![serde_json::json!({
+        "name": FILE_RESULT_TOOL,
+        "description": "File the durable result record for finished work: what you did, the decision the person needs to make (if any), the options, your recommendation and evidence (commits, PR, tests). It becomes an open review item the person decides from (`tend review show`); it does not wait for an answer and is not approval. The record targets your managed Work alias when you run in one, else your session. Call it once when you finish a result someone must look at; inside a pipeline, `tend work done --summary ...` files the same record and completes the alias.",
+        "inputSchema": {
+            "type": "object",
+            "properties": properties,
+            "required": ["summary"],
+            "additionalProperties": false
+        }
+    })]
+}
+
+/// Run [`FILE_RESULT_TOOL`]. The caller is the agent behind this MCP
+/// server, as the daemon identifies it, never a value from the arguments.
+pub(crate) async fn call(client: &tend::ipc::Client, args: Value) -> Result<Value, String> {
+    let Value::Object(mut args) = args else {
+        return Err("arguments must be an object".into());
+    };
+    let summary = take_string(&mut args, "summary")?.ok_or("summary is required")?;
+    let request_id = take_string(&mut args, "request_id")?;
+    let key = take_string(&mut args, "key")?;
+    let commits = match args.remove("commit") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::String(sha)) => vec![sha],
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(sha) => Ok(sha),
+                _ => Err("commit must be an array of SHAs".to_owned()),
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => return Err("commit must be an array of SHAs".into()),
+    };
+    let origin = crate::mcp::resolve_collaboration_origin(client).await?;
+    let me = client
+        .collaboration_context(&origin)
+        .await
+        .map_err(|error| {
+            format!("cannot identify this agent ({error}); use `tend review request` instead")
+        })?
+        .current;
+    let repo = match me.cwd.clone() {
+        Some(cwd) => tokio::task::spawn_blocking(move || {
+            crate::review_cmd::checkout_of(std::path::Path::new(&cwd))
+        })
+        .await
+        .ok()
+        .flatten()
+        .map(|path| path.to_string_lossy().into_owned()),
+        None => None,
+    };
+    let mut evidence = commits
+        .into_iter()
+        .map(|sha| Value::String(format!("commit:{}", sha.trim())))
+        .collect::<Vec<_>>();
+    if let Some(Value::Array(rest)) = args.remove("evidence") {
+        evidence.extend(rest);
+    }
+    if !evidence.is_empty() {
+        args.insert("evidence".into(), Value::Array(evidence));
+    }
+    let decision = take_decision(&mut args, repo.as_deref())?;
+    if let Some(unknown) = args.keys().next() {
+        return Err(format!("unknown argument {unknown:?}"));
+    }
+    let target = match request_id {
+        Some(request_id) => tend::review::ReviewTarget::Request {
+            request_id,
+            attempt_id: None,
+        },
+        None => own_target(&me).await,
+    };
+    let review = tend::review::NewReview {
+        target,
+        summary,
+        anchor: None,
+        idempotency_key: key,
+        requested_by: tend::review::ReviewActor {
+            kind: tend::review::ActorKind::Agent,
+            label: Some(me.alias.clone().unwrap_or_else(|| me.pane.clone())),
+        },
+        decision,
+    };
+    let item = crate::review_cmd::file(client, &review)
+        .await
+        .map_err(|error| format!("{error:#}"))?;
+    Ok(serde_json::json!({
+        "record": item,
+        "next": format!("The person decides with `tend review accept|return {}`; nothing waits on it here.", item.id),
+    }))
+}
+
+/// The caller's managed Work alias when its tmux pane carries the marks
+/// `tend work up` sets, else its session.
+async fn own_target(me: &tend::collaboration::Participant) -> tend::review::ReviewTarget {
+    let session = tend::review::ReviewTarget::Session {
+        provider: Some(me.agent_kind.to_string()),
+        session_id: me.agent_session_id.clone(),
+    };
+    let tmux = me.room.host == "tmux" && me.pane.starts_with('%');
+    if !tmux {
+        return session;
+    }
+    let pane = me.pane.clone();
+    let pipeline = tokio::task::spawn_blocking(move || {
+        crate::tmux_work::pane_pipeline(&pane, None, None).ok()
+    })
+    .await
+    .ok()
+    .flatten();
+    match pipeline {
+        Some((identity, alias, generation)) => tend::review::ReviewTarget::Work {
+            workspace: identity.workspace_id,
+            work: identity.work_id,
+            alias: Some(alias),
+            pipeline_generation: Some(generation),
+        },
+        None => session,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

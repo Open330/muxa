@@ -25,6 +25,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Agents file a finished result with one call: the `tend_file_result` MCP
+  tool, or `tend work done --summary "..." [--commit SHA] [--evidence ...]
+  [--decision-needed ... --option ... --recommend ...]` in a managed
+  pipeline. Either files an open review item on the agent's Work alias (or
+  its session) with the structured decision, so the person decides from the
+  record instead of the pane. `tend work done` files the record before
+  completing the alias, and repeating it returns the same record. The
+  installed agent guide now says finishing work means filing it.
 - Review items and human requests can carry a structured decision: what
   needs deciding, the options, the asker's recommendation and typed
   evidence (commit, pull request, diff range, test command with its result
