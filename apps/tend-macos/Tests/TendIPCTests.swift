@@ -3411,9 +3411,9 @@ private final class OneShotSubscriptionServer: @unchecked Sendable {
             throw TendIPCError.posix(operation: "bind", code: errno)
         }
         let hello = try JSONSerialization.data(withJSONObject: helloReply) + Data("\n".utf8)
-        let listener = listener
+        let listenerFD = self.listener
         Thread.detachNewThread { [self] in
-            let peer = accept(listener, nil, nil)
+            let peer = accept(listenerFD, nil, nil)
             guard peer >= 0 else { return }
             lock.withLock { connection = peer }
             for reply in [hello, Data("{\"ok\":true}\n".utf8)] {
