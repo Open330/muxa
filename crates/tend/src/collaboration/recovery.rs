@@ -29,7 +29,7 @@ impl CollaborationRequest {
     }
 }
 
-fn exact_agent<'a>(participant: &Participant, agents: &'a [Agent]) -> Option<&'a Agent> {
+pub(super) fn exact_agent<'a>(participant: &Participant, agents: &'a [Agent]) -> Option<&'a Agent> {
     if participant.console {
         return None;
     }
@@ -175,6 +175,7 @@ fn recovery_action(
     action.reply = None;
     action.turn_offer = None;
     action.sender_follow = None;
+    action.wake_retry = None;
     action.updates.clear();
     action
 }
@@ -198,6 +199,11 @@ fn recovery_body(
     if current_reason == "reply_overdue" {
         return format!(
             "Tend is retaining request {request_id}: recipient {session} claimed it, was reminded to reply, and is idle without replying.\nThe request has not completed. Choose: wait, ask the recipient for its result (tend_update_request on {request_id}), or stop this work attempt. Tend clears this item when the recipient replies or resumes work; do not resend the request. Your answer records a decision; it does not restart, cancel, or spend automatically."
+        );
+    }
+    if current_reason == "wake_unsubmitted" {
+        return format!(
+            "Tend woke recipient {session} for request {request_id} twice, but no prompt was submitted and the request was never claimed.\nThe recipient is idle; its input line may hold an unsent draft, or the terminal may have dropped Enter. Open this exact recipient's pane and look before pressing anything: submit or clear the draft, then the agent can claim {request_id}. Tend will not type the wake again. Choose: fix the pane and wait, hand the work off, or stop this attempt."
         );
     }
     let observation = if current_reason == "binding_unavailable" {
@@ -286,7 +292,11 @@ impl CollaborationStore {
                     !matches!(*reason, "approval_required" | "input_required") || handed_over
                 })
                 .or(missing_reason)
-                .or_else(|| reply_overdue(original, agent, snapshot.values(), now));
+                .or_else(|| reply_overdue(original, agent, snapshot.values(), now))
+                .or_else(|| {
+                    super::wake_retry::wake_exhausted_unsubmitted(original, agent, now)
+                        .then_some("wake_unsubmitted")
+                });
             let mut parent = original.clone();
             close_stale_stop(&mut parent, agent);
             if let Some(current_reason) = current_reason.filter(|_| !parent.status.is_terminal()) {

@@ -42,7 +42,26 @@ record the same acknowledgement in daemon debug logs without blocking mailbox
 bookkeeping or subsequent peer wakes. Other send interfaces
 continue to report transport outcomes.
 
-Tend does not resend the body or repeat Enter merely because an acknowledgement
+A collaboration mailbox wake (the short notice that names a request id) is the
+one bounded exception. The waker only types into an Idle recipient, and it
+records when each attempt began, before the paste (`wake_retry` on the
+request). A wake that started a turn moves the recipient's registry row: a
+prompt, a state change (a tool hook, even an Idle inferred by a timeout), a
+turn's response, or any activity-bearing hook (a response-less `Stop`
+included; status-line heartbeats do not count). If two minutes after the attempt began the request is still
+unclaimed and the row is Idle with none of those recorded since, tendd types
+the notice once more (re-checking the row just before typing; movement since
+cancels it), and the next prompt the recipient submits also carries
+the request as a structured `UserPromptSubmit` offer. A lost
+`PromptSubmitted` hook alone never causes a second paste. If the second
+attempt also leaves the row untouched, nothing is typed again: the request is
+marked `peer_interrupted` with reason `wake_unsubmitted`, which returns the
+sender's wait and, after the usual grace, opens a recovery item asking a
+person to look at the pane. `notified_at` keeps the first delivery, so such a
+request is never handed to a slot successor as undelivered work. Full-body
+direct wakes keep their own phase-based recovery and are never re-typed.
+
+Apart from that, Tend does not resend the body or repeat Enter merely because an acknowledgement
 is missing. Hooks can arrive late or be unavailable, and a retry could submit a
 different user draft. Inspect the pane before an explicit Enter-only recovery.
 The `confirm-selected-yes` automation remains limited to affirmative choice

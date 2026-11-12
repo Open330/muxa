@@ -922,6 +922,10 @@ pub struct CollaborationRequest {
     /// (`sender_follow.rs`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sender_follow: Option<sender_follow::SenderFollowState>,
+    /// The one re-delivery of a mailbox wake that was pasted but never
+    /// followed by a submitted prompt (`wake_retry.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_retry: Option<wake_retry::WakeRetry>,
 }
 
 impl CollaborationRequest {
@@ -3270,6 +3274,7 @@ impl CollaborationStore {
             user_authorized: input.user_authorized,
             turn_offer: None,
             decision,
+            wake_retry: None,
             dispatch_id: input.dispatch_id,
             source_node_id: input.source_node_id,
             delegation_parent: input.delegation_parent,
@@ -4239,10 +4244,14 @@ impl CollaborationStore {
             .await
             .values()
             .filter(|request| {
-                !request.to.console && request.notified_at.is_none()
+                !request.to.console
+                    && ((request.notified_at.is_none()
                     // Finish an already reserved delivery even after an upgrade.
                     && (request.should_notify() || request.wake_delivery.is_some())
-                    && (request.status == RequestStatus::Queued || request.wake_delivery.is_some())
+                    && (request.status == RequestStatus::Queued || request.wake_delivery.is_some()))
+                        // The one re-delivery of an unsubmitted wake.
+                        || (request.status == RequestStatus::Queued
+                            && request.wake_retry.as_ref().is_some_and(|retry| retry.redeliver)))
             })
             .cloned()
             .collect();
@@ -10016,6 +10025,7 @@ mod recipient_slot_tests;
 mod recovery;
 mod retirement;
 pub mod sender_follow;
+pub mod wake_retry;
 pub use retirement::{RequestRetirement, RETIRE_CAPABILITY};
 #[cfg(test)]
 mod reply_wake_tests;
