@@ -1898,6 +1898,13 @@ fn status_verbose_lists_each_rows_state_source() {
     assert!(text.contains("hook, 2m"), "{text}");
     assert!(text.contains("~screen"), "{text}");
     assert!(text.contains("unknown"), "{text}");
+
+    // Paneless rows (threads behind a shared app-server) keep an identity.
+    let first = agent("019a1b2c-thread-one", None, AgentState::Working, "");
+    let second = agent("019a9f8e-thread-two", None, AgentState::Idle, "");
+    let text = crate::status_handlers::render_state_sources(&[first, second], &[], now);
+    assert!(text.contains("session 019a1b2c-thre"), "{text}");
+    assert!(text.contains("session 019a9f8e-thre"), "{text}");
 }
 
 #[test]

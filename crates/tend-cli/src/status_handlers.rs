@@ -84,13 +84,27 @@ pub(super) fn render_state_sources(
     let mut lines = vec!["State sources:".to_string()];
     for agent in agents {
         let source = state_source_label(agent, now);
+        // The pane label, or the session id when there is no pane to name
+        // the row by (paneless threads behind a shared app-server).
+        let pane = pane_display(agent, panes);
+        let label = if pane == "-" {
+            short_session(&agent.session_id)
+        } else {
+            pane
+        };
         lines.push(format!(
             "  {:<24} {:<14} {source}",
-            truncate_cell(&pane_display(agent, panes), 24),
+            truncate_cell(&label, 24),
             agent.state.to_string(),
         ));
     }
     lines.join("\n")
+}
+
+/// A session id short enough for a column (its first 13 characters).
+fn short_session(session: &str) -> String {
+    let short: String = session.chars().take(13).collect();
+    format!("session {short}")
 }
 
 /// `hook, 2m ago` or `~screen, 5s ago`; `unknown` for a row restored from a
