@@ -32,6 +32,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same line ("정식 수정 두 개만 따로 PR로 올려 머지할 수 있습니다. 진행할까요?").
   Opening an asked card in Home also shows the response behind the question,
   scrolled to the end, so the proposal it refers to is on screen.
+- Settings no longer warns about double and missing notifications at once
+  when tendd's Delivery is off, and dims Tend's notification switches while
+  macOS denies Tend permission. Provider card fields have visible labels,
+  the fleet host icon field is wide enough to type in, and run-log reasons,
+  launch options, pipeline agent names, the Dispatch update notice and the
+  installed CLI line show translated, readable text instead of internal
+  tokens. Usage-limit choices report which one is selected, rule switches
+  carry the rule's name, host state is spelled out next to its dot, and
+  decorative icons are hidden from VoiceOver.
 
 ## [0.10.9] - 2026-11-12
 

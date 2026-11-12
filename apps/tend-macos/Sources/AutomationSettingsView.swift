@@ -364,7 +364,9 @@ private struct AutomationRuleRow: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Toggle("Enabled", isOn: enabledBinding)
+            // The label stays hidden on screen but names the rule, so
+            // VoiceOver says which rule the switch is for.
+            Toggle(isOn: enabledBinding) { Text(verbatim: rule.name) }
                 .labelsHidden()
                 .disabled(store.isMutating)
                 .padding(.top, 2)
@@ -628,6 +630,7 @@ private struct AutomationLogRow: View {
             Image(systemName: symbol)
                 .foregroundStyle(tint)
                 .padding(.top, 2)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 8) {
                     Text(verbatim: entry.rule).font(.callout.weight(.semibold))
@@ -684,7 +687,17 @@ private struct AutomationLogRow: View {
     /// that was sent, which is the operator's own and stays verbatim.
     @ViewBuilder
     private var detailLine: some View {
-        if let reason = entry.skipReason, !reason.isEmpty {
+        if let reason = automationLogReason(outcome: entry.outcome, detail: entry.detail) {
+            Text(verbatim: reason.title)
+                .font(TendType.detail)
+                .foregroundStyle(.secondary)
+            if let remainder = reason.remainder {
+                Text(verbatim: remainder)
+                    .font(TendType.detail.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+        } else if let reason = entry.skipReason, !reason.isEmpty {
             Text(verbatim: automationSkipReasonTitle(reason))
                 .font(TendType.detail)
                 .foregroundStyle(.secondary)
@@ -774,6 +787,7 @@ private struct AutomationTestRow: View {
             Image(systemName: candidate.wouldFire ? "bolt.circle.fill" : "minus.circle")
                 .foregroundStyle(candidate.wouldFire ? Color.accentColor : Color.secondary)
                 .padding(.top, 2)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 Text(verbatim: automationDecisionTitle(candidate.decision))
                     .font(.callout.weight(candidate.wouldFire ? .semibold : .regular))
@@ -1238,6 +1252,7 @@ private struct AutomationTokenLabel: View {
             if let mark {
                 Image(systemName: mark.symbol)
                     .foregroundStyle(mark.tint)
+                    .accessibilityHidden(true)
             }
             Text(verbatim: style.title(for: token))
         }
@@ -1463,6 +1478,35 @@ func automationOutcomeTitle(_ outcome: TendAutomationOutcome) -> String {
 /// tendd's `SkipReason` tokens, said in words. An unknown token is shown as
 /// it arrived rather than hidden.
 func automationSkipReasonTitle(_ reason: String) -> String {
+    automationKnownReasonTitle(reason) ?? reason
+}
+
+/// A skipped or failed run's detail when it leads with a reason token tendd
+/// names — `action_failed`, or `action_failed: job 7 ended failed` — as the
+/// reason in words plus whatever tendd added after it. Nil for anything
+/// else: the text a firing sent, or a sentence tendd wrote itself.
+func automationLogReason(
+    outcome: TendAutomationOutcome,
+    detail: String?
+) -> (title: String, remainder: String?)? {
+    guard outcome == .skipped || outcome == .failed,
+          let detail = detail?.trimmingCharacters(in: .whitespacesAndNewlines),
+          !detail.isEmpty else { return nil }
+    let token: String
+    var remainder: String?
+    if let separator = detail.range(of: ": ") {
+        token = String(detail[..<separator.lowerBound])
+        let rest = detail[separator.upperBound...].trimmingCharacters(in: .whitespaces)
+        remainder = rest.isEmpty ? nil : rest
+    } else {
+        token = detail
+    }
+    guard let title = automationKnownReasonTitle(token) else { return nil }
+    return (title, remainder)
+}
+
+/// The words for a reason token this build knows; nil for any other text.
+func automationKnownReasonTitle(_ reason: String) -> String? {
     switch reason {
     case "ask_required": String(localized: "Ask judgment required (not run by this free test)")
     case "engine_disabled": String(localized: "Automations are switched off")
@@ -1478,7 +1522,7 @@ func automationSkipReasonTitle(_ reason: String) -> String {
     case "condition_cleared": String(localized: "The agent recovered before it fired")
     case "pane_gone": String(localized: "The pane is gone")
     case "action_failed": String(localized: "The action was refused")
-    default: reason
+    default: nil
     }
 }
 

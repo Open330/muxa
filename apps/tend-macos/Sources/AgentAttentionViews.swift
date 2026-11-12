@@ -145,7 +145,8 @@ struct TendAttentionTracking: ViewModifier {
 /// Settings › Behaviour: the Mac app's own notifications, above tendd's.
 struct TendAppNotificationsSection: View {
     let attention: TendAgentAttentionCenter
-    /// Whether tendd's desktop notifier is also on, which would notify twice.
+    /// Whether tendd also posts desktop notifications (enabled with a
+    /// delivery method), which would notify twice.
     let daemonNotifierEnabled: Bool
     @AppStorage(TendNotificationPreferences.attentionKey) private var notifyAttention = true
     @AppStorage(TendNotificationPreferences.finishedKey) private var notifyFinished = true
@@ -154,23 +155,30 @@ struct TendAppNotificationsSection: View {
     @AppStorage(TendUsageAlerts.enabledKey) private var notifyUsage = true
     @State private var authorization: TendUserNotifications.Authorization?
 
+    private var isDenied: Bool { authorization == .denied }
+
     var body: some View {
         Section("Tend notifications") {
-            Toggle("Notify when an agent needs you", isOn: $notifyAttention)
-            Toggle("Notify when an agent finishes a turn", isOn: $notifyFinished)
-            Toggle("Play a sound", isOn: $sound)
-                .disabled(!notifyAttention && !notifyFinished)
-            Toggle("Show the count on the Dock icon", isOn: $dockBadge)
-                .onChange(of: dockBadge) { _ in attention.refreshDockBadge() }
-            Toggle("Notify before a usage limit runs out", isOn: $notifyUsage)
-            Text("Once at 80% and once at 95% of a 5-hour or weekly window, with a sound at 95%.")
-                .font(TendType.detail)
-                .foregroundStyle(.secondary)
-            Text("Tend skips the pane you are looking at and repeats for the same agent within 30 seconds. An agent that finished or started waiting since you last opened it keeps a dot until you do.")
-                .font(TendType.detail)
-                .foregroundStyle(.secondary)
+            // Permission first: while macOS blocks Tend, the switches below
+            // cannot do anything, so they are dimmed rather than looking live.
             authorizationRow
-            if daemonNotifierEnabled, notifyAttention || notifyFinished {
+            Group {
+                Toggle("Notify when an agent needs you", isOn: $notifyAttention)
+                Toggle("Notify when an agent finishes a turn", isOn: $notifyFinished)
+                Toggle("Play a sound", isOn: $sound)
+                    .disabled(!notifyAttention && !notifyFinished)
+                Toggle("Show the count on the Dock icon", isOn: $dockBadge)
+                    .onChange(of: dockBadge) { _ in attention.refreshDockBadge() }
+                Toggle("Notify before a usage limit runs out", isOn: $notifyUsage)
+                Text("Once at 80% and once at 95% of a 5-hour or weekly window, with a sound at 95%.")
+                    .font(TendType.detail)
+                    .foregroundStyle(.secondary)
+                Text("Tend skips the pane you are looking at and repeats for the same agent within 30 seconds. An agent that finished or started waiting since you last opened it keeps a dot until you do.")
+                    .font(TendType.detail)
+                    .foregroundStyle(.secondary)
+            }
+            .disabled(isDenied)
+            if daemonNotifierEnabled, !isDenied, notifyAttention || notifyFinished {
                 Label("tendd's desktop notifications are also on, so you may be notified twice.", systemImage: "exclamationmark.circle")
                     .font(TendType.detail)
                     .foregroundStyle(.orange)

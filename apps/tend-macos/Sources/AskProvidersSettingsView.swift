@@ -308,6 +308,7 @@ struct AskProviderDetectedRow: View {
             Image(systemName: provider.symbolName)
                 .foregroundStyle(.tint)
                 .frame(width: 20)
+                .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 6) {
                     Text(provider.title)
@@ -512,6 +513,7 @@ struct AskProviderCard: View {
             Image(systemName: provider.symbolName)
                 .foregroundStyle(.tint)
                 .frame(width: 20)
+                .accessibilityHidden(true)
             Text(provider.title)
                 .font(.headline)
             AskProviderKindBadge(kind: provider.kind)
@@ -576,11 +578,22 @@ struct AskProviderCard: View {
                     .foregroundStyle(.secondary)
             }
         case .installed(let tool):
-            Text("Installed · \(tool.name) \(tool.version ?? "") at \(tool.path)")
-                .font(TendType.detail.monospaced())
-                .foregroundStyle(.secondary)
-                .textSelection(.enabled)
-                .lineLimit(2)
+            // The version line often carries its own parentheses
+            // ("2.1.3 (Claude Code)"), so the path gets a line of its own
+            // instead of being wrapped in more.
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Installed · \(InstalledTools.versionSummary(name: tool.name, version: tool.version))")
+                    .font(TendType.detail.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                Text(verbatim: tool.path)
+                    .font(TendType.detail.monospaced())
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
         case .notInstalled:
             VStack(alignment: .leading, spacing: 4) {
                 Text("Install the \(provider.executable) command and make sure it is on your PATH, then re-check.")
@@ -599,8 +612,10 @@ struct AskProviderCard: View {
     private var credentialRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                AskProviderFieldLabel(title: "API key")
                 SecureField(keyFieldTitle, text: $key)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel(Text(keyFieldTitle))
                     .onSubmit(saveKey)
                 Button("Save", action: saveKey)
                     .controlSize(.small)
@@ -650,16 +665,28 @@ struct AskProviderCard: View {
     /// The instance's `[ask.providers.<id>]` fields, saved in one request.
     private var detailsEditor: some View {
         VStack(alignment: .leading, spacing: 6) {
+            // Outside a Form a TextField shows no label of its own, so each
+            // field gets a visible one beside it.
             HStack(spacing: 8) {
+                AskProviderFieldLabel(title: "Title")
                 TextField("Title", text: $titleText, prompt: Text(verbatim: provider.title))
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel(Text("Title"))
+            }
+            HStack(spacing: 8) {
+                AskProviderFieldLabel(title: "Model")
                 TextField("Model", text: $modelName, prompt: modelPrompt)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel(Text("Model"))
             }
             if provider.kind == .cli {
-                TextField("Executable", text: $executablePath, prompt: executablePrompt)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospaced())
+                HStack(spacing: 8) {
+                    AskProviderFieldLabel(title: "Executable")
+                    TextField("Executable", text: $executablePath, prompt: executablePrompt)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.body.monospaced())
+                        .accessibilityLabel(Text("Executable"))
+                }
             }
             if provider.isApple {
                 Text("Model: on-device, or private-cloud for Private Cloud Compute (macOS 27 or later; not working yet).")
@@ -684,8 +711,10 @@ struct AskProviderCard: View {
     private var modelRow: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
+                AskProviderFieldLabel(title: "Model")
                 TextField("Model", text: $modelName, prompt: modelPrompt)
                     .textFieldStyle(.roundedBorder)
+                    .accessibilityLabel(Text("Model"))
                     .onSubmit(saveModel)
                 Button("Save Model", action: saveModel)
                     .controlSize(.small)
@@ -887,5 +916,21 @@ struct AskProviderAddSheet: View {
             )
             if added { dismiss() }
         }
+    }
+}
+
+/// The visible caption beside a provider card's field. The field carries the
+/// same words as its accessibility label, so VoiceOver skips this one.
+private struct AskProviderFieldLabel: View {
+    let title: LocalizedStringKey
+
+    var body: some View {
+        Text(title)
+            .font(TendType.detail)
+            .foregroundStyle(.secondary)
+            .lineLimit(1)
+            .fixedSize()
+            .frame(minWidth: 72, alignment: .leading)
+            .accessibilityHidden(true)
     }
 }

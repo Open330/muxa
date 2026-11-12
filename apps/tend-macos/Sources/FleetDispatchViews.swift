@@ -235,7 +235,7 @@ struct FleetDispatchSettingsView: View {
             }.padding()
         }.task {
             supported = await model.client.supports("config_orchestration_v1")
-            if supported { load() } else { message = "Update the CLI and daemon to edit Fleet dispatch settings." }
+            if supported { load() } else { message = String(localized: "Update the CLI and daemon to edit Fleet dispatch settings.") }
         }.onChange(of: workspace) { _ in node = "" }
         .sheet(item: $labelHost) { host in
             FleetLabelEditor(model: model, host: host, onSaved: refreshAfterLabelEdit)

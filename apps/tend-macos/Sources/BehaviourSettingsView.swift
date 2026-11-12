@@ -11,6 +11,9 @@ struct BehaviourSettingsPane: View {
     @ObservedObject var store: TendConfigStore
     @State private var settings = TendBehaviourSettings()
     @State private var copiedTOML = false
+    /// Set once a save from this pane lands, so the restart note speaks
+    /// about changes that are actually saved.
+    @State private var savedChanges = false
 
     private var isChanged: Bool {
         store.hasLoaded && settings != store.behaviour
@@ -21,7 +24,9 @@ struct BehaviourSettingsPane: View {
             // WS-A: the Mac app's own notifications and Dock badge.
             TendAppNotificationsSection(
                 attention: model.attention,
-                daemonNotifierEnabled: store.behaviour.notifierEnabled
+                // The form's own values, so this warning and the Delivery
+                // warning below never describe two different configurations.
+                daemonNotifierEnabled: settings.daemonPostsNotifications
             )
 
             Section("Notifications") {
@@ -90,11 +95,17 @@ struct BehaviourSettingsPane: View {
                                     .foregroundStyle(.orange)
                                     .textSelection(.enabled)
                             } else if isChanged {
-                                Text("Saved changes apply when tendd restarts.")
+                                Text("You have unsaved changes. Save to keep them.")
                                     .foregroundStyle(.secondary)
                             } else if let status = store.status {
-                                Label(status, systemImage: "checkmark.circle.fill")
-                                    .foregroundStyle(.green)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Label(status, systemImage: "checkmark.circle.fill")
+                                        .foregroundStyle(.green)
+                                    if savedChanges {
+                                        Text("Saved changes apply when tendd restarts.")
+                                            .foregroundStyle(.secondary)
+                                    }
+                                }
                             } else {
                                 Text("These values are read from tend configuration.")
                                     .foregroundStyle(.secondary)
@@ -110,7 +121,7 @@ struct BehaviourSettingsPane: View {
                         if !store.retryEdits.isEmpty {
                             Button("Apply Again") {
                                 Task {
-                                    _ = await store.retryPendingEdits(model: model)
+                                    if await store.retryPendingEdits(model: model) { savedChanges = true }
                                     settings = store.behaviour
                                 }
                             }
@@ -121,7 +132,9 @@ struct BehaviourSettingsPane: View {
                             .disabled(!isChanged || store.isSaving)
                         Button("Save") {
                             Task {
-                                _ = await store.apply(settings.edits(against: store.behaviour), model: model)
+                                if await store.apply(settings.edits(against: store.behaviour), model: model) {
+                                    savedChanges = true
+                                }
                                 settings = store.behaviour
                             }
                         }

@@ -4484,6 +4484,40 @@ func automationLogDecodesFiringsSkipsAndFailures() async throws {
     #expect(automationOutcomeTitle(.other("weird")) == "weird")
 }
 
+/// A failure's detail is a reason token, sometimes with tendd's own note
+/// after it; the run log names the token in words instead of showing it raw.
+@Test
+func automationLogReasonNamesTokensAndKeepsTheirNote() {
+    let plain = automationLogReason(outcome: .failed, detail: "action_failed")
+    #expect(plain?.title == "The action was refused")
+    #expect(plain?.remainder == nil)
+
+    let noted = automationLogReason(outcome: .failed, detail: "action_failed: job 7 ended failed (timeout)")
+    #expect(noted?.title == "The action was refused")
+    #expect(noted?.remainder == "job 7 ended failed (timeout)")
+
+    #expect(automationLogReason(outcome: .skipped, detail: "cooldown")?.title == "Still inside the cooldown")
+    // tendd's own sentences and a firing's sent text stay as they are.
+    #expect(automationLogReason(outcome: .skipped, detail: "Queued rule or pane endpoint changed") == nil)
+    #expect(automationLogReason(outcome: .failed, detail: "pane refused input") == nil)
+    #expect(automationLogReason(outcome: .fired, detail: "cooldown") == nil)
+    #expect(automationLogReason(outcome: .failed, detail: nil) == nil)
+}
+
+/// tendd posts nothing while Delivery is off, so the Behaviour tab must not
+/// warn about double notifications and missing ones at the same time.
+@Test
+func behaviourSettingsDaemonNotifiesOnlyWithADeliveryMethod() {
+    var settings = TendBehaviourSettings()
+    #expect(!settings.daemonPostsNotifications)
+    settings.notifierEnabled = true
+    #expect(!settings.daemonPostsNotifications)
+    settings.notifierBackend = .libnotify
+    #expect(settings.daemonPostsNotifications)
+    settings.notifierEnabled = false
+    #expect(!settings.daemonPostsNotifications)
+}
+
 @Test
 func automationRequestBodiesMatchTheDocumentedWireShapes() throws {
     #expect(TendAutomationClient.listRequest()["kind"] as? String == "automation_list")

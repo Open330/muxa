@@ -97,6 +97,22 @@ struct TendLaunchSettings: Codable, Hashable, Sendable {
         return legacyGuide.program == program ? legacyGuide.options : []
     }
 
+    /// Launch arguments as a person reads them: space-separated, with an
+    /// empty or space-bearing argument quoted so its boundaries stay
+    /// visible, and "None" for an empty list.
+    static func displayText(_ arguments: [String]) -> String {
+        guard !arguments.isEmpty else { return String(localized: "None") }
+        return arguments.map { argument in
+            let needsQuotes = argument.isEmpty
+                || argument.contains(where: { $0.isWhitespace || $0 == "\"" || $0 == "\\" })
+            guard needsQuotes else { return argument }
+            let escaped = argument
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            return "\"\(escaped)\""
+        }.joined(separator: " ")
+    }
+
     func edits(against baseline: Self) -> [[String: Any]] {
         var edits: [[String: Any]] = []
         for provider in providers where provider.options != baseline.providers.first(where: { $0.id == provider.id })?.options {
