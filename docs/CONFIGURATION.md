@@ -50,6 +50,27 @@ interval_secs = 5
 This tmux foreground sampler remains as a compatibility source and helps
 stats while newer activity ledger intervals are accumulating.
 
+## Storage
+
+```toml
+[storage]
+audit_max_bytes = 8388608 # 8 MiB; 0 never rotates
+backups_keep = 5          # 0 keeps every backup
+```
+
+`audit_max_bytes` rotates `collaboration-audit.ndjson` to
+`collaboration-audit.ndjson.1` when the live ledger reaches that size; one
+previous generation is kept, so the ledger stays under about twice the cap.
+`backups_keep` keeps only the newest entries (by modification time) in
+`$XDG_DATA_HOME/tend/backups`, where install and upgrade backups go; older
+entries are deleted at daemon startup and hourly. Hidden entries are left
+alone and symlinks are removed without being followed.
+
+tendd also expires its own launch-provenance archives under
+`$XDG_DATA_HOME/tend/spawns`: completed or failed launches after 30 days, and
+launches that never completed after 90 days, unless a live agent or an open
+worker ticket still refers to them.
+
 ## Snapshots
 
 ```toml
@@ -433,7 +454,7 @@ wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
 max_message_bytes = 16384
 # path = "$XDG_DATA_HOME/tend/collaboration.json"
-# retention_days = 90 # omitted: retain indefinitely
+retention_days = 90 # default; 0 retains indefinitely
 ```
 
 `auto_spawn_workers` lets high-level peer calls reuse a worker or create one
@@ -448,8 +469,8 @@ The historical optional `path` default is
 authoritative sibling `collaboration.sqlite3` and retains the JSON as a
 migration backup. A configured `.sqlite`, `.sqlite3`, or `.db` path is used
 directly. The database stores mailbox state and exact-session aliases/roles.
-`retention_days` prunes eligible fully delivered terminal threads at daemon
-startup; omission retains all history. The retained JSON backup is a duplicate
+`retention_days` (default 90) prunes eligible fully delivered terminal threads
+at daemon startup and hourly afterwards; `0` retains all history. The retained JSON backup is a duplicate
 copy of bodies and is not pruned.
 `idle_only` injects only at a hook-authoritative top-level Idle prompt.
 The default `wake_payload = "operator_full"` directly delivers requests sent

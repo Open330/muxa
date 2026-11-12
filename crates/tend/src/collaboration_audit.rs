@@ -23,6 +23,12 @@ const COLLABORATION_AUDIT_FILE_MODE: u32 = 0o600;
 
 pub const COLLABORATION_AUDIT_SCHEMA_VERSION: u32 = 1;
 
+/// Default size at which the live ledger is rotated to `<file>.1`. One
+/// previous generation is kept, so the ledger never uses more than about
+/// twice this on disk. Read-only calls (`list`, `inbox`, `wait`) dominate the
+/// ledger, so an unbounded file grew by ~0.5 MB a day under normal use.
+pub const DEFAULT_COLLABORATION_AUDIT_MAX_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CollaborationAuditOperation {
@@ -221,7 +227,12 @@ impl CollaborationAuditContext {
 #[derive(Debug)]
 pub struct CollaborationAuditLog {
     path: Option<PathBuf>,
-    append_lock: Mutex<()>,
+    /// Rotate once the live file would grow past this many bytes; `0`
+    /// disables rotation.
+    max_bytes: u64,
+    /// Serializes appends and caches the live file's size, so rotation needs
+    /// one `stat` per daemon lifetime rather than one per append.
+    append_lock: Mutex<Option<u64>>,
     memory: Mutex<Vec<CollaborationAuditEntry>>,
 }
 
@@ -229,15 +240,23 @@ impl CollaborationAuditLog {
     pub fn in_memory() -> Arc<Self> {
         Arc::new(Self {
             path: None,
-            append_lock: Mutex::new(()),
+            max_bytes: 0,
+            append_lock: Mutex::new(None),
             memory: Mutex::new(Vec::new()),
         })
     }
 
     pub fn at_path(path: PathBuf) -> Arc<Self> {
+        Self::at_path_with_max_bytes(path, DEFAULT_COLLABORATION_AUDIT_MAX_BYTES)
+    }
+
+    /// A file-backed ledger rotated to `<file>.1` at `max_bytes` (`0` keeps
+    /// one ever-growing file).
+    pub fn at_path_with_max_bytes(path: PathBuf, max_bytes: u64) -> Arc<Self> {
         Arc::new(Self {
             path: Some(path),
-            append_lock: Mutex::new(()),
+            max_bytes,
+            append_lock: Mutex::new(None),
             memory: Mutex::new(Vec::new()),
         })
     }
@@ -247,13 +266,49 @@ impl CollaborationAuditLog {
     }
 
     pub async fn append(&self, entry: CollaborationAuditEntry) {
-        let _append = self.append_lock.lock().await;
+        let mut size = self.append_lock.lock().await;
         let Some(path) = self.path.as_deref() else {
             self.memory.lock().await.push(entry);
             return;
         };
-        if let Err(error) = append_entry(path, &entry).await {
-            tracing::warn!(%error, path = %path.display(), "collaboration audit append failed");
+        let bytes = match encode_entry(&entry) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%error, "collaboration audit entry could not be encoded");
+                return;
+            }
+        };
+        if self.max_bytes > 0 {
+            let current = match *size {
+                Some(current) => current,
+                None => tokio::fs::metadata(path).await.map_or(0, |meta| meta.len()),
+            };
+            let current = if current > 0
+                && current.saturating_add(bytes.len() as u64) > self.max_bytes
+            {
+                match rotate(path).await {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        tracing::warn!(%error, path = %path.display(), "collaboration audit rotation failed");
+                        current
+                    }
+                }
+            } else {
+                current
+            };
+            *size = Some(current);
+        }
+        match append_bytes(path, &bytes).await {
+            Ok(()) => {
+                if let Some(current) = size.as_mut() {
+                    *current = current.saturating_add(bytes.len() as u64);
+                }
+            }
+            Err(error) => {
+                // The cached size may now be wrong; re-read it next time.
+                *size = None;
+                tracing::warn!(%error, path = %path.display(), "collaboration audit append failed");
+            }
         }
     }
 
@@ -290,7 +345,34 @@ pub async fn load(path: &Path) -> std::io::Result<Vec<CollaborationAuditEntry>> 
     Ok(entries)
 }
 
-async fn append_entry(path: &Path, entry: &CollaborationAuditEntry) -> std::io::Result<()> {
+/// The previous generation of a rotated ledger: `<file>.1`.
+pub fn rotated_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+async fn rotate(path: &Path) -> std::io::Result<()> {
+    // `rename` replaces the older generation atomically on Unix; Windows
+    // refuses to replace, so clear it first there.
+    let previous = rotated_path(path);
+    #[cfg(windows)]
+    match tokio::fs::remove_file(&previous).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    tokio::fs::rename(path, &previous).await
+}
+
+fn encode_entry(entry: &CollaborationAuditEntry) -> std::io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec(entry)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+async fn append_bytes(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             tokio::fs::create_dir_all(parent).await?;
@@ -301,10 +383,7 @@ async fn append_entry(path: &Path, entry: &CollaborationAuditEntry) -> std::io::
     #[cfg(unix)]
     options.mode(COLLABORATION_AUDIT_FILE_MODE);
     let mut file = options.open(path).await?;
-    let mut bytes = serde_json::to_vec(entry)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-    bytes.push(b'\n');
-    file.write_all(&bytes).await?;
+    file.write_all(bytes).await?;
     file.flush().await
 }
 
@@ -373,5 +452,47 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[tokio::test]
+    async fn rotates_to_one_previous_generation_at_the_size_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration-audit.ndjson");
+        // One fixed entry: `at` is "now", and its encoded length varies.
+        let fixed = entry();
+        let line = encode_entry(&fixed).unwrap().len() as u64;
+        // Room for two entries per generation.
+        let log = CollaborationAuditLog::at_path_with_max_bytes(path.clone(), line * 2);
+        for _ in 0..5 {
+            log.append(fixed.clone()).await;
+        }
+        assert_eq!(load(&path).await.unwrap().len(), 1);
+        assert_eq!(load(&rotated_path(&path)).await.unwrap().len(), 2);
+        assert!(!dir.path().join("collaboration-audit.ndjson.1.1").exists());
+    }
+
+    #[tokio::test]
+    async fn rotation_counts_a_preexisting_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration-audit.ndjson");
+        let fixed = entry();
+        let line = encode_entry(&fixed).unwrap().len();
+        tokio::fs::write(&path, vec![b'x'; line * 2]).await.unwrap();
+        let log = CollaborationAuditLog::at_path_with_max_bytes(path.clone(), line as u64 * 2);
+        log.append(fixed).await;
+        assert_eq!(load(&path).await.unwrap().len(), 1);
+        assert!(rotated_path(&path).exists());
+    }
+
+    #[tokio::test]
+    async fn zero_cap_never_rotates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collaboration-audit.ndjson");
+        let log = CollaborationAuditLog::at_path_with_max_bytes(path.clone(), 0);
+        for _ in 0..3 {
+            log.append(entry()).await;
+        }
+        assert_eq!(load(&path).await.unwrap().len(), 3);
+        assert!(!rotated_path(&path).exists());
     }
 }

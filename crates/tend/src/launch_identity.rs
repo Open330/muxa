@@ -105,8 +105,9 @@ pub struct LaunchRecord {
 pub fn archive_directory() -> Option<PathBuf> {
     Some(crate::paths::data_dir()?.join("tend").join("spawns"))
 }
-/// Remove terminal archives older than 30 days. Unknown intents and anything
-/// referenced by a live row or an unfinished worker ticket are retained.
+/// Remove terminal archives older than 30 days and intents that never
+/// completed after 90 days. Anything referenced by a live row or an
+/// unfinished worker ticket is retained.
 /// Age is measured from the last archive write, including receipt completion.
 pub fn prune_archives(
     directory: &Path,
@@ -120,6 +121,9 @@ pub fn prune_archives(
         Err(error) => return Err(error),
     };
     let ttl = std::time::Duration::from_secs(30 * 24 * 60 * 60);
+    // A launch that never wrote a receipt or a failure is kept longer, in
+    // case its pane is still coming up, but not forever.
+    let intent_ttl = std::time::Duration::from_secs(90 * 24 * 60 * 60);
     let mut removed = 0;
     for entry in entries {
         let entry = entry?;
@@ -137,18 +141,20 @@ pub fn prune_archives(
             continue;
         }
         let metadata = entry.metadata()?;
-        if metadata
+        let Some(age) = metadata
             .modified()
             .ok()
             .and_then(|at| now.duration_since(at).ok())
-            .is_none_or(|age| age < ttl)
-        {
+        else {
+            continue;
+        };
+        if age < ttl {
             continue;
         }
         let Some(record) = read_archive(directory, id) else {
             continue;
         };
-        if !record.failed && record.receipt.is_none() {
+        if !record.failed && record.receipt.is_none() && age < intent_ttl {
             continue;
         }
         let referenced = agents
@@ -829,7 +835,7 @@ mod tests {
             .unwrap(),
             1
         );
-        // An unfinished intent has no age-based expiry.
+        // An unfinished intent outlives the terminal window...
         terminal.receipt = None;
         prepare(directory.path(), &terminal).unwrap();
         assert_eq!(
@@ -842,6 +848,23 @@ mod tests {
             .unwrap(),
             0
         );
+        // ...but is not kept forever, unless something still protects it.
+        let far_future = now + std::time::Duration::from_secs(91 * 24 * 60 * 60);
+        assert_eq!(
+            prune_archives(directory.path(), &[], &protected, far_future).unwrap(),
+            0
+        );
+        assert_eq!(
+            prune_archives(
+                directory.path(),
+                &[],
+                &std::collections::BTreeSet::default(),
+                far_future
+            )
+            .unwrap(),
+            1
+        );
+        prepare(directory.path(), &terminal).unwrap();
         failed(directory.path(), LAUNCH).unwrap();
         std::fs::write(directory.path().join("unknown.json"), b"not an archive").unwrap();
         std::fs::write(directory.path().join(".temporary.tmp"), b"partial").unwrap();

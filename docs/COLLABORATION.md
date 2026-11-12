@@ -276,8 +276,8 @@ enabled = true
 wake = "idle_only" # or "never" for pull-only delivery
 # Optional: "operator_full" (default), "notice", or "full".
 wake_payload = "operator_full"
-# Optional; omitted retains history indefinitely.
-# retention_days = 90
+# Optional; completed threads are pruned after this many days.
+retention_days = 90 # default; 0 retains indefinitely
 ```
 
 An existing `wake` is never overwritten — a deliberate `never` means "give me
@@ -660,12 +660,12 @@ covered by SQLite retention. Remove or archive it under equivalent access
 controls once rollback is no longer required.
 
 New mutations update indexed rows instead of rewriting the full history.
-SQLite, WAL, and shared-memory files are set to `0600`. `retention_days` is
-unset by default and therefore keeps history indefinitely. When configured,
-tendd prunes at startup only whole threads whose newest activity is older than
+SQLite, WAL, and shared-memory files are set to `0600`. `retention_days`
+defaults to 90; `0` keeps history indefinitely. tendd prunes at startup and
+hourly afterwards, and only whole threads whose newest activity is older than
 the cutoff and whose requests are terminal and fully delivered; it never
 splits a parent chain or removes pending delivery/wake or unread reply state.
-The separate body-free audit ledger is unchanged. Do not downgrade and run an
+The separate body-free audit ledger rotates by size instead (`[storage]`). Do not downgrade and run an
 older tendd against the retained JSON after migration: it can write a stale
 fork that the already-marked SQLite database will not import again. Back up
 both files before any downgrade.
@@ -726,7 +726,8 @@ Requests addressed to a pending launch stay pinned to that pane and room.
 
 Every collaboration IPC operation (context, identity, send, inbox, list,
 reply, get, wait, and cancel) is also appended to
-`$XDG_DATA_HOME/tend/collaboration-audit.ndjson`. The `0600` ledger records the
+`$XDG_DATA_HOME/tend/collaboration-audit.ndjson`, rotated to `.1` at
+`[storage].audit_max_bytes` (8 MiB by default). The `0600` ledger records the
 represented origin/session, OS-observed caller, target/request id, and outcome,
 but never duplicates message or reply bodies. `tend msg list --json --full` and
 `tend_list_messages` with `full=true` expose the creation provenance stored on each request;

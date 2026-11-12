@@ -144,8 +144,13 @@
 # path is used directly.
 # path              = "/home/$USER/.local/share/tend/collaboration.json"
 # max_message_bytes = 16384
-# retention_days    = 90 # omit to retain indefinitely; prunes eligible whole
-#                        # terminal threads at daemon startup
+# retention_days    = 90 # default; 0 retains indefinitely. Prunes eligible whole
+#                        # terminal threads at daemon startup and hourly
+
+# Caps on files that otherwise only grow. 0 turns a cap off.
+# [storage]
+# audit_max_bytes = 8388608 # rotate collaboration-audit.ndjson to .1 at 8 MiB
+# backups_keep    = 5       # newest entries kept under $XDG_DATA_HOME/tend/backups
 
 # Prompt audit log: every PromptSubmitted event is appended to a bounded
 # NDJSON file plus an in-memory ring per pane. Powers `tend recap --all`

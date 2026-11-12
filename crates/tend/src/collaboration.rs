@@ -77,7 +77,8 @@ pub struct CollaborationOptions {
     pub path: Option<PathBuf>,
     pub max_message_bytes: usize,
     pub scope: crate::config::CollaborationScope,
-    /// Optional terminal-thread retention. `None` preserves history forever.
+    /// Optional terminal-thread retention. `None` or `Some(0)` preserves
+    /// history forever.
     pub retention_days: Option<u64>,
 }
 
@@ -2789,13 +2790,21 @@ impl CollaborationStore {
             turn_continuation: std::sync::atomic::AtomicBool::new(true),
             changes,
         });
-        if let Some(days) = store.opts.retention_days {
-            let seconds = days.saturating_mul(24 * 60 * 60).min(i64::MAX as u64);
-            let cutoff = OffsetDateTime::now_utc()
-                - time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX));
-            store.prune_history(cutoff).await?;
-        }
+        store.apply_retention().await?;
         Ok(store)
+    }
+
+    /// Prune eligible history older than `retention_days`. A missing or zero
+    /// retention keeps everything. The daemon calls this at load and then
+    /// periodically, so a long-running daemon does not hold expired threads.
+    pub async fn apply_retention(&self) -> Result<usize, CollaborationError> {
+        let Some(days) = self.opts.retention_days.filter(|days| *days > 0) else {
+            return Ok(0);
+        };
+        let seconds = days.saturating_mul(24 * 60 * 60).min(i64::MAX as u64);
+        let cutoff = OffsetDateTime::now_utc()
+            - time::Duration::seconds(i64::try_from(seconds).unwrap_or(i64::MAX));
+        self.prune_history(cutoff).await
     }
 
     pub fn unavailable(mut options: CollaborationOptions, reason: String) -> Arc<Self> {

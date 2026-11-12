@@ -49,6 +49,25 @@ interval_secs = 5
 tmux foreground sampler입니다. 새 activity ledger interval이 쌓이기 전까지
 compatibility source이자 stats fallback으로 사용됩니다.
 
+## Storage
+
+```toml
+[storage]
+audit_max_bytes = 8388608 # 8 MiB, 0이면 회전하지 않음
+backups_keep = 5          # 0이면 백업을 모두 보존
+```
+
+`audit_max_bytes`에 이르면 `collaboration-audit.ndjson`을
+`collaboration-audit.ndjson.1`로 넘깁니다. 이전 세대는 하나만 남기므로 ledger는 cap의
+두 배 안쪽을 유지합니다. `backups_keep`은 설치·업그레이드 백업이 모이는
+`$XDG_DATA_HOME/tend/backups`에서 수정 시각 기준 최신 항목만 남기고, 나머지는 daemon
+시작 시와 매시간 지웁니다. 숨김 항목은 건드리지 않고 symlink는 따라가지 않고 링크만
+지웁니다.
+
+tendd는 `$XDG_DATA_HOME/tend/spawns`의 launch provenance 기록도 정리합니다. 완료나
+실패한 launch는 30일, 끝내 완료되지 않은 launch는 90일이 지나면 지우며, 살아 있는
+agent나 열린 worker ticket이 가리키는 기록은 남깁니다.
+
 ## MCP 오케스트레이션 가이드
 
 ```toml
@@ -318,7 +337,7 @@ wake_payload = "operator_full" # notice | operator_full | full
 scope = "window"   # window | host
 max_message_bytes = 16384
 # path = "$XDG_DATA_HOME/tend/collaboration.json"
-# retention_days = 90 # 생략하면 영구 보존
+retention_days = 90 # 기본값, 0이면 영구 보존
 ```
 
 `auto_spawn_workers`는 고수준 peer 호출에서 worker를 재사용하고 없으면 생성하게 합니다.
@@ -331,8 +350,8 @@ max_message_bytes = 16384
 Tend는 기존 JSON을 authoritative sibling `collaboration.sqlite3`에 한 번 import하고
 JSON은 migration backup으로 유지합니다. `.sqlite`, `.sqlite3`, `.db` path를 설정하면
 그 파일을 직접 사용합니다. DB는 mailbox와 exact-session alias/role을 함께 저장합니다.
-`retention_days`는 daemon 시작 시 조건을 만족하는 전달 완료 terminal thread를
-정리하며 생략하면 모두 보존합니다. 남은 JSON backup은 본문의 중복 사본이고 retention
+`retention_days`(기본 90)는 daemon 시작 시와 이후 매시간 조건을 만족하는 전달 완료
+terminal thread를 정리하며, `0`이면 모두 보존합니다. 남은 JSON backup은 본문의 중복 사본이고 retention
 대상이 아닙니다.
 `idle_only`는 hook 기반 top-level agent가 Idle일 때만 입력합니다.
 기본값인 `wake_payload = "operator_full"`은 watch/dashboard 같은 operator surface에서
