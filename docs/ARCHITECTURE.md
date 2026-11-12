@@ -99,9 +99,12 @@ pane inventory, exact process, screen, timing, …; see `tend::provenance`), and
 one rule in `Store::apply_event` decides whether a daemon observation may
 change a row:
 
-1. Nothing overwrites a deterministic state unless it was observed strictly
-   after it. An older Codex rollout record or screen capture cannot undo a
-   newer hook, and re-reading an already applied record is not news.
+1. Nothing changes a deterministically described row unless it was observed
+   strictly after the newest deterministic observation
+   (`state_source.deterministic_at`, kept across heuristic refinements). An
+   older Codex rollout record or screen capture cannot undo a newer hook, and
+   re-reading an already applied record is not news. Heartbeats carry only
+   telemetry and are never held back.
 2. A heuristic alone never stops a row a deterministic source described. It
    may stop a row only heuristics ever described (a screen or discovery
    placeholder), and it may refine a deterministic row with a newer,

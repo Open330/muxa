@@ -839,7 +839,11 @@ out), or the heuristic `process_name` (discovery), `screen` (pane capture),
 `host_report` (herdr's own detection), `correlation` (matched by
 elimination) and `timing` (staleness and cap timers). A state-bearing event
 refreshes it even when the state is unchanged; a heartbeat only when it
-changes the state.
+changes the state. `deterministic_at`, when present, is the newest
+deterministic observation of the row's state, kept across later heuristic
+refinements: tendd holds daemon observations to it (an observation not newer
+than it cannot change the row, and a heuristic cannot stop a row that has
+one).
 
 `tmux_socket` and `tmux_session` are additive and optional. `tmux_socket`
 is the short socket name (the socket file's basename, e.g. `default` or

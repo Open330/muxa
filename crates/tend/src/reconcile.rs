@@ -419,32 +419,23 @@ impl<L: LivenessSource> Reconciler<L> {
                 }
             }
             if let Some(response) = recovery_response {
-                if self
-                    .store
-                    .by_session(&t.id.session_id)
-                    .await
-                    .is_some_and(|current| {
-                        current.state == AgentState::Error
-                            && current.last_activity_at == t.last_activity_at
-                    })
-                {
-                    self.store
-                        .apply_observed_repair(
-                            &AgentEvent::TurnStopped {
-                                id: t.id.clone(),
-                                response: Some(response),
-                                recap: None,
-                                ai_title: None,
-                                idle_confirmed: false,
-                                // Repair state without making an old turn
-                                // look recent. The unchanged-row check above
-                                // is its ordering guarantee.
-                                at: t.last_activity_at,
-                            },
-                            StateSource::ProviderRecord,
-                        )
-                        .await;
-                }
+                // Repair state without making an old turn look recent, and
+                // only if the row is still the capped row this reading was
+                // judged against: the Store checks that under its lock.
+                self.store
+                    .apply_observed_repair_if_unchanged(
+                        &AgentEvent::TurnStopped {
+                            id: t.id.clone(),
+                            response: Some(response),
+                            recap: None,
+                            ai_title: None,
+                            idle_confirmed: false,
+                            at: t.last_activity_at,
+                        },
+                        StateSource::ProviderRecord,
+                        t.last_activity_at,
+                    )
+                    .await;
             }
             // Lifecycle signals are useful even before the first token-count
             // record, or when large tool output pushed quota out of the tail.
