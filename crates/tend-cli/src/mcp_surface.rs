@@ -145,27 +145,9 @@ pub(crate) fn route(name: &str, args: Value) -> Result<Routed, String> {
             }
         }
         "tend_wait" => route_wait(&args),
-        "tend_status" => Ok(route_status(args)),
-        "tend_send_prompt" if remote_host(&args).is_some() => Ok(routed(
-            "tend_fleet_send_prompt",
-            copy(&args, &["host", "pane", "text", "submit"]),
-        )),
-        "tend_start_work" if args.get("commit").is_some() => Ok(routed(
-            "tend_dispatch_work",
-            copy(
-                &args,
-                &[
-                    "dispatch_id",
-                    "workspace",
-                    "work",
-                    "commit",
-                    "body",
-                    "selector",
-                    "host",
-                    "plan",
-                ],
-            ),
-        )),
+        "tend_status" => route_status(args),
+        "tend_send_prompt" if remote_host(&args).is_some() => route_fleet_prompt(&args),
+        "tend_start_work" if args.get("commit").is_some() => route_dispatch(&args),
         "tend_agent_search" if args.get("event_id").is_some() => Ok(routed(
             "tend_agent_read",
             copy(
@@ -203,6 +185,71 @@ fn handle_kind(id: &str) -> &'static str {
     }
 }
 
+fn plain(name: &str, args: serde_json::Map<String, Value>) -> Routed {
+    Routed {
+        name: name.to_string(),
+        args: Value::Object(args),
+        replaced_by: None,
+    }
+}
+
+/// `tend_send_prompt` on a Fleet host.
+fn route_fleet_prompt(args: &Value) -> Result<Routed, String> {
+    // The Fleet route cannot enforce these yet; refuse rather than
+    // send without them.
+    for unsupported in ["session_id", "socket"] {
+        if args.get(unsupported).is_some() {
+            return Err(format!(
+                "{unsupported} is not supported with host yet; nothing was sent"
+            ));
+        }
+    }
+    Ok(plain(
+        "tend_fleet_send_prompt",
+        copy(args, &["host", "pane", "text", "submit"]),
+    ))
+}
+
+/// `tend_start_work` with a commit: a Fleet dispatch.
+fn route_dispatch(args: &Value) -> Result<Routed, String> {
+    let mut out = copy(
+        args,
+        &[
+            "dispatch_id",
+            "workspace",
+            "work",
+            "commit",
+            "body",
+            "selector",
+            "host",
+            "plan",
+        ],
+    );
+    // dry_run is the start_work spelling of the dispatch plan.
+    if let Some(dry_run) = args.get("dry_run") {
+        if out.get("plan").is_some_and(|plan| plan != dry_run) {
+            return Err("dry_run and plan disagree; nothing was dispatched".into());
+        }
+        out.insert("plan".into(), dry_run.clone());
+    }
+    for unsupported in [
+        "pipeline",
+        "cwd",
+        "skill",
+        "context",
+        "external",
+        "no_ticket",
+        "refresh",
+    ] {
+        if args.get(unsupported).is_some() {
+            return Err(format!(
+                    "{unsupported} is not supported with commit (Fleet dispatch); nothing was dispatched"
+                ));
+        }
+    }
+    Ok(plain("tend_dispatch_work", out))
+}
+
 /// `host` naming a Fleet host other than this one.
 fn remote_host(args: &Value) -> Option<&str> {
     args.get("host")
@@ -211,36 +258,56 @@ fn remote_host(args: &Value) -> Option<&str> {
         .filter(|host| !host.is_empty() && *host != "local")
 }
 
-fn route_status(args: Value) -> Routed {
+fn route_status(mut args: Value) -> Result<Routed, String> {
     let routed = |name: &str, args: serde_json::Map<String, Value>| Routed {
         name: name.to_string(),
         args: Value::Object(args),
         replaced_by: None,
     };
-    if args.get("host").is_some() && args.get("pane").is_some() {
-        return routed("tend_fleet_capture", copy(&args, &["host", "pane"]));
-    }
-    if args.get("host").is_some() {
-        return routed("tend_fleet_status", copy(&args, &["selector", "full"]));
+    match args.get("host").and_then(Value::as_str).map(str::trim) {
+        // The whole Fleet, explicitly.
+        Some("all") => {
+            if args.get("pane").is_some() {
+                return Err("host=all reads the Fleet summary; name a host to read a pane".into());
+            }
+            return Ok(routed(
+                "tend_fleet_status",
+                copy(&args, &["selector", "full"]),
+            ));
+        }
+        Some("local" | "") => {
+            if let Some(object) = args.as_object_mut() {
+                object.remove("host");
+            }
+        }
+        Some(_) => {
+            if args.get("pane").is_none() {
+                return Err(
+                    "name a pane on that host, or use host=all for the Fleet summary".into(),
+                );
+            }
+            return Ok(routed("tend_fleet_capture", copy(&args, &["host", "pane"])));
+        }
+        None => {}
     }
     if args.get("query").is_some() {
-        return routed(
+        return Ok(routed(
             "tend_agent_find",
             copy(&args, &["query", "limit", "refresh", "exclude_sessions"]),
-        );
+        ));
     }
     if args.get("pane").is_none() && args.get("history_limit").is_some() {
         let mut out = copy(&args, &["full"]);
         if let Some(limit) = args.get("history_limit") {
             out.insert("limit".into(), limit.clone());
         }
-        return routed("tend_recent_prompts", out);
+        return Ok(routed("tend_recent_prompts", out));
     }
-    Routed {
+    Ok(Routed {
         name: "tend_status".into(),
         args,
         replaced_by: None,
-    }
+    })
 }
 
 /// Fold the absorbed tools' arguments into the listed schemas, tersely.
@@ -267,7 +334,7 @@ pub(crate) fn extend_schemas(tools: &mut [Value]) {
             ),
             "tend_start_work" => (
                 json!({
-                    "commit": {"type": "string", "description": "Dispatch through the Fleet coordinator instead: prepare an isolated worktree at this commit and launch the pipeline (needs dispatch_id, workspace, body)."},
+                    "commit": {"type": "string", "description": "Dispatch through the Fleet coordinator instead: an isolated worktree at this commit and the pipeline (needs dispatch_id, workspace, body; dry_run plans). Launched means started, not completed."},
                     "dispatch_id": {"type": "string", "description": "commit: UUID; reuse it on retries."},
                     "host": {"type": "string"},
                     "selector": {"type": "string"},
@@ -500,11 +567,38 @@ mod tests {
         assert_eq!(
             route_ok(
                 "tend_status",
-                json!({"host": "mini", "selector": "env=prod"})
+                json!({"host": "all", "selector": "env=prod"})
             )
             .name,
             "tend_fleet_status"
         );
+        assert!(route("tend_status", json!({"host": "mini"})).is_err());
+        let local = route_ok(
+            "tend_status",
+            json!({"host": "local", "pane": "%1", "include_capture": true}),
+        );
+        assert_eq!(local.name, "tend_status");
+        assert_eq!(local.args, json!({"pane": "%1", "include_capture": true}));
+        assert!(route(
+            "tend_send_prompt",
+            json!({"host": "mini", "pane": "%1", "text": "x", "session_id": "s"})
+        )
+        .is_err());
+        let plan = route_ok(
+            "tend_start_work",
+            json!({"work": "W", "commit": "abc", "dry_run": true}),
+        );
+        assert_eq!(plan.args["plan"], true);
+        assert!(route(
+            "tend_start_work",
+            json!({"work": "W", "commit": "abc", "dry_run": true, "plan": false})
+        )
+        .is_err());
+        assert!(route(
+            "tend_start_work",
+            json!({"work": "W", "commit": "abc", "pipeline": "p"})
+        )
+        .is_err());
         let prompts = route_ok("tend_status", json!({"history_limit": 5}));
         assert_eq!(prompts.name, "tend_recent_prompts");
         assert_eq!(prompts.args, json!({"limit": 5}));

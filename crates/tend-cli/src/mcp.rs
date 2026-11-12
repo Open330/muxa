@@ -1175,14 +1175,16 @@ async fn call_tool(
         Some((_, routed)) => (Some(routed.name.as_str()), Some(&routed.args)),
         None => (name, params.and_then(|p| p.get("arguments"))),
     };
-    let mutates = matches!(run_name, Some("tend_start_agent" | "tend_start_work"))
-        || (run_name == Some("tend_manage_tmux")
-            && run_args
-                .and_then(|args| args.get("action"))
-                .and_then(Value::as_str)
-                .is_some_and(|action| {
-                    matches!(action, "terminate_agent" | "close_work" | "close_workspace")
-                }));
+    let mutates = matches!(
+        run_name,
+        Some("tend_start_agent" | "tend_start_work" | "tend_dispatch_work")
+    ) || (run_name == Some("tend_manage_tmux")
+        && run_args
+            .and_then(|args| args.get("action"))
+            .and_then(Value::as_str)
+            .is_some_and(|action| {
+                matches!(action, "terminate_agent" | "close_work" | "close_workspace")
+            }));
     let result = match &routed {
         Some((_, routed)) => {
             let params = json!({"name": routed.name, "arguments": routed.args});
