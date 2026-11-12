@@ -19,7 +19,14 @@ impl Client {
             "kind": "review_create",
             "review": review,
         });
-        field(&self.call_checked(&req).await?, "review_item")
+        // The daemon may run the Work's declared checks first.
+        let response = self
+            .call_with_timeout(&req, crate::work_verify::VERIFY_CALL_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(super::response_error(&response));
+        }
+        field(&response, "review_item")
     }
 
     pub async fn review_get(&self, id: &str) -> Result<ReviewItem, RuntimeError> {

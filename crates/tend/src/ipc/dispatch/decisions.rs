@@ -17,8 +17,26 @@ pub(super) async fn handle(
     let kind = &mut turn.kind;
     let pending_audit = &mut turn.pending_audit;
     let response = match body {
-        body @ (RequestBody::ReviewCreate { .. }
-        | RequestBody::ReviewGet { .. }
+        RequestBody::ReviewCreate { mut review } => {
+            // A result an agent files on a Work with declared checks is
+            // verified by tend first; a failure keeps it from the person.
+            match Box::pin(verify_result(ctx, &mut review)).await {
+                Ok(()) => {
+                    let (name, response) = Box::pin(review_response(
+                        reviews,
+                        RequestBody::ReviewCreate { review },
+                    ))
+                    .await;
+                    *kind = name;
+                    response
+                }
+                Err(refusal) => {
+                    *kind = "review_create";
+                    Response::err(refusal)
+                }
+            }
+        }
+        body @ (RequestBody::ReviewGet { .. }
         | RequestBody::ReviewList { .. }
         | RequestBody::ReviewSummary
         | RequestBody::ReviewDispose { .. }
@@ -68,4 +86,42 @@ pub(super) async fn handle(
         other => unreachable!("dispatch routed {other:?} to decisions"),
     };
     Ok(Flow::Respond(response))
+}
+
+/// Run the declared checks of the Work an agent's result belongs to, and
+/// put their outcome on the record. Any client claim that tend ran its
+/// evidence is cleared, verified or not.
+async fn verify_result(
+    ctx: &ServerCtx,
+    review: &mut crate::review::NewReview,
+) -> Result<(), String> {
+    crate::work_verify::strip_claims(&mut review.decision);
+    if review.requested_by.kind != crate::review::ActorKind::Agent {
+        return Ok(());
+    }
+    let identity = match &review.target {
+        crate::review::ReviewTarget::Work {
+            workspace, work, ..
+        } => Some(crate::work::WorkIdentity::new(
+            workspace.clone(),
+            work.clone(),
+        )),
+        crate::review::ReviewTarget::Request { request_id, .. } => ctx
+            .collaboration
+            .request_work(request_id)
+            .await
+            .map(|(workspace, work)| crate::work::WorkIdentity::new(workspace, work)),
+        crate::review::ReviewTarget::Session { .. } => None,
+    };
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+    match crate::work_verify::verify(&ctx.work_store, &ctx.pipeline_runs, &identity).await {
+        crate::work_verify::Gate::NoChecks => Ok(()),
+        crate::work_verify::Gate::Passed(outcomes) => {
+            crate::work_verify::attach(&mut review.decision, &outcomes);
+            Ok(())
+        }
+        crate::work_verify::Gate::Failed(outcomes) => Err(crate::work_verify::refusal(&outcomes)),
+    }
 }

@@ -2720,3 +2720,102 @@ async fn a_planned_work_round_trips_over_ipc_with_its_result_records() {
     tx.send(()).unwrap();
     handle.await.unwrap();
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_result_on_a_work_with_checks_is_filed_only_once_tend_has_run_them() {
+    use crate::decision::{Decision, Evidence};
+    use crate::review::{ActorKind, NewReview, ReviewActor, ReviewTarget};
+    use crate::work::{WorkEdit, WorkIdentity};
+    let dir = tempdir().unwrap();
+    let checkout = dir.path().join("checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    let sock = dir.path().join("tend-verify.sock");
+    let work_store = Arc::new(tokio::sync::Mutex::new(
+        crate::dashboard::work_store::WorkStore::memory(),
+    ));
+    let server = Server::new(sock.clone(), Store::shared()).with_work_store(work_store);
+    let (tx, rx) = broadcast::channel(1);
+    let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
+    wait_for_socket(&sock).await;
+    let client = Client::new(sock);
+    assert!(client
+        .hello(Duration::from_secs(3))
+        .await
+        .unwrap()
+        .capabilities
+        .iter()
+        .any(|c| c == crate::work::WORK_VERIFY_CAPABILITY));
+    let id = WorkIdentity::new("verify-ipc", "ENG-7");
+    client
+        .work_edit(
+            &id,
+            &WorkEdit {
+                title: Some("Ship it".into()),
+                cwd: Some(checkout.to_string_lossy().into_owned()),
+                checks: Some(vec![crate::work_verify::WorkCheck::new(
+                    "test -f built && echo built ok",
+                )]),
+                ..WorkEdit::default()
+            },
+        )
+        .await
+        .unwrap();
+    let result = || NewReview {
+        target: ReviewTarget::Work {
+            workspace: "verify-ipc".into(),
+            work: "ENG-7".into(),
+            alias: Some("impl".into()),
+            pipeline_generation: Some(1),
+        },
+        summary: "Built".into(),
+        anchor: None,
+        idempotency_key: None,
+        requested_by: ReviewActor {
+            kind: ActorKind::Agent,
+            label: None,
+        },
+        // The agent claims tend ran this; the daemon clears it.
+        decision: Some(Decision {
+            evidence: vec![Evidence::Test {
+                command: "my own test".into(),
+                passed: Some(true),
+                tail: None,
+                verified: true,
+            }],
+            ..Decision::default()
+        }),
+    };
+    let refused = client
+        .review_create(&result())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(refused.contains("checks_failed"), "{refused}");
+    assert!(refused.contains("FAIL test -f built"), "{refused}");
+    assert!(client
+        .work_record_show(&id)
+        .await
+        .unwrap()
+        .reviews
+        .is_empty());
+
+    std::fs::write(checkout.join("built"), b"").unwrap();
+    let item = client.review_create(&result()).await.unwrap();
+    let evidence = item.decision.unwrap().evidence;
+    assert_eq!(
+        evidence[0],
+        Evidence::Test {
+            command: "test -f built && echo built ok".into(),
+            passed: Some(true),
+            tail: Some("built ok".into()),
+            verified: true,
+        }
+    );
+    assert!(matches!(
+        &evidence[1],
+        Evidence::Test { command, verified: false, .. } if command == "my own test"
+    ));
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}

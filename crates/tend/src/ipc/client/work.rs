@@ -107,7 +107,13 @@ impl Client {
             "alias": alias,
             "generation": generation,
         });
-        let response = self.call_checked(&req).await?;
+        // The daemon may run the Work's declared checks first.
+        let response = self
+            .call_with_timeout(&req, crate::work_verify::VERIFY_CALL_TIMEOUT)
+            .await?;
+        if !response["ok"].as_bool().unwrap_or(false) {
+            return Err(super::response_error(&response));
+        }
         serde_json::from_value(response["pipeline_run"].clone()).map_err(RuntimeError::Json)
     }
 

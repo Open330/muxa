@@ -90,6 +90,24 @@ change its own, but not the person's or another agent's. This keeps the agent
 whose work is checked from rewriting its own checks. It is not
 authentication: every caller runs as the same user.
 
+tendd runs the checks itself, one after another in the Work's directory
+(its durable Run's, else the one the checks were declared for),
+when an agent reports a result: `tend_file_result` or
+`tend work done --summary` on the Work (or on a collaboration request sent
+for it), and `tend work done` before it marks the alias done. Each check
+gets its own time limit (default 300 s, at most 1,200 s) and all of them
+together at most 1,200 s; output is kept to its last 40 lines.
+
+- Every check passes: the result record is filed with each check as test
+  evidence marked as run by tend (`"verified": true`), ahead of the agent's
+  own evidence. An agent's own claim to `verified` is cleared.
+- A check fails, times out or cannot start: nothing is filed, the alias
+  stays open, and the agent gets `checks_failed` with each check's output to
+  fix and report again. The person is not asked.
+
+A completion right after a passing result (within ten minutes) reuses that
+verification instead of running the checks again.
+
 ### External issues
 
 ```sh
