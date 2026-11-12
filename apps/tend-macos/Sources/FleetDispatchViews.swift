@@ -155,6 +155,7 @@ struct FleetDispatchSettingsView: View {
     @State private var busy = false
     @State private var supported = false
     @State private var message: String?
+    @State private var confirmsReload = false
     private var client: TendDispatchClient { TendDispatchClient(socketPath: model.client.socketPath) }
     private var localOwner: Bool { settings.coordinator == nil || settings.coordinator == "local" }
     private var isChanged: Bool { document != nil && settings != document?.orchestration }
@@ -296,14 +297,27 @@ struct FleetDispatchSettingsView: View {
                 canRevert: isChanged,
                 canSave: isChanged && supported,
                 revert: { if let document { settings = document.orchestration } },
-                save: save
-            ) {
-                if let message {
-                    Text(verbatim: message).foregroundStyle(.orange).textSelection(.enabled)
-                } else {
-                    Text("Saving reconnects Tend to tendd.").foregroundStyle(.secondary)
+                save: save,
+                status: {
+                    if let message {
+                        Text(verbatim: message).foregroundStyle(.orange).textSelection(.enabled)
+                    } else {
+                        Text("Saving reconnects Tend to tendd.").foregroundStyle(.secondary)
+                    }
+                },
+                leading: {
+                    // Reads the file again: the way back after a failed first
+                    // read, or after another writer moved config.toml.
+                    Button("Reload") {
+                        if isChanged { confirmsReload = true } else { load() }
+                    }
+                    .disabled(busy || !supported)
+                    .help("Reads the Dispatch settings from the configuration file again")
                 }
-            }
+            )
+        }
+        .confirmationDialog("Discard unsaved Dispatch changes and reload?", isPresented: $confirmsReload) {
+            Button("Discard and Reload", role: .destructive) { load() }
         }
     }
 
@@ -370,8 +384,26 @@ struct FleetDispatchSettingsView: View {
                 let result = try await client.saveSettings(settings, expected: document.config.text)
                 self.document = result; settings = result.orchestration; message = nil
                 model.retryConnection()
-            } catch { message = error.localizedDescription }
+            } catch {
+                message = await recoverFromFailedSave(error, baseline: document)
+            }
         }
+    }
+
+    /// A refused save is often another writer having moved config.toml.
+    /// When that writer left the Dispatch settings alone, the draft is put on
+    /// top of the file as it is now; when it changed them too, only Reload
+    /// (which discards the draft) can continue.
+    private func recoverFromFailedSave(_ error: Error, baseline: TendOrchestrationDocument) async -> String {
+        let failure = error.localizedDescription
+        guard let latest = try? await client.readSettings(), latest.config.text != baseline.config.text else {
+            return failure
+        }
+        guard let refreshed = try? baseline.refreshedAfterLabelEdit(latest) else {
+            return failure + " " + String(localized: "Dispatch settings changed elsewhere. Reload to take them; your unsaved changes are discarded.")
+        }
+        document = refreshed
+        return failure + " " + String(localized: "The configuration file changed elsewhere. Your Dispatch changes are kept; Save again to apply them on top.")
     }
 }
 

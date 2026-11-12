@@ -375,39 +375,61 @@ extension TendSettingsFooter where Leading == EmptyView {
     }
 }
 
-/// Whether a saved configuration change still waits for tendd to restart.
+/// Which tendd process is answering, as far as the app can tell.
 ///
-/// The daemon's generation goes up each time it starts, so a change saved
-/// under one generation is applied once another one answers.
+/// tendd's generation only counts self-re-execs (a fresh process starts at
+/// 0 again), so it is paired with the socket owner's pid and with the
+/// number of replacements this app has completed. A part that is unknown on
+/// either side is not used to tell two daemons apart.
+struct TendDaemonIdentity: Equatable, Sendable {
+    var generation: UInt64?
+    var pid: Int32?
+    /// Successful "Reload tendd" replacements since the app started.
+    var replacements: UInt64 = 0
+
+    func isSameDaemon(as other: TendDaemonIdentity) -> Bool {
+        if replacements != other.replacements { return false }
+        if let generation, let other = other.generation, generation != other { return false }
+        if let pid, let other = other.pid, pid != other { return false }
+        return true
+    }
+}
+
+/// Whether a saved configuration change still waits for tendd to restart:
+/// pending from the save until a different daemon answers. Pressing Restart
+/// does not clear it — only a replacement that actually happened does.
 struct TendRestartNotice: Equatable, Sendable {
     private(set) var isPending = false
-    /// The generation the first unapplied change was saved under; nil when
-    /// the daemon did not report one.
-    private(set) var savedGeneration: UInt64?
+    /// The daemon the first unapplied change was saved under.
+    private(set) var savedUnder: TendDaemonIdentity?
 
-    /// Whether the bar shows while `current` is the running generation.
-    func isShown(currentGeneration current: UInt64?) -> Bool {
+    /// Whether the bar shows while `current` is the daemon answering.
+    func isShown(current: TendDaemonIdentity) -> Bool {
         guard isPending else { return false }
-        guard let savedGeneration, let current else { return true }
-        return savedGeneration == current
+        guard let savedUnder else { return true }
+        return savedUnder.isSameDaemon(as: current)
     }
 
     /// Records a change that applies on the next restart.
-    mutating func noteSaved(generation: UInt64?) {
-        if !isShown(currentGeneration: generation) { savedGeneration = generation }
+    mutating func noteSaved(under current: TendDaemonIdentity) {
+        if !isShown(current: current) { savedUnder = current }
         isPending = true
     }
 
     mutating func clear() {
         isPending = false
-        savedGeneration = nil
+        savedUnder = nil
     }
 }
 
 extension AppModel {
-    /// The local tendd's start count, when it reports one.
-    var localDaemonGeneration: UInt64? {
-        fleetHosts.first(where: \.local)?.daemonGeneration
+    /// The local tendd as the restart bar tells daemons apart.
+    var localDaemonIdentity: TendDaemonIdentity {
+        TendDaemonIdentity(
+            generation: fleetHosts.first(where: \.local)?.daemonGeneration,
+            pid: localDaemonPID,
+            replacements: daemonReplacements
+        )
     }
 }
 
@@ -418,7 +440,7 @@ struct TendRestartBar: View {
     @ObservedObject var store: TendConfigStore
 
     var body: some View {
-        if store.restartNotice.isShown(currentGeneration: model.localDaemonGeneration) {
+        if store.restartNotice.isShown(current: model.localDaemonIdentity) {
             VStack(spacing: 0) {
                 Divider()
                 HStack(spacing: 10) {
@@ -428,10 +450,8 @@ struct TendRestartBar: View {
                     Text("Restart tendd to apply")
                         .font(TendType.detail.weight(.medium))
                     Spacer(minLength: 8)
-                    TendDaemonReloadButton(model: model, title: "Restart") {
-                        store.clearRestartNotice()
-                    }
-                    .controlSize(.small)
+                    TendDaemonReloadButton(model: model, title: "Restart")
+                        .controlSize(.small)
                 }
                 .padding(.horizontal, 20)
                 .padding(.vertical, 8)
@@ -447,17 +467,13 @@ struct TendRestartBar: View {
 struct TendDaemonReloadButton: View {
     @ObservedObject var model: AppModel
     var title: LocalizedStringKey = "Reload tendd…"
-    var onReload: (() -> Void)?
     @State private var confirmsReload = false
 
     var body: some View {
         Button(title) { confirmsReload = true }
             .alert("Reload the bundled tendd?", isPresented: $confirmsReload) {
                 Button("Cancel", role: .cancel) {}
-                Button("Reload", role: .destructive) {
-                    onReload?()
-                    model.replaceRunningDaemon()
-                }
+                Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
             } message: {
                 Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shells will end. tmux sessions are not terminated.")
             }

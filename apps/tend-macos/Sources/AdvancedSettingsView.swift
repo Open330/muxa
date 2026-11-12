@@ -89,7 +89,7 @@ struct AdvancedSettingsPane: View {
                 Button("Retry Connection") { model.retryConnection() }
                     .disabled(model.connectionState == .connecting)
                 Spacer()
-                TendDaemonReloadButton(model: model) { store.clearRestartNotice() }
+                TendDaemonReloadButton(model: model)
             }
             TendSettingsCaption("Reloading replaces the process on the owner-only socket. tmux sessions remain, but native PTY sessions end.")
             DisclosureGroup("Show details", isExpanded: $showsDetails) {

@@ -559,7 +559,7 @@ final class TendConfigStore: ObservableObject {
     @discardableResult
     func save(model: AppModel) async -> Bool {
         let saved = await save(client: model.client.makeConfigClient())
-        if saved { restartNotice.noteSaved(generation: model.localDaemonGeneration) }
+        if saved { restartNotice.noteSaved(under: model.localDaemonIdentity) }
         return saved
     }
 
@@ -589,7 +589,7 @@ final class TendConfigStore: ObservableObject {
         // A conflict leaves `document` holding the file as it now stands, so
         // the same edits re-applied land on top of whatever changed.
         retryEdits = wrote || conflictMessage == nil ? [] : edits
-        if wrote { restartNotice.noteSaved(generation: model.localDaemonGeneration) }
+        if wrote { restartNotice.noteSaved(under: model.localDaemonIdentity) }
         return wrote
     }
 
@@ -689,11 +689,6 @@ final class TendConfigStore: ObservableObject {
         conflictMessage = nil
         retryEdits = []
         status = nil
-    }
-
-    /// The operator restarted tendd from the restart bar.
-    func clearRestartNotice() {
-        restartNotice.clear()
     }
 
     func clearStatus() {

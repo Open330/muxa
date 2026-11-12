@@ -23112,6 +23112,46 @@
           }
         }
       }
+    },
+    "Discard unsaved Dispatch changes and reload?" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "저장하지 않은 작업 배치 변경 사항을 버리고 다시 로드할까요?"
+          }
+        }
+      }
+    },
+    "Reads the Dispatch settings from the configuration file again" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 파일에서 작업 배치 설정을 다시 읽습니다"
+          }
+        }
+      }
+    },
+    "The configuration file changed elsewhere. Your Dispatch changes are kept; Save again to apply them on top." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "설정 파일이 다른 곳에서 바뀌었습니다. 작업 배치 변경 사항은 그대로 남아 있으니, 다시 저장하면 바뀐 파일 위에 적용됩니다."
+          }
+        }
+      }
+    },
+    "Dispatch settings changed elsewhere. Reload to take them; your unsaved changes are discarded." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 배치 설정이 다른 곳에서 바뀌었습니다. 다시 로드해 반영하세요. 저장하지 않은 변경 사항은 사라집니다."
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

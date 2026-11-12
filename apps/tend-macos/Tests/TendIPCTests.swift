@@ -3051,32 +3051,72 @@ func settingsTabSelectionsFromEarlierBuildsOpenTheirNewHome() {
 }
 
 @Test
-func restartNoticeShowsUntilTheDaemonRestarts() {
+func restartNoticeShowsUntilADifferentDaemonAnswers() {
+    let first = TendDaemonIdentity(generation: 4, pid: 100)
     var notice = TendRestartNotice()
-    #expect(!notice.isShown(currentGeneration: 4))
+    #expect(!notice.isShown(current: first))
 
-    notice.noteSaved(generation: 4)
-    #expect(notice.isShown(currentGeneration: 4))
-    // Disconnected mid-restart: no generation to compare, so keep asking.
-    #expect(notice.isShown(currentGeneration: nil))
-    // A second save before the restart keeps the first generation.
-    notice.noteSaved(generation: 4)
-    #expect(notice.savedGeneration == 4)
-    // tendd came back as generation 5: the change is applied.
-    #expect(!notice.isShown(currentGeneration: 5))
+    notice.noteSaved(under: first)
+    #expect(notice.isShown(current: first))
+    // Disconnected mid-restart: nothing known to compare, so keep asking.
+    #expect(notice.isShown(current: TendDaemonIdentity()))
+    // A second save before the restart keeps the first daemon.
+    notice.noteSaved(under: first)
+    #expect(notice.savedUnder == first)
+    // tendd re-exec'd itself: a new generation.
+    #expect(!notice.isShown(current: TendDaemonIdentity(generation: 5, pid: 100)))
 
-    // A save under the new generation shows the bar again.
-    notice.noteSaved(generation: 5)
-    #expect(notice.isShown(currentGeneration: 5))
-    #expect(notice.savedGeneration == 5)
+    // A save under the new daemon shows the bar again.
+    let second = TendDaemonIdentity(generation: 5, pid: 100)
+    notice.noteSaved(under: second)
+    #expect(notice.isShown(current: second))
+    #expect(notice.savedUnder == second)
 
     notice.clear()
-    #expect(!notice.isShown(currentGeneration: 5))
+    #expect(!notice.isShown(current: second))
+}
 
-    // A daemon that reports no generation keeps the bar until cleared.
-    var unknown = TendRestartNotice()
-    unknown.noteSaved(generation: nil)
-    #expect(unknown.isShown(currentGeneration: 7))
+@Test
+func restartNoticeTellsAFreshProcessFromTheOldOneAtGenerationZero() {
+    // A fresh tendd starts at generation 0 again, so generation alone
+    // cannot tell an outside restart apart; the socket owner's pid can.
+    var notice = TendRestartNotice()
+    notice.noteSaved(under: TendDaemonIdentity(generation: 0, pid: 100))
+    #expect(notice.isShown(current: TendDaemonIdentity(generation: 0, pid: 100)))
+    #expect(!notice.isShown(current: TendDaemonIdentity(generation: 0, pid: 200)))
+    // The new process's pid not read yet: the same daemon, as far as known.
+    #expect(notice.isShown(current: TendDaemonIdentity(generation: 0, pid: nil)))
+}
+
+@Test
+func restartNoticeStaysUntilAReplacementSucceeds() {
+    // Pressing Restart changes nothing by itself; a replacement that failed
+    // (old daemon still running, same pid and generation) keeps the bar.
+    var notice = TendRestartNotice()
+    let before = TendDaemonIdentity(generation: 0, pid: nil, replacements: 0)
+    notice.noteSaved(under: before)
+    #expect(notice.isShown(current: before))
+    // A completed replacement counts, even with nothing else known.
+    #expect(!notice.isShown(current: TendDaemonIdentity(generation: 0, pid: nil, replacements: 1)))
+}
+
+@MainActor
+@Test
+func behaviourDraftKeepsEditsWhenTheDaemonCannotWriteItsConfiguration() async {
+    let store = TendConfigStore()
+    #expect(!store.isSupported)
+    let draft = TendBehaviourDraft(store: store)
+    draft.attach(AppModel())
+    draft.settings.notifierEnabled = true
+    draft.settings.collaborationScope = .host
+    for _ in 0..<50 { await Task.yield() }
+    #expect(draft.pendingWrites == 0)
+    #expect(draft.settings.notifierEnabled)
+    #expect(draft.settings.collaborationScope == .host)
+    // Reopening the tab must not put the defaults back over the edits.
+    draft.syncFromStore()
+    #expect(draft.settings.notifierEnabled)
+    #expect(draft.settings.edits(against: .daemonDefaults).count == 2)
 }
 
 @Test

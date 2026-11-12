@@ -16,6 +16,9 @@ final class TendBehaviourDraft: ObservableObject {
     @Published var settings = TendBehaviourSettings() {
         didSet {
             guard !isSyncing, settings != oldValue else { return }
+            // A daemon that cannot write its configuration gets nothing
+            // written: the draft stays as edited, for the block to copy.
+            guard store.isSupported else { return }
             scheduleApply()
         }
     }
@@ -43,9 +46,11 @@ final class TendBehaviourDraft: ObservableObject {
     }
 
     /// Takes the file's values, unless a write of the draft is still on its
-    /// way — then the write's own completion takes them.
+    /// way — then the write's own completion takes them. With no file read
+    /// (a daemon that cannot edit its configuration) there is nothing to
+    /// take, and the edited draft is what the copy block shows.
     func syncFromStore() {
-        guard pendingWrites == 0 else { return }
+        guard pendingWrites == 0, store.hasLoaded else { return }
         replace(with: store.behaviour)
     }
 
@@ -78,7 +83,7 @@ final class TendBehaviourDraft: ObservableObject {
         lastWrite = Task { @MainActor in
             await previous?.value
             let edits = settings.edits(against: store.behaviour)
-            if !edits.isEmpty, store.isSupported {
+            if !edits.isEmpty {
                 await store.apply(edits, model: model)
             }
             finishWrite()
@@ -89,7 +94,7 @@ final class TendBehaviourDraft: ObservableObject {
         pendingWrites -= 1
         // A write that landed leaves the file equal to the draft; one that
         // was refused leaves the draft as typed, with the reason beside it.
-        if pendingWrites == 0, store.saveError == nil, store.conflictMessage == nil {
+        if pendingWrites == 0, store.isSupported, store.saveError == nil, store.conflictMessage == nil {
             replace(with: store.behaviour)
         }
     }
