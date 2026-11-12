@@ -1316,6 +1316,50 @@ async fn swap_health_answers_in_every_state() {
     handle.await.unwrap();
 }
 
+/// `swap_health` says when the account module is off, as a field, and
+/// only then; hello advertises that it does.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn swap_health_says_when_the_account_module_is_off() {
+    let off: Arc<dyn crate::swap_api::SwapJobs> = Arc::new(
+        crate::swap_api::UnopenedSwap::module_off("the account module is not enabled".into(), 2),
+    );
+    let response = crate::ipc::swap::swap_health_response(Some(&off)).await;
+    let swap = response.swap.expect("health answers");
+    assert_eq!(swap["module_off"], serde_json::Value::Bool(true));
+    assert_eq!(swap["readiness"], "unavailable");
+
+    let failed: Arc<dyn crate::swap_api::SwapJobs> = Arc::new(crate::swap_api::UnopenedSwap::new(
+        "schema 9, this build reads 2".into(),
+        2,
+    ));
+    let response = crate::ipc::swap::swap_health_response(Some(&failed)).await;
+    assert_eq!(
+        response.swap.expect("health answers")["module_off"],
+        serde_json::Value::Bool(false)
+    );
+
+    let ready = FakeSwap::new(true);
+    let (_dir, client, tx, handle) = swap_server(Some(
+        Arc::clone(&ready) as Arc<dyn crate::swap_api::SwapJobs>
+    ))
+    .await;
+    let hello = client.hello(Duration::from_secs(2)).await.unwrap();
+    assert!(hello
+        .capabilities
+        .iter()
+        .any(|c| c == SWAP_HEALTH_MODULE_CAPABILITY));
+    let response = crate::ipc::swap::swap_health_response(Some(
+        &(ready as Arc<dyn crate::swap_api::SwapJobs>),
+    ))
+    .await;
+    assert_eq!(
+        response.swap.expect("health answers")["module_off"],
+        serde_json::Value::Bool(false)
+    );
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}
+
 /// No service: nothing advertised, every swap request refused — no
 /// other path is taken.
 #[tokio::test]

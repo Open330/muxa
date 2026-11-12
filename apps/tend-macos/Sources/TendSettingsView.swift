@@ -174,7 +174,7 @@ struct TendSettingsView: View {
             TendMenuBarSettingsView(model: model)
                 .tendSettingsTab(.menuBar, model: model)
 
-            TendAccountsSettingsPane(model: model, registry: TendModuleRegistry.shared)
+            TendAccountsSettingsPane(model: model, registry: TendModuleRegistry.shared, swaps: model.swaps)
                 .tendSettingsTab(.accounts, model: model)
 
             AskProvidersSettingsPane(model: model, store: AskProviderStore.shared)
@@ -532,6 +532,23 @@ struct TendDaemonReloadButton: View {
 
 // MARK: - Menu Bar
 
+/// The account usage chip's switch; off and explained while the daemon's
+/// account module is off.
+private struct TendMenuBarUsageChipToggle: View {
+    @ObservedObject var swaps: TendSwapCenter
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Toggle("Show AAS usage chip", isOn: Binding(get: { isOn && !swaps.accountModuleOff }, set: { isOn = $0 }))
+            .disabled(swaps.accountModuleOff)
+        if swaps.accountModuleOff {
+            TendSettingsCaption("The account module is off in tendd, so there is no account usage to show.")
+        } else {
+            TendSettingsCaption("Hover to see active account usage. Click to compare all accounts.")
+        }
+    }
+}
+
 private struct TendMenuBarSettingsView: View {
     @ObservedObject var model: AppModel
     @State private var hostIcons = TendHostIcons.all()
@@ -553,8 +570,7 @@ private struct TendMenuBarSettingsView: View {
                     }
                 }
                 TendSettingsCaption("Additional activity stays in the +N list. Reviewed agents are hidden until new activity arrives.")
-                Toggle("Show AAS usage chip", isOn: $showAasChip)
-                TendSettingsCaption("Hover to see active account usage. Click to compare all accounts.")
+                TendMenuBarUsageChipToggle(swaps: model.swaps, isOn: $showAasChip)
             }
 
             Section {

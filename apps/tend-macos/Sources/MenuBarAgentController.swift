@@ -195,7 +195,8 @@ final class TendMenuBarAgentController: NSObject, NSPopoverDelegate {
         }
         state.agents = content
         let activity = TendMenuBarChip.activity(candidates, grouping: grouping)
-        let aas = showAasChip && registry.isEnabled("aas") ? registry.module(AasModule.self) : nil
+        // No usage chip while the daemon's account module is off.
+        let aas = showAasChip && registry.isEnabled("aas") && !model.swaps.accountModuleOff ? registry.module(AasModule.self) : nil
         let usage = aas.flatMap { $0.availability.isAvailable ? TendMenuBarChip.aas($0.store) : nil }
         availableChips = activity + (usage.map { [$0] } ?? [])
         // Freeze membership, capsule width and overflow while pointing or reading.
@@ -263,7 +264,8 @@ final class TendMenuBarAgentController: NSObject, NSPopoverDelegate {
         if Date().timeIntervalSince(statusRefreshAt) >= 15 {
             statusRefreshAt = Date()
             refresh()
-            if showAasChip, registry.isEnabled("aas"), let aas = registry.module(AasModule.self), aas.availability.isAvailable,
+            if showAasChip, registry.isEnabled("aas"), !model.swaps.accountModuleOff,
+               let aas = registry.module(AasModule.self), aas.availability.isAvailable,
                !aas.store.isRefreshing,
                TendMenuBarPolling.refreshUsage(chipShown: true, lastAttempt: usageRefreshAt, lastSuccess: aas.store.lastRefreshedAt, now: statusRefreshAt) {
                 usageRefreshAt = statusRefreshAt
@@ -437,7 +439,7 @@ final class TendMenuBarAgentController: NSObject, NSPopoverDelegate {
             refresh()
             show(selected: nil)
         case .aas:
-            guard registry.isEnabled("aas") else { return }
+            guard registry.isEnabled("aas"), !model.swaps.accountModuleOff else { return }
             state.scope = nil
             state.showingUsage = true
             show(selected: nil)

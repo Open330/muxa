@@ -15,7 +15,7 @@ struct TendMenuBarContent: View {
     @ObservedObject private var registry = TendModuleRegistry.shared
 
     var body: some View {
-        if state.showingUsage, registry.isEnabled("aas"), let aas = registry.module(AasModule.self) {
+        if state.showingUsage, registry.isEnabled("aas"), !model.swaps.accountModuleOff, let aas = registry.module(AasModule.self) {
             VStack(alignment: .leading, spacing: 0) {
                 Button("Back to activity") { state.showingUsage = false; select(nil) }.buttonStyle(.plain).padding([.top, .horizontal], 16)
                 AasMenuBarPanel(store: aas.store)
@@ -104,7 +104,7 @@ struct TendMenuBarContent: View {
                             systemImage: "arrow.triangle.2.circlepath")
                     }
                 }
-                if registry.isEnabled("aas") {
+                if registry.isEnabled("aas"), !model.swaps.accountModuleOff {
                     Button { state.showingUsage = true } label: { Label("Accounts and usage", systemImage: "gauge.medium") }
                         .buttonStyle(.plain).foregroundStyle(Color.accentColor)
                 }
