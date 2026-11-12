@@ -54,6 +54,7 @@
 
 pub mod cmux;
 pub mod herdr;
+pub mod inventory;
 pub mod rmux;
 pub mod tmux;
 pub(crate) mod unix_socket;

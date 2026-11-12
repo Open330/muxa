@@ -38,6 +38,7 @@ pub(crate) async fn start(
     cfg: &FleetConfig,
     local_agents: SharedStore,
     backends: Vec<SharedBackend>,
+    inventory: Vec<SharedBackend>,
     collaboration: Arc<tend::collaboration::CollaborationStore>,
     local_client: tend::ipc::Client,
     daemon_generation: u64,
@@ -72,6 +73,7 @@ pub(crate) async fn start(
             local: LocalManagerInput {
                 agents: local_agents,
                 backends,
+                inventory,
                 collaboration,
                 client: local_client,
                 mailbox_changes,
@@ -128,6 +130,7 @@ struct ManagerInput {
 struct LocalManagerInput {
     agents: SharedStore,
     backends: Vec<SharedBackend>,
+    inventory: Vec<SharedBackend>,
     collaboration: Arc<tend::collaboration::CollaborationStore>,
     client: tend::ipc::Client,
     transitions: broadcast::Receiver<tend::Transition>,
@@ -161,6 +164,7 @@ async fn run_manager(input: ManagerInput) {
             store: Arc::clone(&store),
             agents: local.agents,
             backends: local.backends,
+            inventory: local.inventory,
             collaboration: local.collaboration,
             client: local.client,
             commands: local_rx,
@@ -300,6 +304,9 @@ struct LocalTask {
     store: Arc<FleetStore>,
     agents: SharedStore,
     backends: Vec<SharedBackend>,
+    /// The same backends behind the daemon's shared pane inventory, for the
+    /// periodic snapshot only. An explicit refresh lists fresh.
+    inventory: Vec<SharedBackend>,
     /// The daemon's store, for the pane input guard and drain check every
     /// prompt delivery goes through.
     collaboration: Arc<tend::collaboration::CollaborationStore>,
@@ -324,7 +331,7 @@ impl LocalTask {
         loop {
             tokio::select! {
                 _ = self.shutdown.recv() => break,
-                _ = refresh.tick() => self.refresh().await,
+                _ = refresh.tick() => self.refresh_from(&self.inventory).await,
                 mailbox = self.mailbox_changes.changed(), if mailbox_open => {
                     if mailbox.is_ok() {
                         let revision = *self.mailbox_changes.borrow_and_update();
@@ -382,8 +389,12 @@ impl LocalTask {
     }
 
     async fn refresh(&self) {
+        self.refresh_from(&self.backends).await;
+    }
+
+    async fn refresh_from(&self, backends: &[SharedBackend]) {
         let snapshot =
-            collect_local_snapshot(&self.agents, &self.backends, Arc::clone(&self.revision)).await;
+            collect_local_snapshot(&self.agents, backends, Arc::clone(&self.revision)).await;
         let observed = snapshot.observed_at;
         let identity_error = self.identity_error.clone();
         let current = self.store.host_snapshot(LOCAL_HOST_ALIAS).await;
@@ -2368,6 +2379,7 @@ mod tests {
             transitions: agents.subscribe(),
             agents,
             backends: Vec::new(),
+            inventory: Vec::new(),
             collaboration: tend::collaboration::CollaborationStore::in_memory(
                 tend::collaboration::CollaborationOptions::default(),
             ),
