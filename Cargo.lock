@@ -3844,6 +3844,7 @@ dependencies = [
  "dirs",
  "futures",
  "http-body-util",
+ "libc",
  "nix 0.29.0",
  "notify-rust",
  "openidconnect",

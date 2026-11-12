@@ -190,8 +190,8 @@ pub struct SwapOutcome {
     /// Where the resumed conversation id came from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id_source: Option<SessionIdSource>,
-    /// The `TEND_LAUNCH_ID` the relaunched agent was started with, once a
-    /// relaunch was attempted. Its hooks carry it back.
+    /// The `TEND_SWAP_LAUNCH_ID` this swap's relaunch exports, set once it
+    /// reaches the point of relaunching (absent on Windows).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch_id: Option<String>,
     /// Whether the running process itself was read to be on that

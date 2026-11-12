@@ -17,9 +17,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[swap] relaunch = "respawn"` relaunches a swapped agent by respawning
   its pane through the login shell (a shell is left after the agent exits)
   instead of typing the line into the pane's shell. The default stays
-  `"type"`. Every relaunch now exports a fresh `TEND_LAUNCH_ID`, reported as
-  the outcome's `launch_id`; a relaunched process whose environment names
-  another launch gets no follow-up or draft.
+  `"type"`. A shell running anything besides the agent is still typed
+  into. Every relaunch now exports a fresh `TEND_SWAP_LAUNCH_ID`, reported
+  as the outcome's `launch_id`; a relaunched process whose environment names
+  another one gets no follow-up or draft.
 
 ### Changed
 

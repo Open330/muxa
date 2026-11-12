@@ -1913,10 +1913,17 @@ fn swap_one(
     };
     // A pane with its shell is respawned too when `[swap] relaunch =
     // "respawn"` asks for it, wherever a direct pane may be.
+    // Only a shell that runs nothing but the agent: `respawn-pane -k` ends
+    // the shell's other jobs too, which typing leaves running.
     let respawn_shell_pane = !direct
         && request.allow_direct_respawn
         && request.relaunch == tend::swap_api::RelaunchMode::Respawn
-        && !cfg!(windows);
+        && !cfg!(windows)
+        && shell_runs_only(
+            &pane_processes(pane.pane_pid),
+            pane.pane_pid,
+            launch.top_pid,
+        );
     // The relaunch runs through the user's login shell, the one checked and
     // the one respawned with.
     if direct || respawn_shell_pane {
@@ -2538,7 +2545,9 @@ struct Target {
     /// The pane has its shell but is respawned anyway (`[swap] relaunch =
     /// "respawn"`), with a login shell left after the agent exits.
     respawn_shell_pane: bool,
-    /// The `TEND_LAUNCH_ID` the relaunch exports, where it can.
+    /// The `TEND_SWAP_LAUNCH_ID` the relaunch exports, where it can. Not
+    /// `TEND_LAUNCH_ID`: the relaunch resumes a session that already has a
+    /// launch claim, and is no `tend launch` with a receipt of its own.
     launch_id: Option<String>,
     /// Where a respawned agent starts.
     cwd: String,
@@ -2565,19 +2574,31 @@ impl Target {
     }
 }
 
+/// Whether the pane's shell `pane_pid` runs nothing but `top` (the agent, or
+/// the wrapper that leads to it). A listing without `top` in it cannot rule
+/// other jobs out.
+fn shell_runs_only(processes: &[ProcessInfo], pane_pid: u32, top: u32) -> bool {
+    let children: Vec<u32> = processes
+        .iter()
+        .filter(|process| process.parent_pid == pane_pid && process.pid != pane_pid)
+        .map(|process| process.pid)
+        .collect();
+    children == [top]
+}
+
 /// A fresh launch id for one relaunch. Not on Windows, whose relaunch runs
 /// through PowerShell without `env`.
 fn new_launch_id() -> Option<String> {
     cfg!(unix).then(|| uuid::Uuid::new_v4().to_string())
 }
 
-/// `command` with `TEND_LAUNCH_ID` exported to it through `env`, which
+/// `command` with `TEND_SWAP_LAUNCH_ID` exported to it through `env`, which
 /// every POSIX shell (fish and nushell too) runs as a program.
 fn with_launch_id(command: &str, launch_id: Option<&str>) -> String {
     match launch_id {
         Some(id) => format!(
             "env {} {command}",
-            tend::shell::Dialect::Posix.word(&format!("TEND_LAUNCH_ID={id}"))
+            tend::shell::Dialect::Posix.word(&format!("TEND_SWAP_LAUNCH_ID={id}"))
         ),
         None => command.to_owned(),
     }
@@ -2651,7 +2672,7 @@ fn execute(
         }
         .into());
     }
-    if target.direct {
+    if target.respawns() {
         // Running again: the pane may close with its agent as before.
         runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
@@ -3390,24 +3411,24 @@ fn stop_agent(
     draft: Option<&str>,
     answered: &mut Vec<&'static str>,
 ) -> Result<(), Refusal> {
-    if target.direct && !runner.set_remain_on_exit(Purpose::KeepPaneOpen, true) {
-        return Err(
-            "the pane runs the agent directly and cannot be kept open to relaunch it".into(),
-        );
+    // A respawned pane, shell or not, is kept open until the relaunch is
+    // known to run, so a failed start leaves its output there.
+    if target.respawns() && !runner.set_remain_on_exit(Purpose::KeepPaneOpen, true) {
+        return Err("the pane cannot be kept open to respawn it with the relaunch".into());
     }
     let stopped = if target.kind == AgentKind::ClaudeCode {
         exit_claude(runner, target, launch, follow_up, draft, answered)
     } else {
         stop(runner, launch).map_err(Refusal::from)
     };
-    if stopped.is_err() && target.direct {
+    if stopped.is_err() && target.respawns() {
         runner.set_remain_on_exit(Purpose::ReleasePane, false);
     }
     stopped
 }
 
 /// The line a respawned pane runs: `command` through the login `shell`,
-/// with `TEND_LAUNCH_ID` in its environment, and — for a pane that had its
+/// with `TEND_SWAP_LAUNCH_ID` in its environment, and — for a pane that had its
 /// shell — that shell again once the agent exits.
 fn respawn_line(shell: &str, command: &str, launch_id: Option<&str>, keep_shell: bool) -> String {
     let dialect = tend::shell::Dialect::native();
@@ -3418,7 +3439,7 @@ fn respawn_line(shell: &str, command: &str, launch_id: Option<&str>, keep_shell:
     };
     let mut words: Vec<String> = Vec::new();
     if let Some(id) = launch_id {
-        words.extend(["env".to_owned(), format!("TEND_LAUNCH_ID={id}")]);
+        words.extend(["env".to_owned(), format!("TEND_SWAP_LAUNCH_ID={id}")]);
     }
     words.extend([shell.to_owned(), "-lic".to_owned(), script]);
     dialect.command_line(&words)
@@ -3428,7 +3449,7 @@ fn respawn_line(shell: &str, command: &str, launch_id: Option<&str>, keep_shell:
 /// it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LaunchMark {
-    /// It carries this `TEND_LAUNCH_ID`.
+    /// It carries this `TEND_SWAP_LAUNCH_ID`.
     Carries(String),
     /// Its environment was read and has none.
     Absent,
@@ -3960,16 +3981,35 @@ mod tests {
         assert!(skipped.is_empty());
     }
 
+    /// A shell with another job besides the agent is not respawned: that
+    /// would end the job.
+    #[test]
+    fn only_a_shell_running_just_the_agent_is_respawned() {
+        let process = |pid: u32, parent_pid: u32| ProcessInfo {
+            pid,
+            parent_pid,
+            depth: 1,
+            comm: String::new(),
+            cmdline: String::new(),
+        };
+        assert!(shell_runs_only(&[process(10, 1), process(11, 10)], 1, 10));
+        // A background job next to the agent.
+        assert!(!shell_runs_only(&[process(10, 1), process(12, 1)], 1, 10));
+        // A listing that does not show the agent rules nothing out.
+        assert!(!shell_runs_only(&[], 1, 10));
+        assert!(!shell_runs_only(&[process(12, 1)], 1, 10));
+    }
+
     #[test]
     fn a_relaunch_line_exports_its_launch_id() {
         assert_eq!(
             with_launch_id("aas e b --resume S", Some("L")),
-            "env TEND_LAUNCH_ID=L aas e b --resume S"
+            "env TEND_SWAP_LAUNCH_ID=L aas e b --resume S"
         );
         assert_eq!(with_launch_id("aas e b", None), "aas e b");
         assert_eq!(
             respawn_line("/bin/zsh", "aas e b", Some("L"), false),
-            "env TEND_LAUNCH_ID=L /bin/zsh -lic 'aas e b'"
+            "env TEND_SWAP_LAUNCH_ID=L /bin/zsh -lic 'aas e b'"
         );
         assert_eq!(
             respawn_line("/bin/zsh", "aas e b", None, true),
@@ -4023,7 +4063,7 @@ mod tests {
             LaunchMark::Absent
         );
         assert_eq!(
-            io::launch_id_of(&env(&[("HOME", "/h"), ("TEND_LAUNCH_ID", "L")])),
+            io::launch_id_of(&env(&[("HOME", "/h"), ("TEND_SWAP_LAUNCH_ID", "L")])),
             LaunchMark::Carries("L".into())
         );
     }

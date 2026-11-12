@@ -1678,16 +1678,40 @@ fn a_shell_pane_is_respawned_with_its_launch_id_when_asked() {
     assert_eq!(
         io.sent(),
         [
+            "remain true",
             "signal TERM [10]",
             "respawn",
+            "remain false",
             "prompt \"continue\"",
             "text \"\\r\"",
         ]
     );
     assert_eq!(
         io.respawned.borrow().as_slice(),
-        ["env TEND_LAUNCH_ID=L-1 /bin/sh -lic 'RELAUNCH; exec /bin/sh -l'"]
+        ["env TEND_SWAP_LAUNCH_ID=L-1 /bin/sh -lic 'RELAUNCH; exec /bin/sh -l'"]
     );
+}
+
+/// A respawned shell pane whose agent never starts is kept open with its
+/// output, like a direct one.
+#[test]
+fn a_shell_pane_whose_respawn_fails_is_kept_open() {
+    let io = FakeIo::new(
+        CODEX_IDLE,
+        Box::new(|io: &FakeIo, line: &str| {
+            if line.starts_with("signal TERM") {
+                io.kill(AGENT);
+            }
+        }),
+    );
+    let mut target = target(AgentKind::Codex, false, false);
+    target.respawn_shell_pane = true;
+    let (result, _, _) = run(&io, &target, &launch(), None, &mut NoObserver);
+    let Err(Refusal::Failed(note)) = result else {
+        panic!("an agent that never appears must fail");
+    };
+    assert!(note.contains("kept open"), "{note}");
+    assert_eq!(io.sent(), ["remain true", "signal TERM [10]", "respawn"]);
 }
 
 /// The typed relaunch exports the launch id through `env`.
@@ -1700,7 +1724,7 @@ fn a_typed_relaunch_carries_its_launch_id() {
                 io.kill(AGENT);
             }
             if line == "text \"\\r\""
-                && io.previous().as_deref() == Some("text \"env TEND_LAUNCH_ID=L-2 RELAUNCH\"")
+                && io.previous().as_deref() == Some("text \"env TEND_SWAP_LAUNCH_ID=L-2 RELAUNCH\"")
             {
                 io.agent_appears_in(Duration::from_secs(1));
             }
@@ -1714,7 +1738,7 @@ fn a_typed_relaunch_carries_its_launch_id() {
         io.sent(),
         [
             "signal TERM [10]",
-            "text \"env TEND_LAUNCH_ID=L-2 RELAUNCH\"",
+            "text \"env TEND_SWAP_LAUNCH_ID=L-2 RELAUNCH\"",
             "text \"\\r\"",
         ]
     );

@@ -56,7 +56,7 @@ pub(super) trait SwapIo: Clock {
     fn file_digest(&self, path: &str) -> Option<String>;
     /// The working directory process `pid` is actually in.
     fn process_cwd(&self, pid: u32) -> Option<ShellCwd>;
-    /// The `TEND_LAUNCH_ID` in process `pid`'s own environment.
+    /// The `TEND_SWAP_LAUNCH_ID` in process `pid`'s own environment.
     fn launch_id_of(&self, pid: u32) -> super::LaunchMark {
         let _ = pid;
         super::LaunchMark::Unreadable
@@ -200,7 +200,7 @@ pub(super) fn launch_id_of(environ: &[(String, String)]) -> super::LaunchMark {
     }
     environ
         .iter()
-        .find(|(key, _)| key == "TEND_LAUNCH_ID")
+        .find(|(key, _)| key == "TEND_SWAP_LAUNCH_ID")
         .map_or(super::LaunchMark::Absent, |(_, value)| {
             super::LaunchMark::Carries(value.clone())
         })

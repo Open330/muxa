@@ -296,10 +296,11 @@ relaunch = "type"        # type | respawn: how a pane that still has its shell i
 
 ### How the agent is started again
 
-Every relaunch carries a fresh launch id: the relaunched agent runs with
-`TEND_LAUNCH_ID=<uuid>` in its environment (`env TEND_LAUNCH_ID=… <line>`),
-its hooks carry it back to tendd like any tend launch, and the report shows
-it (`launch_id`). After the relaunch, the process bound to the conversation
+Every relaunch carries a fresh swap launch id: the relaunched agent runs
+with `TEND_SWAP_LAUNCH_ID=<uuid>` in its environment
+(`env TEND_SWAP_LAUNCH_ID=… <line>`), and the report shows it (`launch_id`).
+It is not `TEND_LAUNCH_ID`: the relaunch resumes a session that already has
+its launch claim, and has no launch receipt of its own. After the relaunch, the process bound to the conversation
 by its arguments is also read for that id: one that names *another* launch is
 some other start of the same conversation, so no follow-up or draft is typed
 into it. A process whose environment has no launch id, or cannot be read,
@@ -309,8 +310,12 @@ With `relaunch = "type"` (the default) the line is typed into the pane's
 shell, as before. With `relaunch = "respawn"` nothing is typed: tend respawns
 the pane itself (`respawn-pane -k`, same pane id, in the agent's directory)
 through your login shell with the relaunch, and that shell again once the
-agent exits, so the pane still has a shell afterwards. The shell's history
-and unexported variables of the old shell do not carry over. A pane that runs
+agent exits, so the pane still has a shell afterwards. The pane is kept open
+(`remain-on-exit`) until the relaunched agent is seen, so a failed start
+leaves its output. Only a shell that runs nothing but the agent is
+respawned: one with another job (a `sleep &`, a dev server) is typed into
+instead, since a respawn would end it. The old shell's history and
+unexported variables do not carry over. A pane that runs
 its agent directly is always respawned. Requests the daemon relays from
 elsewhere keep typing (`respawn` applies where a direct pane may be respawned:
 `tend swap` itself and the daemon's own automation).
