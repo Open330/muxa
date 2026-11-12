@@ -918,6 +918,10 @@ pub struct CollaborationRequest {
     /// readable question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decision: Option<crate::decision::Decision>,
+    /// The sender's slot, and where its reply wake followed it
+    /// (`sender_follow.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender_follow: Option<sender_follow::SenderFollowState>,
 }
 
 impl CollaborationRequest {
@@ -3093,13 +3097,28 @@ impl CollaborationStore {
         self.create_with_provenance(from, to, input, None).await
     }
 
-    #[allow(clippy::too_many_lines)] // request construction and persistence rollback form one transaction
     pub async fn create_with_provenance(
         &self,
         from: Participant,
         to: Participant,
         input: NewRequest,
         provenance: Option<CollaborationProvenance>,
+    ) -> Result<CollaborationRequest, CollaborationError> {
+        self.create_with_sender_work(from, to, input, provenance, None)
+            .await
+    }
+
+    /// [`Self::create_with_provenance`], also recording the durable Work
+    /// (`workspace_id`, `work_id`) of the sender's pane, so a reply wake can
+    /// follow the sender's slot into a recreated window of the same Work.
+    #[allow(clippy::too_many_lines)] // request construction and persistence rollback form one transaction
+    pub async fn create_with_sender_work(
+        &self,
+        from: Participant,
+        to: Participant,
+        input: NewRequest,
+        provenance: Option<CollaborationProvenance>,
+        sender_work: Option<(String, String)>,
     ) -> Result<CollaborationRequest, CollaborationError> {
         self.ensure_enabled()?;
         let body = input.body.trim().to_string();
@@ -3235,7 +3254,14 @@ impl CollaborationStore {
                 ));
             }
         }
+        let sender_follow = sender_follow::sender_slot(&from, sender_work).map(|slot| {
+            sender_follow::SenderFollowState {
+                slot: Some(slot),
+                ..Default::default()
+            }
+        });
         let request = CollaborationRequest {
+            sender_follow,
             attempt: input.task_contract.as_ref().map(TaskContract::attempt),
             task_contract: input.task_contract,
             supersedes_request_id: input.supersedes_request_id,
@@ -9989,6 +10015,7 @@ mod purpose_promote_tests;
 mod recipient_slot_tests;
 mod recovery;
 mod retirement;
+pub mod sender_follow;
 pub use retirement::{RequestRetirement, RETIRE_CAPABILITY};
 #[cfg(test)]
 mod reply_wake_tests;

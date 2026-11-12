@@ -733,7 +733,20 @@ back to a short inbox recovery notice instead of injecting the body twice. A
 manual inbox read supersedes either recovery path.
 
 Reading a terminal result through `tend_wait_reply` acknowledges it and
-prevents a later reply wake. Room context reports incoming unread requests and
+prevents a later reply wake.
+
+A reply wake follows its sender the way an undelivered request follows its
+recipient. Each request records the sender's alias and first role in its
+window (`sender_follow.slot`). If the sender's session is gone when the reply
+comes back (no longer in the pane scan and no live registry row, for example
+after it exited or the provider replaced the session), and exactly one other
+live session holds that alias, or failing that that role, the request's
+sender is rebound to it (`sender_follow.rebound_from` keeps the old session).
+That session is then woken at its next idle turn and may read the reply. A
+session that merely reuses the sender's pane inherits nothing. With no single
+successor, two minutes after the reply Tend opens one human item that names
+the request; the wake stays owed in case the session returns, and the item is
+withdrawn once the reply is read or delivered. Room context reports incoming unread requests and
 unacknowledged replies separately. `tend_list_messages` is non-claiming history;
 the sender may cancel only while a request remains `queued`, before the
 recipient has claimed it.

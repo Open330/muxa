@@ -1542,12 +1542,14 @@ pub(super) async fn handle(
                             let anchor = if origin.console { &recipient } else { &sender };
                             topology.stamp_request_metadata(anchor, &mut request);
                             let provenance = collaboration_actor.provenance(&origin);
+                            let sender_work = topology.durable_work(&sender);
                             match collaboration
-                                .create_with_provenance(
+                                .create_with_sender_work(
                                     sender,
                                     recipient,
                                     *request,
                                     Some(provenance),
+                                    sender_work,
                                 )
                                 .await
                             {

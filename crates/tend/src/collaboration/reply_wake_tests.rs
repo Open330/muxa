@@ -489,6 +489,7 @@ fn legacy_request(pair: &Pair) -> CollaborationRequest {
     CollaborationRequest {
         decision: None,
         turn_offer: None,
+        sender_follow: None,
         user_authorized: false,
         task_contract: None,
         attempt: None,
