@@ -931,6 +931,7 @@ pub(super) async fn handle(
                     text,
                     submit,
                     origin,
+                    force,
                 } => {
                     kind = "send_prompt";
                     match resolve_backend(&backends, &pane) {
@@ -963,7 +964,20 @@ pub(super) async fn handle(
                                 &agents,
                                 socket.as_deref(),
                                 session_id.as_deref(),
-                            ) {
+                            )
+                            .and_then(|socket| {
+                                // Judged under the input guard, on the
+                                // resolved endpoint, before anything is typed.
+                                if force == Some(false) {
+                                    crate::prompt_delivery::idle_gate(
+                                        &pane,
+                                        &agents,
+                                        socket.as_deref(),
+                                        session_id.as_deref(),
+                                    )?;
+                                }
+                                Ok(socket)
+                            }) {
                                 Err(error) => Response::err(error),
                                 Ok(socket) => {
                                     use crate::prompt_delivery::{

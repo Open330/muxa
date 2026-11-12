@@ -212,7 +212,7 @@ it:
 | `tend_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `tend_swap_account` | `action?`, `job?`, `request_key?`, `detach?`, `wait_secs?`, `host?`, `targets?`, `all?`, `provider?`, `to?`, `force?`, `continue_text?`, `continue_when?`, `continue_evidence?`, `no_continue?`, `dry_run?` | Move Claude/Codex agents onto another account and resume them in place, here or on a control-mode Fleet host (`tend swap`; see [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md)). `action` is `swap` (default), `retry` (an ended job's safely retryable targets), `status` or `cancel` (with `job`). A start or retry runs under a request key — pass your own `request_key` to hold it before anything is sent, or use the one returned — and every result, errors included, carries it with a `recovery` call (`action=status`); the tool never sends a swap twice. `status`/`cancel` return the job as it is now unless `wait_secs` (≤120) asks to wait. |
 | `tend_manage_tmux` | `action`, `pane?`, `workspace?`, `work?`, `confirm?` | List/show/close managed workspaces and work; interrupt/terminate an agent pane. |
-| `tend_send_prompt` | `pane`, `text`, `submit?`, `socket?`, `session_id?` | Inject `text` into a pane; `submit` (default `true`) presses Enter to commit the line. |
+| `tend_send_prompt` | `pane`, `text`, `submit?`, `socket?`, `session_id?`, `force?` | Inject `text` into an idle agent's pane; `submit` (default `true`) presses Enter to commit the line. `force=true` types into a non-idle or untracked pane. |
 | `tend_capture_pane` | `pane` | Capture the visible contents of a pane. |
 | `tend_fleet_status` | `selector?`, `full?` | Cached host health, capabilities, counts and up to 20 active agent identities per host. `full=true` returns the complete hierarchy. |
 | `tend_fleet_capture` | `host`, `pane` | Capture one exact pane on a named Fleet host. |
@@ -236,7 +236,19 @@ it:
 | `tend_withdraw_reply_wake` | `request_ids` | Stop being woken for replies to your own requests you gave up on or replaced. Work, replies and `tend_wait_reply` results are unchanged. |
 | `tend_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
 
-`tend_send_prompt` is refused (surfaced to the model as a tool error) when the
+`tend_send_prompt` types only into an agent whose registry state is `idle`.
+A working agent, one at a permission prompt or choice menu, and a pane with no
+tracked agent are refused with `target_not_idle` and nothing is typed: text
+typed into a running turn merges with it, and a prompt or menu takes it as an
+answer. Pass `force=true` only when a person explicitly asked for that
+keystroke. Work another agent should pick up belongs in the mailbox
+(`tend_send_message` / `tend_call_peer`), which waits for the recipient to be
+idle by itself. The gate is the daemon capability `send_prompt_state_gate_v1`;
+an older daemon ignores `force` and types as before. Operator clients (`tend
+watch`, Tend for Mac) omit the field and keep typing on a person's action;
+`tend_fleet_send_prompt` is not gated yet.
+
+`tend_send_prompt` is also refused (surfaced to the model as a tool error) when the
 pane's backend can't inject keystrokes — e.g. zellij, where CLI `write-chars`
 only reaches the focused pane. tmux, cmux, rmux, and herdr support targeted input.
 
@@ -542,8 +554,11 @@ tend_status
 **Unblock an agent that's waiting on input**
 
 ```
-tend_send_prompt { "pane": "%12", "text": "yes, proceed", "submit": true }
+tend_send_prompt { "pane": "%12", "text": "yes, proceed", "submit": true, "force": true }
 ```
+
+Only on a person's explicit instruction: a waiting agent is not idle, so this
+needs `force`.
 
 **Hand off a task and wait for it to land**
 

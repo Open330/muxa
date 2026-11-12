@@ -33,6 +33,23 @@ impl Client {
         socket: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<SendPromptOutcome, RuntimeError> {
+        self.send_prompt_with_gate(pane, text, submit, socket, session_id, None)
+            .await
+    }
+
+    /// [`Self::send_prompt_scoped`] with the `send_prompt_state_gate_v1`
+    /// choice: `Some(false)` asks the daemon to refuse unless the target is
+    /// Idle (`target_not_idle`), `Some(true)` forces. A daemon without the
+    /// capability ignores the field and types as before.
+    pub async fn send_prompt_with_gate(
+        &self,
+        pane: &str,
+        text: &str,
+        submit: bool,
+        socket: Option<&str>,
+        session_id: Option<&str>,
+        force: Option<bool>,
+    ) -> Result<SendPromptOutcome, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "socket": socket,
@@ -41,6 +58,7 @@ impl Client {
             "pane": pane,
             "text": text,
             "submit": submit,
+            "force": force,
         });
         let resp = self.call_checked(&req).await?;
         Ok(SendPromptOutcome {

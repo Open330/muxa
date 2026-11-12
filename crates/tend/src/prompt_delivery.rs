@@ -65,6 +65,52 @@ pub type PaneInputGuard = Arc<OwnedMutexGuard<()>>;
 
 /// Refusal text when a worker drain has paused the pane's input. Every
 /// prompt path reports it the same way.
+/// Advertised by a daemon whose `send_prompt` honours `force`
+/// ([`idle_gate`]).
+pub const SEND_PROMPT_STATE_GATE_CAPABILITY: &str = "send_prompt_state_gate_v1";
+/// Refusal prefix of [`idle_gate`]. Nothing was typed.
+pub const TARGET_NOT_IDLE: &str = "target_not_idle";
+
+/// Refuse a gated `send_prompt` unless every live agent row on the target
+/// pane (narrowed to `socket` and `session_id` when given) is Idle.
+///
+/// A working agent would get the text queued into, or merged with, its
+/// current turn; a permission prompt or choice menu would take it as an
+/// answer. Typing is only safe into an Idle composer, so anything else, an
+/// untracked pane included, is refused unless the caller forces it. The
+/// state is the hook-driven registry state, not the screen.
+pub fn idle_gate(
+    pane: &str,
+    agents: &[Agent],
+    socket: Option<&str>,
+    session_id: Option<&str>,
+) -> Result<(), String> {
+    let live: Vec<_> = agents
+        .iter()
+        .filter(|agent| agent.state != crate::AgentState::Stopped)
+        .filter(|agent| socket.is_none_or(|socket| agent.tmux_socket.as_deref() == Some(socket)))
+        .filter(|agent| session_id.is_none_or(|session| agent.session_id == session))
+        .collect();
+    if live.is_empty() {
+        return Err(format!(
+            "{TARGET_NOT_IDLE}: no tracked agent on pane {pane}, so its state is unknown; \
+             nothing was sent. Pass force=true to type into it anyway."
+        ));
+    }
+    if let Some(busy) = live
+        .iter()
+        .find(|agent| agent.state != crate::AgentState::Idle)
+    {
+        return Err(format!(
+            "{TARGET_NOT_IDLE}: the agent on pane {pane} is {}; nothing was sent. Wait for it to \
+             be idle (tend_wait_for_change), use the mailbox (tend_send_message) for work it \
+             should pick up, or pass force=true to type into it anyway.",
+            busy.state
+        ));
+    }
+    Ok(())
+}
+
 pub const WORKER_DRAINING: &str = "worker_draining: managed terminal input is paused";
 
 /// Take the pane's input guard. Waiting here is what keeps a second prompt

@@ -541,6 +541,85 @@ async fn send_prompt_injects_text_then_submit_cr() {
     handle.await.unwrap();
 }
 
+/// `send_prompt_state_gate_v1`: a gated send types only into an Idle agent;
+/// a busy one, one at a choice menu, or an untracked pane is refused with
+/// nothing typed. Forced and legacy (no `force`) sends type as before.
+#[tokio::test]
+async fn send_prompt_state_gate_refuses_a_busy_target_unless_forced() {
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("tend-send-gate.sock");
+    let store = Store::shared();
+    let id = AgentId {
+        kind: AgentKind::Codex,
+        session_id: "busy".into(),
+        surface: None,
+        pane: Some("%1".into()),
+        tmux_socket: Some("default".into()),
+        cwd: None,
+    };
+    store
+        .apply(&AgentEvent::PromptSubmitted {
+            id: id.clone(),
+            prompt: "long task".into(),
+            at: OffsetDateTime::now_utc(),
+        })
+        .await;
+    let (backend, sends) = RecordingBackend::new(HostKind::Tmux, true);
+    let (tx, handle) = serve(&sock, store.clone(), vec![backend]).await;
+    let client = Client::new(sock);
+    let send = |pane: &'static str, force: Option<bool>| {
+        let client = client.clone();
+        async move {
+            client
+                .send_prompt_with_gate(pane, "hi", true, Some("default"), None, force)
+                .await
+        }
+    };
+
+    // The stall/merge this prevents: text typed into a working turn.
+    let refused = send("%1", Some(false)).await.unwrap_err().to_string();
+    assert!(refused.contains("target_not_idle"), "{refused}");
+    assert!(refused.contains("working"), "{refused}");
+    let untracked = send("%7", Some(false)).await.unwrap_err().to_string();
+    assert!(untracked.contains("target_not_idle"), "{untracked}");
+    assert!(
+        sends.lock().unwrap().is_empty(),
+        "nothing typed when refused"
+    );
+
+    store
+        .apply(&AgentEvent::TurnStopped {
+            id: id.clone(),
+            response: None,
+            recap: None,
+            ai_title: None,
+            idle_confirmed: false,
+            at: OffsetDateTime::now_utc(),
+        })
+        .await;
+    send("%1", Some(false))
+        .await
+        .expect("an idle target is typed into");
+    assert_eq!(sends.lock().unwrap().len(), 2);
+    sends.lock().unwrap().clear();
+
+    store
+        .apply(&AgentEvent::PromptSubmitted {
+            id,
+            prompt: "again".into(),
+            at: OffsetDateTime::now_utc(),
+        })
+        .await;
+    send("%1", Some(true)).await.expect("forced");
+    send("%1", None)
+        .await
+        .expect("legacy callers are unchanged");
+    assert_eq!(sends.lock().unwrap().len(), 4);
+
+    tx.send(()).unwrap();
+    handle.await.unwrap();
+}
+
 #[tokio::test]
 async fn send_prompt_confirms_hook_without_repeating_body_or_enter() {
     let dir = tempdir().unwrap();

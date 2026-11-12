@@ -763,7 +763,8 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
             "description": "Inject text into an agent's pane as keystrokes. With \
                 submit=true (the default), a trailing Enter commits the line so the \
                 agent starts working. This is a control action against another \
-                agent — use deliberately.",
+                agent — use deliberately. Refused (target_not_idle) unless the \
+                target is idle; for work, prefer the mailbox.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -772,6 +773,7 @@ fn tool_definitions(config: &tend::config::Config) -> Vec<Value> {
                     "session_id": { "type": "string", "description": "Only send if this agent session still occupies the target pane and endpoint." },
                     "text": { "type": "string", "description": "Literal text to type into the pane." },
                     "submit": { "type": "boolean", "description": "Press Enter after the text. Default true." },
+                    "force": { "type": "boolean", "description": "Type even when the target is not idle (busy, at a prompt or menu, or untracked). Default false; only on a person's explicit instruction." },
                 },
                 "required": ["pane", "text"],
                 "additionalProperties": false,
@@ -1561,6 +1563,12 @@ async fn call_tool_inner(
             }
             // Submit defaults to true — the common case is "prompt and run".
             let submit = args.get("submit").and_then(Value::as_bool).unwrap_or(true);
+            if args.get("force").is_some_and(|value| !value.is_boolean()) {
+                return Ok(error_result("send_prompt `force` must be a boolean"));
+            }
+            // Agents are gated: only an Idle target is typed into unless the
+            // caller explicitly forces it.
+            let force = args.get("force").and_then(Value::as_bool).unwrap_or(false);
             Ok(
                 match send_prompt_with_local_cmux(
                     client,
@@ -1569,6 +1577,7 @@ async fn call_tool_inner(
                     submit,
                     args.get("socket").and_then(Value::as_str),
                     args.get("session_id").and_then(Value::as_str),
+                    force,
                 )
                 .await
                 {
@@ -4826,6 +4835,7 @@ async fn send_prompt_with_local_cmux(
     submit: bool,
     socket: Option<&str>,
     session_id: Option<&str>,
+    force: bool,
 ) -> std::result::Result<SendPromptOutcome, String> {
     let inside_cmux = std::env::var("CMUX_SURFACE_ID").is_ok_and(|id| !id.trim().is_empty());
     if tend::backend::pane_id_host_kind(pane) == Some(tend::HostKind::Cmux)
@@ -4834,12 +4844,19 @@ async fn send_prompt_with_local_cmux(
         && session_id.is_none()
     {
         let env_endpoint = tend::backend::cmux::endpoint_from_env();
-        let mut endpoints = client
+        let on_pane: Vec<_> = client
             .snapshot()
             .await
             .unwrap_or_default()
             .into_iter()
             .filter(|agent| agent.pane.as_deref() == Some(pane))
+            .collect();
+        // This path types without the daemon, so it applies the same gate.
+        if !force {
+            tend::prompt_delivery::idle_gate(pane, &on_pane, None, None)?;
+        }
+        let mut endpoints = on_pane
+            .into_iter()
             .filter_map(|agent| agent.tmux_socket)
             .collect::<Vec<_>>();
         endpoints.sort();
@@ -4887,7 +4904,14 @@ async fn send_prompt_with_local_cmux(
         .map(ToOwned::to_owned)
         .or_else(|| prompt_socket_from_env(pane));
     client
-        .send_prompt_scoped(pane, prompt, submit, caller_socket.as_deref(), session_id)
+        .send_prompt_with_gate(
+            pane,
+            prompt,
+            submit,
+            caller_socket.as_deref(),
+            session_id,
+            Some(force),
+        )
         .await
         .map_err(|error| error.to_string())
 }
@@ -8422,14 +8446,14 @@ mod tests {
             .unwrap()
             .contains("confirm=true"));
 
-        // tend_send_prompt routes through to the backend with a submit CR.
+        // Forced, it routes through to the backend with a submit CR.
         let send = dispatch(
             &client,
             &json!({
                 "jsonrpc": "2.0", "id": 4, "method": "tools/call",
                 "params": {
                     "name": "tend_send_prompt",
-                    "arguments": { "pane": "%1", "text": "hello", "submit": true, "socket": "default" },
+                    "arguments": { "pane": "%1", "text": "hello", "submit": true, "socket": "default", "force": true },
                 },
             }),
         )
@@ -8458,6 +8482,33 @@ mod tests {
             cap["result"]["content"][0]["text"].as_str().unwrap(),
             "screen of %1",
         );
+
+        tx.send(()).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_prompt_is_gated_on_an_idle_target_unless_forced() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("mcp-gated-send.sock");
+        let (client, sends, tx, handle) = spawn_daemon(&sock).await;
+        // tend_send_prompt is gated: an untracked (state unknown) pane is
+        // refused before anything is typed.
+        let gated = dispatch(
+            &client,
+            &json!({
+                "jsonrpc": "2.0", "id": 40, "method": "tools/call",
+                "params": {
+                    "name": "tend_send_prompt",
+                    "arguments": { "pane": "%1", "text": "hello", "submit": true, "socket": "default" },
+                },
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(gated["result"]["isError"], true, "{gated}");
+        assert!(gated.to_string().contains("target_not_idle"), "{gated}");
+        assert!(sends.lock().unwrap().is_empty());
 
         tx.send(()).unwrap();
         handle.await.unwrap();
@@ -8547,7 +8598,8 @@ mod tests {
         let (tx, rx) = broadcast::channel(1);
         let handle = tokio::spawn(async move { server.run(rx).await.unwrap() });
         wait_for_socket(&sock).await;
-        let mut arguments = json!({"pane":pane, "text":"hello", "submit":false});
+        // Forced: this checks endpoint selection, not the idle gate.
+        let mut arguments = json!({"pane":pane, "text":"hello", "submit":false, "force":true});
         if case == "explicit" {
             arguments["socket"] = json!("/tmp/explicit/amux");
         }

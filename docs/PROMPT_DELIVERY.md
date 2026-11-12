@@ -19,6 +19,14 @@ transport retain a 250ms best-effort fallback; that delay cannot prove submissio
 The fallback and host selection live in `crates/tend/src/backend/mod.rs`, rather
 than an automation rule or a user-editable timing setting.
 
+An IPC `send_prompt` request may carry `force` (`send_prompt_state_gate_v1`).
+`force: false` refuses with `target_not_idle`, before anything is typed and
+under the pane input guard, unless every live agent row on the resolved
+endpoint (and `session_id`, when given) is `idle`; an untracked pane is
+refused too. `force: true` and an absent field (older operator clients) type
+as before. MCP `tend_send_prompt` sends `force: false` unless the caller
+passes `force=true`.
+
 The IPC `send_prompt` response distinguishes:
 
 - `sent`: the host accepted prompt text; do not resend it.
