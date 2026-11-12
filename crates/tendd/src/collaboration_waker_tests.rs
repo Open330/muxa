@@ -607,6 +607,7 @@ async fn collaboration_waker_delivers_to_a_launched_pane_before_it_registers() {
             pending,
             NewRequest {
                 decision: None,
+                allow_path_overlap: false,
                 user_authorized: false,
                 task_contract: None,
                 supersedes_request_id: None,
