@@ -130,13 +130,32 @@ pub fn under_shared_codex_app_server(start_pid: u32) -> bool {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let table = crate::process_snapshot::read_current_process_table();
+        // Ask for each ancestor alone instead of reading the whole process
+        // table: hooks and IPC calls run this once per event, and a full
+        // `ps -axo args` pass costs tens of milliseconds on a busy Mac.
+        // The walk asks each pid for its parent and then its argv; one
+        // query answers both.
+        let seen = std::cell::RefCell::new(std::collections::HashMap::new());
+        let lookup = |pid: u32| {
+            seen.borrow_mut()
+                .entry(pid)
+                .or_insert_with(|| crate::process_snapshot::parent_and_cmdline(pid))
+                .clone()
+        };
         shared_codex_app_server_in_ancestry(
             start_pid,
-            |pid| table.get(pid).map(|p| p.parent_pid),
-            |pid| table.get(pid).map(|p| p.cmdline.clone()),
+            |pid| lookup(pid).and_then(|(parent, _)| parent),
+            |pid| lookup(pid).map(|(_, cmdline)| cmdline),
         )
     }
+}
+
+/// [`under_shared_codex_app_server`] for this process, computed once. A hook
+/// process asks twice (launch claim and pane resolution); its ancestry
+/// cannot change in between.
+pub fn self_under_shared_codex_app_server() -> bool {
+    static ANSWER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ANSWER.get_or_init(|| under_shared_codex_app_server(std::process::id()))
 }
 
 fn shared_codex_app_server_in_ancestry<P, A>(start_pid: u32, parent_of: P, argv_of: A) -> bool

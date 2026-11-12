@@ -264,6 +264,53 @@ pub fn process_argv(pid: u32) -> Option<Vec<String>> {
     })
 }
 
+/// One process's parent pid and its argv joined with spaces (its image name
+/// when the command line is unreadable), or `None` once it has exited. A
+/// single-process query: no `ps` spawn and no whole-table read, for
+/// callers that walk a short ancestor chain.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn parent_and_cmdline(pid: u32) -> Option<(Option<u32>, String)> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_cmd(UpdateKind::Always),
+    );
+    let process = system.process(pid)?;
+    let argv: Vec<String> = process
+        .cmd()
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect();
+    let cmdline = if argv.is_empty() {
+        process.name().to_string_lossy().into_owned()
+    } else {
+        argv.join(" ")
+    };
+    Some((process.parent().map(sysinfo::Pid::as_u32), cmdline))
+}
+
+/// The executable path of `pid` (its image name when the path is
+/// unreadable), or `None` once it has exited. No process is spawned.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn process_executable(pid: u32) -> Option<String> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+    let pid = Pid::from_u32(pid);
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        ProcessesToUpdate::Some(&[pid]),
+        true,
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
+    );
+    let process = system.process(pid)?;
+    Some(process.exe().map_or_else(
+        || process.name().to_string_lossy().into_owned(),
+        |path| path.to_string_lossy().into_owned(),
+    ))
+}
+
 /// When `pid` started, in Unix seconds, or `None` once it has exited.
 #[cfg(windows)]
 pub fn start_time(pid: u32) -> Option<u64> {

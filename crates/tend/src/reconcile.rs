@@ -614,17 +614,32 @@ impl<L: LivenessSource> Reconciler<L> {
         // from its map), so it must see every complete host's panes at once, and
         // `update_workloads` then governs only rows on a complete host (see
         // `Store::update_workloads`), leaving an incomplete host's rows as-is.
-        let workload_started = Instant::now();
-        let workloads = if complete_kinds.is_empty() {
-            std::collections::HashMap::new()
-        } else {
+        // One process-table read serves both the workload scan and the
+        // Codex resume scan below; on macOS each read is a full `ps` pass.
+        let scan_workloads = !complete_kinds.is_empty();
+        let scan_codex = !union_panes.is_empty();
+        // The workload timing keeps covering the table read plus the
+        // workload walk, as it did when the workload scan read its own.
+        let (workloads, codex_scan, workload_scan_us) = if scan_workloads || scan_codex {
             let panes = union_panes.clone();
-            tokio::task::spawn_blocking(move || process_tree::scan_pane_workloads(&panes))
-                .await
-                .unwrap_or_default()
+            tokio::task::spawn_blocking(move || {
+                let started = Instant::now();
+                let source = process_tree::ProcessSource::capture();
+                let workloads = if scan_workloads {
+                    process_tree::scan_pane_workloads_with(&panes, &source)
+                } else {
+                    std::collections::HashMap::new()
+                };
+                let elapsed = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                let codex =
+                    scan_codex.then(|| process_tree::scan_codex_panes_with(&panes, &source));
+                (workloads, codex, elapsed)
+            })
+            .await
+            .unwrap_or_default()
+        } else {
+            (std::collections::HashMap::new(), None, 0)
         };
-        let workload_scan_us =
-            u64::try_from(workload_started.elapsed().as_micros()).unwrap_or(u64::MAX);
         // Detached app-server hooks can retain another terminal's pane, and a
         // multiplexer restart renumbers every pane while `tend reload`
         // relaunches agents by resume id. Explicit resume ids plus live process
@@ -634,11 +649,7 @@ impl<L: LivenessSource> Reconciler<L> {
         // Not gated on an existing real row: right after a multiplexer
         // restart the resumed agents may have none, and adopting them is the
         // point.
-        if !union_panes.is_empty() {
-            let panes = union_panes.clone();
-            let scan = tokio::task::spawn_blocking(move || process_tree::scan_codex_panes(&panes))
-                .await
-                .unwrap_or_default();
+        if let Some(scan) = codex_scan {
             self.store.rebind_resumes(&scan.resume_bindings).await;
             let adopted = self
                 .store

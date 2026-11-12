@@ -203,17 +203,32 @@ struct RecapProbe {
     captured: Instant,
     settle: bool,
 }
+/// How often a hook-owned pane that is still Working is re-captured. Its
+/// hooks bump activity on every tool call, so activity alone would capture
+/// it every tick; a Working Codex recap or a missed Claude `Stop` can wait
+/// this long.
+const WORKING_PROBE_INTERVAL: Duration = Duration::from_secs(15);
+/// Fallback re-capture of an unchanged, not-Working hook-owned pane.
+const IDLE_PROBE_INTERVAL: Duration = Duration::from_secs(30);
+
 impl RecapProbe {
+    /// The owner became another session or changed state.
+    fn transitioned(&self, owner: &tend::Agent) -> bool {
+        self.session != owner.session_id || self.state != owner.state
+    }
+    /// Anything that warrants a fresh look: a transition, or — outside
+    /// Working, where activity churns with every tool call — new activity.
     fn changed(&self, owner: &tend::Agent) -> bool {
-        self.session != owner.session_id
-            || self.state != owner.state
-            || self.activity != owner.last_activity_at
+        self.transitioned(owner)
+            || (owner.state != AgentState::Working && self.activity != owner.last_activity_at)
     }
     fn due(&self, owner: &tend::Agent, now: Instant) -> bool {
-        owner.state == AgentState::Working
-            || self.changed(owner)
-            || self.settle
-            || now.duration_since(self.captured) >= Duration::from_secs(30)
+        let interval = if owner.state == AgentState::Working {
+            WORKING_PROBE_INTERVAL
+        } else {
+            IDLE_PROBE_INTERVAL
+        };
+        self.changed(owner) || self.settle || now.duration_since(self.captured) >= interval
     }
 }
 

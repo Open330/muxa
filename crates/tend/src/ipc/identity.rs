@@ -344,40 +344,42 @@ pub(super) fn process_environment_pane(_pid: u32) -> Option<String> {
     None
 }
 
+/// The caller's executable and client kind, read once when the connection
+/// is accepted, so the provenance names the process that connected even if
+/// it exits (and its pid is reused) during a long request.
 pub(super) fn process_identity(pid: u32) -> (Option<String>, CollaborationClientKind) {
     #[cfg(target_os = "linux")]
+    let kind = std::fs::read(format!("/proc/{pid}/cmdline")).ok().map_or(
+        CollaborationClientKind::Unknown,
+        |bytes| {
+            bytes
+                .split(|byte| *byte == 0)
+                .filter_map(|arg| std::str::from_utf8(arg).ok())
+                .find_map(client_kind_from_arg)
+                .unwrap_or(CollaborationClientKind::Unknown)
+        },
+    );
+    #[cfg(not(target_os = "linux"))]
+    let kind = CollaborationClientKind::Unknown;
+    (process_executable(pid), kind)
+}
+
+/// The executable of `pid`, without spawning a process: `/proc/<pid>/exe` on
+/// Linux, a single-process query elsewhere. On macOS this used to be a
+/// `ps -o comm=` spawn on every IPC connection.
+pub(super) fn process_executable(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
     {
-        let executable = std::fs::read_link(format!("/proc/{pid}/exe"))
+        std::fs::read_link(format!("/proc/{pid}/exe"))
             .ok()
             .and_then(|path| {
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
-            });
-        let kind = std::fs::read(format!("/proc/{pid}/cmdline")).ok().map_or(
-            CollaborationClientKind::Unknown,
-            |bytes| {
-                bytes
-                    .split(|byte| *byte == 0)
-                    .filter_map(|arg| std::str::from_utf8(arg).ok())
-                    .find_map(client_kind_from_arg)
-                    .unwrap_or(CollaborationClientKind::Unknown)
-            },
-        );
-        (executable, kind)
+            })
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let output = std::process::Command::new("ps")
-            .args(["-o", "comm=", "-p", &pid.to_string()])
-            .output()
-            .ok();
-        let executable = output.and_then(|output| {
-            output
-                .status
-                .success()
-                .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
-        });
-        (executable, CollaborationClientKind::Unknown)
+        crate::process_snapshot::process_executable(pid)
     }
 }
 
