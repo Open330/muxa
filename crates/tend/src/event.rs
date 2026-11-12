@@ -281,10 +281,11 @@ pub enum AgentEvent {
         /// recap, so it's the practical steady-state summary.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         ai_title: Option<String>,
-        /// Marker set ONLY by the SYNTHETIC detection producers (screen
-        /// inference / the herdr bridge) when they have OBSERVED the pane go
-        /// idle — the approval prompt / spinner is gone from the screen. A real
-        /// hook's turn-boundary `Stop` always leaves this `false`.
+        /// Positive evidence the agent is now idle: set by the SYNTHETIC
+        /// detection producers (screen inference / the herdr bridge) when
+        /// they have OBSERVED the pane go idle, and by the opencode adapter,
+        /// whose `session.idle` is the provider's explicit idle status.
+        /// Claude/Codex turn-boundary `Stop` hooks leave this `false`.
         ///
         /// It exists to distinguish "a stop that is positive evidence the agent
         /// is now idle" (set it) from "a bare response-less stop that proves

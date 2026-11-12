@@ -62,6 +62,8 @@ pub fn classify_command(cmd: &str) -> Option<AgentKind> {
         // accepted too: the installer's shell shim can be renamed, and the
         // cost of the extra arm is one string compare.
         "agy" | "antigravity" => Some(AgentKind::Antigravity),
+        // opencode ships a compiled binary named for itself.
+        "opencode" => Some(AgentKind::Opencode),
         _ => None,
     }
 }
@@ -457,13 +459,14 @@ pub struct DiscoveryReport {
     pub claude_code: usize,
     pub codex: usize,
     pub antigravity: usize,
+    pub opencode: usize,
     pub skipped_known: usize,
     pub failed: usize,
 }
 
 impl DiscoveryReport {
     pub fn total_ingested(&self) -> usize {
-        self.claude_code + self.codex + self.antigravity
+        self.claude_code + self.codex + self.antigravity + self.opencode
     }
 
     fn bump(&mut self, kind: AgentKind) {
@@ -471,8 +474,9 @@ impl DiscoveryReport {
             AgentKind::ClaudeCode => self.claude_code += 1,
             AgentKind::Codex => self.codex += 1,
             AgentKind::Antigravity => self.antigravity += 1,
-            // We never synthesize for Opencode/Unknown/Task today.
-            AgentKind::Opencode | AgentKind::Unknown | AgentKind::Task => {}
+            AgentKind::Opencode => self.opencode += 1,
+            // We never synthesize for Unknown/Task.
+            AgentKind::Unknown | AgentKind::Task => {}
         }
     }
 }
@@ -574,6 +578,7 @@ mod tests {
         // The Gemini CLI is no longer a supported agent.
         assert_eq!(classify_command("gemini"), None);
         assert_eq!(classify_command("gemini-cli"), None);
+        assert_eq!(classify_command("opencode"), Some(AgentKind::Opencode));
         assert_eq!(classify_command("agy"), Some(AgentKind::Antigravity));
         assert_eq!(
             classify_command("antigravity"),
@@ -1026,10 +1031,12 @@ mod tests {
         r.bump(AgentKind::ClaudeCode);
         r.bump(AgentKind::Codex);
         r.bump(AgentKind::Antigravity);
-        // Bumps for kinds we don't synthesize must not move the total.
         r.bump(AgentKind::Opencode);
+        // Bumps for kinds we don't synthesize must not move the total.
         r.bump(AgentKind::Unknown);
-        assert_eq!(r.total_ingested(), 4);
+        r.bump(AgentKind::Task);
+        assert_eq!(r.total_ingested(), 5);
+        assert_eq!(r.opencode, 1);
         assert_eq!(r.claude_code, 2);
         assert_eq!(r.codex, 1);
         assert_eq!(r.antigravity, 1);

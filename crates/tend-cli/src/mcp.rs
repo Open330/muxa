@@ -4346,14 +4346,15 @@ async fn spawn_peer(
 ///
 /// That requires the pane to carry a registry row, which comes from discovery
 /// classifying the process (`discovery::classify_command`) or from a bundled
-/// screen manifest. Opencode has neither today — `DiscoveryReport::bump`
-/// documents that it is never synthesized — so a request queued against an
-/// unregistered opencode pane would wait forever.
+/// screen manifest. Every launchable provider has one: opencode is
+/// classified by its process name, like the rest.
 fn has_pane_readiness_signal(program: crate::agent_launch::AgentProgram) -> bool {
     use crate::agent_launch::AgentProgram;
     match program {
-        AgentProgram::Claude | AgentProgram::Codex | AgentProgram::Antigravity => true,
-        AgentProgram::Opencode => false,
+        AgentProgram::Claude
+        | AgentProgram::Codex
+        | AgentProgram::Antigravity
+        | AgentProgram::Opencode => true,
     }
 }
 
@@ -8186,8 +8187,8 @@ mod tests {
     }
 
     /// Queueing against a pane only makes sense when tend can tell that the
-    /// pane became ready. Opencode has neither a discovery classification nor
-    /// a screen manifest, so its spawns must keep failing fast.
+    /// pane became ready: discovery classifies every launchable provider,
+    /// opencode included, by its process name.
     #[test]
     fn legacy_workers_are_probed_instead_of_assuming_registration_is_ready() {
         assert!(legacy_worker_needs_probe(Ok("launch\tclaude\t"), true));
@@ -8237,7 +8238,7 @@ mod tests {
         assert!(has_pane_readiness_signal(AgentProgram::Codex));
         assert!(has_pane_readiness_signal(AgentProgram::Claude));
         assert!(has_pane_readiness_signal(AgentProgram::Antigravity));
-        assert!(!has_pane_readiness_signal(AgentProgram::Opencode));
+        assert!(has_pane_readiness_signal(AgentProgram::Opencode));
     }
 
     #[cfg(unix)]

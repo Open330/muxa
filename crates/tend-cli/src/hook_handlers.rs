@@ -1,6 +1,6 @@
 use super::{
     claude, run_hook, tmux_work, watch, AgentKind, AntigravityAdapter, ClaudeAdapter, Client,
-    CodexAdapter, Context, HookCmd, OpencodeAdapter, Read, Result, Stdio, Write,
+    CodexAdapter, Context, HookCmd, Read, Result, Stdio, Write,
 };
 
 /// Hook commands are invoked on the agent's critical path (every prompt,
@@ -211,9 +211,23 @@ pub(super) async fn handle_hook(client: &Client, cmd: HookCmd) -> Result<()> {
             }
         }
         HookCmd::Opencode { event } => {
-            let ev = run_hook::<OpencodeAdapter, _>(&event, &mut std::io::stdin())?;
-            best_effort_ingest(client, &ev).await;
-            best_effort_default_alias(client, &ev).await;
+            // Fail-open like agy: the plugin awaits this process from inside
+            // opencode, so a payload tend cannot use is logged and dropped
+            // rather than surfaced as a failing command.
+            let mut text = String::new();
+            std::io::stdin().read_to_string(&mut text)?;
+            let place = tend::adapters::hook::HookPlace::resolve(AgentKind::Opencode);
+            let parsed = tend::adapters::opencode::check_flag(&event)
+                .and_then(|()| tend::adapters::opencode::parse(&text, place.pane.clone()));
+            match parsed {
+                Ok(Some(ev)) => {
+                    let ev = place.bind(ev);
+                    best_effort_ingest(client, &ev).await;
+                    best_effort_default_alias(client, &ev).await;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::debug!(error = %e, event, "opencode hook payload ignored"),
+            }
         }
     }
     Ok(())

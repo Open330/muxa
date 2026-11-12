@@ -45,6 +45,7 @@ pub(super) async fn cmd_sync(client: &Client) -> Result<()> {
         report.claude_code += found.claude_code;
         report.codex += found.codex;
         report.antigravity += found.antigravity;
+        report.opencode += found.opencode;
         report.skipped_known += found.skipped_known;
         report.failed += found.failed;
     }
@@ -60,6 +61,9 @@ pub(super) async fn cmd_sync(client: &Client) -> Result<()> {
     }
     if report.antigravity > 0 {
         parts.push(format!("{} antigravity", report.antigravity));
+    }
+    if report.opencode > 0 {
+        parts.push(format!("{} opencode", report.opencode));
     }
 
     let total = report.total_ingested();

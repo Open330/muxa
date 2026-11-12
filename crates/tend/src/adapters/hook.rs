@@ -79,45 +79,75 @@ where
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
     let input: A::Input = serde_json::from_str(&buf)?;
-    let surface = tend_session_env();
-    let headless = std::env::var_os(crate::ask::ASK_ENV_MARKER).is_some();
-    let pane = if headless
-        || surface.is_some()
-        || (A::KIND == AgentKind::Codex
-            && crate::adapters::proc_ancestry::self_under_shared_codex_app_server())
-    {
-        // A shared Codex app-server fires hooks for every attached thread
-        // with the env of whichever pane started it, so its pane names a
-        // stranger. Report paneless and let the reconciler bind the session
-        // from its `codex resume <id>` process or an unambiguous cwd.
-        None
-    } else {
-        host_pane_env()
-            .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()))
-    };
-    let mut ev = A::normalize(event, input, pane);
-    if let Some(surface) = surface.filter(|_| !headless) {
-        ev.id_mut().surface = Some(surface);
-    } else if ev
-        .id()
-        .pane
-        .as_deref()
-        .and_then(crate::backend::pane_id_host_kind)
-        == Some(crate::backend::HostKind::Cmux)
-    {
-        ev.id_mut().surface = cmux_surface_env();
+    let place = HookPlace::resolve(A::KIND);
+    let ev = A::normalize(event, input, place.pane.clone());
+    Ok(place.bind(ev))
+}
+
+/// Where a hook process runs: its pane, a tend-owned surface, or a headless
+/// Ask. Shared by [`run_hook`] and adapters whose payload may carry no state
+/// change, which build their event (or none) from [`Self::pane`] and then
+/// [`Self::bind`] it.
+#[derive(Debug, Clone)]
+pub struct HookPlace {
+    /// The pane to stamp on the event, when the hook runs in one.
+    pub pane: Option<String>,
+    surface: Option<SurfaceRef>,
+    headless: bool,
+}
+
+impl HookPlace {
+    #[must_use]
+    pub fn resolve(kind: AgentKind) -> Self {
+        let surface = tend_session_env();
+        let headless = std::env::var_os(crate::ask::ASK_ENV_MARKER).is_some();
+        let pane = if headless
+            || surface.is_some()
+            || (kind == AgentKind::Codex
+                && crate::adapters::proc_ancestry::self_under_shared_codex_app_server())
+        {
+            // A shared Codex app-server fires hooks for every attached thread
+            // with the env of whichever pane started it, so its pane names a
+            // stranger. Report paneless and let the reconciler bind the session
+            // from its `codex resume <id>` process or an unambiguous cwd.
+            None
+        } else {
+            host_pane_env()
+                .or_else(|| resolve_pane_via_ancestry(crate::backend::default_backend().as_ref()))
+        };
+        Self {
+            pane,
+            surface,
+            headless,
+        }
     }
-    // Endpoint metadata belongs to an external pane binding. A tend-owned PTY
-    // may inherit CMUX/TMUX variables from the terminal that requested it, but
-    // that outer socket does not own the daemon-created PTY surface.
-    //
-    // The endpoint is read for the host that *owns the pane id*, never for
-    // whichever host `detect_host_env` would pick on its own. A tmux pane
-    // inside a cmux tab inherits `CMUX_*` variables, and an independent
-    // detection used to stamp `%N` rows with the cmux socket — a pairing no
-    // pane scan can match, which made the agent invisible to collaboration.
-    stamp_pane_endpoint(&mut ev);
-    Ok(ev)
+
+    /// Attach the surface and endpoint this hook process can see to `ev`.
+    #[must_use]
+    pub fn bind(self, mut ev: AgentEvent) -> AgentEvent {
+        if let Some(surface) = self.surface.filter(|_| !self.headless) {
+            ev.id_mut().surface = Some(surface);
+        } else if ev
+            .id()
+            .pane
+            .as_deref()
+            .and_then(crate::backend::pane_id_host_kind)
+            == Some(crate::backend::HostKind::Cmux)
+        {
+            ev.id_mut().surface = cmux_surface_env();
+        }
+        // Endpoint metadata belongs to an external pane binding. A tend-owned PTY
+        // may inherit CMUX/TMUX variables from the terminal that requested it, but
+        // that outer socket does not own the daemon-created PTY surface.
+        //
+        // The endpoint is read for the host that *owns the pane id*, never for
+        // whichever host `detect_host_env` would pick on its own. A tmux pane
+        // inside a cmux tab inherits `CMUX_*` variables, and an independent
+        // detection used to stamp `%N` rows with the cmux socket — a pairing no
+        // pane scan can match, which made the agent invisible to collaboration.
+        stamp_pane_endpoint(&mut ev);
+        ev
+    }
 }
 
 /// Record the control endpoint of the server that owns `ev`'s pane, read from

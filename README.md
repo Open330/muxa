@@ -90,7 +90,7 @@ organizes the agents Tend launches into Work. Attention never requires Runtime.
 See [Direction](docs/DIRECTION.md).
 
 - **Keeps your setup.** Reads agent state from Claude Code, Codex, and
-  Antigravity CLI (`agy`) hooks, with screen detection
+  Antigravity CLI (`agy`) hooks and opencode plugin events, with screen detection
   for hook-less agents, and maps it onto the tmux panes you already have.
   You can keep launching agents yourself, or use tend's optional agent and
   pipeline launchers. tmux, [rmux](https://rmux.io),
@@ -457,7 +457,7 @@ systems, so tend gets exact state transitions:
 | Claude Code | Supported | `~/.claude/settings.json` |
 | OpenAI Codex | Supported | `~/.codex/config.toml` |
 | Google Antigravity CLI (`agy`) | Supported | `~/.gemini/config/hooks.json` — [details](docs/ANTIGRAVITY.md) |
-| opencode | Launch supported; hook integration planned | [tracking issue](https://github.com/Open330/tend/issues/14) |
+| opencode | Supported (plugin events) | `~/.config/opencode/plugins/tend.ts` — [details](docs/OPENCODE.md) |
 
 The Google Gemini CLI is no longer supported; use its successor, the
 Antigravity CLI. `tend init` removes the hooks an older tend wrote into

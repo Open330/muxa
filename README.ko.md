@@ -391,7 +391,7 @@ case-sensitive이고 `*`, `?` wildcard를 지원합니다. 예:
 | Claude Code | 지원 | `~/.claude/settings.json` |
 | OpenAI Codex | 지원 | `~/.codex/config.toml` |
 | Google Antigravity CLI (`agy`) | 지원 | `~/.gemini/config/hooks.json` — [문서](docs/ANTIGRAVITY.md) |
-| opencode | 실행 지원, hook 통합 예정 | [tracking issue](https://github.com/Open330/tend/issues/14) |
+| opencode | 지원 (plugin event) | `~/.config/opencode/plugins/tend.ts` — [문서](docs/OPENCODE.md) |
 
 Google Gemini CLI는 더 이상 지원하지 않습니다. 후속인 Antigravity CLI를 쓰세요.
 `tend init`이 예전 tend가 `~/.gemini/settings.json`에 쓴 hook을 지우고,
