@@ -1,0 +1,36 @@
+[package]
+name = "tend-work"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "tend Work model, agent launch and `work up`, shared by the CLI and the daemon"
+
+[features]
+# The optional account module; see tend-cli's `aas` feature.
+aas = ["dep:tend-aas"]
+
+[dependencies]
+tend = { workspace = true }
+tend-aas = { workspace = true, optional = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+# Interactive confirmations the `tend work` runners still ask.
+cliclack = "0.3"
+# The terminal size a native session starts at.
+crossterm = "0.29"
+dirs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true

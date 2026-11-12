@@ -188,6 +188,9 @@ against glibc 2.17 (a native build would require the build host's glibc).
   check the CLI side with `cargo check -p tend-cli` (no feature)
 - `crates/tendd` — daemon binary
 - `crates/tend-cli` — CLI binary and terminal UIs
+- `crates/tend-work` — the Work model, agent launch and `work up`: managed
+  tmux workspaces/windows/panes, pipelines and reconcile. A library so the
+  daemon can call it without running the `tend` binary
 - `apps/tend-macos` — native Mac app and bundled runtime build scripts
 - `site` — GitHub Pages entry point using the dashboard's shared landing assets
 

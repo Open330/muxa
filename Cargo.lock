@@ -3921,6 +3921,7 @@ dependencies = [
  "tempfile",
  "tend",
  "tend-aas",
+ "tend-work",
  "time",
  "tokio",
  "tokio-tungstenite",
@@ -3931,6 +3932,26 @@ dependencies = [
  "unicode-width",
  "uuid",
  "which",
+]
+
+[[package]]
+name = "tend-work"
+version = "0.10.15"
+dependencies = [
+ "anyhow",
+ "clap",
+ "cliclack",
+ "crossterm",
+ "dirs",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tend",
+ "tend-aas",
+ "time",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

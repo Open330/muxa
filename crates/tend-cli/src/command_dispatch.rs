@@ -51,7 +51,7 @@ pub(super) async fn main() -> Result<()> {
         ..
     } = &cmd
     {
-        return mux_control::watch_popup(caller_client.as_deref(), caller_pane.as_deref());
+        return crate::mux_popup::watch_popup(caller_client.as_deref(), caller_pane.as_deref());
     }
     if matches!(cmd, Cmd::Start) && !start::interactive() {
         start::print_help();

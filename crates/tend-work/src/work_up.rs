@@ -163,95 +163,37 @@ pub struct UpResult {
 /// (every tmux call) stay separable: the CLI runs them back to back,
 /// while the MCP server hands the blocking half to `spawn_blocking`
 /// rather than stalling its reactor on a subprocess.
-pub(crate) struct Resolved {
-    work: String,
-    workspace: String,
-    pipeline: String,
-    cwd: PathBuf,
-    ticket: Option<Ticket>,
-    worktree: Option<WorktreePlan>,
-    created_worktree: bool,
+pub struct Resolved {
+    pub work: String,
+    pub workspace: String,
+    pub pipeline: String,
+    pub cwd: PathBuf,
+    pub ticket: Option<Ticket>,
+    pub worktree: Option<WorktreePlan>,
+    pub created_worktree: bool,
     /// Whether the caller actually asked for this directory, as opposed to
     /// happening to stand in it. Only a pinned cwd is asserted against the
     /// work window's recorded one.
-    cwd_pinned: bool,
-    layout: Option<String>,
-    request: Option<ComposedRequest>,
+    pub cwd_pinned: bool,
+    pub layout: Option<String>,
+    pub request: Option<ComposedRequest>,
     /// `request` is a planned Work's saved task ([`UpArgs::body_from_plan`]).
-    request_from_plan: bool,
-    desired: Vec<DesiredAgent>,
+    pub request_from_plan: bool,
+    pub desired: Vec<DesiredAgent>,
     /// Existing daemon-owned state, used by dry-run rendering. A real apply
     /// performs an atomic register and reads the returned Run instead.
-    durable_run: Option<tend::pipeline_run::PipelineRun>,
+    pub durable_run: Option<tend::pipeline_run::PipelineRun>,
     /// pane → what the daemon says that agent is doing. Empty when the
     /// daemon is unreachable, which degrades to the old pane-only view
     /// rather than failing the launch.
-    states: HashMap<String, AgentState>,
+    pub states: HashMap<String, AgentState>,
     /// `[agent.<program>].account` for each provider that sets one.
-    accounts: Vec<tend::swap_api::AccountRoute>,
-}
-
-pub async fn run(
-    mut args: UpArgs,
-    config: &Config,
-    config_path: Option<PathBuf>,
-    client: Option<&tend::ipc::Client>,
-) -> Result<()> {
-    // A planned Work starts from its plan: arguments left out come from
-    // the backlog record, and starting it moves it to in progress.
-    let planned = match client {
-        Some(client) if crate::work_backlog::backlog_supported(client).await => {
-            let records = client
-                .work_backlog(None)
-                .await
-                .context("reading the Work backlog")?;
-            crate::work_backlog::find_record(&records, &args.work, args.workspace.as_deref(), true)?
-                .cloned()
-        }
-        _ => None,
-    };
-    if let Some(record) = &planned {
-        crate::work_backlog::fill_from_plan(&mut args, record);
-    }
-    let json = args.json;
-    let dry_run = args.dry_run;
-    let show_prompts = args.show_prompts;
-    let resolved = resolve_or_onboard(&args, config, config_path, client).await?;
-    if show_prompts {
-        print_prompts(&resolved.desired);
-    }
-    let result = if dry_run {
-        apply(resolved, true)?
-    } else {
-        let client = client.ok_or_else(|| {
-            anyhow::anyhow!("tend work up requires tendd for durable pipeline state")
-        })?;
-        let result = apply_durable(resolved, client).await?;
-        if let Some(record) = planned
-            .as_ref()
-            .filter(|record| record.metadata.stage == tend::work::WorkStage::Queued)
-        {
-            let started = tend::work::WorkEdit {
-                stage: Some(tend::work::WorkStage::InProgress),
-                ..tend::work::WorkEdit::default()
-            };
-            if let Err(error) = client.work_edit(&record.identity, &started).await {
-                eprintln!("note: started, but the backlog record stays queued: {error}");
-            }
-        }
-        result
-    };
-    if json {
-        println!("{}", serde_json::to_string_pretty(&result)?);
-    } else {
-        print_result(&result);
-    }
-    Ok(())
+    pub accounts: Vec<tend::swap_api::AccountRoute>,
 }
 
 /// The blocking half: read the window, diff it against the pipeline, and
 /// act on the difference.
-pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
+pub fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
     if !dry_run {
         bail!("non-dry pipeline reconciliation must use tendd's durable Run state");
     }
@@ -285,10 +227,7 @@ pub(crate) fn apply(resolved: Resolved, dry_run: bool) -> Result<UpResult> {
 /// aliases, then report the physical launch/re-prompt result. Completion and
 /// dependency gating are never inferred from the live pane set here.
 #[allow(clippy::too_many_lines)] // register, claim, physical apply, and report are one reconciliation flow
-pub(crate) async fn apply_durable(
-    resolved: Resolved,
-    client: &tend::ipc::Client,
-) -> Result<UpResult> {
+pub async fn apply_durable(resolved: Resolved, client: &tend::ipc::Client) -> Result<UpResult> {
     let existing = existing_agents(&resolved.work, &resolved.workspace, &resolved.states)?;
     let work_info = crate::tmux_work::find_work_in(&resolved.work, Some(&resolved.workspace))?;
     let observed = existing
@@ -477,7 +416,7 @@ pub(crate) async fn apply_durable(
 /// This is used immediately after a completion event and by tendd's restart
 /// safety-net worker, so neither path needs to resolve the ticket again.
 #[allow(clippy::too_many_lines)] // claim, launch, and durable report form one reconciliation pass
-pub(crate) async fn reconcile_run(
+pub async fn reconcile_run(
     client: &tend::ipc::Client,
     config: &Config,
     identity: &WorkIdentity,
@@ -670,7 +609,7 @@ fn finish(
 
 // ---------------------------------------------------------------- resolve
 
-pub(crate) async fn resolve(
+pub async fn resolve(
     args: &UpArgs,
     config: &Config,
     client: Option<&tend::ipc::Client>,
@@ -930,7 +869,7 @@ fn run_prepare(command: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn expand_tilde(value: &str) -> String {
+pub fn expand_tilde(value: &str) -> String {
     let Some(rest) = value.strip_prefix('~') else {
         return value.to_string();
     };
@@ -1100,7 +1039,7 @@ fn ensure_worktree(
         (Some(plan.branch.clone()), None)
     };
     // A receipt that cannot be written only costs cleanup its proof.
-    let receipt = crate::worktrees_cmd::begin_receipt(&plan.repo, &plan.path, branch, base, origin);
+    let receipt = crate::worktrees::begin_receipt(&plan.repo, &plan.path, branch, base, origin);
     if let Err(error) = git(&plan.repo, &args) {
         if let Some(receipt) = receipt {
             let _ = receipt.fail();
@@ -1214,62 +1153,6 @@ fn existing_agents(
                 .collect()
         })
         .unwrap_or_default())
-}
-
-/// Resolve, and on a first run with nothing configured, offer to set it
-/// up rather than failing with instructions the operator then has to
-/// follow by hand.
-///
-/// "No route matches" is only an error for someone who already has a
-/// config. For everyone else it is the first thing tend ever says to
-/// them, and answering it with TOML syntax is how a feature goes unused.
-/// `tend work init` is already the conversation that fixes it, so this
-/// hands over to it and retries once with the config it wrote.
-async fn resolve_or_onboard(
-    args: &UpArgs,
-    config: &Config,
-    config_path: Option<PathBuf>,
-    client: Option<&tend::ipc::Client>,
-) -> Result<Resolved> {
-    let error = match resolve(args, config, client).await {
-        Ok(resolved) => return Ok(resolved),
-        Err(error) => error,
-    };
-    let unconfigured = error
-        .downcast_ref::<pipeline::PipelineError>()
-        .is_some_and(|error| matches!(error, pipeline::PipelineError::NoRoute(_)));
-    if !unconfigured || !offer_onboarding()? {
-        return Err(error);
-    }
-    crate::work_init::run(
-        crate::work_init::InitArgs {
-            describe: None,
-            agent: None,
-            dry_run: false,
-            yes: false,
-        },
-        config,
-        config_path.clone(),
-    )
-    .await?;
-    // Reload: the file just changed underneath the config this process
-    // started with.
-    let config = Config::load_or_default(config_path.as_deref())
-        .context("re-reading the config tend work init just wrote")?;
-    resolve(args, &config, client).await
-}
-
-/// Ask whether to set tend up now. Non-interactive callers keep the plain
-/// error — a script wants a failure it can read, not a prompt.
-fn offer_onboarding() -> Result<bool> {
-    use std::io::IsTerminal;
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return Ok(false);
-    }
-    println!("tend has no work pipeline configured yet.");
-    Ok(cliclack::confirm("Set one up now?")
-        .initial_value(true)
-        .interact()?)
 }
 
 /// Build the caller's request, asking for one when nothing was supplied.
@@ -1429,7 +1312,7 @@ fn recover_unreported_alias(
 /// Glyphs stay inside Geometric Shapes U+25A0–25CF. The half-filled
 /// circles just past that range fall back to a different font in most
 /// terminals and render at the wrong size.
-fn print_plan_rows(result: &UpResult) {
+pub fn print_plan_rows(result: &UpResult) {
     let nodes = &result.graph;
     let layered = nodes.iter().any(|node| node.depth > 0);
     let mut depth = usize::MAX;
@@ -1475,7 +1358,7 @@ fn print_plan_rows(result: &UpResult) {
 }
 
 /// Glyph, status word, and trailing detail for one alias.
-fn describe(step: &PlanStep, result: &UpResult) -> (char, String, String) {
+pub fn describe(step: &PlanStep, result: &UpResult) -> (char, String, String) {
     match step {
         PlanStep::Launch(agent) => {
             let pane = result
@@ -1753,7 +1636,7 @@ mod done_view_tests {
     }
 }
 
-fn state_label(state: AgentState) -> &'static str {
+pub fn state_label(state: AgentState) -> &'static str {
     match state {
         AgentState::Starting => "starting",
         AgentState::Working => "working",
@@ -1804,7 +1687,7 @@ fn apply_layout(window: &str, layout: &str) -> Result<()> {
 /// the thing worth reviewing before spending a turn on it — a leftover
 /// `{{ticket.title}}` or a role instruction that says the wrong thing is
 /// obvious here and invisible in the plan summary.
-fn print_prompts(desired: &[DesiredAgent]) {
+pub fn print_prompts(desired: &[DesiredAgent]) {
     println!("prompts that would be sent:\n");
     for agent in desired {
         println!(
@@ -1823,7 +1706,7 @@ fn print_prompts(desired: &[DesiredAgent]) {
     }
 }
 
-fn print_result(result: &UpResult) {
+pub fn print_result(result: &UpResult) {
     let verb = if result.dry_run { "would be" } else { "is" };
     println!(
         "work {} {verb} in workspace {} via pipeline {}",
