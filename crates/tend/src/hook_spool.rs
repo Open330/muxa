@@ -11,11 +11,18 @@
 //! Bounds: the live file is rotated to `<file>.1` at [`MAX_SPOOL_BYTES`],
 //! keeping one previous generation, so the spool never exceeds about twice
 //! that. Heartbeats are not spooled: a stale liveness ping has nothing to
-//! replay.
+//! replay. Neither are headless Ask runs, whose ingest carries an Ask
+//! identity the spool does not reproduce.
+//!
+//! Every append, rotation and drain holds an exclusive advisory lock on
+//! `<file>.lock`, so concurrent hooks never lose a line to a rotation and a
+//! drain never unlinks a file a hook is still writing.
 //!
 //! Replay is deterministic and conservative: an event is replayed only when
 //! it is younger than [`MAX_REPLAY_AGE`] and the daemon holds nothing newer
-//! for that session. Everything else is counted as skipped.
+//! for that session. `tendd` replays into its registry before it accepts any
+//! connection, so no live hook can interleave with the replay. Everything
+//! else is counted as skipped.
 
 use crate::event::AgentEvent;
 use serde::{Deserialize, Serialize};
@@ -139,19 +146,41 @@ pub fn rotated_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Whether an event is worth spooling at all.
+/// Whether an event is worth spooling at all. `headless_ask` is whether
+/// the hook runs inside a headless Ask (`TEND_ASK` set).
 #[must_use]
-pub fn spoolable(event: &AgentEvent) -> bool {
-    !matches!(event, AgentEvent::Heartbeat { .. })
+pub fn spoolable(event: &AgentEvent, headless_ask: bool) -> bool {
+    !headless_ask && !matches!(event, AgentEvent::Heartbeat { .. })
+}
+
+fn lock_path(path: &Path) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".lock");
+    PathBuf::from(name)
+}
+
+/// Hold the spool's exclusive lock until the returned file is dropped.
+fn lock(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(false).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(lock_path(path))?;
+    file.lock()?;
+    Ok(file)
 }
 
 /// Append one entry. Best-effort by contract: the caller is a hook on the
 /// agent's critical path, so every failure is swallowed into the return
 /// value and never surfaced to the agent.
 pub fn append(path: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
-    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        std::fs::create_dir_all(parent)?;
-    }
+    let _lock = lock(path)?;
     if std::fs::metadata(path).is_ok_and(|meta| meta.len() >= MAX_SPOOL_BYTES) {
         let previous = rotated_path(path);
         #[cfg(windows)]
@@ -167,7 +196,6 @@ pub fn append(path: &Path, entry: &SpoolEntry) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    // One `write` per line: concurrent hooks append whole lines.
     options.open(path)?.write_all(&line)
 }
 
@@ -191,20 +219,17 @@ pub fn read_all(path: &Path) -> (Vec<SpoolEntry>, usize) {
     (entries, unreadable)
 }
 
-/// Move both generations aside and read them, so hooks appending during a
-/// drain start a fresh spool instead of racing the reader. The moved files
-/// are removed once read.
+/// Read and remove both generations under the spool lock, so no hook can
+/// append in between and lose its line.
 #[must_use]
 pub fn take(path: &Path) -> (Vec<SpoolEntry>, usize) {
-    let mut draining = path.as_os_str().to_os_string();
-    draining.push(".draining");
-    let draining = PathBuf::from(draining);
-    let previous = rotated_path(path);
-    let previous_draining = rotated_path(&draining);
-    let _ = std::fs::rename(&previous, &previous_draining);
-    let _ = std::fs::rename(path, &draining);
-    let taken = read_all(&draining);
-    clear(&draining);
+    let Ok(_lock) = lock(path) else {
+        // Without the lock a hook could write into a file being removed;
+        // leave the spool for the next start.
+        return (Vec::new(), 0);
+    };
+    let taken = read_all(path);
+    clear(path);
     taken
 }
 
@@ -223,7 +248,9 @@ pub struct DrainReport {
     pub replayed: usize,
     /// Older than the replay window, or superseded by newer daemon state.
     pub skipped: usize,
-    /// Replays the daemon refused again.
+    /// Replays the daemon refused again (kept for older reports; an
+    /// in-process replay is not refused).
+    #[serde(default)]
     pub failed: usize,
     pub unreadable: usize,
     /// Entries per failure kind, as the hooks recorded them.
@@ -358,6 +385,34 @@ mod tests {
         assert_eq!(entries[1].event.id().session_id, "b");
         assert!(unreadable >= 1);
         clear(&path);
+        assert!(!path.exists() && !rotated_path(&path).exists());
+    }
+
+    #[test]
+    fn concurrent_appenders_across_rotations_lose_no_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = std::sync::Arc::new(dir.path().join(SPOOL_FILENAME));
+        let now = OffsetDateTime::now_utc();
+        // Large entries so the run crosses the rotation threshold.
+        let mut big = entry("x", now, IngestFailure::Unreachable);
+        big.error = "e".repeat(16 * 1024);
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let path = path.clone();
+                let big = big.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..4 {
+                        append(&path, &big).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        // 32 × ~16 KiB stays under two generations, so nothing was dropped.
+        let (entries, unreadable) = take(&path);
+        assert_eq!((entries.len(), unreadable), (32, 0));
         assert!(!path.exists() && !rotated_path(&path).exists());
     }
 

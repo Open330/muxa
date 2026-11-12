@@ -334,6 +334,10 @@ async fn run() -> Result<()> {
     // spawns so the first save isn't a no-op overwrite of the file we
     // just read.
     hydrate_state(&cfg, &store).await;
+    // Hook events that failed to ingest while this daemon was down or
+    // incompatible. Replayed into the registry now, before any producer task
+    // or the IPC server runs, so no live event can interleave with it.
+    drain_hook_spool(&store).await;
     store
         .reconcile_native_surfaces(|id| sessions.session_liveness(id))
         .await;
@@ -621,12 +625,6 @@ async fn run() -> Result<()> {
     // between server start and subscription.
     let pipeline_reconciler_handle =
         pipeline_reconciler::spawn(pipeline_runs, socket.clone(), &shutdown_tx);
-    // Hook events that failed to ingest while this daemon was down or
-    // incompatible: replay what is still current through the normal ingest
-    // path, and leave a report for `tend doctor`.
-    if listener_ready {
-        spawn_hook_spool_drain(socket.clone());
-    }
 
     // Self-heal: if a tmux server is already running, inject our socket
     // path into its environment so that every pane — including any that
@@ -4520,66 +4518,72 @@ fn should_heal_tmux_socket_env(
 /// can drive both branches of the `discovery.enabled` flag without having
 /// to spawn the real daemon.
 /// Drain the hook spool once at startup. See [`tend::hook_spool`].
-fn spawn_hook_spool_drain(socket: PathBuf) {
+///
+/// Replay restores agent state through the same registry entry point the
+/// ingest handler uses (scope check, `apply_with_ask`, launch claim). The
+/// collaboration worker binding and paneless-Codex correlation are left to
+/// the agent's next live hook and the reconciler.
+async fn drain_hook_spool(store: &tend::SharedStore) {
     let Some(path) = tend::hook_spool::default_spool_file() else {
         return;
     };
-    tokio::spawn(async move {
-        let (entries, unreadable) =
-            tokio::task::spawn_blocking(move || tend::hook_spool::take(&path))
-                .await
-                .unwrap_or_default();
-        if entries.is_empty() && unreadable == 0 {
-            return;
+    let (entries, unreadable) = tokio::task::spawn_blocking(move || tend::hook_spool::take(&path))
+        .await
+        .unwrap_or_default();
+    if entries.is_empty() && unreadable == 0 {
+        return;
+    }
+    let latest: HashMap<String, time::OffsetDateTime> = store
+        .snapshot()
+        .await
+        .into_iter()
+        .map(|agent| (agent.session_id, agent.last_activity_at))
+        .collect();
+    let (replay, mut report) = tend::hook_spool::plan_replay(
+        entries,
+        unreadable,
+        time::OffsetDateTime::now_utc(),
+        |session| latest.get(session).copied(),
+    );
+    for entry in replay {
+        let event = &entry.event;
+        let pane_host = event
+            .id()
+            .pane
+            .as_deref()
+            .and_then(tend::backend::pane_id_host_kind);
+        let in_scope = pane_host.is_some_and(|host| host != tend::HostKind::Tmux)
+            || tend::tmux::scanner::event_tmux_socket_in_scope(event.id().tmux_socket.as_deref());
+        if !in_scope {
+            report.skipped += 1;
+            continue;
         }
-        let client = Client::new(socket);
-        let latest: HashMap<String, time::OffsetDateTime> = client
-            .snapshot()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|agent| (agent.session_id, agent.last_activity_at))
-            .collect();
-        let (replay, mut report) = tend::hook_spool::plan_replay(
-            entries,
-            unreadable,
-            time::OffsetDateTime::now_utc(),
-            |session| latest.get(session).copied(),
-        );
-        for entry in replay {
-            match client
-                .ingest_with_launch_claim(&entry.event, entry.launch_id.clone())
-                .await
-            {
-                Ok(()) => report.replayed += 1,
-                Err(error) => {
-                    report.failed += 1;
-                    tracing::debug!(%error, "hook spool replay failed");
-                }
-            }
-        }
-        tracing::info!(
-            spooled = report.total(),
-            replayed = report.replayed,
-            skipped = report.skipped,
-            failed = report.failed,
-            protocol_mismatch = report
-                .failures
-                .get(&tend::hook_spool::IngestFailure::ProtocolMismatch)
-                .copied()
-                .unwrap_or(0),
-            "drained hook events that failed to ingest"
-        );
-        if let Some(report_path) = tend::hook_spool::default_drain_report_file() {
-            let result = tokio::task::spawn_blocking(move || {
-                tend::hook_spool::write_report(&report_path, &report)
-            })
+        store.apply_with_ask(event, None).await;
+        store
+            .observe_launch_claim(event, entry.launch_id.as_deref())
             .await;
-            if !matches!(result, Ok(Ok(()))) {
-                tracing::warn!("hook spool drain report could not be written");
-            }
+        report.replayed += 1;
+    }
+    tracing::info!(
+        spooled = report.total(),
+        replayed = report.replayed,
+        skipped = report.skipped,
+        protocol_mismatch = report
+            .failures
+            .get(&tend::hook_spool::IngestFailure::ProtocolMismatch)
+            .copied()
+            .unwrap_or(0),
+        "drained hook events that failed to ingest"
+    );
+    if let Some(report_path) = tend::hook_spool::default_drain_report_file() {
+        let result = tokio::task::spawn_blocking(move || {
+            tend::hook_spool::write_report(&report_path, &report)
+        })
+        .await;
+        if !matches!(result, Ok(Ok(()))) {
+            tracing::warn!("hook spool drain report could not be written");
         }
-    });
+    }
 }
 
 fn spawn_startup_discovery(

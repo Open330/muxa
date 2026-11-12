@@ -14,7 +14,8 @@ pub(super) async fn best_effort_ingest(client: &Client, ev: &tend::event::AgentE
     let launch_id = tend::adapters::hook::launch_claim(ev.id().kind);
     if let Err(e) = client.ingest_with_launch_claim(ev, launch_id.clone()).await {
         tracing::debug!(error = %e, "tend ingest failed; spooling the event");
-        if !tend::hook_spool::spoolable(ev) {
+        let headless_ask = std::env::var_os(tend::ask::ASK_ENV_MARKER).is_some();
+        if !tend::hook_spool::spoolable(ev, headless_ask) {
             return;
         }
         let Some(path) = tend::hook_spool::default_spool_file() else {
