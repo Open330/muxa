@@ -152,6 +152,10 @@ pub(super) enum RequestBody {
     /// asked, done and decided, whether or not a window is open.
     WorkRecordShow {
         identity: crate::work::WorkIdentity,
+        /// Only the newest `newest` result records (still oldest first in
+        /// the reply), for surfaces that show a recent slice.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        newest: Option<usize>,
     },
     /// Durable desired graph and per-alias execution state for every Work Run.
     PipelineRuns,
@@ -1052,6 +1056,7 @@ pub(super) const CAPABILITIES: &[&str] = &[
     crate::decision::HUMAN_DECISION_CAPABILITY,
     crate::decision_queue::DECISION_QUEUE_CAPABILITY,
     crate::work::WORK_BACKLOG_CAPABILITY,
+    crate::work::WORK_RECENT_RESULTS_CAPABILITY,
     "pipeline_subscribe",
     "work_control_v1",
     "work_command_v1",
