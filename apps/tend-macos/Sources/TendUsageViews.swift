@@ -236,7 +236,7 @@ struct TendUsagePopover: View {
 
     private var autoResumeFooter: some View {
         HStack {
-            TendOpenSettingsButton(tab: .automations) {
+            TendOpenSettingsButton(tab: .accounts) {
                 Text("Limit Policy…")
             }
             .buttonStyle(.tendGhost)

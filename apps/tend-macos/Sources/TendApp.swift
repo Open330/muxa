@@ -33,7 +33,7 @@ private final class TendApplicationDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        // Look for the enabled modules' tools once, here. Settings › Modules
+        // Look for the enabled modules' tools once, here. Settings › Accounts
         // used to be the only thing that probed, so until it had been opened
         // every action needing a tool sat disabled saying it was still
         // looking — for a module the operator had already pointed at a
@@ -212,6 +212,15 @@ struct TendApp: App {
             TendSettingsView(model: model)
                 .preferredColorScheme(preferredColorScheme)
         }
+
+        // Settings › Advanced › Edit Raw TOML…: the whole configuration
+        // file, in a window that can be as large as the file needs.
+        Window("Configuration File", id: TendRawConfigEditorView.windowID) {
+            TendRawConfigEditorView(model: model, store: TendConfigStore.shared)
+                .preferredColorScheme(preferredColorScheme)
+        }
+        .defaultSize(width: 760, height: 620)
+        .commandsRemoved()
 
         // First-launch Welcome guide; reopened from Help › Welcome Guide…
         // (see OnboardingView.swift for the launch decision).

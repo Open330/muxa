@@ -262,7 +262,7 @@ struct WorkCommandCenterView: View {
 
             if model.workCapableHosts.count > 1, !model.supportsHostWorkCommands {
                 Label(
-                    "Host sync needs the updated tendd on this Mac (Settings › Runtime › Reload Bundled tendd).",
+                    "Host sync needs the updated tendd on this Mac (Settings › Advanced › Reload tendd).",
                     systemImage: "exclamationmark.triangle"
                 )
                 .font(TendType.detail)

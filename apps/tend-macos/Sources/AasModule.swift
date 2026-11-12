@@ -542,9 +542,10 @@ final class AasModule: TendModule {
         return candidates.compactMap { $0 }.first { known.contains($0) }
     }
 
-    /// Opens Settings on the Modules tab, where this module's card lives.
+    /// Opens Settings on the Accounts tab, where this module's switch and
+    /// accounts live.
     static func openSettings() {
-        TendSettingsOpener.select(.modules)
+        TendSettingsOpener.select(.accounts)
         TendSettingsOpener.openLegacySettingsWindow()
     }
 
@@ -646,16 +647,24 @@ enum AasSwitchConfirmation {
     }
 }
 
-// MARK: - Settings › Modules › aas
+// MARK: - Settings › Accounts
 
+extension AasAccount {
+    /// The meter closest to running out — what a one-line row shows.
+    var worstMeter: AasMeter? {
+        meters.max { $0.usedPct < $1.usedPct }
+    }
+}
+
+/// The account list under Settings › Accounts: one refresh (live behind its
+/// menu), then a compact table per provider.
 private struct AasSettingsPane: View {
     let module: AasModule
     @ObservedObject var store: AasAccountStore
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            controls
+        Section {
             if let error = store.error {
                 Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(TendType.detail)
@@ -663,67 +672,69 @@ private struct AasSettingsPane: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             if store.groups.isEmpty {
-                emptyState
-            } else {
-                ForEach(store.groups) { group in
-                    AasProviderSection(group: group, module: module, model: model)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("No accounts stored yet.")
+                    TendSettingsCaption("Add one with `aas login <provider> <name>` in a terminal — for example `aas login claude work` — then refresh.")
                 }
+            } else {
+                AasAccountTable(groups: store.groups, module: module, model: model)
             }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private var controls: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        } header: {
             HStack(spacing: 8) {
-                Button("Refresh") { Task { await store.refresh() } }
-                Button("Refresh live") { Task { await store.refresh(live: true) } }
+                Text("Accounts")
+                Spacer()
                 if store.isRefreshing {
                     ProgressView().controlSize(.mini)
                 }
-                Spacer(minLength: 8)
                 if let refreshed = store.lastRefreshedAt {
                     Text("Updated \(refreshed.formatted(date: .omitted, time: .shortened))")
                         .font(TendType.detail)
                         .foregroundStyle(.secondary)
                 }
+                Menu {
+                    Button("Refresh live") { Task { await store.refresh(live: true) } }
+                } label: {
+                    Text("Refresh")
+                } primaryAction: {
+                    Task { await store.refresh() }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .controlSize(.small)
+                .disabled(store.isRefreshing)
+                .help("Refresh reads the usage aas already has. Refresh live asks every provider again — one request per account — so it takes longer.")
             }
-            .controlSize(.small)
-            .disabled(store.isRefreshing)
-            Text("Refresh reads the usage aas already has. Refresh live asks every provider again — one request per account — so it takes longer.")
-                .font(TendType.detail)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
-    }
-
-    private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("No accounts stored yet.")
-                .font(.callout)
-            Text("Add one with `aas login <provider> <name>` in a terminal — for example `aas login claude work` — then refresh.")
-                .font(TendType.detail)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
-private struct AasProviderSection: View {
-    let group: AasProviderGroup
+/// Name, plan, the meter nearest its limit, and a shell — one line each.
+private struct AasAccountTable: View {
+    let groups: [AasProviderGroup]
     let module: AasModule
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text(verbatim: group.title)
-                .font(.subheadline.weight(.semibold))
-            ForEach(group.accounts) { account in
-                AasAccountRow(account: account, module: module, model: model)
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 7) {
+            GridRow {
+                Text("Name")
+                Text("Plan")
+                Text("Usage")
+                Color.clear.frame(width: 1, height: 1)
+            }
+            .font(TendType.detail)
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+            ForEach(groups) { group in
+                Divider()
+                Text(verbatim: group.title)
+                    .font(TendType.detail.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                ForEach(group.accounts) { account in
+                    AasAccountRow(account: account, module: module, model: model)
+                }
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -733,88 +744,88 @@ private struct AasAccountRow: View {
     @ObservedObject var model: AppModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .firstTextBaseline, spacing: 8) {
+        GridRow {
+            HStack(spacing: 7) {
                 Circle()
                     .fill(account.active ? Color.green : Color.secondary.opacity(0.25))
                     .frame(width: 8, height: 8)
                     .accessibilityLabel(account.active ? Text("Active account") : Text("Not active"))
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(verbatim: account.name)
-                        .font(.body.weight(.medium))
-                    if let email = account.email, !email.isEmpty {
-                        Text(verbatim: email)
-                            .font(TendType.detail)
-                            .foregroundStyle(.secondary)
-                    }
+                Text(verbatim: account.name)
+                    .font(.body.weight(account.active ? .semibold : .regular))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let error = account.error, !error.isEmpty {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .help(error)
+                        .accessibilityLabel(Text(verbatim: error))
                 }
-                // Without a plan badge the summary describes the account.
-                .help(account.planText == nil ? headline : Text(verbatim: ""))
-                Spacer(minLength: 8)
+            }
+            .help(accountSummary)
+            Group {
                 if let plan = account.planText {
                     Text(verbatim: plan)
-                        .font(TendType.detail)
                         .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
+                        .padding(.vertical, 1)
                         .background(Color.accentColor.opacity(0.12), in: Capsule())
-                        .help(headline)
+                        .help(Text(verbatim: account.headline ?? ""))
+                } else {
+                    Text(verbatim: "—").foregroundStyle(.secondary)
                 }
-                Button("New shell") {
-                    Task { await module.openShell(for: account, model: model) }
-                }
-                .controlSize(.small)
-                .disabled(!model.isConnected)
-                .help("Opens a Tend shell that starts as this account.")
             }
-            if let error = account.error, !error.isEmpty {
-                Label(error, systemImage: "exclamationmark.triangle.fill")
-                    .font(TendType.detail)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+            .font(TendType.detail)
+            .lineLimit(1)
+            AasWorstMeterCell(account: account)
+            Button {
+                Task { await module.openShell(for: account, model: model) }
+            } label: {
+                Image(systemName: "terminal")
             }
-            ForEach(account.meters) { meter in
-                AasMeterRow(meter: meter)
-            }
-            ForEach(account.notes, id: \.self) { note in
-                Text(verbatim: note)
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            .buttonStyle(.borderless)
+            .disabled(!model.isConnected)
+            .help("Opens a Tend shell that starts as this account.")
+            .accessibilityLabel(Text("New shell"))
+            .gridColumnAlignment(.trailing)
         }
-        .padding(10)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
     }
 
-    /// aas's own `key=value` summary of the plan, on hover over the plan
-    /// badge (or the account name when there is no badge) — not the whole
-    /// row, whose buttons and meters have help of their own. Raw provider
-    /// detail, so it stays out of the row itself.
-    private var headline: Text { Text(verbatim: account.headline ?? "") }
+    /// Email and aas's notes, on hover over the name.
+    private var accountSummary: String {
+        ([account.email].compactMap { $0 }.filter { !$0.isEmpty } + account.notes).joined(separator: "\n")
+    }
 }
 
-private struct AasMeterRow: View {
-    let meter: AasMeter
+/// The meter nearest its limit as a short bar; every meter on hover.
+private struct AasWorstMeterCell: View {
+    let account: AasAccount
 
     var body: some View {
-        HStack(spacing: 8) {
-            Text(verbatim: meter.label)
-                .font(TendType.detail.monospaced())
-                .foregroundStyle(.secondary)
-                .frame(width: 26, alignment: .leading)
-            ProgressView(value: meter.fraction)
-                .progressViewStyle(.linear)
-                .tint(meter.tint)
-            Text(verbatim: AasFormat.percent(meter.usedPct))
-                .font(TendType.detail.monospacedDigit())
-                .frame(width: 40, alignment: .trailing)
-            if let resets = AasFormat.resets(atMilliseconds: meter.resetMs) {
-                Text(verbatim: resets)
-                    .font(TendType.detail)
+        if let meter = account.worstMeter {
+            HStack(spacing: 6) {
+                Text(verbatim: meter.label)
+                    .font(TendType.detail.monospaced())
                     .foregroundStyle(.secondary)
-                    .frame(width: 150, alignment: .leading)
+                ProgressView(value: meter.fraction)
+                    .progressViewStyle(.linear)
+                    .tint(meter.tint)
+                    .frame(width: 80)
+                    .accessibilityHidden(true)
+                Text(verbatim: AasFormat.percent(meter.usedPct))
+                    .font(TendType.detail.monospacedDigit())
             }
+            .help(allMeters)
+            .accessibilityElement(children: .combine)
+        } else {
+            Text(verbatim: "—").foregroundStyle(.secondary)
         }
+    }
+
+    private var allMeters: String {
+        account.meters.map { meter in
+            var line = "\(meter.label) \(AasFormat.percent(meter.usedPct))"
+            if let resets = AasFormat.resets(atMilliseconds: meter.resetMs) { line += " · \(resets)" }
+            return line
+        }
+        .joined(separator: "\n")
     }
 }

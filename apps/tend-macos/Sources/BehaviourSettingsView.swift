@@ -1,194 +1,308 @@
 import AppKit
 import SwiftUI
 
-/// Settings › Behaviour: the two sections of tend configuration a person
-/// actually tunes — desktop notifications and agent-to-agent collaboration.
+/// The `[notifier]` and `[collaboration]` values on screen in Settings ›
+/// Notifications and Settings › Agents, applied as they change.
 ///
-/// The form writes through the same `config_write` the Advanced tab uses,
-/// rewriting only the keys below, so a malformed edit cannot come from here.
-struct BehaviourSettingsPane: View {
+/// Both tabs edit the one draft, and every change writes through the same
+/// `config_write` the raw editor uses, rewriting only the keys that differ
+/// from the file, so a malformed edit cannot come from here. Writes run one
+/// after another: a second change made while the first is saving is diffed
+/// against the file the first one left.
+@MainActor
+final class TendBehaviourDraft: ObservableObject {
+    static let shared = TendBehaviourDraft()
+
+    @Published var settings = TendBehaviourSettings() {
+        didSet {
+            guard !isSyncing, settings != oldValue else { return }
+            scheduleApply()
+        }
+    }
+    @Published private(set) var pendingWrites = 0
+
+    private let store: TendConfigStore
+    private weak var model: AppModel?
+    private var isSyncing = false
+    private var lastWrite: Task<Void, Never>?
+
+    init(store: TendConfigStore = .shared) {
+        self.store = store
+    }
+
+    var isApplying: Bool { pendingWrites > 0 }
+
+    /// Whether the draft holds a value the file does not, once every write
+    /// has finished — a refused write leaves this true.
+    var hasUnappliedChanges: Bool {
+        !isApplying && store.hasLoaded && settings != store.behaviour
+    }
+
+    func attach(_ model: AppModel) {
+        self.model = model
+    }
+
+    /// Takes the file's values, unless a write of the draft is still on its
+    /// way — then the write's own completion takes them.
+    func syncFromStore() {
+        guard pendingWrites == 0 else { return }
+        replace(with: store.behaviour)
+    }
+
+    func revert() {
+        replace(with: store.behaviour)
+    }
+
+    /// Puts the edits a conflict interrupted on top of the file as it is now.
+    func retry() {
+        guard let model else { return }
+        pendingWrites += 1
+        let previous = lastWrite
+        lastWrite = Task { @MainActor in
+            await previous?.value
+            await store.retryPendingEdits(model: model)
+            finishWrite()
+        }
+    }
+
+    private func replace(with value: TendBehaviourSettings) {
+        isSyncing = true
+        settings = value
+        isSyncing = false
+    }
+
+    private func scheduleApply() {
+        guard let model else { return }
+        pendingWrites += 1
+        let previous = lastWrite
+        lastWrite = Task { @MainActor in
+            await previous?.value
+            let edits = settings.edits(against: store.behaviour)
+            if !edits.isEmpty, store.isSupported {
+                await store.apply(edits, model: model)
+            }
+            finishWrite()
+        }
+    }
+
+    private func finishWrite() {
+        pendingWrites -= 1
+        // A write that landed leaves the file equal to the draft; one that
+        // was refused leaves the draft as typed, with the reason beside it.
+        if pendingWrites == 0, store.saveError == nil, store.conflictMessage == nil {
+            replace(with: store.behaviour)
+        }
+    }
+}
+
+// MARK: - Notifications
+
+/// Settings › Notifications: the Mac app's own notifications first, then
+/// tendd's, which only matter while Tend is not running.
+struct TendNotificationsSettingsPane: View {
     @ObservedObject var model: AppModel
     @ObservedObject var store: TendConfigStore
-    @State private var settings = TendBehaviourSettings()
-    @State private var copiedTOML = false
-    /// Set once a save from this pane lands, so the restart note speaks
-    /// about changes that are actually saved.
-    @State private var savedChanges = false
-
-    private var isChanged: Bool {
-        store.hasLoaded && settings != store.behaviour
-    }
+    @ObservedObject private var draft = TendBehaviourDraft.shared
+    @State private var showsDaemonNotifier = false
 
     var body: some View {
         Form {
-            // WS-A: the Mac app's own notifications and Dock badge.
             TendAppNotificationsSection(
                 attention: model.attention,
-                // The form's own values, so this warning and the Delivery
+                // The draft's own values, so this warning and the delivery
                 // warning below never describe two different configurations.
-                daemonNotifierEnabled: settings.daemonPostsNotifications
+                daemonNotifierEnabled: draft.settings.daemonPostsNotifications
             )
 
-            Section("Notifications") {
-                Toggle("Post a desktop notification when an agent needs you", isOn: $settings.notifierEnabled)
-                Picker("Delivery", selection: $settings.notifierBackend) {
-                    ForEach(TendNotifierBackend.allCases) { backend in
-                        Text(notifierBackendTitle(backend)).tag(backend)
+            Section {
+                DisclosureGroup(isExpanded: $showsDaemonNotifier) {
+                    Toggle("Post a desktop notification when an agent needs you", isOn: $draft.settings.notifierEnabled)
+                    Picker("Delivery", selection: $draft.settings.notifierBackend) {
+                        ForEach(TendNotifierBackend.allCases) { backend in
+                            Text(notifierBackendTitle(backend)).tag(backend)
+                        }
+                    }
+                    .disabled(!draft.settings.notifierEnabled)
+                    if draft.settings.notifierEnabled, draft.settings.notifierBackend == .none {
+                        Label("Choose a delivery method, or nothing is posted.", systemImage: "exclamationmark.circle")
+                            .font(TendType.detail)
+                            .foregroundStyle(.orange)
+                    }
+                } label: {
+                    HStack(spacing: 6) {
+                        Text("Also notify from tendd when Tend isn't running")
+                        TendSettingsInfoButton(title: "Notifications from tendd") {
+                            Text("tendd notifies when an agent starts waiting for a person, hits an error, or stops mid-turn. Repeats for the same agent are suppressed for 30 seconds.")
+                        }
                     }
                 }
-                .disabled(!settings.notifierEnabled)
-                Text("tendd notifies when an agent starts waiting for a person, hits an error, or stops mid-turn. Repeats for the same agent are suppressed for 30 seconds.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
-                if settings.notifierEnabled, settings.notifierBackend == .none {
-                    Label("Choose a delivery method, or nothing is posted.", systemImage: "exclamationmark.circle")
-                        .font(TendType.detail)
-                        .foregroundStyle(.orange)
-                }
+                .disabled(!store.isSupported && store.hasLoaded)
             }
 
+            TendBehaviourStatusSection(model: model, store: store, draft: draft)
+        }
+        .formStyle(.grouped)
+        .tendBehaviourLoading(model: model, store: store, draft: draft)
+        .onAppear {
+            if draft.settings.daemonPostsNotifications { showsDaemonNotifier = true }
+        }
+    }
+}
+
+// MARK: - Agents
+
+/// Settings › Agents: how agents reach each other, and the arguments every
+/// agent is launched with.
+struct TendAgentsSettingsPane: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var store: TendConfigStore
+    @ObservedObject private var draft = TendBehaviourDraft.shared
+
+    var body: some View {
+        Form {
             Section("Collaboration") {
-                Toggle("Let agents send each other requests", isOn: $settings.collaborationEnabled)
+                Toggle("Let agents send each other requests", isOn: $draft.settings.collaborationEnabled)
                 Group {
-                    Picker("Wake", selection: $settings.collaborationWake) {
+                    Picker("Wake", selection: $draft.settings.collaborationWake) {
                         ForEach(TendCollaborationWake.allCases) { wake in
                             Text(collaborationWakeTitle(wake)).tag(wake)
                         }
                     }
-                    Text(collaborationWakeDetail(settings.collaborationWake))
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
-                    Picker("Delivered payload", selection: $settings.collaborationWakePayload) {
+                    Picker("Delivered payload", selection: $draft.settings.collaborationWakePayload) {
                         ForEach(TendCollaborationWakePayload.allCases) { payload in
                             Text(collaborationPayloadTitle(payload)).tag(payload)
                         }
                     }
-                    Text(collaborationPayloadDetail(settings.collaborationWakePayload))
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
-                    Picker("Pane scope", selection: $settings.collaborationScope) {
+                    Picker("Pane scope", selection: $draft.settings.collaborationScope) {
                         ForEach(TendCollaborationScope.allCases) { scope in
                             Text(collaborationScopeTitle(scope)).tag(scope)
                         }
                     }
-                    Text(collaborationScopeDetail(settings.collaborationScope))
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
+                    TendSettingsCaption(verbatim: [
+                        collaborationWakeDetail(draft.settings.collaborationWake),
+                        collaborationPayloadDetail(draft.settings.collaborationWakePayload),
+                        collaborationScopeDetail(draft.settings.collaborationScope),
+                    ].joined(separator: " "))
                 }
-                .disabled(!settings.collaborationEnabled)
+                .disabled(!draft.settings.collaborationEnabled)
             }
+            .disabled(!store.isSupported && store.hasLoaded)
 
-            if store.isSupported {
-                Section {
-                    HStack {
-                        Group {
-                            if let conflict = store.conflictMessage {
-                                Label(conflict, systemImage: "arrow.triangle.branch")
-                                    .foregroundStyle(.orange)
-                                    .textSelection(.enabled)
-                            } else if let error = store.saveError {
-                                Label(error, systemImage: "xmark.octagon.fill")
-                                    .foregroundStyle(.red)
-                                    .textSelection(.enabled)
-                            } else if let error = store.loadError {
-                                Label(error, systemImage: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.orange)
-                                    .textSelection(.enabled)
-                            } else if isChanged {
-                                Text("You have unsaved changes. Save to keep them.")
-                                    .foregroundStyle(.secondary)
-                            } else if let status = store.status {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Label(status, systemImage: "checkmark.circle.fill")
-                                        .foregroundStyle(.green)
-                                    if savedChanges {
-                                        Text("Saved changes apply when tendd restarts.")
-                                            .foregroundStyle(.secondary)
-                                    }
-                                }
-                            } else {
-                                Text("These values are read from tend configuration.")
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .font(TendType.detail)
-                        .fixedSize(horizontal: false, vertical: true)
-                        Spacer(minLength: 8)
-                        if store.isSaving || store.isLoading {
-                            ProgressView().controlSize(.small)
-                        }
-                        TendDaemonReloadButton(model: model)
-                        if !store.retryEdits.isEmpty {
-                            Button("Apply Again") {
-                                Task {
-                                    if await store.retryPendingEdits(model: model) { savedChanges = true }
-                                    settings = store.behaviour
-                                }
-                            }
-                            .help("Puts the same change on top of the file as it now stands.")
-                            .disabled(store.isSaving)
-                        }
-                        Button("Revert") { settings = store.behaviour }
-                            .disabled(!isChanged || store.isSaving)
-                        Button("Save") {
-                            Task {
-                                if await store.apply(settings.edits(against: store.behaviour), model: model) {
-                                    savedChanges = true
-                                }
-                                settings = store.behaviour
-                            }
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .disabled(!isChanged || store.isSaving)
-                    }
-                    .controlSize(.small)
-                }
-            } else {
-                Section("Not editable from here") {
-                    Text("This tendd cannot write its configuration. Copy the block below into the tend configuration file, then reload tendd.")
-                        .font(TendType.detail)
+            TendBehaviourStatusSection(model: model, store: store, draft: draft)
+
+            TendLaunchArgumentsSections(model: model, store: store)
+        }
+        .formStyle(.grouped)
+        .tendBehaviourLoading(model: model, store: store, draft: draft)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            if store.isLaunchDirty {
+                TendSettingsFooter(
+                    isBusy: store.isSaving || store.isLoading,
+                    canRevert: store.isLaunchDirty,
+                    canSave: store.isLaunchDirty && !store.isDirty && !store.launchNeedsReload,
+                    revert: { store.discardLaunch() },
+                    save: { Task { await store.saveLaunch(model: model) } }
+                ) {
+                    Text("Launch arguments have unsaved changes.")
                         .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+        }
+    }
+}
+
+// MARK: - Shared by both tabs
+
+private extension View {
+    func tendBehaviourLoading(model: AppModel, store: TendConfigStore, draft: TendBehaviourDraft) -> some View {
+        task(id: model.isConnected) {
+            draft.attach(model)
+            await store.load(model: model)
+            draft.syncFromStore()
+        }
+        .onChange(of: store.loadedText) { _ in draft.syncFromStore() }
+    }
+}
+
+/// What happened to the last change: a refusal, a conflict, or — for a
+/// daemon that cannot write its configuration — the block to paste.
+private struct TendBehaviourStatusSection: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var store: TendConfigStore
+    @ObservedObject var draft: TendBehaviourDraft
+    @State private var copiedTOML = false
+
+    var body: some View {
+        if store.hasLoaded || store.loadError != nil || !store.isSupported {
+            if store.isSupported {
+                if let message = problem {
+                    Section {
+                        HStack(spacing: 8) {
+                            message
+                                .font(TendType.detail)
+                                .textSelection(.enabled)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Spacer(minLength: 8)
+                            if !store.retryEdits.isEmpty {
+                                Button("Apply Again") { draft.retry() }
+                                    .help("Puts the same change on top of the file as it now stands.")
+                                    .disabled(store.isSaving)
+                            }
+                            if draft.hasUnappliedChanges {
+                                Button("Revert") { draft.revert() }
+                                    .disabled(store.isSaving)
+                            }
+                        }
+                        .controlSize(.small)
+                    }
+                }
+            } else if !store.isLoading {
+                Section("Not editable from here") {
+                    TendSettingsCaption("This tendd cannot write its configuration. Copy the block below into the tend configuration file, then restart tendd from Advanced.")
                     Text(verbatim: snippet)
                         .font(TendType.detail.monospaced())
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(8)
-                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: 8))
-                    HStack {
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(snippet, forType: .string)
-                            copiedTOML = true
-                        } label: {
-                            Label(copiedTOML ? "Copied" : "Copy", systemImage: "doc.on.doc")
-                        }
-                        Spacer()
-                        TendDaemonReloadButton(model: model)
+                        .background(Color.primary.opacity(0.05), in: RoundedRectangle(cornerRadius: TendTheme.panelRadius))
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(snippet, forType: .string)
+                        copiedTOML = true
+                    } label: {
+                        Label(copiedTOML ? "Copied" : "Copy", systemImage: "doc.on.doc")
                     }
                     .controlSize(.small)
                 }
+                .onChange(of: draft.settings) { _ in copiedTOML = false }
             }
         }
-        .formStyle(.grouped)
-        .padding(.top, 8)
-        .task(id: model.isConnected) {
-            await store.load(model: model)
-            settings = store.behaviour
+    }
+
+    private var problem: Label<Text, Image>? {
+        if let conflict = store.conflictMessage {
+            return Label { Text(verbatim: conflict).foregroundColor(.orange) } icon: {
+                Image(systemName: "arrow.triangle.branch")
+            }
         }
-        .onChange(of: store.loadedText) { _ in
-            settings = store.behaviour
+        if let error = store.saveError {
+            return Label { Text(verbatim: error).foregroundColor(.red) } icon: {
+                Image(systemName: "xmark.octagon.fill")
+            }
         }
-        .onChange(of: settings) { _ in
-            copiedTOML = false
+        if let error = store.loadError {
+            return Label { Text(verbatim: error).foregroundColor(.orange) } icon: {
+                Image(systemName: "exclamationmark.triangle.fill")
+            }
         }
+        return nil
     }
 
     /// What the two sections would look like in the file, for the daemon
     /// that cannot be written to. Only values that differ from tend's
     /// defaults are listed — those are the ones worth writing down.
     private var snippet: String {
-        let edits = settings.edits(against: .daemonDefaults)
+        let edits = draft.settings.edits(against: .daemonDefaults)
         guard !edits.isEmpty else {
             return "# " + String(localized: "Everything here already matches tend's defaults.")
         }

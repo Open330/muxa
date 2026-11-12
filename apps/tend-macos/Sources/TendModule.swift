@@ -21,11 +21,12 @@ protocol TendModule: AnyObject, Identifiable {
     var availability: TendModuleAvailability { get }
 
     /// Look for the tool and record what was found. Cheap enough to call on
-    /// every appearance of the Modules pane; a module that needs more should
+    /// every appearance of its Settings pane; a module that needs more should
     /// cache it itself.
     func probe() async
 
-    /// The module's own settings, shown under Settings › Modules.
+    /// The module's own settings: form sections shown under its switch in
+    /// Settings › Accounts.
     func settingsPane(model: AppModel) -> AnyView
 
     /// What this module offers to do with a given object. Called while the

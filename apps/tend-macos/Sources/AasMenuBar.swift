@@ -64,7 +64,7 @@ struct AasMenuBarPanel: View {
                     Button("Refresh live") { Task { await store.refresh(live: true) } }
                     if store.isRefreshing { ProgressView().controlSize(.small) }
                     Spacer()
-                    TendSettingsShortcut(tab: .modules, title: "Open Accounts settings").labelStyle(.iconOnly)
+                    TendSettingsShortcut(tab: .accounts, title: "Open Accounts settings").labelStyle(.iconOnly)
                 }
                 .controlSize(.small)
                 .disabled(store.isRefreshing)

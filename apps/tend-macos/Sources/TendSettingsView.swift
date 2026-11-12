@@ -25,17 +25,90 @@ enum TendAppearance: String, CaseIterable, Identifiable {
     }
 }
 
+/// The Settings window's tabs, in toolbar order.
 enum TendSettingsTab: String, CaseIterable, Identifiable {
     case general
+    case notifications
     case menuBar
-    case providers
+    case accounts
+    case ask
+    case agents
     case automations
-    case behaviour
-    case modules
     case fleet
-    case dispatch
-    case runtime
     case advanced
+
+    var id: Self { self }
+
+    var title: LocalizedStringKey {
+        switch self {
+        case .general: "General"
+        case .notifications: "Notifications"
+        case .menuBar: "Menu Bar"
+        case .accounts: "Accounts"
+        case .ask: "Ask"
+        case .agents: "Agents"
+        case .automations: "Automations"
+        case .fleet: "Fleet"
+        case .advanced: "Advanced"
+        }
+    }
+
+    /// The toolbar symbol, with an older one where the preferred symbol is
+    /// newer than the running macOS.
+    var systemImage: String {
+        let preferred = preferredSystemImage
+        guard let fallback = fallbackSystemImage else { return preferred }
+        return NSImage(systemSymbolName: preferred, accessibilityDescription: nil) == nil ? fallback : preferred
+    }
+
+    var preferredSystemImage: String {
+        switch self {
+        case .general: "gearshape"
+        case .notifications: "bell.badge"
+        case .menuBar: "menubar.rectangle"
+        case .accounts: "person.2"
+        case .ask: "bubble.left.and.text.bubble.right"
+        case .agents: "person.3.sequence"
+        case .automations: "bolt.badge.automatic"
+        case .fleet: "server.rack"
+        case .advanced: "slider.horizontal.3"
+        }
+    }
+
+    var fallbackSystemImage: String? {
+        switch self {
+        case .ask: "bubble.left.and.bubble.right"
+        case .agents: "square.stack.3d.up"
+        case .automations: "bolt"
+        default: nil
+        }
+    }
+
+    /// The tab a stored selection names. Earlier builds had Providers,
+    /// Behaviour, Modules, Dispatch and Runtime tabs; a selection saved by
+    /// one of them opens the tab that holds those settings now.
+    static func resolve(_ rawValue: String) -> TendSettingsTab {
+        if let tab = TendSettingsTab(rawValue: rawValue) { return tab }
+        switch rawValue {
+        case "providers": return .ask
+        case "behaviour": return .notifications
+        case "modules": return .accounts
+        case "dispatch": return .fleet
+        case "runtime": return .advanced
+        default: return .general
+        }
+    }
+
+    /// The Fleet tab's section a stored selection asks for, when it names one.
+    static func fleetSection(for rawValue: String) -> TendFleetSettingsSection? {
+        rawValue == "dispatch" ? .dispatch : nil
+    }
+}
+
+/// The Fleet tab's two halves.
+enum TendFleetSettingsSection: String, CaseIterable, Identifiable {
+    case hosts
+    case dispatch
 
     var id: Self { self }
 }
@@ -45,6 +118,7 @@ enum TendPreferences {
     static let showWorkbenchOnLaunchKey = "tend.showWorkbenchOnLaunch"
     static let homeAnimatesMovesKey = "tend.home.animatesMoves"
     static let settingsTabKey = "tend.settings.selectedTab"
+    static let fleetSettingsSectionKey = "tend.settings.fleetSection"
     static let workDirectoryKey = "nativeWorkDirectory"
     static let menuBarAgentLimitKey = "tend.menuBar.maximumAgentIcons"
     static let defaultMenuBarAgentLimit = 3
@@ -68,57 +142,113 @@ enum TendPreferences {
     }
 }
 
+/// The Settings window's size: resizable, never smaller than the controls
+/// need, and long tabs scroll inside their form.
+enum TendSettingsWindowSize {
+    static let minWidth: CGFloat = 720
+    static let idealWidth: CGFloat = 820
+    static let minHeight: CGFloat = 560
+    static let idealHeight: CGFloat = 680
+}
+
 struct TendSettingsView: View {
     @ObservedObject var model: AppModel
-    @AppStorage(TendPreferences.settingsTabKey) private var selectedTab = TendSettingsTab.general.rawValue
+    @AppStorage(TendPreferences.settingsTabKey) private var storedTab = TendSettingsTab.general.rawValue
+    @AppStorage(TendPreferences.fleetSettingsSectionKey) private var fleetSection = TendFleetSettingsSection.hosts.rawValue
+
+    private var selection: Binding<TendSettingsTab> {
+        Binding(
+            get: { TendSettingsTab.resolve(storedTab) },
+            set: { storedTab = $0.rawValue }
+        )
+    }
 
     var body: some View {
-        TabView(selection: $selectedTab) {
+        TabView(selection: selection) {
             TendGeneralSettingsView()
-                .tabItem { Label("General", systemImage: "gearshape") }
-                .tag(TendSettingsTab.general.rawValue)
+                .tendSettingsTab(.general, model: model)
+
+            TendNotificationsSettingsPane(model: model, store: TendConfigStore.shared)
+                .tendSettingsTab(.notifications, model: model)
 
             TendMenuBarSettingsView(model: model)
-                .tabItem { Label("Menu Bar", systemImage: "menubar.rectangle") }
-                .tag(TendSettingsTab.menuBar.rawValue)
+                .tendSettingsTab(.menuBar, model: model)
+
+            TendAccountsSettingsPane(model: model, registry: TendModuleRegistry.shared)
+                .tendSettingsTab(.accounts, model: model)
 
             AskProvidersSettingsPane(model: model, store: AskProviderStore.shared)
-                .tabItem { Label("Providers", systemImage: "brain.head.profile") }
-                .tag(TendSettingsTab.providers.rawValue)
+                .tendSettingsTab(.ask, model: model)
+
+            TendAgentsSettingsPane(model: model, store: TendConfigStore.shared)
+                .tendSettingsTab(.agents, model: model)
 
             AutomationSettingsPane(
                 model: model,
                 store: AutomationStore.shared,
                 configStore: TendConfigStore.shared
             )
-            .tabItem { Label("Automations", systemImage: "wand.and.rays") }
-            .tag(TendSettingsTab.automations.rawValue)
-
-            BehaviourSettingsPane(model: model, store: TendConfigStore.shared)
-                .tabItem { Label("Behaviour", systemImage: "bell.badge") }
-                .tag(TendSettingsTab.behaviour.rawValue)
-
-            ModulesSettingsPane(model: model, registry: TendModuleRegistry.shared)
-                .tabItem { Label("Modules", systemImage: "puzzlepiece.extension") }
-                .tag(TendSettingsTab.modules.rawValue)
+            .tendSettingsTab(.automations, model: model)
 
             TendFleetSettingsPane(model: model)
-                .tabItem { Label("Hosts", systemImage: "server.rack") }
-                .tag(TendSettingsTab.fleet.rawValue)
-
-            FleetDispatchSettingsView(model: model)
-                .tabItem { Label("Dispatch", systemImage: "network") }
-                .tag(TendSettingsTab.dispatch.rawValue)
-
-            TendRuntimeSettingsPane(model: model)
-                .tabItem { Label("Runtime", systemImage: "terminal") }
-                .tag(TendSettingsTab.runtime.rawValue)
+                .tendSettingsTab(.fleet, model: model)
 
             AdvancedSettingsPane(model: model, store: TendConfigStore.shared)
-                .tabItem { Label("Advanced", systemImage: "gearshape.2") }
-                .tag(TendSettingsTab.advanced.rawValue)
+                .tendSettingsTab(.advanced, model: model)
         }
-        .frame(width: 760, height: 640)
+        .onAppear(perform: migrateStoredSelection)
+        .onChange(of: storedTab) { _ in migrateStoredSelection() }
+    }
+
+    /// A deep link or an older build may have stored a tab that is now a
+    /// section of another one; store the tab that exists instead.
+    private func migrateStoredSelection() {
+        let resolved = TendSettingsTab.resolve(storedTab)
+        guard resolved.rawValue != storedTab else { return }
+        if let section = TendSettingsTab.fleetSection(for: storedTab) {
+            fleetSection = section.rawValue
+        }
+        storedTab = resolved.rawValue
+    }
+}
+
+private extension View {
+    /// One tab of the Settings window: its toolbar item, the window's size
+    /// limits, and the shared restart bar along the bottom.
+    func tendSettingsTab(_ tab: TendSettingsTab, model: AppModel) -> some View {
+        safeAreaInset(edge: .bottom, spacing: 0) {
+            TendRestartBar(model: model, store: TendConfigStore.shared)
+        }
+        .frame(
+            minWidth: TendSettingsWindowSize.minWidth,
+            idealWidth: TendSettingsWindowSize.idealWidth,
+            maxWidth: .infinity,
+            minHeight: TendSettingsWindowSize.minHeight,
+            idealHeight: TendSettingsWindowSize.idealHeight,
+            maxHeight: .infinity
+        )
+        .background(TendSettingsWindowResizing())
+        .tabItem { Label(tab.title, systemImage: tab.systemImage) }
+        .tag(tab)
+    }
+}
+
+/// SwiftUI's Settings window has a fixed frame; this lets it resize within
+/// the minimum the tabs need.
+private struct TendSettingsWindowResizing: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView { ResizingView() }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+
+    final class ResizingView: NSView {
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            guard let window else { return }
+            window.styleMask.insert(.resizable)
+            window.contentMinSize = NSSize(
+                width: TendSettingsWindowSize.minWidth,
+                height: TendSettingsWindowSize.minHeight
+            )
+        }
     }
 }
 
@@ -136,6 +266,206 @@ struct TendSettingsShortcut: View {
     }
 }
 
+// MARK: - Shared pieces
+
+/// The one style for help under a control: detail size, secondary colour,
+/// wrapping instead of truncating.
+struct TendSettingsCaption: View {
+    private let text: Text
+
+    init(_ key: LocalizedStringKey) { text = Text(key) }
+    init(verbatim: String) { text = Text(verbatim: verbatim) }
+
+    var body: some View {
+        text
+            .font(TendType.detail)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+/// An ⓘ button whose popover holds an explanation too long for a caption.
+struct TendSettingsInfoButton<Content: View>: View {
+    let title: LocalizedStringKey
+    var tint: Color = .secondary
+    @ViewBuilder let content: Content
+    @State private var isShown = false
+
+    var body: some View {
+        Button { isShown.toggle() } label: {
+            Image(systemName: "info.circle")
+                .foregroundStyle(tint)
+        }
+        .buttonStyle(.borderless)
+        .help(title)
+        .accessibilityLabel(Text(title))
+        .popover(isPresented: $isShown, arrowEdge: .bottom) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(title).font(.headline)
+                content
+                    .font(TendType.detail)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(14)
+            .frame(width: 360, alignment: .leading)
+        }
+    }
+}
+
+/// Save and Revert for the two editors that cannot apply as you type
+/// (Fleet › Dispatch and the raw configuration file), in one place and one
+/// order everywhere.
+struct TendSettingsFooter<Status: View, Leading: View>: View {
+    var isBusy = false
+    let canRevert: Bool
+    let canSave: Bool
+    var revertTitle: LocalizedStringKey = "Revert"
+    let revert: () -> Void
+    let save: () -> Void
+    @ViewBuilder let status: Status
+    @ViewBuilder let leading: Leading
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 10) {
+                leading
+                status
+                    .font(TendType.detail)
+                    .fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: 8)
+                if isBusy {
+                    ProgressView().controlSize(.small)
+                }
+                Button(revertTitle, action: revert)
+                    .disabled(!canRevert || isBusy)
+                Button("Save", action: save)
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut("s", modifiers: .command)
+                    .disabled(!canSave || isBusy)
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 10)
+        }
+        .background(.bar)
+    }
+}
+
+extension TendSettingsFooter where Leading == EmptyView {
+    init(
+        isBusy: Bool = false,
+        canRevert: Bool,
+        canSave: Bool,
+        revertTitle: LocalizedStringKey = "Revert",
+        revert: @escaping () -> Void,
+        save: @escaping () -> Void,
+        @ViewBuilder status: () -> Status
+    ) {
+        self.init(
+            isBusy: isBusy,
+            canRevert: canRevert,
+            canSave: canSave,
+            revertTitle: revertTitle,
+            revert: revert,
+            save: save,
+            status: status,
+            leading: { EmptyView() }
+        )
+    }
+}
+
+/// Whether a saved configuration change still waits for tendd to restart.
+///
+/// The daemon's generation goes up each time it starts, so a change saved
+/// under one generation is applied once another one answers.
+struct TendRestartNotice: Equatable, Sendable {
+    private(set) var isPending = false
+    /// The generation the first unapplied change was saved under; nil when
+    /// the daemon did not report one.
+    private(set) var savedGeneration: UInt64?
+
+    /// Whether the bar shows while `current` is the running generation.
+    func isShown(currentGeneration current: UInt64?) -> Bool {
+        guard isPending else { return false }
+        guard let savedGeneration, let current else { return true }
+        return savedGeneration == current
+    }
+
+    /// Records a change that applies on the next restart.
+    mutating func noteSaved(generation: UInt64?) {
+        if !isShown(currentGeneration: generation) { savedGeneration = generation }
+        isPending = true
+    }
+
+    mutating func clear() {
+        isPending = false
+        savedGeneration = nil
+    }
+}
+
+extension AppModel {
+    /// The local tendd's start count, when it reports one.
+    var localDaemonGeneration: UInt64? {
+        fleetHosts.first(where: \.local)?.daemonGeneration
+    }
+}
+
+/// "Restart tendd to apply", along the bottom of every tab, while a saved
+/// change waits for the daemon. Replaces the per-tab restart sentences.
+struct TendRestartBar: View {
+    @ObservedObject var model: AppModel
+    @ObservedObject var store: TendConfigStore
+
+    var body: some View {
+        if store.restartNotice.isShown(currentGeneration: model.localDaemonGeneration) {
+            VStack(spacing: 0) {
+                Divider()
+                HStack(spacing: 10) {
+                    Image(systemName: "arrow.clockwise.circle.fill")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    Text("Restart tendd to apply")
+                        .font(TendType.detail.weight(.medium))
+                    Spacer(minLength: 8)
+                    TendDaemonReloadButton(model: model, title: "Restart") {
+                        store.clearRestartNotice()
+                    }
+                    .controlSize(.small)
+                }
+                .padding(.horizontal, 20)
+                .padding(.vertical, 8)
+            }
+            .background(.bar)
+        }
+    }
+}
+
+/// The app's one daemon reload, with its confirmation. Settings › Advanced
+/// shows it; the restart bar and the few panes that must reload tendd for
+/// a reason of their own reuse it rather than carrying their own alert.
+struct TendDaemonReloadButton: View {
+    @ObservedObject var model: AppModel
+    var title: LocalizedStringKey = "Reload tendd…"
+    var onReload: (() -> Void)?
+    @State private var confirmsReload = false
+
+    var body: some View {
+        Button(title) { confirmsReload = true }
+            .alert("Reload the bundled tendd?", isPresented: $confirmsReload) {
+                Button("Cancel", role: .cancel) {}
+                Button("Reload", role: .destructive) {
+                    onReload?()
+                    model.replaceRunningDaemon()
+                }
+            } message: {
+                Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shells will end. tmux sessions are not terminated.")
+            }
+    }
+}
+
+// MARK: - Menu Bar
+
 private struct TendMenuBarSettingsView: View {
     @ObservedObject var model: AppModel
     @State private var hostIcons = TendHostIcons.all()
@@ -143,7 +473,6 @@ private struct TendMenuBarSettingsView: View {
     @AppStorage(TendPreferences.menuBarAgentLimitKey) private var menuBarAgentLimit = TendPreferences.defaultMenuBarAgentLimit
     @AppStorage(TendPreferences.menuBarGroupingKey) private var menuBarGrouping = TendMenuBarGrouping.agent.rawValue
     @AppStorage(TendPreferences.menuBarAasChipKey) private var showAasChip = true
-    @ObservedObject private var registry = TendModuleRegistry.shared
 
     var body: some View {
         Form {
@@ -157,49 +486,57 @@ private struct TendMenuBarSettingsView: View {
                         Text(verbatim: String(count)).tag(count)
                     }
                 }
-                Text("Additional activity stays in the +N list. Reviewed agents are hidden until new activity arrives.")
-                    .font(TendType.detail).foregroundStyle(.secondary)
-                Text("AAS appears as a hoverable usage chip when its module is enabled.")
-                    .font(TendType.detail).foregroundStyle(.secondary)
-            }
-
-            Section("Fleet host icons") {
-                Text("Shown when activity is grouped by host. Agents show their provider: a spark for Claude, >_ for Codex.")
-                    .font(TendType.detail).foregroundStyle(.secondary)
-                if model.fleetHosts.isEmpty {
-                    Text("No fleet hosts yet.").font(TendType.detail).foregroundStyle(.secondary)
-                }
-                ForEach(model.fleetHosts) { host in
-                    hostIconRow(host)
-                }
-            }
-
-            Section("Accounts and usage") {
+                TendSettingsCaption("Additional activity stays in the +N list. Reviewed agents are hidden until new activity arrives.")
                 Toggle("Show AAS usage chip", isOn: $showAasChip)
-                Text("Hover to see active account usage. Click to compare all accounts.")
-                    .font(TendType.detail).foregroundStyle(.secondary)
-                if !registry.isEnabled("aas") {
-                    Button("Enable AAS module") { registry.setEnabled("aas", true) }
-                } else if let module = registry.module(AasModule.self), !module.availability.isAvailable {
-                    Text(verbatim: module.availability.summary).font(TendType.detail).foregroundStyle(.secondary)
+                TendSettingsCaption("Hover to see active account usage. Click to compare all accounts.")
+            }
+
+            Section {
+                if model.fleetHosts.isEmpty {
+                    TendSettingsCaption("No fleet hosts yet.")
+                } else {
+                    hostIconTable
                 }
-                TendSettingsShortcut(tab: .modules, title: "Open Accounts settings")
+            } header: {
+                Text("Fleet host icons")
+            } footer: {
+                TendSettingsCaption("Shown when activity is grouped by host. Agents show their provider: a spark for Claude, >_ for Codex.")
             }
         }
         .formStyle(.grouped)
-        .padding(.top, 8)
+    }
+
+    private var hostIconTable: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 8) {
+            GridRow {
+                Text("Host")
+                Text("Symbol")
+                Text("Text")
+                Color.clear.frame(width: 1, height: 1)
+            }
+            .font(TendType.detail)
+            .foregroundStyle(.secondary)
+            .accessibilityHidden(true)
+            Divider()
+            ForEach(model.fleetHosts) { host in
+                hostIconRow(host)
+            }
+        }
     }
 
     private func hostIconRow(_ host: TendFleetHost) -> some View {
         let icon = TendHostIcons.icon(for: host.alias, local: host.local)
         let isCustomText = TendGlyph.kind(icon) != .symbol(icon)
-        return HStack(spacing: 10) {
-            TendGlyphView(value: icon, size: 12)
-                .frame(width: 26, height: 26)
-                .background(TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
-                .accessibilityHidden(true)
-            Text(verbatim: host.alias)
-            Spacer()
+        return GridRow {
+            HStack(spacing: 8) {
+                TendGlyphView(value: icon, size: 11)
+                    .frame(width: 22, height: 22)
+                    .background(TendMenuBarAgentAppearance(identity: host.alias, symbol: icon, provider: "").gradient, in: Circle())
+                    .accessibilityHidden(true)
+                Text(verbatim: host.alias)
+                    .lineLimit(1)
+            }
+            .gridColumnAlignment(.leading)
             Menu {
                 ForEach(TendHostIcons.choices, id: \.self) { symbol in
                     Button {
@@ -215,13 +552,6 @@ private struct TendMenuBarSettingsView: View {
             .fixedSize()
             .help("Choose a symbol")
             .accessibilityLabel(Text("Choose a symbol"))
-            // A Form would put the field's own label beside it and squeeze
-            // both into the fixed width; the caption sits outside instead.
-            Text("Text")
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-                .fixedSize()
-                .accessibilityHidden(true)
             TextField("Text", text: Binding(
                 get: { customText[host.alias] ?? (isCustomText ? String(icon.dropFirst(TendGlyph.textPrefix.count)) : "") },
                 set: { value in
@@ -236,13 +566,18 @@ private struct TendMenuBarSettingsView: View {
             .frame(width: 48)
             .accessibilityLabel(Text("Text"))
             .help("Up to two characters or an emoji instead of a symbol")
-            if hostIcons[host.alias] != nil {
-                Button("Reset") {
-                    customText[host.alias] = ""
-                    setIcon(nil, for: host.alias)
+            Group {
+                if hostIcons[host.alias] != nil {
+                    Button("Use Default") {
+                        customText[host.alias] = ""
+                        setIcon(nil, for: host.alias)
+                    }
+                    .controlSize(.small)
+                } else {
+                    Color.clear.frame(width: 1, height: 1)
                 }
-                .controlSize(.small)
             }
+            .gridColumnAlignment(.trailing)
         }
     }
 
@@ -252,6 +587,8 @@ private struct TendMenuBarSettingsView: View {
         hostIcons = TendHostIcons.all()
     }
 }
+
+// MARK: - General
 
 private struct TendGeneralSettingsView: View {
     @AppStorage(TendPreferences.appearanceKey) private var appearance = TendAppearance.system.rawValue
@@ -274,19 +611,28 @@ private struct TendGeneralSettingsView: View {
                         Text(option.title).tag(option.rawValue)
                     }
                 }
-                .pickerStyle(.segmented)
-                Text("System follows the current macOS appearance automatically.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("System follows the current macOS appearance automatically.")
             }
 
             TendLanguageSettingsSection()
 
+            Section("Startup") {
+                Toggle("Show the Workbench when Tend launches", isOn: $showWorkbenchOnLaunch)
+                TendSettingsCaption("When disabled, Tend starts in the menu bar and keeps host monitoring available.")
+                Button("Show Welcome Guide…") {
+                    openWindow(id: OnboardingPreferences.windowID)
+                    NSApp.activate(ignoringOtherApps: true)
+                }
+                .buttonStyle(.link)
+                .help("The first-launch tour of Work, Explore, Inbox, and Shells, with the setup checklist.")
+            }
+
             Section("Home") {
                 Toggle("Animate cards moving between lanes", isOn: $homeAnimatesMoves)
-                Text("A card glides to its new lane and shows where it came from for a few seconds.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
+                TendSettingsCaption("A card glides to its new lane and shows where it came from for a few seconds.")
+            }
+
+            Section("Keyboard shortcut") {
                 Picker("Show agents from any app", selection: $agentsHotKey) {
                     ForEach(TendHotKeyPreset.allCases) { preset in
                         Text(preset.title).tag(preset.rawValue)
@@ -300,35 +646,30 @@ private struct TendGeneralSettingsView: View {
                         .font(TendType.detail)
                         .foregroundStyle(.orange)
                 } else {
-                    Text("Brings Tend forward with the agents palette, those waiting on you first.")
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
+                    TendSettingsCaption("Brings Tend forward with the agents palette, those waiting on you first.")
                 }
             }
 
-            Section("Startup") {
-                Toggle("Show the Workbench when Tend launches", isOn: $showWorkbenchOnLaunch)
-                Text("When disabled, Tend starts in the menu bar and keeps host monitoring available.")
-                    .font(TendType.detail)
-                    .foregroundStyle(.secondary)
-                HStack {
-                    Button("Show Welcome Guide…") {
-                        openWindow(id: OnboardingPreferences.windowID)
-                        NSApp.activate(ignoringOtherApps: true)
-                    }
-                    Text("The first-launch tour of Work, Explore, Inbox, and Shells, with the setup checklist.")
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
-                }
-            }
-
-            Section("Work") {
-                HStack {
-                    TextField("Default project folder", text: $workDirectory)
-                        .textFieldStyle(.roundedBorder)
-                    Button("Choose…", action: chooseWorkDirectory)
-                    if !workDirectory.isEmpty {
-                        Button("Clear") { workDirectory = "" }
+            Section("Default project folder") {
+                LabeledContent("Folder") {
+                    HStack(spacing: 8) {
+                        Group {
+                            if workDirectory.isEmpty {
+                                Text("Not set")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text(verbatim: workDirectory)
+                                    .font(TendType.detail.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                        }
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(workDirectory)
+                        Button("Choose…", action: chooseWorkDirectory)
+                        if !workDirectory.isEmpty {
+                            Button("Clear") { workDirectory = "" }
+                        }
                     }
                 }
                 if !directoryExists {
@@ -336,14 +677,11 @@ private struct TendGeneralSettingsView: View {
                         .font(TendType.detail)
                         .foregroundStyle(.orange)
                 } else {
-                    Text("Used as the initial folder in Start Work. Leave empty to use route configuration.")
-                        .font(TendType.detail)
-                        .foregroundStyle(.secondary)
+                    TendSettingsCaption("Used as the initial folder in Start Work. Leave empty to use route configuration.")
                 }
             }
         }
         .formStyle(.grouped)
-        .padding(.top, 8)
     }
 
     private func chooseWorkDirectory() {
@@ -362,99 +700,60 @@ private struct TendGeneralSettingsView: View {
     }
 }
 
+// MARK: - Fleet
+
+/// Settings › Fleet: the hosts this controller watches, and how Fleet
+/// dispatch places work on them.
 private struct TendFleetSettingsPane: View {
     @ObservedObject var model: AppModel
-    @State private var isRegisteringHost = false
+    @AppStorage(TendPreferences.fleetSettingsSectionKey) private var section = TendFleetSettingsSection.hosts.rawValue
 
-    private var hosts: [TendFleetHost] {
-        model.fleetHosts.sorted { left, right in
-            if left.local != right.local { return left.local }
-            return left.alias.localizedStandardCompare(right.alias) == .orderedAscending
-        }
+    private var selection: Binding<TendFleetSettingsSection> {
+        Binding(
+            get: { TendFleetSettingsSection(rawValue: section) ?? .hosts },
+            set: { section = $0.rawValue }
+        )
     }
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack {
-                settingsHeading(
-                    "Hosts",
-                    detail: "Local and SSH hosts registered with the central tendd controller."
-                )
-                Spacer()
-                Button {
-                    Task { await model.refresh() }
-                } label: {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
-                Button {
-                    model.prepareHostRegistration()
-                    isRegisteringHost = true
-                } label: {
-                    Label("Add Host…", systemImage: "plus")
-                }
-                .buttonStyle(.borderedProminent)
+            Picker("Fleet settings", selection: selection) {
+                Text("Hosts").tag(TendFleetSettingsSection.hosts)
+                Text("Dispatch").tag(TendFleetSettingsSection.dispatch)
             }
-            .padding(20)
-
-            Divider()
-
-            if hosts.isEmpty {
-                VStack(spacing: 10) {
-                    Image(systemName: "server.rack")
-                        .font(.system(size: 30))
-                        .foregroundStyle(.secondary)
-                    Text("No Hosts").font(.headline)
-                    Text("Register an SSH host to monitor its agents from Tend.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    LazyVStack(spacing: 10) {
-                        ForEach(hosts) { host in
-                            TendFleetSettingsRow(host: host)
-                        }
-                        if !hosts.contains(where: { !$0.local }) {
-                            Label("No SSH hosts yet. Add one to watch its panes and run Work on it from this Mac.", systemImage: "info.circle")
-                                .font(TendType.detail)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                    }
-                    .padding(16)
-                }
-            }
-        }
-        .sheet(isPresented: $isRegisteringHost) {
-            HostRegistrationView(model: model)
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .fixedSize()
+            .padding(.top, 14)
+            .padding(.bottom, 2)
+            FleetDispatchSettingsView(model: model, section: selection.wrappedValue)
         }
     }
 }
 
-private struct TendFleetSettingsRow: View {
+/// One host in Settings › Fleet › Hosts.
+struct TendFleetSettingsRow: View {
     let host: TendFleetHost
+    /// Nil when labels cannot be edited from here.
+    var onEditLabels: (() -> Void)?
 
-    private var stateColor: Color {
-        fleetHostColor(host.state)
+    private var labelText: String {
+        (host.labels ?? [:]).sorted { $0.key < $1.key }.map { "\($0.key)=\($0.value)" }.joined(separator: ", ")
     }
 
     var body: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 9)
-                    .fill(Color.accentColor.opacity(0.1))
-                Image(systemName: host.local ? "desktopcomputer" : "server.rack")
-                    .foregroundStyle(.tint)
-            }
-            .frame(width: 42, height: 42)
-            .accessibilityHidden(true)
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: host.local ? "desktopcomputer" : "server.rack")
+                .foregroundStyle(.tint)
+                .frame(width: 28, height: 28)
+                .background(Color.accentColor.opacity(0.1), in: RoundedRectangle(cornerRadius: TendTheme.panelRadius))
+                .accessibilityHidden(true)
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 3) {
                 HStack(spacing: 7) {
                     // The dot's colour is backed by the state in words, so
                     // the state never rests on colour alone.
-                    Circle().fill(stateColor).frame(width: 7, height: 7)
+                    Circle().fill(fleetHostColor(host.state)).frame(width: 7, height: 7)
                         .accessibilityHidden(true)
                     Text(host.alias).font(.headline)
                     Group {
@@ -480,9 +779,19 @@ private struct TendFleetSettingsRow: View {
                 .font(TendType.detail.monospaced())
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+                Group {
+                    if labelText.isEmpty {
+                        Text("No labels")
+                    } else {
+                        Text(verbatim: labelText).textSelection(.enabled)
+                    }
+                }
+                .font(TendType.detail)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
             }
 
-            Spacer()
+            Spacer(minLength: 8)
 
             VStack(alignment: .trailing, spacing: 4) {
                 Group {
@@ -494,143 +803,14 @@ private struct TendFleetSettingsRow: View {
                 }
                 .font(TendType.detail.monospacedDigit())
                 Text("\(host.remote?.agents.count ?? 0) agents · \(host.remote?.panes.count ?? 0) panes")
-                    .font(TendType.meta)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(12)
-        .background(Color.primary.opacity(0.035), in: RoundedRectangle(cornerRadius: 10))
-    }
-}
-
-private struct TendRuntimeSettingsPane: View {
-    @ObservedObject var model: AppModel
-
-    private static let buildCommit: String? = {
-        guard let url = Bundle.main.url(forResource: "tend-build", withExtension: "json"),
-              let data = try? Data(contentsOf: url),
-              let document = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let commit = document["commit"] as? String else { return nil }
-        return String(commit.prefix(12))
-    }()
-
-    private var localHost: TendFleetHost? {
-        model.fleetHosts.first(where: \.local)
-    }
-
-    private var connectionTitle: String {
-        switch model.connectionState {
-        case .connecting: String(localized: "Connecting")
-        case .connected: String(localized: "Connected")
-        case .upgradeRequired: String(localized: "Upgrade required")
-        case .failed: String(localized: "Connection failed")
-        }
-    }
-
-    private var connectionColor: Color {
-        switch model.connectionState {
-        case .connected: .green
-        case .connecting: .orange
-        case .upgradeRequired, .failed: .red
-        }
-    }
-
-    var body: some View {
-        Form {
-            Section("Connection") {
-                LabeledContent("Status") {
-                    Label(connectionTitle, systemImage: "circle.fill")
-                        .foregroundStyle(connectionColor)
-                }
-                LabeledContent("Socket") {
-                    Text(model.client.socketPath)
-                        .font(.callout.monospaced())
-                        .textSelection(.enabled)
-                }
-                if case .failed(let detail) = model.connectionState {
-                    Text(detail).font(TendType.detail).foregroundStyle(.red).textSelection(.enabled)
-                }
-                if case .upgradeRequired(let detail) = model.connectionState {
-                    Text(detail).font(TendType.detail).foregroundStyle(.red).textSelection(.enabled)
-                }
-            }
-
-            Section("Runtime") {
-                if let commit = Self.buildCommit {
-                    LabeledContent("App build") {
-                        Text(verbatim: commit).font(.callout.monospaced()).textSelection(.enabled)
-                    }
-                }
-                LabeledContent("tend") {
-                    Group {
-                        if let version = localHost?.tendVersion {
-                            Text(version)
-                        } else {
-                            Text("Unavailable")
-                        }
-                    }
-                    .monospacedDigit()
-                }
-                LabeledContent("Daemon generation") {
-                    Group {
-                        if let generation = localHost?.daemonGeneration {
-                            Text(verbatim: String(generation))
-                        } else {
-                            Text("Unavailable")
-                        }
-                    }
-                    .monospacedDigit()
-                }
-                LabeledContent("Native shells") {
-                    Text("\(model.sessions.lazy.filter { !$0.exited }.count) active")
-                        .monospacedDigit()
-                }
-                LabeledContent("Hosts") {
-                    Text("\(model.fleetHosts.lazy.filter { $0.state == "online" }.count) / \(model.fleetHosts.count) online")
-                        .monospacedDigit()
-                }
-            }
-
-            Section {
-                HStack {
-                    Button("Retry Connection") { model.retryConnection() }
-                        .disabled(model.connectionState == .connecting)
-                    Spacer()
-                    TendDaemonReloadButton(model: model, title: "Reload Bundled tendd…")
-                }
-                Text("Reloading replaces the process on the owner-only socket. tmux sessions remain, but native PTY sessions end.")
                     .font(TendType.detail)
                     .foregroundStyle(.secondary)
+                if let onEditLabels {
+                    Button("Edit Labels…", action: onEditLabels)
+                        .controlSize(.small)
+                }
             }
         }
-        .formStyle(.grouped)
-        .padding(.top, 8)
-    }
-}
-
-/// The Runtime tab's daemon reload, shared by every pane that has to say a
-/// change only applies after tendd restarts. One button, one confirmation.
-struct TendDaemonReloadButton: View {
-    @ObservedObject var model: AppModel
-    var title: LocalizedStringKey = "Reload tendd…"
-    @State private var confirmsReload = false
-
-    var body: some View {
-        Button(title) { confirmsReload = true }
-            .alert("Reload the bundled tendd?", isPresented: $confirmsReload) {
-                Button("Cancel", role: .cancel) {}
-                Button("Reload", role: .destructive) { model.replaceRunningDaemon() }
-            } message: {
-                Text("\(model.sessions.lazy.filter { !$0.exited }.count) active native shells will end. tmux sessions are not terminated.")
-            }
-    }
-}
-
-/// Shared by the settings panes, including `AskProvidersSettingsPane`.
-@ViewBuilder
-func settingsHeading(_ title: LocalizedStringKey, detail: LocalizedStringKey) -> some View {
-    VStack(alignment: .leading, spacing: 3) {
-        Text(title).font(.title2.weight(.semibold))
-        Text(detail).font(.subheadline).foregroundStyle(.secondary)
+        .padding(.vertical, 2)
     }
 }

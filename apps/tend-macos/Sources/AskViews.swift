@@ -222,7 +222,7 @@ struct TendAskView: View {
     }
 
     /// Conversations first: starting a new one is the most common action in
-    /// this bar, so it leads. Provider setup lives in Settings › Providers.
+    /// this bar, so it leads. Provider setup lives in Settings › Ask.
     private var conversationMenu: some View {
         Menu {
             Button {

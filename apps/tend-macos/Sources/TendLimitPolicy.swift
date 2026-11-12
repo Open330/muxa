@@ -144,16 +144,23 @@ extension AutomationStore {
 // MARK: - View
 
 /// The three choices, with the current one checked. Used in the rate-limit
-/// popover, the usage popover and Settings › Automations.
+/// popover, the usage popover and Settings › Accounts.
 struct TendLimitPolicyPicker: View {
     @ObservedObject var model: AppModel
     @ObservedObject var store: AutomationStore = .shared
     var compact = false
+    /// Off where a section header already says it.
+    var showsTitle = true
+
+    /// Popovers annotate at meta size; Settings captions are detail size.
+    private var noteFont: Font { compact ? TendType.meta : TendType.detail }
 
     var body: some View {
         VStack(alignment: .leading, spacing: compact ? 4 : 8) {
-            Text("When an agent hits its usage limit")
-                .font(compact ? TendType.detail.weight(.semibold) : .headline)
+            if showsTitle {
+                Text("When an agent hits its usage limit")
+                    .font(compact ? TendType.detail.weight(.semibold) : .headline)
+            }
             if !store.hasLoaded {
                 ProgressView().controlSize(.small)
             } else if !store.isSupported {
@@ -165,18 +172,18 @@ struct TendLimitPolicyPicker: View {
                     row(policy)
                 }
                 Text("Applies to agents on this Mac. Fleet hosts follow their own tendd's rules, so a capped agent there still asks for you.")
-                    .font(TendType.meta)
+                    .font(noteFont)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if store.snapshot.isPaused() {
                     Label("Automations are paused, so nothing happens on its own until they resume.", systemImage: "pause.circle")
-                        .font(TendType.meta)
+                        .font(noteFont)
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if let error = store.actionError {
                     Text(error)
-                        .font(TendType.meta)
+                        .font(noteFont)
                         .foregroundStyle(.red)
                         .fixedSize(horizontal: false, vertical: true)
                 }
@@ -203,7 +210,7 @@ struct TendLimitPolicyPicker: View {
                         .font(TendType.detail.weight(selected ? .semibold : .regular))
                     if !compact || selected {
                         Text(policy.detail)
-                            .font(TendType.meta)
+                            .font(noteFont)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
