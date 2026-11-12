@@ -239,7 +239,12 @@ async fn run() -> Result<()> {
         .clone()
         .or(cfg.socket.clone())
         .unwrap_or_else(paths::default_socket);
-    tracing::info!(socket = %socket.display(), "starting tendd");
+    tracing::info!(
+        socket = %socket.display(),
+        generation = restart_generation(),
+        boot_id = tend::ipc::daemon_boot_id(),
+        "starting tendd"
+    );
     // A second daemon used to load the registry, start its snapshotter and
     // notifiers and heal tmux before its bind failed — and a KeepAlive
     // service manager restarted it every ten seconds for as long as the
@@ -655,7 +660,10 @@ async fn run() -> Result<()> {
 }
 
 /// Image generation advertised in IPC `hello`: zero on a fresh process and
-/// incremented for each successful self-reexec.
+/// incremented for each successful self-reexec. It is not a start identity —
+/// an external stop/start is back at zero — so `hello` also carries
+/// `tend::ipc::daemon_boot_id()`, which every process image (a re-exec
+/// included) draws afresh.
 fn restart_generation() -> u64 {
     std::env::var(RESTART_GENERATION_ENV)
         .ok()

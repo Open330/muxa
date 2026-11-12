@@ -197,9 +197,21 @@ final class AppModel: ObservableObject {
     @Published private(set) var askAgent = "claude"
     @Published private(set) var askEnabled: Bool?
     @Published private(set) var askConfigurationPendingReload = false
-    /// The pid of the process that owns tendd's socket, read after each
-    /// connection; nil until known. Part of `localDaemonIdentity`.
+    /// The boot id from the last successful `hello` — every refresh, so the
+    /// reconciliation loop and reconnects keep it current. Part of
+    /// `localDaemonIdentity`.
+    @Published private(set) var localDaemonBootID: String?
+    /// The last successful `hello` carried no boot id (an older tendd).
+    @Published private(set) var localDaemonLacksBootID = false
+    /// The pid of the process that owns tendd's socket; nil until known.
+    /// Looked up only for a daemon without a boot id, after a connection or
+    /// an observed disconnect. Part of `localDaemonIdentity`.
     @Published private(set) var localDaemonPID: Int32?
+    /// The next hello from a daemon without a boot id should look the socket
+    /// owner up again: set on connecting and on every observed failure.
+    private var daemonPIDLookupDue = false
+    private var daemonPIDLookupTask: Task<Void, Never>?
+    private var daemonPIDLookupAgain = false
     /// Daemon replacements ("Reload tendd") that completed, so a restart the
     /// app made is told apart even when the new process reports the same
     /// generation.
@@ -350,7 +362,10 @@ final class AppModel: ObservableObject {
         connectionGeneration &+= 1
         let generation = connectionGeneration
         connectionState = .connecting
+        localDaemonBootID = nil
+        localDaemonLacksBootID = false
         localDaemonPID = nil
+        daemonPIDLookupDue = true
         refreshTask = Task { [weak self] in
             guard let self else { return }
             defer {
@@ -366,7 +381,6 @@ final class AppModel: ObservableObject {
                     try await daemon.ensureRunning(client: client)
                 }
                 guard connectionGeneration == generation else { return }
-                Task { [weak self] in await self?.readLocalDaemonPID(ifGeneration: generation) }
                 if connectionState != .connected { connectionState = .connected }
                 await refresh(ifGeneration: generation)
                 // The Inbox badge and sidebar counts are derived from the
@@ -406,13 +420,49 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Which process answers on the socket now. Best effort: a failed
-    /// lookup leaves the pid unknown, which the restart bar treats as "could
-    /// still be the same daemon".
-    private func readLocalDaemonPID(ifGeneration generation: UInt64) async {
-        let owner = try? await DaemonSocketOwner.find(socketPath: client.socketPath)
-        guard connectionGeneration == generation else { return }
-        localDaemonPID = owner?.pid
+    /// Records which daemon answered a successful `hello`. A boot id names
+    /// the process outright; without one the socket owner's pid stands in,
+    /// looked up only when a connection or disconnect makes it stale.
+    private func adoptDaemonHello(_ hello: TendDaemonHello) {
+        if let bootID = hello.bootID {
+            if localDaemonBootID != bootID { localDaemonBootID = bootID }
+            if localDaemonLacksBootID { localDaemonLacksBootID = false }
+            if localDaemonPID != nil { localDaemonPID = nil }
+            daemonPIDLookupDue = false
+        } else {
+            if localDaemonBootID != nil { localDaemonBootID = nil }
+            if !localDaemonLacksBootID { localDaemonLacksBootID = true }
+            if daemonPIDLookupDue {
+                daemonPIDLookupDue = false
+                lookUpLocalDaemonPID()
+            }
+        }
+        TendConfigStore.shared.observeDaemon(localDaemonIdentity)
+    }
+
+    /// Which process owns the socket now. Concurrent requests coalesce into
+    /// one more lookup; `lsof` is bounded by `DaemonSocketOwner.lookupTimeout`.
+    /// Best effort: a failed lookup leaves the pid unknown, which the restart
+    /// bar treats as "could still be the same daemon".
+    private func lookUpLocalDaemonPID() {
+        guard daemonPIDLookupTask == nil else {
+            daemonPIDLookupAgain = true
+            return
+        }
+        daemonPIDLookupTask = Task { [weak self] in
+            guard let self else { return }
+            repeat {
+                daemonPIDLookupAgain = false
+                let generation = connectionGeneration
+                let owner = try? await DaemonSocketOwner.find(socketPath: client.socketPath)
+                if connectionGeneration == generation, localDaemonLacksBootID,
+                   localDaemonPID != owner?.pid {
+                    localDaemonPID = owner?.pid
+                    TendConfigStore.shared.observeDaemon(localDaemonIdentity)
+                }
+            } while daemonPIDLookupAgain
+            daemonPIDLookupTask = nil
+        }
     }
 
     func refresh() async {
@@ -424,7 +474,10 @@ final class AppModel: ObservableObject {
         refreshInFlight = true
         defer { refreshInFlight = false }
         do {
-            try await client.hello()
+            let hello = try await client.hello()
+            if generation == nil || connectionGeneration == generation {
+                adoptDaemonHello(hello)
+            }
             async let sessionsRequest = client.listSessions()
             async let pipelineRequest = client.listPipelineRuns()
             async let executionRequest = client.executionSnapshot()
@@ -501,6 +554,7 @@ final class AppModel: ObservableObject {
             return
         } catch {
             if let generation, connectionGeneration != generation { return }
+            daemonPIDLookupDue = true
             TendLog.app.error(
                 "refresh failed: \(error.localizedDescription, privacy: .public)"
             )
@@ -523,11 +577,19 @@ final class AppModel: ObservableObject {
     /// gaps without returning to a high-frequency poll.
     private func runFleetSubscription(ifGeneration generation: UInt64) async {
         guard await client.supports(TendIPCClient.fleetSubscribeCapability) else { return }
+        var reconnecting = false
         while !Task.isCancelled, connectionGeneration == generation {
             do {
                 let updates = try await client.fleetUpdates()
                 for try await update in updates {
                     guard !Task.isCancelled, connectionGeneration == generation else { return }
+                    if reconnecting {
+                        // The stream is back, possibly on a different
+                        // daemon: hello again now rather than at the next
+                        // reconciliation tick, so its boot id is current.
+                        reconnecting = false
+                        Task { [weak self] in await self?.refresh(ifGeneration: generation) }
+                    }
                     if update.mailboxRevision != nil {
                         if mailboxRevisions[update.host] != update.mailboxRevision {
                             mailboxRevisions[update.host] = update.mailboxRevision
@@ -541,6 +603,10 @@ final class AppModel: ObservableObject {
                 return
             } catch {
                 guard connectionGeneration == generation else { return }
+                // The stream broke: the daemon may have been replaced
+                // without a refresh ever failing.
+                daemonPIDLookupDue = true
+                reconnecting = true
                 TendLog.app.warning(
                     "Fleet invalidation stream reconnecting: \(error.localizedDescription, privacy: .public)"
                 )

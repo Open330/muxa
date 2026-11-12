@@ -377,18 +377,33 @@ extension TendSettingsFooter where Leading == EmptyView {
 
 /// Which tendd process is answering, as far as the app can tell.
 ///
-/// tendd's generation only counts self-re-execs (a fresh process starts at
-/// 0 again), so it is paired with the socket owner's pid and with the
-/// number of replacements this app has completed. A part that is unknown on
-/// either side is not used to tell two daemons apart.
+/// A tendd with `daemon_boot_id_v1` names its process with a random boot id,
+/// which settles the question. An older one does not, and its generation
+/// only counts self-re-execs (a fresh process starts at 0 again), so it is
+/// paired with the socket owner's pid. Both are paired with the number of
+/// replacements this app has completed. A part that is unknown on either
+/// side is not used to tell two daemons apart.
 struct TendDaemonIdentity: Equatable, Sendable {
+    /// The daemon's per-process boot id; nil until a hello carried one.
+    var bootID: String?
+    /// A hello succeeded without a boot id: an older tendd, told apart by
+    /// generation and pid only.
+    var lacksBootID = false
     var generation: UInt64?
+    /// The socket owner's pid; looked up only for a daemon without a boot id.
     var pid: Int32?
     /// Successful "Reload tendd" replacements since the app started.
     var replacements: UInt64 = 0
 
+    /// Whether anything names this process: a boot id, or knowing it has
+    /// none (so generation and pid are the evidence).
+    var isAnchored: Bool { bootID != nil || lacksBootID }
+
     func isSameDaemon(as other: TendDaemonIdentity) -> Bool {
         if replacements != other.replacements { return false }
+        if let bootID, let other = other.bootID { return bootID == other }
+        // One build names its process and the other cannot: two processes.
+        if bootID != nil && other.lacksBootID || lacksBootID && other.bootID != nil { return false }
         if let generation, let other = other.generation, generation != other { return false }
         if let pid, let other = other.pid, pid != other { return false }
         return true
@@ -402,6 +417,10 @@ struct TendRestartNotice: Equatable, Sendable {
     private(set) var isPending = false
     /// The daemon the first unapplied change was saved under.
     private(set) var savedUnder: TendDaemonIdentity?
+    /// Part of `savedUnder` was unknown at the save and was filled in from
+    /// the first daemon seen afterwards. That daemon may already be the
+    /// replacement, which only keeps the bar longer — never clears it early.
+    private(set) var learnedAfterSave = false
 
     /// Whether the bar shows while `current` is the daemon answering.
     func isShown(current: TendDaemonIdentity) -> Bool {
@@ -412,13 +431,42 @@ struct TendRestartNotice: Equatable, Sendable {
 
     /// Records a change that applies on the next restart.
     mutating func noteSaved(under current: TendDaemonIdentity) {
-        if !isShown(current: current) { savedUnder = current }
+        if !isShown(current: current) {
+            savedUnder = current
+            learnedAfterSave = false
+        }
         isPending = true
+    }
+
+    /// Fills what the save could not know from `current`, while `current` is
+    /// still indistinguishable from the saved daemon. Without this, a save
+    /// made before the first hello would compare unknown against every later
+    /// process and never clear.
+    mutating func observe(_ current: TendDaemonIdentity) {
+        guard isPending, var saved = savedUnder, saved.isSameDaemon(as: current) else { return }
+        var learned = false
+        if !saved.isAnchored, current.isAnchored {
+            saved.bootID = current.bootID
+            saved.lacksBootID = current.lacksBootID
+            learned = true
+        }
+        if saved.pid == nil, saved.lacksBootID, current.lacksBootID, let pid = current.pid {
+            saved.pid = pid
+            learned = true
+        }
+        if saved.generation == nil, let generation = current.generation {
+            saved.generation = generation
+            learned = true
+        }
+        guard learned else { return }
+        savedUnder = saved
+        learnedAfterSave = true
     }
 
     mutating func clear() {
         isPending = false
         savedUnder = nil
+        learnedAfterSave = false
     }
 }
 
@@ -426,6 +474,8 @@ extension AppModel {
     /// The local tendd as the restart bar tells daemons apart.
     var localDaemonIdentity: TendDaemonIdentity {
         TendDaemonIdentity(
+            bootID: localDaemonBootID,
+            lacksBootID: localDaemonLacksBootID,
             generation: fleetHosts.first(where: \.local)?.daemonGeneration,
             pid: localDaemonPID,
             replacements: daemonReplacements

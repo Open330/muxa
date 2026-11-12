@@ -113,6 +113,11 @@ async fn restart_is_advertised_accepted_and_drained() {
         .any(|cap| cap == RESTART_CAPABILITY));
     assert!(hello.capabilities.iter().any(|cap| cap == STOP_CAPABILITY));
     assert_eq!(hello.generation, Some(7));
+    assert_eq!(hello.boot_id.as_deref(), Some(daemon_boot_id()));
+    assert!(hello
+        .capabilities
+        .iter()
+        .any(|cap| cap == DAEMON_BOOT_ID_CAPABILITY));
 
     client
         .restart(Duration::from_secs(2))
@@ -1402,4 +1407,77 @@ async fn fleet_snapshot_selector_and_command_round_trip_over_ipc() {
     tokio::task::yield_now().await;
     let _ = shutdown_tx.send(());
     server_task.await.unwrap();
+}
+
+#[test]
+fn daemon_boot_id_is_random_shaped_and_stable_for_the_process() {
+    let first = daemon_boot_id();
+    assert_eq!(first.len(), 32, "{first}");
+    assert!(first.chars().all(|c| c.is_ascii_hexdigit()), "{first}");
+    assert_eq!(daemon_boot_id(), first);
+    assert!(
+        std::ptr::eq(first, daemon_boot_id()),
+        "drawn once per process"
+    );
+}
+
+#[test]
+fn hello_response_serializes_boot_id_and_capability() {
+    let value = serde_json::to_value(Response::hello(None)).unwrap();
+    assert_eq!(value["boot_id"], daemon_boot_id());
+    assert!(
+        value["generation"].is_null(),
+        "no controller, no generation"
+    );
+    assert!(value["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|cap| cap == DAEMON_BOOT_ID_CAPABILITY));
+    assert!(CAPABILITIES.contains(&DAEMON_BOOT_ID_CAPABILITY));
+    // Every other response kind keeps the field off the wire.
+    let plain = serde_json::to_value(Response::ok()).unwrap();
+    assert!(plain.get("boot_id").is_none());
+}
+
+#[tokio::test]
+async fn hello_from_a_daemon_without_boot_id_still_decodes() {
+    // A pre-`daemon_boot_id_v1` daemon: hand-rolled hello with no boot_id.
+    let dir = tempdir().unwrap();
+    let sock = dir.path().join("tend-old-hello.sock");
+    let listener = crate::transport::Listener::bind(&sock).unwrap();
+    let server = tokio::spawn(async move {
+        let stream = listener.accept().await.unwrap();
+        let (reader, mut writer) = stream.into_split();
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        // The per-connection handshake, then the hello itself.
+        reader.read_line(&mut line).await.unwrap();
+        writer.write_all(b"{\"ok\":true}\n").await.unwrap();
+        writer.flush().await.unwrap();
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let request: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(request["kind"], "hello");
+        let reply = serde_json::json!({
+            "ok": true,
+            "protocol": PROTOCOL_VERSION,
+            "min_protocol": 1,
+            "max_protocol": PROTOCOL_VERSION,
+            "capabilities": ["restart"],
+            "generation": 0,
+            "version": "0.0.1",
+        });
+        let mut bytes = serde_json::to_vec(&reply).unwrap();
+        bytes.push(b'\n');
+        writer.write_all(&bytes).await.unwrap();
+        writer.flush().await.unwrap();
+    });
+    let hello = Client::new(sock)
+        .hello(Duration::from_secs(2))
+        .await
+        .expect("an old hello still decodes");
+    assert_eq!(hello.boot_id, None);
+    assert_eq!(hello.generation, Some(0));
+    server.await.unwrap();
 }

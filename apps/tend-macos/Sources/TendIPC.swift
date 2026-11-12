@@ -978,6 +978,9 @@ private struct TendIPCResponse: Decodable, Sendable {
     let minProtocol: UInt32?
     let maxProtocol: UInt32?
     let capabilities: [String]?
+    /// `hello`'s per-process daemon identity (`daemon_boot_id_v1`); absent
+    /// from an older tendd.
+    let bootID: String?
     let agents: [TendAgent]?
     let sessions: [TendSession]?
     let session: TendSession?
@@ -1008,6 +1011,7 @@ private struct TendIPCResponse: Decodable, Sendable {
         case ok, error, capabilities, agents, sessions, session, output, capture, fleet, swap
         case minProtocol = "min_protocol"
         case maxProtocol = "max_protocol"
+        case bootID = "boot_id"
         case fleetResult = "fleet_result"
         case pipelineRuns = "pipeline_runs"
         case workCommand = "work_command"
@@ -1142,6 +1146,13 @@ final class SerializedIPCTransport: @unchecked Sendable {
     }
 }
 
+/// What a successful `hello` says about which daemon answered.
+struct TendDaemonHello: Equatable, Sendable {
+    /// Random per-process id; nil from a tendd older than
+    /// `daemon_boot_id_v1`, which the app then tells apart by socket owner pid.
+    var bootID: String?
+}
+
 actor TendIPCClient {
     static let protocolVersion: UInt32 = 6
     static let byteSafeCapability = "session_bytes_v1"
@@ -1155,9 +1166,13 @@ actor TendIPCClient {
     static let sessionWaitCapability = "session_wait_v1"
     static let askSubscribeCapability = "ask_subscribe"
     static let pipelineSubscribeCapability = "pipeline_subscribe"
+    static let daemonBootIDCapability = "daemon_boot_id_v1"
 
     let socketPath: String
     private(set) var capabilities: Set<String> = []
+    /// The boot id from the last successful `hello`; nil before one, or
+    /// when the daemon predates `daemon_boot_id_v1`.
+    private(set) var daemonBootID: String?
     private let transport: SerializedIPCTransport
     // Slow command execution and background snapshots must never queue in
     // front of terminal input, resize, attachment, or prompt delivery.
@@ -1209,7 +1224,8 @@ actor TendIPCClient {
         return "/tmp/tend-\(getuid()).sock"
     }
 
-    func hello() async throws {
+    @discardableResult
+    func hello() async throws -> TendDaemonHello {
         let response = try await call([
             "protocol": Self.protocolVersion,
             "kind": "hello",
@@ -1224,12 +1240,14 @@ actor TendIPCClient {
             )
         }
         capabilities = Set(response.capabilities ?? [])
+        daemonBootID = response.bootID.flatMap { $0.isEmpty ? nil : $0 }
         try requireNativeSessionCapabilities()
         guard capabilities.contains(Self.workControlCapability) else {
             throw TendIPCError.server(
                 "tendd does not support native Work control; update tend or choose Use Bundled tendd"
             )
         }
+        return TendDaemonHello(bootID: daemonBootID)
     }
 
     func listSessions() async throws -> [TendSession] {

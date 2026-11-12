@@ -22,49 +22,62 @@ struct DaemonSocketOwner: Equatable, Sendable {
     let pid: Int32
     let executablePath: String
 
-    static func find(socketPath: String) async throws -> DaemonSocketOwner {
-        try await Task.detached(priority: .userInitiated) {
-            let attributes = try FileManager.default.attributesOfItem(atPath: socketPath)
-            let socketOwner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
-            guard socketOwner == getuid() else {
-                throw TendIPCError.server("refusing to replace a socket not owned by this user")
-            }
+    /// How long `lsof` may take before the lookup gives up and kills it.
+    static let lookupTimeout: TimeInterval = 2
 
-            let process = Process()
-            let output = Pipe()
-            process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-            process.arguments = ["-nP", "-Fpcu", "-a", "-U", socketPath]
-            process.standardOutput = output
-            process.standardError = FileHandle.nullDevice
-            try process.run()
-            process.waitUntilExit()
+    static func find(
+        socketPath: String,
+        timeout: TimeInterval = lookupTimeout
+    ) async throws -> DaemonSocketOwner {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
+        process.arguments = ["-nP", "-Fpcu", "-a", "-U", socketPath]
+        let lsof = TendBoundedSubprocess(process)
+        return try await withTaskCancellationHandler {
+            try await Task.detached(priority: .userInitiated) {
+                try owner(socketPath: socketPath, lsof: lsof, timeout: timeout)
+            }.value
+        } onCancel: {
+            lsof.cancel()
+        }
+    }
 
-            let data = output.fileHandleForReading.readDataToEndOfFile()
-            let records = parseLsof(String(decoding: data, as: UTF8.self))
-            let candidates = records.compactMap { record -> Int32? in
-                guard record.command == "tendd", record.uid == getuid() else { return nil }
-                return record.pid
-            }
-            guard candidates.count == 1, let pid = candidates.first else {
-                throw TendIPCError.server(
-                    "could not identify exactly one owner-only tendd for \(socketPath)"
-                )
-            }
+    private static func owner(
+        socketPath: String,
+        lsof: TendBoundedSubprocess,
+        timeout: TimeInterval
+    ) throws -> DaemonSocketOwner {
+        let attributes = try FileManager.default.attributesOfItem(atPath: socketPath)
+        let socketOwner = (attributes[.ownerAccountID] as? NSNumber)?.uint32Value
+        guard socketOwner == getuid() else {
+            throw TendIPCError.server("refusing to replace a socket not owned by this user")
+        }
 
-            var pathBuffer = [CChar](repeating: 0, count: 4096)
-            let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
-            guard pathLength > 0 else {
-                throw TendIPCError.posix(operation: "proc_pidpath", code: errno)
-            }
-            let executablePath = String(
-                decoding: pathBuffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) },
-                as: UTF8.self
+        let data = try lsof.run(timeout: timeout)
+        let records = parseLsof(String(decoding: data, as: UTF8.self))
+        let candidates = records.compactMap { record -> Int32? in
+            guard record.command == "tendd", record.uid == getuid() else { return nil }
+            return record.pid
+        }
+        guard candidates.count == 1, let pid = candidates.first else {
+            throw TendIPCError.server(
+                "could not identify exactly one owner-only tendd for \(socketPath)"
             )
-            guard URL(fileURLWithPath: executablePath).lastPathComponent == "tendd" else {
-                throw TendIPCError.server("the socket owner is not a tendd executable")
-            }
-            return DaemonSocketOwner(pid: pid, executablePath: executablePath)
-        }.value
+        }
+
+        var pathBuffer = [CChar](repeating: 0, count: 4096)
+        let pathLength = proc_pidpath(pid, &pathBuffer, UInt32(pathBuffer.count))
+        guard pathLength > 0 else {
+            throw TendIPCError.posix(operation: "proc_pidpath", code: errno)
+        }
+        let executablePath = String(
+            decoding: pathBuffer.prefix(while: { $0 != 0 }).map { UInt8(bitPattern: $0) },
+            as: UTF8.self
+        )
+        guard URL(fileURLWithPath: executablePath).lastPathComponent == "tendd" else {
+            throw TendIPCError.server("the socket owner is not a tendd executable")
+        }
+        return DaemonSocketOwner(pid: pid, executablePath: executablePath)
     }
 
     static func parseLsof(_ output: String) -> [LsofRecord] {
@@ -177,6 +190,75 @@ struct DaemonSocketOwner: Equatable, Sendable {
                 // with, which is already the state this call wants.
             }
         }.value
+    }
+}
+
+/// One subprocess run with a deadline: on timeout or cancellation the child
+/// is terminated rather than left to hold the caller (and its pipe) forever.
+final class TendBoundedSubprocess: @unchecked Sendable {
+    struct TimedOut: LocalizedError {
+        let timeout: TimeInterval
+        var errorDescription: String? { "subprocess did not finish within \(timeout)s" }
+    }
+
+    private let lock = NSLock()
+    private let process: Process
+    private var cancelled = false
+    private var output = Data()
+
+    init(_ process: Process) {
+        self.process = process
+    }
+
+    /// Terminates the child if it is running; a later `run` refuses.
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+        if process.isRunning { process.terminate() }
+    }
+
+    /// Runs the child to exit and returns its stdout. Blocks the calling
+    /// thread for at most `timeout` (plus a short drain after a kill).
+    func run(timeout: TimeInterval) throws -> Data {
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        process.standardInput = FileHandle.nullDevice
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        lock.lock()
+        if cancelled {
+            lock.unlock()
+            throw CancellationError()
+        }
+        do {
+            try process.run()
+        } catch {
+            lock.unlock()
+            throw error
+        }
+        lock.unlock()
+        // Drain concurrently: a child blocked on a full pipe never exits.
+        let drained = DispatchSemaphore(value: 0)
+        let reader = pipe.fileHandleForReading
+        DispatchQueue.global(qos: .userInitiated).async { [self] in
+            let data = reader.readDataToEndOfFile()
+            lock.lock()
+            output = data
+            lock.unlock()
+            drained.signal()
+        }
+        if exited.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            _ = drained.wait(timeout: .now() + 1)
+            throw TimedOut(timeout: timeout)
+        }
+        _ = drained.wait(timeout: .now() + 1)
+        lock.lock()
+        defer { lock.unlock() }
+        if cancelled { throw CancellationError() }
+        return output
     }
 }
 

@@ -488,6 +488,23 @@ fn daemon_lifecycle_commands_round_trip() {
         .expect("run daemon status");
     assert!(status.status.success());
     assert!(String::from_utf8_lossy(&status.stdout).contains("generation: 0"));
+    let boot_id = |daemon: &Daemon| {
+        let output = daemon
+            .cli()
+            .args(["daemon", "status", "--json"])
+            .output()
+            .expect("run daemon status --json");
+        assert!(output.status.success());
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("status --json is JSON");
+        assert_eq!(value["running"], true);
+        let id = value["boot_id"].as_str().expect("boot_id").to_string();
+        assert_eq!(id.len(), 32, "{id}");
+        (id, value["generation"].as_u64())
+    };
+    let (first_boot, first_generation) = boot_id(&daemon);
+    assert_eq!(first_generation, Some(0));
+    assert_eq!(boot_id(&daemon).0, first_boot, "stable within a process");
 
     let restart = daemon
         .cli()
@@ -500,6 +517,9 @@ fn daemon_lifecycle_commands_round_trip() {
         String::from_utf8_lossy(&restart.stderr)
     );
     assert!(String::from_utf8_lossy(&restart.stdout).contains("generation: 1"));
+    let (second_boot, second_generation) = boot_id(&daemon);
+    assert_eq!(second_generation, Some(1));
+    assert_ne!(second_boot, first_boot, "a re-exec draws a new boot id");
 
     let stop = daemon
         .cli()

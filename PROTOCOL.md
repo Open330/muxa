@@ -390,8 +390,9 @@ Response:
   "protocol": 2,
   "min_protocol": 1,
   "max_protocol": 2,
-  "capabilities": ["waiting_choice", "needs_choice", "rate_limited", "restart"],
-  "generation": 0
+  "capabilities": ["waiting_choice", "needs_choice", "rate_limited", "restart", "daemon_boot_id_v1"],
+  "generation": 0,
+  "boot_id": "9f1c2e4a7b0d4c3e8a51f6d2b7c9e013"
 }
 ```
 
@@ -406,6 +407,12 @@ Response:
   always non-breaking.
 - `generation`: present only with the `restart` capability. It starts at zero
   for a fresh daemon and increments across each self-reexec.
+- `boot_id` (with `daemon_boot_id_v1`): 128 random bits as 32 lowercase hex
+  characters, drawn once per daemon process image. It is the start identity
+  `generation` is not: an external stop/start gets a new one even though
+  `generation` is zero again. A self-reexec also draws a new one (alongside the
+  new `generation`). Clients compare it only for equality and MUST treat its
+  absence as "unknown", since older daemons omit it.
 
 Capability tags currently advertised:
 
@@ -419,6 +426,7 @@ Capability tags currently advertised:
 | `work_control_v1` | server accepts `work_up` / `work_up_status`. |
 | `work_command_v1` | server accepts `work_command` and the `host` field on `work_up`. |
 | `restart`        | server accepts `restart` and can re-exec itself in place. |
+| `daemon_boot_id_v1` | `hello` carries `boot_id`, a random per-process daemon identity. |
 
 #### v1-compat downgrade
 

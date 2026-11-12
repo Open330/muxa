@@ -20,6 +20,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the usage-limit policy moves to Accounts, and the raw configuration file
   opens in its own window from Advanced.
 
+### Fixed
+
+- The "Restart tendd to apply" bar now clears when tendd is restarted outside
+  the app (`tend daemon stop`/`start`, a service restart). tendd's IPC `hello`
+  carries a random per-process `boot_id` (capability `daemon_boot_id_v1`,
+  also shown by the new `tend daemon status --json`), and the app reads it on
+  every refresh and reconnect. Against an older tendd the app still falls
+  back to the socket owner's pid, now looked up only after a reconnect and
+  with `lsof` bounded to 2 seconds.
+
 ## [0.10.10] - 2026-11-12
 
 ### Changed

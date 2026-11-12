@@ -489,6 +489,13 @@ final class TendConfigStore: ObservableObject {
     /// window's restart bar.
     @Published private(set) var restartNotice = TendRestartNotice()
 
+    /// Lets the restart bar learn what was unknown when a change was saved.
+    func observeDaemon(_ current: TendDaemonIdentity) {
+        var notice = restartNotice
+        notice.observe(current)
+        if notice != restartNotice { restartNotice = notice }
+    }
+
     init(document: TendDaemonConfigDocument? = nil, launch: TendLaunchSettings? = nil) {
         self.document = document
         self.launch = launch
