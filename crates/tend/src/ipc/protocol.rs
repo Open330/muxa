@@ -984,6 +984,7 @@ pub const MIN_PROTOCOL_VERSION: u32 = 1;
 /// to feature-gate behaviour without re-reading `protocol`.
 pub(super) const CAPABILITIES: &[&str] = &[
     crate::launch_identity::CAPABILITY,
+    crate::provenance::STATE_SOURCE_CAPABILITY,
     "agent_session_id",
     "waiting_choice",
     "needs_choice",

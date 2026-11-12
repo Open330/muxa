@@ -822,10 +822,24 @@ Same fields as stored in the registry:
   "rate_limited_until": "2026-04-24T14:00:00Z",
   "rate_limit_scope": "five_hour",
   "rate_limit_source": "statusline",
+  "state_source": { "source": "hook", "at": "2026-04-24T12:03:21Z" },
   "started_at": "2026-04-24T12:00:00Z",
   "last_activity_at": "2026-04-24T12:03:21Z"
 }
 ```
+
+`state_source` (capability `agent_state_source_v1`) is additive and optional:
+which kind of signal set the current `state`, and when that signal was
+observed. It is absent on rows restored from a snapshot written before it
+existed. `source` is one of the deterministic `hook`, `provider_record`
+(Codex rollout), `provider_api`, `launch_mark` (tend-owned PTY lifecycle),
+`process_exact` (a tracked pid or its argv), `pane_inventory` (the
+multiplexer no longer lists the pane), `control` (an action tend carried
+out), or the heuristic `process_name` (discovery), `screen` (pane capture),
+`host_report` (herdr's own detection), `correlation` (matched by
+elimination) and `timing` (staleness and cap timers). A state-bearing event
+refreshes it even when the state is unchanged; a heartbeat only when it
+changes the state.
 
 `tmux_socket` and `tmux_session` are additive and optional. `tmux_socket`
 is the short socket name (the socket file's basename, e.g. `default` or

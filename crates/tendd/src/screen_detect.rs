@@ -40,6 +40,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
+use tend::provenance::StateSource;
 use tend::screen::{AgentManifest, ManifestSet, ScreenState};
 use tend::state::SYNTHETIC_SESSION_PREFIX;
 use tend::tmux::PaneInfo;
@@ -277,7 +278,7 @@ impl ScreenDetector {
             .cloned()
             .collect();
         for pane_id in dropped {
-            synthetic::stop_synthetic_row(&self.store, &pane_id).await;
+            synthetic::stop_synthetic_row(&self.store, &pane_id, StateSource::Screen).await;
             self.tracked.remove(&pane_id);
         }
         // Drop the last-classified state for every pane that fell out of
@@ -490,7 +491,7 @@ impl ScreenDetector {
                 return recap_changed;
             }
             for ev in &events {
-                self.store.apply_observed(ev).await;
+                self.store.apply_observed(ev, StateSource::Screen).await;
             }
             tracing::debug!(
                 pane = %pane_id,
@@ -509,7 +510,7 @@ impl ScreenDetector {
             None,
             OffsetDateTime::now_utc(),
         );
-        synthetic::apply_if_unowned(&self.store, &pane_id, &events).await;
+        synthetic::apply_if_unowned(&self.store, &pane_id, &events, StateSource::Screen).await;
         self.tracked.insert(pane_id);
         true
     }
@@ -983,7 +984,7 @@ mod tests {
         assert_eq!(det.run_tick().await, 0, "and then deduped again");
 
         // The reconciler's stale sweep ends the row outright.
-        synthetic::stop_synthetic_row(&store, "%1").await;
+        synthetic::stop_synthetic_row(&store, "%1", StateSource::Screen).await;
         assert_eq!(store.by_pane("%1").await[0].state, AgentState::Stopped);
         assert_eq!(det.run_tick().await, 1, "stopped row is re-applied");
         assert_eq!(store.by_pane("%1").await[0].state, AgentState::Working);

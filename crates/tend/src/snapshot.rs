@@ -282,6 +282,10 @@ fn serialize_agents(agents: &[Agent]) -> std::io::Result<(Vec<u8>, Vec<u8>)> {
     for agent in &mut blanked {
         agent.last_activity_at = OffsetDateTime::UNIX_EPOCH;
         agent.last_event_at = None;
+        // The same source re-confirming the same state is activity too.
+        if let Some(provenance) = agent.state_source.as_mut() {
+            provenance.at = OffsetDateTime::UNIX_EPOCH;
+        }
     }
     Ok((exact, to_bytes(&blanked)?))
 }

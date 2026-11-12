@@ -235,7 +235,13 @@ pub fn translate(envelope: &Value, at: OffsetDateTime) -> Result<BridgeUpdate, D
 /// shared [`synthetic::apply_if_unowned`]: if a *live* non-synthetic (real
 /// hook) row already owns the pane, drop the bridge update wholesale.
 async fn apply_update(store: &SharedStore, update: BridgeUpdate) {
-    synthetic::apply_if_unowned(store, &update.pane_id, &update.events).await;
+    synthetic::apply_if_unowned(
+        store,
+        &update.pane_id,
+        &update.events,
+        tend::provenance::StateSource::HostReport,
+    )
+    .await;
 }
 
 /// The tend-namespaced pane id of an agent-less `pane.agent_status_changed`
@@ -260,7 +266,12 @@ async fn ingest_envelope(store: &SharedStore, envelope: &Value) {
         // screen detection via [`synthetic::stop_synthetic_row`].
         Err(DropReason::NoAgent) => {
             if let Some(pane) = agentless_pane_id(envelope) {
-                synthetic::stop_synthetic_row(store, &pane).await;
+                synthetic::stop_synthetic_row(
+                    store,
+                    &pane,
+                    tend::provenance::StateSource::HostReport,
+                )
+                .await;
             }
         }
         // Unknown status is routine — keep it off the debug stream so the log
@@ -1315,6 +1326,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: AT,
             last_activity_at: AT,
             state_entered_at: AT,

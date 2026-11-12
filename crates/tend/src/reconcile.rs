@@ -40,6 +40,7 @@ use crate::backend::{HostKind, PaneObservation};
 use crate::event::{AgentEvent, AgentId, AgentKind, AgentState, RateLimitScope, RateLimitSource};
 use crate::metrics::Metrics;
 use crate::process_tree;
+use crate::provenance::StateSource;
 use crate::state::{ReconcileReport, SharedStore};
 #[cfg(test)]
 use crate::tmux::PaneInfo;
@@ -412,7 +413,9 @@ impl<L: LivenessSource> Reconciler<L> {
                             }
                         }
                     };
-                    self.store.apply_observed(&event).await;
+                    self.store
+                        .apply_observed(&event, StateSource::ProviderRecord)
+                        .await;
                 }
             }
             if let Some(response) = recovery_response {
@@ -426,15 +429,18 @@ impl<L: LivenessSource> Reconciler<L> {
                     })
                 {
                     self.store
-                        .apply_observed(&AgentEvent::TurnStopped {
-                            id: t.id.clone(),
-                            response: Some(response),
-                            recap: None,
-                            ai_title: None,
-                            idle_confirmed: false,
-                            // Repair state without making an old turn look recent.
-                            at: t.last_activity_at,
-                        })
+                        .apply_observed(
+                            &AgentEvent::TurnStopped {
+                                id: t.id.clone(),
+                                response: Some(response),
+                                recap: None,
+                                ai_title: None,
+                                idle_confirmed: false,
+                                // Repair state without making an old turn look recent.
+                                at: t.last_activity_at,
+                            },
+                            StateSource::ProviderRecord,
+                        )
                         .await;
                 }
             }
@@ -461,17 +467,20 @@ impl<L: LivenessSource> Reconciler<L> {
                 || seven.and_then(|w| w.resets_at) != t.cur_7d_reset;
             if hb_changed {
                 self.store
-                    .apply_observed(&AgentEvent::Heartbeat {
-                        id: t.id.clone(),
-                        model: None,
-                        context_used_pct: None,
-                        cost_usd: None,
-                        rate_limit_5h_pct: five.map(|w| w.used_percent),
-                        rate_limit_5h_resets_at: five.and_then(|w| w.resets_at),
-                        rate_limit_7d_pct: seven.map(|w| w.used_percent),
-                        rate_limit_7d_resets_at: seven.and_then(|w| w.resets_at),
-                        at: now,
-                    })
+                    .apply_observed(
+                        &AgentEvent::Heartbeat {
+                            id: t.id.clone(),
+                            model: None,
+                            context_used_pct: None,
+                            cost_usd: None,
+                            rate_limit_5h_pct: five.map(|w| w.used_percent),
+                            rate_limit_5h_resets_at: five.and_then(|w| w.resets_at),
+                            rate_limit_7d_pct: seven.map(|w| w.used_percent),
+                            rate_limit_7d_resets_at: seven.and_then(|w| w.resets_at),
+                            at: now,
+                        },
+                        StateSource::ProviderRecord,
+                    )
                     .await;
             }
 
@@ -503,14 +512,17 @@ impl<L: LivenessSource> Reconciler<L> {
                         }
                     };
                     self.store
-                        .apply_observed(&AgentEvent::RateLimited {
-                            id: t.id,
-                            scope,
-                            source: RateLimitSource::CodexRollout,
-                            resets_at,
-                            message: None,
-                            at: rl.at.unwrap_or(now),
-                        })
+                        .apply_observed(
+                            &AgentEvent::RateLimited {
+                                id: t.id,
+                                scope,
+                                source: RateLimitSource::CodexRollout,
+                                resets_at,
+                                message: None,
+                                at: rl.at.unwrap_or(now),
+                            },
+                            StateSource::ProviderRecord,
+                        )
                         .await;
                 }
             }
@@ -1604,6 +1616,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: t0,
             last_activity_at: t0,
             state_entered_at: t0,

@@ -21,6 +21,7 @@ use crate::event::{
 use crate::history::{HistoryEntry, HistoryOptions, PromptHistory};
 use crate::metrics::Metrics;
 use crate::process_tree::WorkloadSummary;
+use crate::provenance::{StateProvenance, StateSource};
 use crate::tmux::PaneInfo;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -304,6 +305,11 @@ pub struct Agent {
     /// over would keep its row glowing red forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit_source: Option<RateLimitSource>,
+    /// Which kind of signal set the current `state`, and when. `None` on
+    /// rows restored from a snapshot written before this field existed.
+    /// Additive on the wire (`agent_state_source_v1`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_source: Option<crate::provenance::StateProvenance>,
     #[serde(with = "time::serde::rfc3339")]
     pub started_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
@@ -486,6 +492,7 @@ impl Agent {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,
@@ -851,6 +858,9 @@ impl Store {
         };
         let mut agent = Agent::new(AgentKind::Task, key.clone(), surface, pane, cwd, now);
         agent.state = AgentState::Working;
+        // tend registered this task itself (`tend run`/`register`, a
+        // tend-owned PTY), with the exact pid it tracks.
+        agent.state_source = Some(StateProvenance::new(StateSource::LaunchMark, now));
         agent.pid = pid;
         agent.last_prompt_at = command.as_ref().map(|_| now);
         agent.last_prompt = command;
@@ -935,8 +945,12 @@ fn mutate_for_event(
     id: &AgentId,
     at: OffsetDateTime,
     duplicate_prompt: bool,
-) -> (Option<PromptRecord>, Option<HistoryEntry>, bool) {
+) -> EventEffect {
     let mut prompt_record: Option<PromptRecord> = None;
+    // Whether the event itself said what state the row is in, even when
+    // that is the state it already had. An ignored or purely informational
+    // event does not, and must not claim the row's state as its own.
+    let mut asserted = false;
     let mut history_entry: Option<HistoryEntry> = None;
     let prev_state = agent.state;
     let stale_prompt = matches!(ev, AgentEvent::PromptSubmitted { .. })
@@ -981,6 +995,7 @@ fn mutate_for_event(
 
     match ev {
         AgentEvent::Started { .. } => {
+            asserted = true;
             agent.state = AgentState::Idle;
             agent.subagents.clear();
             // A new or resumed session has asked nothing yet.
@@ -1013,8 +1028,14 @@ fn mutate_for_event(
             // Preserve historical evidence, but a delayed/retried prompt must
             // not undo a later state transition or overwrite a newer prompt.
             if stale_prompt {
-                return (None, history_entry, false);
+                return EventEffect {
+                    prompt_record: None,
+                    history_entry,
+                    touches_activity: false,
+                    asserted: false,
+                };
             }
+            asserted = true;
             agent.pending_command = None;
             agent.last_prompt = Some(prompt.clone());
             agent.last_prompt_at = Some(at);
@@ -1042,6 +1063,7 @@ fn mutate_for_event(
             // — the next Stop or NotificationFired clears it.
             if agent.state != AgentState::Error {
                 agent.state = AgentState::Working;
+                asserted = true;
             }
             // A Claude `Task` call carries a subagent spec — record it as an
             // in-flight subagent; the matching `ToolCompleted` retires it.
@@ -1069,6 +1091,7 @@ fn mutate_for_event(
                 AgentState::WaitingInput | AgentState::WaitingChoice
             ) {
                 agent.state = AgentState::Working;
+                asserted = true;
             }
             // A completed `Task` retires the oldest in-flight subagent. We
             // match FIFO rather than by id — the hook stream carries no
@@ -1086,6 +1109,7 @@ fn mutate_for_event(
                 NotificationLevel::Error => agent.state = AgentState::Error,
                 NotificationLevel::Info | NotificationLevel::Warning => {}
             }
+            asserted = !matches!(level, NotificationLevel::Info | NotificationLevel::Warning);
         }
         AgentEvent::TurnStopped {
             response,
@@ -1131,6 +1155,7 @@ fn mutate_for_event(
                 agent.rate_limited_until = None;
                 agent.rate_limit_source = None;
                 agent.state = AgentState::Idle;
+                asserted = true;
             } else if matches!(
                 agent.state,
                 AgentState::WaitingInput | AgentState::WaitingChoice
@@ -1152,6 +1177,7 @@ fn mutate_for_event(
                 // other bare synthetic stop — still freezes the waiting row.
             } else if agent.state != AgentState::Error {
                 agent.state = AgentState::Idle;
+                asserted = true;
             }
             // Turn boundary: subagents have finished (their own
             // `ToolCompleted` fired first); clear defensively so a missed
@@ -1159,11 +1185,15 @@ fn mutate_for_event(
             agent.subagents.clear();
         }
         AgentEvent::SessionEnded { .. } => {
+            asserted = true;
             agent.state = AgentState::Stopped;
             agent.subagents.clear();
         }
         AgentEvent::Heartbeat { .. } => apply_heartbeat(agent, ev),
-        AgentEvent::RateLimited { .. } => apply_rate_limited(agent, ev),
+        AgentEvent::RateLimited { .. } => {
+            apply_rate_limited(agent, ev);
+            asserted = agent.state == AgentState::Error;
+        }
     }
 
     // Catch-all: any event for a `Starting` agent demonstrates the
@@ -1185,7 +1215,22 @@ fn mutate_for_event(
         agent.state_entered_at = at;
     }
 
-    (prompt_record, history_entry, touches_activity)
+    EventEffect {
+        prompt_record,
+        history_entry,
+        touches_activity,
+        asserted: asserted || prev_state != agent.state,
+    }
+}
+
+/// What applying one event did to a row.
+struct EventEffect {
+    prompt_record: Option<PromptRecord>,
+    history_entry: Option<HistoryEntry>,
+    touches_activity: bool,
+    /// The event set or confirmed the row's state; only then does its
+    /// source become the state's provenance.
+    asserted: bool,
 }
 
 /// Copy the model/cost/limit fields from a `Heartbeat` onto the agent
@@ -1415,6 +1460,7 @@ fn reconcile_pane_for_started(
     pane: &str,
     tmux_socket: Option<&str>,
     at: OffsetDateTime,
+    source: StateSource,
 ) -> bool {
     if is_synthetic(incoming_session) {
         let live_owner_exists = agents.values().any(|a| {
@@ -1447,6 +1493,7 @@ fn reconcile_pane_for_started(
             && other.state != AgentState::Stopped
         {
             other.state = AgentState::Stopped;
+            other.state_source = Some(StateProvenance::new(source, at));
             other.last_activity_at = at;
         }
     }
@@ -1653,14 +1700,11 @@ impl Store {
         // Keep the unknown-session gate in place until the row is tagged.
         let mut agents = self.agents.write().await;
         let row = agents.entry(session.into()).or_insert_with(|| {
-            Agent::new(
-                kind,
-                session.into(),
-                None,
-                None,
-                Some(cwd.into()),
-                OffsetDateTime::now_utc(),
-            )
+            let now = OffsetDateTime::now_utc();
+            let mut row = Agent::new(kind, session.into(), None, None, Some(cwd.into()), now);
+            // tend is starting this Ask run itself.
+            row.state_source = Some(StateProvenance::new(StateSource::Control, now));
+            row
         });
         // A conversation may have been opened interactively since the last
         // Ask turn. Headless reuse must preserve its trusted live binding.
@@ -1692,6 +1736,10 @@ impl Store {
                 .is_some_and(|o| o.execution_id == run)
         }) {
             row.state = AgentState::Stopped;
+            row.state_source = Some(StateProvenance::new(
+                StateSource::Control,
+                OffsetDateTime::now_utc(),
+            ));
             row.state_entered_at = OffsetDateTime::now_utc();
         }
         drop(agents);
@@ -1728,18 +1776,32 @@ impl Store {
         self.apply_with_ask(ev, None).await;
     }
 
-    /// Apply daemon/screen/rollout observations without advancing adapter time.
-    pub async fn apply_observed(&self, ev: &AgentEvent) {
-        self.apply_event(ev, None, false).await;
+    /// Apply a daemon observation (screen, rollout, host report, …) without
+    /// advancing adapter time. `source` names the kind of signal it is.
+    pub async fn apply_observed(&self, ev: &AgentEvent, source: StateSource) {
+        self.apply_event(ev, None, false, source).await;
     }
 
+    /// Apply an ingested adapter event. A real session's event is a hook; a
+    /// `synthetic-*` row is only ever minted by process discovery.
     pub async fn apply_with_ask(&self, ev: &AgentEvent, ask_entry: Option<&str>) {
-        self.apply_event(ev, ask_entry, true).await;
+        let source = if is_synthetic(&ev.id().session_id) {
+            StateSource::ProcessName
+        } else {
+            StateSource::Hook
+        };
+        self.apply_event(ev, ask_entry, true, source).await;
     }
 
     #[allow(clippy::too_many_lines)] // one event transaction, with provenance checked before pane reconciliation
     #[tracing::instrument(level = "debug", skip(self, ev), fields(event_type))]
-    async fn apply_event(&self, ev: &AgentEvent, ask_entry: Option<&str>, ingested: bool) {
+    async fn apply_event(
+        &self,
+        ev: &AgentEvent,
+        ask_entry: Option<&str>,
+        ingested: bool,
+        source: StateSource,
+    ) {
         let mut sanitized;
         let ev = if ask_entry.is_some() {
             sanitized = ev.clone();
@@ -1813,6 +1875,7 @@ impl Store {
                     pane,
                     id.tmux_socket.as_deref(),
                     at,
+                    source,
                 ) {
                     return;
                 }
@@ -1891,8 +1954,17 @@ impl Store {
         } else {
             false
         };
-        let (mut prompt_record, history_entry, touches_activity) =
-            mutate_for_event(agent, ev, id, at, duplicate_prompt);
+        let EventEffect {
+            mut prompt_record,
+            history_entry,
+            touches_activity,
+            asserted,
+        } = mutate_for_event(agent, ev, id, at, duplicate_prompt);
+        // Only an event that set or confirmed the state owns it: an Info
+        // notification, a stale prompt or an ignored tool call does not.
+        if asserted {
+            agent.state_source = Some(StateProvenance::new(source, at));
+        }
         if ingested {
             agent.last_event_at = Some(agent.last_event_at.map_or(at, |last| last.max(at)));
         }
@@ -1910,6 +1982,7 @@ impl Store {
         {
             agent.state = AgentState::Stopped;
             agent.state_entered_at = at;
+            agent.state_source = Some(StateProvenance::new(source, at));
         }
         if touches_activity {
             agent.last_activity_at = at;
@@ -2012,6 +2085,10 @@ impl Store {
         }
         let from = agent.state;
         agent.state = AgentState::Stopped;
+        agent.state_source = Some(StateProvenance::new(
+            StateSource::Control,
+            OffsetDateTime::now_utc(),
+        ));
         agent.state_entered_at = OffsetDateTime::now_utc();
         let _ = self.transitions.send(Transition {
             from,
@@ -2234,6 +2311,10 @@ impl Store {
             let previous = agent.state;
             if previous != AgentState::Stopped {
                 agent.state = AgentState::Stopped;
+                agent.state_source = Some(StateProvenance::new(
+                    StateSource::LaunchMark,
+                    OffsetDateTime::now_utc(),
+                ));
                 agent.state_entered_at = OffsetDateTime::now_utc();
                 agent.subagents.clear();
                 let _ = self.transitions.send(Transition {
@@ -2344,6 +2425,7 @@ impl Store {
             }
             let prev = agent.state;
             agent.state = AgentState::Idle;
+            agent.state_source = Some(StateProvenance::new(StateSource::Timing, now));
             agent.state_entered_at = now;
             agent.last_activity_at = now;
             flipped += 1;
@@ -2395,6 +2477,7 @@ impl Store {
         }
         let from = agent.state;
         agent.state = AgentState::Idle;
+        agent.state_source = Some(StateProvenance::new(StateSource::Screen, at));
         agent.state_entered_at = at;
         agent.last_notification = None;
         let _ = self.transitions.send(Transition {
@@ -2454,6 +2537,7 @@ impl Store {
             }
             let prev = agent.state;
             agent.state = AgentState::Stopped;
+            agent.state_source = Some(StateProvenance::new(StateSource::ProcessName, now));
             agent.state_entered_at = now;
             stopped += 1;
             let _ = self.transitions.send(Transition {
@@ -2528,6 +2612,7 @@ impl Store {
             let prev = agent.state;
             let now = OffsetDateTime::now_utc();
             agent.state = AgentState::Stopped;
+            agent.state_source = Some(StateProvenance::new(StateSource::ProcessExact, now));
             agent.state_entered_at = now;
             // Touch last_activity_at so the GC's Stopped-row TTL is measured
             // from when the task died, not from registration — otherwise a
@@ -2601,6 +2686,7 @@ impl Store {
             let prev = agent.state;
             let now = OffsetDateTime::now_utc();
             agent.state = AgentState::Stopped;
+            agent.state_source = Some(StateProvenance::new(StateSource::Timing, now));
             agent.state_entered_at = now;
             // Measure the GC's Stopped-row TTL from when we gave up on the
             // row, not from its last real activity — otherwise a row already
@@ -2652,6 +2738,7 @@ impl Store {
             };
             let prev = agent.state;
             agent.state = AgentState::Stopped;
+            agent.state_source = Some(StateProvenance::new(StateSource::Timing, now));
             agent.state_entered_at = now;
             agent.last_activity_at = now;
             flipped += 1;
@@ -2739,6 +2826,7 @@ impl Store {
             let prev = agent.state;
             let now = OffsetDateTime::now_utc();
             agent.state = AgentState::Stopped;
+            agent.state_source = Some(StateProvenance::new(StateSource::Timing, now));
             agent.state_entered_at = now;
             // Measure the GC's Stopped-row TTL from when we gave up on the
             // row, not from its last real activity — same rationale as
@@ -3104,6 +3192,10 @@ impl Store {
             }
             if agent.ask_origin.is_some() && agent.state == AgentState::Stopped {
                 agent.state = AgentState::Starting;
+                agent.state_source = Some(StateProvenance::new(
+                    StateSource::ProcessExact,
+                    OffsetDateTime::now_utc(),
+                ));
                 agent.state_entered_at = OffsetDateTime::now_utc();
             }
             agent.ask_origin = None;
@@ -3151,17 +3243,20 @@ impl Store {
         for binding in &adoptable {
             let cwd =
                 (!binding.pane.current_path.is_empty()).then(|| binding.pane.current_path.clone());
-            self.apply_observed(&AgentEvent::Started {
-                id: AgentId {
-                    kind: binding.kind,
-                    session_id: binding.session_id.clone(),
-                    surface: None,
-                    pane: Some(binding.pane.pane_id.clone()),
-                    tmux_socket: binding.pane.socket.clone(),
-                    cwd,
+            self.apply_observed(
+                &AgentEvent::Started {
+                    id: AgentId {
+                        kind: binding.kind,
+                        session_id: binding.session_id.clone(),
+                        surface: None,
+                        pane: Some(binding.pane.pane_id.clone()),
+                        tmux_socket: binding.pane.socket.clone(),
+                        cwd,
+                    },
+                    at,
                 },
-                at,
-            })
+                StateSource::ProcessExact,
+            )
             .await;
         }
         adoptable.len()
@@ -3297,6 +3392,10 @@ impl Store {
                 if let Some(previous) = agents.get_mut(&owner) {
                     previous.pane = None;
                     previous.state = AgentState::Stopped;
+                    previous.state_source = Some(StateProvenance::new(
+                        StateSource::Correlation,
+                        OffsetDateTime::now_utc(),
+                    ));
                 }
             }
             if let Some(agent) = agents.get_mut(&session) {
@@ -3352,6 +3451,8 @@ impl Store {
                 let mut stopped = a.clone();
                 let from = stopped.state;
                 stopped.state = AgentState::Stopped;
+                stopped.state_source =
+                    Some(StateProvenance::new(StateSource::PaneInventory, reaped_at));
                 stopped.state_entered_at = reaped_at;
                 stopped.last_activity_at = reaped_at;
                 stale_transitions.push(Transition {
@@ -3547,6 +3648,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: at,
             last_activity_at: at,
             state_entered_at: at,
@@ -3625,10 +3727,13 @@ mod tests {
                 .await;
             if observed_event {
                 store
-                    .apply_observed(&AgentEvent::SessionEnded {
-                        id: id("clock"),
-                        at: OffsetDateTime::now_utc(),
-                    })
+                    .apply_observed(
+                        &AgentEvent::SessionEnded {
+                            id: id("clock"),
+                            at: OffsetDateTime::now_utc(),
+                        },
+                        StateSource::Timing,
+                    )
                     .await;
             } else {
                 let agent = store.by_session("clock").await.unwrap();
@@ -3738,10 +3843,10 @@ mod tests {
             prompt: "old".into(),
             at,
         };
-        let (record, _, touches_activity) =
-            mutate_for_event(&mut agent, &event, event.id(), at, false);
-        assert!(record.is_none());
-        assert!(!touches_activity);
+        let effect = mutate_for_event(&mut agent, &event, event.id(), at, false);
+        assert!(effect.prompt_record.is_none());
+        assert!(!effect.touches_activity);
+        assert!(!effect.asserted, "a stale prompt claims no state");
         assert_eq!(agent.state, AgentState::Error);
         assert_eq!(agent.rate_limit_source, Some(RateLimitSource::Statusline));
         assert_eq!(agent.pending_command.as_deref(), Some("pending"));
@@ -7757,6 +7862,7 @@ mod tests {
                     rate_limited_until: None,
                     rate_limit_scope: None,
                     rate_limit_source: None,
+                    state_source: None,
                     started_at: mid,
                     last_activity_at: mid,
                     state_entered_at: mid,
@@ -7798,6 +7904,7 @@ mod tests {
                     rate_limited_until: None,
                     rate_limit_scope: None,
                     rate_limit_source: None,
+                    state_source: None,
                     started_at: new,
                     last_activity_at: new,
                     state_entered_at: new,
@@ -7868,6 +7975,7 @@ mod tests {
                         rate_limited_until: None,
                         rate_limit_scope: None,
                         rate_limit_source: None,
+                        state_source: None,
                         started_at: at,
                         last_activity_at: at,
                         state_entered_at: at,
@@ -7943,6 +8051,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: t0,
             last_activity_at: t0,
             state_entered_at: t0,
@@ -8245,5 +8354,191 @@ mod tests {
         assert_eq!(after.pane, before.pane);
         assert_eq!(after.state, before.state);
         assert!(after.ask_origin.is_none());
+    }
+
+    async fn source_of(store: &Store, session: &str) -> Option<crate::provenance::StateSource> {
+        store
+            .by_session(session)
+            .await
+            .and_then(|row| row.state_source)
+            .map(|provenance| provenance.source)
+    }
+
+    #[tokio::test]
+    async fn every_state_change_records_its_source() {
+        use crate::provenance::StateSource;
+        let store = Store::shared();
+        let at = OffsetDateTime::now_utc() - time::Duration::seconds(5);
+
+        // An ingested real session is a hook.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("hooked"),
+                prompt: "go".into(),
+                at,
+            })
+            .await;
+        assert_eq!(source_of(&store, "hooked").await, Some(StateSource::Hook));
+
+        // An ingested synthetic row comes from process discovery.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    pane: Some("%9".into()),
+                    ..id("synthetic-%9")
+                },
+                at,
+            })
+            .await;
+        assert_eq!(
+            source_of(&store, "synthetic-%9").await,
+            Some(StateSource::ProcessName)
+        );
+
+        // A daemon observation carries the source it was applied with.
+        store
+            .apply_observed(
+                &AgentEvent::TurnStopped {
+                    id: id("hooked"),
+                    response: None,
+                    recap: None,
+                    ai_title: None,
+                    idle_confirmed: true,
+                    at: at + time::Duration::seconds(1),
+                },
+                StateSource::ProviderRecord,
+            )
+            .await;
+        let row = store.by_session("hooked").await.unwrap();
+        assert_eq!(row.state, AgentState::Idle);
+        let provenance = row.state_source.unwrap();
+        assert_eq!(provenance.source, StateSource::ProviderRecord);
+        assert_eq!(provenance.at, at + time::Duration::seconds(1));
+
+        // A heartbeat that changes nothing leaves the source alone.
+        store
+            .apply(&AgentEvent::Heartbeat {
+                id: id("hooked"),
+                model: Some("m".into()),
+                context_used_pct: None,
+                cost_usd: None,
+                rate_limit_5h_pct: None,
+                rate_limit_5h_resets_at: None,
+                rate_limit_7d_pct: None,
+                rate_limit_7d_resets_at: None,
+                at: at + time::Duration::seconds(2),
+            })
+            .await;
+        assert_eq!(
+            source_of(&store, "hooked").await,
+            Some(StateSource::ProviderRecord)
+        );
+
+        // A timer sweep is timing.
+        store
+            .apply(&AgentEvent::Started {
+                id: AgentId {
+                    pane: None,
+                    ..id("paneless")
+                },
+                at: at - time::Duration::days(3),
+            })
+            .await;
+        assert_eq!(
+            store
+                .mark_stale_paneless_stopped(Duration::from_secs(60))
+                .await,
+            1
+        );
+        assert_eq!(
+            source_of(&store, "paneless").await,
+            Some(StateSource::Timing)
+        );
+    }
+
+    #[test]
+    fn a_snapshot_row_without_a_source_still_loads() {
+        let mut row = serde_json::to_value(stored_agent(
+            "old",
+            AgentKind::ClaudeCode,
+            AgentState::Idle,
+            None,
+        ))
+        .unwrap();
+        row.as_object_mut().unwrap().remove("state_source");
+        let agent: Agent = serde_json::from_value(row).unwrap();
+        assert!(agent.state_source.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_event_that_does_not_set_the_state_does_not_claim_it() {
+        use crate::provenance::StateSource;
+        let store = Store::shared();
+        let at = OffsetDateTime::now_utc() - time::Duration::seconds(30);
+        store
+            .apply_observed(
+                &AgentEvent::RateLimited {
+                    id: AgentId {
+                        kind: AgentKind::Codex,
+                        ..id("capped")
+                    },
+                    scope: crate::event::RateLimitScope::FiveHour,
+                    source: RateLimitSource::CodexRollout,
+                    resets_at: None,
+                    message: None,
+                    at,
+                },
+                StateSource::ProviderRecord,
+            )
+            .await;
+        let capped = || AgentId {
+            kind: AgentKind::Codex,
+            ..id("capped")
+        };
+        // An informational notification leaves Error, and its source, alone.
+        store
+            .apply(&AgentEvent::NotificationFired {
+                id: capped(),
+                level: NotificationLevel::Info,
+                message: "fyi".into(),
+                at: at + time::Duration::seconds(1),
+            })
+            .await;
+        let row = store.by_session("capped").await.unwrap();
+        assert_eq!(row.state, AgentState::Error);
+        assert_eq!(
+            row.state_source.unwrap().source,
+            StateSource::ProviderRecord
+        );
+        assert_eq!(row.state_source.unwrap().at, at);
+
+        // A stale prompt is ignored and must not backdate the provenance.
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("prompted"),
+                prompt: "new".into(),
+                at,
+            })
+            .await;
+        store
+            .apply(&AgentEvent::PromptSubmitted {
+                id: id("prompted"),
+                prompt: "old".into(),
+                at: at - time::Duration::seconds(10),
+            })
+            .await;
+        let row = store.by_session("prompted").await.unwrap();
+        assert_eq!(row.state_source.unwrap().at, at);
+    }
+
+    #[tokio::test]
+    async fn rows_tend_creates_itself_carry_their_source() {
+        use crate::provenance::StateSource;
+        let store = Store::shared();
+        let key = store
+            .register_task("job".into(), Some(4242), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(source_of(&store, &key).await, Some(StateSource::LaunchMark));
     }
 }

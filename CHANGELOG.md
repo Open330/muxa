@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Every agent row records where its current state came from:
+  `state_source` in `tend status --json`, the IPC agent rows and
+  `state.json` carries the kind of signal (`hook`, `provider_record`,
+  `pane_inventory`, `screen`, `timing`, …) and when it was observed
+  (capability `agent_state_source_v1`). Hooks, the Codex rollout poll, screen
+  detection, the herdr bridge, discovery and each reconciler sweep stamp it.
+
 ### Changed
 
 - MCP: `tend_wait` waits on any handle (a request id, Fleet requests
