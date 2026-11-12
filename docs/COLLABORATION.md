@@ -166,9 +166,12 @@ minutes apart; recorded as `turn_offer.reply_reminders`). Workers are
 reminded; so is a primary for user-authorized work it took through an offer,
 but not a human who accepted a request by id in their own session. A recipient
 waiting on an open request of its own, sent after the claim, is not reminded:
-ending a turn to wait for that reply's wake is the intended pattern. If the
-recipient is still Idle without a reply five minutes after a reminder, the
-request is marked `peer_interrupted` with reason `reply_overdue` and goes
+ending a turn to wait for that reply's wake (until the wake is delivered) is
+the intended pattern. Every `Stop` without a reply is recorded
+(`turn_offer.unanswered_stop_at`); seeing the recipient work or take a new
+prompt clears it, so an Idle inferred by a timeout never counts. If, after at
+least one reminder, the recipient is still Idle five minutes after its latest
+recorded `Stop`, the request is marked `peer_interrupted` with reason `reply_overdue` and goes
 through the ordinary interruption path below: the sender's wait returns it
 first, and the linked human recovery item follows after the two-minute grace.
 Working again or a reply clears it. Providers without a `Stop` hook are never

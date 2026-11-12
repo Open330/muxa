@@ -74,6 +74,15 @@ pub struct TurnOffer {
         skip_serializing_if = "Option::is_none"
     )]
     pub last_reply_reminder_at: Option<OffsetDateTime>,
+    /// The latest Stop boundary the claimant reached without having replied.
+    /// Cleared when it is seen working again, so `reply_overdue` is judged
+    /// only from a Stop of the current idle episode.
+    #[serde(
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub unanswered_stop_at: Option<OffsetDateTime>,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)] // serde's skip_serializing_if signature
@@ -89,11 +98,12 @@ impl TurnOffer {
                 .is_none_or(|at| now - at >= OFFER_BACKOFF)
     }
 
-    /// A reminder was offered and has had a full backoff to produce a reply.
+    /// At least one reminder was offered, and the claimant's latest Stop
+    /// without a reply is a full backoff old and still the current episode.
     pub fn reminder_overdue(&self, now: OffsetDateTime) -> bool {
         self.reply_reminders > 0
             && self
-                .last_reply_reminder_at
+                .unanswered_stop_at
                 .is_some_and(|at| now - at >= OFFER_BACKOFF)
     }
 
@@ -184,16 +194,28 @@ impl CollaborationStore {
         let mut rows = Vec::new();
         let mut used = 0usize;
         if event == TurnBoundaryEvent::Stop {
-            for mut request in self.reply_reminder_candidates(caller, now).await {
-                if offers.len() == max_requests {
-                    break;
-                }
-                let payload = reminder_payload(&request);
-                used += payload.to_string().len();
+            for mut request in self.reply_owing_requests(caller).await {
                 let offer = request.turn_offer.get_or_insert_with(TurnOffer::default);
-                offer.reply_reminders += 1;
-                offer.last_reply_reminder_at = Some(now);
-                offers.push(payload);
+                // Every Stop while the reply is owed is recorded, reminded or
+                // not: it is the deterministic boundary `reply_overdue` needs.
+                offer.unanswered_stop_at = Some(now);
+                if offers.len() < max_requests && offer.reminder_eligible(now) {
+                    let full = reminder_payload(&request, true);
+                    let payload = if used + full.to_string().len() <= max_bytes {
+                        Some(full)
+                    } else if offers.is_empty() {
+                        Some(reminder_payload(&request, false))
+                    } else {
+                        None
+                    };
+                    if let Some(payload) = payload {
+                        used += payload.to_string().len();
+                        let offer = request.turn_offer.get_or_insert_with(TurnOffer::default);
+                        offer.reply_reminders += 1;
+                        offer.last_reply_reminder_at = Some(now);
+                        offers.push(payload);
+                    }
+                }
                 rows.push(request);
             }
         }
@@ -228,24 +250,16 @@ impl CollaborationStore {
 }
 
 impl CollaborationStore {
-    /// Claimed requests `caller` owes a reply to and has not been reminded of
-    /// within the backoff, oldest claim first. Recipients that are waiting on
-    /// a request of their own are left alone: ending a turn to wait for that
-    /// reply wake is the intended pattern, not a stall.
-    async fn reply_reminder_candidates(
-        &self,
-        caller: &Participant,
-        now: OffsetDateTime,
-    ) -> Vec<super::CollaborationRequest> {
+    /// Claimed requests `caller` owes a reply to, oldest claim first.
+    /// Recipients that are waiting on a request of their own are left alone:
+    /// ending a turn to wait for that reply's wake is the intended pattern,
+    /// not a stall.
+    async fn reply_owing_requests(&self, caller: &Participant) -> Vec<super::CollaborationRequest> {
         let requests = self.requests.read().await;
         let mut due: Vec<_> = requests
             .values()
             .filter(|request| {
                 owes_reply(request, caller)
-                    && request
-                        .turn_offer
-                        .as_ref()
-                        .is_none_or(|offer| offer.reminder_eligible(now))
                     && !waits_on_own_request(requests.values(), caller, request.claimed_at)
             })
             .cloned()
@@ -268,8 +282,9 @@ pub(super) fn owes_reply(request: &super::CollaborationRequest, caller: &Partici
         && (caller.accepts_peer_work() || request.awaits_turn_boundary(caller))
 }
 
-/// Whether `participant` has an open request of its own, sent at or after
-/// `since`, that expects a reply: it is waiting for that reply's wake.
+/// Whether `participant` has a request of its own, sent at or after `since`,
+/// whose reply it is still waiting for: open and expecting a reply, or
+/// answered with its reply wake not yet delivered.
 pub(super) fn waits_on_own_request<'a>(
     requests: impl IntoIterator<Item = &'a super::CollaborationRequest>,
     participant: &Participant,
@@ -278,12 +293,17 @@ pub(super) fn waits_on_own_request<'a>(
     requests.into_iter().any(|other| {
         other.from.same_session(participant)
             && other.expects_reply
-            && !other.status.is_terminal()
             && since.is_none_or(|since| other.created_at >= since)
+            && (!other.status.is_terminal()
+                || other.reply_wake_owed()
+                || matches!(other.reply_wake, Some(super::ReplyWake::Reserved { .. })))
     })
 }
 
-fn reminder_payload(request: &super::CollaborationRequest) -> Value {
+fn reminder_payload(request: &super::CollaborationRequest, full: bool) -> Value {
+    if !full {
+        return json!({"request_id": request.id, "offer": "reply_reminder"});
+    }
     json!({
         "request_id": request.id,
         "from": request.from.label(),
@@ -674,5 +694,65 @@ mod tests {
         let id = send(&store, "authorized", true).await;
         store.claim_by_id(&primary(), &id).await.unwrap();
         assert_eq!(ids(&stop(&store, &primary()).await), vec![id]);
+    }
+
+    #[tokio::test]
+    async fn reminders_share_the_byte_budget_and_an_oversized_head_is_compacted() {
+        let store = store();
+        // A sender label too large for any full reminder within 1 KB.
+        let mut loud = sender();
+        loud.alias = Some("a".repeat(2_000));
+        let mut claimed = Vec::new();
+        for body in ["one", "two"] {
+            let id = store
+                .create(
+                    loud.clone(),
+                    worker(),
+                    NewRequest {
+                        body: body.into(),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap()
+                .id;
+            store.claim_by_id(&worker(), &id).await.unwrap();
+            claimed.push(id);
+        }
+        let offers = store
+            .offer_turn_boundary(&worker(), TurnBoundaryEvent::Stop, None, Some(1024))
+            .await
+            .unwrap();
+        let total: usize = offers.iter().map(|offer| offer.to_string().len()).sum();
+        assert!(total <= 1024, "{total}");
+        // The head goes out compact; the next waits for a later Stop.
+        assert_eq!(ids(&offers), vec![claimed[0].clone()]);
+        assert!(offers[0].get("from").is_none());
+        // Both claims are recorded as unanswered at this Stop either way.
+        for id in &claimed {
+            let row = store.peek_for(&worker(), id).await.unwrap();
+            assert!(row.turn_offer.unwrap().unanswered_stop_at.is_some());
+        }
+        let second = store.peek_for(&worker(), &claimed[1]).await.unwrap();
+        assert_eq!(second.turn_offer.unwrap().reply_reminders, 0);
+        // Mixed with a queued offer to a primary, reminders count first and
+        // the offer behind them stays within the same budget.
+        let store = self::store();
+        let claimed = send(&store, "authorized and claimed", true).await;
+        store.claim_by_id(&primary(), &claimed).await.unwrap();
+        let queued = send(&store, &"x".repeat(900), true).await;
+        let offers = store
+            .offer_turn_boundary(&primary(), TurnBoundaryEvent::Stop, None, Some(1024))
+            .await
+            .unwrap();
+        let total: usize = offers.iter().map(|offer| offer.to_string().len()).sum();
+        assert!(total <= 1024, "{total}");
+        assert_eq!(ids(&offers), vec![claimed.clone()]);
+        assert_eq!(offers[0]["offer"], "reply_reminder");
+        let row = store.peek_for(&primary(), &queued).await.unwrap();
+        assert!(
+            row.turn_offer.is_none(),
+            "an offer cut by the budget is not recorded"
+        );
     }
 }
