@@ -293,6 +293,45 @@ impl CollaborationStore {
             })
             .collect()
     }
+    /// Test fixture: an unresolved stop on `pane`, which pauses its input
+    /// until cleared, without standing up a real worker to drain.
+    #[cfg(test)]
+    pub(crate) async fn block_worker_input_for_test(&self, pane: &str, socket: Option<&str>) {
+        self.worker_drains.lock().await.push(WorkerDrainRecord {
+            view: WorkerDrainView {
+                token: WorkerDrainToken {
+                    drain_id: uuid::Uuid::new_v4().to_string(),
+                    generation: 1,
+                    target: WorkerDrainTarget {
+                        session_id: "worker".into(),
+                        agent_kind: AgentKind::Codex,
+                        pane: pane.into(),
+                        socket: socket.map(str::to_owned),
+                        room: RoomId {
+                            host: "tmux".into(),
+                            socket: socket.map(str::to_owned),
+                            window_id: "@1".into(),
+                        },
+                    },
+                    process_fence: ProcessFence {
+                        pid: 0,
+                        birth: String::new(),
+                    },
+                    expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+                },
+                phase: WorkerDrainPhase::Uncertain,
+                operation_id: None,
+                detail: String::new(),
+            },
+            policy: WorkerDrainPolicy {
+                min_observed_idle_secs: 0,
+                allow_error: false,
+            },
+            roles: Vec::new(),
+            finished_at: None,
+            stop_outcome: None,
+        });
+    }
     pub async fn worker_input_blocked(&self, pane: &str, socket: Option<&str>) -> bool {
         self.worker_drains
             .lock()

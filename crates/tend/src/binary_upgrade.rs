@@ -210,7 +210,7 @@ mod tests {
             vec!["--config".into(), config.clone().into_os_string()],
         );
         let valid = check.validate().await.unwrap();
-        assert_eq!(valid.target, binary);
+        assert_eq!(valid.target, std::fs::canonicalize(&binary).unwrap());
         assert!(valid.unchanged());
         std::fs::write(&config, "changed").unwrap();
         assert!(!valid.unchanged());

@@ -132,21 +132,8 @@ impl ProcessFence {
     }
 }
 
-/// The kernel's own answer that no process has this pid. `ps` printing
-/// nothing cannot tell an exited pid from a failed spawn; ESRCH can. EPERM
-/// means the pid is alive under another user, so it is not an exit.
 #[cfg(all(unix, not(target_os = "linux")))]
-fn pid_gone(pid: u32) -> bool {
-    let Ok(raw) = i32::try_from(pid) else {
-        return false;
-    };
-    // 0 and negatives address process groups, never a single process.
-    raw > 0
-        && matches!(
-            nix::sys::signal::kill(nix::unistd::Pid::from_raw(raw), None),
-            Err(nix::errno::Errno::ESRCH)
-        )
-}
+use crate::pid_liveness::pid_gone;
 
 fn process_birth(pid: u32) -> Option<String> {
     if pid == 0 {

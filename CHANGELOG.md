@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- A prompt sent from the dashboard or through Fleet while a peer's wake
+  message was being typed into the same agent no longer merges with it. Both
+  used to land on one input line and be submitted together by a single Enter;
+  now each prompt waits for the one before it to be submitted. Dashboard and
+  Fleet prompts to a worker that is being drained for shutdown are refused
+  with `worker_draining`, as `tend` prompts already were.
+- On macOS, tendd no longer marks a tracked task as stopped when its process
+  is still running under another user, and no longer starts a `kill` process
+  for every pid-tracked row while holding the agent registry.
+
 ## [0.10.11] - 2026-11-12
 
 ### Changed

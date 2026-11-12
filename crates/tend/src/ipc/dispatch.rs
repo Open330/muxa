@@ -952,7 +952,8 @@ pub(super) async fn handle(
                             let target = target.clone();
                             // Check the registry after acquiring the input guard:
                             // waiting for an earlier action may replace the session.
-                            let action_guard = collaboration.worker_action_guard(&pane).await;
+                            let action_guard =
+                                crate::prompt_delivery::lock_pane(&collaboration, &pane).await;
                             // Resolve endpoint/session authority before any input or
                             // expected-prompt registration can reach the backend.
                             let agents = store.by_pane(&pane).await;
@@ -965,81 +966,41 @@ pub(super) async fn handle(
                             ) {
                                 Err(error) => Response::err(error),
                                 Ok(socket) => {
-                                    if collaboration
-                                        .worker_input_blocked(&pane, socket.as_deref())
-                                        .await
+                                    use crate::prompt_delivery::{
+                                        deliver_prompt_holding, DeliveryRefused, PromptDelivery,
+                                    };
+                                    match deliver_prompt_holding(
+                                        action_guard,
+                                        &collaboration,
+                                        &store,
+                                        &agents,
+                                        target,
+                                        PromptDelivery {
+                                            pane: &pane,
+                                            socket: socket.as_deref(),
+                                            text: &text,
+                                            submit,
+                                            origin: Some(crate::PromptOrigin::declared(origin)),
+                                        },
+                                    )
+                                    .await
                                     {
-                                        Response::err(
-                                            "worker_draining: managed terminal input is paused",
-                                        )
-                                    } else {
-                                        // `send_text_on` is a blocking shell-out /
-                                        // socket call, so run it off the async worker.
-                                        // Text and submit CR are TWO non-atomic
-                                        // injections; report the outcomes separately.
-                                        let observer =
-                                            crate::prompt_delivery::SubmissionObserver::new(
-                                                &store,
-                                                &agents,
-                                                socket.as_deref(),
-                                                &text,
-                                            );
-                                        // Registered before typing, so the
-                                        // hook reporting it carries its origin.
-                                        let expected = if submit && !text.is_empty() {
-                                            store
-                                                .expect_prompt(
-                                                    &pane,
-                                                    socket.as_deref(),
-                                                    &text,
-                                                    crate::PromptOrigin::declared(origin),
-                                                )
-                                                .await
-                                        } else {
-                                            None
-                                        };
-                                        let (sent, submitted) =
-                                            tokio::task::spawn_blocking(move || {
-                                                let _action = action_guard;
-                                                let s = socket.as_deref();
-                                                let sent =
-                                                    target.send_prompt_text_on(s, &pane, &text);
-                                                let submitted = if sent && submit {
-                                                    if !text.is_empty() {
-                                                        std::thread::sleep(
-                                                            crate::backend::prompt_submit_grace(
-                                                                &pane,
-                                                            ),
-                                                        );
-                                                    }
-                                                    target.send_text_on(s, &pane, "\r")
-                                                } else {
-                                                    false
-                                                };
-                                                (sent, submitted)
-                                            })
-                                            .await
-                                            .unwrap_or((false, false));
-                                        if !submitted {
-                                            if let Some(token) = expected {
-                                                store.forget_expected_prompt(token);
-                                            }
+                                        Err(DeliveryRefused::WorkerDraining) => {
+                                            Response::err(crate::prompt_delivery::WORKER_DRAINING)
                                         }
-                                        if sent {
+                                        // Nothing landed — safe for the caller to
+                                        // retry the whole send.
+                                        Err(DeliveryRefused::NotSent) => Response::err(
+                                            "send_text failed: pane gone or host unreachable",
+                                        ),
+                                        Ok(delivered) => {
+                                            let submitted = delivered.submitted;
                                             tracing::debug!(submit, submitted, "send_prompt");
                                             let mut response =
-                                                Response::with_send_result(sent, submitted);
-                                            if submitted {
-                                                response.submission_confirmed =
-                                                    observer.confirm().await;
-                                            }
+                                                Response::with_send_result(true, submitted);
+                                            response.submission_confirmed =
+                                                delivered.confirm().await;
                                             response
-                                        } else {
-                                            // Nothing landed — safe for the caller to
-                                            // retry the whole send.
-                                            Response::err(
-                                                "send_text failed: pane gone or host unreachable",
-                                            )
                                         }
                                     }
                                 }

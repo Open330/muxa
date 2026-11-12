@@ -341,6 +341,7 @@ async fn run() -> Result<()> {
         &cfg.fleet,
         store.clone(),
         backends.clone(),
+        collaboration.clone(),
         Client::new(socket.clone()),
         restart.generation(),
         collaboration.subscribe(),
@@ -2684,30 +2685,43 @@ fn jitter_ratio() -> f64 {
     }
 }
 
-/// Inject literal text into the firing's pane through the backend that owns
-/// its id namespace. Mirrors `send_collaboration_text`; a backend without
+type WorkerIoGuard = tend::prompt_delivery::PaneInputGuard;
+
+/// Inject literal text into an automation firing's pane. A backend without
 /// `send_text` (zellij) simply refuses, which the caller records as a
 /// failure rather than a silent success.
-type WorkerIoGuard = Arc<tokio::sync::OwnedMutexGuard<()>>;
-
 async fn send_automation_text(
     backends: &[tend::SharedBackend],
     firing: &PlannedFiring,
     text: &str,
     io_guard: Option<WorkerIoGuard>,
 ) -> bool {
-    let Some(kind) = tend::backend::pane_id_host_kind(&firing.pane) else {
+    send_pane_text(
+        backends,
+        &firing.pane,
+        firing.socket.as_deref(),
+        text,
+        io_guard,
+    )
+    .await
+}
+
+/// One raw injection through the backend that owns the pane's id namespace,
+/// holding `io_guard` until the keys are written. Enter and Ctrl-C go
+/// literally; anything else is typed as prompt text. Callers that type and
+/// then submit a whole prompt use `tend::prompt_delivery` instead.
+async fn send_pane_text(
+    backends: &[tend::SharedBackend],
+    pane: &str,
+    socket: Option<&str>,
+    text: &str,
+    io_guard: Option<WorkerIoGuard>,
+) -> bool {
+    let Some(backend) = text_backend(backends, pane) else {
         return false;
     };
-    let Some(backend) = backends
-        .iter()
-        .find(|backend| backend.kind() == kind && backend.caps().send_text)
-        .cloned()
-    else {
-        return false;
-    };
-    let pane = firing.pane.clone();
-    let socket = firing.socket.clone();
+    let pane = pane.to_string();
+    let socket = socket.map(str::to_string);
     let text = text.to_string();
     tokio::task::spawn_blocking(move || {
         let _held_guard = io_guard;
@@ -2719,6 +2733,15 @@ async fn send_automation_text(
     })
     .await
     .unwrap_or(false)
+}
+
+/// The backend that owns `pane`'s id namespace, if it can take text.
+fn text_backend(backends: &[tend::SharedBackend], pane: &str) -> Option<tend::SharedBackend> {
+    let kind = tend::backend::pane_id_host_kind(pane)?;
+    backends
+        .iter()
+        .find(|backend| backend.kind() == kind && backend.caps().send_text)
+        .cloned()
 }
 
 fn spawn_collaboration_waker_task(
@@ -3168,7 +3191,7 @@ async fn deliver_full_collaboration_request(
     quiet: usize,
     wake_payload: CollaborationWakePayload,
 ) -> bool {
-    let io_guard = Arc::new(collaboration.worker_action_guard(&recipient.pane).await);
+    let io_guard = tend::prompt_delivery::lock_pane(collaboration, &recipient.pane).await;
     if collaboration
         .worker_input_blocked(&recipient.pane, recipient.socket.as_deref())
         .await
@@ -3535,58 +3558,41 @@ async fn send_collaboration_wake(
     backends: &[tend::SharedBackend],
     store: &tend::Store,
 ) -> (bool, bool) {
-    let io_guard = Arc::new(collaboration.worker_action_guard(&participant.pane).await);
-    if collaboration
-        .worker_input_blocked(&participant.pane, participant.socket.as_deref())
-        .await
-    {
+    let Some(backend) = text_backend(backends, &participant.pane) else {
         return (false, false);
-    }
-    let agents = store.by_pane(&participant.pane).await;
-    let observer = tend::prompt_delivery::SubmissionObserver::new(
+    };
+    // A peer delivery: the shared path holds the pane guard from the drain
+    // check through Enter, and registers the prompt before typing so the
+    // hook reporting it is stamped as from a peer rather than a person.
+    let delivered = tend::prompt_delivery::deliver_prompt(
+        collaboration,
         store,
-        &agents,
-        participant.socket.as_deref(),
-        prompt,
-    );
-    // A peer delivery: registered before typing, so the hook reporting the
-    // prompt is stamped as from a peer rather than a person.
-    let expected = if prompt.is_empty() {
-        None
-    } else {
-        store
-            .expect_prompt(
-                &participant.pane,
-                participant.socket.as_deref(),
-                prompt,
-                tend::PromptOrigin::Peer,
-            )
-            .await
+        backend,
+        tend::prompt_delivery::PromptDelivery {
+            pane: &participant.pane,
+            socket: participant.socket.as_deref(),
+            text: prompt,
+            submit: true,
+            origin: Some(tend::PromptOrigin::Peer),
+        },
+    )
+    .await;
+    let Ok(delivered) = delivered else {
+        return (false, false);
     };
-    let sent = send_collaboration_text(participant, prompt, backends, io_guard.clone()).await;
-    let submitted = if sent {
-        tokio::time::sleep(tend::backend::prompt_submit_grace(&participant.pane)).await;
-        send_collaboration_text(participant, "\r", backends, io_guard.clone()).await
-    } else {
-        false
-    };
-    if !submitted {
-        if let Some(token) = expected {
-            store.forget_expected_prompt(token);
-        }
-    }
+    let submitted = delivered.submitted;
     if submitted {
         // A missing hook must not delay mailbox bookkeeping, the next peer's
         // wake, or shutdown. This bounded observer only logs evidence and
         // never sends keys or retries the body.
         let pane = participant.pane.clone();
         tokio::spawn(async move {
-            let confirmed = observer.confirm().await;
+            let confirmed = delivered.confirm().await;
             tracing::debug!(pane, submission_confirmed = ?confirmed,
                 "collaboration Enter delivered; application acknowledgement observed separately");
         });
     }
-    (sent, submitted)
+    (true, submitted)
 }
 
 async fn send_collaboration_text(
@@ -3595,29 +3601,14 @@ async fn send_collaboration_text(
     backends: &[tend::SharedBackend],
     io_guard: WorkerIoGuard,
 ) -> bool {
-    let Some(kind) = tend::backend::pane_id_host_kind(&participant.pane) else {
-        return false;
-    };
-    let Some(backend) = backends
-        .iter()
-        .find(|backend| backend.kind() == kind && backend.caps().send_text)
-        .cloned()
-    else {
-        return false;
-    };
-    let pane = participant.pane.clone();
-    let socket = participant.socket.clone();
-    let text = text.to_string();
-    tokio::task::spawn_blocking(move || {
-        let _held_guard = io_guard;
-        if text == "\r" || text == "\u{3}" {
-            backend.send_text_on(socket.as_deref(), &pane, &text)
-        } else {
-            backend.send_prompt_text_on(socket.as_deref(), &pane, &text)
-        }
-    })
+    send_pane_text(
+        backends,
+        &participant.pane,
+        participant.socket.as_deref(),
+        text,
+        Some(io_guard),
+    )
     .await
-    .unwrap_or(false)
 }
 
 /// Spawn the GC task: evicts long-stopped agents on a periodic timer.
