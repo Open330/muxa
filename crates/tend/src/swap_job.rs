@@ -11,9 +11,9 @@
 //!   no result is an effect that may or may not have happened;
 //! - one manager owns the file at a time ([`SwapJobStore::acquire`]), and
 //!   only an owner that is provably gone is taken over;
-//! - on taking over, every job the previous owner left unfinished is marked
-//!   for a person to look at ([`SwapJobStore::recover`]). Nothing is
-//!   replayed.
+//! - on taking over, started or uncertain attempts are marked for a person
+//!   to look at. An untouched pending target may get a fresh attempt under
+//!   its accepted public policy. No effect is replayed.
 //!
 //! What is never written: typed text (follow-ups, drafts, relaunch lines —
 //! a launch line can carry credentials), environments, command lines and
@@ -25,6 +25,7 @@
 // Wired into the daemon in a follow-up; until then only tests construct it.
 #![cfg_attr(not(test), allow(dead_code))]
 
+mod resume;
 #[cfg(test)]
 mod tests;
 
@@ -38,7 +39,7 @@ use std::sync::Mutex;
 
 /// The schema this build writes and reads. Any other version is refused
 /// without being touched.
-pub(crate) const SCHEMA_VERSION: i64 = 3;
+pub(crate) const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE owner (
@@ -46,7 +47,8 @@ CREATE TABLE owner (
     nonce TEXT NOT NULL,
     pid INTEGER NOT NULL,
     process_start TEXT,
-    acquired_at TEXT NOT NULL
+    acquired_at TEXT NOT NULL,
+    draining INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE jobs (
     job_id TEXT PRIMARY KEY,
@@ -56,7 +58,7 @@ CREATE TABLE jobs (
     plan_digest TEXT NOT NULL,
     owner_nonce TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN
-        ('accepted', 'running', 'done', 'needs_reconciliation', 'abandoned')),
+        ('accepted', 'running', 'done', 'needs_reconciliation', 'abandoned', 'deferred')),
     cancel_requested INTEGER NOT NULL DEFAULT 0,
     plan_json TEXT NOT NULL,
     revision INTEGER NOT NULL,
@@ -66,6 +68,7 @@ CREATE TABLE jobs (
     retry_of TEXT,
     evidence_pruned_at TEXT
 );
+CREATE TABLE resume_counts (lineage TEXT PRIMARY KEY, crashes INTEGER NOT NULL);
 CREATE TABLE targets (
     job_id TEXT NOT NULL REFERENCES jobs (job_id),
     target_id INTEGER NOT NULL,
@@ -229,12 +232,31 @@ impl TextRef {
 /// The accepted plan, as written before any effect.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AcceptedPlan {
+    /// Absent on old journals: insufficient policy to resume automatically.
+    #[serde(default)]
+    pub(crate) resume: Option<ResumePolicy>,
     pub(crate) node_id: String,
     pub(crate) continue_when: String,
     pub(crate) continue_text: Option<TextRef>,
     /// Targets to run, in run order; `target_id` is the index here.
     pub(crate) targets: Vec<PlannedTarget>,
     pub(crate) settled: Vec<SettledEntry>,
+}
+
+/// Resolved non-text policy. Never serialize a request, which can contain text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(clippy::struct_excessive_bools)] // resolved independent request switches
+pub(crate) struct ResumePolicy {
+    pub(crate) public: bool,
+    pub(crate) when_idle: bool,
+    pub(crate) idle_deadline: i64,
+    pub(crate) restore_draft: bool,
+    pub(crate) continue_when: crate::account_swap::ContinueWhen,
+    pub(crate) continue_evidence: crate::account_swap::ContinueEvidence,
+    pub(crate) bare: crate::account_swap::BareMode,
+    pub(crate) force: bool,
+    /// Only configured text can be recovered, and only with an equal digest.
+    pub(crate) configured_text: bool,
 }
 
 /// A digest of the request exactly as the caller made it — its typed
@@ -290,6 +312,8 @@ pub(crate) enum Disposition {
     Skipped,
     /// Interrupted; what happened has to be looked at, not assumed.
     NeedsReconciliation,
+    /// Untouched; eligible for a new attempt under its accepted policy.
+    Deferred,
 }
 
 /// A typed observation the executor made, never parsed from a note.
@@ -396,6 +420,8 @@ pub(crate) enum WithheldReason {
     UnverifiedConversation,
     /// `verified`: the relaunch's account was not confirmed.
     AccountUnconfirmed,
+    /// The accepted text could not be reconstructed without storing it.
+    TextUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -566,6 +592,8 @@ pub(crate) enum Boundary {
     Cancelled,
     /// No cancel, and not asked to start yet.
     Open,
+    /// Shutdown settled this pending attempt without an effect.
+    Deferred,
 }
 
 /// What [`SwapJobStore::create_job`] did.
@@ -612,6 +640,11 @@ impl SwapJobStore {
         let mut connection = Connection::open(path)?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        // Rebuilding the jobs CHECK must preserve referencing rows. Disable
+        // enforcement only on this private, unopened connection, outside the tx.
+        if (1..4).contains(&version) {
+            connection.pragma_update(None, "foreign_keys", "OFF")?;
+        }
         match version {
             0 => {
                 connection.pragma_update(None, "journal_mode", "WAL")?;
@@ -628,21 +661,62 @@ impl SwapJobStore {
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
                 tx.execute_batch(MIGRATE_1_TO_2)?;
                 tx.execute_batch(MIGRATE_2_TO_3)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.pragma_update(None, "user_version", 3)?;
                 tx.commit()?;
             }
             2 => {
                 connection.pragma_update(None, "synchronous", "FULL")?;
                 let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
                 tx.execute_batch(MIGRATE_2_TO_3)?;
-                tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+                tx.pragma_update(None, "user_version", 3)?;
                 tx.commit()?;
             }
-            SCHEMA_VERSION => {
+            3 | SCHEMA_VERSION => {
                 connection.pragma_update(None, "synchronous", "FULL")?;
             }
             found => return Err(JobError::UnsupportedSchema { found }),
         }
+        if (1..4).contains(&version) {
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+            let jobs_schema = SCHEMA
+                .split("CREATE TABLE jobs (")
+                .nth(1)
+                .and_then(|s| s.split("CREATE TABLE resume_counts").next())
+                .expect("jobs schema");
+            tx.execute_batch(&format!("CREATE TABLE jobs_v4 ({jobs_schema}"))?;
+            tx.execute_batch(
+                "INSERT INTO jobs_v4 SELECT * FROM jobs;
+                DROP TABLE jobs; ALTER TABLE jobs_v4 RENAME TO jobs;
+                ALTER TABLE owner ADD COLUMN draining INTEGER NOT NULL DEFAULT 0;
+                CREATE TABLE resume_counts (lineage TEXT PRIMARY KEY, crashes INTEGER NOT NULL);",
+            )?;
+            tx.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+            tx.commit()?;
+            connection.pragma_update(None, "foreign_keys", "ON")?;
+            let violations: u32 = connection.query_row(
+                "SELECT COUNT(*) FROM pragma_foreign_key_check",
+                [],
+                |row| row.get(0),
+            )?;
+            if violations != 0 {
+                return Err(JobError::Store(
+                    "foreign key violation after v4 migration".into(),
+                ));
+            }
+        }
+        // Additive v4 metadata: also opens journals written by the initial
+        // unreleased v4 build. Seed old deferrals once from their transition.
+        connection.execute_batch(
+            "CREATE TABLE IF NOT EXISTS resume_windows (
+            lineage TEXT PRIMARY KEY, deadline INTEGER NOT NULL);
+            INSERT OR IGNORE INTO resume_windows (lineage, deadline)
+            SELECT COALESCE(t.lineage, t.job_id || ':' || t.target_id),
+                CASE WHEN json_extract(j.plan_json, '$.resume.when_idle') = 1
+                THEN json_extract(j.plan_json, '$.resume.idle_deadline')
+                ELSE COALESCE(CAST(strftime('%s', j.updated_at) AS INTEGER), unixepoch()) + 1800 END
+            FROM targets t JOIN jobs j ON j.job_id = t.job_id
+            WHERE t.disposition = 'deferred';",
+        )?;
         secure_files(path)?;
         let store = Self {
             path: path.to_path_buf(),
@@ -716,7 +790,7 @@ impl SwapJobStore {
             tx.execute(
                 "INSERT INTO owner (id, nonce, pid, process_start, acquired_at)
                  VALUES (1, ?1, ?2, ?3, ?4)
-                 ON CONFLICT (id) DO UPDATE SET nonce = ?1, pid = ?2, process_start = ?3, acquired_at = ?4",
+                 ON CONFLICT (id) DO UPDATE SET nonce = ?1, pid = ?2, process_start = ?3, acquired_at = ?4, draining = 0",
                 params![me.nonce, me.pid, me.process_start, now()],
             )?;
             tx.commit()?;
@@ -726,68 +800,11 @@ impl SwapJobStore {
         })
     }
 
-    /// Mark every job another owner left unfinished. A job that never did
-    /// anything is abandoned; one that did is left for a person, with each
-    /// unfinished target saying how far it got. Nothing is replayed.
+    /// Classify each unfinished target another owner left: started targets
+    /// require reconciliation, untouched public targets may be deferred.
+    /// Legacy plans lack resume authority. No recorded effect is replayed.
     pub(crate) fn recover(&self, lease: &Lease) -> Result<Vec<String>, JobError> {
-        self.with(|connection| {
-            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            fence(&tx, lease)?;
-            let jobs: Vec<String> = {
-                let mut statement = tx.prepare(
-                    "SELECT job_id FROM jobs
-                     WHERE state IN ('accepted', 'running') AND owner_nonce != ?1
-                     ORDER BY created_at",
-                )?;
-                let rows = statement.query_map([&lease.nonce], |row| row.get(0))?;
-                rows.collect::<Result<_, _>>()?
-            };
-            for job in &jobs {
-                let effects: u32 = tx.query_row(
-                    "SELECT COUNT(*) FROM effects WHERE job_id = ?1",
-                    [job],
-                    |row| row.get(0),
-                )?;
-                if effects == 0 {
-                    tx.execute(
-                        "UPDATE targets SET disposition = 'skipped', reason = 'not_started'
-                         WHERE job_id = ?1 AND disposition IS NULL",
-                        [job],
-                    )?;
-                    set_state(
-                        &tx,
-                        job,
-                        "abandoned",
-                        Some("its manager stopped before any effect"),
-                    )?;
-                    continue;
-                }
-                let unfinished: Vec<(u32, u32)> = {
-                    let mut statement = tx.prepare(
-                        "SELECT target_id, attempt FROM targets
-                         WHERE job_id = ?1 AND disposition IS NULL",
-                    )?;
-                    let rows = statement.query_map([job], |row| Ok((row.get(0)?, row.get(1)?)))?;
-                    rows.collect::<Result<_, _>>()?
-                };
-                for (target, attempt) in unfinished {
-                    let reason = interrupted_reason(&tx, job, target, attempt)?;
-                    tx.execute(
-                        "UPDATE targets SET disposition = 'needs_reconciliation', reason = ?4
-                         WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3",
-                        params![job, target, attempt, reason],
-                    )?;
-                }
-                set_state(
-                    &tx,
-                    job,
-                    "needs_reconciliation",
-                    Some("its manager stopped part way"),
-                )?;
-            }
-            tx.commit()?;
-            Ok(jobs)
-        })
+        self.recover_targets(lease)
     }
 
     /// Prune the observations and the settled (accepted or refused) effects
@@ -1158,13 +1175,16 @@ impl SwapJobStore {
                 })
                 .optional()?
                 .ok_or_else(|| JobError::NotFound(job.to_owned()))?;
-            if !matches!(state.as_str(), "accepted" | "running") {
+            if !matches!(state.as_str(), "accepted" | "running" | "deferred" | "needs_reconciliation") {
                 return Ok(false);
             }
             tx.execute(
                 "UPDATE jobs SET cancel_requested = 1 WHERE job_id = ?1",
                 [job],
             )?;
+            tx.execute("UPDATE targets SET disposition = 'skipped', reason = 'cancelled', phase = 'finished'
+                WHERE job_id = ?1 AND disposition = 'deferred'", [job])?;
+            resume::aggregate(&tx, job)?;
             bump(&tx, job)?;
             tx.commit()?;
             Ok(true)
@@ -1186,6 +1206,15 @@ impl SwapJobStore {
         self.with(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             fence(&tx, lease)?;
+            let disposition: Option<String> = tx.query_row(
+                "SELECT disposition FROM targets WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3",
+                params![job, target, attempt], |row| row.get(0))?;
+            if disposition.as_deref() == Some("deferred") {
+                return Ok(Boundary::Deferred);
+            }
+            if disposition.as_deref() == Some("skipped") {
+                return Ok(Boundary::Cancelled);
+            }
             owned_running(&tx, lease, job)?;
             let cancelled: bool = tx.query_row(
                 "SELECT cancel_requested != 0 FROM jobs WHERE job_id = ?1",
@@ -1207,12 +1236,18 @@ impl SwapJobStore {
                     });
                 }
                 Boundary::Cancelled
+            } else if tx.query_row("SELECT draining FROM owner WHERE id = 1", [], |row| row.get::<_, bool>(0))? {
+                resume::defer_one(&tx, job, target, attempt, "daemon_shutdown")?;
+                Boundary::Deferred
             } else if start {
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE targets SET phase = 'started'
-                     WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND phase = 'pending'",
+                     WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND phase = 'pending' AND disposition IS NULL",
                     params![job, target, attempt],
                 )?;
+                if changed != 1 {
+                    return Err(JobError::Invalid { job: job.into(), why: "attempt is no longer pending".into() });
+                }
                 Boundary::Started
             } else {
                 Boundary::Open
@@ -1248,6 +1283,18 @@ impl SwapJobStore {
         self.with(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             fence(&tx, lease)?;
+            // Drain may have settled this untouched attempt while its worker
+            // was preparing a no-effect outcome. Never overwrite that decision.
+            let deferred: bool = tx.query_row("SELECT disposition = 'deferred' FROM targets
+                WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3",
+                params![job, target, attempt], |r| r.get::<_, Option<bool>>(0).map(|v| v.unwrap_or(false)))?;
+            if deferred { return Ok(()); }
+            if disposition == Disposition::Deferred {
+                resume::defer_one(&tx, job, target, attempt, reason.unwrap_or("deferred"))?;
+                bump(&tx, job)?;
+                tx.commit()?;
+                return Ok(());
+            }
             owned_running(&tx, lease, job)?;
             if disposition != Disposition::NeedsReconciliation
                 && open_intents(&tx, job, target, attempt)? > 0
@@ -1261,7 +1308,7 @@ impl SwapJobStore {
                 });
             }
             let changed = tx.execute(
-                "UPDATE targets SET disposition = ?4, reason = ?5, phase = 'finished'
+                "UPDATE targets SET disposition = ?4, reason = COALESCE(?5, reason), phase = 'finished'
                  WHERE job_id = ?1 AND target_id = ?2 AND attempt = ?3 AND disposition IS NULL",
                 params![job, target, attempt, disposition.to_string(), reason],
             )?;
@@ -1283,7 +1330,14 @@ impl SwapJobStore {
         self.with(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             fence(&tx, lease)?;
-            owned_running(&tx, lease, job)?;
+            let owner: String = tx.query_row(
+                "SELECT owner_nonce FROM jobs WHERE job_id = ?1",
+                [job],
+                |r| r.get(0),
+            )?;
+            if owner != lease.nonce {
+                return Err(JobError::Fenced);
+            }
             let open: u32 = tx.query_row(
                 "SELECT COUNT(*) FROM targets WHERE job_id = ?1 AND disposition IS NULL",
                 [job],
@@ -1295,7 +1349,7 @@ impl SwapJobStore {
                     why: format!("{open} target(s) have no recorded outcome yet"),
                 });
             }
-            set_state(&tx, job, "done", None)?;
+            resume::aggregate(&tx, job)?;
             tx.commit()?;
             Ok(())
         })
@@ -1387,7 +1441,9 @@ impl SwapJobStore {
                         (SELECT o.value_json FROM observations o WHERE o.job_id = t.job_id
                             AND o.target_id = t.target_id AND o.attempt = t.attempt
                             AND o.kind = 'follow_up_evidence' ORDER BY o.seq DESC LIMIT 1)
-                 FROM targets t WHERE t.job_id = ?1 ORDER BY t.target_id, t.attempt",
+                 FROM targets t WHERE t.job_id = ?1 AND t.attempt =
+                    (SELECT MAX(l.attempt) FROM targets l WHERE l.job_id = t.job_id AND l.target_id = t.target_id)
+                 ORDER BY t.target_id",
             )?;
             let targets = statement
                 .query_map([job], |row| {
@@ -1416,6 +1472,11 @@ impl SwapJobStore {
                 })?
                 .collect::<Result<Vec<TargetStatus>, _>>()?;
             let mut targets = targets;
+            for target in &mut targets {
+                if target.reason.as_deref() == Some("follow_up_text_unavailable") {
+                    target.continuation = Some("text_unavailable".into());
+                }
+            }
             // A pruned job's follow-up is expired, never pieced together
             // from the effects that were kept.
             for target in targets.iter_mut().filter(|_| evidence_pruned_at.is_none()) {

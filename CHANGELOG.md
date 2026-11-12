@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Daemon restarts preserve swaps that are waiting for an agent to become idle.
+  Untouched targets in public swap jobs resume automatically under the same job
+  key, after checking that the same agent process is still there. Targets already
+  stopped or typed into when the daemon went down still need a person to inspect
+  them (`needs_reconciliation`). Closed agents are skipped as `target_gone`;
+  deferrals that outlive their resume window are skipped as `resume_window_expired`.
+  The window is the original idle deadline for idle-wait jobs, otherwise 30 minutes
+  from first deferral. Cancellation remains in force; unavailable follow-up text
+  is withheld.
+
 ## [0.10.9] - 2026-11-12
 
 ### Removed

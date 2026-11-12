@@ -609,15 +609,16 @@ async fn run() -> Result<()> {
     let _ = shutdown_tx.send(());
     // Swap jobs: take no new one, and give running ones a short moment to
     // reach their end while the runtime and stores they use still exist.
-    // A job still running when it passes is recovered on the next start as
-    // needing reconciliation, never replayed. Budget: IPC drain (5 s) +
+    // Untouched targets are durably deferred even if an active target does
+    // not finish in time. Only untouched public targets resume on startup;
+    // started targets still require reconciliation and are never replayed. Budget: IPC drain (5 s) +
     // this + runtime teardown (2 s) stays under launchd's 20 s; the 2 s
     // per-task timeouts below are a worst-case ceiling on top that only
     // hung tasks reach.
     if let Some(swap) = &swap_service {
         if !swap.service.drain(SWAP_DRAIN_ON_SHUTDOWN).await {
             tracing::warn!(
-                "swap jobs still running at shutdown; they will be marked for reconciliation on the next start"
+                "swap targets still active at shutdown; started targets will need reconciliation, untouched public targets will resume on the next start"
             );
         }
     }

@@ -2860,15 +2860,36 @@ pub(crate) fn prepare_retry(
     config: &SwapConfig,
     accounts: &crate::accounts::AccountsConfig,
 ) -> (SwapRequest, Step) {
+    let (request, step, _) =
+        prepare_retry_classified(request, planned, agents, backends, config, accounts);
+    (request, step)
+}
+
+/// Also distinguish a positively changed binding from an unavailable read.
+pub(crate) fn prepare_retry_classified(
+    request: &SwapRequest,
+    planned: &RetryTarget<'_>,
+    agents: &[Agent],
+    backends: &[SharedBackend],
+    config: &SwapConfig,
+    accounts: &crate::accounts::AccountsConfig,
+) -> (SwapRequest, Step, bool) {
     let (resolved, steps) = prepare(request, agents, backends, config, accounts);
     let mut settled = None;
+    let mut changed = false;
     for step in steps {
         match step {
             Step::Run(target) => {
                 let identity = target.identity();
                 if is_planned_process(&identity, planned) {
-                    return (resolved, Step::Run(target));
+                    return (resolved, Step::Run(target), false);
                 }
+                changed |= identity.endpoint != planned.endpoint
+                    || identity.conversation_id != planned.conversation_id
+                    || identity.process_pid != planned.process_pid
+                    || (identity.process_start.is_some()
+                        && planned.process_start.is_some()
+                        && identity.process_start.as_deref() != planned.process_start);
                 settled = Some(SwapOutcome {
                     note: "skipped: not the agent its job planned (another process now, or its \
                            start cannot be read); nothing was done"
@@ -2897,7 +2918,7 @@ pub(crate) fn prepare_retry(
         continue_withheld: None,
         follow_up: None,
     });
-    (resolved, Step::Done(outcome))
+    (resolved, Step::Done(outcome), changed)
 }
 
 /// The very process a parent job planned: same endpoint, conversation, pid
