@@ -94,7 +94,13 @@ items) or `collaboration_human_decision_v1` (human requests).
   accepted the result, not that a human understood it.
 - **Targets are descriptors.** An item outlives its pane, session or
   transcript. Nothing retires an item except an explicit disposition.
-- **Anchors are recorded, never opened.**
+- **Evidence is printed, not opened.** `tend review show` lists the command
+  that opens each piece of evidence (and a `commit:` anchor): `git show` /
+  `git diff` (with `--stat`) in the recorded checkout, `gh pr view` /
+  `gh pr diff` for a pull request, the command to rerun a test. tend runs
+  none of them: the checkout is the asker's declaration and git reads
+  repository config that can run programs (signature verifiers, lazy
+  fetches), so opening evidence is the person's own act, in their shell.
 - **No control characters.** Identifiers, labels, anchors and keys refuse all
   control characters; summaries and notes allow newlines and tabs only. Every
   stored string is printed by the CLI, so terminal escapes are refused at the

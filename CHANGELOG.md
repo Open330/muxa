@@ -25,6 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `tend review show` prints the command that opens each piece of evidence:
+  `git show`/`git diff` (with `--stat`) in the recorded checkout, `gh pr
+  view`/`gh pr diff` for a pull request, and the command for a test. A
+  `commit:` anchor counts as evidence. Nothing is run for you.
 - Agents file a finished result with one call: the `tend_file_result` MCP
   tool, or `tend work done --summary "..." [--commit SHA] [--evidence ...]
   [--decision-needed ... --option ... --recommend ...]` in a managed

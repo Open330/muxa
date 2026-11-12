@@ -41,6 +41,7 @@ mod peer_cli;
 mod relay;
 mod reload;
 mod review_cmd;
+mod review_evidence;
 mod servers_cmd;
 mod sidebar;
 mod spawn_provenance;
