@@ -61,7 +61,7 @@ pub(crate) fn definitions() -> Vec<Value> {
             "name": "tend_wait",
             "description": "Wait on one handle: a request id (its reply), a swap job (until it ends), a dispatch UUID (current status, at once), or a pane's next state change (pane, no id). A timeout changes nothing. Prefer wakes; wait 30-60 s, not 1 s probes.",
             "inputSchema": {"type": "object", "properties": {
-                "id": {"type": "string" },
+                "id": {"type": "string", "description": "Also accepted as request_id." },
                 "kind": {"type": "string", "enum": ["request", "dispatch", "swap"] },
                 "timeout_secs": {"type": "integer", "minimum": 1, "maximum": 600 },
                 "after_update": {"type": "integer", "minimum": 0, "description": "Fleet: return on newer progress."},
@@ -668,7 +668,12 @@ fn route_wait(args: &Value) -> Result<Routed, String> {
         args: Value::Object(args),
         replaced_by: None,
     };
-    let id = args.get("id").and_then(Value::as_str).map(str::trim);
+    // `request_id` is accepted too: receipts' next_step routes name it.
+    let id = args
+        .get("id")
+        .or_else(|| args.get("request_id"))
+        .and_then(Value::as_str)
+        .map(str::trim);
     let Some(id) = id.filter(|id| !id.is_empty()) else {
         if args.get("pane").is_some() {
             return Ok(routed(

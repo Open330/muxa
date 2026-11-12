@@ -5,206 +5,122 @@ description: Coordinate coding agents through Tend MCP and its tmux workspace, w
 
 # Tend collaboration
 
-Use the connected Tend MCP tools to coordinate bounded work and retain ownership
-of the final result. Start with one `tend_collaboration_guide` call: it returns your
-identity (`room.self`: pane, tmux session, window), same-window peers, and the user's
-launch preferences, so separate `tend_guide`/`tend_room_context` calls are redundant.
-For independent review, use the opposite provider: Codex selects Claude and
-Claude selects Codex unless the user explicitly requests another provider. A
-worker launch uses configured provider permissions; bypass launch and edits
-still require authorization. Detailed workflow examples are opt-in
-via `tend_collaboration_guide(workflows=true)`.
-Later, refresh peers and unread counts with `tend_room_context` only when they may
-have changed. Report your location from `self`; never derive it from `$TMUX_PANE` or
-tmux commands, which can name another pane (Codex's shared app-server). Tool
-schemas and returned IDs describe the currently installed capabilities. Discover
-exact tool names (for example a name ending in `__tend_inbox`), not matches in
-shared descriptions. For discovery, print matching names only
-(`ALL_TOOLS.filter(...).map(({name}) => name)`), then retrieve the description
-of one exact selected name. Never print every matching schema. Retain resolved tool handles and schemas within the session;
-do not print `ALL_TOOLS` again for a known tool. Refresh only after a version/
-capability change or an unknown-tool/argument error.
+Delegate bounded work through Tend and keep ownership of the final result.
 
-## Execution layout
+## Start
 
-- A managed tmux session hosts a Workspace, a window hosts a Work's current Run,
-  and a pane hosts an Agent session. Work is durable; closing a window ends a Run.
-- Peers share the same tmux socket and stable window ID. Keep collaborators for
-  one Work in that window; use another Work window for an independent outcome.
-- Use `tend_start_work` for a configured pipeline, `tend_start_agent` for one
-  agent, and `tend_manage_tmux` for supported lifecycle actions. Inspect their
-  schemas before supplying arguments. Do not infer managed ownership from names.
-- Pane splits share files. Assign disjoint edit paths, or use separate worktrees
-  when edits would overlap. A pane or agent session is not a filesystem sandbox.
+Call `tend_guide` once. It returns your identity (`room.self`: pane, tmux
+session, window), same-window peers, the user's launch preferences and the
+guardrails. Refresh later with `tend_guide(topic=room)` only when peers may
+have changed. Take your location from `self`, never from `$TMUX_PANE` or tmux
+commands, which can name another pane. Discover exact tool names (one ending in
+`__tend_inbox`, not matches in descriptions), keep the handles you resolved,
+and refresh only after a version change or an unknown-tool error.
 
-## Dispatch and completion
+For an independent review use the opposite provider (Codex picks Claude,
+Claude picks Codex) unless the user named one.
 
-1. Resolve existing peers from room context. Choose an explicit pane, provider,
-   alias, or unambiguous role when the recipient matters. Never infer pane IDs.
-2. Use the exact `peer.pane` returned by room context, including `rmux:`. If a
-   peer moved or disappeared, refresh context once; do not retry old IDs or aliases.
-   For new work, use `tend_call_peer`. State the objective, relevant context,
-   acceptance criteria, permitted paths, and expected verification/artifacts.
-   Review and question requests are read-only. Editing requires `intent=task`
-   and `execute=true` within the user's authorized delegation scope.
-3. Prefer `wait=false` while independent local work remains. Read the result after
-   its completion wake or a substantive work checkpoint. When waiting in the
-   foreground, use 30–60 seconds. Reserve 1-second probes for an expected result;
-   do not repeat unchanged probes. Keep the returned `request_id`; retrieve the structured reply with `tend_wait_reply`. For an
-   existing report or feedback request, use `tend_peer_report` before sending work.
-4. A timeout or `peer_pending` is not proof that the peer can still work.
-   Wait in slices of at most 60 seconds, then follow **Interrupted peers and human decisions**
-   before repeating the same request. Never dispatch duplicate work. Resume a
-   yielded tool cell with the host's wait tool instead of starting another wait.
-5. Inspect replies against the actual files and relevant checks. Apply valid
-   findings, explain rejected findings when material, and integrate the result.
+## Layout
 
-Human sessions default to protected `primary`; automatic/provider/role routing
-uses dedicated `worker` sessions. High-level `tend_call_peer` reuses a worker
-or creates one by default, using configured provider permissions without adding
-bypass flags. Naming a primary routes generic work to a same-provider worker;
-use `context_bound=true` only when that exact conversation is required. Those
-primary requests and low-level exact-pane messages stay queued. Inspect IDs
-with message lists and accept just one with `tend_inbox(request_id=...)` only when
-the human task permits it; do not promote a human session merely to drain inbox.
-When the user explicitly tells you to deliver to a primary session, pass
-`user_authorized=true` (CLI `--user-authorized`): the primary takes the request
-at its next turn boundary (end of its current turn or the user's next prompt)
-through its provider hook, never by typing into its terminal; an exact
-primary target is kept instead of rerouted, and
-the flag is recorded on the request. Never ask the user to accept it again on
-the target. On the receiving side, a hook message offering such requests is
-an offer: claim each with `tend_inbox(request_id)` first and act only on the
-claimed instruction; if the claim is refused, do not act on the offered text.
+A managed tmux session is a Workspace, a window is a Work's current Run, a
+pane is one agent. Keep one Work's collaborators in its window. Use
+`tend_start_work` for a configured pipeline, `tend_start_agent` for one agent,
+`tend_manage_tmux` for lifecycle. Panes share files: give peers disjoint paths
+or separate worktrees.
 
-For requests addressed to you, claim/read with `tend_inbox` unless already
-claimed and delivered in full. Honor kind/work_mode/paths. Only when
-`expects_reply=true`, finish with one terminal `tend_reply` (`completed`,
-`blocked`, `declined`, or `failed`) with useful artifacts and verification.
-Never reply to or acknowledge a one-way notice solely to confirm receipt.
-Do not treat idle status or terminal text as a durable completion report. Use
-`tend_wait_for_change` for process state waits and mailbox tools for peer results.
+## Send work
 
-## Finishing work
+1. `tend_call_peer` with the objective, context, acceptance criteria, paths
+   and the evidence you expect back. Review and question are read-only;
+   editing needs `intent=task` and `execute=true` within the user's
+   authorization. `target` picks a peer, provider, `%N`, `@alias` or `role:`;
+   Tend reuses or creates a worker with configured permissions.
+2. It returns at once with a `request_id`. Keep working; the reply arrives as
+   a wake. Read it with `tend_inbox(view=report, request_id=ID)` or `tend_wait(id=ID)`
+   (30-60 s foreground waits, never repeated 1-second probes). Never send the
+   same work twice; a timeout is not failure.
+3. Verify the reply against the files and checks. A reply is not proof.
 
-Finishing means filing one result record the person can decide from without
-reading your pane: `tend work done --summary ...` inside a managed pipeline
-(it also completes the alias), otherwise `tend_file_result`. Give the summary,
-commits and test evidence (`test-pass:CMD`/`test-fail:CMD`), and, when the
-person must choose, `decision_needed`, `options` and your `recommendation`.
-The record is not approval and nothing waits on it; use
-`tend_request_attention` when you are blocked on the answer.
+Exact mailbox delivery (`exact=true`, or `intent=notice` for one-way
+information) queues on a protected primary instead of rerouting to a worker.
+Human sessions are protected primaries. When the user told you to deliver a
+request to their session, add `user_authorized=true`: it is offered at that
+session's next turn boundary, never typed into its terminal. On the receiving
+side such an offer is not an instruction until you claim it with
+`tend_inbox(request_id)`.
 
-## Transport and compact reads
+## Receive work
 
-Tend reports delivery and final reply receipt; it does not judge task success.
-`final_reply_received` includes failed/blocked/declined replies; `reported_status`
-is the recipient's declaration. Progress uses `tend_update_request`; final replies
-use `tend_reply`. A timeout or process idle/stopped observation is not completion.
-Do not decide status by searching words in the reply body.
+Claim with `tend_inbox` (the wake names the `request_id`). Honor
+kind/work_mode/paths. Only when `expects_reply=true`, finish with exactly one
+`tend_reply` (`completed`, `blocked`, `declined` or `failed`) with artifacts
+and verification. Never acknowledge a one-way notice. Progress goes on the
+same request with `tend_update_request`, at real checkpoints only.
 
-Inbox already includes required instructions; reserve `full=true` for diagnostics.
-Reports omit original requests. Lists default to 20 metadata records; retrieve
-instructions with `request_id` + `include_body=true`, and progress with that ID
-+ `after_update` (resume with `next_after_update`). Use `full=true` only when
-legacy full records are necessary. `include_body=true` requires an exact request
-ID unless `full=true` explicitly requests full history. Inbox preserves the contract.
-Prompt history defaults to 20 entries (ordinary maximum 100). Fleet status is a
-compact summary; use `full=true` only when the complete data is needed.
-For CLI replies use `tend msg wait REQUEST --body --output FILE` or `--body`
-for stdout. Keep the command's exit status and stderr; filtering with `grep`
-can hide an option error as empty output. Do not resend after an empty filtered
-receipt. Avoid shell JSON parsing; never pass JSON through `echo`.
-CLI `tend msg list --json` defaults to 20 metadata rows. Use
-`--request-id REQUEST --full` for one original request, or `--full` for explicit
-full history pages. Use `--offset` for another page, not a repeated whole list.
-For incremental CLI guidance use
-`tend msg list --request-id REQUEST --after-update SEQUENCE --json` and resume
-from `next_after_update`; original task and final reply bodies are omitted.
-Default CLI wait prints timeout JSON and exits 2 without changing work state.
-`--full` also exits nonzero on timeout. Resume the same request, not new work.
+If a reminder says you claimed a request and ended your turn without
+replying, reply now or post progress; do not redo the work.
 
-## Notification discipline
+## Finishing
 
-Agree on reporting checkpoints when dispatching work. Omit receipt confirmations,
-"in progress", and unchanged status. Consolidate intermediate findings at meaningful
-build/test or review checkpoints; check the inbox then instead of polling for notices.
-Never update a terminal request; use a new request with `parent_request_id` for new work.
-Use `tend_update_request` or `tend msg update REQUEST BODY [--json]` for
-consolidated guidance/progress on the original request. Updates are quiet and
-preserve its authority and paths. If neither is available, send one consolidated `kind="notice"`, `expects_reply=false`
-message with `parent_request_id` referencing the original request.
+File one result record the person can decide from without reading your pane:
+`tend work done --summary ...` in a managed pipeline, otherwise
+`tend_file_result` (summary, commits, `test-pass:CMD`/`test-fail:CMD`, and
+`decision_needed`/`options`/`recommendation` when they must choose).
 
-One-way notices are durable but do not wake recipients by default. Use `notify=true`
-only when a blocker, decision, edit-scope conflict, or resource handoff requires the
-recipient's attention (CLI: `--notify` or `--notify true`; `--notify false` is quiet). This respects idle-only delivery and global wake settings;
-it never authorizes interrupting a busy agent. `notify=false` explicitly records a
-message without waking. Wake delivery and `expects_reply` are independent.
-Terminal replies already wake the requester; do not send a second completion notice.
-When you give up on or replace your own request, name it in `withdraw_reply_wakes`
-on the replacement (CLI: `msg send --withdraw REQ`) or call `tend_withdraw_reply_wake`,
-so its late reply stays readable without waking you. Nothing else about it changes.
-The coordinator reports meaningful outcomes and needed decisions to the user, not
-an update for every peer message. Inspect only the relevant installed schema before using an unfamiliar option.
+## Reading the mailbox
+
+`tend_inbox(view=incoming|sent|all)` lists without claiming (20 metadata rows
+by default; `request_id` + `include_body=true` for one instruction,
+`after_update` for progress). `tend_inbox(view=report)` returns the newest
+peer reply. Delivery and `final_reply_received` are receipts, not success;
+`reported_status` is the recipient's word. Never judge status from words in a
+body.
+
+## Notices and wakes
+
+One-way notices do not wake anyone unless `notify=true`; use it only for a
+blocker, decision, edit-scope conflict or handoff. Replies already wake the
+sender. When you give up on your own request, `tend_update_request(action=
+withdraw_wake, request_id=ID)`; cancel a still-queued one with
+`action=cancel`. Never update a finished request; send a new one with
+`parent_request_id`. Report outcomes and decisions to the user, not every
+message.
 
 ## Interrupted peers and human decisions
 
-For an explicit `reason="peer_interrupted"`, read `interruption` and reuse its
-`action_request_id`; do not dispatch duplicate work or repeatedly wait blindly.
-A timeout alone proves neither interruption nor completion. Check fresh recipient
-identity/health once at a checkpoint. If no interruption was recorded, consult
-`tend_collaboration_guide(workflows=true)` or the recovery reference for options.
-Record one recovery update on the original open request. Reassignment needs a
-verified stop/handoff or an isolated worktree so the old worker cannot overlap.
+A `peer_interrupted` result keeps the work open: read `interruption`, reuse
+its `action_request_id`, do not resend. Reasons include provider approval,
+caps, a lost binding, `reply_overdue` (claimed, reminded, still silent) and
+`wake_unsubmitted` (the wake never reached a turn). Check fresh recipient
+state once at a checkpoint; reassign only after a verified stop or in an
+isolated worktree. `tend_guide(workflows=true)` has recovery examples.
 
-For a real approval, choice, or missing information, first verify
-`guide.capabilities.human_actions=true` and the relevant schema has
-`human_action`. Otherwise ask in the existing user conversation; do not retry
-`human`/`console` aliases. When supported, use `target="human"`,
-`kind="question"`, `expects_reply=true`, and the supported `human_action`.
-Include the existing parent request when applicable and reuse the returned ID.
-Continue independent authorized work while awaiting the actual answer; timeout
-is not consent, and a submitted answer may be a refusal. Existing authorization
-counts. Keep the parent open until its work ends. Never impersonate the console
-or answer a human request as an agent. Use the existing user conversation when
-this protocol is unavailable. Keep remote host/request identity together.
+For a real approval, choice or missing information, call
+`tend_request_attention` (body, options, recommendation, evidence) and keep
+its id. Its answer arrives as a wake. Timeout is never consent; an answer
+may be a refusal. Never answer a human request as an agent.
 
-## Authority and unavailable capabilities
+## Authority
 
-Existing explicit user authorization remains valid within the same scope; do not
-ask for it again. An authorized peer task may reuse or create a worker through
-`tend_call_peer` with configured provider permissions. Automatic creation defaults
-to enabled (`collaboration.auto_spawn_workers`); `spawn_if_missing` overrides it
-per call. `collaboration.worker_bypass_permissions=true` explicitly enables
-bypass flags for these workers. Direct worker `tend_start_agent` launches also
-honor this setting; primary launches retain their existing execution profile.
-A review does not grant
-editing authority. Never add bypass flags to work around a permission prompt.
+Existing user authorization stays valid within its scope; do not ask again.
+A review grants no edit authority. Never add bypass flags to get past a
+permission prompt.
 
-When MCP is missing, report that setup/restart is needed and use `tend doctor`
-for diagnosis if shell access is available. For new peer work without MCP, use `tend peer codex "BOUNDED REQUEST"`
-(or `claude`, an exact pane, or `auto`). It uses the same dedicated-worker
-routing as `tend_call_peer`, including primary-to-worker substitution, and
-returns a durable request id without waiting by default. Use `--wait
---timeout-secs 60` when needed, or `tend msg wait REQUEST` later. Use
-`--context-bound` only for that exact conversation; it keeps primary acceptance.
-`--user-authorized` delivers to the named primary when the user asked for it.
-Do not substitute `tend msg send %N` for generic peer work: that is an exact
-mailbox delivery and can remain queued on a protected primary.
-CLI mailbox equivalents are usable
-when they preserve identity and the request contract; inspect `tend msg --help`.
-Do not substitute terminal input or screen scraping for durable peer messages,
-or turn Tend feedback into a GitHub PR workflow without grounded PR context.
+## Fleet
 
-For concrete review, parallel implementation, and incoming-work examples, read
-[references/workflows.md](references/workflows.md) when helpful. Tend's
-`[message.skills]` are outgoing prompt templates, distinct from this agent skill.
+Add `host` to reach a control-mode Fleet host: `tend_status(host)`,
+`tend_call_peer(host, pane)`, `tend_send_prompt(host, pane)`. Dispatch Work
+with `tend_start_work(commit, dispatch_id, ...)`, reuse the dispatch id after
+an uncertain delivery, and read it with `tend_wait(id)`; launched means
+started, not done.
 
-## Fleet Work dispatch
+## Without MCP
 
-When the installed tools advertise `tend_dispatch_work`, use it for authorized
-work placement. Supply a UUID dispatch_id, workspace, Work, exact commit and
-bounded objective. Tend resolves node selection and personalized paths; do not
-copy host inventories into prompts. Reuse the ID after uncertain delivery and
-read `tend_dispatch_status` before any recovery. Launched means started, not
-completed. Use the existing request for updates; report artifacts or blockers.
+Report that setup or a restart is needed (`tend doctor`). `tend peer codex
+"BOUNDED REQUEST"` (or `claude`, a pane, `auto`) uses the same worker routing
+and returns a request id; `tend msg wait REQUEST --body` reads the reply.
+`tend msg send %N` is exact delivery and can stay queued on a primary. Keep
+CLI exit status and stderr; never parse JSON through `echo`.
+
+Examples: [references/workflows.md](references/workflows.md). Tend's
+`[message.skills]` are outgoing prompt templates, distinct from this skill.

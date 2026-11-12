@@ -1,100 +1,62 @@
 # Workflow examples
 
-## Human decision during peer work
-
-The dedicated `tend_request_attention` tool accepts `body` and `action` (approval,
-choice, information). Preserve causal Work IDs and reuse a UUID `dispatch_id`
-for retries. The source host stores one durable request; connected Fleet Mac
-clients show it in Attention/Inbox and notify the human. The equivalent CLI is
-`tend msg attention "..." --action choice`. Continue independent work and wait
-for the returned request ID using `tend_wait_reply`. The full send form below
-remains compatible.
-
-While handling `req_review`, a reviewer discovers two mutually exclusive product
-requirements that the authorized task does not resolve. Send:
-
-```json
-{
-  "target": "human",
-  "kind": "question",
-  "expects_reply": true,
-  "human_action": "choice",
-  "parent_request_id": "req_review",
-  "body": "Choose A (preserve compatibility) or B (remove the legacy API). This changes the public contract, so I need your choice. Recommend A for this release."
-}
-```
-
-Use `tend_send_message`, retain its returned ID (for example `req_decision`),
-then call `tend_wait_reply(request_id="req_decision")`. Keep the original review
-open; continue independent checks. On timeout, wait on `req_decision` again.
-When the operator answers, inspect both status and body, implement only what
-the answer authorizes, then complete `req_review` with the verified result.
-These IDs are illustrative: always use actual returned IDs.
-
-Do not use `tend_call_peer(target="human")`, `pane:console`, or `console=true`
-to create or answer an operator decision. A failed review, missing peer, or
-routine permission already granted by the user does not justify this flow.
-`approval` and `information` use the same protocol with their corresponding
-`human_action`. The dashboard/app shows the linked request and return reply;
-orange/Need you identifies an unresolved human request, not agent activity.
+All ids below are illustrative; always use the ids Tend returns.
 
 ## Independent review
 
-For independent review, Codex uses Claude and Claude uses Codex unless the
-user explicitly selects a different provider. Resolve a matching peer in room
-context; when a new reviewer is authorized, explicitly launch that opposite
-provider instead of choosing the caller's own provider.
-
-For "@peer review the current changes", retrieve room context, then call
-`tend_call_peer(target="auto", intent="review", body="Review the current diff for
-correctness. Acceptance criteria: ...; checks already run: ...; focus: ...",
-wait=false)`. Include the exact repository/worktree and commit or diff context.
-Continue independent checks, read the reply using the returned request ID, and
-verify the findings. This does not require creating a PR or a new agent.
+Codex reviews with Claude and Claude with Codex unless the user chose a
+provider. For "@peer review the current changes", call
+`tend_call_peer(target="auto", intent="review", body="Review the diff at
+<worktree> <commit> for correctness. Acceptance criteria: ...; checks run: ...;
+focus: ...")`. It returns `req_r` at once. Continue independent checks; when
+the reply wakes you, read it with `tend_inbox(view="report", request_id="req_r")` and verify
+the findings against the code. No PR or new agent is required.
 
 ## Parallel implementation
 
-For an authorized implementation with peer delegation, assign one bounded
-deliverable per worker and record file ownership in each request. For example,
-delegate API regression coverage under `tests/api/` while implementing the
-handler locally. Use `intent="task"`, `execute=true`, and the narrow `paths`
-scope. Paths are advisory and must also be explained in the body.
+Give each worker one bounded deliverable and its file ownership, e.g. API
+regression tests under `tests/api/` while you implement the handler:
+`intent="task"`, `execute=true`, `paths=["tests/api/"]`, and the scope stated in
+the body too (paths are advisory). When workers must edit the same files, give
+each its own worktree and cwd; integrate commits explicitly. A successful
+reply does not mean your checkout changed.
 
-When multiple workers need to edit the same files, prepare separate worktrees
-and launch each agent with the intended working directory. A shared Work window
-still supplies the collaboration room. Integrate commits or patches explicitly;
-do not assume that successful replies imply the shared checkout is updated.
+## Human decision during peer work
 
-An independent outcome belongs to another Work window in the same Workspace;
-an unrelated project belongs to another Workspace. Prefer managed launch tools
-so identity and lifecycle metadata stay consistent.
+While handling `req_review`, a reviewer finds two mutually exclusive
+requirements the task does not resolve:
 
-## Incoming work and follow-up
+```json
+{"body": "Choose A (keep compatibility) or B (remove the legacy API). It changes the public contract. Recommend A for this release.",
+ "action": "choice", "options": ["A", "B"], "recommendation": "A",
+ "parent_request_id": "req_review"}
+```
 
-On a Tend notification, call `tend_inbox` unless the complete request was already
-claimed and delivered in the prompt. A read-only review returns findings without
-changing files. An execute task edits only within its delegated scope and reports
-the checks run. When `expects_reply=true`, use `tend_reply` once with the original
-request ID, terminal status, result, and artifacts. For one-way notices, absorb
-the information without an acknowledgement or a new user-facing status report.
-Read quiet progress notices together at agreed build/test or review checkpoints.
+Send it with `tend_request_attention`, keep `req_decision`, continue
+independent checks, and read the answer when it wakes you
+(`tend_wait(id="req_decision")` if you must block). Implement only what the
+answer authorizes, then finish `req_review`. A failed review, a missing peer
+or an already-granted permission does not justify this flow. CLI:
+`tend msg attention "..." --action choice`.
 
-If a missing prerequisite ends this work attempt, return `blocked` and name it.
-While awaiting a human decision within an active attempt, keep the request open
-and use the Human decision protocol above instead of a terminal `blocked` reply.
-If asked to summarize "the peer's report", retrieve `tend_peer_report`; do not
-ask the peer to repeat work. Keep the same durable request ID, but if the
-target disappears, follow Peer interruption recovery instead of blindly waiting. Remote Fleet requests require an explicit host and
-pane and obey the host's observe/control mode.
+## Incoming work
 
-## Interrupted peer example
+On a Tend wake, `tend_inbox(request_id=ID)` unless the full request was already
+delivered. A review returns findings without editing; a task edits only its
+scope and reports the checks it ran. With `expects_reply=true`, finish once
+with `tend_reply`. Absorb one-way notices silently. If a missing prerequisite
+ends the attempt, reply `blocked` and name it; while a human decision is
+pending, keep the request open instead. For "the peer's report", read
+`tend_inbox(view=report)`; do not ask the peer to repeat the work.
 
-After `tend_wait_reply(request_id=R, timeout_secs=60)` times out, check the durable
-record and fresh state for R's exact recipient. If it is capped, record the
-observed scope/reset and last artifacts with `tend_update_request`. A reset time
-may be unknown. Use an already-authorized recovery when possible. Otherwise send
-one human choice request explaining "wait for reset / use a healthy provider",
-with `parent_request_id=R`, and retain its returned ID. Keep R open during that
-decision; a claimed R still requires verified stop/handoff or isolated work before
-reassignment. Resume only after checking fresh state and the operator's answer.
-For Fleet use its returned host/pane_key and the remote message endpoint.
+## Interrupted peer
+
+`tend_wait(id="req_r", timeout_secs=60)` timed out, or returned
+`peer_interrupted`. Check the durable record and fresh state of req_r's exact
+recipient once. If it is capped, record the scope, reset and last artifacts
+with `tend_update_request(request_id="req_r", body=...)`. Use an authorized
+recovery when one exists; otherwise one `tend_request_attention` with
+`parent_request_id="req_r"` ("wait for the reset / move to a healthy
+provider"). Keep req_r open; a claimed request needs a verified stop or an
+isolated worktree before anyone else takes it. A Fleet request keeps its
+returned host and pane_key.

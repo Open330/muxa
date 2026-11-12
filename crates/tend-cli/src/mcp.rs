@@ -1744,7 +1744,7 @@ async fn call_tool_inner(
                 }
                 Ok(output) => Ok(error_result(&output.stderr)),
                 Err(e) => Ok(json_result(
-                    &json!({"state":"unknown","dispatch_id":args["dispatch_id"],"error":e.to_string(),"next_step":"read tend_dispatch_status with this ID; do not create a replacement"}),
+                    &json!({"state":"unknown","dispatch_id":args["dispatch_id"],"error":e.to_string(),"next_step":"read tend_wait(id) with this ID; do not create a replacement"}),
                 )),
             }
         }
@@ -2427,22 +2427,22 @@ fn collaboration_guide(
             "peer_interruption": {
                 "wait_slice_secs": 60,
                 "owner": "The coordinator owns recovery; a capped peer may never send a reply. Set an overall wait budget; never renew timed-out waits blindly.",
-                "health": "Read the durable reply first, then fresh tend_status for the exact recipient agent/session/socket or tend_fleet_status for the returned host/pane_key. Request to.state is stale. Missing/offline is unknown availability, not proof of a cap or process exit.",
+                "health": "Read the durable reply first, then fresh tend_status for the exact recipient agent/session/socket or tend_status(host) for the returned host/pane_key. Request to.state is stale. Missing/offline is unknown availability, not proof of a cap or process exit.",
                 "evidence": ["state", "rate_limit_scope", "rate_limit_source", "rate_limited_until", "last_notification"],
                 "trigger": "Known cap/error/stopped, repeated unavailability, or exhausted overall budget requires a recovery decision. Utilization alone is insufficient; reset time is only a recheck hint.",
                 "recovery": "Record one update with evidence/artifacts. Use authorized independent work, one bounded reset recheck, or a healthy peer. Verify current health and progress; do not repeatedly prompt the capped agent.",
-                "handoff": "Cancel queued local requests with tend_cancel_message and verify success. Claimed requests need supported authorized stop/handoff or isolated replacement work; a cap/offline state does not prevent resumption. Preserve request/thread identities and never impersonate the peer.",
+                "handoff": "Cancel queued local requests with tend_update_request(action=cancel) and verify success. Claimed requests need supported authorized stop/handoff or isolated replacement work; a cap/offline state does not prevent resumption. Preserve request/thread identities and never impersonate the peer.",
                 "human": "Only if a real choice/approval/information is needed, follow human_feedback with one linked request; reuse its ID and existing authorization. Preserve remote endpoint identity.",
                 "completion": "Do not fabricate the peer reply. If ending your own incoming attempt, reply blocked with dependency/handoff evidence; keep it open during an active human decision.",
                 "limitation": "Upgraded daemons return peer_interrupted without completing work. A running coordinator handles recovery first; if unavailable or unacknowledged for two minutes the daemon creates one durable human action. Reuse interruption.action_request_id; inspect interruption.decision without interpreting completion as consent. Older hosts still need bounded health checks."
             },
             "human_feedback": {
                 "when": "Only when an actual operator approval, choice, or missing information is required; never for routine peer traffic or already-authorized work.",
-                "tool": "tend_send_message",
-                "request": { "target": "human", "kind": "question", "expects_reply": true, "human_action": "choice" },
+                "tool": "tend_request_attention",
+                "request": { "action": "choice" },
                 "actions": ["approval", "choice", "information"],
                 "context": "Include the exact decision, why required, options and recommendation. Include parent_request_id only for an existing request you participate in; inherit its thread and preserve known work identity.",
-                "wait": "Retain the returned request_id and use tend_wait_reply. Continue independent work; never treat a timeout as consent or create duplicate questions. Keep the original peer request open while waiting.",
+                "wait": "Retain the returned request_id; its answer arrives as a wake (tend_wait(id) to block). Continue independent work; never treat a timeout as consent or create duplicate questions. Keep the original peer request open while waiting.",
                 "answer": "The human answers in Need you (watch: e). Read status and body; completed is not necessarily approval. Honor refusal/cancellation and complete the original peer request after authorized work.",
                 "identity": "Never use console=true or claim/answer the operator inbox as an agent.",
                 "fallback": "If the installed schema lacks human_action, ask in the existing user conversation. Do not silently drop the question or redirect it to a peer."
@@ -2460,7 +2460,7 @@ fn collaboration_guide(
                         "specific risks or uncertainties"
                     ]
                 },
-                "after_sending": "Continue any independent checks, wait with tend_wait_reply, then verify and address the findings."
+                "after_sending": "Continue any independent checks, read the reply when it wakes you (tend_inbox(view=report, request_id) or tend_wait(id)), then verify and address the findings."
             },
             "subagent": {
                 "when": "A useful subtask is independently verifiable and does not overlap your active edits.",
@@ -2483,9 +2483,9 @@ fn collaboration_guide(
             },
             "ongoing_fleet_work": {
                 "steps": [
-                    "Consolidate verified guidance with tend_fleet_update_request on the returned host/pane_key/request_id; do not inject repeated task prompts.",
+                    "Consolidate verified guidance with tend_update_request on the returned request_id (host/pane_key from another process); do not inject repeated task prompts.",
                     "Report nonterminal progress with tend_update_request on the same request, never by addressing pane:console.",
-                    "At agreed checkpoints read tend_list_messages; updates do not interrupt terminal input or widen execution authority.",
+                    "At agreed checkpoints read tend_inbox(view=incoming); updates do not interrupt terminal input or widen execution authority.",
                     "Wait with after_update=0 for progress, then resume with next_after_update; finish with exactly one terminal reply."
                 ]
             },
@@ -3107,7 +3107,7 @@ pub(crate) async fn call_peer(
         common["delivery"] = json!(format!(
             "pane {} has no registered agent session yet; tendd delivers this request as soon as \
              that pane reports idle, which needs tend to see an agent process there. Wait on \
-             request_id {} with tend_wait_reply — never watch the pane with capture-pane or \
+             request_id {} with tend_wait — never watch the pane with capture-pane or \
              sleep. If the reply times out, check `tend status` for a row on the pane.",
             sent.to.pane, sent.id
         ));
@@ -3146,8 +3146,8 @@ pub(crate) async fn call_peer(
             payload["delivery_state"] =
                 crate::collaboration_output::receipt(&sent)["delivery_state"].clone();
             payload["next_step"] = json!(format!(
-                "the request remains durable for {}; call tend_wait_reply with request_id {} to keep \
-                 waiting, or tend_peer_report later. Do not poll the pane.",
+                "the request remains durable for {}; call tend_wait with request_id {} to keep \
+                 waiting, or tend_inbox(view=report) later. Do not poll the pane.",
                 sent.to.pane, sent.id
             ));
             json_result(&payload)
@@ -3246,7 +3246,7 @@ async fn fleet_call_peer(
         // The withdrawn requests live in this host's mailbox and the new one
         // in the remote host's; there is no transaction spanning both.
         return error_result(
-            "fleet_call_peer cannot withdraw reply wakes; call tend_withdraw_reply_wake on the host that holds those requests",
+            "fleet_call_peer cannot withdraw reply wakes; call tend_update_request(action=withdraw_wake) on the host that holds those requests",
         );
     }
 
@@ -3349,7 +3349,7 @@ async fn fleet_call_peer(
         "selected_peer": sent.to,
         "initiator": sent.initiator,
         "progress_route": {"tool":"tend_update_request", "request_id":sent.id},
-        "guidance_route": {"tool":"tend_fleet_update_request", "host":host, "pane_key":pane_key, "request_id":sent.id},
+        "guidance_route": {"tool":"tend_update_request", "host":host, "pane_key":pane_key, "request_id":sent.id},
         "expanded_skill": expanded_skill,
         "request_id": sent.id,
         "thread_id": sent.thread_id,
@@ -3399,7 +3399,7 @@ async fn fleet_call_peer(
                     ["delivery_state"]
                     .clone();
             payload["next_step"] = json!({
-                "tool": "tend_fleet_wait_reply",
+                "tool": "tend_wait",
                 "arguments": {
                     "host": host,
                     "pane_key": pane_key,
@@ -3421,7 +3421,7 @@ async fn fleet_call_peer(
             payload["delivery_state"] =
                 crate::collaboration_output::receipt(&sent)["delivery_state"].clone();
             payload["next_step"] = json!({
-                "tool": "tend_fleet_wait_reply",
+                "tool": "tend_wait",
                 "arguments": {
                     "host": host,
                     "pane_key": pane_key,
@@ -7720,23 +7720,9 @@ mod tests {
             .unwrap()
             .contains("running coordinator"));
         let human = &guide["workflows"]["human_feedback"];
-        assert_eq!(human["tool"], "tend_send_message");
-        assert_eq!(human["request"]["target"], "human");
-        assert_eq!(human["request"]["expects_reply"], true);
-        let input = new_request_from_args(
-            &human["request"],
-            RequestKind::Question,
-            "Choose A or B".into(),
-            true,
-            WorkMode::ReadOnly,
-            vec![],
-        )
-        .unwrap();
-        assert_eq!(
-            input.human_action,
-            Some(tend::collaboration::HumanAction::Choice)
-        );
-        assert!(human["wait"].as_str().unwrap().contains("tend_wait_reply"));
+        assert_eq!(human["tool"], "tend_request_attention");
+        assert_eq!(human["request"]["action"], "choice");
+        assert!(human["wait"].as_str().unwrap().contains("tend_wait"));
         assert_eq!(guide["room"]["peers"][0]["pane"], "%2");
         let guardrails = guide["guardrails"].to_string();
         for rule in [
