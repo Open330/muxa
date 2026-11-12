@@ -30,6 +30,7 @@
 //!   row still names its agent).
 
 use tend::event::{AgentEvent, AgentId, NotificationLevel};
+use tend::provenance::StateSource;
 use tend::state::{Agent, SYNTHETIC_SESSION_PREFIX};
 use tend::{AgentState, SharedStore};
 use time::{Duration, OffsetDateTime};
@@ -192,7 +193,12 @@ pub fn attention_refinement_events(
 /// *live* non-synthetic (real hook) row already owns `pane_id`, drop the whole
 /// update. A `Stopped` real row is a stale tombstone, not an owner — see
 /// [`occupant_is_authoritative`].
-pub async fn apply_if_unowned(store: &SharedStore, pane_id: &str, events: &[AgentEvent]) {
+pub async fn apply_if_unowned(
+    store: &SharedStore,
+    pane_id: &str,
+    events: &[AgentEvent],
+    source: StateSource,
+) {
     let occupants = store.by_pane(pane_id).await;
     if occupants.iter().any(occupant_is_authoritative) {
         tracing::debug!(
@@ -202,7 +208,7 @@ pub async fn apply_if_unowned(store: &SharedStore, pane_id: &str, events: &[Agen
         return;
     }
     for ev in events {
-        store.apply_observed(ev).await;
+        store.apply_observed(ev, source).await;
     }
 }
 
@@ -213,7 +219,7 @@ pub async fn apply_if_unowned(store: &SharedStore, pane_id: &str, events: &[Agen
 /// it). Emitting `SessionEnded` drives the synthetic row to `Stopped`, after
 /// which GC can reclaim it. A pane with no synthetic row is left untouched (no
 /// row is invented), and a real hook row is never disturbed by this path.
-pub async fn stop_synthetic_row(store: &SharedStore, pane_id: &str) {
+pub async fn stop_synthetic_row(store: &SharedStore, pane_id: &str, source: StateSource) {
     let occupants = store.by_pane(pane_id).await;
     for occ in occupants {
         if !occ.session_id.starts_with(SYNTHETIC_SESSION_PREFIX) || occ.state == AgentState::Stopped
@@ -231,10 +237,13 @@ pub async fn stop_synthetic_row(store: &SharedStore, pane_id: &str) {
             cwd: occ.cwd.clone(),
         };
         store
-            .apply_observed(&AgentEvent::SessionEnded {
-                id,
-                at: OffsetDateTime::now_utc(),
-            })
+            .apply_observed(
+                &AgentEvent::SessionEnded {
+                    id,
+                    at: OffsetDateTime::now_utc(),
+                },
+                source,
+            )
             .await;
         tracing::debug!(pane = %pane_id, "synthetic: agent gone, stopped synthetic row");
     }
@@ -415,6 +424,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: AT,
             last_activity_at: AT,
             state_entered_at: AT,
@@ -731,7 +741,7 @@ mod tests {
             })
             .await;
         let events = state_events(id("%1"), SyntheticState::Working, "cursor", None, AT);
-        apply_if_unowned(&store, "%1", &events).await;
+        apply_if_unowned(&store, "%1", &events, StateSource::Screen).await;
 
         let rows = store.by_pane("%1").await;
         assert_eq!(rows.len(), 1, "only the real row remains");
@@ -742,7 +752,7 @@ mod tests {
     async fn apply_if_unowned_applies_when_pane_is_free() {
         let store = Store::shared();
         let events = state_events(id("%1"), SyntheticState::Working, "cursor", None, AT);
-        apply_if_unowned(&store, "%1", &events).await;
+        apply_if_unowned(&store, "%1", &events, StateSource::Screen).await;
         let rows = store.by_pane("%1").await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].state, AgentState::Working);
@@ -754,8 +764,8 @@ mod tests {
         let store = Store::shared();
         // Synthetic working row.
         let events = state_events(id("%1"), SyntheticState::Working, "cursor", None, AT);
-        apply_if_unowned(&store, "%1", &events).await;
-        stop_synthetic_row(&store, "%1").await;
+        apply_if_unowned(&store, "%1", &events, StateSource::Screen).await;
+        stop_synthetic_row(&store, "%1", StateSource::Screen).await;
         assert_eq!(store.by_pane("%1").await[0].state, AgentState::Stopped);
 
         // A real row on another pane must be left alone.
@@ -772,7 +782,7 @@ mod tests {
                 at: AT,
             })
             .await;
-        stop_synthetic_row(&store, "%2").await;
+        stop_synthetic_row(&store, "%2", StateSource::Screen).await;
         assert_eq!(store.by_pane("%2").await[0].state, AgentState::Idle);
     }
 
@@ -808,6 +818,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: AT,
             last_activity_at: AT,
             state_entered_at: AT,

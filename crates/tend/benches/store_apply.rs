@@ -77,6 +77,7 @@ fn make_realistic_agent() -> Agent {
         rate_limited_until: None,
         rate_limit_scope: None,
         rate_limit_source: None,
+        state_source: None,
         started_at: now,
         last_activity_at: now,
         state_entered_at: now,

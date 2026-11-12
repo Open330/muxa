@@ -300,6 +300,7 @@ mod tests {
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: datetime!(2026-04-24 12:00:00 UTC),
             last_activity_at: datetime!(2026-04-24 12:00:00 UTC),
             state_entered_at: datetime!(2026-04-24 12:00:00 UTC),

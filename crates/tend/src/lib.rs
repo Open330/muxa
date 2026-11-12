@@ -83,6 +83,7 @@ pub mod pipeline_run;
 pub mod process_snapshot;
 pub mod process_tree;
 mod prompt_headline;
+pub mod provenance;
 #[cfg(unix)]
 #[doc(hidden)]
 pub mod test_support;

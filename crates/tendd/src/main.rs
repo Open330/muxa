@@ -4330,6 +4330,7 @@ async fn enrich_from_history(
             rate_limited_until: None,
             rate_limit_scope: None,
             rate_limit_source: None,
+            state_source: None,
             started_at: entry.at,
             last_activity_at: entry.at,
             state_entered_at: entry.at,
