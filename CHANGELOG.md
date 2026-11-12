@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.15] - 2026-11-12
+
 ### Added
 
 - `tend work link WORK --github OWNER/REPO#N | --linear KEY` attaches an
