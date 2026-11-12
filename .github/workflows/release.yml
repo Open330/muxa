@@ -169,6 +169,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # AppIcon.icon (Icon Composer) needs Xcode 26 or newer. The runner's
+      # default Xcode can be older: it then copies the icon as a plain folder
+      # and the app ships without one (v0.10.12). Pick the newest Xcode 26+.
+      - name: Select Xcode 26 or newer
+        run: |
+          set -euo pipefail
+          best=""; bestv=""
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || echo 0)
+            [ "${v%%.*}" -ge 26 ] 2>/dev/null || continue
+            if [ -z "$bestv" ] || [ "$(printf '%s\n%s\n' "$bestv" "$v" | sort -V | tail -1)" = "$v" ]; then
+              best="$app"; bestv="$v"
+            fi
+          done
+          if [ -z "$best" ]; then
+            ls -d /Applications/Xcode*.app || true
+            echo "::error::no Xcode 26 or newer on this runner; AppIcon.icon needs it"
+            exit 1
+          fi
+          sudo xcode-select -s "$best/Contents/Developer"
+          xcodebuild -version
+
       - name: Resolve ref name
         id: ref
         run: |

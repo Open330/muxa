@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The Tend for Mac download has its app icon again. 0.10.12 was built with an
+  Xcode too old for the new Icon Composer icon, so the app showed a generic
+  icon. Release and CI builds now pick Xcode 26 or newer and refuse an app
+  that comes out without an icon.
+
 ## [0.10.12] - 2026-11-12
 
 ### Changed

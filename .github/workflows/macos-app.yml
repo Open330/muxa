@@ -30,6 +30,29 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+
+      # AppIcon.icon (Icon Composer) needs Xcode 26 or newer. The runner's
+      # default Xcode can be older: it then copies the icon as a plain folder
+      # and the app ships without one (v0.10.12). Pick the newest Xcode 26+.
+      - name: Select Xcode 26 or newer
+        run: |
+          set -euo pipefail
+          best=""; bestv=""
+          for app in /Applications/Xcode*.app; do
+            [ -d "$app" ] || continue
+            v=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist" 2>/dev/null || echo 0)
+            [ "${v%%.*}" -ge 26 ] 2>/dev/null || continue
+            if [ -z "$bestv" ] || [ "$(printf '%s\n%s\n' "$bestv" "$v" | sort -V | tail -1)" = "$v" ]; then
+              best="$app"; bestv="$v"
+            fi
+          done
+          if [ -z "$best" ]; then
+            ls -d /Applications/Xcode*.app || true
+            echo "::error::no Xcode 26 or newer on this runner; AppIcon.icon needs it"
+            exit 1
+          fi
+          sudo xcode-select -s "$best/Contents/Developer"
+          xcodebuild -version
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
@@ -108,6 +131,13 @@ jobs:
             build > "$RUNNER_TEMP/xcodebuild-release.log" 2>&1 && status=0 || status=$?
           grep -E ': (error|warning): |\*\* BUILD ' "$RUNNER_TEMP/xcodebuild-release.log" | sort -u | head -200 || true
           exit "$status"
+      # An Xcode that cannot compile AppIcon.icon still builds, but the app
+      # has no icon. The release would ship it that way, so check here.
+      - name: Check the app icon
+        working-directory: apps/tend-macos
+        run: |
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" \
+            .build/DerivedDataRelease/Build/Products/Release/Tend.app/Contents/Info.plist
       # The build extracts every new string into the catalog; one without a
       # Korean value means a translation was forgotten.
       - name: Check translations

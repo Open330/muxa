@@ -51,6 +51,13 @@ xcodebuild \
 
 APP_PATH="$DERIVED_DATA/Build/Products/$CONFIGURATION/Tend.app"
 test -d "$APP_PATH"
+# AppIcon.icon (Icon Composer) compiles only with Xcode 26 or newer. An older
+# Xcode copies it into Resources as a plain folder and the app ships with no
+# icon at all (v0.10.12), so refuse such a build here.
+if ! /usr/libexec/PlistBuddy -c "Print :CFBundleIconName" "$APP_PATH/Contents/Info.plist" >/dev/null 2>&1; then
+    echo "Tend.app has no app icon (CFBundleIconName missing): build with Xcode 26 or newer ($(xcodebuild -version | head -1))" >&2
+    exit 1
+fi
 # Keep build identity in the bundle: main builds may share a release version.
 python3 - "$APP_PATH" "$REPO_DIR" "$APP_VERSION" <<'PYTHON'
 import json, pathlib, subprocess, sys
