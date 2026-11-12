@@ -125,7 +125,7 @@ recorded in CHANGELOG.md under **Removed** with the reason. The 2026-11-12
 pass removed `tend graph`, the BarShelf widget and the zellij plugin stub,
 and moved analytics and the 16-step onboarding tour to frozen Labs. It also
 removed the dashboard's OIDC sign-in and sharing, which a published
-dashboard was using; that was restored in the next release. Check every
+dashboard was using; it was restored after 0.10.13. Check every
 host's config before calling a feature unused.
 
 Frozen means: bug fixes and keeping it compiling with the rest of tend, but
