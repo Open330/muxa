@@ -18,6 +18,15 @@ tend review request --work tend/storage --alias impl \
 tend review request --session <session-id> --provider codex --summary "…"
 tend review request --request <collaboration-request-id> --summary "…"
 
+# Ask for a decision, with the context to make it from the card.
+tend review request --work tend/storage --alias impl \
+  --summary "Storage migration ready" \
+  --decision-needed "Merge now or wait for the perf run?" \
+  --option "merge now" --option "wait for perf" \
+  --recommend "merge now: the perf run only covers the read path" \
+  --evidence commit:1a2b3c --evidence https://github.com/o/r/pull/12 \
+  --evidence "test-pass:cargo test -p tend review"
+
 tend review list            # open items, newest first, 50 per page
 tend review list --oldest   # oldest first (where the status-line age comes from)
 tend review list --all      # include disposed items
@@ -31,6 +40,27 @@ tend review withdraw rv_… [--note "…"]
 
 Every command takes `--json`. `request` and the dispositions take
 `--as user|agent` (default `user`) and an optional `--label`.
+
+## Decision fields
+
+An item may carry a `decision`: `needed` (the question), `options` (up to
+8 one-line choices), `recommendation`, and `evidence` (up to 16 typed
+pointers). Evidence kinds:
+
+| Kind | Shorthand | Fields |
+| --- | --- | --- |
+| `commit` | `commit:SHA` | `sha` (4-64 hex), `repo` (absolute checkout path) |
+| `pull_request` | `pr:URL` or a bare `https://` URL | `url` |
+| `diff` | `diff:A..B` | `range` (revision syntax only), `repo` |
+| `test` | `test:CMD`, `test-pass:CMD`, `test-fail:CMD` | `command`, `passed`, `tail` (last 2 KiB of output, escapes removed) |
+| `path` | `path:PATH` | `path` |
+
+`commit:` and `diff:` evidence records the current directory's git
+checkout unless `--repo` names one. Every field is the asker's declaration;
+tend validates its shape, never its truth. Human requests
+(`tend_request_attention`) carry the same `decision` object next to their
+`body`. Storing it needs a tendd advertising `review_decision_v1` (review
+items) or `collaboration_human_decision_v1` (human requests).
 
 ## Semantics
 

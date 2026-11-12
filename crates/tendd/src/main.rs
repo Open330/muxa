@@ -5462,6 +5462,7 @@ mod tests {
                 sender,
                 recipient,
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
@@ -5700,6 +5701,7 @@ mod tests {
                 sender,
                 pending,
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
@@ -5800,6 +5802,7 @@ mod tests {
                 sender.clone(),
                 recipient.clone(),
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
@@ -5865,6 +5868,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
@@ -5936,6 +5940,7 @@ mod tests {
                 console,
                 recipient.clone(),
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
@@ -6028,6 +6033,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
@@ -6114,6 +6120,7 @@ mod tests {
                     sender.clone(),
                     recipient.clone(),
                     NewRequest {
+                        decision: None,
                         user_authorized: false,
                         task_contract: None,
                         supersedes_request_id: None,
@@ -6266,6 +6273,7 @@ mod tests {
                     sender,
                     recipient.clone(),
                     NewRequest {
+                        decision: None,
                         user_authorized: false,
                         task_contract: None,
                         supersedes_request_id: None,
@@ -6691,6 +6699,7 @@ mod tests {
                 sender,
                 recipient.clone(),
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,
@@ -6825,6 +6834,7 @@ mod tests {
                 console.clone(),
                 recipient.clone(),
                 NewRequest {
+                    decision: None,
                     user_authorized: false,
                     task_contract: None,
                     supersedes_request_id: None,

@@ -3132,6 +3132,7 @@ mod tests {
                         from.clone(),
                         to.clone(),
                         NewRequest {
+                            decision: None,
                             user_authorized: false,
                             task_contract: None,
                             supersedes_request_id: None,
@@ -3167,6 +3168,7 @@ mod tests {
                     from,
                     to,
                     NewRequest {
+                        decision: None,
                         user_authorized: false,
                         task_contract: None,
                         supersedes_request_id: None,

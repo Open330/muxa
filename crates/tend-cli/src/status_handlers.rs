@@ -989,6 +989,7 @@ mod needs_attention_line_tests {
                     kind: ActorKind::User,
                     label: None,
                 },
+                decision: None,
             })
             .await
             .unwrap();

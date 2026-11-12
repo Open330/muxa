@@ -1376,6 +1376,7 @@ fn handle_key(
                             )
                         };
                         let request = NewRequest {
+                            decision: None,
                             user_authorized: false,
                             task_contract: None,
                             supersedes_request_id: None,
@@ -4876,6 +4877,7 @@ mod tests {
 
     fn broadcast_request() -> NewRequest {
         NewRequest {
+            decision: None,
             user_authorized: false,
             task_contract: None,
             supersedes_request_id: None,

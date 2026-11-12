@@ -228,6 +228,10 @@ pub struct ReviewItem {
     #[serde(with = "time::serde::rfc3339")]
     pub requested_at: OffsetDateTime,
     pub requested_by: ReviewActor,
+    /// What the claimer wants decided, the options, their recommendation
+    /// and the evidence (`review_decision_v1`). Declared, never verified.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::decision::Decision>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disposition: Option<ReviewDisposition>,
 }
@@ -250,6 +254,11 @@ pub struct NewReview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<String>,
     pub requested_by: ReviewActor,
+    /// Needs a daemon advertising
+    /// [`crate::decision::REVIEW_DECISION_CAPABILITY`]; older ones refuse
+    /// the unknown field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::decision::Decision>,
 }
 
 impl NewReview {
@@ -261,6 +270,9 @@ impl NewReview {
         }
         if let Some(key) = &self.idempotency_key {
             bounded("idempotency_key", key, MAX_KEY_BYTES, Text::Line)?;
+        }
+        if let Some(decision) = &self.decision {
+            decision.validate().map_err(ReviewError::Invalid)?;
         }
         self.requested_by.validate_client()
     }
@@ -326,31 +338,10 @@ impl From<std::io::Error> for ReviewError {
     }
 }
 
-/// What a text field may contain besides printable characters.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Text {
-    /// Identifiers, labels, anchors: no control characters at all.
-    Line,
-    /// Summaries and notes: newlines and tabs allowed, nothing else.
-    Prose,
-}
+use crate::decision::Text;
 
-/// Every stored string is printed by the CLI and status surfaces, so control
-/// characters (terminal escapes, NUL) are refused at the boundary.
 fn bounded(name: &str, value: &str, max: usize, text: Text) -> Result<(), ReviewError> {
-    if value.trim().is_empty() {
-        return Err(ReviewError::Invalid(format!("{name} must not be blank")));
-    }
-    if value.len() > max {
-        return Err(ReviewError::Invalid(format!("{name} exceeds {max} bytes")));
-    }
-    let allowed = |c: char| text == Text::Prose && (c == '\n' || c == '\t');
-    if value.chars().any(|c| c.is_control() && !allowed(c)) {
-        return Err(ReviewError::Invalid(format!(
-            "{name} must not contain control characters"
-        )));
-    }
-    Ok(())
+    crate::decision::check(name, value, max, text).map_err(ReviewError::Invalid)
 }
 
 fn nanos(at: OffsetDateTime) -> i64 {
@@ -659,6 +650,9 @@ fn create(
         idempotency_key: new.idempotency_key,
         requested_at: now,
         requested_by: new.requested_by,
+        decision: new
+            .decision
+            .and_then(crate::decision::Decision::into_option),
         disposition: None,
     };
     tx.execute(
@@ -734,6 +728,9 @@ fn record(
             idempotency_key: new.idempotency_key,
             requested_at: now,
             requested_by: new.requested_by,
+            decision: new
+                .decision
+                .and_then(crate::decision::Decision::into_option),
             disposition: None,
         };
         tx.execute(
@@ -833,6 +830,7 @@ mod tests {
                 kind: ActorKind::Agent,
                 label: Some("impl".into()),
             },
+            decision: None,
         }
     }
 

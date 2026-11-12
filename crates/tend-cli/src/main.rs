@@ -15,6 +15,7 @@ mod config_cmd;
 mod config_sync_cmd;
 mod daemon;
 mod dashboard_cmd;
+mod decision_record;
 mod doctor;
 mod doctor_report;
 mod fleet_cli;

@@ -218,6 +218,11 @@ fn dispatch_matches(
         && existing.expects_reply == input.expects_reply
         && existing.notify == input.notify
         && existing.human_action == input.human_action
+        && existing.decision
+            == input
+                .decision
+                .clone()
+                .and_then(crate::decision::Decision::into_option)
         && existing.work_mode == input.work_mode
         && existing.source_node_id == input.source_node_id
         && existing.delegation_parent == input.delegation_parent
@@ -908,6 +913,11 @@ pub struct CollaborationRequest {
     /// Turn-boundary offer attempts for user-authorized work to a primary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_offer: Option<turn_offer::TurnOffer>,
+    /// Structured context for a human decision: options, recommendation,
+    /// evidence. Only on requests with `human_action`; `body` stays the
+    /// readable question.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::decision::Decision>,
 }
 
 impl CollaborationRequest {
@@ -1103,6 +1113,11 @@ pub struct NewRequest {
     /// as the audit record of that claim.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub user_authorized: bool,
+    /// Structured context for a human decision
+    /// ([`crate::decision::HUMAN_DECISION_CAPABILITY`]). Requires
+    /// `human_action`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<crate::decision::Decision>,
 }
 
 impl Default for NewRequest {
@@ -1131,6 +1146,7 @@ impl Default for NewRequest {
             task_contract: None,
             supersedes_request_id: None,
             user_authorized: false,
+            decision: None,
         }
     }
 }
@@ -1527,6 +1543,8 @@ pub enum CollaborationError {
     InvalidTaskContract(String),
     #[error("invalid dispatch metadata: {0}")]
     InvalidDispatch(String),
+    #[error("invalid decision fields: {0}")]
+    InvalidDecision(String),
     #[error("dispatch {0} already exists with a different recipient or payload")]
     DispatchConflict(String),
     #[error("agent collaboration is disabled; enable [collaboration].enabled")]
@@ -3095,6 +3113,20 @@ impl CollaborationStore {
         if body.is_empty() {
             return Err(CollaborationError::EmptyMessage);
         }
+        let decision = input
+            .decision
+            .clone()
+            .and_then(crate::decision::Decision::into_option);
+        if let Some(decision) = &decision {
+            if input.human_action.is_none() {
+                return Err(CollaborationError::InvalidDecision(
+                    "decision fields need a human_action request".into(),
+                ));
+            }
+            decision
+                .validate()
+                .map_err(CollaborationError::InvalidDecision)?;
+        }
         if body.len() > self.opts.max_message_bytes {
             return Err(CollaborationError::MessageTooLarge(
                 self.opts.max_message_bytes,
@@ -3211,6 +3243,7 @@ impl CollaborationStore {
             late_replies: Vec::new(),
             user_authorized: input.user_authorized,
             turn_offer: None,
+            decision,
             dispatch_id: input.dispatch_id,
             source_node_id: input.source_node_id,
             delegation_parent: input.delegation_parent,
@@ -5817,6 +5850,87 @@ mod tests {
             store.create(sender, human, input).await.unwrap().id,
             request.id
         );
+    }
+
+    #[tokio::test]
+    async fn a_human_decision_is_stored_only_on_human_requests_and_survives_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let options = CollaborationOptions {
+            path: Some(dir.path().join("decision.json")),
+            ..CollaborationOptions::default()
+        };
+        let mailbox = CollaborationStore::load(options.clone()).await.unwrap();
+        let sender = participant("%1", "sender");
+        let peer = participant("%2", "peer");
+        let human = resolve_target(&sender, "human", &[], CollaborationScope::Window).unwrap();
+        let decision = crate::decision::Decision {
+            options: vec!["merge".into(), "hold".into()],
+            recommendation: Some("merge".into()),
+            evidence: vec![crate::decision::Evidence::PullRequest {
+                url: "https://github.com/o/r/pull/1".into(),
+            }],
+            ..Default::default()
+        };
+        let peer_request = mailbox
+            .create(
+                sender.clone(),
+                peer,
+                NewRequest {
+                    body: "pick one".into(),
+                    decision: Some(decision.clone()),
+                    ..NewRequest::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            peer_request,
+            Err(CollaborationError::InvalidDecision(_))
+        ));
+        let mut bad = decision.clone();
+        bad.options = vec!["x\u{1b}[2J".into()];
+        let refused = mailbox
+            .create(
+                sender.clone(),
+                human.clone(),
+                NewRequest {
+                    body: "pick one".into(),
+                    human_action: Some(HumanAction::Choice),
+                    decision: Some(bad),
+                    ..NewRequest::default()
+                },
+            )
+            .await;
+        assert!(matches!(
+            refused,
+            Err(CollaborationError::InvalidDecision(_))
+        ));
+        let input = NewRequest {
+            body: "Merge #1?".into(),
+            human_action: Some(HumanAction::Choice),
+            decision: Some(decision.clone()),
+            dispatch_id: Some(uuid::Uuid::new_v4().to_string()),
+            ..NewRequest::default()
+        };
+        let request = mailbox
+            .create(sender.clone(), human.clone(), input.clone())
+            .await
+            .unwrap();
+        assert_eq!(request.decision.as_ref(), Some(&decision));
+        // A retry with the same decision is the same request.
+        assert_eq!(
+            mailbox
+                .create(sender.clone(), human.clone(), input)
+                .await
+                .unwrap()
+                .id,
+            request.id
+        );
+        let reloaded = CollaborationStore::load(options).await.unwrap();
+        let stored = reloaded
+            .list_for(&sender, RequestMailbox::Sent, MailboxScope::Caller)
+            .await
+            .unwrap();
+        assert_eq!(stored[0].decision.as_ref(), Some(&decision));
     }
 
     #[tokio::test]
