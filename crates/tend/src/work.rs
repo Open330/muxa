@@ -218,6 +218,8 @@ pub struct WorkRecord {
 /// Daemons that serve the Work backlog (`work_backlog`, `work_edit`,
 /// `work_record_show`).
 pub const WORK_BACKLOG_CAPABILITY: &str = "work_backlog_v1";
+/// Daemons that honor `newest` on `work_record_show`.
+pub const WORK_RECENT_RESULTS_CAPABILITY: &str = "work_recent_results_v1";
 
 /// What `tend work up` needs to start a planned Work, plus its backlog
 /// position. Every field is optional; `work up` arguments win over it.

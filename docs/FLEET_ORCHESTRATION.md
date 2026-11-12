@@ -107,6 +107,13 @@ completion from the durable pipeline aliases for the exact workspace/work/cwd,
 not from agent idleness or terminal text. Results carry verification states and
 an artifact directory locator; artifact bytes and commits are not automatically
 copied back or merged. Agents should report deliverables and resulting commits.
+`result.results` lists the result records filed on the Work (`tend work done
+--summary`, `tend_file_result`): the newest 20, oldest first, within 256 KiB,
+with their decision fields (needed, options, recommendation, evidence) and
+the person's disposition and note. `result.results_more` says older ones
+exist. It is re-read on every status, including after the Run completed, so a
+later accept or return shows up; a dispatch finished before this existed is
+linked to its Run on its next status (`work_backlog_v1`).
 
 ## Delivery and recovery
 

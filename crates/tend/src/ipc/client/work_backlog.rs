@@ -48,10 +48,21 @@ impl Client {
         &self,
         identity: &WorkIdentity,
     ) -> Result<WorkShow, RuntimeError> {
+        self.work_record_show_newest(identity, None).await
+    }
+
+    /// [`Self::work_record_show`] with only the newest `newest` result
+    /// records (oldest first); `reviews_more` says older ones exist.
+    pub async fn work_record_show_newest(
+        &self,
+        identity: &WorkIdentity,
+        newest: Option<usize>,
+    ) -> Result<WorkShow, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
             "kind": "work_record_show",
             "identity": identity,
+            "newest": newest,
         });
         let response = self.call_checked(&req).await?;
         Ok(WorkShow {

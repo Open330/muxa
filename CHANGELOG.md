@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `tend work dispatch-status` (and `tend_dispatch_status`) includes the
+  result records filed on the dispatched Work: summary, decision asked for,
+  evidence, and the person's disposition and note, refreshed on every read.
+
 ### Fixed
 
 - A tendd started on its own socket or config with its own `TMUX_TMPDIR` (a

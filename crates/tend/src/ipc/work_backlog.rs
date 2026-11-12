@@ -38,14 +38,15 @@ pub(super) async fn response(
                 },
             )
         }
-        RequestBody::WorkRecordShow { identity } => {
+        RequestBody::WorkRecordShow { identity, newest } => {
             let record = work_store.lock().await.get(&identity);
             let run = pipeline_runs.get(&identity).await;
             let items = reviews
                 .for_work(
                     identity.workspace_id.clone(),
                     identity.work_id.clone(),
-                    crate::review::MAX_LIST_LIMIT,
+                    newest.unwrap_or(crate::review::MAX_LIST_LIMIT),
+                    newest.is_some(),
                 )
                 .await;
             if record.is_none() && run.is_none() && items.as_ref().is_ok_and(|p| p.items.is_empty())

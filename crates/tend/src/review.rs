@@ -487,11 +487,14 @@ impl ReviewStore {
 
     /// Every item filed on one Work, any alias, oldest first: the result
     /// records and their dispositions, for `tend work show`.
+    /// With `newest`, the newest `limit` items instead (still returned
+    /// oldest first), and `has_more` says older ones exist.
     pub async fn for_work(
         &self,
         workspace: String,
         work: String,
         limit: usize,
+        newest: bool,
     ) -> Result<ReviewPage, ReviewError> {
         let limit = limit.clamp(1, MAX_LIST_LIMIT);
         self.with(move |connection| {
@@ -501,11 +504,12 @@ impl ReviewStore {
             let mut prefix = serde_json::to_string(&("work", &workspace, &work))?;
             prefix.pop();
             prefix.push(',');
-            let mut statement = connection.prepare(
+            let order = if newest { "DESC" } else { "ASC" };
+            let mut statement = connection.prepare(&format!(
                 "SELECT body FROM review_items
                  WHERE substr(target_key, 1, length(?1)) = ?1
-                 ORDER BY requested_at_ns ASC, rowid ASC LIMIT ?2",
-            )?;
+                 ORDER BY requested_at_ns {order}, rowid {order} LIMIT ?2"
+            ))?;
             let fetch = i64::try_from(limit + 1).unwrap_or(i64::MAX);
             let rows =
                 statement.query_map(params![prefix, fetch], |row| row.get::<_, String>(0))?;
@@ -514,6 +518,9 @@ impl ReviewStore {
                 .collect::<Result<Vec<ReviewItem>, ReviewError>>()?;
             let has_more = items.len() > limit;
             items.truncate(limit);
+            if newest {
+                items.reverse();
+            }
             Ok(ReviewPage { items, has_more })
         })
         .await
@@ -998,11 +1005,18 @@ mod tests {
             store.create(claim(target, None)).await.unwrap();
         }
         let page = store
-            .for_work("web".into(), "ENG-1".into(), 10)
+            .for_work("web".into(), "ENG-1".into(), 10, false)
             .await
             .unwrap();
         assert_eq!(page.items.len(), 2, "{:?}", page.items);
         assert!(!page.has_more);
+        let all = page.items;
+        let newest = store
+            .for_work("web".into(), "ENG-1".into(), 1, true)
+            .await
+            .unwrap();
+        assert!(newest.has_more);
+        assert_eq!(newest.items, all[1..], "the newest one, not the oldest");
     }
 
     #[tokio::test]

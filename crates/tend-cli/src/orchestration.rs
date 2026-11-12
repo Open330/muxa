@@ -256,13 +256,24 @@ pub async fn status(args: StatusArgs, cfg: &Config, client: &Client) -> Result<(
     }
     let path = data_dir("coordinator")?.join(format!("{id}.json"));
     let mut record = load(&path)?.context("dispatch not found on coordinator")?;
-    // Recovery reads the worker journal, never resends a launch.
-    if matches!(
-        record.state.as_str(),
-        "unknown" | "preparing" | "launched" | "blocked"
-    ) {
+    // Recovery reads the worker journal, never resends a launch. A
+    // finished dispatch is read too: its result records and their
+    // dispositions keep changing after the Run completes.
+    let finished = matches!(record.state.as_str(), "completed" | "failed");
+    if finished
+        || matches!(
+            record.state.as_str(),
+            "unknown" | "preparing" | "launched" | "blocked"
+        )
+    {
         let result = if record.plan.host == "local" {
-            Some(serde_json::to_value(refresh_worker(&id, client).await?)?)
+            match refresh_worker(&id, client).await {
+                Ok(worker) => Some(serde_json::to_value(worker)?),
+                // A dispatch that failed before its worker journal existed
+                // has nothing more to read; the record stands as it is.
+                Err(_) if finished => None,
+                Err(error) => return Err(error),
+            }
         } else {
             client
                 .work_command(
@@ -294,7 +305,15 @@ async fn refresh_worker(id: &str, client: &Client) -> Result<Record> {
     let id = uuid::Uuid::parse_str(id)?.to_string();
     let path = data_dir("worker")?.join(format!("{id}.json"));
     let mut record = load(&path)?.context("worker dispatch not found")?;
-    if matches!(record.state.as_str(), "launched" | "blocked" | "unknown") {
+    let open = matches!(record.state.as_str(), "launched" | "blocked" | "unknown");
+    // A finished journal written before Runs were linked by identity has
+    // a result but no `work`: look its Run up once, without touching the
+    // saved state, so its result records can be read.
+    let unlinked = record
+        .result
+        .as_ref()
+        .is_some_and(|result| result.get("work").is_none());
+    if open || unlinked {
         let paths = record
             .plan
             .resolve_paths(&dirs::home_dir().context("home missing")?)
@@ -311,24 +330,123 @@ async fn refresh_worker(id: &str, client: &Client) -> Result<Record> {
                     .eq_ignore_ascii_case(&record.plan.request.work)
                 && r.cwd == run_path
         }) {
-            use tend::pipeline_run::PipelineAliasStatus as S;
-            if !run.aliases.is_empty() && run.aliases.values().all(|a| a.status == S::Done) {
-                record.state = "completed".into();
-            } else if run.aliases.values().any(|a| a.status == S::Failed) {
-                record.state = "failed".into();
-            } else if run.aliases.values().any(|a| a.status == S::Blocked) {
-                record.state = "blocked".into();
-            } else {
-                record.state = "launched".into();
+            if open {
+                use tend::pipeline_run::PipelineAliasStatus as S;
+                if !run.aliases.is_empty() && run.aliases.values().all(|a| a.status == S::Done) {
+                    record.state = "completed".into();
+                } else if run.aliases.values().any(|a| a.status == S::Failed) {
+                    record.state = "failed".into();
+                } else if run.aliases.values().any(|a| a.status == S::Blocked) {
+                    record.state = "blocked".into();
+                } else {
+                    record.state = "launched".into();
+                }
+                // Carry bounded machine-readable verification state and artifact location.
+                record.result = Some(
+                    json!({"generation":run.generation,"aliases":run.aliases,"artifacts":paths.artifacts,"cwd":paths.run,"commit":record.plan.request.commit,"work":run.identity}),
+                );
+            } else if let Some(result) = record.result.as_mut() {
+                // The exact Run identity, never the dispatch's own spelling.
+                result["work"] = json!(run.identity);
             }
-            // Carry bounded machine-readable verification state and artifact location.
-            record.result = Some(
-                json!({"generation":run.generation,"aliases":run.aliases,"artifacts":paths.artifacts,"cwd":paths.run,"commit":record.plan.request.commit}),
-            );
             save(&path, &record)?;
         }
     }
+    // Result records (`tend work done --summary`, `tend_file_result`) and
+    // their dispositions keep changing after the Run completes, so they are
+    // read on every status, not frozen with the Run state.
+    if let Some(result) = record.result.as_mut() {
+        if let Some(identity) = result
+            .get("work")
+            .cloned()
+            .and_then(|work| serde_json::from_value::<tend::work::WorkIdentity>(work).ok())
+        {
+            let capabilities = client
+                .hello(std::time::Duration::from_secs(2))
+                .await
+                .map(|hello| hello.capabilities)
+                .unwrap_or_default();
+            let has = |name: &str| capabilities.iter().any(|c| c == name);
+            if has(tend::work::WORK_BACKLOG_CAPABILITY) {
+                let recent = has(tend::work::WORK_RECENT_RESULTS_CAPABILITY);
+                let newest = recent.then_some(MAX_STATUS_RESULTS);
+                if let Ok(show) = client.work_record_show_newest(&identity, newest).await {
+                    attach_results(result, &show, recent);
+                }
+            }
+        }
+    }
     Ok(record)
+}
+
+/// Put the result records on a status. An older daemon ignores `newest`
+/// and answers with the oldest page; when that page is cut off, its tail is
+/// not the newest records, so none are claimed and the status says why.
+fn attach_results(result: &mut Value, show: &tend::ipc::WorkShow, recent: bool) {
+    if let Some(object) = result.as_object_mut() {
+        object.remove("results_more");
+        object.remove("results_unavailable");
+    }
+    if !recent && show.reviews_more {
+        result["results"] = json!([]);
+        result["results_more"] = json!(true);
+        result["results_unavailable"] =
+            json!("tendd is too old to read a Work's newest result records; restart it with the same tend build");
+        return;
+    }
+    let (results, dropped) = result_records(&show.reviews);
+    result["results"] = results;
+    if show.reviews_more || dropped {
+        result["results_more"] = json!(true);
+    }
+}
+
+/// Upper bound on result records carried in a dispatch status.
+const MAX_STATUS_RESULTS: usize = 20;
+/// Serialized budget for those records: a remote status travels through a
+/// work command capped at 1 MiB, and the rest of the status must fit too.
+const MAX_STATUS_RESULT_BYTES: usize = 256 * 1024;
+
+/// The newest result records filed on a dispatched Work (oldest first),
+/// compact: what was done, the decision asked for, and what the person
+/// decided. Older records are dropped first to stay within
+/// [`MAX_STATUS_RESULT_BYTES`]; the flag says some were.
+fn result_records(items: &[tend::review::ReviewItem]) -> (Value, bool) {
+    let skip = items.len().saturating_sub(MAX_STATUS_RESULTS);
+    let mut entries: Vec<Value> = items
+        .iter()
+        .skip(skip)
+        .map(|item| {
+            let alias = match &item.target {
+                tend::review::ReviewTarget::Work { alias, .. } => alias.clone(),
+                _ => None,
+            };
+            let decision = item.decision.as_ref();
+            json!({
+                "id": item.id,
+                "alias": alias,
+                "generation": item.generation,
+                "summary": item.summary,
+                "decision_needed": decision.and_then(|d| d.needed.clone()),
+                "options": decision.map(|d| d.options.clone()).unwrap_or_default(),
+                "recommendation": decision.and_then(|d| d.recommendation.clone()),
+                "evidence": decision.map(|d| d.evidence.clone()).unwrap_or_default(),
+                "requested_at": item
+                    .requested_at
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .ok(),
+                "disposition": item.disposition.as_ref().map(|d| d.kind),
+                "note": item.disposition.as_ref().and_then(|d| d.note.clone()),
+            })
+        })
+        .collect();
+    let mut dropped = skip > 0;
+    let size = |entries: &[Value]| serde_json::to_vec(entries).map_or(0, |bytes| bytes.len());
+    while entries.len() > 1 && size(&entries) > MAX_STATUS_RESULT_BYTES {
+        entries.remove(0);
+        dropped = true;
+    }
+    (Value::Array(entries), dropped)
 }
 pub async fn worker_status(id: &str, client: &Client) -> Result<()> {
     print(&refresh_worker(id, client).await?)
@@ -586,6 +704,100 @@ pub async fn options(cfg: &Config, client: &Client, at_coordinator: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_old_daemons_oldest_page_is_never_shown_as_the_newest() {
+        let item = |n: usize| -> tend::review::ReviewItem {
+            serde_json::from_value(json!({
+                "id": format!("rv_{n}"), "generation": 1, "summary": "done",
+                "target": {"kind": "work", "workspace": "web", "work": "ENG-1"},
+                "requested_at": "2026-11-12T11:00:00Z", "requested_by": {"kind": "agent"}
+            }))
+            .unwrap()
+        };
+        // What an older daemon returns for 501 records: the oldest 500.
+        let old_page = tend::ipc::WorkShow {
+            record: None,
+            run: None,
+            reviews: (0..500).map(item).collect(),
+            reviews_more: true,
+            reviews_error: None,
+        };
+        let mut result = json!({});
+        attach_results(&mut result, &old_page, false);
+        assert_eq!(result["results"], json!([]));
+        assert_eq!(result["results_more"], true);
+        assert!(result["results_unavailable"].is_string());
+        // A short page from an older daemon is complete, so its tail is right.
+        let short = tend::ipc::WorkShow {
+            reviews: (0..3).map(item).collect(),
+            reviews_more: false,
+            ..old_page.clone()
+        };
+        attach_results(&mut result, &short, false);
+        assert_eq!(result["results"].as_array().unwrap().len(), 3);
+        assert!(result.get("results_unavailable").is_none());
+        assert!(result.get("results_more").is_none());
+        // A current daemon's newest page is trusted as such.
+        let newest = tend::ipc::WorkShow {
+            reviews: (481..501).map(item).collect(),
+            reviews_more: true,
+            ..old_page
+        };
+        attach_results(&mut result, &newest, true);
+        assert_eq!(result["results"][19]["id"], "rv_500");
+        assert_eq!(result["results_more"], true);
+    }
+
+    #[test]
+    fn a_dispatch_status_carries_the_works_result_records() {
+        let item: tend::review::ReviewItem = serde_json::from_value(json!({
+            "id": "rv_1", "generation": 2, "summary": "Login fixed",
+            "target": {"kind": "work", "workspace": "web", "work": "ENG-1", "alias": "impl"},
+            "requested_at": "2026-11-12T11:00:00Z", "requested_by": {"kind": "agent"},
+            "decision": {"needed": "Ship it?", "recommendation": "yes",
+                         "evidence": [{"kind": "commit", "sha": "abc123"}]},
+            "disposition": {"kind": "accepted", "by": {"kind": "user"},
+                            "at": "2026-11-12T11:30:00Z", "note": "fine"}
+        }))
+        .unwrap();
+        let many: Vec<_> = (0..MAX_STATUS_RESULTS + 5)
+            .map(|n| {
+                let mut item = item.clone();
+                item.id = format!("rv_{n}");
+                item
+            })
+            .collect();
+        let (records, dropped) = result_records(&many);
+        assert!(dropped);
+        let records = records.as_array().unwrap().clone();
+        assert_eq!(records.len(), MAX_STATUS_RESULTS);
+        assert_eq!(records[0]["id"], "rv_5", "the newest, oldest first");
+        assert_eq!(records[MAX_STATUS_RESULTS - 1]["id"], "rv_24");
+        assert_eq!(
+            records[0],
+            json!({
+                "id": "rv_5", "alias": "impl", "generation": 2, "summary": "Login fixed",
+                "decision_needed": "Ship it?", "options": [], "recommendation": "yes",
+                "evidence": [{"kind": "commit", "sha": "abc123"}],
+                "requested_at": "2026-11-12T11:00:00Z",
+                "disposition": "accepted", "note": "fine"
+            })
+        );
+        // Maximum-size legal evidence stays under the status byte budget.
+        let mut heavy = item.clone();
+        heavy.decision.as_mut().unwrap().evidence = (0..16)
+            .map(|_| tend::decision::Evidence::Diff {
+                range: "a".repeat(2048),
+                repo: Some(format!("/{}", "r".repeat(2047))),
+            })
+            .collect();
+        let heavy: Vec<_> = (0..MAX_STATUS_RESULTS).map(|_| heavy.clone()).collect();
+        let (records, dropped) = result_records(&heavy);
+        assert!(dropped);
+        assert!(serde_json::to_vec(&records).unwrap().len() <= MAX_STATUS_RESULT_BYTES);
+        assert!(!records.as_array().unwrap().is_empty());
+    }
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tend::orchestration::ExecutionPaths;
