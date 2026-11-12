@@ -33,6 +33,28 @@ pub fn is_agent_process(process: &ProcessInfo, kind: AgentKind) -> bool {
             })
 }
 
+/// The `kind` agent under the pane process `pane_pid`: the shallowest one,
+/// provided every process between it and the pane is in `processes`. A pane
+/// started as `exec claude …` has the agent as its own root.
+#[must_use]
+pub fn find_agent(
+    processes: &[ProcessInfo],
+    pane_pid: u32,
+    kind: AgentKind,
+) -> Option<&ProcessInfo> {
+    let agent = processes
+        .iter()
+        .filter(|p| is_agent_process(p, kind))
+        .min_by_key(|p| p.depth)?;
+    let mut parent = agent.parent_pid;
+    if agent.pid != pane_pid {
+        while parent != pane_pid {
+            parent = processes.iter().find(|p| p.pid == parent)?.parent_pid;
+        }
+    }
+    Some(agent)
+}
+
 pub fn signal_pids(signal: &str, pids: &[u32]) {
     // Windows has no signals: `taskkill` asks a process to close, and `/F`
     // is the `KILL` that cannot be refused.
@@ -256,4 +278,42 @@ pub fn outside_codex_servers<'a>(
         .collect();
     owners.sort();
     owners.into_iter().map(|(_, label)| label).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn proc(pid: u32, parent_pid: u32, depth: u8, cmdline: &str) -> ProcessInfo {
+        ProcessInfo {
+            pid,
+            parent_pid,
+            depth,
+            comm: cmdline.split_whitespace().next().unwrap_or_default().into(),
+            cmdline: cmdline.into(),
+        }
+    }
+
+    #[test]
+    fn the_agent_is_found_only_through_an_unbroken_chain_to_the_pane() {
+        let shell = [
+            proc(11, 10, 1, "aas e work@claude claude"),
+            proc(12, 11, 2, "claude --resume x"),
+        ];
+        assert_eq!(
+            find_agent(&shell, 10, AgentKind::ClaudeCode).map(|p| p.pid),
+            Some(12)
+        );
+        // A missing link between agent and pane proves nothing.
+        assert!(find_agent(&shell[1..], 10, AgentKind::ClaudeCode).is_none());
+        // `exec claude …`: the agent is the pane's own root.
+        let exec = [proc(10, 1, 0, "claude")];
+        assert_eq!(
+            find_agent(&exec, 10, AgentKind::ClaudeCode).map(|p| p.pid),
+            Some(10)
+        );
+        // Codex's app-server is not the interactive agent.
+        let server = [proc(11, 10, 1, "codex app-server")];
+        assert!(find_agent(&server, 10, AgentKind::Codex).is_none());
+    }
 }

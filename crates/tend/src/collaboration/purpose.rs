@@ -108,7 +108,7 @@ impl ProcessFence {
             pane.pane_pid
         } else {
             let processes = crate::process_tree::read_descendants(pane.pane_pid);
-            crate::account_swap::find_launch(&processes, pane.pane_pid, kind)?.agent_pid
+            crate::pane_process::find_agent(&processes, pane.pane_pid, kind)?.pid
         };
         if kind == AgentKind::Codex {
             #[cfg(target_os = "linux")]
