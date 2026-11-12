@@ -1541,6 +1541,22 @@ impl HostTask {
                         )));
                         continue;
                     }
+                    // A gated prompt reaches only a relay that enforces it;
+                    // an older relay would ignore the field and type.
+                    if matches!(
+                        command.operation,
+                        FleetOperation::SendPrompt { force: Some(false), .. }
+                    ) && !connected.hello.capabilities.iter().any(|capability| {
+                        capability == tend::fleet::FLEET_SEND_PROMPT_GATE_CAPABILITY
+                    }) {
+                        let _ = command.reply.send(Err(format!(
+                            "{}: host '{}' cannot check that the target is idle (no {}); nothing was sent",
+                            tend::prompt_delivery::TARGET_NOT_IDLE,
+                            self.alias,
+                            tend::fleet::FLEET_SEND_PROMPT_GATE_CAPABILITY,
+                        )));
+                        continue;
+                    }
                     if matches!(
                         command.operation,
                         FleetOperation::CollaborationSend { .. }

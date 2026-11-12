@@ -3544,6 +3544,22 @@ async fn ensure_fleet_send_gate(
     client: &Client,
     host_alias: &str,
 ) -> std::result::Result<(), String> {
+    let gate = tend::fleet::FLEET_SEND_PROMPT_GATE_CAPABILITY;
+    // Both hops: this controller must carry `force`, and the host enforce it.
+    let hello = client
+        .hello(Duration::from_secs(3))
+        .await
+        .map_err(|error| error.to_string())?;
+    if !hello
+        .capabilities
+        .iter()
+        .any(|capability| capability == gate)
+    {
+        return Err(format!(
+            "{}: this tendd cannot forward the idle gate to Fleet hosts (no {gate}); nothing was sent. Upgrade/restart tendd, or pass force=true.",
+            tend::prompt_delivery::TARGET_NOT_IDLE
+        ));
+    }
     let snapshot = client
         .fleet_snapshot(None)
         .await
@@ -3553,11 +3569,11 @@ async fn ensure_fleet_send_gate(
         .into_iter()
         .find(|host| host.alias == host_alias)
         .ok_or_else(|| format!("Fleet host '{host_alias}' is not known"))?;
-    let gate = tend::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY;
-    if host
-        .capabilities
-        .iter()
-        .any(|capability| capability == gate)
+    if host.local
+        || host
+            .capabilities
+            .iter()
+            .any(|capability| capability == gate)
     {
         Ok(())
     } else {
@@ -5021,6 +5037,7 @@ async fn send_prompt_with_local_cmux(
             caller_socket.as_deref(),
             session_id,
             Some(force),
+            None,
         )
         .await
         .map_err(|error| error.to_string())
@@ -8714,6 +8731,55 @@ mod tests {
             .unwrap()
             .iter()
             .any(|kind| kind == "send_prompt"));
+    }
+
+    /// New MCP, older controller: the controller would drop `force` on the
+    /// way to the relay, so a gated Fleet prompt is refused before any
+    /// Fleet operation is issued.
+    #[tokio::test]
+    async fn a_gated_fleet_prompt_needs_a_controller_that_forwards_the_gate() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("old-controller.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let kinds = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let record = kinds.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (reader, mut writer) = stream.into_split();
+                let mut lines = BufReader::new(reader).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let request: Value = serde_json::from_str(&line).unwrap();
+                    record
+                        .lock()
+                        .unwrap()
+                        .push(request["kind"].as_str().unwrap_or_default().to_string());
+                    // Has the local gate, not the Fleet forwarding one.
+                    let _ = writer
+                        .write_all(
+                            b"{\"ok\":true,\"capabilities\":[\"send_prompt_state_gate_v1\"]}\n",
+                        )
+                        .await;
+                }
+            }
+        });
+        let refused = dispatch(
+            &Client::new(socket),
+            &json!({
+                "jsonrpc":"2.0", "id":42, "method":"tools/call",
+                "params":{"name":"tend_send_prompt", "arguments":{
+                    "host":"mini", "pane":"%1", "text":"hi"}},
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refused["result"]["isError"], true, "{refused}");
+        assert!(refused.to_string().contains("fleet_send_prompt_gate_v1"));
+        let kinds = kinds.lock().unwrap();
+        assert!(
+            !kinds.iter().any(|kind| kind.starts_with("fleet_")),
+            "no Fleet operation issued: {kinds:?}"
+        );
     }
 
     #[tokio::test]

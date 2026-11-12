@@ -388,21 +388,42 @@ async fn handle_request(
             }
             let socket = pane.window.session.endpoint.socket.clone();
             let pane_id = pane.pane_id.clone();
-            // The relay types itself (no daemon input guard), so the gate is
-            // judged on this host's registry just before typing.
+            // A gated prompt goes through this host's daemon, whose
+            // send_prompt holds the pane input guard across the final row
+            // read, the idle gate and the typing. A daemon without the gate
+            // would ignore `force`, so refuse rather than type ungated.
             if force == Some(false) {
-                let rows: Vec<_> = client
-                    .snapshot()
+                let hello = client
+                    .hello(std::time::Duration::from_secs(3))
                     .await
-                    .context("read this host's agents for the idle gate")?
-                    .into_iter()
-                    .filter(|agent| agent.pane.as_deref() == Some(pane_id.as_str()))
-                    .collect();
-                if let Err(refusal) =
-                    tend::prompt_delivery::idle_gate(&pane_id, &rows, Some(&socket), None)
+                    .context("ask this host's daemon for the idle gate")?;
+                let gate = tend::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY;
+                if !hello
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == gate)
                 {
-                    bail!("{refusal}");
+                    bail!(
+                        "{}: this host's tendd cannot check that the target is idle (no {gate}); nothing was sent",
+                        tend::prompt_delivery::TARGET_NOT_IDLE
+                    );
                 }
+                let outcome = client
+                    .send_prompt_with_gate(
+                        &pane_id,
+                        &text,
+                        submit,
+                        Some(&socket),
+                        None,
+                        Some(false),
+                        Some(tend::PromptOrigin::declared(origin)),
+                    )
+                    .await
+                    .map_err(|error| anyhow::anyhow!("{error}"))?;
+                return Ok(RelayFrame::Result {
+                    request_id,
+                    result: Box::new(FleetCommandResult::sent(outcome)),
+                });
             }
             // Register with this host's daemon before typing, so the hook
             // reporting the prompt carries its origin. A daemon without

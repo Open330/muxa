@@ -33,7 +33,7 @@ impl Client {
         socket: Option<&str>,
         session_id: Option<&str>,
     ) -> Result<SendPromptOutcome, RuntimeError> {
-        self.send_prompt_with_gate(pane, text, submit, socket, session_id, None)
+        self.send_prompt_with_gate(pane, text, submit, socket, session_id, None, None)
             .await
     }
 
@@ -41,6 +41,7 @@ impl Client {
     /// choice: `Some(false)` asks the daemon to refuse unless the target is
     /// Idle (`target_not_idle`), `Some(true)` forces. A daemon without the
     /// capability ignores the field and types as before.
+    #[allow(clippy::too_many_arguments)] // one optional field per IPC send_prompt argument
     pub async fn send_prompt_with_gate(
         &self,
         pane: &str,
@@ -49,6 +50,7 @@ impl Client {
         socket: Option<&str>,
         session_id: Option<&str>,
         force: Option<bool>,
+        origin: Option<crate::PromptOrigin>,
     ) -> Result<SendPromptOutcome, RuntimeError> {
         let req = serde_json::json!({
             "protocol": PROTOCOL_VERSION,
@@ -59,6 +61,7 @@ impl Client {
             "text": text,
             "submit": submit,
             "force": force,
+            "origin": origin,
         });
         let resp = self.call_checked(&req).await?;
         Ok(SendPromptOutcome {

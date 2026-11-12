@@ -571,7 +571,7 @@ async fn send_prompt_state_gate_refuses_a_busy_target_unless_forced() {
         let client = client.clone();
         async move {
             client
-                .send_prompt_with_gate(pane, "hi", true, Some("default"), None, force)
+                .send_prompt_with_gate(pane, "hi", true, Some("default"), None, force, None)
                 .await
         }
     };
@@ -612,6 +612,7 @@ async fn send_prompt_state_gate_refuses_a_busy_target_unless_forced() {
             Some("/tmp/tmux-501/default"),
             None,
             Some(false),
+            None,
         )
         .await
         .expect("the same endpoint spelled as a path");

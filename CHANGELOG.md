@@ -56,8 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   listed tools.
 - `tend_send_prompt` to a Fleet host (and the retired
   `tend_fleet_send_prompt`) is gated like a local send: only an Idle agent
-  is typed into unless `force=true`, checked on that host. A host whose tend
-  does not advertise `send_prompt_state_gate_v1` refuses a non-forced send.
+  is typed into unless `force=true`, checked by that host's daemon under its
+  pane input guard. Both this tendd and the host must advertise
+  `fleet_send_prompt_gate_v1`; otherwise a non-forced send is refused.
   `tend fleet watch` and `tend fleet send` are unchanged.
 
 ### Fixed

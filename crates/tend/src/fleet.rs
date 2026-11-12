@@ -95,12 +95,17 @@ pub const FLEET_WORKTREE_INVENTORY_CAPABILITY: &str = "worktree_inventory_v1";
 pub const FLEET_WORKTREE_CHANGE_CAPABILITY: &str = "worktree_change_v1";
 /// Relay capability: the relay answers [`RelayRequest::ServerInventory`].
 pub const FLEET_SERVER_INVENTORY_CAPABILITY: &str = "server_inventory_v1";
+/// The relay (and, in a daemon's own hello, the controller) carries
+/// `SendPrompt.force` end to end and enforces it through the destination
+/// daemon's guarded `send_prompt`. Distinct from the local
+/// `send_prompt_state_gate_v1`, which older controllers already had.
+pub const FLEET_SEND_PROMPT_GATE_CAPABILITY: &str = "fleet_send_prompt_gate_v1";
 pub const FLEET_CAPABILITIES: &[&str] = &[
     "snapshot_watch",
     "capture",
     "window_capture",
     "send_prompt",
-    crate::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY,
+    FLEET_SEND_PROMPT_GATE_CAPABILITY,
     "collaboration",
     "collaboration_get",
     "collaboration_dispatch_v1",
@@ -1873,9 +1878,7 @@ mod tests {
             force: Some(false),
         };
         assert_eq!(serde_json::to_value(&gated).unwrap()["force"], false);
-        assert!(
-            FLEET_CAPABILITIES.contains(&crate::prompt_delivery::SEND_PROMPT_STATE_GATE_CAPABILITY)
-        );
+        assert!(FLEET_CAPABILITIES.contains(&FLEET_SEND_PROMPT_GATE_CAPABILITY));
     }
 
     #[test]
