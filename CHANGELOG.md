@@ -102,6 +102,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Refreshing in the macOS app right after an action, while a background
   update is already running, now shows the new state instead of waiting up
   to 15 seconds for the next update.
+- The Tend app icon is full size in the Dock on macOS 26 and later. It was a
+  pre-rounded image, which macOS shrinks into a grey plate; it is now an Icon
+  Composer icon (`AppIcon.icon`) the system draws in its own squircle.
 
 ## [0.10.11] - 2026-11-12
 

@@ -1,0 +1,49 @@
+{
+  "fill-specializations": [
+    {
+      "value": {
+        "automatic-gradient": "extended-srgb:0.18039,0.19608,0.23137,1.00000"
+      }
+    },
+    {
+      "appearance": "dark",
+      "value": "system-dark"
+    }
+  ],
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "RoomError.svg",
+          "name": "RoomError"
+        },
+        {
+          "image-name": "RoomDone.svg",
+          "name": "RoomDone"
+        },
+        {
+          "image-name": "RoomWaiting.svg",
+          "name": "RoomWaiting"
+        },
+        {
+          "image-name": "RoomWorking.svg",
+          "name": "RoomWorking"
+        }
+      ],
+      "name": "Rooms",
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": false,
+        "value": 0
+      }
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}
