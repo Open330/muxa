@@ -66,8 +66,8 @@ modification time where the filesystem records none) in
 `$XDG_DATA_HOME/tend/backups`, where install and upgrade backups go; older
 entries are deleted at daemon startup and hourly. Hidden entries are left
 alone and symlinks are removed without being followed. A pass holds
-`backups/.prune.lock` (a second pruner skips) and renames each victim to a
-hidden `.removing-<name>` before deleting it.
+`backups/.prune.lock` (a second pruner skips) and moves each victim into its
+own marked staging directory `backups/.tend-prune/` before deleting it.
 
 tendd also expires its own launch-provenance archives under
 `$XDG_DATA_HOME/tend/spawns`: completed or failed launches after 30 days, and

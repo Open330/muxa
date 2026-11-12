@@ -190,7 +190,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only the default daemon (canonical socket, default config) sweeps
   `backups/` and `spawns/` and drains the hook spool, and other daemons log
   that they skipped it. Backups are ordered by creation time, a pass holds
-  `backups/.prune.lock` and hides each victim before deleting it, so
+  `backups/.prune.lock` and stages each victim in its own marked
+  `backups/.tend-prune/` before deleting it, so
   concurrent pruners cannot delete a backup they should keep; and the e2e and CLI integration tests run
   with private `XDG_DATA_HOME`/`XDG_STATE_HOME`.
 

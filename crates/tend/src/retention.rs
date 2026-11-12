@@ -17,10 +17,13 @@ use std::time::SystemTime;
 ///
 /// Safety does not rest on that key alone: selection through deletion holds
 /// an exclusive lock on `<directory>/.prune.lock` (a pruner that finds it
-/// held skips this pass), and each victim is first renamed to a hidden
-/// `.removing-<name>` so no other reader can mistake a half-deleted entry
-/// for a live backup. A `.removing-*` left by an interrupted pass is
-/// finished on the next one. Entries that vanish meanwhile are skipped.
+/// held skips this pass), and each victim is first moved into the pruner's
+/// own staging directory `<directory>/.tend-prune/` so no other reader can
+/// mistake a half-deleted entry for a live backup. The staging directory
+/// carries a marker file that proves tend created it; anything staged there
+/// by an interrupted pass is finished on the next one, and a `.tend-prune`
+/// without the marker is never emptied (pruning is skipped instead).
+/// Entries that vanish meanwhile are skipped.
 /// Hidden entries (`.name`) are left alone, symlinks are
 /// removed as links and never followed. `keep == 0` disables pruning, and
 /// so does a `directory` that is itself a symlink or not a directory: the
@@ -60,13 +63,7 @@ pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathB
     let mut candidates = Vec::new();
     for entry in entries {
         let entry = entry?;
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.starts_with(QUARANTINE_PREFIX) {
-            // An earlier pass chose it and was interrupted.
-            remove_entry(&entry.path());
-            continue;
-        }
-        if name.starts_with('.') {
+        if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
         let metadata = match std::fs::symlink_metadata(entry.path()) {
@@ -82,6 +79,16 @@ pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathB
             metadata,
         ));
     }
+    let Some(staging) = owned_staging(directory)? else {
+        return Ok(Vec::new());
+    };
+    // Finish whatever an interrupted pass had already staged.
+    for staged in std::fs::read_dir(&staging)? {
+        let staged = staged?;
+        if staged.file_name() != STAGING_MARKER {
+            remove_entry(&staged.path());
+        }
+    }
     if candidates.len() <= keep {
         return Ok(Vec::new());
     }
@@ -89,9 +96,10 @@ pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathB
     candidates.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
     let mut removed = Vec::new();
     for (_, name, path, _) in candidates.into_iter().skip(keep) {
-        let mut hidden = std::ffi::OsString::from(QUARANTINE_PREFIX);
-        hidden.push(&name);
-        let quarantined = directory.join(hidden);
+        if name == STAGING_MARKER {
+            continue;
+        }
+        let quarantined = staging.join(&name);
         match std::fs::rename(&path, &quarantined) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -108,7 +116,36 @@ pub fn prune_backups(directory: &Path, keep: usize) -> std::io::Result<Vec<PathB
 }
 
 const PRUNE_LOCK: &str = ".prune.lock";
-const QUARANTINE_PREFIX: &str = ".removing-";
+const STAGING_DIR: &str = ".tend-prune";
+const STAGING_MARKER: &str = ".tend-retention-staging";
+
+/// The pruner's staging directory, created with its marker if absent.
+/// `None` (pruning skipped) when something else already holds the name.
+fn owned_staging(directory: &Path) -> std::io::Result<Option<PathBuf>> {
+    let staging = directory.join(STAGING_DIR);
+    match std::fs::symlink_metadata(&staging) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(&staging)?;
+            std::fs::write(
+                staging.join(STAGING_MARKER),
+                b"tend backup retention staging\n",
+            )?;
+            Ok(Some(staging))
+        }
+        Err(error) => Err(error),
+        Ok(metadata)
+            if metadata.is_dir()
+                && std::fs::symlink_metadata(staging.join(STAGING_MARKER))
+                    .is_ok_and(|marker| marker.is_file()) =>
+        {
+            Ok(Some(staging))
+        }
+        Ok(_) => {
+            tracing::warn!(path = %staging.display(), "backup retention skipped: a `.tend-prune` it did not create is in the way");
+            Ok(None)
+        }
+    }
+}
 
 /// Remove a quarantined entry; a link is removed as a link.
 fn remove_entry(path: &Path) {
@@ -250,17 +287,46 @@ mod tests {
     }
 
     #[test]
-    fn a_half_deleted_entry_is_hidden_and_finished_by_the_next_pass() {
+    fn a_half_deleted_entry_is_staged_and_finished_by_the_next_pass() {
         let dir = tempfile::tempdir().unwrap();
         create_in_order(dir.path(), &["mid", "new"]);
-        // An interrupted pass left its quarantined victim, half-emptied and
-        // with a fresh mtime: it is neither counted nor kept.
-        let leftover = dir.path().join(format!("{QUARANTINE_PREFIX}old"));
+        // An interrupted pass left its staged victim, half-emptied and with
+        // a fresh mtime: it is neither counted nor kept.
+        assert!(owned_staging(dir.path()).unwrap().is_some());
+        let leftover = dir.path().join(STAGING_DIR).join("old");
         std::fs::create_dir(&leftover).unwrap();
         std::fs::write(leftover.join("rest"), b"x").unwrap();
         assert!(prune_backups(dir.path(), 2).unwrap().is_empty());
         assert!(!leftover.exists());
         assert!(dir.path().join("mid").exists() && dir.path().join("new").exists());
+    }
+
+    #[test]
+    fn hidden_entries_and_a_foreign_staging_name_are_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        // Hidden backups the operator made, including ones that look like
+        // an internal quarantine.
+        for hidden in [".removing-manual-backup", ".manual"] {
+            std::fs::create_dir(dir.path().join(hidden)).unwrap();
+            std::fs::write(dir.path().join(hidden).join("only-copy"), b"x").unwrap();
+        }
+        create_in_order(dir.path(), &["a"]);
+        assert!(prune_backups(dir.path(), 5).unwrap().is_empty());
+        assert!(dir
+            .path()
+            .join(".removing-manual-backup/only-copy")
+            .exists());
+        assert!(dir.path().join(".manual/only-copy").exists());
+
+        // A `.tend-prune` without tend's marker is not emptied, and the
+        // pass is skipped rather than staging into it.
+        let foreign = tempfile::tempdir().unwrap();
+        std::fs::create_dir(foreign.path().join(STAGING_DIR)).unwrap();
+        std::fs::write(foreign.path().join(STAGING_DIR).join("theirs"), b"x").unwrap();
+        create_in_order(foreign.path(), &["x", "y", "z"]);
+        assert!(prune_backups(foreign.path(), 1).unwrap().is_empty());
+        assert!(foreign.path().join(STAGING_DIR).join("theirs").exists());
+        assert!(foreign.path().join("x").exists());
     }
 
     #[cfg(unix)]
