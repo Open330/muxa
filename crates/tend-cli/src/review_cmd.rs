@@ -9,6 +9,10 @@
 use anyhow::{bail, Context, Result};
 use std::fmt::Write as _;
 use tend::decision::{Decision, Evidence, REVIEW_DECISION_CAPABILITY};
+use tend::decision_queue::{
+    DecidedItem, DecisionHistory, HumanRequestEntry, PendingItem, PendingQueue,
+    DECISION_QUEUE_CAPABILITY,
+};
 use tend::ipc::Client;
 use tend::review::{
     ActorKind, DispositionKind, NewReview, ReviewActor, ReviewItem, ReviewQuery, ReviewTarget,
@@ -293,6 +297,22 @@ enum Action {
         #[arg(long)]
         json: bool,
     },
+    /// Everything waiting on you, in one list: human requests, agents
+    /// blocked in their pane, then open review items, oldest first in each.
+    Queue {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// What was decided: review dispositions and answered human requests,
+    /// newest first, with their notes and answers.
+    History {
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
     /// One review item in full.
     Show {
         id: String,
@@ -373,6 +393,26 @@ pub(crate) async fn run(args: Args, client: &Client) -> Result<()> {
             }
             Ok(())
         }
+        Action::Queue { limit, json } => {
+            require_queue_capability(client).await?;
+            let queue = client.decision_queue(limit).await?;
+            if json {
+                println!("{}", serde_json::to_string(&queue)?);
+            } else {
+                print!("{}", render_queue(&queue, OffsetDateTime::now_utc()));
+            }
+            Ok(())
+        }
+        Action::History { limit, json } => {
+            require_queue_capability(client).await?;
+            let history = client.decision_history(limit).await?;
+            if json {
+                println!("{}", serde_json::to_string(&history)?);
+            } else {
+                print!("{}", render_history(&history, OffsetDateTime::now_utc()));
+            }
+            Ok(())
+        }
         Action::Show { id, json } => print_item(&client.review_get(&id).await?, json),
         Action::Accept(a) => dispose(client, DispositionKind::Accepted, a).await,
         Action::Return(a) => dispose(client, DispositionKind::Returned, a).await,
@@ -389,6 +429,173 @@ async fn require_capability(client: &Client) -> Result<()> {
         bail!("this tendd does not serve review items ({REVIEW_CAPABILITY}); restart it with the same tend build");
     }
     Ok(())
+}
+
+async fn require_queue_capability(client: &Client) -> Result<()> {
+    if !queue_supported(client).await {
+        bail!("this tendd does not serve the decision queue ({DECISION_QUEUE_CAPABILITY}); restart it with the same tend build");
+    }
+    Ok(())
+}
+
+/// Whether the daemon serves `decision_queue_v1`.
+pub(crate) async fn queue_supported(client: &Client) -> bool {
+    client
+        .hello(std::time::Duration::from_secs(3))
+        .await
+        .is_ok_and(|hello| {
+            hello
+                .capabilities
+                .iter()
+                .any(|c| c == DECISION_QUEUE_CAPABILITY)
+        })
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim()
+}
+
+fn asker(entry: &HumanRequestEntry) -> String {
+    let who = entry
+        .from_alias
+        .as_ref()
+        .map_or_else(|| entry.from_pane.clone(), |alias| format!("@{alias}"));
+    match (&entry.workspace_id, &entry.work_id) {
+        (Some(workspace), Some(work)) => format!("{who} {workspace}/{work}"),
+        _ => who,
+    }
+}
+
+/// One line per human request: id, age, who asked, the question, and the
+/// options with the recommendation when the request carries them.
+pub(crate) fn render_human_request(entry: &HumanRequestEntry, now: OffsetDateTime) -> String {
+    let mut line = format!(
+        "{}  {:>4}  {}  {}",
+        entry.request_id,
+        crate::attend::humanize_since(entry.created_at, now),
+        asker(entry),
+        first_line(&entry.body),
+    );
+    if let Some(decision) = &entry.decision {
+        if !decision.options.is_empty() {
+            let _ = write!(line, "  [{}]", decision.options.join(" | "));
+        }
+        if let Some(recommendation) = &decision.recommendation {
+            let _ = write!(line, " → {}", first_line(recommendation));
+        }
+    }
+    line
+}
+
+fn render_queue(queue: &PendingQueue, now: OffsetDateTime) -> String {
+    let mut out = String::new();
+    if queue.items.is_empty() {
+        out.push_str("nothing is waiting on you\n");
+    } else {
+        let n = queue.items.len();
+        let _ = writeln!(out, "{n} waiting on you:");
+    }
+    for item in &queue.items {
+        match item {
+            PendingItem::HumanRequest(entry) => {
+                let _ = writeln!(out, "  ? ask     {}", render_human_request(entry, now));
+            }
+            PendingItem::AgentWaiting(agent) => {
+                let state = match agent.state {
+                    tend::AgentState::Error => "error",
+                    tend::AgentState::WaitingChoice => "choice",
+                    tend::AgentState::WaitingInput => "input",
+                    _ => "asked",
+                };
+                let _ = writeln!(
+                    out,
+                    "  ! agent   {}  {:>4}  {} {state}  {}",
+                    agent.pane.as_deref().unwrap_or(&agent.session_id),
+                    crate::attend::humanize_since(agent.since, now),
+                    agent.agent_kind,
+                    agent.message.as_deref().unwrap_or(""),
+                );
+            }
+            PendingItem::Review(item) => {
+                let what = item
+                    .decision
+                    .as_ref()
+                    .and_then(|d| d.needed.as_deref())
+                    .unwrap_or(&item.summary);
+                let _ = writeln!(
+                    out,
+                    "  ◇ review  {}  {:>4}  {}  {}",
+                    item.id,
+                    crate::attend::humanize_since(item.requested_at, now),
+                    describe_target(&item.target),
+                    first_line(what),
+                );
+            }
+        }
+    }
+    if queue.truncated {
+        out.push_str("… more than shown: --limit N\n");
+    }
+    for source in &queue.unavailable {
+        let _ = writeln!(out, "unavailable: {source}");
+    }
+    out
+}
+
+fn render_history(history: &DecisionHistory, now: OffsetDateTime) -> String {
+    let mut out = String::new();
+    if history.items.is_empty() {
+        out.push_str("no decisions recorded\n");
+    }
+    for item in &history.items {
+        let ago = crate::attend::humanize_since(item.decided_at(), now);
+        match item {
+            DecidedItem::Review(review) => {
+                let Some(d) = &review.disposition else {
+                    continue;
+                };
+                let _ = write!(
+                    out,
+                    "{ago:>4}  {:<9} {}  {}  {}",
+                    disposition_label(d.kind),
+                    review.id,
+                    describe_target(&review.target),
+                    first_line(&review.summary),
+                );
+                if let Some(note) = &d.note {
+                    let _ = write!(out, "  — {}", first_line(note));
+                }
+                out.push('\n');
+            }
+            DecidedItem::HumanAnswer(answer) => {
+                let label = match answer.status {
+                    tend::collaboration::RequestStatus::Completed => "answered",
+                    tend::collaboration::RequestStatus::Declined => "declined",
+                    tend::collaboration::RequestStatus::Failed => "failed",
+                    tend::collaboration::RequestStatus::Blocked => "blocked",
+                    _ => "closed",
+                };
+                let _ = writeln!(
+                    out,
+                    "{ago:>4}  {label:<9} {}  {}  {}  → {}",
+                    answer.request.request_id,
+                    asker(&answer.request),
+                    first_line(&answer.request.body),
+                    first_line(&answer.answer),
+                );
+            }
+        }
+    }
+    if history.truncated {
+        out.push_str("… older decisions: --limit N\n");
+    }
+    for source in &history.unavailable {
+        let _ = writeln!(out, "unavailable: {source}");
+    }
+    out
 }
 
 fn target(
@@ -706,6 +913,59 @@ mod tests {
         let decision = first.decision.unwrap();
         assert!(matches!(&decision.evidence[0], Evidence::Commit { sha, .. } if sha == "abc123"));
         assert_eq!(decision.evidence.len(), 2);
+    }
+
+    #[test]
+    fn queue_and_history_render_one_line_per_item() {
+        let now = datetime!(2026-11-12 12:00 UTC);
+        let entry = HumanRequestEntry {
+            request_id: "rq_1".into(),
+            action: None,
+            body: "Merge #12?\nmore".into(),
+            decision: Some(Decision {
+                options: vec!["merge".into(), "hold".into()],
+                recommendation: Some("merge".into()),
+                ..Decision::default()
+            }),
+            from_session_id: "s".into(),
+            from_pane: "%3".into(),
+            from_alias: Some("impl".into()),
+            workspace_id: Some("tend".into()),
+            work_id: Some("storage".into()),
+            created_at: datetime!(2026-11-12 11:00 UTC),
+        };
+        let queue = PendingQueue {
+            items: vec![PendingItem::HumanRequest(entry.clone())],
+            truncated: true,
+            unavailable: vec!["review items: closed".into()],
+        };
+        let out = render_queue(&queue, now);
+        assert!(out.contains("1 waiting on you:"), "{out}");
+        assert!(
+            out.contains("rq_1    1h  @impl tend/storage  Merge #12?  [merge | hold] → merge"),
+            "{out}"
+        );
+        assert!(out.contains("unavailable: review items: closed"), "{out}");
+        assert_eq!(
+            render_queue(&PendingQueue::default(), now),
+            "nothing is waiting on you\n"
+        );
+        let history = DecisionHistory {
+            items: vec![DecidedItem::HumanAnswer(Box::new(
+                tend::decision_queue::HumanAnswerEntry {
+                    request: entry,
+                    status: tend::collaboration::RequestStatus::Completed,
+                    answer: "merge it".into(),
+                    answered_at: datetime!(2026-11-12 11:30 UTC),
+                },
+            ))],
+            ..DecisionHistory::default()
+        };
+        let out = render_history(&history, now);
+        assert!(
+            out.contains("answered  rq_1  @impl tend/storage  Merge #12?  → merge it"),
+            "{out}"
+        );
     }
 
     #[test]

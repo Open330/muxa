@@ -2346,6 +2346,7 @@ async fn ask_provider_add_and_remove_compose_the_list_over_the_wire() {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)] // one daemon fixture covers create, queue, dispose and history
 async fn review_items_round_trip_over_ipc() {
     use crate::review::{ActorKind, DispositionKind, NewReview, ReviewActor, ReviewTarget};
     let dir = tempdir().unwrap();
@@ -2395,6 +2396,12 @@ async fn review_items_round_trip_over_ipc() {
     let item = client.review_create(&new).await.unwrap();
     assert_eq!(client.review_create(&new).await.unwrap(), item);
     assert_eq!(item.decision, new.decision, "the decision round-trips");
+    let queue = client.decision_queue(10).await.unwrap();
+    assert!(
+        matches!(&queue.items[..], [crate::decision_queue::PendingItem::Review(r)] if r.id == item.id),
+        "{queue:?}"
+    );
+    assert!(client.decision_history(10).await.unwrap().items.is_empty());
     assert_eq!(client.review_get(&item.id).await.unwrap(), item);
     let summary = client
         .review_summary_with_timeout(Duration::from_secs(3))
@@ -2414,6 +2421,13 @@ async fn review_items_round_trip_over_ipc() {
     assert_eq!(
         returned.disposition.as_ref().map(|d| d.kind),
         Some(DispositionKind::Returned)
+    );
+    assert!(client.decision_queue(10).await.unwrap().items.is_empty());
+    let history = client.decision_history(10).await.unwrap();
+    assert!(
+        matches!(&history.items[..], [crate::decision_queue::DecidedItem::Review(r)]
+            if r.disposition.as_ref().and_then(|d| d.note.as_deref()) == Some("no tests")),
+        "{history:?}"
     );
     let query = |open_only| crate::review::ReviewQuery {
         open_only,

@@ -188,7 +188,9 @@ pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Op
     let paneless = paneless_waiters(&agents);
 
     if args.list {
-        if cands.is_empty() && paneless.is_empty() {
+        let decisions = pending_decisions(client).await;
+        let nothing = cands.is_empty() && paneless.is_empty();
+        if nothing && decisions.is_empty() {
             print_nothing(&agents);
         } else {
             if !cands.is_empty() {
@@ -197,6 +199,7 @@ pub async fn run(client: &Client, panes: Vec<PaneInfo>, args: Args) -> Result<Op
             // Separate the un-jumpable section from the queue with a
             // blank line only when both are present.
             print_paneless(&paneless, !cands.is_empty());
+            print!("{}", decisions.render(!nothing, OffsetDateTime::now_utc()));
         }
         return Ok(None);
     }
@@ -299,6 +302,79 @@ fn paneless_waiters(agents: &[Agent]) -> Vec<&Agent> {
             .then_with(|| a.session_id.cmp(&b.session_id))
     });
     waiters
+}
+
+/// Human requests and open review items from the decision queue, for
+/// `--list`. Empty on a daemon without `decision_queue_v1`, so `attend`
+/// keeps working against an older tendd.
+#[derive(Default)]
+struct PendingDecisions {
+    human: Vec<tend::decision_queue::HumanRequestEntry>,
+    reviews: usize,
+    truncated: bool,
+}
+
+impl PendingDecisions {
+    fn is_empty(&self) -> bool {
+        self.human.is_empty() && self.reviews == 0
+    }
+
+    fn render(&self, leading_blank: bool, now: OffsetDateTime) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        if self.is_empty() {
+            return out;
+        }
+        if leading_blank {
+            out.push('\n');
+        }
+        if !self.human.is_empty() {
+            let n = self.human.len();
+            let _ = writeln!(
+                out,
+                "{n} question{} for you (answer in `tend watch`, key e, or Tend for Mac):",
+                if n == 1 { "" } else { "s" }
+            );
+            for entry in &self.human {
+                let _ = writeln!(
+                    out,
+                    "  ? {}",
+                    crate::review_cmd::render_human_request(entry, now)
+                );
+            }
+        }
+        if self.reviews > 0 {
+            let _ = writeln!(
+                out,
+                "{}{} result{} to review: tend review queue",
+                self.reviews,
+                if self.truncated { "+" } else { "" },
+                if self.reviews == 1 { "" } else { "s" }
+            );
+        }
+        out
+    }
+}
+
+async fn pending_decisions(client: &Client) -> PendingDecisions {
+    if !crate::review_cmd::queue_supported(client).await {
+        return PendingDecisions::default();
+    }
+    let Ok(queue) = client.decision_queue(100).await else {
+        return PendingDecisions::default();
+    };
+    let mut pending = PendingDecisions {
+        truncated: queue.truncated,
+        ..PendingDecisions::default()
+    };
+    for item in queue.items {
+        match item {
+            tend::decision_queue::PendingItem::HumanRequest(entry) => pending.human.push(entry),
+            tend::decision_queue::PendingItem::Review(_) => pending.reviews += 1,
+            tend::decision_queue::PendingItem::AgentWaiting(_) => {}
+        }
+    }
+    pending
 }
 
 /// "nothing to do" line — separates "nothing tracked" from "everything's

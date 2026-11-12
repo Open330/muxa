@@ -14,6 +14,7 @@ pub use contract::{
     task_contract_schema, task_report_schema, CriterionOutcome, CriterionReport, EvidenceKind,
     EvidenceReference, TaskAttempt, TaskContract, TaskReport, TASK_CONTRACT_CAPABILITY,
 };
+mod human_decisions;
 mod mailbox_snapshot;
 mod open_counts;
 mod read_validator;

@@ -485,6 +485,27 @@ impl ReviewStore {
         .await
     }
 
+    /// Decided items, most recently decided first: the review half of
+    /// "what did I decide". `has_more` as in [`Self::list`].
+    pub async fn decided(&self, limit: usize) -> Result<ReviewPage, ReviewError> {
+        let limit = limit.clamp(1, MAX_LIST_LIMIT);
+        self.with(move |connection| {
+            let mut statement = connection.prepare(
+                "SELECT body FROM review_items WHERE disposed_at_ns IS NOT NULL
+                 ORDER BY disposed_at_ns DESC, rowid DESC LIMIT ?1",
+            )?;
+            let fetch = i64::try_from(limit + 1).unwrap_or(i64::MAX);
+            let rows = statement.query_map(params![fetch], |row| row.get::<_, String>(0))?;
+            let mut items = rows
+                .map(|body| Ok(serde_json::from_str(&body?)?))
+                .collect::<Result<Vec<ReviewItem>, ReviewError>>()?;
+            let has_more = items.len() > limit;
+            items.truncate(limit);
+            Ok(ReviewPage { items, has_more })
+        })
+        .await
+    }
+
     pub async fn summary(&self) -> Result<ReviewSummary, ReviewError> {
         self.with(|connection| {
             let (open, oldest): (i64, Option<i64>) = connection.query_row(

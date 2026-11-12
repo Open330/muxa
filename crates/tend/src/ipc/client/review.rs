@@ -97,3 +97,33 @@ impl Client {
         field(&self.call_checked(&req).await?, "review_item")
     }
 }
+
+impl Client {
+    /// Everything pending on the person, in one ordered list. Requires
+    /// `decision_queue_v1`.
+    pub async fn decision_queue(
+        &self,
+        limit: usize,
+    ) -> Result<crate::decision_queue::PendingQueue, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "decision_queue",
+            "limit": limit,
+        });
+        field(&self.call_checked(&req).await?, "decision_queue")
+    }
+
+    /// Decided review items and answered human requests, newest first.
+    /// Requires `decision_queue_v1`.
+    pub async fn decision_history(
+        &self,
+        limit: usize,
+    ) -> Result<crate::decision_queue::DecisionHistory, RuntimeError> {
+        let req = serde_json::json!({
+            "protocol": PROTOCOL_VERSION,
+            "kind": "decision_history",
+            "limit": limit,
+        });
+        field(&self.call_checked(&req).await?, "decision_history")
+    }
+}

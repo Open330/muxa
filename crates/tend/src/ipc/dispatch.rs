@@ -417,6 +417,18 @@ pub(super) async fn handle(
                     kind = name;
                     response
                 }
+                body
+                @ (RequestBody::DecisionQueue { .. } | RequestBody::DecisionHistory { .. }) => {
+                    let (name, response) = Box::pin(super::review::decision_response(
+                        &reviews,
+                        &collaboration,
+                        &store,
+                        body,
+                    ))
+                    .await;
+                    kind = name;
+                    response
+                }
                 RequestBody::PipelineRuns => {
                     kind = "pipeline_runs";
                     Response::with_pipeline_runs(pipeline_runs.list().await)

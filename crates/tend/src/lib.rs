@@ -60,6 +60,7 @@ pub mod config_file;
 pub mod config_sync;
 pub mod dashboard;
 pub mod decision;
+pub mod decision_queue;
 pub mod discovery;
 pub mod error;
 pub mod event;
