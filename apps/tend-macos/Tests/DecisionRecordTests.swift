@@ -19,6 +19,7 @@ private final class RecordingDaemon: @unchecked Sendable {
     var capabilities = ["session_bytes_v1", "session_attachment_identity_v1", "work_control_v1",
                         "review_items_v1", "review_record_v1", "decision_queue_v1"]
     var refuseRecords = false
+    var failHistory = false
     /// Older records already in the store, oldest first.
     var preloaded: [(key: String, at: String)] = []
     private(set) var pagesRead = 0
@@ -58,6 +59,8 @@ private final class RecordingDaemon: @unchecked Sendable {
             ])
         case "decision_queue":
             return try JSONSerialization.data(withJSONObject: ["ok": true, "decision_queue": ["items": []]])
+        case "decision_history" where failHistory:
+            return try JSONSerialization.data(withJSONObject: ["ok": false, "error": "history store locked"])
         case "decision_history":
             let items: [[String: Any]] = recorded.enumerated().map { index, request in
                 let review = request["review"] as? [String: Any] ?? [:]
@@ -118,6 +121,57 @@ private final class RecordingDaemon: @unchecked Sendable {
         #expect(FleetDecisionRecord.kind(ofKey: "home-answer:def") == .answered)
         #expect(FleetDecisionRecord.kind(ofKey: "home-sendback:x") == .sentBack)
         #expect(FleetDecisionRecord.kind(ofKey: "cli:x") == nil)
+    }
+
+    @Test func historyRowsSayWhatWasDecided() throws {
+        let json = """
+        {"items":[
+          {"kind":"human_answer","request_id":"req_1","body":"Merge?","from_session_id":"s","from_pane":"%1","from_alias":"impl",
+           "created_at":"2026-11-12T01:00:00Z","status":"completed","answer":"Merge now","answered_at":"2026-11-12T02:00:00Z",
+           "decision":{"needed":"Merge #12 or hold?"}},
+          {"kind":"human_answer","request_id":"req_2","body":"Deploy?","from_session_id":"s","from_pane":"%1",
+           "created_at":"2026-11-12T01:00:00Z","status":"declined","answer":"Not today","answered_at":"2026-11-12T02:00:00Z"},
+          {"kind":"review","id":"rv_1","target":{"kind":"work","workspace":"ws","work":"w"},"generation":1,
+           "summary":"Docs pass","idempotency_key":"home:abc","requested_at":"2026-11-12T01:00:00Z","requested_by":{"kind":"user"},
+           "disposition":{"kind":"accepted","by":{"kind":"user"},"at":"2026-11-12T01:30:00Z"}},
+          {"kind":"review","id":"rv_2","target":{"kind":"session","session_id":"s"},"generation":1,
+           "summary":"Retry path","requested_at":"2026-11-12T01:00:00Z","requested_by":{"kind":"agent","label":"impl"},
+           "disposition":{"kind":"returned","by":{"kind":"user"},"at":"2026-11-12T01:10:00Z","note":"Needs a test"}},
+          {"kind":"review","id":"rv_3","target":{"kind":"session","session_id":"s"},"generation":1,
+           "summary":"Port","idempotency_key":"home-sendback:x","requested_at":"2026-11-12T01:00:00Z","requested_by":{"kind":"user"},
+           "disposition":{"kind":"returned","by":{"kind":"user"},"at":"2026-11-12T01:10:00Z","note":"Use 8080"}}
+        ]}
+        """
+        let history = try JSONDecoder().decode(TendDecisionHistory.self, from: Data(json.utf8))
+        let rows = history.items.map(FleetDecidedRow.init)
+        #expect(rows.map(\.verdict) == [.answered, .replied("declined"), .looksGood, .returned, .sentBack])
+        #expect(rows[0].title == "Merge #12 or hold?" && rows[0].said == "Merge now" && rows[0].context == "@impl")
+        #expect(rows[3].said == "Needs a test")
+        #expect(rows[3].context?.contains("impl") == true)
+        #expect(rows.allSatisfy { $0.at != nil })
+    }
+
+    @MainActor
+    @Test func aFailedHistoryReadSaysSoAndAnOlderDaemonHasNone() async throws {
+        let daemon = RecordingDaemon()
+        daemon.failHistory = true
+        let client = daemon.client()
+        try await client.hello()
+        let feed = FleetDecisionFeed()
+        await feed.loadHistory(client, force: true)
+        #expect(feed.history == nil && !feed.historyUnsupported)
+        #expect(feed.historyError?.contains("history store locked") == true)
+        daemon.failHistory = false
+        await feed.loadHistory(client, force: true)
+        #expect(feed.history != nil && feed.historyError == nil)
+
+        let older = RecordingDaemon()
+        older.capabilities.removeAll { $0 == "decision_queue_v1" }
+        let oldClient = older.client()
+        try await oldClient.hello()
+        let oldFeed = FleetDecisionFeed()
+        await oldFeed.loadHistory(oldClient, force: true)
+        #expect(oldFeed.historyUnsupported)
     }
 
     @Test func recordedKeysDecideWhatHomeHides() throws {

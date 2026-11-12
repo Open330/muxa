@@ -24,6 +24,11 @@ final class FleetDecisionFeed: ObservableObject {
     @Published private var drafts: [String: String] = [:]
     /// Past decisions on this Mac's daemon, for the history view.
     @Published private(set) var history: TendDecisionHistory?
+    /// Why the last history read failed; the view offers a retry.
+    @Published private(set) var historyError: String?
+    /// The daemon has no `decision_history` (an older tendd).
+    @Published private(set) var historyUnsupported = false
+    @Published private(set) var historyLoading = false
     /// Results marked Looks Good in Home that tendd holds a record of; nil
     /// while the daemon cannot record or report them, when Home keeps its
     /// own marks instead.
@@ -72,15 +77,22 @@ final class FleetDecisionFeed: ObservableObject {
     func loadHistory(_ client: TendIPCClient, force: Bool) async {
         guard await client.supports(tendDecisionQueueCapability) else {
             history = nil
+            historyUnsupported = true
+            historyError = nil
             return
         }
+        historyUnsupported = false
         guard force || Date().timeIntervalSince(lastHistoryLoad) >= Self.historyEvery else { return }
         lastHistoryLoad = Date()
+        historyLoading = true
+        defer { historyLoading = false }
         do {
             guard let history = try await client.decisionHistory() else { return }
             if self.history != history { self.history = history }
+            historyError = nil
         } catch {
-            TendLog.app.warning("reading the decision history failed: \(error.localizedDescription, privacy: .public)")
+            // The last good history stays on screen under the error.
+            historyError = String(localized: "Could not read the decision history: \(error.localizedDescription)")
         }
     }
 

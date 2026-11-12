@@ -23442,6 +23442,156 @@
           }
         }
       }
+    },
+    "Decided" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정한 것"
+          }
+        }
+      }
+    },
+    "Back to Review" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "검토로 돌아가기"
+          }
+        }
+      }
+    },
+    "History" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록"
+          }
+        }
+      }
+    },
+    "What you already decided, newest first" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이미 결정한 것, 최신순"
+          }
+        }
+      }
+    },
+    "Sent back" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "되돌려 보냄"
+          }
+        }
+      }
+    },
+    "Accepted" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "수락함"
+          }
+        }
+      }
+    },
+    "Returned" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "반려함"
+          }
+        }
+      }
+    },
+    "Withdrawn" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "철회됨"
+          }
+        }
+      }
+    },
+    "Showing the latest %lld" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "최근 %lld개만 표시"
+          }
+        }
+      }
+    },
+    "Nothing decided yet." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 결정한 것이 없습니다."
+          }
+        }
+      }
+    },
+    "No matching decisions." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일치하는 결정이 없습니다."
+          }
+        }
+      }
+    },
+    "This tendd keeps no decision history. Update tend to record decisions." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 tendd는 결정 기록을 남기지 않습니다. 결정을 기록하려면 tend를 업데이트하세요."
+          }
+        }
+      }
+    },
+    "Could not read the decision history: %@" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "결정 기록을 읽지 못했습니다: %@"
+          }
+        }
+      }
+    },
+    "The history could not be read. Check again." : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록을 읽지 못했습니다. 다시 확인하세요."
+          }
+        }
+      }
+    },
+    "Reading the history…" : {
+      "localizations" : {
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "기록을 읽는 중…"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"
