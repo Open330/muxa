@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- MCP: `tend_wait` waits on any handle (a request id, Fleet requests
+  included, a dispatch, a swap job, or a pane's next state change), and
+  `tend_guide` takes a `topic` (`collaboration`, `room`, `launch`). The six
+  tools they replace (`tend_wait_reply`, `tend_fleet_wait_reply`,
+  `tend_wait_for_change`, `tend_dispatch_status`, `tend_collaboration_guide`,
+  `tend_room_context`) are no longer listed but keep working, and their results
+  name the replacement. `tools/list` drops from 52,864 to 50,149 bytes.
+
 ## [0.10.13] - 2026-11-12
 
 ### Fixed

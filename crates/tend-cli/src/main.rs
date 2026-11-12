@@ -30,6 +30,7 @@ mod mcp;
 mod mcp_output;
 mod mcp_reload;
 mod mcp_revision;
+mod mcp_surface;
 mod message_skill;
 mod mux_control;
 mod onboarding;

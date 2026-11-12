@@ -203,11 +203,22 @@ it:
 
 ## Tools
 
+The listed surface is converging on one tool per job
+([MCP_SURFACE](proposals/MCP_SURFACE.md)). Retired names keep working for
+agents that already hold their schema; they are not listed, and their result
+carries `replaced_by` with the tool to use instead:
+
+| Retired | Use |
+| --- | --- |
+| `tend_wait_reply`, `tend_fleet_wait_reply`, `tend_wait_for_change`, `tend_dispatch_status` | `tend_wait` |
+| `tend_collaboration_guide`, `tend_room_context` | `tend_guide` (`topic=collaboration` / `room`) |
+
 | Tool | Arguments | Does |
 | --- | --- | --- |
 | `tend_status` | `pane?`, `full?`, `include_capture?`, `history_limit?`, `max_capture_lines?` | Return a compact fleet/agent summary by default, the complete topology with `full=true`, or one focused pane. |
 | `tend_recent_prompts` | `pane?`, `limit?`, `full?` | Recent prompts (newest first): default 20, maximum 100. `full=true` explicitly permits larger limits or all retained history. |
-| `tend_guide` | — | Return the user's configured surface, agent, option, direction, and free-form orchestration preferences. |
+| `tend_guide` | `topic?` (`collaboration`, `room`, `launch`), `workflows?` | Orientation. `collaboration` (default): identity, peers, preferences, guardrails and running-daemon capabilities; `workflows=true` adds detailed examples. `room`: identity, same-window peers and unread counts. `launch`: the configured surface, agent, options, direction and guidance. |
+| `tend_wait` | `id?`, `kind?`, `timeout_secs?`, `after_update?`, `host?`, `pane_key?`, `pane?`, `until?`, `include_capture?`, `max_capture_lines?` | Wait on one handle: a request id (its final reply; a Fleet request this MCP process sent needs only the id), a dispatch UUID (its status), a swap job, or, with `pane` and no id, that pane's next state change (`until=settled` skips intermediate working states). |
 | `tend_start_agent` | `agent?`, `options?`, `workspace?`, `work?`, `role?`, `task?`, `placement?`, `target?`, `cwd?`, `prompt?`, `name?`, `direction?` | Create/reuse a workspace session and work window, or start an allowlisted agent in a lower-level tmux surface. `agent` is optional only when configured in `[mcp.guide]`. |
 | `tend_start_work` | `work`, `pipeline?`, `workspace?`, `cwd?`, `body?`, `skill?`, `context?`, `no_ticket?`, `refresh?`, `dry_run?` | Bring a work item's window to the state its pipeline declares: resolve the ticket, route it, create the missing agent panes, and deliver `body` to the ones already running. |
 | `tend_swap_account` | `action?`, `job?`, `request_key?`, `detach?`, `wait_secs?`, `host?`, `targets?`, `all?`, `provider?`, `to?`, `force?`, `continue_text?`, `continue_when?`, `continue_evidence?`, `no_continue?`, `dry_run?` | Move Claude/Codex agents onto another account and resume them in place, here or on a control-mode Fleet host (`tend swap`; see [ACCOUNT_SWAP.md](ACCOUNT_SWAP.md)). `action` is `swap` (default), `retry` (an ended job's safely retryable targets), `status` or `cancel` (with `job`). A start or retry runs under a request key — pass your own `request_key` to hold it before anything is sent, or use the one returned — and every result, errors included, carries it with a `recovery` call (`action=status`); the tool never sends a swap twice. `status`/`cancel` return the job as it is now unless `wait_secs` (≤120) asks to wait. |
@@ -220,10 +231,6 @@ it:
 | `tend_fleet_call_peer` | `host`, `pane`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?` | Send durable structured work to one explicitly selected Fleet agent and optionally wait for its reply. |
 | `tend_update_request` | `request_id`, `body` | Add nonterminal progress/guidance as an existing participant. |
 | `tend_fleet_update_request` | `host`, `pane_key`, `request_id`, `body` | Add guidance to the original Fleet request without prompt injection. |
-| `tend_fleet_wait_reply` | `host`, `pane_key`, `request_id`, `timeout_secs?`, `after_update?` | Continue an exact remote durable reply wait, including after the target pane exits. |
-| `tend_wait_for_change` | `timeout_secs?`, `pane?`, `until?`, `include_capture?` | Wait for any change or a focused settled/idle/blocked/stopped state, optionally returning the screen. |
-| `tend_collaboration_guide` | `workflows?` | Return identity, preferences, guardrails and running-daemon capabilities. `workflows=true` adds detailed examples; human-action guidance requires `capabilities.human_actions=true`. |
-| `tend_room_context` | — | Identify self, list same-window peers, and report unread request/reply counts. |
 | `tend_call_peer` | `target?`, `intent?`, `body?`, `skill?`, `context?`, `execute?`, `paths?`, `wait?`, `timeout_secs?`, `spawn_if_missing?`, `context_bound?`, `user_authorized?`, `spawn_agent?`, `spawn_timeout_secs?` | Expand a registered skill, select a peer, send a durable request, optionally wait for its reply, and reuse or create a dedicated worker with configured provider permissions. |
 | `tend_peer_report` | `target?`, `request_id?`, `full?` | Read a received final reply without repeating the original request. `full=true` returns the legacy full record. |
 | `tend_set_identity` | `alias?`, `roles?` | Replace this exact session's room-local alias and role set; empty input clears it. |
@@ -233,7 +240,6 @@ it:
 | `tend_inbox` | `request_id?, full?` | Claim and read instructions, authority, paths and attachments. Use the wake’s `request_id` to read one request; `full=true` includes audit metadata. CLI: `tend msg accept ID --json` (one), `tend msg inbox --json` (compact inbox), `--json --full` (legacy audit records). |
 | `tend_list_messages` | `mailbox?`, `request_id?`, `limit?`, `offset?`, `include_body?`, `after_update?`, `full?` | List newest metadata records without claiming (default 20, max 100). Read an exact request or incremental progress explicitly. |
 | `tend_reply` | `request_id`, `status`, `body`, `artifacts?` | Return a structured terminal response. |
-| `tend_wait_reply` | `request_id`, `timeout_secs?` | Event-driven wait for a structured peer response. |
 | `tend_withdraw_reply_wake` | `request_ids` | Stop being woken for replies to your own requests you gave up on or replaced. Work, replies and `tend_wait_reply` results are unchanged. |
 | `tend_cancel_message` | `request_id` | Cancel a sent request while it is still queued. |
 
